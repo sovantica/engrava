@@ -1,0 +1,80 @@
+# semantic-release pipeline — auto-version + CHANGELOG + tag + GitHub Release on push to main.
+#
+# PyPI publish block is COMMENTED OUT until the v1.0.0 release milestone.
+# Before uncommenting:
+#   1. Ensure PyPI trusted publisher is configured (OIDC) for this repository.
+#   2. Confirm LICENSE is finalized (MIT per repository policy).
+#
+# Reference: https://semantic-release.gitbook.io/semantic-release/
+
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write       # create tags + releases
+  issues: write         # comment on released issues
+  pull-requests: write  # comment on released PRs
+  id-token: write       # trusted publishing to PyPI (OIDC)
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: semantic-release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install semantic-release
+        run: |
+          npm install --no-save \
+            semantic-release@24 \
+            @semantic-release/changelog@6 \
+            @semantic-release/git@10 \
+            @semantic-release/github@11 \
+            @semantic-release/exec@6 \
+            conventional-changelog-conventionalcommits@7
+
+      - name: Run semantic-release
+        id: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx semantic-release
+
+      # ─────────────────────────────────────────────────────────────
+      # PyPI publish — ENABLE at the v1.0.0 release milestone.
+      # Current existing publish.yml is tag-triggered — keep it until
+      # semantic-release is validated, then remove publish.yml and
+      # uncomment below.
+      #
+      # - name: Build distribution
+      #   if: steps.release.outputs.new_release_published == 'true'
+      #   run: |
+      #     python -m pip install --upgrade build
+      #     python -m build
+      #
+      # - name: Publish to PyPI (trusted publishing — OIDC)
+      #   if: steps.release.outputs.new_release_published == 'true'
+      #   uses: pypa/gh-action-pypi-publish@release/v1
+      # ─────────────────────────────────────────────────────────────

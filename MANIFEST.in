@@ -1,0 +1,10 @@
+include README.md
+include LICENSE
+include CHANGELOG.md
+recursive-include src/engrava *.sql
+recursive-include src/engrava *.json
+recursive-include src/engrava *.md
+recursive-include docs *.md
+prune tests
+global-exclude __pycache__
+global-exclude *.py[cod]

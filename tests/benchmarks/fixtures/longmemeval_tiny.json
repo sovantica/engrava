@@ -1,0 +1,75 @@
+[
+  {
+    "question_id": "fixture-q-001",
+    "question_type": "single-session-recall",
+    "question": "What pet did the user adopt?",
+    "answer": "tabby cat named Pepper",
+    "question_date": "2026-01-15",
+    "haystack_sessions": [
+      {
+        "session_id": "session-0001",
+        "turns": [
+          {"role": "user", "content": "Yesterday I finally adopted a tabby cat named Pepper from the shelter."},
+          {"role": "assistant", "content": "That is wonderful. Tabby cats often settle in quickly."},
+          {"role": "user", "content": "She is already napping on the windowsill."}
+        ]
+      },
+      {
+        "session_id": "session-0002",
+        "turns": [
+          {"role": "user", "content": "The new coffee shop on Maple Street opens at seven."},
+          {"role": "assistant", "content": "Early opening hours are useful for commuters."}
+        ]
+      }
+    ],
+    "answer_session_ids": ["session-0001"]
+  },
+  {
+    "question_id": "fixture-q-002",
+    "question_type": "multi-session",
+    "question": "Where did the user say they would travel next month?",
+    "answer": "Lisbon for a research conference",
+    "question_date": "2026-02-10",
+    "haystack_sessions": [
+      {
+        "session_id": "session-0010",
+        "turns": [
+          {"role": "user", "content": "My passport just arrived in the mail."},
+          {"role": "assistant", "content": "Useful before any trip."}
+        ]
+      },
+      {
+        "session_id": "session-0011",
+        "turns": [
+          {"role": "user", "content": "Next month I am flying to Lisbon for a research conference on memory systems."},
+          {"role": "assistant", "content": "Sounds like a productive trip."}
+        ]
+      },
+      {
+        "session_id": "session-0012",
+        "turns": [
+          {"role": "user", "content": "The book I ordered finally arrived today."}
+        ]
+      }
+    ],
+    "answer_session_ids": ["session-0011"]
+  },
+  {
+    "question_id": "fixture-q-003",
+    "question_type": "knowledge-update",
+    "question": "What did the user say about their favorite tea?",
+    "answer": "Earl Grey with a slice of orange peel",
+    "question_date": "2026-03-05",
+    "haystack_sessions": [
+      {
+        "session_id": "session-0020",
+        "turns": [
+          {"role": "user", "content": "My favorite tea is Earl Grey with a slice of orange peel."},
+          {"role": "assistant", "content": "An aromatic combination."},
+          {"role": "user", "content": "I drink one cup every morning."}
+        ]
+      }
+    ],
+    "answer_session_ids": ["session-0020"]
+  }
+]

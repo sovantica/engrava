@@ -1,0 +1,52 @@
+# Branch Name Guard — validates PR source branch names per BRANCHING.md.
+# Rules: <type>/<kebab-description>, ≤50 chars, lowercase ASCII only.
+
+name: Branch Name Guard
+
+on:
+  pull_request:
+    types: [opened, reopened, edited, synchronize]
+
+jobs:
+  check:
+    name: Validate branch name
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip for release/hotfix merging to main
+        id: precheck
+        env:
+          BRANCH: ${{ github.head_ref }}
+          BASE: ${{ github.base_ref }}
+        run: |
+          # Don't rigorously check if this is a release/hotfix PR to main — those may have looser naming.
+          if [ "$BASE" = "main" ] && [ "$BRANCH" = "dev" ]; then
+            echo "skip_shape=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip_shape=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate shape
+        if: steps.precheck.outputs.skip_shape == 'false'
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          # Schema: <type>/<kebab-description>
+          if [[ ! "$BRANCH" =~ ^(feature|fix|chore|docs|refactor|test|perf|release|hotfix)/[a-z0-9-]+$ ]]; then
+            echo "Invalid branch name: '$BRANCH'"
+            echo ""
+            echo "Required format: <type>/<kebab-description>"
+            echo "Allowed types: feature, fix, chore, docs, refactor, test, perf, release, hotfix"
+            echo "Description: lowercase, kebab-case, plain English"
+            echo ""
+            echo "See BRANCHING.md"
+            exit 1
+          fi
+
+          if [ ${#BRANCH} -gt 50 ]; then
+            echo "Branch name too long (${#BRANCH} chars, max 50): '$BRANCH'"
+            exit 1
+          fi
+
+          echo "Branch shape OK: '$BRANCH' (${#BRANCH} chars)"

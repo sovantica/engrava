@@ -1,0 +1,128 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "engrava"
+version = "0.3.0"
+description = "Thought-graph database for AI agents — store, link, search, and evolve ideas"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [{name = "Sovantica", email = "engineering@sovantica.ai"}]
+keywords = ["ai", "agent", "memory", "knowledge-graph", "sqlite", "embedding", "thought-graph"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "pydantic>=2.9.0",
+    "aiosqlite>=0.20.0",
+    "numpy>=1.26.0",
+    "click>=8.1.0",
+    "PyYAML>=6.0",
+]
+
+[project.scripts]
+engrava = "engrava.cli.main:main"
+
+[project.urls]
+Homepage = "https://github.com/Sovantica/engrava"
+Documentation = "https://engrava.ai/docs"
+Repository = "https://github.com/Sovantica/engrava"
+Issues = "https://github.com/Sovantica/engrava/issues"
+Changelog = "https://github.com/Sovantica/engrava/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+vec = ["sqlite-vec>=0.1.0,<0.2.0"]
+dreaming = []
+embeddings-local = ["sentence-transformers>=3.0.0", "torch>=2.0.0"]
+embeddings-openai = ["httpx>=0.27.0"]
+embeddings-ollama = ["httpx>=0.27.0"]
+embeddings-hf = ["huggingface_hub>=0.24.0"]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=5.0.0",
+    "mypy>=1.11.0",
+    "ruff>=0.7.0",
+    "types-PyYAML>=6.0",
+    # Synthetic benchmark suite needs a real embedding provider in CI
+    # to exercise the OFF/ON evaluator path.  Pinned to the same
+    # version range as the ``embeddings-local`` extra so both
+    # extras resolve together (``pip install -e .[dev,embeddings-local]``
+    # used to fail with a resolver conflict before this alignment).
+    # ``sentence-transformers`` pulls torch transitively (~500 MB) —
+    # the CI cache absorbs that cost after the first cold install.
+    "sentence-transformers>=3.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+engrava = [
+    "infrastructure/sqlite/*.sql",
+    "benchmarks/synthetic/datasets/*.json",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "D203",
+    "D213",
+    "COM812",
+    "ISC001",
+    "D107",
+    "TC001",
+    "PLR0913",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "PLR2004", "D", "SLF001", "PT011", "B017", "FBT", "PLC0415", "ARG001", "ARG002"]
+"examples/**" = ["T201", "INP001", "D"]
+"scripts/**" = ["INP001", "T201", "ASYNC240"]
+
+[tool.mypy]
+strict = true
+warn_return_any = true
+disallow_untyped_defs = true
+no_implicit_reexport = true
+# Type-check assuming Python 3.11 floor (matches requires-python).
+# Prevents accidental 3.12-only syntax (PEP 695, PEP 701) leaking into a
+# package whose pyproject claims to install on 3.11. Devs still get 3.12
+# locally via .python-version=3.12; CI matrix covers 3.11/3.12/3.13.
+python_version = "3.11"
+
+[[tool.mypy.overrides]]
+module = "sentence_transformers.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "sqlite_vec.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "httpx.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "huggingface_hub.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

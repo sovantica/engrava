@@ -1,0 +1,59 @@
+# engrava — example configuration
+#
+# This file provides sensible defaults that enable dreaming consolidation
+# out of the box.  Copy it next to your application and customise as needed.
+#
+# See docs/configuration.md for the full reference.
+
+database:
+  path: "./engrava.db"
+  wal_mode: true
+
+extensions:
+  vector:
+    backend: numpy       # "numpy" (brute-force) or "sqlite-vec" (ANN)
+    dimension: 384       # must match your embedding model
+
+  dreaming:
+    enabled: true
+    schedule_every_n_cycles: 100
+    promote_threshold: 0.55
+
+    # Dreaming signals — weights must sum to ~1.0
+    signals:
+      recency: 0.25
+      staleness: 0.20
+      confirmation: 0.20
+      confidence: 0.15
+      frequency: 0.20
+
+    gates:
+      min_confirmations: 2
+      min_age_cycles: 1               # freshly ingested thoughts eligible after 1 cycle
+      max_promoted_per_run: 20
+      allow_zero_confirmation: true   # bypass confirmation gate for single-write batches
+
+    # Edge creation from dreaming
+    edges:
+      enabled: true                   # create ASSOCIATED edges on promotion
+      top_k: 1                        # max neighbours per promoted thought
+      min_similarity: 0.7             # cosine threshold for edge creation
+      edge_weight_factor: 0.5         # edge.weight = factor × similarity
+
+search:
+  default_fts_weight: 0.30
+  default_vector_weight: 0.55
+  default_recency_weight: 0.10
+  default_priority_weight: 0.05      # priority as 4th hybrid-search signal
+  default_graph_weight: 0.00         # graph signal off by default (opt-in)
+  recency_half_life: 50
+
+  # Priority boost multipliers — higher = more influence on ranking
+  priority_boost_p1: 1.0   # highest priority
+  priority_boost_p2: 0.6
+  priority_boost_p3: 0.3
+  priority_boost_p4: 0.0   # lowest priority — no boost
+
+  # Graph signal — 1-hop-weighted neighbour boost
+  graph_edge_decay: 0.5              # decay factor for neighbour boost
+  max_neighbors_per_candidate: 5     # safety cap per candidate
