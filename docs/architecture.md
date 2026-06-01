@@ -1,6 +1,6 @@
 # Architecture
 
-engrava is a **thought-graph database** — a Python library for
+engrava is **the memory database for AI agents** — a Python library for
 storing, linking, searching, and evolving ideas.  It is SQLite-first
 and designed to be embedded by larger cognitive systems.
 

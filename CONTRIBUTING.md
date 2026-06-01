@@ -6,7 +6,7 @@ we look for in contributions.
 
 ## Scope
 
-engrava is a **thought-graph database for AI agents**. Contributions should
+engrava is **the memory database for AI agents**. Contributions should
 stay within this scope:
 
 **In scope:**
