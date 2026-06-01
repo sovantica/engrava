@@ -604,26 +604,21 @@ class TestFTS5Schema:
         conn.row_factory = aiosqlite.Row
         await conn.execute("PRAGMA journal_mode = WAL")
         await conn.execute("PRAGMA foreign_keys = ON")
-        await conn.execute(
-            "CREATE TABLE thought ("
-            "  thought_id TEXT PRIMARY KEY, thought_type TEXT NOT NULL,"
-            "  essence TEXT NOT NULL, content TEXT NOT NULL,"
-            "  priority TEXT NOT NULL, lifecycle_status TEXT NOT NULL DEFAULT 'CREATED',"
-            "  created_cycle INTEGER NOT NULL DEFAULT 0,"
-            "  updated_cycle INTEGER NOT NULL DEFAULT 0,"
-            "  source TEXT NOT NULL DEFAULT 'human',"
-            "  confidence REAL, embedding_ref TEXT,"
-            "  source_type TEXT NOT NULL DEFAULT 'EXPERIENCE',"
-            "  confirmation_count INTEGER NOT NULL DEFAULT 0,"
-            "  consolidated_from TEXT,"
-            "  visibility TEXT NOT NULL DEFAULT 'selective',"
-            "  access_count INTEGER NOT NULL DEFAULT 0,"
-            "  last_accessed_at TEXT,"
-            "  created_at TEXT,"
-            "  updated_at TEXT,"
-            "  expires_at TEXT"
-            ")"
-        )
+
+        # Build the current core schema, then roll the FTS5 index back to the
+        # legacy v1 state under test: the original virtual table tokenized ``-``
+        # as an operator (no ``tokenchars '-_'``), so hyphenated prefix searches
+        # such as ``REQ-FUNC*`` could not match. The ``thought`` table itself is
+        # left at the current schema so the current ``create_thought`` insert
+        # (all core columns) seeds a row cleanly; only the FTS index + triggers
+        # are downgraded and ``user_version`` is reset to 2 to mimic a database
+        # that predates the hyphen-aware FTS rebuild.
+        bootstrap_store = SqliteEngravaCore(conn)
+        await bootstrap_store.ensure_schema()
+        await conn.execute("DROP TRIGGER IF EXISTS thought_fts_insert")
+        await conn.execute("DROP TRIGGER IF EXISTS thought_fts_delete")
+        await conn.execute("DROP TRIGGER IF EXISTS thought_fts_update")
+        await conn.execute("DROP TABLE IF EXISTS thought_fts")
         await conn.execute(
             "CREATE VIRTUAL TABLE thought_fts USING fts5("
             "  essence, content, content='thought', content_rowid='rowid'"
@@ -650,6 +645,8 @@ class TestFTS5Schema:
             "END"
         )
         await conn.execute("PRAGMA user_version = 2")
+        await conn.commit()
+
         legacy_store = SqliteEngravaCore(conn)
         await legacy_store.create_thought(
             _make_thought("t-legacy", essence="General", content="REQ-FUNC-003 compliance")
