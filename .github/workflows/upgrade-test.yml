@@ -24,10 +24,27 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Check the baseline version is published
+        id: baseline
+        run: |
+          # The upgrade matrix installs a prior release from PyPI as its
+          # starting point. Until that prior release exists, the test cannot
+          # run — skip cleanly rather than fail (e.g. before the first publish,
+          # or if a from-spec is bumped ahead of an actual release).
+          spec="${{ matrix.from-spec }}"
+          if pip index versions "${spec%%==*}" 2>/dev/null | grep -q "${spec##*==}"; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Baseline '$spec' is not on PyPI yet — skipping the upgrade smoke test."
+          fi
+
       - name: Install test dependencies
+        if: steps.baseline.outputs.available == 'true'
         run: pip install -e ".[dev]"
 
       - name: Run upgrade smoke test
+        if: steps.baseline.outputs.available == 'true'
         env:
           ENGRAVA_RUN_UPGRADE_MATRIX: "1"
           ENGRAVA_UPGRADE_FROM_SPEC: ${{ matrix.from-spec }}
