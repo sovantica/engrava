@@ -377,9 +377,12 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "discover_manifests",
         "load_config",
         "parse",
+        "percept",
         "resolve_embedding_provider",
         "resolve_hooks",
         "resolve_manifests",
+        "thought",
+        "utterance",
     },
 )
 
