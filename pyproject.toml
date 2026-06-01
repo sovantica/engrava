@@ -5,12 +5,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "engrava"
 version = "0.3.0"
-description = "Thought-graph database for AI agents — store, link, search, and evolve ideas"
+description = "The memory database for AI agents — graph memory, hybrid search, audit trail."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.11"
-authors = [{name = "Sovantica", email = "engineering@sovantica.ai"}]
-keywords = ["ai", "agent", "memory", "knowledge-graph", "sqlite", "embedding", "thought-graph"]
+authors = [{name = "Sovantica", email = "hello@sovantica.ai"}]
+keywords = [
+    "ai-agents", "agent-memory", "graph-memory", "hybrid-search",
+    "memory-consolidation", "audit-trail", "sqlite", "llm",
+    "autonomous-agents", "python",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -36,11 +40,11 @@ dependencies = [
 engrava = "engrava.cli.main:main"
 
 [project.urls]
-Homepage = "https://github.com/Sovantica/engrava"
-Documentation = "https://engrava.ai/docs"
-Repository = "https://github.com/Sovantica/engrava"
-Issues = "https://github.com/Sovantica/engrava/issues"
-Changelog = "https://github.com/Sovantica/engrava/blob/main/CHANGELOG.md"
+Homepage = "https://engrava.ai"
+Documentation = "https://docs.engrava.ai"
+Repository = "https://github.com/sovantica/engrava"
+Issues = "https://github.com/sovantica/engrava/issues"
+Changelog = "https://github.com/sovantica/engrava/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 vec = ["sqlite-vec>=0.1.0,<0.2.0"]

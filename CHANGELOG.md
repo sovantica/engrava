@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **docs:** align package description and documentation with the product
+  tagline ("The memory database for AI agents") and the public contact
+  address.
+
 ### Maintenance
 
 - **Pre-publish smoke gate.** The publish workflow now runs a hard-fail
@@ -332,9 +338,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LICENSE` copyright holder, the `pyproject.toml` `[project] authors`
   field, and the `[project.urls]` GitHub references now reflect the
   Sovantica organization identity instead of an individual maintainer.
-  A `engineering@sovantica.ai` contact address replaces the previous
+  A `hello@sovantica.ai` contact address replaces the previous
   unauthored entry, and the `Documentation` URL points at
-  `https://engrava.ai/docs` so PyPI listings link to the product
+  `https://docs.engrava.ai` so PyPI listings link to the product
   documentation rather than the in-repo `docs/` tree.  No behavioural
   changes — packaging metadata only.
 

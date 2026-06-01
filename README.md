@@ -1,6 +1,8 @@
 # engrava
 
-> Thought-graph database for AI agents — store, link, search, and evolve ideas.
+> The memory database for AI agents.
+>
+> Graph memory, hybrid search, and a tamper-evident audit trail — one `pip install`, no server, no LLM.
 
 [![CI](https://github.com/sovantica/engrava/actions/workflows/ci.yml/badge.svg)](https://github.com/sovantica/engrava/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/engrava.svg)](https://pypi.org/project/engrava/)
