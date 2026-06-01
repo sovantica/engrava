@@ -10,6 +10,11 @@ on:
 jobs:
   check:
     name: Validate branch name
+    # Skip automated dependency PRs: Dependabot uses its own fixed branch
+    # namespace (dependabot/<ecosystem>/<path>-<version>) that cannot be
+    # renamed. This guard enforces the naming convention for human-authored
+    # branches; bot branches are out of its scope.
+    if: github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
