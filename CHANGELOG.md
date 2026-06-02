@@ -5,6 +5,12 @@ All notable changes to engrava will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## <small>0.3.1 (2026-06-02)</small>
+
+* fix(vector): load sqlite-vec extension on the connection's worker thread ([457d2f7](https://github.com/sovantica/engrava/commit/457d2f7))
+* fix(vector): re-disable extension loading in finally after load attempt ([e9ab267](https://github.com/sovantica/engrava/commit/e9ab267))
+* docs: point documentation url to engrava.ai/docs ([aeeb3cb](https://github.com/sovantica/engrava/commit/aeeb3cb))
+
 ## [Unreleased]
 
 ### Fixed
