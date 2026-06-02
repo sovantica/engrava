@@ -11,6 +11,11 @@
 # runs the smoke gate, builds the sdist + wheel, and uploads to PyPI via
 # trusted publishing (OIDC — no API token).
 #
+# Only GitHub-owned (actions/*) and verified-publisher (pypa/*) actions are
+# used, to satisfy the repository's "allow select actions" policy. The
+# semantic-release CLI is invoked directly via npx rather than a third-party
+# wrapper action.
+#
 # Reference: https://semantic-release.gitbook.io/semantic-release/
 
 name: Release
@@ -35,9 +40,11 @@ jobs:
     name: semantic-release
     runs-on: ubuntu-latest
     outputs:
-      published: ${{ steps.release.outputs.new_release_published }}
-      version:   ${{ steps.release.outputs.new_release_version }}
-      tag:       ${{ steps.release.outputs.new_release_git_tag }}
+      # Raw semantic-release CLI does not emit GitHub Actions step outputs, so
+      # we detect a release by checking whether a new version tag now points at
+      # HEAD after the run.
+      published: ${{ steps.detect.outputs.published }}
+      version: ${{ steps.detect.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -52,18 +59,32 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Run semantic-release
-        id: release
-        uses: cycjimmy/semantic-release-action@v6
-        with:
-          semantic_version: "24"
-          extra_plugins: |
-            @semantic-release/changelog@6
-            @semantic-release/git@10
-            @semantic-release/exec@6
+      - name: Install semantic-release
+        run: |
+          npm install --no-save \
+            semantic-release@24 \
+            @semantic-release/changelog@6 \
+            @semantic-release/git@10 \
+            @semantic-release/github@11 \
+            @semantic-release/exec@6 \
             conventional-changelog-conventionalcommits@7
+      - name: Run semantic-release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx semantic-release
+      - name: Detect whether a release was published
+        id: detect
+        run: |
+          # semantic-release created and pushed a vX.Y.Z tag on HEAD iff a
+          # release happened this run. Use that as the publish gate.
+          if tag=$(git describe --tags --exact-match HEAD 2>/dev/null); then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+            echo "::notice::semantic-release published ${tag}."
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No release-triggering commits — nothing published."
+          fi
 
   publish:
     name: build + publish to PyPI
