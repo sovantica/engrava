@@ -2,6 +2,33 @@
 
 All notable changes to engrava will be documented in this file.
 
+The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
+
+## 0.3.0 (2026-06-02)
+
+* ci: add on-demand smoke-gate workflow (#10) ([50e2bf2](https://github.com/sovantica/engrava/commit/50e2bf2)), closes [#10](https://github.com/sovantica/engrava/issues/10)
+* ci: automated release pipeline ([18c1d68](https://github.com/sovantica/engrava/commit/18c1d68))
+* ci: quote semantic_version input to fix release workflow startup ([2f3c9c3](https://github.com/sovantica/engrava/commit/2f3c9c3))
+* ci: skip branch-name guard for automated dependency PRs (#8) ([b14bb0a](https://github.com/sovantica/engrava/commit/b14bb0a)), closes [#8](https://github.com/sovantica/engrava/issues/8)
+* ci: skip upgrade smoke test when the baseline is not yet published (#9) ([cc05ed7](https://github.com/sovantica/engrava/commit/cc05ed7)), closes [#9](https://github.com/sovantica/engrava/issues/9)
+* ci: use semantic-release CLI directly to satisfy actions allowlist ([0ebf9f1](https://github.com/sovantica/engrava/commit/0ebf9f1))
+* release: merge dev into release/v0.3.0 (automated release pipeline) ([02d3f05](https://github.com/sovantica/engrava/commit/02d3f05))
+* release: v0.3.0 — first public release ([8bd705e](https://github.com/sovantica/engrava/commit/8bd705e))
+* feat: graph memory database — dreaming consolidation, hybrid search, audit trail ([ed82259](https://github.com/sovantica/engrava/commit/ed82259))
+* test: refresh stale FTS-upgrade fixture and public-export baseline (#11) ([46cab01](https://github.com/sovantica/engrava/commit/46cab01)), closes [#11](https://github.com/sovantica/engrava/issues/11)
+* chore(deps): bump actions/checkout from 4 to 6 (#3) ([840ab88](https://github.com/sovantica/engrava/commit/840ab88)), closes [#3](https://github.com/sovantica/engrava/issues/3)
+* chore(deps): bump actions/download-artifact from 4 to 8 (#7) ([c7ca7cf](https://github.com/sovantica/engrava/commit/c7ca7cf)), closes [#7](https://github.com/sovantica/engrava/issues/7)
+* chore(deps): bump actions/setup-node from 4 to 6 (#6) ([99acddc](https://github.com/sovantica/engrava/commit/99acddc)), closes [#6](https://github.com/sovantica/engrava/issues/6)
+* chore(deps): bump actions/upload-artifact from 4 to 7 (#5) ([7ad3f2f](https://github.com/sovantica/engrava/commit/7ad3f2f)), closes [#5](https://github.com/sovantica/engrava/issues/5)
+* chore(deps): bump softprops/action-gh-release from 2 to 3 (#4) ([9eb3729](https://github.com/sovantica/engrava/commit/9eb3729)), closes [softprops/action-#release](https://github.com/softprops/action-/issues/release) [#4](https://github.com/sovantica/engrava/issues/4)
+* Bump idna from 3.13 to 3.15 (#1) ([f402fd2](https://github.com/sovantica/engrava/commit/f402fd2)), closes [#1](https://github.com/sovantica/engrava/issues/1)
+* docs: align metadata and docs with product tagline; add dependabot and issue config (#2) ([b3bb62d](https://github.com/sovantica/engrava/commit/b3bb62d)), closes [#2](https://github.com/sovantica/engrava/issues/2)
+
+# Changelog
+
+All notable changes to engrava will be documented in this file.
+
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
