@@ -1,13 +1,18 @@
-# Single automated release pipeline — push to main.
+# Single automated release pipeline — push to dev.
 #
 # semantic-release (the `release` job) owns versioning: it analyses the
 # Conventional-Commit history, bumps the version in pyproject.toml, updates
 # CHANGELOG.md, creates the git tag, and publishes the GitHub Release (via the
 # bundled @semantic-release/github plugin). It commits the bumped files back to
-# main with [skip ci] so the pipeline does not re-trigger itself.
+# dev with [skip ci] so the pipeline does not re-trigger itself.
+#
+# `dev` is the release-trigger branch (portfolio-wide convention). `main` is a
+# stable mirror — it inherits the tagged release-commit via a separate forward
+# merge from `dev` after each release. Regular-merge strategy on `dev → main`
+# preserves SHA equality, so the tagged commit is reachable from both branches.
 #
 # When (and only when) semantic-release publishes a new version, the gated
-# `publish` job checks out main HEAD (which now carries the bumped version),
+# `publish` job checks out dev HEAD (which now carries the bumped version),
 # runs the smoke gate, builds the sdist + wheel, and uploads to PyPI via
 # trusted publishing (OIDC — no API token).
 #
@@ -23,7 +28,7 @@ name: Release
 on:
   push:
     branches:
-      - main
+      - dev
 
 permissions:
   contents: write       # create tags + releases
@@ -99,7 +104,7 @@ jobs:
       - name: Checkout released commit
         uses: actions/checkout@v6
         with:
-          ref: main
+          ref: dev
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
