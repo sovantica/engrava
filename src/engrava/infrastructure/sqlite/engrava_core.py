@@ -439,7 +439,7 @@ class SqliteEngravaCore:
             load_sqlite_vec,
         )
 
-        loaded = load_sqlite_vec(self._db._conn)  # noqa: SLF001
+        loaded = await load_sqlite_vec(self._db)
         if not loaded:
             logger.warning("sqlite-vec requested but unavailable — using numpy fallback")
             self._vector_backend = None

@@ -5,6 +5,27 @@ All notable changes to engrava will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## <small>0.3.1 (2026-06-02)</small>
+
+* fix(vector): load sqlite-vec extension on the connection's worker thread ([457d2f7](https://github.com/sovantica/engrava/commit/457d2f7))
+* fix(vector): re-disable extension loading in finally after load attempt ([e9ab267](https://github.com/sovantica/engrava/commit/e9ab267))
+* docs: point documentation url to engrava.ai/docs ([aeeb3cb](https://github.com/sovantica/engrava/commit/aeeb3cb))
+
+## [Unreleased]
+
+### Fixed
+
+- **sqlite-vec backend no longer crashes on configuration.** Selecting the
+  `sqlite-vec` vector backend (via `engrava[vec]`) previously raised a
+  thread error when building a store from configuration, because the
+  extension was loaded on the calling thread instead of the connection's
+  own worker thread. The extension now loads on the worker thread that owns
+  the connection, so configuration succeeds; if the extension still cannot
+  be loaded for any reason, the store falls back to the built-in search
+  backend with a warning instead of raising. Extension loading is also
+  always re-disabled after the load attempt, even when the load fails, so a
+  connection is never left with extension loading enabled.
+
 ## 0.3.0 (2026-06-02)
 
 * ci: add on-demand smoke-gate workflow (#10) ([50e2bf2](https://github.com/sovantica/engrava/commit/50e2bf2)), closes [#10](https://github.com/sovantica/engrava/issues/10)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "engrava"
-version = "0.3.0"
+version = "0.3.1"
 description = "The memory database for AI agents — graph memory, hybrid search, audit trail."
 readme = "README.md"
 license = {text = "MIT"}
@@ -41,7 +41,7 @@ engrava = "engrava.cli.main:main"
 
 [project.urls]
 Homepage = "https://engrava.ai"
-Documentation = "https://docs.engrava.ai"
+Documentation = "https://engrava.ai/docs"
 Repository = "https://github.com/sovantica/engrava"
 Issues = "https://github.com/sovantica/engrava/issues"
 Changelog = "https://github.com/sovantica/engrava/blob/main/CHANGELOG.md"
@@ -68,6 +68,11 @@ dev = [
     # ``sentence-transformers`` pulls torch transitively (~500 MB) —
     # the CI cache absorbs that cost after the first cold install.
     "sentence-transformers>=3.0.0",
+    # Install the optional sqlite-vec extension in the test environment so
+    # CI actually exercises the real extension-load path (the worker-thread
+    # load and ANN search), not just the numpy fallback.  Mirrors the
+    # constraint declared in the ``vec`` extra above.
+    "sqlite-vec>=0.1.0,<0.2.0",
 ]
 
 [tool.setuptools.packages.find]
