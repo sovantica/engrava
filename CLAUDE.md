@@ -80,12 +80,14 @@ This repo follows a feature → release → integration → stable flow.
 
 | Branch | Role |
 |---|---|
-| `main` | Stable, released. Tagged versions live here. |
-| `dev` | Integration. Default PR target for features and fixes. |
-| `release/v<X.Y.Z>` | Release stabilisation. Created from `dev`, merged forward. |
+| `dev` | Release-trigger and integration trunk. semantic-release runs on push to `dev` — the version tag `vX.Y.Z`, the release-commit (CHANGELOG + `pyproject.toml` bump), the PyPI artifact, and the GitHub Release are all created on `dev`. |
+| `main` | Stable mirror. The branch users land on when cloning. After each release, `main` is forward-merged from `dev` with a regular merge so the tagged commit is reachable from both branches (same SHA). `main` never originates a release on its own. |
+| `release/v<X.Y.Z>` | Per-version stabilisation. Created from `main` (the last released state); accumulates one squash-commit per change; merged into `dev` to fire the release pipeline; then deleted. |
 | `<type>/<kebab-description>` | Feature / fix / chore branches. Plain English; no internal identifiers; ≤ 50 chars. |
 
-Open PRs targeting `dev`. Branch names should describe the change in plain English (`feature/priority-signal-hybrid-search`, `fix/empty-count-on-mindql`, `docs/quickstart-update`).
+Open PRs from your feature branch targeting the active `release/v<X.Y.Z>` branch (or `dev` directly if no release branch is currently open). Branch names should describe the change in plain English (`feature/priority-signal-hybrid-search`, `fix/empty-count-on-mindql`, `docs/quickstart-update`).
+
+Direct merge from a `release/*` branch into `main` is not used in this repo — `main` is updated exclusively via forward-merge from `dev` after a release publishes. This keeps the tagged commit reachable from both branches and prevents `main` from drifting ahead of the publisher branch.
 
 ## Contributions
 
