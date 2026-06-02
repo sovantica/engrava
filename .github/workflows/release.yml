@@ -1,9 +1,15 @@
-# semantic-release pipeline — auto-version + CHANGELOG + tag + GitHub Release on push to main.
+# Single automated release pipeline — push to main.
 #
-# PyPI publish block is COMMENTED OUT until the v1.0.0 release milestone.
-# Before uncommenting:
-#   1. Ensure PyPI trusted publisher is configured (OIDC) for this repository.
-#   2. Confirm LICENSE is finalized (MIT per repository policy).
+# semantic-release (the `release` job) owns versioning: it analyses the
+# Conventional-Commit history, bumps the version in pyproject.toml, updates
+# CHANGELOG.md, creates the git tag, and publishes the GitHub Release (via the
+# bundled @semantic-release/github plugin). It commits the bumped files back to
+# main with [skip ci] so the pipeline does not re-trigger itself.
+#
+# When (and only when) semantic-release publishes a new version, the gated
+# `publish` job checks out main HEAD (which now carries the bumped version),
+# runs the smoke gate, builds the sdist + wheel, and uploads to PyPI via
+# trusted publishing (OIDC — no API token).
 #
 # Reference: https://semantic-release.gitbook.io/semantic-release/
 
@@ -28,53 +34,62 @@ jobs:
   release:
     name: semantic-release
     runs-on: ubuntu-latest
-
+    outputs:
+      published: ${{ steps.release.outputs.new_release_published }}
+      version:   ${{ steps.release.outputs.new_release_version }}
+      tag:       ${{ steps.release.outputs.new_release_git_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
-
       - name: Setup Node
         uses: actions/setup-node@v6
         with:
           node-version: "20"
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install semantic-release
-        run: |
-          npm install --no-save \
-            semantic-release@24 \
-            @semantic-release/changelog@6 \
-            @semantic-release/git@10 \
-            @semantic-release/github@11 \
-            @semantic-release/exec@6 \
-            conventional-changelog-conventionalcommits@7
-
       - name: Run semantic-release
         id: release
+        uses: cycjimmy/semantic-release-action@v6
+        with:
+          semantic_version: 24
+          extra_plugins: |
+            @semantic-release/changelog@6
+            @semantic-release/git@10
+            @semantic-release/exec@6
+            conventional-changelog-conventionalcommits@7
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx semantic-release
 
-      # ─────────────────────────────────────────────────────────────
-      # PyPI publish — ENABLE at the v1.0.0 release milestone.
-      # Current existing publish.yml is tag-triggered — keep it until
-      # semantic-release is validated, then remove publish.yml and
-      # uncomment below.
-      #
-      # - name: Build distribution
-      #   if: steps.release.outputs.new_release_published == 'true'
-      #   run: |
-      #     python -m pip install --upgrade build
-      #     python -m build
-      #
-      # - name: Publish to PyPI (trusted publishing — OIDC)
-      #   if: steps.release.outputs.new_release_published == 'true'
-      #   uses: pypa/gh-action-pypi-publish@release/v1
-      # ─────────────────────────────────────────────────────────────
+  publish:
+    name: build + publish to PyPI
+    needs: release
+    if: needs.release.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout released commit
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Pre-publish smoke gate
+        run: |
+          pip install -e ".[embeddings-local]"
+          python scripts/check_smoke_gate.py
+      - name: Build sdist + wheel
+        run: |
+          pip install build
+          python -m build
+      - name: Publish to PyPI (OIDC, no token)
+        uses: pypa/gh-action-pypi-publish@release/v1
