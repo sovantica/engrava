@@ -12,6 +12,7 @@ existing numpy implementation — no crash, just a warning log.
 from __future__ import annotations
 
 import logging
+import sqlite3
 import struct
 from typing import TYPE_CHECKING
 
@@ -195,28 +196,62 @@ class SqliteVecSearchBackend:
         )
 
 
-def load_sqlite_vec(db_conn: object) -> bool:
-    """Attempt to load the sqlite-vec extension into a raw sqlite3 connection.
+def _load_sqlite_vec_sync(raw_conn: sqlite3.Connection) -> None:
+    """Load the sqlite-vec extension into a raw sqlite3 connection.
+
+    This runs the ``enable_load_extension`` / ``sqlite_vec.load`` /
+    ``enable_load_extension(False)`` sequence synchronously.  It **must**
+    execute on the thread that owns ``raw_conn`` (sqlite3 enforces a
+    same-thread guard); callers route it onto aiosqlite's worker thread
+    via :func:`load_sqlite_vec`.
 
     Args:
-        db_conn: A ``sqlite3.Connection`` (the underlying sync connection
-            from aiosqlite, accessed via ``db._conn``).
+        raw_conn: The underlying ``sqlite3.Connection`` to load into.
+
+    """
+    import sqlite_vec  # noqa: PLC0415
+
+    raw_conn.enable_load_extension(True)  # noqa: FBT003
+    sqlite_vec.load(raw_conn)
+    raw_conn.enable_load_extension(False)  # noqa: FBT003
+
+
+async def load_sqlite_vec(db: aiosqlite.Connection) -> bool:
+    """Attempt to load the sqlite-vec extension on the connection's worker thread.
+
+    aiosqlite creates its underlying ``sqlite3.Connection`` on a dedicated
+    worker thread and marshals every query to it.  The extension load must
+    run on that same thread, otherwise sqlite3's same-thread guard rejects
+    it with :class:`sqlite3.ProgrammingError`.  This coroutine routes the
+    synchronous load through aiosqlite's worker-thread execution primitive
+    (``Connection._execute``), so the load shares the thread that later
+    serves all index and search queries.
+
+    Any failure to load (missing package, unsupported build, threading or
+    OS error) degrades gracefully: a warning is logged and ``False`` is
+    returned so the caller can fall back to the numpy brute-force backend.
+
+    Args:
+        db: The aiosqlite ``Connection`` that owns the target database.
 
     Returns:
         ``True`` if sqlite-vec was loaded successfully, ``False`` otherwise.
 
     """
     try:
-        import sqlite_vec  # noqa: PLC0415
+        import sqlite_vec  # noqa: F401, PLC0415
     except ImportError:
         logger.warning("sqlite-vec not installed — falling back to numpy brute-force search")
         return False
 
+    # Run the load on aiosqlite's worker thread (the thread that owns the
+    # raw connection), not the calling coroutine's thread.  ``_execute``
+    # queues ``fn(*args)`` onto that worker thread and awaits the result.
+    # aiosqlite ships ``py.typed`` but leaves ``_execute`` unannotated, so
+    # --strict flags the call as untyped; the loader itself is fully typed.
     try:
-        db_conn.enable_load_extension(True)  # type: ignore[attr-defined]  # noqa: FBT003
-        sqlite_vec.load(db_conn)
-        db_conn.enable_load_extension(False)  # type: ignore[attr-defined]  # noqa: FBT003
-    except (AttributeError, OSError) as exc:
+        await db._execute(_load_sqlite_vec_sync, db._conn)  # type: ignore[no-untyped-call]  # noqa: SLF001
+    except (AttributeError, OSError, sqlite3.Error) as exc:
         logger.warning("Cannot load sqlite-vec extension: %s — falling back to numpy", exc)
         return False
     else:

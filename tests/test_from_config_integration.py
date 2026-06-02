@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -141,19 +142,31 @@ class TestFromConfig:
         async with await SqliteEngravaCore.from_config(cfg_file) as store:
             assert store._vector_backend is None  # numpy fallback
 
-    async def test_from_config_sqlite_vec_fallback(self, tmp_path: Path) -> None:
-        """When sqlite-vec is requested but not installed, falls back to numpy."""
-        db_path = tmp_path / "vec_fallback.db"
+    async def test_from_config_sqlite_vec_backend(self, tmp_path: Path) -> None:
+        """from_config with sqlite-vec constructs without crashing.
+
+        Construction must never raise regardless of whether the optional
+        ``sqlite-vec`` package is installed.  The configured backend then
+        reflects availability: a live ``SqliteVecSearchBackend`` when the
+        package imports, or ``None`` (numpy fallback) when it does not.
+        """
+        from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
+
+        sqlite_vec_available = importlib.util.find_spec("sqlite_vec") is not None
+
+        db_path = tmp_path / "vec_backend.db"
         cfg_file = tmp_path / "engrava.yaml"
         cfg_file.write_text(
             f"database:\n  path: {db_path}\nextensions:\n  vector:\n    backend: sqlite-vec\n",
             encoding="utf-8",
         )
 
+        # No crash on construction is the primary regression assertion.
         async with await SqliteEngravaCore.from_config(cfg_file) as store:
-            # sqlite-vec likely not installed in test env → fallback to numpy
-            # No crash is the key assertion; verify numpy fallback when vec unavailable
-            assert store._vector_backend is None
+            if sqlite_vec_available:
+                assert isinstance(store._vector_backend, SqliteVecSearchBackend)
+            else:
+                assert store._vector_backend is None
 
 
 # ------------------------------------------------------------------
