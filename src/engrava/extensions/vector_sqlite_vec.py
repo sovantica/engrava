@@ -205,6 +205,12 @@ def _load_sqlite_vec_sync(raw_conn: sqlite3.Connection) -> None:
     same-thread guard); callers route it onto aiosqlite's worker thread
     via :func:`load_sqlite_vec`.
 
+    Extension loading is re-disabled in a ``finally`` block: once
+    ``enable_load_extension(True)`` has succeeded, the connection must not
+    be left with extension loading enabled even if ``sqlite_vec.load``
+    raises — leaving it on would be an unintended, elevated-capability
+    state on a connection that the caller will keep using.
+
     Args:
         raw_conn: The underlying ``sqlite3.Connection`` to load into.
 
@@ -212,8 +218,10 @@ def _load_sqlite_vec_sync(raw_conn: sqlite3.Connection) -> None:
     import sqlite_vec  # noqa: PLC0415
 
     raw_conn.enable_load_extension(True)  # noqa: FBT003
-    sqlite_vec.load(raw_conn)
-    raw_conn.enable_load_extension(False)  # noqa: FBT003
+    try:
+        sqlite_vec.load(raw_conn)
+    finally:
+        raw_conn.enable_load_extension(False)  # noqa: FBT003
 
 
 async def load_sqlite_vec(db: aiosqlite.Connection) -> bool:

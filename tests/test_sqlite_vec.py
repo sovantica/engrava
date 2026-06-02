@@ -204,6 +204,27 @@ class TestLoadSqliteVec:
             ]
             mock_vec.load.assert_called_once_with(raw_conn)
 
+    def test_load_sync_helper_disables_extension_loading_on_load_failure(self) -> None:
+        """When sqlite_vec.load raises, extension loading is still re-disabled.
+
+        Guards the ``finally`` invariant: once ``enable_load_extension(True)``
+        has succeeded the connection must never be left with extension loading
+        enabled, even if the load itself fails. The exception still propagates
+        so the caller can fall back to numpy.
+        """
+        mock_vec = MagicMock()
+        mock_vec.load.side_effect = sqlite3.OperationalError("load failed")
+        with patch.dict("sys.modules", {"sqlite_vec": mock_vec}):
+            raw_conn = MagicMock()
+            with pytest.raises(sqlite3.OperationalError, match="load failed"):
+                _load_sqlite_vec_sync(raw_conn)
+            # enable(True) then enable(False) — the finally ran despite the raise.
+            assert raw_conn.enable_load_extension.call_args_list == [
+                call(True),
+                call(False),
+            ]
+            mock_vec.load.assert_called_once_with(raw_conn)
+
 
 # ------------------------------------------------------------------
 # upsert_embedding unit tests
