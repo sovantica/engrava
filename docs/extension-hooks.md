@@ -25,13 +25,19 @@ see [extensions.md](extensions.md).
 
 ### 1.2 Available hooks
 
-| Method | When | Returns |
-|--------|------|---------|
-| `on_store` | After a thought is persisted | `ThoughtRecord` (enriched or unchanged) |
-| `on_retrieve` | After a thought is loaded from storage | `ThoughtRecord` (enriched or unchanged) |
-| `score_function` | During hybrid search, to compute a custom relevance score | `float` |
-| `decay_function` | During dreaming consolidation, to compute per-thought decay | `float` in `[0.0, 1.0]` |
-| `mindql_extension_registry` | At `SqliteEngravaCore` init, to register custom MindQL verbs | `dict[str, MindQLExtension]` |
+Only `on_store` and `on_retrieve` are invoked by the public engrava package
+today. The remaining three are part of the protocol contract but are
+**reserved** — core engrava does not call them (they exist for downstream
+consumers and future use). Implement them if you want protocol conformance,
+but do not expect core to invoke them.
+
+| Method | When | Returns | Status in core |
+|--------|------|---------|----------------|
+| `on_store` | After a thought is persisted | `ThoughtRecord` (enriched or unchanged) | **active** |
+| `on_retrieve` | After a thought is loaded from storage | `ThoughtRecord` (enriched or unchanged) | **active** |
+| `score_function(thought, context)` | Custom relevance score | `float` | reserved — not called by core |
+| `decay_function(thought, elapsed_cycles)` | Per-thought decay factor | `float` in `[0.0, 1.0]` | reserved — not called by core |
+| `mindql_extension_registry()` | Register custom MindQL verbs | `dict[str, MindQLExtension]` | reserved — core wires MindQL verbs via `ExtensionManifest.mindql_extensions`, not this hook |
 
 ---
 
@@ -52,12 +58,12 @@ class RecencyBoostHooks(DefaultEngravaHooks):
         thought: ThoughtRecord,
         context: ScoringContext,
     ) -> float:
-        # Add a small recency bonus if the thought was updated recently.
-        base = 0.0
-        if thought.updated_at and context.current_cycle > 0:
-            age = context.current_cycle - thought.updated_at
-            base = max(0.0, 1.0 - age / 100)
-        return base
+        # Add a small recency bonus for thoughts updated in a recent cycle.
+        # (updated_cycle is an int; updated_at is an ISO-8601 string, not a cycle.)
+        if context.current_cycle > 0:
+            age = context.current_cycle - thought.updated_cycle
+            return max(0.0, 1.0 - age / 100)
+        return 0.0
 
 
 # Registration:
@@ -79,34 +85,55 @@ care about.
 
 ## 3. Custom MindQL verb
 
-Use `mindql_extension_registry` to register a new MindQL command:
+A custom MindQL command is an `MindQLExtension` whose `handler` is an async
+callable. The executor invokes the handler with **two positional arguments** —
+the open `aiosqlite.Connection` and the parsed extension-argument list — and
+expects a `list[dict[str, object]]` back:
 
 ```python
 from __future__ import annotations
 
-from engrava.domain.protocols.hooks import DefaultEngravaHooks, MindQLExtension
+import aiosqlite
+
+from engrava.domain.protocols.hooks import MindQLExtension
 
 
-async def _pinned_handler(**kwargs: object) -> list[dict[str, object]]:
-    """Return all thoughts tagged 'pinned'."""
-    store = kwargs["store"]
-    results = await store.search("", filters={"tags": ["pinned"]}, top_k=100)
-    return [{"id": str(t.id), "content": t.content} for t in results]
+async def _recent_handler(
+    db: aiosqlite.Connection,
+    args: list[str],  # noqa: ARG001 — this command takes no args
+) -> list[dict[str, object]]:
+    """Return the 100 most recently updated thoughts."""
+    cursor = await db.execute(
+        "SELECT thought_id, content FROM thought "
+        "ORDER BY updated_cycle DESC LIMIT 100"
+    )
+    rows = await cursor.fetchall()
+    return [{"thought_id": row["thought_id"], "content": row["content"]} for row in rows]
 
 
-class PinnedMindQLHooks(DefaultEngravaHooks):
-    def mindql_extension_registry(self) -> dict[str, MindQLExtension]:
-        return {
-            "PINNED": MindQLExtension(
-                command_name="PINNED",
-                handler=_pinned_handler,
-                description="Return all pinned thoughts.",
-                category="custom",
-            ),
-        }
+RECENT_COMMAND = MindQLExtension(
+    command_name="RECENT",
+    handler=_recent_handler,
+    description="Return the most recently updated thoughts.",
+    category="custom",
+)
 ```
 
-Usage: `FIND PINNED` — treated as a first-class MindQL verb after registration.
+The command is registered by listing it in an extension's
+`ExtensionManifest.mindql_extensions` (the discovery path), or by passing it
+through `MindQLExtension`-keyed `extensions=` when constructing the executor:
+
+```python
+from engrava import MindQLExecutor, parse
+
+executor = MindQLExecutor(conn, extensions={"RECENT": RECENT_COMMAND})
+# parse() needs the registered verb names to recognise an extension command.
+result = await executor.execute(parse("RECENT", known_extensions={"RECENT"}))
+```
+
+> Note: `EngravaHooksProtocol.mindql_extension_registry()` is **not** consulted
+> by core engrava (see §1.2) — declare custom verbs via `ExtensionManifest`
+> or the executor's `extensions=` argument as shown above.
 
 ---
 

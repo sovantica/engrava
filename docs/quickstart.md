@@ -94,48 +94,76 @@ reports the REFLECTION coverage dreaming produces. See
 
 ```python
 import asyncio
+import aiosqlite
 from engrava import SqliteEngravaCore
 
 async def main() -> None:
-    # In-memory for experimentation, or provide a file path
-    store = SqliteEngravaCore(":memory:")
-    await store.ensure_schema()
-    print("Store ready!")
-    await store.close()
+    # SqliteEngravaCore wraps an open aiosqlite connection.
+    # Use ":memory:" for experimentation, or a file path to persist.
+    async with aiosqlite.connect(":memory:") as conn:
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        await store.ensure_schema()
+        print("Store ready!")
 
 asyncio.run(main())
 ```
 
+> The rest of this page assumes you are inside the `async with` block above,
+> so `store` and `conn` are in scope. For a configuration-driven alternative,
+> use `await SqliteEngravaCore.from_config("engrava.yaml")` (it opens and owns
+> the connection for you).
+
 ## Add Thoughts
 
 ```python
-thought_id = await store.create_thought(
-    thought_type="OBSERVATION",
+import uuid
+from engrava import ThoughtRecord, ThoughtType, Priority, LifecycleStatus
+
+observation = ThoughtRecord(
+    thought_id=str(uuid.uuid4()),
+    thought_type=ThoughtType.OBSERVATION,
     essence="Python is great for AI agents",
     content="Python's async ecosystem and rich ML libraries make it ideal.",
-    priority="P2",
+    priority=Priority.P2,
+    lifecycle_status=LifecycleStatus.ACTIVE,
+    created_cycle=0,
+    updated_cycle=0,
     source="human",
 )
-print(f"Created thought: {thought_id}")
+stored = await store.create_thought(observation)
+print(f"Created thought: {stored.thought_id}")
 ```
 
 ## Link Thoughts with Edges
 
 ```python
-insight_id = await store.create_thought(
-    thought_type="INSIGHT",
+from engrava import EdgeRecord, EdgeType
+
+belief = ThoughtRecord(
+    thought_id=str(uuid.uuid4()),
+    thought_type=ThoughtType.BELIEF,
     essence="SQLite provides zero-config persistence",
     content="WAL mode enables concurrent reads with single-writer safety.",
-    priority="P2",
+    priority=Priority.P2,
+    lifecycle_status=LifecycleStatus.ACTIVE,
+    created_cycle=0,
+    updated_cycle=0,
     source="human",
 )
+await store.create_thought(belief)
 
-edge_id = await store.create_edge(
-    from_thought_id=thought_id,
-    to_thought_id=insight_id,
-    edge_type="ASSOCIATION",
+edge = await store.create_edge(
+    EdgeRecord(
+        edge_id=str(uuid.uuid4()),
+        from_thought_id=observation.thought_id,
+        to_thought_id=belief.thought_id,
+        edge_type=EdgeType.ASSOCIATED,
+        weight=0.8,
+        created_cycle=0,
+    )
 )
-print(f"Linked thoughts via edge: {edge_id}")
+print(f"Linked thoughts via edge: {edge.edge_id}")
 ```
 
 ## Search
@@ -143,9 +171,11 @@ print(f"Linked thoughts via edge: {edge_id}")
 ### Full-Text Search
 
 ```python
-results = await store.search_fts("Python AI", limit=5)
-for thought in results:
-    print(f"  [{thought.priority}] {thought.essence}")
+# search_fts returns (thought_id, bm25_score) tuples — fetch the record for fields.
+for thought_id, score in await store.search_fts("Python AI", top_k=5):
+    record = await store.get_thought(thought_id)
+    if record is not None:
+        print(f"  [{record.priority.value}] {record.essence}  (score={score:.3f})")
 ```
 
 ### Embedding Similarity Search
@@ -160,30 +190,36 @@ provider = CallbackProvider(
     model_name="my-model",
 )
 
-# Store embedding
-vector = await provider.embed(thought.content)
-await store.store_embedding(thought_id, vector, "my-model", 384)
+# Store an embedding for an existing thought
+vector = await provider.embed(observation.content)
+await store.store_embedding(observation.thought_id, vector, model_name="my-model")
 
-# Search by similarity
-similar = await store.search_similar(vector, limit=5)
-for emb in similar:
-    print(f"  {emb.owner_id} (score: {emb.score:.3f})")
+# Search by similarity — returns (thought_id, score) tuples
+for thought_id, score in await store.search_similar(vector, top_k=5):
+    record = await store.get_thought(thought_id)
+    if record is not None:
+        print(f"  {record.essence}  (score: {score:.3f})")
 ```
 
 ## Query with MindQL
 
 ```python
-from engrava import MindQLExecutor
+from engrava import MindQLExecutor, parse
 
-executor = MindQLExecutor(store)
+# MindQLExecutor runs against an aiosqlite connection; parse the string first.
+executor = MindQLExecutor(conn)
 
 # Find observations
-result = await executor.execute("FIND type=OBSERVATION LIMIT 10")
+result = await executor.execute(
+    parse("FIND thoughts WHERE thought_type = 'OBSERVATION' LIMIT 10")
+)
 print(f"Found {len(result.rows)} thoughts")
 
-# Count by status
-result = await executor.execute("COUNT status=ACTIVE")
-print(f"Active thoughts: {result.rows[0]['count']}")
+# Count active thoughts
+result = await executor.execute(
+    parse("COUNT thoughts WHERE lifecycle_status = 'ACTIVE'")
+)
+print(f"Active thoughts: {result.count}")
 ```
 
 ## Use the CLI
@@ -193,7 +229,7 @@ print(f"Active thoughts: {result.rows[0]['count']}")
 engrava --db my_thoughts.db info
 
 # Run a MindQL query
-engrava --db my_thoughts.db query "FIND type=INSIGHT LIMIT 5"
+engrava --db my_thoughts.db query "FIND thoughts WHERE thought_type = 'OBSERVATION' LIMIT 5"
 
 # Back up your data
 engrava --db my_thoughts.db snapshot -o backup.jsonl
