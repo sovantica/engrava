@@ -46,17 +46,7 @@ import uuid
 
 import aiosqlite
 
-from engrava import (
-    EdgeRecord,
-    EdgeType,
-    LifecycleStatus,
-    MindQLExecutor,
-    Priority,
-    SqliteEngravaCore,
-    ThoughtRecord,
-    ThoughtType,
-    parse,
-)
+from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
 
 
 async def main() -> None:
@@ -66,7 +56,7 @@ async def main() -> None:
         store = SqliteEngravaCore(conn)
         await store.ensure_schema()
 
-        # Create a thought — build a ThoughtRecord and pass it to create_thought.
+        # Build a ThoughtRecord and persist it with create_thought.
         observation = ThoughtRecord(
             thought_id=str(uuid.uuid4()),
             thought_type=ThoughtType.OBSERVATION,
@@ -85,41 +75,13 @@ async def main() -> None:
         if thought is not None:
             print(f"Stored: {thought.essence}")
 
-        # Create a second thought and link the two with a typed edge.
-        belief = ThoughtRecord(
-            thought_id=str(uuid.uuid4()),
-            thought_type=ThoughtType.BELIEF,
-            essence="SQLite is underrated",
-            content="SQLite provides ACID transactions with zero setup.",
-            priority=Priority.P2,
-            lifecycle_status=LifecycleStatus.ACTIVE,
-            created_cycle=0,
-            updated_cycle=0,
-            source="human",
-        )
-        await store.create_thought(belief)
-        await store.create_edge(
-            EdgeRecord(
-                edge_id=str(uuid.uuid4()),
-                from_thought_id=observation.thought_id,
-                to_thought_id=belief.thought_id,
-                edge_type=EdgeType.ASSOCIATED,
-                weight=0.8,
-                created_cycle=0,
-            )
-        )
-
-        # Query with MindQL — parse the string, then execute against the connection.
-        executor = MindQLExecutor(conn)
-        result = await executor.execute(
-            parse("FIND thoughts WHERE thought_type = 'OBSERVATION' LIMIT 5")
-        )
-        for row in result.rows:
-            print(row)
-
 
 asyncio.run(main())
 ```
+
+From here, link thoughts with [typed edges](#edge-based-knowledge-graph),
+query them with [MindQL](#mindql-query-language), or run the full
+ingest → dream → search tour in the [Quick Start guide](docs/quickstart.md).
 
 ### Configuration-Driven Setup
 
