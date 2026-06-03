@@ -1,4 +1,4 @@
-# engrava
+# Engrava
 
 > The memory database for AI agents.
 >
@@ -9,7 +9,7 @@
 [![Python](https://img.shields.io/pypi/pyversions/engrava.svg)](https://pypi.org/project/engrava/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**engrava** is a standalone embedded database for AI agent memory. Built on
+**Engrava** is a standalone embedded database for AI agent memory. Built on
 SQLite, it provides thought CRUD, edge-based knowledge graphs, embedding-based
 similarity search, full-text search (FTS5/BM25), and a declarative extension
 system — all in a single package with zero external service dependencies.
@@ -42,55 +42,56 @@ pip install engrava[embeddings-openai] # OpenAI-compatible embeddings
 
 ```python
 import asyncio
-from engrava import SqliteEngravaCore
+import uuid
+
+import aiosqlite
+
+from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+
 
 async def main() -> None:
-    store = SqliteEngravaCore(":memory:")
-    await store.ensure_schema()
+    # SqliteEngravaCore wraps an open aiosqlite connection.
+    async with aiosqlite.connect(":memory:") as conn:
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        await store.ensure_schema()
 
-    # Create a thought
-    thought_id = await store.create_thought(
-        thought_type="OBSERVATION",
-        essence="Python is great for AI",
-        content="Python's async ecosystem makes it ideal for AI agents.",
-        priority="P2",
-        source="human",
-    )
+        # Build a ThoughtRecord and persist it with create_thought.
+        observation = ThoughtRecord(
+            thought_id=str(uuid.uuid4()),
+            thought_type=ThoughtType.OBSERVATION,
+            essence="Python is great for AI",
+            content="Python's async ecosystem makes it ideal for AI agents.",
+            priority=Priority.P2,
+            lifecycle_status=LifecycleStatus.ACTIVE,
+            created_cycle=0,
+            updated_cycle=0,
+            source="human",
+        )
+        await store.create_thought(observation)
 
-    # Retrieve it
-    thought = await store.get_thought(thought_id)
-    print(f"Stored: {thought.essence}")
+        # Retrieve it
+        thought = await store.get_thought(observation.thought_id)
+        if thought is not None:
+            print(f"Stored: {thought.essence}")
 
-    # Create an edge between thoughts
-    second_id = await store.create_thought(
-        thought_type="INSIGHT",
-        essence="SQLite is underrated",
-        content="SQLite provides ACID transactions with zero setup.",
-        priority="P2",
-        source="human",
-    )
-    await store.create_edge(thought_id, second_id, "ASSOCIATION")
-
-    # Query with MindQL
-    from engrava import MindQLExecutor
-    executor = MindQLExecutor(store)
-    result = await executor.execute("FIND type=OBSERVATION LIMIT 5")
-    for row in result.rows:
-        print(row)
-
-    await store.close()
 
 asyncio.run(main())
 ```
 
+From here, link thoughts with [typed edges](#edge-based-knowledge-graph),
+query them with [MindQL](#mindql-query-language), or run the full
+ingest → dream → search tour in the [Quick Start guide](docs/quickstart.md).
+
 ### Configuration-Driven Setup
 
 ```python
-from engrava import load_config, SqliteEngravaCore
+from engrava import SqliteEngravaCore
 
-config = load_config("engrava.yaml")
-store = SqliteEngravaCore(config.db_path)
-await store.ensure_schema()
+# from_config opens and OWNS the connection — use it as an async context manager.
+async with await SqliteEngravaCore.from_config("engrava.yaml") as store:
+    # The schema is already applied by from_config.
+    thought = await store.get_thought("some-id")
 ```
 
 See [docs/configuration.md](docs/configuration.md) for the full YAML schema.
@@ -110,8 +111,9 @@ All models are frozen Pydantic objects — mutations happen via `evolve()`.
 
 ### Edge-Based Knowledge Graph
 
-Link thoughts with typed, weighted edges. Supports association, causation,
-contradiction, and custom edge types.
+Link thoughts with typed, weighted edges. Edge types include `ASSOCIATED`,
+`DEPENDS_ON`, `DERIVED_FROM`, `CONSOLIDATED_FROM` (created by dreaming), and
+`CONTESTED_BY`.
 
 ### Embedding Search
 
@@ -136,9 +138,9 @@ similarity, text relevance, and recency scoring.
 Declarative query language for the thought-graph:
 
 ```
-FIND type=OBSERVATION priority=P1 LIMIT 10
-COUNT status=ACTIVE
-SELECT thought_id, essence WHERE type=INSIGHT
+FIND thoughts WHERE thought_type = 'OBSERVATION' AND priority = 'P1' LIMIT 10
+COUNT thoughts WHERE lifecycle_status = 'ACTIVE'
+SELECT thought_id, essence FROM thought WHERE thought_type = 'BELIEF'
 ```
 
 Extensible with custom commands via the hook system.
@@ -166,8 +168,9 @@ class MyHooks(EngravaHooksProtocol):
 
 Built-in `DreamingExtension` for periodic memory consolidation — scores
 thoughts via configurable signals, promotes high-value entries, and
-(*v0.4.0*) creates **REFLECTION thoughts** by clustering semantically
-related thoughts and computing centroid embeddings (no LLM required).
+creates **REFLECTION thoughts** by clustering semantically related
+thoughts and computing centroid embeddings (no LLM required). Available
+since 0.3.0.
 
 → See [`docs/benchmarks.md`](docs/benchmarks.md) for reproducible
 evidence (synthetic benchmark suite runnable in ~5 minutes).
@@ -215,7 +218,7 @@ engrava --db mydata.db export -o portable.json
 - [Quick Start](docs/quickstart.md) — 5-minute setup guide
 - [Configuration](docs/configuration.md) — YAML config format and options
 - [Extensions](docs/extensions.md) — Writing custom extensions and hooks
-- [Observability](docs/observability.md) — Metrics snapshot API and event hooks
+- [Observability](docs/observability.md) — Metrics snapshot API
 - [API Reference](docs/api-reference.md) — Full protocol and class reference
 - [MindQL](docs/mindql.md) — Query language syntax and examples
 - [Known Limitations](docs/known-limitations.md) — Platform notes and constraints

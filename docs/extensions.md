@@ -17,42 +17,49 @@ from engrava import (
 
 class MyHooks(EngravaHooksProtocol):
     async def on_store(self, thought: ThoughtRecord) -> ThoughtRecord:
-        """Called before a thought is persisted. Return modified thought."""
+        """Called after a thought is persisted. Return the (enriched) thought."""
         return thought
 
     async def on_retrieve(self, thought: ThoughtRecord) -> ThoughtRecord:
-        """Called after a thought is loaded from DB. Return modified thought."""
+        """Called after a thought is loaded from DB. Return the (enriched) thought."""
         return thought
 
     async def score_function(
         self, thought: ThoughtRecord, context: ScoringContext
     ) -> float:
-        """Custom relevance scoring for search results."""
+        """Custom relevance score (reserved — not currently called by core)."""
         return thought.confidence or 0.5
 
     async def decay_function(
         self, thought: ThoughtRecord, elapsed_cycles: int
     ) -> float:
-        """Decay multiplier for edge weights over time."""
+        """Decay multiplier (reserved — not currently called by core)."""
         return 1.0
 
     def mindql_extension_registry(self) -> dict[str, MindQLExtension]:
-        """Register custom MindQL commands."""
+        """Reserved — core wires MindQL verbs via ExtensionManifest, not this hook."""
         return {}
 ```
 
+> In the public engrava package only `on_store` and `on_retrieve` are invoked.
+> The other three protocol methods are reserved (see
+> [Extension hooks](extension-hooks.md) §1.2). Subclass `DefaultEngravaHooks`
+> if you only want to override one or two methods.
+
 ## Using Hooks
 
-Pass hooks when creating a store:
+Pass hooks when creating a store (the store wraps an open connection):
 
 ```python
+import aiosqlite
 from engrava import SqliteEngravaCore
 
 hooks = MyHooks()
-store = SqliteEngravaCore("my.db", hooks=hooks)
-await store.ensure_schema()
-
-# Hooks are now called automatically during CRUD operations
+async with aiosqlite.connect("my.db") as conn:
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(conn, hooks=hooks)
+    await store.ensure_schema()
+    # on_store / on_retrieve are now called automatically during CRUD operations
 ```
 
 ## Default Hooks
@@ -62,40 +69,43 @@ are no-ops that pass through data unchanged.
 
 ## Custom MindQL Commands
 
-Register custom commands via `mindql_extension_registry()`:
+A custom command is an `MindQLExtension`. Its `handler` is an async callable
+that the executor invokes with two positional arguments — the open
+`aiosqlite.Connection` and the parsed argument list — and returns a
+`list[dict[str, object]]`. The `MindQLExtension` fields are `command_name`,
+`handler`, `description`, and `category` (there is no `help_text` field):
 
 ```python
+import aiosqlite
 from engrava import MindQLExtension
 
-class StatsHooks(EngravaHooksProtocol):
-    # ... other hook methods ...
 
-    def mindql_extension_registry(self) -> dict[str, MindQLExtension]:
-        return {
-            "STATS": MindQLExtension(
-                command_name="STATS",
-                handler=self._handle_stats,
-                help_text="Show thought statistics",
-            ),
-        }
+async def _handle_stats(
+    db: aiosqlite.Connection,
+    args: list[str],  # noqa: ARG001 — STATS takes no args
+) -> list[dict[str, object]]:
+    cursor = await db.execute(
+        "SELECT thought_type, COUNT(*) AS n FROM thought GROUP BY thought_type"
+    )
+    rows = await cursor.fetchall()
+    return [{row["thought_type"]: row["n"]} for row in rows]
 
-    async def _handle_stats(
-        self, store: EngravaCoreProtocol, args: str
-    ) -> list[dict[str, object]]:
-        thoughts = await store.list_thoughts(limit=1000)
-        by_type: dict[str, int] = {}
-        for t in thoughts:
-            by_type[t.thought_type] = by_type.get(t.thought_type, 0) + 1
-        return [by_type]
+
+STATS_COMMAND = MindQLExtension(
+    command_name="STATS",
+    handler=_handle_stats,
+    description="Show thought statistics",
+)
 ```
 
-Then use it via MindQL:
+Then run it through the executor, passing the command in `extensions=` and
+telling `parse()` which verbs are registered:
 
 ```python
-from engrava import MindQLExecutor
+from engrava import MindQLExecutor, parse
 
-executor = MindQLExecutor(store)
-result = await executor.execute("STATS")
+executor = MindQLExecutor(conn, extensions={"STATS": STATS_COMMAND})
+result = await executor.execute(parse("STATS", known_extensions={"STATS"}))
 ```
 
 ## Dreaming Extension
@@ -108,36 +118,53 @@ from engrava import DreamingExtension, DreamingConfig, DreamingGates
 config = DreamingConfig(
     enabled=True,
     candidates_limit=100,
+    promote_threshold=0.6,
     gates=DreamingGates(
-        min_confidence=0.6,
-        min_confirmation_count=2,
-        min_composite_score=0.5,
+        min_confirmations=2,
+        min_age_cycles=1,
+        max_promoted_per_run=20,
     ),
 )
 
 dreaming = DreamingExtension(config=config)
-result = await dreaming.consolidate(store, current_cycle=42)
+result = await dreaming.run_consolidation(store, current_cycle=42)
 print(f"Promoted {result.promoted_count} thoughts")
 ```
 
+The weighted-score cutoff is `DreamingConfig.promote_threshold`;
+`DreamingGates` controls eligibility (confirmations, age, per-run cap, and the
+clustering/quality thresholds). See [Dreaming](dreaming.md) for the full
+configuration surface.
+
 ### Custom Signals
 
-Implement `DreamingSignalProtocol` to add custom scoring signals:
+`DreamingSignalProtocol` is a callable protocol — implement `__call__(thought,
+ctx)` returning a score in `[0.0, 1.0]`. There is no `name`/`weight` attribute
+or `score()` method; a signal's weight is set separately in
+`DreamingConfig.signals`, and the instance is wired in via
+`DreamingExtension(config, custom_signals={...})`.
 
 ```python
-from engrava import DreamingSignalProtocol, DreamingContext, ThoughtRecord
+from engrava import DreamingContext, DreamingExtension, DreamingConfig, ThoughtRecord
+from engrava import Priority
 
-class ImportanceSignal(DreamingSignalProtocol):
-    name: str = "importance"
-    weight: float = 0.3
 
-    def score(self, thought: ThoughtRecord, context: DreamingContext) -> float:
-        # Custom importance scoring logic
-        if thought.priority == "P1":
+class ImportanceSignal:
+    """Custom scoring signal — must be callable as (thought, ctx) -> float."""
+
+    def __call__(self, thought: ThoughtRecord, ctx: DreamingContext) -> float:
+        if thought.priority == Priority.P1:
             return 1.0
-        if thought.priority == "P2":
+        if thought.priority == Priority.P2:
             return 0.7
         return 0.3
+
+
+# Register the signal AND give it a weight in the signals map, or it never runs.
+dreaming = DreamingExtension(
+    config=DreamingConfig(enabled=True, signals={"importance": 0.3}),
+    custom_signals={"importance": ImportanceSignal()},
+)
 ```
 
 ## Extension Manifest

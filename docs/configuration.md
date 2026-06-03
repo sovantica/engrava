@@ -34,7 +34,7 @@ extensions:
   dreaming:
     enabled: true
     schedule_every_n_cycles: 100
-    promote_threshold: 0.55
+    promote_threshold: 0.7
     candidates_limit: 200
     gates:
       min_confirmations: 2
@@ -60,16 +60,18 @@ async with await SqliteEngravaCore.from_config("engrava.yaml") as store:
 from engrava.config import load_config, resolve_embedding_provider
 
 config = load_config("engrava.yaml")
-provider = resolve_embedding_provider(config)
+# resolve_embedding_provider takes the EmbeddingConfig, i.e. config.embeddings
+provider = resolve_embedding_provider(config.embeddings)
 ```
 
 ## Configuration Reference
 
-### Top-Level
+### `database`
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `db_path` | `str` | `"engrava.db"` | Path to the SQLite database file |
+| `database.path` | `str` | **required** | Path to the SQLite database file (no default — omitting it raises `ConfigError`) |
+| `database.wal_mode` | `bool` | `true` | Enable WAL journal mode for concurrent reads |
 
 ### `search`
 
@@ -96,17 +98,20 @@ to disable that signal entirely.
 
 See [search.md](search.md) for the full 5-signal ranking model.
 
-### `embedding`
+### `embeddings`
 
-Embedding provider configuration.
+Embedding provider configuration. (The YAML key is `embeddings`, plural.) The
+vector dimension lives under `extensions.vector.dimension`, not here.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `provider` | `str` | `null` | Provider type: `"sentence-transformer"`, `"openai"`, `"ollama"`, `"huggingface"`, `"callback"` |
-| `model` | `str` | — | Model name or identifier |
-| `dimension` | `int` | — | Vector dimensionality |
-| `api_base` | `str` | — | API base URL (for `openai`, `ollama`) |
-| `api_key` | `str` | — | API key (for `openai`, `huggingface`) |
+| `provider` | `str` | `null` | Provider type: `"sentence-transformer"`, `"openai-compatible"`, `"ollama"`, `"huggingface"` |
+| `model` | `str` | `null` | Model name or identifier |
+| `auto_embed` | `bool` | `false` | Auto-embed on `create_thought` / `update_thought` |
+| `device` | `str` | `"cpu"` | Compute device for local providers (`"cpu"`, `"cuda"`) |
+| `batch_size` | `int` | `32` | Batch encoding size for local providers |
+| `base_url` | `str` | `null` | Base URL for remote providers |
+| `api_key` | `str` | `null` | API key for remote providers (supports `${ENV_VAR}`) |
 
 ### `dreaming`
 
@@ -146,18 +151,21 @@ See [dreaming.md](dreaming.md) for details.
 
 ### `services`
 
-Multi-service isolation (one database per named service).
+Multi-service isolation (one database file per named service, stored under a
+shared `data_dir` as `<name>.db`).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `default_service` | `str` | — | Default service name when `--service` is omitted |
-| `entries` | `dict` | `{}` | Map of service name → service config |
+| `data_dir` | `str` | **required** | Directory holding the per-service `<name>.db` files |
+| `default_service` | `str` | `"main"` | Default service name when `--service` is omitted |
+| `configs` | `dict` | `{}` | Map of service name → per-service config |
 
-Each service entry supports:
+Each service entry under `configs` supports a single optional override (there
+is no per-service `db_path` — the file is derived as `<data_dir>/<name>.db`):
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `db_path` | `str` | — | Path to this service's SQLite database |
+| `embeddings` | `dict` | — | Per-service embedding-provider override (same shape as the top-level `embeddings` section) |
 
 ## Environment Variables
 
