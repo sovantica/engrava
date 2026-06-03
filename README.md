@@ -1,4 +1,4 @@
-# engrava
+# Engrava
 
 > The memory database for AI agents.
 >
@@ -9,7 +9,7 @@
 [![Python](https://img.shields.io/pypi/pyversions/engrava.svg)](https://pypi.org/project/engrava/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**engrava** is a standalone embedded database for AI agent memory. Built on
+**Engrava** is a standalone embedded database for AI agent memory. Built on
 SQLite, it provides thought CRUD, edge-based knowledge graphs, embedding-based
 similarity search, full-text search (FTS5/BM25), and a declarative extension
 system — all in a single package with zero external service dependencies.
