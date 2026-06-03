@@ -33,12 +33,11 @@ jobs:
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          echo "$PR_TITLE" | npx commitlint --config .commitlintrc.yml
+          echo "$PR_TITLE" | npx commitlint
 
       - name: Lint commits in PR
         run: |
           npx commitlint \
-            --config .commitlintrc.yml \
             --from "${{ github.event.pull_request.base.sha }}" \
             --to   "${{ github.event.pull_request.head.sha }}" \
             --verbose
