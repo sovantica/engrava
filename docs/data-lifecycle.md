@@ -166,4 +166,5 @@ live row count — this is normal SQLite behaviour, not a leak.
 
 - [Configuration → ttl](configuration.md#ttl) — the strategy and default-TTL knobs
 - [Audit Trail](audit-trail.md) — what the journal records (and its delta residue)
+- [CLI](cli.md#gc) — the full `engrava gc` option reference
 - [Known Limitations](known-limitations.md) — storage and concurrency constraints

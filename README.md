@@ -214,6 +214,8 @@ engrava --db mydata.db export -o portable.json
 `engrava info` now renders the same metrics snapshot contract exposed by
 `await store.metrics()`.
 
+See the [CLI reference](docs/cli.md) for every command and option.
+
 ## Architecture
 
 - **SQLite** with WAL mode for concurrent reads
@@ -239,6 +241,7 @@ engrava --db mydata.db export -o portable.json
 - [Observability](docs/observability.md) — Metrics snapshot API
 - [Audit Trail](docs/audit-trail.md) — Tamper-evident hash-chain journal (enabling, querying, verifying, security model)
 - [API Reference](docs/api-reference.md) — Full protocol and class reference
+- [CLI Reference](docs/cli.md) — every `engrava` command and option
 - [MindQL](docs/mindql.md) — Query language syntax and examples
 - [Troubleshooting](docs/troubleshooting.md) — symptom → cause → fix for common errors
 - [FAQ](docs/faq.md) — quick answers (LLM/keys, embeddings-optional, scale, concurrency, backups, …)

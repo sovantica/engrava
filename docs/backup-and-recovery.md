@@ -34,9 +34,9 @@ thought / edge / embedding / action.
 > (which copies the journal verbatim), not a logical snapshot. See
 > [Audit Trail](audit-trail.md).
 
-`restore` options worth knowing: `--clear` to wipe the target first,
-`--skip-embeddings` / `--re-embed` to control embedding handling, and
-`--service` for multi-service targets.
+`restore` options worth knowing (see the [CLI reference](cli.md#restore) for the
+full list): `--clear` to wipe the target first, `--skip-embeddings` / `--re-embed`
+to control embedding handling, and `--service` for multi-service targets.
 
 ## Physical file backup (WAL-safe)
 
