@@ -7,6 +7,9 @@ pieces as a mental model — what each is, why it exists, and when you'd create
 it — before the how-to guides. Read it once and the rest of the docs will make
 more sense.
 
+> For a one-line definition of any term used here (essence, cycle, signal, gate,
+> provenance, …), see the [Glossary](glossary.md).
+
 ```
                  ┌──────────────────────────────────────────┐
    OBSERVATION   │  "User prefers email over phone"         │  essence (prompt-facing)
@@ -207,21 +210,26 @@ where `confirmation_count` never grows — can still be consolidated.)
 ```python
 import uuid
 from engrava import (
-    ThoughtRecord, ThoughtType, Priority, LifecycleStatus, KnowledgeSource, ThoughtVisibility,
+    ThoughtRecord,
+    ThoughtType,
+    Priority,
+    LifecycleStatus,
+    KnowledgeSource,
+    ThoughtVisibility,
 )
 
 observation = ThoughtRecord(
     thought_id=str(uuid.uuid4()),
-    thought_type=ThoughtType.OBSERVATION,   # learned from the world
+    thought_type=ThoughtType.OBSERVATION,  # learned from the world
     essence="User prefers email over phone",  # prompt-facing one-liner
     content="The user said during onboarding that email is the best way to reach them.",
     priority=Priority.P2,
     lifecycle_status=LifecycleStatus.ACTIVE,
-    created_cycle=12,                        # your agent's logical clock, this turn
+    created_cycle=12,  # your agent's logical clock, this turn
     updated_cycle=12,
-    source="onboarding-flow",                # free-form origin id
+    source="onboarding-flow",  # free-form origin id
     source_type=KnowledgeSource.EXPERIENCE,  # how it was obtained
-    confidence=0.9,                          # how sure you are
+    confidence=0.9,  # how sure you are
     visibility=ThoughtVisibility.SELECTIVE,  # inner/outer-speech boundary
 )
 ```

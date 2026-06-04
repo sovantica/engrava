@@ -242,6 +242,7 @@ See the [CLI reference](docs/cli.md) for every command and option.
 - [Audit Trail](docs/audit-trail.md) — Tamper-evident hash-chain journal (enabling, querying, verifying, security model)
 - [API Reference](docs/api-reference.md) — Full protocol and class reference
 - [CLI Reference](docs/cli.md) — every `engrava` command and option
+- [Glossary](docs/glossary.md) — quick definitions of every Engrava term
 - [MindQL](docs/mindql.md) — Query language syntax and examples
 - [Troubleshooting](docs/troubleshooting.md) — symptom → cause → fix for common errors
 - [FAQ](docs/faq.md) — quick answers (LLM/keys, embeddings-optional, scale, concurrency, backups, …)
