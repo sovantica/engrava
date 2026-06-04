@@ -17,13 +17,14 @@ A query touches up to five signals; each scales differently:
 | Signal | Cost driver | Scaling |
 |---|---|---|
 | **FTS5 / BM25** | SQLite's FTS5 inverted index | Sub-linear; scales well into large corpora. |
-| **Vector** | The vector backend (see below) | **numpy: linear in #embeddings**; sqlite-vec: approximate, sub-linear. |
+| **Vector** | The vector backend (see below) | Linear in #embeddings for both backends; **sqlite-vec scans a compact `vec0` table with a much smaller constant factor** than the Python path. |
 | **Recency** | A cheap per-candidate arithmetic decay | Negligible. |
 | **Priority** | A per-candidate enum→multiplier lookup | Negligible. |
 | **Graph** | 1-hop neighbour expansion over edges | Proportional to the fusion-pool size × average degree; **opt-in** (`graph_weight=0.0` makes zero graph queries). |
 
-The dominant term at scale is almost always the **vector** signal, because the
-default backend compares the query against every stored embedding.
+The dominant term at scale is almost always the **vector** signal, because both
+backends compare the query against every stored embedding — the difference is how
+efficiently they do it (see below).
 
 ## The brute-force ceiling (and how to pass it)
 
@@ -33,9 +34,14 @@ This is simple and dependency-free, and works well up to roughly **100k
 embeddings**. Past that, vector-query latency grows linearly and becomes the
 bottleneck.
 
-The fix is the **sqlite-vec** backend, which keeps an approximate-nearest-
-neighbour `vec0` index for sub-linear vector queries. FTS5 scales independently
-and usually needs no special handling.
+The fix is the **sqlite-vec** backend, which stores vectors in a dedicated,
+compact `vec0` virtual table. In the pinned `sqlite-vec` 0.1.x line a `vec0`
+query is still an **exhaustive k-nearest-neighbour scan** — not an approximate or
+sub-linear index — but over a tightly packed, chunked columnar store, so it runs
+with a far smaller constant factor (and lower memory overhead) than the Python
+brute-force path. The practical effect is that the same corpus stays well under
+your latency budget for much longer. FTS5 scales independently and usually needs
+no special handling.
 
 > The ~100k figure is a rule of thumb, not a cliff — see
 > [Known Limitations → sqlite-vec](known-limitations.md#sqlite-vec-pre-v1-status).
@@ -44,8 +50,8 @@ and usually needs no special handling.
 ## Switching to sqlite-vec (incl. migrating an existing database)
 
 The migration is designed to be turnkey: your embeddings already live in the
-`embedding` table, so switching backends only builds and backfills the ANN index
-— you do **not** re-embed anything.
+`embedding` table, so switching backends only builds and backfills the `vec0`
+vector table — you do **not** re-embed anything.
 
 **1. Install the extra.**
 

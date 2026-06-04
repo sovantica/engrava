@@ -2353,7 +2353,7 @@ class SqliteEngravaCore:
                 ("THOUGHT", thought_id, model_name, dimension, blob, created_at, eid),
             )
 
-        # Keep the vec0 ANN index in sync when a vector backend is active.
+        # Keep the vec0 vector table in sync when a vector backend is active.
         if self._vector_backend is not None:
             await self._vector_backend.upsert_embedding(
                 self._db,
@@ -2404,9 +2404,9 @@ class SqliteEngravaCore:
         """Cosine similarity search — delegates to sqlite-vec if available.
 
         When a ``SqliteVecSearchBackend`` is configured (via
-        ``from_config`` with ``vector_backend: "sqlite-vec"``), ANN
-        search is used.  Otherwise falls back to brute-force numpy
-        cosine similarity.
+        ``from_config`` with ``vector_backend: "sqlite-vec"``), the
+        ``vec0`` vector table serves the query.  Otherwise falls back to
+        brute-force numpy cosine similarity.
 
         Args:
             query_vector: Query embedding vector.
