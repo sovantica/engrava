@@ -256,7 +256,7 @@ engrava --db my_thoughts.db restore -i backup.jsonl
 Build something next, then reach for the references:
 
 - [Tutorial](tutorial.md) — build a small notes memory end to end (start here)
-- [Recipes](recipes.md) — copy-paste snippets: store a turn, retrieve context, TTL, dedup, session scoping
+- [Recipes](recipes/index.md) — copy-paste snippets: store a turn, retrieve context, TTL, dedup, session scoping
 - [Building a memory-backed agent](guides/agent-memory.md) — the full agent turn loop
 - [Core Concepts](concepts.md) — the mental model (thought, edge, reflection, cycle)
 - [Configuration](configuration.md) — YAML-based setup for production use

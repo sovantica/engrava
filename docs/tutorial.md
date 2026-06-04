@@ -137,12 +137,16 @@ if __name__ == "__main__":
 Run it and you'll see the coffee notes rank for the coffee query, plus the total
 count. That's a working memory: ingest, embed, link, search.
 
+The complete script is also shipped as
+[`examples/notes_memory.py`](https://github.com/sovantica/engrava/blob/main/examples/notes_memory.py)
+— run it directly with `python examples/notes_memory.py`.
+
 ## Where to go next
 
 - **Make it an agent.** [Building a memory-backed agent](guides/agent-memory.md)
   turns this into a per-turn loop (retrieve before you answer, store the reply).
-- **More tasks.** The [Recipes](recipes.md) cover TTL, dedup, session scoping,
-  and scheduled consolidation.
+- **More tasks.** The [Recipes](recipes/index.md) cover TTL, dedup, session
+  scoping, and scheduled consolidation.
 - **Real embeddings.** Swap the toy `embed` for a provider in the
   [Embeddings guide](guides/embeddings.md).
 - **Consolidation.** [Dreaming](dreaming.md) turns accumulating notes into

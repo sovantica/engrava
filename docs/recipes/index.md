@@ -2,10 +2,10 @@
 
 Short, copy-paste snippets for the things you actually do with an agent-memory
 database. Each assumes you already have an open `store` (see the
-[Quick Start](quickstart.md)); imports are shown once per recipe.
+[Quick Start](../quickstart.md)); imports are shown once per recipe.
 
-> New to the model? Read [Core Concepts](concepts.md) first. For the full
-> agent turn loop, see [Building a memory-backed agent](guides/agent-memory.md).
+> New to the model? Read [Core Concepts](../concepts.md) first. For the full
+> agent turn loop, see [Building a memory-backed agent](../guides/agent-memory.md).
 
 ## Store a conversation turn
 
@@ -76,7 +76,7 @@ async def search_in_session(store, query, session_id, cycle, want=5):
 ```
 
 > For *hard* isolation between users/tenants (separate databases rather than a
-> shared one with a metadata tag), use [`EngravaManager`](api-reference.md) —
+> shared one with a metadata tag), use [`EngravaManager`](../api-reference.md) —
 > one `<name>.db` per service. That trades cross-tenant search for strong
 > isolation; the metadata approach keeps one searchable store.
 
@@ -95,7 +95,7 @@ print(f"{result.expired_count} thoughts expired via '{result.strategy_applied}'"
 ```
 
 A store-wide default TTL and the archive-vs-delete strategy are set in config —
-see the [`ttl` configuration](configuration.md). Archived thoughts leave disk
+see the [`ttl` configuration](../configuration.md). Archived thoughts leave disk
 only on a later `engrava gc`.
 
 ## Deduplicate repeated facts
@@ -111,7 +111,7 @@ again = await store.create_thought(same_fact, deduplicate=True)
 
 The growing `confirmation_count` is also a reliability signal dreaming uses (a
 fact re-confirmed many times ranks as more trustworthy) — see
-[Core Concepts](concepts.md#reliability-confidence-vs-confirmation_count).
+[Core Concepts](../concepts.md#reliability-confidence-vs-confirmation_count).
 
 ## Run consolidation on a schedule
 
@@ -129,11 +129,11 @@ if cycle % 20 == 0:
 ```
 
 A fresh store has little to consolidate — REFLECTIONs emerge as memories
-accumulate and repeat. See [Dreaming](dreaming.md) for the cadence and knobs.
+accumulate and repeat. See [Dreaming](../dreaming.md) for the cadence and knobs.
 
 ## Inspect what changed (audit trail)
 
-With the [audit journal](audit-trail.md) enabled, read the history of any
+With the [audit journal](../audit-trail.md) enabled, read the history of any
 thought:
 
 ```python
@@ -142,8 +142,49 @@ for entry in history:
     print(entry.sequence_number, entry.mutation_type, entry.created_at)
 ```
 
+## Record a tool result / action
+
+If your agent *does* things (calls a tool, sends a message), record each as an
+`ActionRecord` linked to the thought that prompted it, so what the agent did —
+and whether it worked — is part of memory:
+
+```python
+import uuid
+from engrava import ActionRecord, ActionType, ActionStatus, VerificationStatus
+
+await store.create_action(
+    ActionRecord(
+        action_id=str(uuid.uuid4()),
+        source_thought_id=prompting_thought_id,
+        action_type=ActionType.TOOL_CALL,     # or MESSAGE / CLI_OUTPUT / STATE_UPDATE
+        intent="search the web for flight prices",
+        status=ActionStatus.CONFIRMED,        # PLANNED → EXECUTING → CONFIRMED / FAILED / BLOCKED
+        verification_status=VerificationStatus.CONFIRMED,
+    )
+)
+
+# read an entity's actions back:
+actions = await store.get_actions(prompting_thought_id)
+```
+
+## Restore the cycle counter after a restart
+
+The cycle is the agent's logical clock and Engrava does **not** persist it — on
+startup, seed it from the highest cycle already stored so it keeps increasing.
+`list_thoughts` returns rows ordered by `updated_cycle` descending, so the most
+recent thought carries the highest value:
+
+```python
+recent = await store.list_thoughts(limit=1)        # ordered by updated_cycle desc
+cycle = (recent[0].updated_cycle + 1) if recent else 0
+```
+
+See [Cycle (the agent clock)](../concepts.md#cycle-the-agent-clock) for why this
+matters (a frozen clock disables recency and stalls dreaming).
+
 ## Next
 
-- [Building a memory-backed agent](guides/agent-memory.md) — these recipes assembled into a loop.
-- [Core Concepts](concepts.md) — the model behind the snippets.
-- [Hybrid Search](search.md) · [Dreaming](dreaming.md) · [Configuration](configuration.md).
+- [Building a memory-backed agent](../guides/agent-memory.md) — these recipes assembled into a loop.
+- [Tutorial](../tutorial.md) — build a small notes memory from scratch.
+- [Core Concepts](../concepts.md) — the model behind the snippets.
+- [Hybrid Search](../search.md) · [Dreaming](../dreaming.md) · [Configuration](../configuration.md).
