@@ -10,33 +10,36 @@ or manually).
 
 ## How memory consolidation works (the dreaming loop)
 
-Think of a single memory's journey through an agent's lifetime. Nothing here is
-automatic — each step happens when **you** call `run_consolidation()`; that one
-call runs the phases below in order.
+Think of a single memory's journey through an agent's lifetime. The first two
+steps — ingest and confirmation — happen on the **normal write path** as you use
+the store. The consolidation part is **manual**: when you call
+`run_consolidation()`, that one call runs promotion → edge creation → reflection
+clustering/creation → an orphan sweep, in order.
 
 ```
-  ingest        you create an OBSERVATION ("user prefers email")
+  ingest        you create an OBSERVATION ("user prefers email")   (write path)
     │
     ▼
-  confirm       the same fact is re-encountered over time, so its
+  confirm       the same fact is re-encountered over time, so its  (write path)
     │           confirmation_count grows (e.g. via deduplicate=True)
     │
-    ▼  run_consolidation(current_cycle=N)
+    ▼  run_consolidation(current_cycle=N)   ── manual ──
     │
   ┌─┴───────────────────────────────────────────────────────┐
   │ 1. promote   thoughts that pass the gates and clear       │
   │              promote_threshold are raised to priority P1  │
-  │ 2. link      each promoted thought gets ASSOCIATED edges  │
-  │              to its nearest neighbours                     │
-  │ 3. reflect   clusters of related thoughts are summarised  │
-  │              into REFLECTION meta-thoughts (centroid +     │
-  │              CONSOLIDATED_FROM edges back to members)      │
+  │ 2. link      a promoted thought *may* gain ASSOCIATED      │
+  │              edges to similar neighbours (when enabled)    │
+  │ 3. reflect   related thoughts *may* be clustered into      │
+  │              REFLECTION meta-thoughts (when enabled)       │
+  │ 4. sweep     stale REFLECTIONs whose sources left the      │
+  │              active set are retired                         │
   └─┬───────────────────────────────────────────────────────┘
     │
     ▼
   improved      later searches rank the P1 memory higher (priority
-  retrieval     signal), follow the new edges (graph signal), and can
-                surface the REFLECTION instead of many raw thoughts
+  retrieval     signal), follow any new edges (graph signal), and can
+                surface a REFLECTION instead of many raw thoughts
 ```
 
 Walking the journey:
@@ -55,18 +58,21 @@ Walking the journey:
    promoted to **P1**. (Both bars matter: a thought that passes the gates but
    scores low is *not* promoted — see
    [Troubleshooting](troubleshooting.md#dreaming-promotes-nothing-consolidation-is-inert).)
-4. **Link.** Each promoted thought gains `ASSOCIATED` [edges](#edge-creation) to
-   its nearest neighbours by embedding similarity, persisting the structure in
-   the graph (idempotently — re-runs don't duplicate edges).
-5. **Reflect.** Related thoughts are clustered and summarised into
+4. **Link.** A promoted thought *may* gain `ASSOCIATED` [edges](#edge-creation)
+   to similar neighbours — when edge creation is enabled, the thought has a stored
+   embedding, and qualifying neighbours (above `min_similarity`) are found. New
+   edges persist the structure in the graph, idempotently (re-runs don't
+   duplicate edges).
+5. **Reflect.** Related thoughts *may* be clustered and summarised into
    [`REFLECTION`](#reflections-meta-consolidation) meta-thoughts — a centroid
-   embedding plus `CONSOLIDATED_FROM` edges back to the members — so a pile of
-   observations becomes fewer, higher-level memories. (A REFLECTION whose source
-   cluster later leaves the active set is automatically retired so a stale
+   embedding plus `CONSOLIDATED_FROM` edges back to the members — when reflections
+   are enabled and eligible clusters pass the clustering/quality gates. This turns
+   a pile of observations into fewer, higher-level memories. (A REFLECTION whose
+   source cluster later leaves the active set is automatically retired so a stale
    summary can't resurface.)
 6. **Improved retrieval.** All of this changes future
    [hybrid search](search.md): the P1 memory ranks higher via the priority
-   signal, the new edges feed the opt-in graph signal, and reflections let one
+   signal, any new edges feed the opt-in graph signal, and reflections let one
    high-level memory stand in for many raw ones.
 
 The rest of this page is the knob-by-knob reference for each phase.
