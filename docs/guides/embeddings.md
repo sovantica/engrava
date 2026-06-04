@@ -15,9 +15,10 @@ works.
 1. **Ingest-time embedding** — with `auto_embed=True`, every thought is embedded
    on write, so it becomes findable by meaning.
 2. **Query-time embedding** — at search time the query must also be a vector.
-   When a provider is configured, `search_hybrid` / `search_similar` embed the
-   query text **for you** if you don't pass a `query_vector`. You can pass one
-   explicitly to override (e.g. a vector you already computed).
+   `search_hybrid` takes the query *text* and, when a provider is configured,
+   embeds it **for you** (unless you pass an explicit `query_vector`).
+   `search_similar` takes a *vector* directly, so you embed the query yourself
+   first. See [The query side](#the-query-side) for both.
 
 The corpus and the query must use **the same model / dimension** — once a store
 has embeddings for one model, writing with a different model raises
@@ -166,21 +167,34 @@ provider = CallbackProvider(
 
 ## The query side
 
-`search_hybrid` (and `search_similar`) need a query vector. With a provider
-configured you can let Engrava embed the query, or pass one yourself:
+The two search methods handle the query vector differently — `search_hybrid`
+takes the query **text**, `search_similar` takes a query **vector**.
+
+**`search_hybrid(query_text, query_vector=None, ...)`** — pass the query text.
+When an embedding provider is configured, Engrava embeds that text for you if
+you don't supply a `query_vector`; pass one explicitly only to override:
 
 ```python
-# Let the configured provider embed the query text:
+# Provider configured → the query text is embedded for you:
 result = await store.search_hybrid("trips to Japan", top_k=5, current_cycle=cycle)
 
-# Or pass an explicit query vector (e.g. one you already computed):
+# Or override with a vector you already have:
 query_vec = await provider.embed("trips to Japan")
-result = await store.search_similar(query_vec, top_k=5)
+result = await store.search_hybrid("trips to Japan", query_vector=query_vec, top_k=5)
 ```
 
-If **no** provider is configured and you don't pass a `query_vector`, the vector
-signal is skipped and search falls back to the lexical (FTS5/BM25) signal —
-still useful, just keyword-based rather than semantic.
+If **no** provider is configured **and** you pass no `query_vector`,
+`search_hybrid` skips the vector signal and falls back to the lexical (FTS5/BM25)
+signal — still useful, just keyword-based rather than semantic.
+
+**`search_similar(query_vector, ...)`** — takes a ready vector as its first,
+required argument. It does not accept query text, so there is nothing for it to
+auto-embed: you must embed the query yourself first.
+
+```python
+query_vec = await provider.embed("trips to Japan")   # required — no auto-embed here
+result = await store.search_similar(query_vec, top_k=5)
+```
 
 ## Choosing a model and dimension
 
