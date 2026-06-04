@@ -94,7 +94,10 @@ only closes a connection it **owns**:
 
 - **`from_config` (owned connection).** `from_config` opens and owns the
   connection. Leaving the `async with` block closes it for you; equivalently, call
-  `await store.close()`, which checkpoints the WAL and releases the handle.
+  `await store.close()`, which **closes and releases the owned connection
+  cleanly**. (It does not issue an explicit WAL checkpoint — that is a
+  backup/maintenance step, `PRAGMA wal_checkpoint(TRUNCATE)`, covered in
+  [Backup & Recovery](backup-and-recovery.md#if-you-can-stop-or-quiesce-writers).)
 
   ```python
   async with await SqliteEngravaCore.from_config("engrava.yaml") as store:
