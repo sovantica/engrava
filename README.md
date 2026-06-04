@@ -175,6 +175,17 @@ since 0.3.0.
 → See [`docs/benchmarks.md`](docs/benchmarks.md) for reproducible
 evidence (synthetic benchmark suite runnable in ~5 minutes).
 
+### Tamper-Evident Audit Trail
+
+Opt-in hash-chain **journal** that records every thought/edge mutation as a
+SHA-256-linked, before/after entry — off by default, one config flag to enable.
+Query history with `store.journal.get_entries(...)` and validate the chain with
+`store.journal.verify_integrity()`.
+
+→ See [`docs/audit-trail.md`](docs/audit-trail.md) for enabling, querying,
+verification, and the security model (what "tamper-evident" does and does not
+guarantee).
+
 ### Multi-Service Isolation
 
 Run multiple independent databases under one `EngravaManager`:
@@ -219,6 +230,7 @@ engrava --db mydata.db export -o portable.json
 - [Configuration](docs/configuration.md) — YAML config format and options
 - [Extensions](docs/extensions.md) — Writing custom extensions and hooks
 - [Observability](docs/observability.md) — Metrics snapshot API
+- [Audit Trail](docs/audit-trail.md) — Tamper-evident hash-chain journal (enabling, querying, verifying, security model)
 - [API Reference](docs/api-reference.md) — Full protocol and class reference
 - [MindQL](docs/mindql.md) — Query language syntax and examples
 - [Known Limitations](docs/known-limitations.md) — Platform notes and constraints
