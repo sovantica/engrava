@@ -34,8 +34,10 @@ user message
 ## Setup
 
 Create one store for the lifetime of the agent. Configure an embedding provider
-so retrieval is semantic (see [Embeddings](embeddings.md) for real providers;
-the example uses a deterministic stand-in):
+so retrieval is semantic (the example uses a deterministic stand-in; in
+production pass a real provider such as `SentenceTransformerProvider` or
+`OpenAICompatibleProvider`, configurable via
+[`engrava.yaml`](../configuration.md)):
 
 ```python
 import aiosqlite
@@ -52,19 +54,25 @@ store = SqliteEngravaCore(conn, embedding_provider=provider, auto_embed=True)
 await store.ensure_schema()
 ```
 
-`auto_embed=True` means thoughts are embedded on write. **Search does not embed
-the query for you** — you pass a `query_vector` (step 2).
+`auto_embed=True` means thoughts are embedded on write. At search time you may
+pass an explicit `query_vector`; if you omit it, the store embeds the query
+text for you **when an embedding provider is configured**. Passing it yourself
+is handy when you've already computed the vector or want a different query
+representation.
 
 ## Step 1 — store the incoming message (a *percept*)
 
 Each user message becomes an `OBSERVATION` thought, tagged with `percept(...)`
-metadata so its origin is recorded:
+metadata so its origin is recorded. Extend that metadata with a `session_id`
+(which conversation) and `turn_index` (position within it) so every memory is
+anchored to its conversation — these are the keys you'd later filter on (or
+post-filter on) to scope retrieval to one session or user:
 
 ```python
 import uuid
 from engrava import ThoughtRecord, ThoughtType, Priority, LifecycleStatus, percept
 
-async def store_percept(store, text, cycle, user_id):
+async def store_percept(store, text, cycle, user_id, session_id, turn_index):
     record = ThoughtRecord(
         thought_id=str(uuid.uuid4()),
         thought_type=ThoughtType.OBSERVATION,
@@ -75,7 +83,11 @@ async def store_percept(store, text, cycle, user_id):
         created_cycle=cycle,         # the agent clock (see step 6)
         updated_cycle=cycle,
         source=user_id,
-        metadata=percept(source_id=user_id, label="user"),
+        metadata={
+            **percept(source_id=user_id, label="user"),
+            "session_id": session_id,
+            "turn_index": turn_index,
+        },
     )
     return await store.create_thought(record)
 ```
@@ -90,7 +102,7 @@ returned `(thought_id, score)` tuples back into text via `get_thought`:
 async def retrieve_context(store, query, cycle):
     result = await store.search_hybrid(
         query,
-        query_vector=my_embed_fn(query),   # search does NOT auto-embed the query
+        query_vector=my_embed_fn(query),   # optional: omit to let the provider embed `query`
         top_k=3,
         current_cycle=cycle,
     )
@@ -125,7 +137,7 @@ metadata, so the agent's own outputs are part of memory too:
 ```python
 from engrava import utterance
 
-async def store_utterance(store, reply, cycle):
+async def store_utterance(store, reply, cycle, session_id, turn_index):
     record = ThoughtRecord(
         thought_id=str(uuid.uuid4()),
         thought_type=ThoughtType.OUTPUT_DRAFT,
@@ -136,7 +148,11 @@ async def store_utterance(store, reply, cycle):
         created_cycle=cycle,
         updated_cycle=cycle,
         source="agent",
-        metadata=utterance(),
+        metadata={                       # same session + turn as the percept it answered
+            **utterance(),
+            "session_id": session_id,
+            "turn_index": turn_index,
+        },
     )
     return await store.create_thought(record)
 ```
@@ -212,8 +228,9 @@ knobs.
   re-embed on a normal restart. (You only need `engrava restore --re-embed`
   when you deliberately change the embedding model.)
 - **The cycle counter does not persist** — Engrava doesn't store it. Recover it
-  on startup so it keeps increasing, e.g. seed it from the largest
-  `created_cycle` you've already stored:
+  on startup so it keeps increasing. `list_thoughts` returns rows ordered by
+  `updated_cycle` descending, so the most recent thought carries the highest
+  cycle you've used; resume one past it:
 
   ```python
   recent = await store.list_thoughts(limit=1)   # ordered by updated_cycle desc
@@ -240,4 +257,4 @@ python examples/agent_loop.py
 - [Core Concepts](../concepts.md) — thought / edge / reflection / cycle.
 - [Hybrid Search](../search.md) — how the retrieval ranking works.
 - [Dreaming](../dreaming.md) — consolidation in depth.
-- [Embeddings](embeddings.md) — wiring a real embedding provider.
+- [Configuration](../configuration.md) — wiring an embedding provider via `engrava.yaml`.

@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import struct
 import uuid
 
 import aiosqlite
@@ -63,9 +62,10 @@ def _deterministic_embed(text: str) -> list[float]:
     this keeps the example dependency-free and deterministic across runs.
     """
     digest = hashlib.sha256(text.lower().encode("utf-8")).digest()
-    # Stretch the 32-byte digest into EMBED_DIM floats deterministically.
-    raw = (digest * ((EMBED_DIM * 4 // len(digest)) + 1))[: EMBED_DIM * 4]
-    return [v / 255.0 for v in struct.unpack(f"{EMBED_DIM}B" * 4, raw)[:EMBED_DIM]]
+    # Repeat the 32-byte digest to fill EMBED_DIM bytes, then scale to [0, 1].
+    repeats = (EMBED_DIM // len(digest)) + 1
+    stretched = (digest * repeats)[:EMBED_DIM]
+    return [byte / 255.0 for byte in stretched]
 
 
 def _mock_llm(prompt: str) -> str:
@@ -74,9 +74,19 @@ def _mock_llm(prompt: str) -> str:
 
 
 async def _store_percept(
-    store: SqliteEngravaCore, text: str, cycle: int, user_id: str
+    store: SqliteEngravaCore,
+    text: str,
+    cycle: int,
+    user_id: str,
+    session_id: str,
+    turn_index: int,
 ) -> ThoughtRecord:
-    """Persist an incoming user message as an OBSERVATION percept."""
+    """Persist an incoming user message as an OBSERVATION percept.
+
+    The percept metadata is extended with ``session_id`` and ``turn_index`` so
+    every memory is anchored to its conversation and position within it — the
+    keys you'd later filter or post-filter on for per-session retrieval.
+    """
     record = ThoughtRecord(
         thought_id=str(uuid.uuid4()),
         thought_type=ThoughtType.OBSERVATION,
@@ -87,7 +97,11 @@ async def _store_percept(
         created_cycle=cycle,
         updated_cycle=cycle,
         source=user_id,
-        metadata=percept(source_id=user_id, label="user"),
+        metadata={
+            **percept(source_id=user_id, label="user"),
+            "session_id": session_id,
+            "turn_index": turn_index,
+        },
     )
     return await store.create_thought(record)
 
@@ -111,9 +125,17 @@ async def _retrieve_context(
 
 
 async def _store_utterance(
-    store: SqliteEngravaCore, reply: str, cycle: int
+    store: SqliteEngravaCore,
+    reply: str,
+    cycle: int,
+    session_id: str,
+    turn_index: int,
 ) -> ThoughtRecord:
-    """Persist the agent's own reply as an OUTPUT_DRAFT utterance."""
+    """Persist the agent's own reply as an OUTPUT_DRAFT utterance.
+
+    Tagged with the same ``session_id``/``turn_index`` as the percept it
+    answered, so a turn's input and output stay linked.
+    """
     record = ThoughtRecord(
         thought_id=str(uuid.uuid4()),
         thought_type=ThoughtType.OUTPUT_DRAFT,
@@ -124,7 +146,11 @@ async def _store_utterance(
         created_cycle=cycle,
         updated_cycle=cycle,
         source="agent",
-        metadata=utterance(),
+        metadata={
+            **utterance(),
+            "session_id": session_id,
+            "turn_index": turn_index,
+        },
     )
     return await store.create_thought(record)
 
@@ -165,6 +191,7 @@ async def main() -> None:
         )
 
         user_id = "user-demo"
+        session_id = str(uuid.uuid4())  # one conversation; tag every memory with it
         conversation = [
             "I'm planning a trip to Japan in spring.",
             "What's the weather like in Kyoto in April?",
@@ -173,9 +200,11 @@ async def main() -> None:
         ]
 
         cycle = 0  # the agent's logical clock; advance once per turn
-        for user_message in conversation:
-            # 1. store the incoming message
-            percept_thought = await _store_percept(store, user_message, cycle, user_id)
+        for turn_index, user_message in enumerate(conversation):
+            # 1. store the incoming message (anchored to session + turn)
+            percept_thought = await _store_percept(
+                store, user_message, cycle, user_id, session_id, turn_index
+            )
 
             # 2. retrieve relevant prior memory
             context = await _retrieve_context(store, user_message, cycle)
@@ -185,8 +214,8 @@ async def main() -> None:
             prompt += f"\n\nUser: {user_message}\nAssistant:"
             reply = _mock_llm(prompt)
 
-            # 4. store the agent's reply
-            await _store_utterance(store, reply, cycle)
+            # 4. store the agent's reply (same session + turn as its percept)
+            await _store_utterance(store, reply, cycle, session_id, turn_index)
 
             # 5. record the action taken
             await _record_action(store, percept_thought.thought_id, intent="answered user")
