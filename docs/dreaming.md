@@ -8,6 +8,69 @@ Dreaming runs **outside** the normal CRUD path — the consumer decides
 when to invoke `run_consolidation()` (after N cycles, in a cron job,
 or manually).
 
+## How memory consolidation works (the dreaming loop)
+
+Think of a single memory's journey through an agent's lifetime. Nothing here is
+automatic — each step happens when **you** call `run_consolidation()`; that one
+call runs the phases below in order.
+
+```
+  ingest        you create an OBSERVATION ("user prefers email")
+    │
+    ▼
+  confirm       the same fact is re-encountered over time, so its
+    │           confirmation_count grows (e.g. via deduplicate=True)
+    │
+    ▼  run_consolidation(current_cycle=N)
+    │
+  ┌─┴───────────────────────────────────────────────────────┐
+  │ 1. promote   thoughts that pass the gates and clear       │
+  │              promote_threshold are raised to priority P1  │
+  │ 2. link      each promoted thought gets ASSOCIATED edges  │
+  │              to its nearest neighbours                     │
+  │ 3. reflect   clusters of related thoughts are summarised  │
+  │              into REFLECTION meta-thoughts (centroid +     │
+  │              CONSOLIDATED_FROM edges back to members)      │
+  └─┬───────────────────────────────────────────────────────┘
+    │
+    ▼
+  improved      later searches rank the P1 memory higher (priority
+  retrieval     signal), follow the new edges (graph signal), and can
+                surface the REFLECTION instead of many raw thoughts
+```
+
+Walking the journey:
+
+1. **Ingest.** You store memories as thoughts (typically `OBSERVATION`s) on the
+   normal write path. Dreaming does nothing yet.
+2. **Confirm.** As the same knowledge recurs, its `confirmation_count` rises —
+   automatically when you write with `deduplicate=True` (identical content
+   collapses and bumps the count), or via your own logic. This is *evidence the
+   memory matters*, and it feeds dreaming's confirmation signal. (Distinct from
+   `confidence`, the static belief-strength you set — see
+   [Core Concepts](concepts.md#reliability-confidence-vs-confirmation_count).)
+3. **Promote.** When you run consolidation, each candidate must first pass the
+   [gates](#gates) (e.g. old enough, enough confirmations) and then score above
+   `promote_threshold` across the weighted [signals](#signals). Survivors are
+   promoted to **P1**. (Both bars matter: a thought that passes the gates but
+   scores low is *not* promoted — see
+   [Troubleshooting](troubleshooting.md#dreaming-promotes-nothing-consolidation-is-inert).)
+4. **Link.** Each promoted thought gains `ASSOCIATED` [edges](#edge-creation) to
+   its nearest neighbours by embedding similarity, persisting the structure in
+   the graph (idempotently — re-runs don't duplicate edges).
+5. **Reflect.** Related thoughts are clustered and summarised into
+   [`REFLECTION`](#reflections-meta-consolidation) meta-thoughts — a centroid
+   embedding plus `CONSOLIDATED_FROM` edges back to the members — so a pile of
+   observations becomes fewer, higher-level memories. (A REFLECTION whose source
+   cluster later leaves the active set is automatically retired so a stale
+   summary can't resurface.)
+6. **Improved retrieval.** All of this changes future
+   [hybrid search](search.md): the P1 memory ranks higher via the priority
+   signal, the new edges feed the opt-in graph signal, and reflections let one
+   high-level memory stand in for many raw ones.
+
+The rest of this page is the knob-by-knob reference for each phase.
+
 ## Quick start
 
 ```python
@@ -74,6 +137,7 @@ Custom signals can be provided via `DreamingSignalProtocol`:
 class MySignal:
     def __call__(self, thought: ThoughtRecord, ctx: DreamingContext) -> float:
         return 0.42
+
 
 ext = DreamingExtension(
     config=config,
@@ -275,8 +339,8 @@ extensions:
 
 ```python
 result = await ext.run_consolidation(store, current_cycle=42)
-print(result.promoted_count)       # thoughts promoted to P1
-print(result.edges_created)        # ASSOCIATED edges created
+print(result.promoted_count)  # thoughts promoted to P1
+print(result.edges_created)  # ASSOCIATED edges created
 print(result.reflections_created)  # new REFLECTION thoughts created
 ```
 
