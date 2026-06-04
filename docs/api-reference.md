@@ -65,6 +65,7 @@ keyword arguments and does **not** return a UUID string.
 | `await list_thoughts(...)` | `list[ThoughtRecord]` | List with filters (keyword-only) |
 | `await count_thoughts(...)` | `int` | Count with filters (keyword-only) |
 | `await delete_thought(thought_id)` | `bool` | Hard delete; `True` if a row was removed |
+| `await record_access(thought_id)` | `None` | Mark a thought as accessed — bumps `access_count` and sets `last_accessed_at`; raises `ThoughtNotFoundError` if missing. Drives the access-frequency dreaming signal. |
 
 ```python
 import uuid
@@ -135,6 +136,18 @@ await store.create_edge(
 )
 ```
 
+#### REFLECTION lineage
+
+Helpers for navigating the `CONSOLIDATED_FROM` graph that dreaming builds
+between a REFLECTION and the source thoughts it summarises.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `await consolidated_member_ids(reflection_id)` | `list[str]` | The thought IDs a REFLECTION was consolidated from |
+| `await consolidated_source_statuses(reflection_id)` | `list[str]` | The lifecycle statuses of those source thoughts (e.g. to detect a fully-archived, orphaned cluster) |
+| `await reflections_consolidated_from(source_id)` | `list[str]` | The REFLECTION IDs that consolidated a given source thought (the reverse direction) |
+| `await thought_exists_by_source(*, source, thought_type_value)` | `bool` | Whether any thought exists with the given `source` and type — keyword-only |
+
 #### Embedding Operations
 
 | Method | Returns | Description |
@@ -167,11 +180,23 @@ returns a single `HybridSearchResult` container.
 | `await metrics()` | `EngravaMetrics` | Snapshot of thought/edge counts, storage, and search-latency percentiles (see [Observability](observability.md)) |
 | `await cleanup_expired(now=None, *, exclude_id=None)` | `CleanupResult` | Archive or delete thoughts past their `expires_at` |
 | `await verify_embedding_model()` | `None` | Raise `EmbeddingModelMismatchError` if the stored model lock disagrees with the configured provider |
+| `async with store.suspend_auto_commit():` | context manager | Defer per-call commits so a block of writes commits once (rolls back on error) — use for bulk ingest |
 | `await close()` | `None` | Close the owned connection (only when the store opened it via `from_config`) |
+
+```python
+# Bulk ingest: one transaction instead of one commit per write.
+async with store.suspend_auto_commit():
+    for record in many_records:
+        await store.create_thought(record)
+# commit happens once on clean exit; any exception rolls the whole block back
+```
 
 ### `ReadOnlyEngrava`
 
-Wrapper that raises `ReadOnlyViolationError` on any write operation.
+A composition wrapper that delegates reads to the wrapped store and raises
+`ReadOnlyViolationError` on any write. Use it to hand a retrieval-only view of
+shared memory to a component that should never mutate it — e.g. a sub-agent or
+worker whose job is only to look things up.
 
 ```python
 from engrava import ReadOnlyEngrava
@@ -299,14 +324,51 @@ extension is recommended for filtering queries (`json_extract(metadata_json, '$.
 
 ### `ActionRecord`
 
+Records an action the agent took (a tool call, a message, …), linked to the
+thought that prompted it, with execution and verification state.
+
 | Field | Type | Description |
 |-------|------|-------------|
 | `action_id` | `str` | UUID primary key |
-| `source_thought_id` | `str` | Linked thought |
+| `source_thought_id` | `str` | The thought this action originated from |
 | `action_type` | `ActionType` | Action classification |
-| `intent` | `str` | Description of intent |
-| `status` | `ActionStatus` | Current status |
+| `intent` | `str` | Description of intent (min length 1) |
+| `status` | `ActionStatus` | Current execution status |
 | `verification_status` | `VerificationStatus` | Verification state |
+| `raw_metrics_json` | `str \| None` | Optional ground-truth facts for verification |
+
+**Store methods** (on `SqliteEngravaCore`):
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `await create_action(action)` | `ActionRecord` | Persist an `ActionRecord` |
+| `await get_actions(thought_id)` | `list[ActionRecord]` | Actions linked to a thought |
+
+`ActionStatus` is a state machine: `PLANNED → EXECUTING → CONFIRMED` / `FAILED`,
+and `PLANNED → BLOCKED → PLANNED`. `can_transition_to(...)` / `evolve(...)`
+enforce valid transitions (an illegal change raises `InvalidTransitionError`).
+
+```python
+import uuid
+from engrava import ActionRecord, ActionType, ActionStatus, VerificationStatus
+
+action = ActionRecord(
+    action_id=str(uuid.uuid4()),
+    source_thought_id=prompting_thought_id,
+    action_type=ActionType.TOOL_CALL,
+    intent="search the web for flight prices",
+    status=ActionStatus.PLANNED,
+    verification_status=VerificationStatus.PENDING,
+)
+await store.create_action(action)
+
+# advance through the lifecycle (frozen model → evolve returns a new instance):
+done = action.evolve(status=ActionStatus.EXECUTING).evolve(
+    status=ActionStatus.CONFIRMED
+)
+
+actions = await store.get_actions(prompting_thought_id)
+```
 
 ### `HybridSearchResult`
 
