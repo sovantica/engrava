@@ -132,10 +132,19 @@ deterministic, wall-clock-independent math. Search's recency signal and all of
 dreaming's age/scheduling gates (`min_age_cycles`, `schedule_every_n_cycles`,
 `recency_half_life`) are expressed in cycles, not seconds.
 
-> **The trap to avoid.** Because Engrava does not advance the cycle for you, if
-> you always pass `current_cycle=0` (or never advance it), the recency signal
-> degrades to "skipped" and dreaming's age gate never opens — with **no error**.
-> You just get worse rankings and consolidation that never promotes.
+> **The trap to avoid.** Because Engrava does not advance the cycle for you,
+> there are two distinct failure modes — and neither raises an error:
+>
+> - **Omitting it entirely** (`current_cycle=None`, the default in
+>   `search_hybrid`) makes the recency signal **inactive** — it is dropped from
+>   the ranking and its weight is redistributed to the other signals.
+> - **Passing a constant** (e.g. always `current_cycle=0`, and never advancing
+>   `created_cycle`/`updated_cycle`) keeps recency active but **useless**: a
+>   thought's age is `current_cycle - updated_cycle`, so with everything frozen
+>   at the same value every memory looks equally fresh and recency cannot
+>   distinguish old from new. The same staleness also means dreaming's age gate
+>   (`min_age_cycles`) never opens — `created_cycle`/`current_cycle` never grow,
+>   so no thought ever ages enough to be promoted.
 >
 > **Do this instead:** keep a counter in your application, increment it once per
 > turn, pass it as `current_cycle`, and use it for `created_cycle`/`updated_cycle`

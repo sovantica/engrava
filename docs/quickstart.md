@@ -135,6 +135,14 @@ stored = await store.create_thought(observation)
 print(f"Created thought: {stored.thought_id}")
 ```
 
+> **About `created_cycle` / `updated_cycle`.** A *cycle* is a consumer-owned
+> logical clock — Engrava never advances it for you. `0` is fine for this
+> quickstart, but in a real long-running agent you should keep a counter and
+> increment it once per turn, using it for these fields (and for `current_cycle`
+> in search / consolidation). Otherwise recency can't tell old memories from new
+> and dreaming's age gate never opens. See
+> [Cycle (the agent clock)](concepts.md#cycle-the-agent-clock).
+
 ## Link Thoughts with Edges
 
 ```python
