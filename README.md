@@ -228,6 +228,7 @@ engrava --db mydata.db export -o portable.json
 - [Core Concepts](docs/concepts.md) — the mental model (thought, edge, reflection, cycle, …) — start here
 - [Quick Start](docs/quickstart.md) — 5-minute setup guide
 - [Building a memory-backed agent](docs/guides/agent-memory.md) — the end-to-end agent turn loop (ingest → retrieve → generate → consolidate)
+- [Embeddings](docs/guides/embeddings.md) — wiring a real embedding provider (local / OpenAI / Ollama / HuggingFace / custom)
 - [Configuration](docs/configuration.md) — YAML config format and options
 - [Upgrade Guide](docs/upgrade.md) — compatibility matrix, backups, and troubleshooting
 - [Extensions](docs/extensions.md) — Writing custom extensions and hooks

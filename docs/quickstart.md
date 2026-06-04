@@ -188,19 +188,20 @@ for thought_id, score in await store.search_fts("Python AI", top_k=5):
 
 ### Embedding Similarity Search
 
-```python
-from engrava import CallbackProvider
+Use a real embedding provider so similarity is meaningful (this needs the
+`embeddings-local` extra; see the [Embeddings guide](guides/embeddings.md) for
+all provider options):
 
-# Use any embedding function
-provider = CallbackProvider(
-    callback=lambda text: [0.1] * 384,  # Replace with real embeddings
-    dimension=384,
-    model_name="my-model",
-)
+```python
+from engrava import SentenceTransformerProvider
+
+provider = SentenceTransformerProvider(model_name="all-MiniLM-L6-v2")
 
 # Store an embedding for an existing thought
 vector = await provider.embed(observation.content)
-await store.store_embedding(observation.thought_id, vector, model_name="my-model")
+await store.store_embedding(
+    observation.thought_id, vector, model_name=provider.model_name
+)
 
 # Search by similarity — returns (thought_id, score) tuples
 for thought_id, score in await store.search_similar(vector, top_k=5):
@@ -208,6 +209,10 @@ for thought_id, score in await store.search_similar(vector, top_k=5):
     if record is not None:
         print(f"  {record.essence}  (score: {score:.3f})")
 ```
+
+> Tip: configure the provider on the store with `auto_embed=True` (or via
+> `engrava.yaml`) and Engrava embeds thoughts on write — and embeds your query
+> for you in `search_hybrid`. See the [Embeddings guide](guides/embeddings.md).
 
 ## Query with MindQL
 
