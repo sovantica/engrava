@@ -244,6 +244,9 @@ engrava --db mydata.db export -o portable.json
 - [FAQ](docs/faq.md) — quick answers (LLM/keys, embeddings-optional, scale, concurrency, backups, …)
 - [Performance & Scaling](docs/performance.md) — the vector-backend switch, bulk-ingest, and dreaming cost at scale
 - [Data Lifecycle & Retention](docs/data-lifecycle.md) — lifecycle states, TTL, archive-vs-delete, GDPR erasure, disk reclamation
+- [Deployment](docs/deployment.md) — process model, database files on disk, containers, graceful shutdown
+- [Concurrency](docs/concurrency.md) — the WAL single-writer model, busy timeout, and per-service isolation
+- [Backup & Recovery](docs/backup-and-recovery.md) — WAL-safe backups, snapshot vs file copy, restore verification
 - [Known Limitations](docs/known-limitations.md) — Platform notes and constraints
 
 ## Development

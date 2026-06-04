@@ -20,11 +20,17 @@ upgrade.
 These steps are recommended, not required:
 
 ```bash
+# Checkpoint the WAL first so the copy is complete, then back up.
+sqlite3 my-data.db "PRAGMA wal_checkpoint(TRUNCATE);"
 cp my-data.db my-data.db.bak
 pip install --upgrade engrava
 ```
 
-- Create a copy of the SQLite database file before the upgrade.
+- Create a copy of the SQLite database file before the upgrade. In WAL mode a
+  bare `cp` of just the `.db` can miss data still in the `-wal` file — checkpoint
+  first (above), or copy `my-data.db` together with `my-data.db-wal` and
+  `my-data.db-shm`. See [Backup & Recovery](backup-and-recovery.md) for all the
+  WAL-safe options.
 - Review [CHANGELOG.md](../CHANGELOG.md) for breaking changes and database notes.
 - If you ship custom extensions, make sure their schema migrations are included
   in the version you are about to install.
@@ -71,6 +77,12 @@ of opening the upgraded database file directly:
 engrava --db my-data.db snapshot -o backup.snapshot.jsonl
 engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 ```
+
+> **Note:** a snapshot exports thoughts, edges, embeddings, and actions, but
+> **not** the audit journal (`journal_entry`). A database restored from a
+> snapshot starts with an empty journal. If you need the audit history preserved,
+> take a physical file backup instead — see
+> [Backup & Recovery](backup-and-recovery.md).
 
 ## Compatibility Matrix
 
