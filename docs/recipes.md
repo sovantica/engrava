@@ -1,0 +1,149 @@
+# Recipes
+
+Short, copy-paste snippets for the things you actually do with an agent-memory
+database. Each assumes you already have an open `store` (see the
+[Quick Start](quickstart.md)); imports are shown once per recipe.
+
+> New to the model? Read [Core Concepts](concepts.md) first. For the full
+> agent turn loop, see [Building a memory-backed agent](guides/agent-memory.md).
+
+## Store a conversation turn
+
+Persist a user message and the agent's reply, tagged with conversation metadata
+so you can scope retrieval later:
+
+```python
+import uuid
+from engrava import ThoughtRecord, ThoughtType, Priority, LifecycleStatus, percept, utterance
+
+async def store_turn(store, user_text, agent_text, *, cycle, session_id, turn_index, user_id):
+    user_thought = ThoughtRecord(
+        thought_id=str(uuid.uuid4()),
+        thought_type=ThoughtType.OBSERVATION,
+        essence=user_text[:200], content=user_text,
+        priority=Priority.P2, lifecycle_status=LifecycleStatus.ACTIVE,
+        created_cycle=cycle, updated_cycle=cycle, source=user_id,
+        metadata={**percept(source_id=user_id, label="user"),
+                  "session_id": session_id, "turn_index": turn_index},
+    )
+    await store.create_thought(user_thought)
+
+    agent_thought = ThoughtRecord(
+        thought_id=str(uuid.uuid4()),
+        thought_type=ThoughtType.OUTPUT_DRAFT,
+        essence=agent_text[:200], content=agent_text,
+        priority=Priority.P3, lifecycle_status=LifecycleStatus.ACTIVE,
+        created_cycle=cycle, updated_cycle=cycle, source="agent",
+        metadata={**utterance(), "session_id": session_id, "turn_index": turn_index},
+    )
+    await store.create_thought(agent_thought)
+```
+
+## Retrieve context for a prompt
+
+Get the most relevant prior memories and turn them into prompt-ready text. With
+an embedding provider configured, `search_hybrid` embeds the query for you:
+
+```python
+async def context_for(store, query, cycle, top_k=5):
+    result = await store.search_hybrid(query, top_k=top_k, current_cycle=cycle)
+    lines = []
+    for thought_id, _score in result.results:
+        record = await store.get_thought(thought_id)
+        if record is not None:
+            lines.append(record.essence)        # essence = the prompt-facing one-liner
+    return "\n".join(f"- {line}" for line in lines)
+```
+
+## Filter retrieval by session (or user)
+
+The ranked search methods take **no** metadata/scope filter, so "only this
+session's memories" is done by over-fetching and post-filtering on metadata in
+Python:
+
+```python
+async def search_in_session(store, query, session_id, cycle, want=5):
+    # over-fetch, then keep only this session's hits, preserving rank order
+    result = await store.search_hybrid(query, top_k=want * 5, current_cycle=cycle)
+    scoped = []
+    for thought_id, _score in result.results:
+        record = await store.get_thought(thought_id)
+        if record is not None and record.metadata.get("session_id") == session_id:
+            scoped.append(record)
+        if len(scoped) >= want:
+            break
+    return scoped
+```
+
+> For *hard* isolation between users/tenants (separate databases rather than a
+> shared one with a metadata tag), use [`EngravaManager`](api-reference.md) —
+> one `<name>.db` per service. That trades cross-tenant search for strong
+> isolation; the metadata approach keeps one searchable store.
+
+## Set a TTL on transient memories
+
+Give a thought an expiry, then expire due thoughts. The default strategy is
+`archive` (soft — marks `ARCHIVED`); switch to `delete` for hard removal:
+
+```python
+# expire this thought one hour from now
+await store.create_thought(transient_thought, expires_after_seconds=3600)
+
+# later: process everything past its expiry (archive or delete per ttl_strategy)
+result = await store.cleanup_expired()
+print(f"{result.expired_count} thoughts expired via '{result.strategy_applied}'")
+```
+
+A store-wide default TTL and the archive-vs-delete strategy are set in config —
+see the [`ttl` configuration](configuration.md). Archived thoughts leave disk
+only on a later `engrava gc`.
+
+## Deduplicate repeated facts
+
+Pass `deduplicate=True` so identical `content` collapses into one thought with a
+bumped `confirmation_count` instead of a duplicate row:
+
+```python
+first = await store.create_thought(fact, deduplicate=True)
+again = await store.create_thought(same_fact, deduplicate=True)
+# again.thought_id == first.thought_id; confirmation_count incremented, no new row
+```
+
+The growing `confirmation_count` is also a reliability signal dreaming uses (a
+fact re-confirmed many times ranks as more trustworthy) — see
+[Core Concepts](concepts.md#reliability-confidence-vs-confirmation_count).
+
+## Run consolidation on a schedule
+
+In a long-running agent, run dreaming every N turns rather than every turn:
+
+```python
+from engrava import DreamingExtension, DreamingConfig
+
+dreaming = DreamingExtension(config=DreamingConfig(enabled=True))
+
+# inside your turn loop, after advancing the cycle counter:
+if cycle % 20 == 0:
+    result = await dreaming.run_consolidation(store, current_cycle=cycle)
+    print(f"consolidation: promoted {result.promoted_count}")
+```
+
+A fresh store has little to consolidate — REFLECTIONs emerge as memories
+accumulate and repeat. See [Dreaming](dreaming.md) for the cadence and knobs.
+
+## Inspect what changed (audit trail)
+
+With the [audit journal](audit-trail.md) enabled, read the history of any
+thought:
+
+```python
+history = await store.journal.get_entries(target_id=some_thought_id)
+for entry in history:
+    print(entry.sequence_number, entry.mutation_type, entry.created_at)
+```
+
+## Next
+
+- [Building a memory-backed agent](guides/agent-memory.md) — these recipes assembled into a loop.
+- [Core Concepts](concepts.md) — the model behind the snippets.
+- [Hybrid Search](search.md) · [Dreaming](dreaming.md) · [Configuration](configuration.md).
