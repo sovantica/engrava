@@ -217,7 +217,7 @@ There is **no `engrava verify` command** in this version. To verify the
 
 ```python
 result = await store.journal.verify_integrity()
-print(result.is_valid)
+print(result.valid)
 ```
 
 ## See also

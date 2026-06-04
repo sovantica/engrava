@@ -124,7 +124,7 @@ async def journal_ok(store) -> bool:
     if store.journal is None:
         return True  # journaling disabled — nothing to verify
     result = await store.journal.verify_integrity()
-    return result.is_valid
+    return result.valid
 ```
 
 ### Health check
