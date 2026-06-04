@@ -30,7 +30,7 @@ common concepts onto Engrava:
 | Free-form metadata / `metadata={...}` | **`ThoughtRecord.metadata`** | An arbitrary JSON dict, persisted and round-tripped. |
 | "User id" / "session id" / namespace | A key inside **`metadata`** (or `source`) | Engrava has no built-in tenant field — see [scoping](#filtering-scoping-and-multi-tenancy). |
 | Relationship / link between memories | **`EdgeRecord`** (typed, weighted) | First-class graph; edges also feed ranking. |
-| Embedding / vector | Stored automatically when a provider is configured | See the [Embeddings guide](embeddings.md). |
+| Embedding / vector | Stored on write only with `embedding_provider=...` **and** `auto_embed=True`; otherwise call `store_embedding(thought_id, vector)` yourself | See the [Embeddings guide](embeddings.md). |
 | Vector / similarity search | **`search_similar(query_vector, …)`** | Needs a ready query vector. |
 | Keyword / BM25 search | **`search_fts(query, …)`** | Returns `list[(thought_id, score)]`. |
 | Hybrid search | **`search_hybrid(query_text, …)`** | Fuses FTS + vector + recency + priority + graph. |
@@ -152,6 +152,7 @@ async def main() -> None:
 
         total = await bulk_import(store, EXPORTED_MEMORIES)
         # 4 exported rows, one duplicate collapsed -> 3 stored.
+        assert total == 3
         print(f"Imported {total} thoughts.")
 
 
