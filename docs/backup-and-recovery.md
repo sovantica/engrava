@@ -41,47 +41,63 @@ thought / edge / embedding / action.
 ## Physical file backup (WAL-safe)
 
 Engrava runs in **WAL mode**, where recently-written data lives in the `-wal`
-file until it is checkpointed into the main `.db`. **Copying only `engrava.db`
-while the database is in use can therefore miss data still in the WAL.** Use one
-of these WAL-safe approaches instead:
+file until it is checkpointed into the main `.db`. A plain file copy is only safe
+under specific conditions, so choose the method by whether the database is
+**live** (being written) or **stopped**.
 
-**1. Checkpoint, then copy.** Force the WAL into the main file, then copy it:
+### If the database is live (writers running)
 
-```bash
-sqlite3 engrava.db "PRAGMA wal_checkpoint(TRUNCATE);"
-cp engrava.db engrava.db.bak
-```
+A file copy of a database under active writes is **not reliable** — the `.db` and
+`-wal` change during the copy and can be captured inconsistently. Use a method
+that produces an internally consistent copy *without* stopping writers:
 
-**2. Copy all three files together.** If you can't checkpoint (the app is
-writing), copy `engrava.db`, `engrava.db-wal`, and `engrava.db-shm` as a set, so
-the WAL travels with the database:
+**SQLite Online Backup API** — a hot, consistent backup driven from your own code
+via Python's `sqlite3` backup API (`source.backup(dest)`). This is the
+recommended way to back up a running database, and it supports incremental copies.
 
-```bash
-cp engrava.db engrava.db-wal engrava.db-shm /backup/
-```
-
-**3. `VACUUM INTO`** — write a clean, compacted copy without locking the source
-for the whole copy:
+**`VACUUM INTO`** — writes a fresh, consistent, compacted copy of the database to
+a new file. SQLite serialises it correctly against ongoing activity:
 
 ```bash
 sqlite3 engrava.db "VACUUM INTO 'engrava-backup.db';"
 ```
 
-**4. The SQLite Online Backup API** — for a hot backup of a live database from
-your own code (via the `sqlite3` backup API), if you need streaming/incremental
-copies.
+Both produce a single clean `.db` you can store or move; neither requires copying
+the `-wal`/`-shm` files.
 
-> Avoid a bare `cp engrava.db backup.db` on a database that is being written —
-> that is the one method that can silently lose WAL-resident data.
+### If you can stop or quiesce writers
+
+When you can take the database offline (or guarantee no writes for the duration),
+a file copy is safe — preferably after folding the WAL back into the main file:
+
+**Checkpoint, then copy the single file:**
+
+```bash
+# with no writers active:
+sqlite3 engrava.db "PRAGMA wal_checkpoint(TRUNCATE);"
+cp engrava.db engrava.db.bak
+```
+
+**Or copy the file set** (`engrava.db` + `-wal` + `-shm`) **as one atomic unit** —
+e.g. via a filesystem-level snapshot (LVM, ZFS, a cloud volume snapshot) that
+captures all three at the same instant. A plain `cp` of the three files of a
+*live* database is **not** atomic and can still be inconsistent; only do the
+multi-file copy when writers are stopped or behind a consistent snapshot.
+
+> **Do not** rely on a bare `cp engrava.db backup.db` — or even a non-atomic
+> `cp engrava.db engrava.db-wal engrava.db-shm ...` — while the database is being
+> written. For a live database use the Online Backup API or `VACUUM INTO`.
 
 ## Restoring
 
 - **From a snapshot:** `engrava --db <target> restore -i backup.jsonl`. Restore
   into a **fresh** database (optionally `--clear` an existing one). Remember the
   journal is not restored.
-- **From a physical backup:** stop the process, put the backed-up file(s) in
-  place, and start again. If you copied the three WAL files, restore all three
-  together; if you checkpointed before copying, the single `.db` is sufficient.
+- **From a physical backup:** stop the process, put the backed-up file in place,
+  and start again. A backup made with the Online Backup API, `VACUUM INTO`, or a
+  checkpoint-then-copy is a single self-contained `.db`. If instead you captured a
+  multi-file filesystem snapshot, restore `engrava.db`, `engrava.db-wal`, and
+  `engrava.db-shm` together as the unit they were snapshotted in.
 
 ### Verify a restore
 

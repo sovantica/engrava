@@ -50,9 +50,10 @@ keeps **three** files side by side:
 
 Operational consequences:
 
-- **Back up all three together**, or use a WAL-safe method — copying only the
-  `.db` file can lose data still in the `-wal`. See
-  [Backup & Recovery](backup-and-recovery.md).
+- **Use a WAL-safe backup method** — copying only the `.db` file (or copying the
+  three files non-atomically while writes continue) can capture inconsistent
+  state. See [Backup & Recovery](backup-and-recovery.md) for the live-vs-stopped
+  options.
 - **Put them on a real local filesystem.** SQLite + WAL on networked filesystems
   (NFS, some container overlay mounts) can corrupt or fail locking. Use a local
   disk or a properly-configured volume.
@@ -64,7 +65,10 @@ Operational consequences:
 
 - **Mount a volume for the database directory**, not just the file — SQLite needs
   to create the `-wal`/`-shm` siblings next to the `.db`.
-- Point `database.path` (or `ENGRAVA_DB`) at the mounted volume.
+- Point `database.path` in your `engrava.yaml` at the mounted volume — that's the
+  setting `from_config` reads. (`ENGRAVA_DB` is a **CLI-only** fallback for the
+  `engrava --db` flag; it does **not** configure `from_config`, so application
+  code should set `database.path`, not rely on `ENGRAVA_DB`.)
 - One container instance = one writer. If you scale to multiple replicas, they
   must **not** all write the same database file (see
   [multi-process](concurrency.md#multiple-processes)). Either run a single writer
@@ -85,17 +89,38 @@ Engrava follows SQLite's single-writer model. For multi-worker app servers
 
 ## Graceful shutdown
 
-If you opened the store via `from_config` as a context manager, leaving the
-`async with` block closes the connection for you. If you constructed the store
-some other way, close it explicitly on shutdown so the WAL is checkpointed and
-handles are released:
+Who closes the connection depends on how you opened the store — because the store
+only closes a connection it **owns**:
 
-```python
-await store.close()
-```
+- **`from_config` (owned connection).** `from_config` opens and owns the
+  connection. Leaving the `async with` block closes it for you; equivalently, call
+  `await store.close()`, which checkpoints the WAL and releases the handle.
 
-Wire this into your framework's shutdown hook (e.g. FastAPI `lifespan`, a signal
-handler) so an interrupted process still closes cleanly.
+  ```python
+  async with await SqliteEngravaCore.from_config("engrava.yaml") as store:
+      ...
+  # connection closed here
+
+  # or, if you hold the store yourself:
+  await store.close()
+  ```
+
+- **Manual `SqliteEngravaCore(conn)` (caller-managed connection).** The store does
+  **not** own your connection, so `store.close()` is a **no-op** here — *you* must
+  close the connection you created:
+
+  ```python
+  conn = await aiosqlite.connect("engrava.db")
+  conn.row_factory = aiosqlite.Row
+  store = SqliteEngravaCore(conn)
+  ...
+  await conn.close()  # the caller owns and closes the connection
+  ```
+
+  (Using `async with aiosqlite.connect(...) as conn:` handles this for you.)
+
+Wire whichever applies into your framework's shutdown hook (e.g. FastAPI
+`lifespan`, a signal handler) so an interrupted process still closes cleanly.
 
 ## See also
 
