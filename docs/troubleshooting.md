@@ -51,8 +51,8 @@ ValueError: 'INSIGHT' is not a valid ThoughtType
 ```python
 from engrava import ThoughtType
 
-ThoughtType.BELIEF          # preferred
-ThoughtType("BELIEF")       # also valid — must match a real member
+ThoughtType.BELIEF  # preferred
+ThoughtType("BELIEF")  # also valid — must match a real member
 ```
 
 See [Core Concepts](concepts.md) for the full taxonomy and when to use each type.
@@ -110,7 +110,7 @@ from engrava.extensions.dreaming import DreamingExtension
 
 config = DreamingConfig(
     enabled=True,
-    promote_threshold=0.4,   # lower it if nothing clears the bar
+    promote_threshold=0.4,  # lower it if nothing clears the bar
     gates=DreamingGates(
         allow_zero_confirmation=True,  # essential for single-write ingest
         min_age_cycles=1,

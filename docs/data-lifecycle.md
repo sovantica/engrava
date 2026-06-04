@@ -54,7 +54,7 @@ thoughts are **excluded** from `count_thoughts(...)` and `list_thoughts(...)` â€
 pass `include_expired=True` to include them:
 
 ```python
-live = await store.count_thoughts()                      # excludes expired
+live = await store.count_thoughts()  # excludes expired
 everything = await store.count_thoughts(include_expired=True)
 ```
 
@@ -81,9 +81,9 @@ Expiry is applied by an explicit cleanup pass â€” nothing happens on a timer.
 
 ```python
 result = await store.cleanup_expired()
-print(result.expired_count)       # how many thoughts were expired
-print(result.strategy_applied)    # "archive" or "delete" (per config)
-print(result.timestamp)           # ISO-8601 time of the pass
+print(result.expired_count)  # how many thoughts were expired
+print(result.strategy_applied)  # "archive" or "delete" (per config)
+print(result.timestamp)  # ISO-8601 time of the pass
 ```
 
 You can also have the store run cleanup automatically every *N* operations via
