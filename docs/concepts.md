@@ -80,8 +80,13 @@ CREATED → ACTIVE → DONE → ARCHIVED
 ```
 
 `LifecycleStatus` transitions are enforced (`evolve()` rejects illegal jumps).
-`ARCHIVED` thoughts are excluded from normal results and become eligible for
-garbage collection. Most thoughts you create will start `ACTIVE`.
+Most thoughts you create will start `ACTIVE`. `ARCHIVED` is a **soft-retired**
+retention state and a marker for garbage collection — an archived regular thought
+is **not** automatically hidden from `search_hybrid` / `list_thoughts` /
+`count_thoughts`; it stays searchable until you remove it with `engrava gc`. The
+only rows search auto-excludes are **expired** thoughts and **retired
+REFLECTIONs**. See [Data Lifecycle](data-lifecycle.md) for the full
+retention and garbage-collection behavior.
 
 ## Edge
 
