@@ -62,9 +62,10 @@ The tradeoffs are laid out in the
 ## When should I enable dreaming?
 
 Enable [dreaming](dreaming.md) when memory **accumulates over time** and you want
-the store to surface and link what matters (promote important thoughts to P1,
-build associative edges, and from v0.4.0 create REFLECTION summaries). It is not
-useful on a tiny or write-once store. Run it periodically (every N cycles, a cron
+the store to surface and link what matters: it promotes important thoughts to P1,
+builds associative edges, and clusters related thoughts into
+[`REFLECTION`](concepts.md) summaries. It is not useful on a tiny or write-once
+store. Run it periodically (every N cycles, a cron
 job, or manually) — never on the hot CRUD path. For single-write batch ingest,
 keep `allow_zero_confirmation=True` or nothing will ever pass the confirmation
 gate. See the agent loop's
@@ -75,8 +76,15 @@ gate. See the agent loop's
 A cycle is a **consumer-owned monotonic logical clock** — your agent's tick.
 Engrava never advances or persists it for you; you pass `current_cycle` into
 search and consolidation. It drives the recency signal and the dreaming age gate.
-On restart, recover it from `max(created_cycle)` in the store. Leaving it at `0`
-forever disables recency and keeps dreaming inert. See
+On restart, recover it from `max(created_cycle)` in the store.
+
+Two ways to get it wrong have different effects: passing `current_cycle=None`
+(the `search_hybrid` default) makes the recency signal **inactive** — it is
+dropped from the ranking. Passing a **constant** (e.g. always `0`, never
+advancing `created_cycle`/`updated_cycle`) keeps recency *active but useless* —
+every thought's age collapses to the same value, so nothing looks more recent
+than anything else, and the dreaming age gate (`min_age_cycles`) never opens.
+Advance the cycle each turn. See
 [Core Concepts → Cycle](concepts.md) and the related
 [Troubleshooting entry](troubleshooting.md#dreaming-promotes-nothing-consolidation-is-inert).
 
