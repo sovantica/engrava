@@ -262,3 +262,5 @@ Build something next, then reach for the references:
 - [Configuration](configuration.md) — YAML-based setup for production use
 - [API Reference](api-reference.md) — full class and method reference
 - [MindQL](mindql.md) — complete query language reference
+- [Troubleshooting](troubleshooting.md) — when something doesn't work as expected
+- [FAQ](faq.md) — quick answers to common questions
