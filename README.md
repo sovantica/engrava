@@ -175,6 +175,17 @@ since 0.3.0.
 → See [`docs/benchmarks.md`](docs/benchmarks.md) for reproducible
 evidence (synthetic benchmark suite runnable in ~5 minutes).
 
+### Tamper-Evident Audit Trail
+
+Opt-in hash-chain **journal** that records every thought/edge mutation as a
+SHA-256-linked, before/after entry — off by default, one config flag to enable.
+Query history with `store.journal.get_entries(...)` and validate the chain with
+`store.journal.verify_integrity()`.
+
+→ See [`docs/audit-trail.md`](docs/audit-trail.md) for enabling, querying,
+verification, and the security model (what "tamper-evident" does and does not
+guarantee).
+
 ### Multi-Service Isolation
 
 Run multiple independent databases under one `EngravaManager`:
@@ -203,6 +214,8 @@ engrava --db mydata.db export -o portable.json
 `engrava info` now renders the same metrics snapshot contract exposed by
 `await store.metrics()`.
 
+See the [CLI reference](docs/cli.md) for every command and option.
+
 ## Architecture
 
 - **SQLite** with WAL mode for concurrent reads
@@ -214,13 +227,30 @@ engrava --db mydata.db export -o portable.json
 
 ## Documentation
 
-- [Upgrade Guide](docs/upgrade.md) — compatibility matrix, backups, and troubleshooting
+- [Core Concepts](docs/concepts.md) — the mental model (thought, edge, reflection, cycle, …) — start here
+- [Positioning](docs/positioning.md) — when Engrava is (and isn't) the right tool, and how it compares
 - [Quick Start](docs/quickstart.md) — 5-minute setup guide
+- [Tutorial](docs/tutorial.md) — build a small notes memory end to end
+- [Recipes](docs/recipes/index.md) — copy-paste snippets for common tasks (store a turn, retrieve context, TTL, dedup, …)
+- [Building a memory-backed agent](docs/guides/agent-memory.md) — the end-to-end agent turn loop (ingest → retrieve → generate → consolidate)
+- [Migrating from another memory system](docs/guides/migrating-from-other-memory.md) — concept mapping, porting calls, bulk import, and scoping/multi-tenancy
+- [Embeddings](docs/guides/embeddings.md) — wiring a real embedding provider (local / OpenAI / Ollama / HuggingFace / custom)
 - [Configuration](docs/configuration.md) — YAML config format and options
+- [Upgrade Guide](docs/upgrade.md) — compatibility matrix, backups, and troubleshooting
 - [Extensions](docs/extensions.md) — Writing custom extensions and hooks
 - [Observability](docs/observability.md) — Metrics snapshot API
+- [Audit Trail](docs/audit-trail.md) — Tamper-evident hash-chain journal (enabling, querying, verifying, security model)
 - [API Reference](docs/api-reference.md) — Full protocol and class reference
+- [CLI Reference](docs/cli.md) — every `engrava` command and option
+- [Glossary](docs/glossary.md) — quick definitions of every Engrava term
 - [MindQL](docs/mindql.md) — Query language syntax and examples
+- [Troubleshooting](docs/troubleshooting.md) — symptom → cause → fix for common errors
+- [FAQ](docs/faq.md) — quick answers (LLM/keys, embeddings-optional, scale, concurrency, backups, …)
+- [Performance & Scaling](docs/performance.md) — the vector-backend switch, bulk-ingest, and dreaming cost at scale
+- [Data Lifecycle & Retention](docs/data-lifecycle.md) — lifecycle states, TTL, archive-vs-delete, GDPR erasure, disk reclamation
+- [Deployment](docs/deployment.md) — process model, database files on disk, containers, graceful shutdown
+- [Concurrency](docs/concurrency.md) — the WAL single-writer model, busy timeout, and per-service isolation
+- [Backup & Recovery](docs/backup-and-recovery.md) — WAL-safe backups, snapshot vs file copy, restore verification
 - [Known Limitations](docs/known-limitations.md) — Platform notes and constraints
 
 ## Development

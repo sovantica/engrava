@@ -135,6 +135,14 @@ stored = await store.create_thought(observation)
 print(f"Created thought: {stored.thought_id}")
 ```
 
+> **About `created_cycle` / `updated_cycle`.** A *cycle* is a consumer-owned
+> logical clock — Engrava never advances it for you. `0` is fine for this
+> quickstart, but in a real long-running agent you should keep a counter and
+> increment it once per turn, using it for these fields (and for `current_cycle`
+> in search / consolidation). Otherwise recency can't tell old memories from new
+> and dreaming's age gate never opens. See
+> [Cycle (the agent clock)](concepts.md#cycle-the-agent-clock).
+
 ## Link Thoughts with Edges
 
 ```python
@@ -180,19 +188,20 @@ for thought_id, score in await store.search_fts("Python AI", top_k=5):
 
 ### Embedding Similarity Search
 
-```python
-from engrava import CallbackProvider
+Use a real embedding provider so similarity is meaningful (this needs the
+`embeddings-local` extra; see the [Embeddings guide](guides/embeddings.md) for
+all provider options):
 
-# Use any embedding function
-provider = CallbackProvider(
-    callback=lambda text: [0.1] * 384,  # Replace with real embeddings
-    dimension=384,
-    model_name="my-model",
-)
+```python
+from engrava import SentenceTransformerProvider
+
+provider = SentenceTransformerProvider(model_name="all-MiniLM-L6-v2")
 
 # Store an embedding for an existing thought
 vector = await provider.embed(observation.content)
-await store.store_embedding(observation.thought_id, vector, model_name="my-model")
+await store.store_embedding(
+    observation.thought_id, vector, model_name=provider.model_name
+)
 
 # Search by similarity — returns (thought_id, score) tuples
 for thought_id, score in await store.search_similar(vector, top_k=5):
@@ -200,6 +209,10 @@ for thought_id, score in await store.search_similar(vector, top_k=5):
     if record is not None:
         print(f"  {record.essence}  (score: {score:.3f})")
 ```
+
+> Tip: configure the provider on the store with `auto_embed=True` (or via
+> `engrava.yaml`) and Engrava embeds thoughts on write — and embeds your query
+> for you in `search_hybrid`. See the [Embeddings guide](guides/embeddings.md).
 
 ## Query with MindQL
 
@@ -240,7 +253,14 @@ engrava --db my_thoughts.db restore -i backup.jsonl
 
 ## Next Steps
 
+Build something next, then reach for the references:
+
+- [Tutorial](tutorial.md) — build a small notes memory end to end (start here)
+- [Recipes](recipes/index.md) — copy-paste snippets: store a turn, retrieve context, TTL, dedup, session scoping
+- [Building a memory-backed agent](guides/agent-memory.md) — the full agent turn loop
+- [Core Concepts](concepts.md) — the mental model (thought, edge, reflection, cycle)
 - [Configuration](configuration.md) — YAML-based setup for production use
-- [Extensions](extensions.md) — Hook into the thought lifecycle
-- [API Reference](api-reference.md) — Full class and method reference
-- [MindQL](mindql.md) — Complete query language reference
+- [API Reference](api-reference.md) — full class and method reference
+- [MindQL](mindql.md) — complete query language reference
+- [Troubleshooting](troubleshooting.md) — when something doesn't work as expected
+- [FAQ](faq.md) — quick answers to common questions

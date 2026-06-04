@@ -11,7 +11,7 @@ database:
 
 extensions:
   vector:
-    backend: numpy       # "numpy" (brute-force) or "sqlite-vec" (ANN)
+    backend: numpy       # "numpy" (brute-force) or "sqlite-vec" (faster KNN, not ANN)
     dimension: 384       # must match your embedding model
 
   dreaming:

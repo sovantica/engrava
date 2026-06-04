@@ -1,9 +1,13 @@
-"""SqliteVecSearchBackend — ANN vector search via sqlite-vec.
+"""SqliteVecSearchBackend — KNN vector search via sqlite-vec.
 
 Drop-in replacement for the brute-force numpy cosine similarity search
 in ``SqliteEngravaCore``.  When ``sqlite-vec`` is installed and its
 extension is loaded, ``search_similar()`` delegates to the ``vec0``
-virtual table for O(log n) approximate nearest-neighbor queries.
+virtual table for k-nearest-neighbour queries.  In the pinned
+``sqlite-vec`` 0.1.x line ``vec0`` performs an exhaustive scan over a
+compact, chunked columnar store of the vectors — faster and more
+memory-efficient than the Python brute-force path, but **not** an
+approximate / sub-linear index (no ANN guarantee at this version).
 
 If sqlite-vec is unavailable at runtime the store falls back to the
 existing numpy implementation — no crash, just a warning log.
@@ -23,12 +27,12 @@ logger = logging.getLogger(__name__)
 
 
 class SqliteVecSearchBackend:
-    """ANN vector search backend backed by a ``vec0`` virtual table.
+    """KNN vector search backend backed by a ``vec0`` virtual table.
 
     Lifecycle:
         1. ``ensure_index(db, dimension)`` — creates the virtual table.
         2. ``sync_embeddings(db)`` — backfills existing rows.
-        3. ``search(db, query_vector, ...)`` — runs ANN queries.
+        3. ``search(db, query_vector, ...)`` — runs k-nearest-neighbour queries.
 
     All state is kept in SQLite; this class is stateless aside from
     the cached ``dimension``.
@@ -110,7 +114,7 @@ class SqliteVecSearchBackend:
         top_k: int = 10,
         threshold: float = 0.0,
     ) -> list[tuple[str, float]]:
-        """ANN search via sqlite-vec ``vec0`` virtual table.
+        """k-nearest-neighbour search via the sqlite-vec ``vec0`` virtual table.
 
         The ``vec0`` table uses cosine distance (``1 - cosine_similarity``).
         Results are converted to cosine similarity via ``1 - distance``
@@ -174,8 +178,8 @@ class SqliteVecSearchBackend:
     ) -> None:
         """Insert or replace a single embedding in the ``vec0`` index.
 
-        Used by ``store_embedding()`` to keep the ANN index in sync
-        after each write to the ``embedding`` table.
+        Used by ``store_embedding()`` to keep the ``vec0`` vector table in
+        sync after each write to the ``embedding`` table.
 
         Args:
             db: Active database connection with sqlite-vec loaded.

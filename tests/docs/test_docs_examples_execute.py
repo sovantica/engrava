@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 EXECUTABLE_BLOCKS: tuple[tuple[str, str], ...] = (
     ("README.md", "async def main() -> None:"),
     ("docs/quickstart.md", 'print("Store ready!")'),
+    ("docs/guides/migrating-from-other-memory.md", "Imported {total} thoughts."),
 )
 
 
