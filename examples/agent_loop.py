@@ -106,9 +106,7 @@ async def _store_percept(
     return await store.create_thought(record)
 
 
-async def _retrieve_context(
-    store: SqliteEngravaCore, query: str, cycle: int
-) -> list[str]:
+async def _retrieve_context(store: SqliteEngravaCore, query: str, cycle: int) -> list[str]:
     """Return the essences of the most relevant prior memories."""
     result = await store.search_hybrid(
         query,
@@ -155,9 +153,7 @@ async def _store_utterance(
     return await store.create_thought(record)
 
 
-async def _record_action(
-    store: SqliteEngravaCore, source_thought_id: str, intent: str
-) -> None:
+async def _record_action(store: SqliteEngravaCore, source_thought_id: str, intent: str) -> None:
     """Record that the agent took an action, linked to the source thought."""
     await store.create_action(
         ActionRecord(
