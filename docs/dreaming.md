@@ -8,6 +8,75 @@ Dreaming runs **outside** the normal CRUD path — the consumer decides
 when to invoke `run_consolidation()` (after N cycles, in a cron job,
 or manually).
 
+## How memory consolidation works (the dreaming loop)
+
+Think of a single memory's journey through an agent's lifetime. The first two
+steps — ingest and confirmation — happen on the **normal write path** as you use
+the store. The consolidation part is **manual**: when you call
+`run_consolidation()`, that one call runs promotion → edge creation → reflection
+clustering/creation → an orphan sweep, in order.
+
+```
+  ingest        you create an OBSERVATION ("user prefers email")   (write path)
+    │
+    ▼
+  confirm       the same fact is re-encountered over time, so its  (write path)
+    │           confirmation_count grows (e.g. via deduplicate=True)
+    │
+    ▼  run_consolidation(current_cycle=N)   ── manual ──
+    │
+  ┌─┴───────────────────────────────────────────────────────┐
+  │ 1. promote   thoughts that pass the gates and clear       │
+  │              promote_threshold are raised to priority P1  │
+  │ 2. link      a promoted thought *may* gain ASSOCIATED      │
+  │              edges to similar neighbours (when enabled)    │
+  │ 3. reflect   related thoughts *may* be clustered into      │
+  │              REFLECTION meta-thoughts (when enabled)       │
+  │ 4. sweep     stale REFLECTIONs whose sources left the      │
+  │              active set are retired                         │
+  └─┬───────────────────────────────────────────────────────┘
+    │
+    ▼
+  improved      later searches rank the P1 memory higher (priority
+  retrieval     signal), follow any new edges (graph signal), and can
+                surface a REFLECTION instead of many raw thoughts
+```
+
+Walking the journey:
+
+1. **Ingest.** You store memories as thoughts (typically `OBSERVATION`s) on the
+   normal write path. Dreaming does nothing yet.
+2. **Confirm.** As the same knowledge recurs, its `confirmation_count` rises —
+   automatically when you write with `deduplicate=True` (identical content
+   collapses and bumps the count), or via your own logic. This is *evidence the
+   memory matters*, and it feeds dreaming's confirmation signal. (Distinct from
+   `confidence`, the static belief-strength you set — see
+   [Core Concepts](concepts.md#reliability-confidence-vs-confirmation_count).)
+3. **Promote.** When you run consolidation, each candidate must first pass the
+   [gates](#gates) (e.g. old enough, enough confirmations) and then score above
+   `promote_threshold` across the weighted [signals](#signals). Survivors are
+   promoted to **P1**. (Both bars matter: a thought that passes the gates but
+   scores low is *not* promoted — see
+   [Troubleshooting](troubleshooting.md#dreaming-promotes-nothing-consolidation-is-inert).)
+4. **Link.** A promoted thought *may* gain `ASSOCIATED` [edges](#edge-creation)
+   to similar neighbours — when edge creation is enabled, the thought has a stored
+   embedding, and qualifying neighbours (above `min_similarity`) are found. New
+   edges persist the structure in the graph, idempotently (re-runs don't
+   duplicate edges).
+5. **Reflect.** Related thoughts *may* be clustered and summarised into
+   [`REFLECTION`](#reflections-meta-consolidation) meta-thoughts — a centroid
+   embedding plus `CONSOLIDATED_FROM` edges back to the members — when reflections
+   are enabled and eligible clusters pass the clustering/quality gates. This turns
+   a pile of observations into fewer, higher-level memories. (A REFLECTION whose
+   source cluster later leaves the active set is automatically retired so a stale
+   summary can't resurface.)
+6. **Improved retrieval.** All of this changes future
+   [hybrid search](search.md): the P1 memory ranks higher via the priority
+   signal, any new edges feed the opt-in graph signal, and reflections let one
+   high-level memory stand in for many raw ones.
+
+The rest of this page is the knob-by-knob reference for each phase.
+
 ## Quick start
 
 ```python
@@ -74,6 +143,7 @@ Custom signals can be provided via `DreamingSignalProtocol`:
 class MySignal:
     def __call__(self, thought: ThoughtRecord, ctx: DreamingContext) -> float:
         return 0.42
+
 
 ext = DreamingExtension(
     config=config,
@@ -224,6 +294,14 @@ counts from member text, centroid from member vectors). LLM-generated
 prose summaries belong in downstream extension hooks, not in the
 core graph layer.
 
+> **Navigating the lineage.** The `CONSOLIDATED_FROM` edges are queryable
+> through dedicated store helpers — `consolidated_member_ids(reflection_id)`,
+> `consolidated_source_statuses(reflection_id)`, and the reverse
+> `reflections_consolidated_from(source_id)`. Use them to walk from a REFLECTION
+> to its sources and back (e.g. for provenance views or orphan detection)
+> instead of querying the edge table directly. See
+> [REFLECTION lineage](api-reference.md#reflection-lineage) in the API reference.
+
 ### How clustering works
 
 Two algorithms are available via `DreamingGates.cluster_algorithm`:
@@ -267,8 +345,8 @@ extensions:
 
 ```python
 result = await ext.run_consolidation(store, current_cycle=42)
-print(result.promoted_count)       # thoughts promoted to P1
-print(result.edges_created)        # ASSOCIATED edges created
+print(result.promoted_count)  # thoughts promoted to P1
+print(result.edges_created)  # ASSOCIATED edges created
 print(result.reflections_created)  # new REFLECTION thoughts created
 ```
 

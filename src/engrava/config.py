@@ -727,7 +727,8 @@ class EngravaConfig:
         database_path: Path to the SQLite database file.
         wal_mode: Enable WAL journal mode for concurrent reads.
         hooks_class: Dotted import path to a ``EngravaHooksProtocol`` class.
-        vector_backend: ``"numpy"`` (default brute-force) or ``"sqlite-vec"`` (ANN).
+        vector_backend: ``"numpy"`` (default brute-force) or ``"sqlite-vec"``
+            (compact ``vec0`` vector table — faster brute-force KNN, not ANN).
         embedding_dimension: Dimension of embedding vectors (e.g. 384 for MiniLM).
         dreaming: Optional dreaming-consolidation configuration.
         embeddings: Optional embedding-provider configuration.

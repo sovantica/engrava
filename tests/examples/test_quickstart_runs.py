@@ -49,6 +49,31 @@ def test_quickstart_runs_to_completion() -> None:
     assert "teal" in result.stdout.lower()
 
 
+def test_agent_loop_runs_to_completion() -> None:
+    """``agent_loop.py`` runs the full memory-backed turn loop to a clean exit.
+
+    Unlike the quickstart it needs no local-embeddings extra — it uses a
+    deterministic ``CallbackProvider`` and a mock LLM — so it always runs.
+    """
+    result = _run_example("agent_loop.py")
+    assert result.returncode == 0, f"non-zero exit; stderr=\n{result.stderr}"
+    assert "cycle 0:" in result.stdout
+    assert "[dreaming]" in result.stdout
+    assert "Done." in result.stdout
+
+
+def test_notes_memory_runs_to_completion() -> None:
+    """``notes_memory.py`` (the tutorial companion) runs to a clean exit.
+
+    Uses a deterministic ``CallbackProvider`` — no local-embeddings extra — so it
+    always runs.
+    """
+    result = _run_example("notes_memory.py")
+    assert result.returncode == 0, f"non-zero exit; stderr=\n{result.stderr}"
+    assert "Query:" in result.stdout
+    assert "Stored 4 notes." in result.stdout
+
+
 def test_dreaming_benefit_script_not_shipped() -> None:
     """The fresh-store dreaming walkthrough script is not part of the public surface.
 
