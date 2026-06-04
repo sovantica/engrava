@@ -225,9 +225,10 @@ engrava --db mydata.db export -o portable.json
 
 ## Documentation
 
-- [Upgrade Guide](docs/upgrade.md) — compatibility matrix, backups, and troubleshooting
+- [Core Concepts](docs/concepts.md) — the mental model (thought, edge, reflection, cycle, …) — start here
 - [Quick Start](docs/quickstart.md) — 5-minute setup guide
 - [Configuration](docs/configuration.md) — YAML config format and options
+- [Upgrade Guide](docs/upgrade.md) — compatibility matrix, backups, and troubleshooting
 - [Extensions](docs/extensions.md) — Writing custom extensions and hooks
 - [Observability](docs/observability.md) — Metrics snapshot API
 - [Audit Trail](docs/audit-trail.md) — Tamper-evident hash-chain journal (enabling, querying, verifying, security model)
