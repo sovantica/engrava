@@ -217,12 +217,16 @@ Wire a custom `EngravaHooksProtocol` implementation by dotted path. See
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `class` | `str \| null` | `null` | Dotted import path to a hooks class (`"module.path:ClassName"`), instantiated and used by `from_config` |
+| `class` | `str \| null` | `null` | Dotted import path to a hooks class, last segment is the class name (e.g. `"my_package.hooks.MyHooks"`), instantiated and used by `from_config` |
 
 ```yaml
 hooks:
-  class: "my_package.hooks:MyHooks"
+  class: "my_package.hooks.MyHooks"
 ```
+
+The path is split on the final dot (`module.path` + `ClassName`) — this is a
+plain dotted path, **not** the `module.path:ATTRIBUTE` colon form used by
+[`manifests.paths`](#manifests) below.
 
 ### `manifests`
 
@@ -252,10 +256,13 @@ manifests:
 
 ## Environment Variables
 
+Both are read by the **`engrava` CLI** only (library callers pass paths
+explicitly to `load_config` / `SqliteEngravaCore`).
+
 | Variable | Description |
 |----------|-------------|
-| `ENGRAVA_CONFIG` | Path to the YAML configuration file |
-| `ENGRAVA_DB` | Override `db_path` from configuration |
+| `ENGRAVA_CONFIG` | Fallback path to the YAML configuration file when `--config` is omitted (`--config` > `ENGRAVA_CONFIG` > none) |
+| `ENGRAVA_DB` | Fallback database-file path when `--db` is omitted (`--db` > `ENGRAVA_DB` > `./engrava.db`) |
 
 ## Multi-Service Usage
 
