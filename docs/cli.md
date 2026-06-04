@@ -78,12 +78,23 @@ Exports the **entire** database to a JSONL snapshot (one record per line).
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `-o`, `--output` | path | `<service>.snapshot.jsonl` (derived) | Output JSONL file path. |
-| `--service` | name | default service | In multi-service mode, the service to snapshot. |
+| `-o`, `--output` | path | derived (see below) | Output JSONL file path. |
+| `--service` | name | see below | The service to snapshot (multi-service mode only). |
+
+**Default output path** depends on the mode:
+
+- **Single database:** `<db-stem>.snapshot.jsonl` next to the database — e.g.
+  `--db engrava.db` → `engrava.snapshot.jsonl` (the `.db` suffix is replaced).
+- **Multi-service:** `<data_dir>/<service>.snapshot.jsonl`.
+
+**`--service`** only applies when a **services config is loaded**. In that case,
+omitting it falls back to `services.default_service`. Without a services config,
+`--service` has no effect and the command snapshots the single `--db` database.
 
 ```bash
 engrava --db engrava.db snapshot -o backup.jsonl
-engrava snapshot --service tenant_a            # multi-service
+engrava --db engrava.db snapshot               # -> engrava.snapshot.jsonl
+engrava --config engrava.yaml snapshot --service tenant_a   # multi-service
 ```
 
 > A snapshot exports `thought`, `edge`, `embedding`, and `action` records — but
