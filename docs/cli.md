@@ -42,6 +42,21 @@ engrava --db other.db info         # flag overrides the env var
 | [`migrate`](#migrate) | Run pending schema migrations. |
 | [`export`](#export) | Export thoughts to a portable JSON file. |
 
+## Service resolution
+
+The `--service` option on `snapshot` and `restore` resolves the same way in both
+commands:
+
+| `--service` | Services config loaded? | Result |
+|---|---|---|
+| `--service NAME` (explicit) | either | Targets service **NAME**. Its database is found/created in the services `data_dir` if a config is loaded, otherwise in the **parent directory of `--db`** (i.e. `<parent-of-db>/NAME.db`). |
+| omitted | yes | Falls back to `services.default_service`. |
+| omitted | no | Operates on the single `--db` database (not service mode). |
+
+In short: an explicit `--service` works even without a services config (using
+`--db`'s directory as the data directory), while omitting it only enters
+multi-service mode when a services config is present.
+
 ### `info`
 
 Shows a metrics snapshot (counts, etc.) for the current database. Takes no
@@ -87,14 +102,21 @@ Exports the **entire** database to a JSONL snapshot (one record per line).
   `--db engrava.db` → `engrava.snapshot.jsonl` (the `.db` suffix is replaced).
 - **Multi-service:** `<data_dir>/<service>.snapshot.jsonl`.
 
-**`--service`** only applies when a **services config is loaded**. In that case,
-omitting it falls back to `services.default_service`. Without a services config,
-`--service` has no effect and the command snapshots the single `--db` database.
+**`--service`** resolves in three ways (see [Service resolution](#service-resolution)):
+
+- **Explicit `--service NAME`** targets that service even with no services config
+  — the service database is looked up/created in the data directory, which is the
+  services config's `data_dir` if one is loaded, otherwise the **parent directory
+  of `--db`**.
+- **Omitted, with a services config loaded** → falls back to
+  `services.default_service`.
+- **Omitted, with no services config** → snapshots the single `--db` database.
 
 ```bash
 engrava --db engrava.db snapshot -o backup.jsonl
 engrava --db engrava.db snapshot               # -> engrava.snapshot.jsonl
-engrava --config engrava.yaml snapshot --service tenant_a   # multi-service
+engrava --db /data/engrava.db snapshot --service tenant_a   # -> /data/tenant_a.snapshot.jsonl
+engrava --config engrava.yaml snapshot --service tenant_a   # data_dir from config
 ```
 
 > A snapshot exports `thought`, `edge`, `embedding`, and `action` records — but
@@ -112,7 +134,14 @@ Restores a database from a JSONL snapshot produced by `snapshot`.
 | `--clear` | flag | off | Clear existing data before restoring. |
 | `--skip-embeddings` | flag | off | Import without embedding records. |
 | `--re-embed` | flag | off | Re-embed all thoughts via the target provider, ignoring source embeddings. |
-| `--service` | name | default service | In multi-service mode, the service to restore into. |
+| `--service` | name | see below | The service to restore into. |
+
+`--service` resolves exactly as for [`snapshot`](#service-resolution): an explicit
+`--service NAME` targets that service even without a services config (its database
+resolves in the services `data_dir`, or the **parent directory of `--db`** when no
+config is loaded); omitted with a services config falls back to
+`services.default_service`; omitted with no services config restores into the
+single `--db` database.
 
 `--skip-embeddings` and `--re-embed` are **mutually exclusive** — passing both
 fails with:
