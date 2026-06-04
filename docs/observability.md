@@ -88,11 +88,11 @@ async def collect(store) -> None:
     SEARCH_P99.set(m.search_latency.p99_ms)
 ```
 
-The fields available to export are exactly those on `EngravaMetrics`:
-`thoughts` (`total`, `by_type`, `by_status`), `edges` (`total`, `by_type`),
-`storage` (`db_bytes`, `wal_bytes`, `vec_index_bytes`, `total_bytes`), and
-`search_latency` (`sample_count`, `p50_ms`, `p95_ms`, `p99_ms`, `min_ms`,
-`max_ms`, `mean_ms`).
+The main metric groups on `EngravaMetrics` are `thoughts` (`total`, `by_type`,
+`by_status`), `edges` (`total`, `by_type`), `storage` (`db_bytes`, `wal_bytes`,
+`vec_index_bytes`, `total_bytes`), and `search_latency` (`sample_count`,
+`p50_ms`, `p95_ms`, `p99_ms`, `min_ms`, `max_ms`, `mean_ms`). The snapshot also
+carries `schema_version` and `snapshot_timestamp` for the snapshot itself.
 
 ### Scrape cadence
 
@@ -110,24 +110,43 @@ SQL queries.
 | WAL not checkpointing | `storage.wal_bytes` | the WAL keeps growing and never shrinks (checkpoints not happening) |
 | Search latency | `search_latency.p95_ms` / `p99_ms` | p95/p99 exceeds your budget — often the sign you've passed the brute-force vector ceiling (see [Performance](performance.md)) |
 | Expired backlog | `count_thoughts(include_expired=True)` − `count_thoughts()` | the number of expired-but-not-cleaned thoughts grows (run `engrava gc --expired`) — see [Data Lifecycle](data-lifecycle.md) |
-| Audit integrity | `await store.journal.verify_integrity()` | the chain fails verification (tampering or corruption) — see [Audit Trail](audit-trail.md) |
+| Audit integrity | `store.journal.verify_integrity()` (journaling only) | the chain fails verification (tampering or corruption) — see [Audit Trail](audit-trail.md) |
 
 The expired-backlog and audit-integrity signals are **not** in the metrics
 snapshot — compute them from the calls shown above on your own cadence.
 
+The audit-integrity check applies **only when journaling is enabled**
+(`journal.enabled: true`). With journaling off, `store.journal` is `None`, so
+guard the call:
+
+```python
+async def journal_ok(store) -> bool:
+    if store.journal is None:
+        return True  # journaling disabled — nothing to verify
+    result = await store.journal.verify_integrity()
+    return result.is_valid
+```
+
 ### Health check
 
-A cheap liveness/readiness probe is a metrics call (which also confirms the
-database is reachable and the schema is readable):
+For a readiness probe you want a call that actually touches the database. Note
+that `metrics()` is **not** reliable for this when metrics are disabled: with
+`metrics.enabled: false`, `store.metrics()` returns a zero-filled snapshot
+**without issuing any SQL**, so it would report healthy even if the database were
+unreadable. Use a lightweight real read instead — `count_thoughts()` always
+queries the database (independent of the metrics setting):
 
 ```python
 async def healthcheck(store) -> bool:
     try:
-        await store.metrics()
+        await store.count_thoughts()  # issues SQL — confirms DB + schema are readable
     except Exception:
         return False
     return True
 ```
+
+(If you know metrics are enabled in your deployment, `await store.metrics()`
+works too and additionally returns the live counts.)
 
 ### Logging
 
