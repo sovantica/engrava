@@ -242,6 +242,7 @@ engrava --db mydata.db export -o portable.json
 - [MindQL](docs/mindql.md) — Query language syntax and examples
 - [Troubleshooting](docs/troubleshooting.md) — symptom → cause → fix for common errors
 - [FAQ](docs/faq.md) — quick answers (LLM/keys, embeddings-optional, scale, concurrency, backups, …)
+- [Performance & Scaling](docs/performance.md) — the vector-backend switch, bulk-ingest, and dreaming cost at scale
 - [Known Limitations](docs/known-limitations.md) — Platform notes and constraints
 
 ## Development

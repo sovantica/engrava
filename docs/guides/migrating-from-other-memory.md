@@ -167,6 +167,8 @@ transactions block the background SQLite thread (see
 If you have embeddings configured, note that each new thought is embedded on
 write (see the [Embeddings guide](embeddings.md)), so a bulk load pays the
 embedding cost up front — pre-compute vectors or import in batches accordingly.
+See the [Performance guide](../performance.md#write-throughput-and-bulk-ingest)
+for the throughput levers in detail.
 
 ## Filtering, scoping & multi-tenancy
 
