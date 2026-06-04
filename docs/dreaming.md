@@ -224,6 +224,14 @@ counts from member text, centroid from member vectors). LLM-generated
 prose summaries belong in downstream extension hooks, not in the
 core graph layer.
 
+> **Navigating the lineage.** The `CONSOLIDATED_FROM` edges are queryable
+> through dedicated store helpers — `consolidated_member_ids(reflection_id)`,
+> `consolidated_source_statuses(reflection_id)`, and the reverse
+> `reflections_consolidated_from(source_id)`. Use them to walk from a REFLECTION
+> to its sources and back (e.g. for provenance views or orphan detection)
+> instead of querying the edge table directly. See
+> [REFLECTION lineage](api-reference.md#reflection-lineage) in the API reference.
+
 ### How clustering works
 
 Two algorithms are available via `DreamingGates.cluster_algorithm`:

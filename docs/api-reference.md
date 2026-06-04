@@ -148,6 +148,28 @@ between a REFLECTION and the source thoughts it summarises.
 | `await reflections_consolidated_from(source_id)` | `list[str]` | The REFLECTION IDs that consolidated a given source thought (the reverse direction) |
 | `await thought_exists_by_source(*, source, thought_type_value)` | `bool` | Whether any thought exists with the given `source` and type — keyword-only |
 
+```python
+# Walk a REFLECTION down to its sources, and back from a source to its REFLECTIONs.
+member_ids = await store.consolidated_member_ids(reflection_id)
+for thought_id in member_ids:
+    source = await store.get_thought(thought_id)
+    if source is not None:
+        print(source.essence)
+
+# Detect an orphaned cluster — every source archived/gone:
+statuses = await store.consolidated_source_statuses(reflection_id)
+is_orphaned = bool(statuses) and all(s != "ACTIVE" for s in statuses)
+
+# Reverse direction: which REFLECTIONs summarise this source?
+parents = await store.reflections_consolidated_from(member_ids[0])
+
+# Exact-source existence check (e.g. dreaming's idempotency guard — a REFLECTION's
+# source is "dreaming:<cluster_hash>", so match the full value, not a prefix):
+exists = await store.thought_exists_by_source(
+    source="dreaming:abc123def4567890", thought_type_value="REFLECTION"
+)
+```
+
 #### Embedding Operations
 
 | Method | Returns | Description |
