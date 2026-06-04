@@ -167,6 +167,89 @@ is no per-service `db_path` — the file is derived as `<data_dir>/<name>.db`):
 |-----|------|---------|-------------|
 | `embeddings` | `dict` | — | Per-service embedding-provider override (same shape as the top-level `embeddings` section) |
 
+### `journal`
+
+The hash-chain audit trail. Off by default. See [Audit Trail](audit-trail.md).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | `bool` | `false` | Record every thought/edge mutation as a hash-linked journal entry |
+
+```yaml
+journal:
+  enabled: true
+```
+
+### `ttl`
+
+Time-to-live / auto-expiry of thoughts. See the
+[data-lifecycle recipes](recipes/index.md).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `strategy` | `str` | `"archive"` | What `cleanup_expired` does to expired thoughts: `"archive"` (soft, marks `ARCHIVED`) or `"delete"` (hard) |
+| `check_every_n_operations` | `int` | `0` | Run auto-cleanup every *N* store operations (`0` = manual only, via `cleanup_expired()` / `engrava gc --expired`) |
+| `default_ttl_seconds` | `int \| null` | `null` | Default TTL applied to new thoughts with no explicit `expires_at` (`null` = no default) |
+
+```yaml
+ttl:
+  strategy: archive          # or "delete"
+  check_every_n_operations: 100
+  default_ttl_seconds: 2592000   # 30 days
+```
+
+### `ingest`
+
+Ingest-layer behaviour (content-hash deduplication).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `deduplication_enabled` | `bool` | `true` | Whether ingest pipelines should pass `deduplicate=True` so identical `content` collapses into one thought (bumping `confirmation_count`) instead of a duplicate row |
+
+> Note: this flag advises ingest-layer callers; the persistence-layer
+> `create_thought` still defaults to `deduplicate=False` — see
+> [Recipes → Deduplicate repeated facts](recipes/index.md).
+
+### `hooks`
+
+Wire a custom `EngravaHooksProtocol` implementation by dotted path. See
+[Extensions](extensions.md).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `class` | `str \| null` | `null` | Dotted import path to a hooks class (`"module.path:ClassName"`), instantiated and used by `from_config` |
+
+```yaml
+hooks:
+  class: "my_package.hooks:MyHooks"
+```
+
+### `manifests`
+
+Load extension manifests (their hooks + schema migrations). Accepts a plain
+list of dotted paths, or a mapping with `discover` / `paths`. See
+[Extensions](extensions.md).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `paths` | `list[str]` | `[]` | Dotted `module.path:ATTRIBUTE` references to `ExtensionManifest` objects |
+| `discover` | `bool` | `false` | Also scan the `engrava.extensions` entry-point group for manifests |
+
+```yaml
+# list form
+manifests:
+  - "my_plugin.manifest:MANIFEST"
+
+# or mapping form
+manifests:
+  discover: true
+  paths:
+    - "my_plugin.manifest:MANIFEST"
+```
+
+> The `metrics:` section (latency window size, enable/disable) is documented in
+> [Observability](observability.md).
+
 ## Environment Variables
 
 | Variable | Description |
