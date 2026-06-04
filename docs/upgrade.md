@@ -40,8 +40,10 @@ engrava --db my-data.db migrate
 
 - `engrava info` confirms the database is readable and reports current counts.
 - `engrava migrate` is safe to run after upgrade; it re-checks that schema is up to date.
-- `engrava gc` is optional if you want to compact archived or expired data after
-  the upgrade.
+- `engrava gc` is optional if you want to remove archived or expired data after
+  the upgrade. Note that `gc` deletes rows but does **not** shrink the database
+  file — freed pages return to SQLite's free-list. To reclaim file size, run
+  `VACUUM`. See [Data lifecycle → reclaiming disk space](data-lifecycle.md#reclaiming-disk-space).
 
 ## If Migration Fails
 

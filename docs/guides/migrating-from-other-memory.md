@@ -35,7 +35,7 @@ common concepts onto Engrava:
 | Keyword / BM25 search | **`search_fts(query, …)`** | Returns `list[(thought_id, score)]`. |
 | Hybrid search | **`search_hybrid(query_text, …)`** | Fuses FTS + vector + recency + priority + graph. |
 | Automatic summarisation / fact extraction | *(none — by design)* | Engrava does no LLM-side extraction; see [Non-goals](../positioning.md#non-goals). |
-| Decay / forgetting | TTL + lifecycle + the recency signal | Configured via the `ttl` section (see [Configuration](../configuration.md)) and the recency signal in [Search](../search.md). |
+| Decay / forgetting | TTL + lifecycle + the recency signal | See [Data lifecycle](../data-lifecycle.md) (TTL, archive-vs-delete, erasure) and the recency signal in [Search](../search.md). |
 | Summaries of clusters | **`REFLECTION`** thoughts via [dreaming](../dreaming.md) | Structural (centroid + keywords), not LLM prose. |
 
 ## Porting your calls

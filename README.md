@@ -243,6 +243,7 @@ engrava --db mydata.db export -o portable.json
 - [Troubleshooting](docs/troubleshooting.md) — symptom → cause → fix for common errors
 - [FAQ](docs/faq.md) — quick answers (LLM/keys, embeddings-optional, scale, concurrency, backups, …)
 - [Performance & Scaling](docs/performance.md) — the vector-backend switch, bulk-ingest, and dreaming cost at scale
+- [Data Lifecycle & Retention](docs/data-lifecycle.md) — lifecycle states, TTL, archive-vs-delete, GDPR erasure, disk reclamation
 - [Known Limitations](docs/known-limitations.md) — Platform notes and constraints
 
 ## Development
