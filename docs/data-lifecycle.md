@@ -19,11 +19,23 @@ Every thought carries a `LifecycleStatus`. There are four states:
 | `CREATED` | Just created, not yet promoted into active use. |
 | `ACTIVE` | In normal use — the default working state, included in queries. |
 | `DONE` | Completed (e.g. a finished task) but retained. |
-| `ARCHIVED` | Retired from active results; retained until garbage-collected. |
+| `ARCHIVED` | Soft-retired and retained until garbage-collected. **Not a global results filter** — see the note below. |
 
 You set the status on the `ThoughtRecord` you create, and update it over the
 thought's life. Archiving is the soft-retire step: an `ARCHIVED` thought still
 exists (and its content is still stored) until you garbage-collect it.
+
+> **`ARCHIVED` does not hide a thought from search or queries.** Marking a
+> regular thought `ARCHIVED` is a *retention* state, not a visibility filter: an
+> archived `OBSERVATION` still appears in `search_hybrid` / `search_fts` and is
+> still counted by `count_thoughts()` / `list_thoughts()`. Only two kinds of rows
+> are auto-excluded: **expired** thoughts (dropped by the TTL expiry checks
+> described below, unless you pass `include_expired=True`), and **retired
+> REFLECTIONs** — a `REFLECTION` whose `lifecycle_status` is no longer `ACTIVE` is
+> filtered out of search by a *freshness floor* so a stale cluster centroid can't
+> resurface. This REFLECTION gate is type-specific; it does **not** apply to
+> ordinary thoughts. To keep archived regular thoughts out of your own results,
+> either filter on `lifecycle_status` yourself or remove them with `engrava gc`.
 
 ## Time-to-live (TTL) and expiry
 
@@ -77,17 +89,26 @@ print(result.timestamp)           # ISO-8601 time of the pass
 You can also have the store run cleanup automatically every *N* operations via
 `ttl.check_every_n_operations` (default `0` = manual only).
 
-**From the CLI:** `engrava gc --expired` runs the same expiry cleanup (archiving
-or deleting per config), then garbage-collects archived thoughts:
+**From the CLI:** `engrava gc --expired` runs the expiry cleanup per your TTL
+strategy. What it does next depends on that strategy:
 
 ```bash
-engrava gc --expired            # cleanup expired (per strategy) + gc archived
+engrava gc --expired            # run expiry cleanup (per ttl.strategy)
 engrava gc --expired --dry-run  # show what would happen, change nothing
-engrava gc                      # gc archived thoughts (+ orphaned edges) only
+engrava gc                      # delete ARCHIVED thoughts (+ orphaned edges)
 ```
 
-Plain `engrava gc` removes `ARCHIVED` thoughts and their orphaned edges. This is
-how archived data is finally deleted from the live table.
+- **With `ttl.strategy: delete`:** the expired rows are deleted outright, and the
+  same pass then garbage-collects any pre-existing `ARCHIVED` thoughts.
+- **With `ttl.strategy: archive` (default):** the expired rows are *archived*
+  (marked `ARCHIVED`), and the pass **stops there** — it does **not** also
+  garbage-collect archived rows in the same run. (Collecting the rows it just
+  archived would defeat the soft-retire.) To physically remove archived rows you
+  must either run a **separate** `engrava gc`, or switch to `ttl.strategy:
+  delete`.
+
+Plain `engrava gc` (no `--expired`) removes `ARCHIVED` thoughts and their
+orphaned edges. This is how archived data is finally deleted from the live table.
 
 ## GDPR and hard deletion
 
@@ -97,9 +118,10 @@ can retain the content:
 
 1. **Archive does not erase.** Under the default `ttl.strategy: archive`, an
    "expired" thought is only marked `ARCHIVED` — the row and its `content` remain
-   in the database. You must additionally garbage-collect it (`engrava gc`, or
-   `gc --expired` which does both) — or use `ttl.strategy: delete` — to remove the
-   row.
+   in the database. Note that `engrava gc --expired` under the `archive` strategy
+   *archives* the rows and stops; it does **not** delete archived rows in the same
+   pass. To remove the row you must run a **separate** `engrava gc` afterwards, or
+   use `ttl.strategy: delete` so the row is deleted outright.
 2. **The audit journal retains a content delta.** If the
    [audit journal](audit-trail.md) is enabled, deleting a thought does **not**
    remove its content from the journal. The original `INSERT_THOUGHT` entry holds
