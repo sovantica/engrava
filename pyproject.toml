@@ -65,8 +65,10 @@ dev = [
     # version range as the ``embeddings-local`` extra so both
     # extras resolve together (``pip install -e .[dev,embeddings-local]``
     # used to fail with a resolver conflict before this alignment).
-    # ``sentence-transformers`` pulls torch transitively (~500 MB) —
-    # the CI cache absorbs that cost after the first cold install.
+    # ``sentence-transformers`` pulls torch transitively (~500 MB). CI caches
+    # both the pip download (``cache: pip``) and the HuggingFace model store
+    # (``actions/cache`` on ``~/.cache/huggingface``), so this cost is paid once
+    # and the model-loading tests do not re-hit the Hub (avoids HF 429).
     "sentence-transformers>=3.0.0",
     # Install the optional sqlite-vec extension in the test environment so
     # CI actually exercises the real extension-load path (the worker-thread
