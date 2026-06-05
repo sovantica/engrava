@@ -38,7 +38,38 @@ jobs:
       - name: Mypy
         run: mypy --strict src/
 
+  # Warm the HuggingFace model cache exactly once before the test matrix.
+  # The benchmark tests load a real sentence-transformers model
+  # (all-MiniLM-L6-v2) on purpose. If the matrix legs each populated the cache
+  # themselves, a cold cache means all three legs miss and download the model
+  # concurrently — tripping HF rate limiting (HTTP 429), and if every leg fails
+  # the cache is never saved. This single upstream job does at most one download
+  # per cold workflow run, saves the shared cache, and the matrix (which `needs`
+  # it) then restores a warm cache and runs fully offline.
+  warm-hf-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Restore/Save HuggingFace cache
+        id: hf-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-sentence-transformers-all-MiniLM-L6-v2-v1
+      - name: Download model on cache miss
+        if: steps.hf-cache.outputs.cache-hit != 'true'
+        # Only the minimal stack needed to fetch + load the model. This is the
+        # single, serialized download for the whole workflow on a cold cache.
+        run: |
+          pip install "sentence-transformers>=3.0.0"
+          python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+
   test:
+    needs: warm-hf-cache
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -49,14 +80,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: "pip"
-      # Cache the HuggingFace model store. The benchmark tests load a real
-      # sentence-transformers model (all-MiniLM-L6-v2) on purpose; without this
-      # cache every matrix job re-downloads it from the Hub, and the concurrent
-      # requests across the matrix trip HF rate limiting (HTTP 429), which fails
-      # the model-dependent tests. With the cache the model is fetched once and
-      # reused; on a cache hit we additionally go offline so no Hub request is
-      # made at all.
-      - name: Cache HuggingFace models
+      # Restore the cache warmed by `warm-hf-cache`. After warming this is a hit
+      # on every matrix leg, so the tests run offline and make no Hub request.
+      - name: Restore HuggingFace models
         id: hf-cache
         uses: actions/cache@v4
         with:
@@ -66,9 +92,10 @@ jobs:
         run: pip install -e ".[dev]"
       - name: Run tests
         env:
-          # Only force offline when the cache is populated (a cold first run must
-          # still be allowed to download the model once). An empty cache + offline
-          # would fail with "couldn't find the requested files in the local cache".
+          # Force offline only on a cache hit (the warm-hf-cache job populates it
+          # first, so legs hit). A defensive '0' on a miss lets a leg self-heal
+          # by downloading rather than hard-failing — but the warm job makes a
+          # miss here unexpected.
           HF_HUB_OFFLINE: ${{ steps.hf-cache.outputs.cache-hit == 'true' && '1' || '0' }}
           TRANSFORMERS_OFFLINE: ${{ steps.hf-cache.outputs.cache-hit == 'true' && '1' || '0' }}
           HF_HUB_DISABLE_TELEMETRY: "1"

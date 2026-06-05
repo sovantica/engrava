@@ -71,9 +71,10 @@ dev = [
     # and the model-loading tests do not re-hit the Hub (avoids HF 429).
     "sentence-transformers>=3.0.0",
     # Install the optional sqlite-vec extension in the test environment so
-    # CI actually exercises the real extension-load path (the worker-thread
-    # load and ANN search), not just the numpy fallback.  Mirrors the
-    # constraint declared in the ``vec`` extra above.
+    # CI actually exercises the real extension-load path: the worker-thread
+    # load and KNN search over the compact vec0 table — faster brute-force KNN,
+    # not ANN at the pinned 0.1.x line — not just the numpy fallback.  Mirrors
+    # the constraint declared in the ``vec`` extra above.
     "sqlite-vec>=0.1.0,<0.2.0",
 ]
 
