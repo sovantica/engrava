@@ -109,7 +109,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
+      # The pre-publish smoke gate loads the real all-MiniLM-L6-v2 model; cache
+      # the Hub store (and go offline on a cache hit) so a release is never
+      # blocked by transient HF 429 rate limiting.
+      - name: Cache HuggingFace models
+        id: hf-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-sentence-transformers-all-MiniLM-L6-v2-v1
       - name: Pre-publish smoke gate
+        env:
+          HF_HUB_OFFLINE: ${{ steps.hf-cache.outputs.cache-hit == 'true' && '1' || '0' }}
+          TRANSFORMERS_OFFLINE: ${{ steps.hf-cache.outputs.cache-hit == 'true' && '1' || '0' }}
+          HF_HUB_DISABLE_TELEMETRY: "1"
         run: |
           pip install -e ".[embeddings-local]"
           python scripts/check_smoke_gate.py

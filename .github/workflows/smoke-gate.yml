@@ -24,6 +24,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
+
+      # The smoke gate runs the synthetic benchmark, which loads the real
+      # all-MiniLM-L6-v2 model. Cache the Hub store so the model is not
+      # re-downloaded each run (avoids HF 429 rate limiting); go offline on a
+      # cache hit so no Hub request is made.
+      - name: Cache HuggingFace models
+        id: hf-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-sentence-transformers-all-MiniLM-L6-v2-v1
 
       - name: Install package with embeddings extra
         run: pip install -e ".[embeddings-local]"
@@ -31,4 +43,8 @@ jobs:
       - name: Run pre-publish smoke gate
         # Same committed floors as the publish path
         # (scripts/check_smoke_gate.py). A breach fails the run.
+        env:
+          HF_HUB_OFFLINE: ${{ steps.hf-cache.outputs.cache-hit == 'true' && '1' || '0' }}
+          TRANSFORMERS_OFFLINE: ${{ steps.hf-cache.outputs.cache-hit == 'true' && '1' || '0' }}
+          HF_HUB_DISABLE_TELEMETRY: "1"
         run: python scripts/check_smoke_gate.py
