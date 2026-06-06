@@ -131,5 +131,12 @@ jobs:
         run: |
           pip install build
           python -m build
+      # Gate the publish on package-data integrity: verify the freshly built
+      # wheel actually bundles the required non-Python data (schema SQL +
+      # synthetic dataset) before it can reach PyPI. Catches a packaging
+      # regression (e.g. a file falling out of [tool.setuptools.package-data])
+      # at the one point where it would otherwise ship broken.
+      - name: Verify wheel package data
+        run: python scripts/verify_wheel_data.py
       - name: Publish to PyPI (OIDC, no token)
         uses: pypa/gh-action-pypi-publish@release/v1
