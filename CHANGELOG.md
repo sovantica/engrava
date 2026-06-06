@@ -26,6 +26,15 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   always re-disabled after the load attempt, even when the load fails, so a
   connection is never left with extension loading enabled.
 
+### Changed
+
+- **CI hardening (maintenance, no runtime impact).** Continuous integration
+  now runs a generic secret scan (gitleaks, built-in rules) and a dependency
+  vulnerability audit (`pip-audit --strict`) on every push and pull request,
+  and the release pipeline verifies that the built wheel bundles its required
+  package data before publishing to PyPI. These are tooling/CI changes only —
+  no change to the installed package or its behaviour.
+
 ## 0.3.0 (2026-06-02)
 
 * ci: add on-demand smoke-gate workflow (#10) ([50e2bf2](https://github.com/sovantica/engrava/commit/50e2bf2)), closes [#10](https://github.com/sovantica/engrava/issues/10)

@@ -38,6 +38,35 @@ jobs:
       - name: Mypy
         run: mypy --strict src/
 
+  dependency-audit:
+    name: Dependency CVE audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      # Install the package NON-editable so pip-audit can resolve and audit the
+      # engrava distribution itself. An editable install (`-e`) builds an
+      # `*.editable` wheel that pip-audit reports as a SkippedDependency, and
+      # `--strict` hard-fails on ANY skip ("distribution marked as editable").
+      # A plain `pip install .` produces a normal, auditable distribution, so
+      # --strict still fails on a real CVE or collection failure — without
+      # tripping on the self-package.
+      - name: Install package
+        run: |
+          # Upgrade pip first: pip-audit --strict audits the whole environment,
+          # including pip itself, and the runner image can ship a pip with a
+          # freshly disclosed CVE (e.g. PYSEC-2026-196 in pip 26.1.1). Upgrading
+          # to the latest pip clears it for real rather than ignoring the finding.
+          python -m pip install --upgrade pip
+          pip install .
+      - name: Run pip-audit
+        run: |
+          pip install pip-audit
+          pip-audit --strict
+
   # Warm the HuggingFace model cache exactly once before the test matrix.
   # The benchmark tests load a real sentence-transformers model
   # (all-MiniLM-L6-v2) on purpose. If the matrix legs each populated the cache
