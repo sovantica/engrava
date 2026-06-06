@@ -47,13 +47,15 @@ jobs:
         with:
           python-version: "3.12"
           cache: "pip"
-      # Install the package so pip-audit resolves the real dependency tree
-      # (engrava itself is now on PyPI, so --strict no longer trips on the
-      # editable self-package). --strict fails the run on any collection
-      # failure as well as on a known CVE, so a vulnerable or unauditable
-      # dependency cannot pass silently.
+      # Install the package NON-editable so pip-audit can resolve and audit the
+      # engrava distribution itself. An editable install (`-e`) builds an
+      # `*.editable` wheel that pip-audit reports as a SkippedDependency, and
+      # `--strict` hard-fails on ANY skip ("distribution marked as editable").
+      # A plain `pip install .` produces a normal, auditable distribution, so
+      # --strict still fails on a real CVE or collection failure — without
+      # tripping on the self-package.
       - name: Install package
-        run: pip install -e "."
+        run: pip install .
       - name: Run pip-audit
         run: |
           pip install pip-audit
