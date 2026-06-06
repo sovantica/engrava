@@ -55,7 +55,13 @@ jobs:
       # --strict still fails on a real CVE or collection failure — without
       # tripping on the self-package.
       - name: Install package
-        run: pip install .
+        run: |
+          # Upgrade pip first: pip-audit --strict audits the whole environment,
+          # including pip itself, and the runner image can ship a pip with a
+          # freshly disclosed CVE (e.g. PYSEC-2026-196 in pip 26.1.1). Upgrading
+          # to the latest pip clears it for real rather than ignoring the finding.
+          python -m pip install --upgrade pip
+          pip install .
       - name: Run pip-audit
         run: |
           pip install pip-audit
