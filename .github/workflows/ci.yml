@@ -38,6 +38,27 @@ jobs:
       - name: Mypy
         run: mypy --strict src/
 
+  dependency-audit:
+    name: Dependency CVE audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      # Install the package so pip-audit resolves the real dependency tree
+      # (engrava itself is now on PyPI, so --strict no longer trips on the
+      # editable self-package). --strict fails the run on any collection
+      # failure as well as on a known CVE, so a vulnerable or unauditable
+      # dependency cannot pass silently.
+      - name: Install package
+        run: pip install -e "."
+      - name: Run pip-audit
+        run: |
+          pip install pip-audit
+          pip-audit --strict
+
   # Warm the HuggingFace model cache exactly once before the test matrix.
   # The benchmark tests load a real sentence-transformers model
   # (all-MiniLM-L6-v2) on purpose. If the matrix legs each populated the cache
