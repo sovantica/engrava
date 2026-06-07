@@ -239,6 +239,92 @@ class TestExecutorCount:
         result = await executor.execute(q)
         assert result.count == 5
 
+
+# ---------------------------------------------------------------------------
+# SqliteEngravaCore.execute_mindql — store-level execution entry point
+# ---------------------------------------------------------------------------
+
+
+class TestStoreExecuteMindql:
+    """Test the store-level ``execute_mindql`` entry point.
+
+    The method is deliberately **policy-free**: it executes whatever command
+    the parsed query carries (FIND / COUNT / SELECT / extension). Command-set
+    restriction (e.g. FIND-only) is a consumer concern, not the core's.
+    """
+
+    async def test_find_executes(self, populated_db: aiosqlite.Connection) -> None:
+        store = SqliteEngravaCore(populated_db)
+        result = await store.execute_mindql(parse("FIND thoughts WHERE priority = 'P1'"))
+        assert result.command == MindQLCommand.FIND
+        assert len(result.rows) == 2
+
+    async def test_count_executes_not_rejected(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # Proves the method does NOT enforce FIND-only: COUNT runs.
+        store = SqliteEngravaCore(populated_db)
+        result = await store.execute_mindql(parse("COUNT thoughts"))
+        assert result.command == MindQLCommand.COUNT
+        assert result.count == 5
+
+    async def test_select_executes_not_rejected(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # Proves neutrality further: raw-SQL SELECT passthrough runs.
+        store = SqliteEngravaCore(populated_db)
+        result = await store.execute_mindql(
+            parse("SELECT thought_id FROM thought WHERE lifecycle_status = 'ACTIVE'"),
+        )
+        assert result.command == MindQLCommand.SELECT
+        assert len(result.rows) == 4
+
+    async def test_extensions_param_routes_command(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # The optional extensions map is wired through to the executor.
+        received: dict[str, object] = {}
+
+        async def _handler(
+            conn: aiosqlite.Connection,
+            args: object,
+        ) -> list[dict[str, object]]:
+            received["args"] = args
+            return [{"ok": True}]
+
+        extensions = {
+            "PING": MindQLExtension(
+                command_name="PING",
+                handler=_handler,
+                description="echo",
+            ),
+        }
+        store = SqliteEngravaCore(populated_db)
+        parsed = parse("PING hello", known_extensions={"PING"})
+        result = await store.execute_mindql(parsed, extensions=extensions)
+        # The extensions map was wired through and the registered handler ran.
+        assert result.command == "PING"
+        assert result.rows == [{"ok": True}]
+        assert received["args"] is not None
+
+    async def test_invalid_find_column_raises(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        q = MindQLQuery(
+            command=MindQLCommand.FIND,
+            table="thought",
+            conditions=[
+                Condition(field="nonexistent_col", operator=MindQLOperator.EQ, value="x"),
+            ],
+        )
+        with pytest.raises(MindQLParseError, match="not allowed"):
+            await store.execute_mindql(q)
+
     async def test_count_with_filter(self, populated_db: aiosqlite.Connection) -> None:
         executor = MindQLExecutor(populated_db)
         q = parse("COUNT thoughts WHERE priority = 'P1'")
