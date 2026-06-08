@@ -22,6 +22,7 @@ READ_TOOL_NAMES = frozenset(
         "get_thought",
         "search_memory",
         "search_keywords",
+        "list_memory",
         "query_memory",
         "memory_stats",
     }

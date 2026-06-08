@@ -6,18 +6,29 @@ consumer*, not an engrava extension: it registers no hooks, manifests, or
 MindQL extension commands.  Think of it as a sibling of the command-line
 interface that speaks MCP over stdio.
 
-Five read-only tools are exposed:
+Six read-only tools are exposed:
 
 ``get_thought``
     Fetch a single thought by identifier.
 ``search_memory``
-    Hybrid (lexical + vector + recency) ranked search.
+    Hybrid (lexical + vector + recency) ranked search.  Optional
+    ``thought_type`` / ``lifecycle_status`` / ``priority`` filters narrow
+    the ranked hits *after* ranking (the hybrid ranker cannot filter), so
+    a filtered call may return fewer than ``top_k`` results and reports
+    how many ranked hits it dropped.
 ``search_keywords``
     Pure full-text BM25 keyword search.
+``list_memory``
+    Deterministic, unranked browse over stored thoughts with the full
+    filter matrix (``thought_type``, ``lifecycle_status``, ``priority``,
+    updated-cycle range) and ``limit`` / ``offset`` pagination.  Returns
+    thoughts newest-first with no score — the clean home for "list memory
+    by structured field", complementing the ranked ``search_memory``.
 ``query_memory``
     Structured ``FIND`` queries in the MindQL query language.  Only the
     ``FIND`` command is accepted; raw-SQL passthrough and every other
-    command are rejected.
+    command are rejected.  Accepts an optional ``limit`` (the MindQL
+    grammar has no ``OFFSET``, so this tool paginates by ``limit`` only).
 ``memory_stats``
     Aggregate counts and store-health metrics.
 
@@ -112,6 +123,11 @@ DEFAULT_TOP_K = 10
 
 #: Default number of thoughts returned by the ``engrava://recent`` resource.
 DEFAULT_RECENT_LIMIT = 10
+
+#: Default page size for the ``list_memory`` browse tool.  Matches the
+#: store's own ``list_thoughts`` default so an unpaged listing behaves the
+#: same whether driven through MCP or the core API directly.
+DEFAULT_LIST_LIMIT = 50
 
 #: Default number of recent thoughts the ``summarize_recent_memory`` prompt
 #: asks the assistant to consider when the caller omits ``limit``.  Kept
@@ -250,26 +266,109 @@ async def get_thought_impl(store: SqliteEngravaCore, thought_id: str) -> dict[st
     return {"found": True, "thought": thought.model_dump(mode="json")}
 
 
+def _filter_criteria(
+    *,
+    thought_type: ThoughtType | None,
+    lifecycle_status: LifecycleStatus | None,
+    priority: Priority | None,
+) -> dict[str, str]:
+    """Collect the active thought filters as a JSON-friendly mapping.
+
+    Only the filters the caller actually supplied appear in the result;
+    each enum is reduced to its string value so the mapping serialises
+    cleanly into a tool response.
+
+    Args:
+        thought_type: Thought-type filter, or ``None`` if not filtering.
+        lifecycle_status: Lifecycle-status filter, or ``None``.
+        priority: Priority filter, or ``None``.
+
+    Returns:
+        A dict mapping each supplied filter's field name to its string
+        value.  Empty when no filter was supplied.
+
+    """
+    criteria: dict[str, str] = {}
+    if thought_type is not None:
+        criteria["thought_type"] = thought_type.value
+    if lifecycle_status is not None:
+        criteria["lifecycle_status"] = lifecycle_status.value
+    if priority is not None:
+        criteria["priority"] = priority.value
+    return criteria
+
+
+def _thought_matches(
+    thought: ThoughtRecord,
+    *,
+    thought_type: ThoughtType | None,
+    lifecycle_status: LifecycleStatus | None,
+    priority: Priority | None,
+) -> bool:
+    """Report whether a thought satisfies every supplied filter.
+
+    A ``None`` filter is not applied, so a thought matches when it equals
+    each filter that *was* supplied (logical AND).  With no filters
+    supplied this trivially returns ``True``.
+
+    Args:
+        thought: The thought record to test.
+        thought_type: Required thought type, or ``None`` to ignore.
+        lifecycle_status: Required lifecycle state, or ``None`` to ignore.
+        priority: Required priority level, or ``None`` to ignore.
+
+    Returns:
+        ``True`` when the thought matches every supplied filter.
+
+    """
+    if thought_type is not None and thought.thought_type is not thought_type:
+        return False
+    if lifecycle_status is not None and thought.lifecycle_status is not lifecycle_status:
+        return False
+    return not (priority is not None and thought.priority is not priority)
+
+
 async def search_memory_impl(
     store: SqliteEngravaCore,
     query_text: str,
     *,
     top_k: int = DEFAULT_TOP_K,
     include_reflections: bool = True,
+    thought_type: ThoughtType | None = None,
+    lifecycle_status: LifecycleStatus | None = None,
+    priority: Priority | None = None,
 ) -> dict[str, Any]:
     """Run a hybrid ranked search over stored memory.
+
+    The hybrid ranker itself does not filter by type, status, or
+    priority, so any of those filters are applied *after* ranking: the
+    ranked hits are fetched and the ones that do not match every supplied
+    filter are dropped.  Ranking order is preserved and scores are never
+    altered or fabricated — a filtered response simply carries fewer
+    entries than ``top_k`` and reports how many were dropped (see the
+    ``filtered`` block below) so the caller is never misled into reading
+    an empty or short list as "nothing was found".
 
     Args:
         store: The store to query.
         query_text: Natural-language query text.
-        top_k: Maximum number of ranked results to return.
+        top_k: Maximum number of ranked results to consider.  Filters are
+            applied to this ranked window, so the returned list may be
+            shorter when filters drop hits.
         include_reflections: Whether consolidated reflection thoughts may
             appear in the results.
+        thought_type: When set, keep only hits of this type.
+        lifecycle_status: When set, keep only hits in this lifecycle state.
+        priority: When set, keep only hits at this priority level.
 
     Returns:
         A dict with a ``results`` list of ``{"thought_id", "score"}``
-        entries and a ``backends_used`` list naming the search backends
-        that were available for the query.
+        entries (ranking order preserved) and a ``backends_used`` list
+        naming the search backends that were available for the query.
+        When at least one filter is supplied, a ``filtered`` block is
+        added carrying the active ``criteria`` and the ``scanned`` /
+        ``matched`` / ``dropped`` counts over the ranked window, so a
+        short or empty list is never mistaken for "no hits ranked".
 
     """
     result = await store.search_hybrid(
@@ -277,11 +376,43 @@ async def search_memory_impl(
         top_k=top_k,
         include_reflections=include_reflections,
     )
+    backends_used = sorted(result.backends_used)
+
+    criteria = _filter_criteria(
+        thought_type=thought_type,
+        lifecycle_status=lifecycle_status,
+        priority=priority,
+    )
+    if not criteria:
+        # Unfiltered path: byte-for-byte the original response shape.
+        return {
+            "results": [
+                {"thought_id": thought_id, "score": score} for thought_id, score in result.results
+            ],
+            "backends_used": backends_used,
+        }
+
+    kept: list[dict[str, Any]] = []
+    for thought_id, score in result.results:
+        thought = await store.get_thought(thought_id)
+        if thought is not None and _thought_matches(
+            thought,
+            thought_type=thought_type,
+            lifecycle_status=lifecycle_status,
+            priority=priority,
+        ):
+            kept.append({"thought_id": thought_id, "score": score})
+
+    scanned = len(result.results)
     return {
-        "results": [
-            {"thought_id": thought_id, "score": score} for thought_id, score in result.results
-        ],
-        "backends_used": sorted(result.backends_used),
+        "results": kept,
+        "backends_used": backends_used,
+        "filtered": {
+            "criteria": criteria,
+            "scanned": scanned,
+            "matched": len(kept),
+            "dropped": scanned - len(kept),
+        },
     }
 
 
@@ -404,6 +535,67 @@ async def recent_thoughts_impl(
     return {
         "thoughts": [thought.model_dump(mode="json") for thought in thoughts],
         "limit": limit,
+    }
+
+
+async def list_memory_impl(
+    store: SqliteEngravaCore,
+    *,
+    thought_type: ThoughtType | None = None,
+    lifecycle_status: LifecycleStatus | None = None,
+    priority: Priority | None = None,
+    min_cycle: int | None = None,
+    max_cycle: int | None = None,
+    include_expired: bool = False,
+    limit: int = DEFAULT_LIST_LIMIT,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """List thoughts deterministically with filters and pagination.
+
+    A direct pass-through to the public
+    :meth:`~engrava.SqliteEngravaCore.list_thoughts`, which orders by
+    descending ``updated_cycle`` (newest first) and applies every filter
+    server-side.  Unlike :func:`search_memory_impl` this is a plain
+    browse: there is no relevance ranking and therefore no score.  It is
+    the right tool when a caller wants an exhaustive, paginated slice of
+    memory narrowed by structured fields rather than the best matches for
+    a query.
+
+    Args:
+        store: The store to query.
+        thought_type: When set, keep only thoughts of this type.
+        lifecycle_status: When set, keep only thoughts in this state.
+        priority: When set, keep only thoughts at this priority level.
+        min_cycle: Inclusive lower bound on ``updated_cycle``.
+        max_cycle: Inclusive upper bound on ``updated_cycle``.
+        include_expired: When ``True``, expired thoughts are included.
+            Defaults to ``False`` so expired thoughts stay hidden.
+        limit: Maximum number of thoughts to return (page size).
+        offset: Number of leading thoughts to skip (page start).
+
+    Returns:
+        A dict with a ``thoughts`` list of JSON-serialisable thoughts
+        (newest first), the ``count`` of thoughts on this page, and the
+        ``limit`` / ``offset`` that were applied so the caller can drive
+        pagination.
+
+    """
+    thoughts = await store.list_thoughts(
+        thought_type=thought_type.value if thought_type is not None else None,
+        lifecycle_status=lifecycle_status.value if lifecycle_status is not None else None,
+        priority=priority.value if priority is not None else None,
+        min_cycle=min_cycle,
+        max_cycle=max_cycle,
+        include_expired=include_expired,
+        limit=limit,
+        offset=offset,
+    )
+    serialised = [thought.model_dump(mode="json") for thought in thoughts]
+    return {
+        "thoughts": serialised,
+        "count": len(serialised),
+        "limit": limit,
+        "offset": offset,
     }
 
 
@@ -779,8 +971,12 @@ def build_server() -> FastMCP:
         SERVER_NAME,
         instructions=(
             "Access to an engrava agent-memory store: fetch thoughts, run "
-            "hybrid and keyword search, run structured MindQL FIND queries, "
-            "and read store statistics. Unless the server is started in "
+            "hybrid and keyword search, list thoughts with structured filters "
+            "and pagination, run structured MindQL FIND queries, and read "
+            "store statistics. Hybrid search (search_memory) can also be "
+            "narrowed by thought type, lifecycle status, or priority, but it "
+            "filters after ranking; for an exhaustive unranked listing by "
+            "those fields use list_memory. Unless the server is started in "
             "read-only mode, you can also store new thoughts, update existing "
             "thoughts, link thoughts with typed edges, and delete thoughts or "
             "edges. Read-only resources are also available as attachable "
@@ -922,7 +1118,9 @@ def register_prompts(server: FastMCP, provider: StoreProvider) -> None:
 def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C901
     """Register the MCP tools on a server.
 
-    The five read tools are always registered.  The five write tools are
+    The six read tools (``get_thought``, ``search_memory``,
+    ``search_keywords``, ``list_memory``, ``query_memory``,
+    ``memory_stats``) are always registered.  The five write tools are
     registered only when the server is not in read-only mode (see
     :func:`_read_only_enabled`); in read-only mode they are never
     advertised to clients.
@@ -946,7 +1144,12 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         description=(
             "Hybrid ranked search (lexical + vector + recency) over stored "
             "memory. Returns ranked thought identifiers with scores and the "
-            "search backends that were available."
+            "search backends that were available. Optionally narrow the "
+            "ranked hits by thought type, lifecycle status, or priority; "
+            "these filters are applied after ranking, so a filtered call may "
+            "return fewer than top_k results and reports how many ranked hits "
+            "were dropped. For an exhaustive, unranked, paginated listing by "
+            "those same fields, use list_memory instead."
         ),
         annotations=_READ_ONLY,
     )
@@ -955,12 +1158,54 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         top_k: int = DEFAULT_TOP_K,
         *,
         include_reflections: bool = True,
+        thought_type: ThoughtType | None = None,
+        lifecycle_status: LifecycleStatus | None = None,
+        priority: Priority | None = None,
     ) -> dict[str, Any]:
         return await search_memory_impl(
             provider.require(),
             query_text,
             top_k=top_k,
             include_reflections=include_reflections,
+            thought_type=thought_type,
+            lifecycle_status=lifecycle_status,
+            priority=priority,
+        )
+
+    @server.tool(
+        name="list_memory",
+        description=(
+            "List stored thoughts deterministically with optional filters and "
+            "pagination. Unlike search_memory this does no relevance ranking "
+            "and returns no scores: it is a plain browse over memory, ordered "
+            "newest first. Filter by thought type, lifecycle status, priority, "
+            "and an updated-cycle range; page through results with limit and "
+            "offset. Use this to enumerate memory by structured fields; use "
+            "search_memory when you want the best matches for a query."
+        ),
+        annotations=_READ_ONLY,
+    )
+    async def list_memory(
+        thought_type: ThoughtType | None = None,
+        lifecycle_status: LifecycleStatus | None = None,
+        priority: Priority | None = None,
+        *,
+        min_cycle: int | None = None,
+        max_cycle: int | None = None,
+        include_expired: bool = False,
+        limit: int = DEFAULT_LIST_LIMIT,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        return await list_memory_impl(
+            provider.require(),
+            thought_type=thought_type,
+            lifecycle_status=lifecycle_status,
+            priority=priority,
+            min_cycle=min_cycle,
+            max_cycle=max_cycle,
+            include_expired=include_expired,
+            limit=limit,
+            offset=offset,
         )
 
     @server.tool(
