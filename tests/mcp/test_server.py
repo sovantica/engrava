@@ -34,7 +34,14 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 READ_TOOL_NAMES = frozenset(
-    {"get_thought", "search_memory", "search_keywords", "query_memory", "memory_stats"}
+    {
+        "get_thought",
+        "search_memory",
+        "search_keywords",
+        "list_memory",
+        "query_memory",
+        "memory_stats",
+    }
 )
 WRITE_TOOL_NAMES = frozenset(
     {"store_thought", "update_thought", "link_thoughts", "delete_thought", "delete_edge"}
@@ -301,6 +308,129 @@ class TestServerEndToEnd:
 
         assert result.structuredContent is not None
         assert result.structuredContent["thought_count"] == 1
+
+
+async def _seed_varied_database(path: Path) -> None:
+    """Create a database file spanning several types, statuses, priorities.
+
+    The seed gives the filter tools something to discriminate: a mix of
+    ``TASK``/``NOTE`` thoughts, ``ACTIVE``/``CREATED`` states, and ``P1``/
+    ``P3`` priorities, all sharing the keyword "widget" so a single query
+    ranks every row.
+
+    Args:
+        path: Filesystem path for the new database.
+
+    """
+    connection = await aiosqlite.connect(str(path))
+    connection.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(connection)
+    await store.ensure_schema()
+    seeds = [
+        ("active-task", ThoughtType.TASK, LifecycleStatus.ACTIVE, Priority.P1, 1),
+        ("created-note", ThoughtType.NOTE, LifecycleStatus.CREATED, Priority.P3, 2),
+        ("active-note", ThoughtType.NOTE, LifecycleStatus.ACTIVE, Priority.P3, 3),
+    ]
+    for thought_id, thought_type, status, priority, cycle in seeds:
+        await store.create_thought(
+            CoreThoughtRecord(
+                thought_id=thought_id,
+                thought_type=thought_type,
+                essence=f"Widget note {thought_id}",
+                content=f"A widget thought stored as {thought_id}.",
+                priority=priority,
+                lifecycle_status=status,
+                created_cycle=cycle,
+                updated_cycle=cycle,
+                source="test",
+            )
+        )
+    await connection.close()
+
+
+class TestFilterAndListOverTransport:
+    """Drive the new filter and browse surface through a connected client."""
+
+    async def test_search_memory_filter_round_trip(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "search_filter.db"
+        await _seed_varied_database(db_path)
+        monkeypatch.setenv(DB_PATH_ENV_VAR, str(db_path))
+        monkeypatch.delenv(CONFIG_ENV_VAR, raising=False)
+        monkeypatch.delenv(READ_ONLY_ENV_VAR, raising=False)
+
+        server = build_server()
+        async with connect_client(server) as client:
+            unfiltered = await client.call_tool("search_memory", {"query_text": "widget"})
+            filtered = await client.call_tool(
+                "search_memory",
+                {"query_text": "widget", "thought_type": "NOTE"},
+            )
+
+        assert unfiltered.structuredContent is not None
+        # The unfiltered response carries no ``filtered`` block.
+        assert "filtered" not in unfiltered.structuredContent
+
+        assert filtered.structuredContent is not None
+        kept = {entry["thought_id"] for entry in filtered.structuredContent["results"]}
+        assert kept == {"created-note", "active-note"}
+        # Ranking honesty: the dropped TASK hit is accounted for truthfully.
+        block = filtered.structuredContent["filtered"]
+        assert block["criteria"] == {"thought_type": "NOTE"}
+        assert block["matched"] == 2
+        assert block["dropped"] == 1
+
+    async def test_list_memory_round_trip(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "list.db"
+        await _seed_varied_database(db_path)
+        monkeypatch.setenv(DB_PATH_ENV_VAR, str(db_path))
+        monkeypatch.delenv(CONFIG_ENV_VAR, raising=False)
+        monkeypatch.delenv(READ_ONLY_ENV_VAR, raising=False)
+
+        server = build_server()
+        async with connect_client(server) as client:
+            listed = await client.call_tool(
+                "list_memory",
+                {"lifecycle_status": "ACTIVE", "limit": 10},
+            )
+            paged = await client.call_tool("list_memory", {"limit": 1, "offset": 1})
+
+        assert listed.structuredContent is not None
+        ids = {thought["thought_id"] for thought in listed.structuredContent["thoughts"]}
+        assert ids == {"active-task", "active-note"}
+
+        assert paged.structuredContent is not None
+        # Newest first (created-note at cycle 2 is the second row), one per page.
+        assert paged.structuredContent["count"] == 1
+        assert [t["thought_id"] for t in paged.structuredContent["thoughts"]] == ["created-note"]
+
+    async def test_list_memory_available_in_read_only_mode(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "ro_list_tool.db"
+        await _seed_varied_database(db_path)
+        monkeypatch.setenv(DB_PATH_ENV_VAR, str(db_path))
+        monkeypatch.delenv(CONFIG_ENV_VAR, raising=False)
+        monkeypatch.setenv(READ_ONLY_ENV_VAR, "1")
+
+        server = build_server()
+        async with connect_client(server) as client:
+            listed = await client.list_tools()
+            result = await client.call_tool("list_memory", {})
+
+        # list_memory is a read tool, so it survives the write-tool gate.
+        assert "list_memory" in {tool.name for tool in listed.tools}
+        assert result.structuredContent is not None
+        assert result.structuredContent["count"] == 3
 
 
 class TestStoreResolution:
