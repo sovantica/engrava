@@ -102,13 +102,15 @@ from typing import TYPE_CHECKING, Any
 
 import anyio
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from engrava.domain.enums import EdgeType, LifecycleStatus, Priority, ThoughtType
+from engrava.domain.exceptions import ReferentialIntegrityError, ThoughtNotFoundError
 from engrava.domain.models.edge import EdgeRecord
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.mcp.config import ResolvedStore, resolve_store
-from engrava.mindql.parser import MindQLCommand, MindQLQuery, parse
+from engrava.mindql.parser import MindQLCommand, MindQLParseError, MindQLQuery, parse
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -146,6 +148,13 @@ DEFAULT_EDGE_WEIGHT = 1.0
 #: write surface.  This API consumer has no notion of a cognitive cycle
 #: clock, so new records start at the origin cycle.
 INITIAL_CYCLE = 0
+
+#: A valid MindQL ``FIND`` query, embedded verbatim in the actionable hints
+#: that ``query_memory`` returns when a caller sends a malformed or
+#: unsupported query.  Showing one correct example is the fastest way to get
+#: a client back onto the supported path; it deliberately demonstrates only
+#: the ``FIND`` command, never raw SQL.
+FIND_QUERY_EXAMPLE = "FIND thoughts WHERE lifecycle_status = 'ACTIVE' LIMIT 10"
 
 #: Environment variable that, when truthy, suppresses registration of the
 #: write tools so the server exposes a read-only surface.
@@ -202,9 +211,75 @@ class UnsupportedQueryError(ValueError):
         self.command = command
         super().__init__(
             f"query_memory accepts only FIND queries; received {command!r}. "
-            "Use the FIND command, for example: "
-            "FIND thoughts WHERE lifecycle_status = 'ACTIVE' LIMIT 10"
+            f"Use the FIND command, for example: {FIND_QUERY_EXAMPLE}"
         )
+
+
+@asynccontextmanager
+async def _tool_errors() -> AsyncIterator[None]:
+    """Translate known typed failures into clean, actionable MCP errors.
+
+    Wraps the body of a tool handler so that the typed exceptions raised by
+    the store, the MindQL parser, and this module's own consumer-policy
+    guard surface to the client as a :class:`ToolError` carrying a curated,
+    agent-facing message instead of an internal exception.  FastMCP reports
+    a :class:`ToolError` to the client with ``isError`` set and the message
+    as text, so the client receives an actionable hint rather than a raw
+    traceback or an internal class name.
+
+    This is *presentation only*: it adds no new capability and relaxes no
+    guard.  Each branch re-raises an existing failure with a better message;
+    the ``UnsupportedQueryError`` branch in particular preserves the
+    ``FIND``-only contract verbatim and never suggests that raw SQL is
+    runnable over the wire.  Conditions this module does not recognise are
+    left to propagate unchanged.
+
+    The messages name only the documented configuration *environment
+    variables* (never a filesystem path), carry no stack frames, and expose
+    no internal symbol names, so a misuse reply leaks nothing about the
+    deployment.
+
+    Yields:
+        ``None``; the caller runs the guarded tool body inside the ``with``.
+
+    Raises:
+        ToolError: With an actionable message when a recognised typed
+            failure occurs while the body runs.
+
+    """
+    try:
+        yield
+    except StoreNotReadyError as exc:
+        msg = (
+            "The engrava memory store is not available yet. Start the server "
+            "with a store configured: set ENGRAVA_DB_PATH to a database file, "
+            "or point ENGRAVA_MCP_CONFIG at an engrava.yaml that names one."
+        )
+        raise ToolError(msg) from exc
+    except UnsupportedQueryError as exc:
+        # The exception text already states the FIND-only contract and shows
+        # a valid FIND example; echoing it keeps the guard's wording intact
+        # and never invites raw SQL.
+        raise ToolError(str(exc)) from exc
+    except MindQLParseError as exc:
+        msg = (
+            f"That query could not be parsed: {exc}. query_memory runs MindQL "
+            f"FIND queries; for example: {FIND_QUERY_EXAMPLE}"
+        )
+        raise ToolError(msg) from exc
+    except ThoughtNotFoundError as exc:
+        msg = (
+            f"No thought exists with id {exc.thought_id!r}. Check the "
+            "identifier, or use search_memory or list_memory to find it."
+        )
+        raise ToolError(msg) from exc
+    except ReferentialIntegrityError as exc:
+        msg = (
+            f"Cannot link thoughts: no thought exists with id "
+            f"{exc.referenced_id!r}. Create that thought first, or correct "
+            "the identifier."
+        )
+        raise ToolError(msg) from exc
 
 
 class StoreProvider:
@@ -1137,7 +1212,8 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         annotations=_READ_ONLY,
     )
     async def get_thought(thought_id: str) -> dict[str, Any]:
-        return await get_thought_impl(provider.require(), thought_id)
+        async with _tool_errors():
+            return await get_thought_impl(provider.require(), thought_id)
 
     @server.tool(
         name="search_memory",
@@ -1162,15 +1238,16 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         lifecycle_status: LifecycleStatus | None = None,
         priority: Priority | None = None,
     ) -> dict[str, Any]:
-        return await search_memory_impl(
-            provider.require(),
-            query_text,
-            top_k=top_k,
-            include_reflections=include_reflections,
-            thought_type=thought_type,
-            lifecycle_status=lifecycle_status,
-            priority=priority,
-        )
+        async with _tool_errors():
+            return await search_memory_impl(
+                provider.require(),
+                query_text,
+                top_k=top_k,
+                include_reflections=include_reflections,
+                thought_type=thought_type,
+                lifecycle_status=lifecycle_status,
+                priority=priority,
+            )
 
     @server.tool(
         name="list_memory",
@@ -1196,17 +1273,18 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         limit: int = DEFAULT_LIST_LIMIT,
         offset: int = 0,
     ) -> dict[str, Any]:
-        return await list_memory_impl(
-            provider.require(),
-            thought_type=thought_type,
-            lifecycle_status=lifecycle_status,
-            priority=priority,
-            min_cycle=min_cycle,
-            max_cycle=max_cycle,
-            include_expired=include_expired,
-            limit=limit,
-            offset=offset,
-        )
+        async with _tool_errors():
+            return await list_memory_impl(
+                provider.require(),
+                thought_type=thought_type,
+                lifecycle_status=lifecycle_status,
+                priority=priority,
+                min_cycle=min_cycle,
+                max_cycle=max_cycle,
+                include_expired=include_expired,
+                limit=limit,
+                offset=offset,
+            )
 
     @server.tool(
         name="search_keywords",
@@ -1217,7 +1295,8 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         annotations=_READ_ONLY,
     )
     async def search_keywords(query: str, top_k: int = DEFAULT_TOP_K) -> dict[str, Any]:
-        return await search_keywords_impl(provider.require(), query, top_k=top_k)
+        async with _tool_errors():
+            return await search_keywords_impl(provider.require(), query, top_k=top_k)
 
     @server.tool(
         name="query_memory",
@@ -1229,7 +1308,8 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         annotations=_READ_ONLY,
     )
     async def query_memory(query: str, limit: int | None = None) -> dict[str, Any]:
-        return await query_memory_impl(provider.require(), query, limit=limit)
+        async with _tool_errors():
+            return await query_memory_impl(provider.require(), query, limit=limit)
 
     @server.tool(
         name="memory_stats",
@@ -1240,7 +1320,8 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         annotations=_READ_ONLY,
     )
     async def memory_stats() -> dict[str, Any]:
-        return await memory_stats_impl(provider.require())
+        async with _tool_errors():
+            return await memory_stats_impl(provider.require())
 
     if _read_only_enabled():
         return
@@ -1266,17 +1347,18 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         thought_id: str | None = None,
         deduplicate: bool = False,
     ) -> dict[str, Any]:
-        return await store_thought_impl(
-            provider.require(),
-            essence,
-            content,
-            thought_type=thought_type,
-            priority=priority,
-            source=source,
-            confidence=confidence,
-            thought_id=thought_id,
-            deduplicate=deduplicate,
-        )
+        async with _tool_errors():
+            return await store_thought_impl(
+                provider.require(),
+                essence,
+                content,
+                thought_type=thought_type,
+                priority=priority,
+                source=source,
+                confidence=confidence,
+                thought_id=thought_id,
+                deduplicate=deduplicate,
+            )
 
     @server.tool(
         name="update_thought",
@@ -1296,15 +1378,16 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         *,
         confidence: float | None = None,
     ) -> dict[str, Any]:
-        return await update_thought_impl(
-            provider.require(),
-            thought_id,
-            essence=essence,
-            content=content,
-            priority=priority,
-            lifecycle_status=lifecycle_status,
-            confidence=confidence,
-        )
+        async with _tool_errors():
+            return await update_thought_impl(
+                provider.require(),
+                thought_id,
+                essence=essence,
+                content=content,
+                priority=priority,
+                lifecycle_status=lifecycle_status,
+                confidence=confidence,
+            )
 
     @server.tool(
         name="link_thoughts",
@@ -1325,14 +1408,15 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         *,
         edge_id: str | None = None,
     ) -> dict[str, Any]:
-        return await link_thoughts_impl(
-            provider.require(),
-            from_thought_id,
-            to_thought_id,
-            edge_type,
-            weight=weight,
-            edge_id=edge_id,
-        )
+        async with _tool_errors():
+            return await link_thoughts_impl(
+                provider.require(),
+                from_thought_id,
+                to_thought_id,
+                edge_type,
+                weight=weight,
+                edge_id=edge_id,
+            )
 
     @server.tool(
         name="delete_thought",
@@ -1345,7 +1429,8 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         annotations=_WRITE_DESTRUCTIVE,
     )
     async def delete_thought(thought_id: str) -> dict[str, Any]:
-        return await delete_thought_impl(provider.require(), thought_id)
+        async with _tool_errors():
+            return await delete_thought_impl(provider.require(), thought_id)
 
     @server.tool(
         name="delete_edge",
@@ -1358,7 +1443,8 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C
         annotations=_WRITE_DESTRUCTIVE,
     )
     async def delete_edge(edge_id: str) -> dict[str, Any]:
-        return await delete_edge_impl(provider.require(), edge_id)
+        async with _tool_errors():
+            return await delete_edge_impl(provider.require(), edge_id)
 
 
 def main() -> None:
