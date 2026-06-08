@@ -38,6 +38,7 @@ dependencies = [
 
 [project.scripts]
 engrava = "engrava.cli.main:main"
+engrava-mcp = "engrava.mcp.server:main"
 
 [project.urls]
 Homepage = "https://engrava.ai"
@@ -48,6 +49,7 @@ Changelog = "https://github.com/sovantica/engrava/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 vec = ["sqlite-vec>=0.1.0,<0.2.0"]
+mcp = ["mcp>=1.27.0"]
 dreaming = []
 embeddings-local = ["sentence-transformers>=3.0.0", "torch>=2.0.0"]
 embeddings-openai = ["httpx>=0.27.0"]
@@ -76,6 +78,9 @@ dev = [
     # not ANN at the pinned 0.1.x line — not just the numpy fallback.  Mirrors
     # the constraint declared in the ``vec`` extra above.
     "sqlite-vec>=0.1.0,<0.2.0",
+    # MCP SDK so the server module and its tests are importable in CI.
+    # Mirrors the constraint declared in the ``mcp`` extra above.
+    "mcp>=1.27.0",
 ]
 
 [tool.setuptools.packages.find]

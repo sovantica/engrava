@@ -62,7 +62,10 @@ if TYPE_CHECKING:
     from engrava.domain.models.metrics import EngravaMetrics, LatencyHistogram
     from engrava.domain.models.search import HybridSearchResult
     from engrava.domain.protocols.embedding_provider import EmbeddingProviderProtocol
+    from engrava.domain.protocols.hooks import MindQLExtension
     from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
+    from engrava.mindql.executor import MindQLResult
+    from engrava.mindql.parser import MindQLQuery
 
 logger = logging.getLogger(__name__)
 
@@ -2595,6 +2598,53 @@ class SqliteEngravaCore:
         results = [(row["thought_id"], float(row["score"])) for row in rows]
         await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
         return results
+
+    # ------------------------------------------------------------------
+    # MindQL execution
+    # ------------------------------------------------------------------
+
+    async def execute_mindql(
+        self,
+        query: MindQLQuery,
+        *,
+        extensions: dict[str, MindQLExtension] | None = None,
+    ) -> MindQLResult:
+        """Execute an already-parsed MindQL query against this store's connection.
+
+        This is the store-level entry point for the MindQL execution
+        contract: it lets a caller whose connection is owned by this store
+        run MindQL without reaching into store internals. Parse the query
+        first with :func:`engrava.mindql.parse`.
+
+        This method performs **no command-level policy filtering** — it will
+        execute whatever command the parsed query carries (``FIND``,
+        ``COUNT``, ``SELECT``, or a registered extension command). Callers
+        that need to restrict the command set (for example an
+        over-the-wire consumer exposing ``FIND`` only) **must** validate
+        ``query.command`` *before* calling this method.
+
+        Args:
+            query: A parsed MindQL query.
+            extensions: Optional registered MindQL extension commands. When
+                omitted, no extension commands are available. Callers that
+                expose extension commands supply their own map (the store
+                holds no extension-command registry of its own).
+
+        Returns:
+            The ``MindQLResult`` produced by the executor, carrying
+            ``columns``, ``rows``, ``count``, and the executed ``command``.
+
+        Raises:
+            MindQLParseError: If the executor rejects the query at
+                execution time (for example a ``SELECT`` whose raw SQL is
+                not a ``SELECT`` statement, or a ``FIND`` referencing an
+                invalid column).
+
+        """
+        from engrava.mindql.executor import MindQLExecutor  # noqa: PLC0415
+
+        executor = MindQLExecutor(self._db, extensions=extensions or {})
+        return await executor.execute(query)
 
     # ------------------------------------------------------------------
     # Hybrid search (FTS5 + vector + recency fusion)
