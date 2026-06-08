@@ -39,15 +39,33 @@ variable.  When it is set to a truthy value the write tools are not
 registered at all, so a read-only deployment never advertises them to
 clients.  The read tools are always available.
 
-The active store is supplied to tool calls through a :class:`StoreProvider`
-that the server's lifespan populates on startup and clears on shutdown.
-Each tool delegates to a module-level implementation function that takes an
-explicit store argument, which keeps the query and mutation logic
-unit-testable without a running server.
+Three read-only *resources* round out the surface.  Where tools are
+*invoked*, resources are addressable ``engrava://`` URIs that clients
+surface as attachable context:
+
+``engrava://thought/{thought_id}``
+    A single thought as a JSON document.  Reading an unknown identifier
+    yields a graceful not-found payload rather than an error.
+``engrava://stats``
+    Store-health counts and size, identical to the ``memory_stats`` tool
+    (both share :func:`memory_stats_impl`).
+``engrava://recent``
+    The most-recently-updated thoughts as a JSON document.
+
+Resources are reads by definition, so — unlike the write tools — they are
+*not* gated by :data:`READ_ONLY_ENV_VAR`; they are advertised in both the
+default and read-only deployments.
+
+The active store is supplied to tool and resource calls through a
+:class:`StoreProvider` that the server's lifespan populates on startup and
+clears on shutdown.  Each tool delegates to a module-level implementation
+function that takes an explicit store argument, which keeps the query and
+mutation logic unit-testable without a running server.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -74,6 +92,14 @@ SERVER_NAME = "engrava"
 
 #: Default number of results returned by search tools.
 DEFAULT_TOP_K = 10
+
+#: Default number of thoughts returned by the ``engrava://recent`` resource.
+DEFAULT_RECENT_LIMIT = 10
+
+#: MIME type advertised for every ``engrava://`` resource.  Resource
+#: handlers return a JSON document as text, so clients receive a stable,
+#: machine-parseable content type.
+RESOURCE_MIME_TYPE = "application/json"
 
 #: Default edge weight when a caller does not supply one.
 DEFAULT_EDGE_WEIGHT = 1.0
@@ -332,6 +358,33 @@ async def memory_stats_impl(store: SqliteEngravaCore) -> dict[str, Any]:
     }
 
 
+async def recent_thoughts_impl(
+    store: SqliteEngravaCore,
+    *,
+    limit: int = DEFAULT_RECENT_LIMIT,
+) -> dict[str, Any]:
+    """Return the most-recently-updated thoughts.
+
+    Wraps the public :meth:`~engrava.SqliteEngravaCore.list_thoughts`,
+    which orders by descending ``updated_cycle`` — so the first entry is
+    the thought touched most recently.
+
+    Args:
+        store: The store to query.
+        limit: Maximum number of thoughts to return, newest first.
+
+    Returns:
+        A dict with a ``thoughts`` list of JSON-serialisable thoughts
+        (newest first) and the ``limit`` that was applied.
+
+    """
+    thoughts = await store.list_thoughts(limit=limit)
+    return {
+        "thoughts": [thought.model_dump(mode="json") for thought in thoughts],
+        "limit": limit,
+    }
+
+
 async def store_thought_impl(
     store: SqliteEngravaCore,
     essence: str,
@@ -586,8 +639,9 @@ def build_server() -> FastMCP:
 
     The returned server resolves its store from the environment when its
     lifespan starts and releases the connection when the lifespan ends.
-    The read tools are always registered; the write tools are registered
-    unless :func:`_read_only_enabled` reports a read-only deployment.
+    The read tools and the resources are always registered; the write
+    tools are registered unless :func:`_read_only_enabled` reports a
+    read-only deployment.
 
     Returns:
         A configured :class:`FastMCP` server ready to ``run()``.
@@ -618,12 +672,75 @@ def build_server() -> FastMCP:
             "and read store statistics. Unless the server is started in "
             "read-only mode, you can also store new thoughts, update existing "
             "thoughts, link thoughts with typed edges, and delete thoughts or "
-            "edges."
+            "edges. Read-only resources are also available as attachable "
+            "context: a single thought (engrava://thought/{thought_id}), store "
+            "statistics (engrava://stats), and the most recent thoughts "
+            "(engrava://recent)."
         ),
         lifespan=lifespan,
     )
+    register_resources(server, provider)
     register_tools(server, provider)
     return server
+
+
+def register_resources(server: FastMCP, provider: StoreProvider) -> None:
+    """Register the read-only MCP resources on a server.
+
+    Three resources are registered.  They are reads by definition, so —
+    unlike the write tools — they are *not* gated by the read-only
+    environment flag and are advertised in every deployment:
+
+    ``engrava://thought/{thought_id}``
+        A single thought as a JSON document.  An unknown identifier
+        yields a graceful not-found payload rather than an error.
+    ``engrava://stats``
+        Store-health counts and size.  Shares :func:`memory_stats_impl`
+        with the ``memory_stats`` tool, so the two agree by construction.
+    ``engrava://recent``
+        The most-recently-updated thoughts as a JSON document.
+
+    Each handler returns a JSON string with the ``application/json`` MIME
+    type, so clients receive a stable, machine-parseable payload.
+
+    Args:
+        server: The server to register resources on.
+        provider: Supplies the active store to each resource at read time.
+
+    """
+
+    @server.resource(
+        "engrava://thought/{thought_id}",
+        name="thought",
+        title="Thought",
+        description="A single thought by its identifier, as a JSON document.",
+        mime_type=RESOURCE_MIME_TYPE,
+    )
+    async def thought_resource(thought_id: str) -> str:
+        payload = await get_thought_impl(provider.require(), thought_id)
+        return json.dumps(payload)
+
+    @server.resource(
+        "engrava://stats",
+        name="stats",
+        title="Store statistics",
+        description="Aggregate thought and edge counts and total storage size.",
+        mime_type=RESOURCE_MIME_TYPE,
+    )
+    async def stats_resource() -> str:
+        payload = await memory_stats_impl(provider.require())
+        return json.dumps(payload)
+
+    @server.resource(
+        "engrava://recent",
+        name="recent",
+        title="Recent thoughts",
+        description="The most-recently-updated thoughts, newest first, as a JSON document.",
+        mime_type=RESOURCE_MIME_TYPE,
+    )
+    async def recent_resource() -> str:
+        payload = await recent_thoughts_impl(provider.require())
+        return json.dumps(payload)
 
 
 # C901: the mccabe count is inflated by the nested ``@server.tool`` handler
