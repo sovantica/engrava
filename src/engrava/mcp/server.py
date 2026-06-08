@@ -56,6 +56,23 @@ Resources are reads by definition, so — unlike the write tools — they are
 *not* gated by :data:`READ_ONLY_ENV_VAR`; they are advertised in both the
 default and read-only deployments.
 
+Three *prompts* complete the surface.  Prompts are parameterised templates
+that a client surfaces as slash-commands or buttons; each one renders a
+ready-to-send instruction that guides the assistant to gather context with
+the read tools and resources above.  They are templates only — they open no
+write path and call no store method:
+
+``summarize_recent_memory``
+    Summarise the most recently stored thoughts.  Takes an optional
+    ``limit`` (how many recent thoughts to consider).
+``find_related``
+    Find and synthesise thoughts related to a required ``topic``.
+``reflect_on_topic``
+    Reflect over what memory holds about a required ``topic``.
+
+Prompts are read-oriented, so — like the resources — they are *not* gated by
+:data:`READ_ONLY_ENV_VAR` and are advertised in both deployments.
+
 The active store is supplied to tool and resource calls through a
 :class:`StoreProvider` that the server's lifespan populates on startup and
 clears on shutdown.  Each tool delegates to a module-level implementation
@@ -95,6 +112,11 @@ DEFAULT_TOP_K = 10
 
 #: Default number of thoughts returned by the ``engrava://recent`` resource.
 DEFAULT_RECENT_LIMIT = 10
+
+#: Default number of recent thoughts the ``summarize_recent_memory`` prompt
+#: asks the assistant to consider when the caller omits ``limit``.  Kept
+#: small so the summary stays focused on the latest activity.
+DEFAULT_SUMMARY_LIMIT = 5
 
 #: MIME type advertised for every ``engrava://`` resource.  Resource
 #: handlers return a JSON document as text, so clients receive a stable,
@@ -634,14 +656,103 @@ def _with_limit(parsed: MindQLQuery, limit: int) -> MindQLQuery:
     return replace(parsed, limit=limit)
 
 
+def _summarize_recent_prompt(limit: int, recent: dict[str, Any]) -> str:
+    """Build the ``summarize_recent_memory`` prompt text.
+
+    The text embeds the recent thoughts already gathered from the store so
+    the assistant can summarise them directly, while still naming the read
+    tools and resources it can use to widen the picture.  Embedding is
+    read-only: ``recent`` is the output of :func:`recent_thoughts_impl`.
+
+    Args:
+        limit: Number of recent thoughts the summary should cover.
+        recent: The payload returned by :func:`recent_thoughts_impl`,
+            carrying a ``thoughts`` list newest-first.
+
+    Returns:
+        A ready-to-send instruction asking for a concise summary of the
+        most recent stored memory.
+
+    """
+    thoughts = recent.get("thoughts", [])
+    if thoughts:
+        snapshot = json.dumps(thoughts, indent=2)
+        data_section = (
+            f"Here are the {len(thoughts)} most recent thoughts "
+            f"(newest first), as JSON:\n\n{snapshot}\n\n"
+        )
+    else:
+        data_section = "The store currently holds no thoughts to summarise.\n\n"
+    return (
+        f"Summarise the {limit} most recently stored memories in this "
+        "engrava store.\n\n"
+        f"{data_section}"
+        "If you need more detail or want to confirm the latest activity, "
+        "read the `engrava://recent` resource or call the `memory_stats` "
+        "tool; use `get_thought` to expand any single thought by its "
+        "identifier. Produce a concise summary that highlights the main "
+        "themes, any recurring topics, and anything that looks important "
+        "or unresolved. Keep it brief — a short paragraph or a few bullet "
+        "points."
+    )
+
+
+def _find_related_prompt(topic: str) -> str:
+    """Build the ``find_related`` prompt text.
+
+    Args:
+        topic: The subject to find related thoughts about.
+
+    Returns:
+        A ready-to-send instruction asking the assistant to gather and
+        synthesise thoughts related to ``topic`` using ``search_memory``.
+
+    """
+    return (
+        f"Find and synthesise what this engrava memory store holds about "
+        f"{topic!r}.\n\n"
+        f"Use the `search_memory` tool with a query for {topic!r} (it ranks "
+        "results by lexical, vector, and recency signals); you can also try "
+        "`search_keywords` for an exact-term pass. Expand the most relevant "
+        "hits with `get_thought` to read their full content. Then synthesise "
+        "the findings into a short, organised summary of what is known about "
+        f"{topic!r}, grouping related points and noting any gaps or "
+        "contradictions."
+    )
+
+
+def _reflect_on_topic_prompt(topic: str) -> str:
+    """Build the ``reflect_on_topic`` prompt text.
+
+    Args:
+        topic: The subject to reflect on.
+
+    Returns:
+        A ready-to-send instruction that scaffolds a structured reflection
+        over what the store holds about ``topic``.
+
+    """
+    return (
+        f"Reflect on what this engrava memory store holds about {topic!r}.\n\n"
+        f"First gather the relevant memories: call `search_memory` for "
+        f"{topic!r} and read the strongest hits in full with `get_thought`. "
+        "Then reflect rather than merely listing: structure your response "
+        "around (1) what is well established about the topic, (2) open "
+        "questions or gaps in what is stored, and (3) any tensions or "
+        "contradictions between thoughts. Close with one or two concrete "
+        "follow-ups worth recording. Ground every observation in the "
+        "retrieved thoughts."
+    )
+
+
 def build_server() -> FastMCP:
     """Build the engrava MCP server with its tools registered.
 
     The returned server resolves its store from the environment when its
     lifespan starts and releases the connection when the lifespan ends.
-    The read tools and the resources are always registered; the write
-    tools are registered unless :func:`_read_only_enabled` reports a
-    read-only deployment.
+    The read tools, the resources, and the prompts are always registered;
+    the write tools are registered unless :func:`_read_only_enabled`
+    reports a read-only deployment.
 
     Returns:
         A configured :class:`FastMCP` server ready to ``run()``.
@@ -675,11 +786,14 @@ def build_server() -> FastMCP:
             "edges. Read-only resources are also available as attachable "
             "context: a single thought (engrava://thought/{thought_id}), store "
             "statistics (engrava://stats), and the most recent thoughts "
-            "(engrava://recent)."
+            "(engrava://recent). Guided prompts scaffold common retrieval "
+            "workflows: summarize_recent_memory, find_related, and "
+            "reflect_on_topic."
         ),
         lifespan=lifespan,
     )
     register_resources(server, provider)
+    register_prompts(server, provider)
     register_tools(server, provider)
     return server
 
@@ -741,6 +855,63 @@ def register_resources(server: FastMCP, provider: StoreProvider) -> None:
     async def recent_resource() -> str:
         payload = await recent_thoughts_impl(provider.require())
         return json.dumps(payload)
+
+
+def register_prompts(server: FastMCP, provider: StoreProvider) -> None:
+    """Register the guided retrieval prompts on a server.
+
+    Three prompts are registered.  They are parameterised templates that a
+    client surfaces as slash-commands or buttons; each renders a
+    ready-to-send instruction guiding the assistant to gather context with
+    the read tools and resources before answering.  Prompts are
+    read-oriented, so — like the resources and unlike the write tools —
+    they are *not* gated by the read-only environment flag and are
+    advertised in every deployment:
+
+    ``summarize_recent_memory``
+        Summarise the most recent thoughts.  Takes an optional ``limit``;
+        this is the one prompt that reads the store, embedding the recent
+        thoughts (read-only) so the assistant can summarise them inline.
+    ``find_related``
+        Find and synthesise thoughts related to a required ``topic``.
+    ``reflect_on_topic``
+        Reflect over what memory holds about a required ``topic``.
+
+    Args:
+        server: The server to register prompts on.
+        provider: Supplies the active store to ``summarize_recent_memory``
+            at render time; the topic prompts are pure templates and do not
+            use it.
+
+    """
+
+    @server.prompt(
+        name="summarize_recent_memory",
+        title="Summarise recent memory",
+        description=(
+            "Summarise the most recently stored thoughts. Optionally set "
+            "how many recent thoughts to consider."
+        ),
+    )
+    async def summarize_recent_memory(limit: int = DEFAULT_SUMMARY_LIMIT) -> str:
+        recent = await recent_thoughts_impl(provider.require(), limit=limit)
+        return _summarize_recent_prompt(limit, recent)
+
+    @server.prompt(
+        name="find_related",
+        title="Find related thoughts",
+        description="Find and synthesise stored thoughts related to a topic.",
+    )
+    def find_related(topic: str) -> str:
+        return _find_related_prompt(topic)
+
+    @server.prompt(
+        name="reflect_on_topic",
+        title="Reflect on a topic",
+        description="Reflect on what stored memory holds about a topic.",
+    )
+    def reflect_on_topic(topic: str) -> str:
+        return _reflect_on_topic_prompt(topic)
 
 
 # C901: the mccabe count is inflated by the nested ``@server.tool`` handler
