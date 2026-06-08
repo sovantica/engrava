@@ -33,6 +33,8 @@ WRITE_TOOL_NAMES = frozenset(
         "store_thought",
         "update_thought",
         "link_thoughts",
+        "delete_thought",
+        "delete_edge",
     }
 )
 
@@ -51,7 +53,7 @@ async def _registered_tool_names() -> set[str]:
 class TestRegistrationGating:
     """Tests for which tools register under each mode."""
 
-    async def test_unset_registers_all_eight_tools(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_unset_registers_all_tools(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(READ_ONLY_ENV_VAR, raising=False)
         names = await _registered_tool_names()
         assert names == READ_TOOL_NAMES | WRITE_TOOL_NAMES
