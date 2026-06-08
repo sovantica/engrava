@@ -21,7 +21,7 @@ Five read-only tools are exposed:
 ``memory_stats``
     Aggregate counts and store-health metrics.
 
-Three write tools complete the surface:
+Five write tools complete the surface:
 
 ``store_thought``
     Create a new thought node.
@@ -29,6 +29,10 @@ Three write tools complete the surface:
     Mutate selected fields of an existing thought.
 ``link_thoughts``
     Create a typed edge between two existing thoughts.
+``delete_thought``
+    Remove a thought by identifier.
+``delete_edge``
+    Remove an edge by identifier.
 
 The write tools are gated by the :data:`READ_ONLY_ENV_VAR` environment
 variable.  When it is set to a truthy value the write tools are not
@@ -100,6 +104,13 @@ _WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHi
 #: Annotation for an idempotent, non-destructive write (updating a thought —
 #: repeating with the same arguments converges on the same end state).
 _WRITE_IDEMPOTENT = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True)
+
+#: Annotation for a destructive but idempotent write (deleting a thought or
+#: edge).  It is marked idempotent because deleting an already-absent
+#: identifier is a no-op that returns ``deleted=False`` and leaves the same
+#: end state — the record is gone either way — so a client may safely retry a
+#: delete that appeared to fail.
+_WRITE_DESTRUCTIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True)
 
 
 class StoreNotReadyError(RuntimeError):
@@ -500,6 +511,44 @@ async def link_thoughts_impl(
     }
 
 
+async def delete_thought_impl(store: SqliteEngravaCore, thought_id: str) -> dict[str, Any]:
+    """Delete a thought by identifier.
+
+    Deleting an identifier that is not present is a no-op rather than an
+    error: the call simply reports that nothing was removed.
+
+    Args:
+        store: The store to write to.
+        thought_id: Identifier of the thought to delete.
+
+    Returns:
+        A dict with a ``deleted`` flag: ``True`` when a thought was
+        removed, ``False`` when no thought had the given identifier.
+
+    """
+    deleted = await store.delete_thought(thought_id)
+    return {"deleted": deleted}
+
+
+async def delete_edge_impl(store: SqliteEngravaCore, edge_id: str) -> dict[str, Any]:
+    """Delete an edge by identifier.
+
+    Deleting an identifier that is not present is a no-op rather than an
+    error: the call simply reports that nothing was removed.
+
+    Args:
+        store: The store to write to.
+        edge_id: Identifier of the edge to delete.
+
+    Returns:
+        A dict with a ``deleted`` flag: ``True`` when an edge was removed,
+        ``False`` when no edge had the given identifier.
+
+    """
+    deleted = await store.delete_edge(edge_id)
+    return {"deleted": deleted}
+
+
 def _read_only_enabled() -> bool:
     """Report whether the server should expose a read-only surface.
 
@@ -568,7 +617,8 @@ def build_server() -> FastMCP:
             "hybrid and keyword search, run structured MindQL FIND queries, "
             "and read store statistics. Unless the server is started in "
             "read-only mode, you can also store new thoughts, update existing "
-            "thoughts, and link thoughts with typed edges."
+            "thoughts, link thoughts with typed edges, and delete thoughts or "
+            "edges."
         ),
         lifespan=lifespan,
     )
@@ -576,10 +626,15 @@ def build_server() -> FastMCP:
     return server
 
 
-def register_tools(server: FastMCP, provider: StoreProvider) -> None:
+# C901: the mccabe count is inflated by the nested ``@server.tool`` handler
+# definitions (one trivial delegating wrapper per tool), not by branching logic
+# — this function has a single branch, the read-only guard. Splitting the flat
+# registration list would hurt readability, so the complexity cap is waived here
+# deliberately.
+def register_tools(server: FastMCP, provider: StoreProvider) -> None:  # noqa: C901
     """Register the MCP tools on a server.
 
-    The five read tools are always registered.  The three write tools are
+    The five read tools are always registered.  The five write tools are
     registered only when the server is not in read-only mode (see
     :func:`_read_only_enabled`); in read-only mode they are never
     advertised to clients.
@@ -745,6 +800,32 @@ def register_tools(server: FastMCP, provider: StoreProvider) -> None:
             weight=weight,
             edge_id=edge_id,
         )
+
+    @server.tool(
+        name="delete_thought",
+        description=(
+            "Delete a thought by its identifier. Use this to remove a memory "
+            "that is wrong or no longer wanted. Returns whether a thought was "
+            "removed; deleting an identifier that does not exist is not an "
+            "error and simply reports that nothing was removed."
+        ),
+        annotations=_WRITE_DESTRUCTIVE,
+    )
+    async def delete_thought(thought_id: str) -> dict[str, Any]:
+        return await delete_thought_impl(provider.require(), thought_id)
+
+    @server.tool(
+        name="delete_edge",
+        description=(
+            "Delete an edge between two thoughts by its identifier. Use this to "
+            "remove a relationship that is wrong or no longer wanted. Returns "
+            "whether an edge was removed; deleting an identifier that does not "
+            "exist is not an error and simply reports that nothing was removed."
+        ),
+        annotations=_WRITE_DESTRUCTIVE,
+    )
+    async def delete_edge(edge_id: str) -> dict[str, Any]:
+        return await delete_edge_impl(provider.require(), edge_id)
 
 
 def main() -> None:

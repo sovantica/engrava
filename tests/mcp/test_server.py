@@ -36,7 +36,12 @@ if TYPE_CHECKING:
 READ_TOOL_NAMES = frozenset(
     {"get_thought", "search_memory", "search_keywords", "query_memory", "memory_stats"}
 )
-WRITE_TOOL_NAMES = frozenset({"store_thought", "update_thought", "link_thoughts"})
+WRITE_TOOL_NAMES = frozenset(
+    {"store_thought", "update_thought", "link_thoughts", "delete_thought", "delete_edge"}
+)
+#: The subset of write tools that remove data and therefore carry
+#: ``destructiveHint=True``.
+DESTRUCTIVE_TOOL_NAMES = frozenset({"delete_thought", "delete_edge"})
 EXPECTED_TOOL_NAMES = READ_TOOL_NAMES | WRITE_TOOL_NAMES
 
 
@@ -85,11 +90,13 @@ class TestServerEndToEnd:
 
         read_only_by_name: dict[str, bool | None] = {}
         idempotent_by_name: dict[str, bool | None] = {}
+        destructive_by_name: dict[str, bool | None] = {}
         for tool in listed.tools:
             # Every tool must carry an annotation block.
             assert tool.annotations is not None
             read_only_by_name[tool.name] = tool.annotations.readOnlyHint
             idempotent_by_name[tool.name] = tool.annotations.idempotentHint
+            destructive_by_name[tool.name] = tool.annotations.destructiveHint
 
         assert set(read_only_by_name) == EXPECTED_TOOL_NAMES
         # The read tools are read-only and the write tools are not.
@@ -101,9 +108,18 @@ class TestServerEndToEnd:
         #   - update_thought converges on the same end state  -> idempotent
         #   - store_thought creates a fresh node each call    -> NOT idempotent
         #   - link_thoughts rejects a duplicate (from,to,type) -> NOT idempotent
+        #   - delete_* of an absent id is a no-op, same end state -> idempotent
         assert idempotent_by_name["update_thought"] is True
         assert idempotent_by_name["store_thought"] is False
         assert idempotent_by_name["link_thoughts"] is False
+        assert idempotent_by_name["delete_thought"] is True
+        assert idempotent_by_name["delete_edge"] is True
+
+        # Only the delete tools remove data, so only they are destructive.
+        assert all(destructive_by_name[name] is True for name in DESTRUCTIVE_TOOL_NAMES)
+        assert all(
+            destructive_by_name[name] is False for name in WRITE_TOOL_NAMES - DESTRUCTIVE_TOOL_NAMES
+        )
 
     async def test_read_only_mode_hides_write_tools(
         self,
@@ -171,6 +187,64 @@ class TestServerEndToEnd:
         assert fetched.structuredContent is not None
         assert fetched.structuredContent["found"] is True
         assert fetched.structuredContent["thought"]["essence"] == "Edited note"
+
+    async def test_delete_tools_round_trip_over_transport(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv(DB_PATH_ENV_VAR, str(tmp_path / "deletes.db"))
+        monkeypatch.delenv(CONFIG_ENV_VAR, raising=False)
+        monkeypatch.delenv(READ_ONLY_ENV_VAR, raising=False)
+
+        server = build_server()
+        async with connect_client(server) as client:
+            first = await client.call_tool(
+                "store_thought",
+                {"essence": "From note", "content": "Source thought."},
+            )
+            assert first.structuredContent is not None
+            first_id = first.structuredContent["thought"]["thought_id"]
+
+            second = await client.call_tool(
+                "store_thought",
+                {"essence": "To note", "content": "Target thought."},
+            )
+            assert second.structuredContent is not None
+            second_id = second.structuredContent["thought"]["thought_id"]
+
+            linked = await client.call_tool(
+                "link_thoughts",
+                {
+                    "from_thought_id": first_id,
+                    "to_thought_id": second_id,
+                    "edge_type": "ASSOCIATED",
+                },
+            )
+            assert linked.structuredContent is not None
+            edge_id = linked.structuredContent["edge"]["edge_id"]
+
+            deleted_edge = await client.call_tool("delete_edge", {"edge_id": edge_id})
+            assert deleted_edge.isError is False
+            assert deleted_edge.structuredContent is not None
+            assert deleted_edge.structuredContent["deleted"] is True
+
+            deleted_thought = await client.call_tool("delete_thought", {"thought_id": first_id})
+            assert deleted_thought.isError is False
+            assert deleted_thought.structuredContent is not None
+            assert deleted_thought.structuredContent["deleted"] is True
+
+            # Deleting the same thought again converges on the same end state
+            # (already gone) and reports it without erroring.
+            again = await client.call_tool("delete_thought", {"thought_id": first_id})
+            assert again.isError is False
+            assert again.structuredContent is not None
+            assert again.structuredContent["deleted"] is False
+
+            fetched = await client.call_tool("get_thought", {"thought_id": first_id})
+
+        assert fetched.structuredContent is not None
+        assert fetched.structuredContent["found"] is False
 
     async def test_get_thought_round_trip(
         self,
