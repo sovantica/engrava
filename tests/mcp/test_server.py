@@ -28,13 +28,16 @@ from engrava.mcp.config import (
     StoreResolutionError,
     resolve_store,
 )
+from engrava.mcp.server import READ_ONLY_ENV_VAR
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-EXPECTED_TOOL_NAMES = frozenset(
+READ_TOOL_NAMES = frozenset(
     {"get_thought", "search_memory", "search_keywords", "query_memory", "memory_stats"}
 )
+WRITE_TOOL_NAMES = frozenset({"store_thought", "update_thought", "link_thoughts"})
+EXPECTED_TOOL_NAMES = READ_TOOL_NAMES | WRITE_TOOL_NAMES
 
 
 async def _seed_database(path: Path) -> None:
@@ -67,22 +70,107 @@ async def _seed_database(path: Path) -> None:
 class TestServerEndToEnd:
     """Drive the server through a connected in-memory client."""
 
-    async def test_lists_exactly_five_tools(
+    async def test_lists_read_and_write_tools_by_default(
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
         monkeypatch.setenv(DB_PATH_ENV_VAR, str(tmp_path / "tools.db"))
         monkeypatch.delenv(CONFIG_ENV_VAR, raising=False)
+        monkeypatch.delenv(READ_ONLY_ENV_VAR, raising=False)
 
         server = build_server()
         async with connect_client(server) as client:
             listed = await client.list_tools()
 
-        assert {tool.name for tool in listed.tools} == EXPECTED_TOOL_NAMES
-        assert all(
-            tool.annotations is not None and tool.annotations.readOnlyHint for tool in listed.tools
-        )
+        read_only_by_name: dict[str, bool | None] = {}
+        idempotent_by_name: dict[str, bool | None] = {}
+        for tool in listed.tools:
+            # Every tool must carry an annotation block.
+            assert tool.annotations is not None
+            read_only_by_name[tool.name] = tool.annotations.readOnlyHint
+            idempotent_by_name[tool.name] = tool.annotations.idempotentHint
+
+        assert set(read_only_by_name) == EXPECTED_TOOL_NAMES
+        # The read tools are read-only and the write tools are not.
+        assert all(read_only_by_name[name] for name in READ_TOOL_NAMES)
+        assert all(read_only_by_name[name] is False for name in WRITE_TOOL_NAMES)
+
+        # Idempotency hints must match the real store semantics a client
+        # would rely on for safe retries:
+        #   - update_thought converges on the same end state  -> idempotent
+        #   - store_thought creates a fresh node each call    -> NOT idempotent
+        #   - link_thoughts rejects a duplicate (from,to,type) -> NOT idempotent
+        assert idempotent_by_name["update_thought"] is True
+        assert idempotent_by_name["store_thought"] is False
+        assert idempotent_by_name["link_thoughts"] is False
+
+    async def test_read_only_mode_hides_write_tools(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv(DB_PATH_ENV_VAR, str(tmp_path / "ro.db"))
+        monkeypatch.delenv(CONFIG_ENV_VAR, raising=False)
+        monkeypatch.setenv(READ_ONLY_ENV_VAR, "1")
+
+        server = build_server()
+        async with connect_client(server) as client:
+            listed = await client.list_tools()
+
+        assert {tool.name for tool in listed.tools} == READ_TOOL_NAMES
+
+    async def test_write_tools_round_trip_over_transport(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv(DB_PATH_ENV_VAR, str(tmp_path / "writes.db"))
+        monkeypatch.delenv(CONFIG_ENV_VAR, raising=False)
+        monkeypatch.delenv(READ_ONLY_ENV_VAR, raising=False)
+
+        server = build_server()
+        async with connect_client(server) as client:
+            created = await client.call_tool(
+                "store_thought",
+                {"essence": "Live note", "content": "Stored over the transport."},
+            )
+            assert created.isError is False
+            assert created.structuredContent is not None
+            first_id = created.structuredContent["thought"]["thought_id"]
+
+            second = await client.call_tool(
+                "store_thought",
+                {"essence": "Second note", "content": "Another stored note."},
+            )
+            assert second.structuredContent is not None
+            second_id = second.structuredContent["thought"]["thought_id"]
+
+            updated = await client.call_tool(
+                "update_thought",
+                {"thought_id": first_id, "essence": "Edited note"},
+            )
+            assert updated.isError is False
+            assert updated.structuredContent is not None
+            assert updated.structuredContent["thought"]["essence"] == "Edited note"
+
+            linked = await client.call_tool(
+                "link_thoughts",
+                {
+                    "from_thought_id": first_id,
+                    "to_thought_id": second_id,
+                    "edge_type": "ASSOCIATED",
+                },
+            )
+            assert linked.isError is False
+            assert linked.structuredContent is not None
+            assert linked.structuredContent["edge"]["from_thought_id"] == first_id
+
+            fetched = await client.call_tool("get_thought", {"thought_id": first_id})
+
+        assert fetched.structuredContent is not None
+        assert fetched.structuredContent["found"] is True
+        assert fetched.structuredContent["thought"]["essence"] == "Edited note"
 
     async def test_get_thought_round_trip(
         self,
