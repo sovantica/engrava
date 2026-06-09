@@ -236,14 +236,30 @@ class TestGuardPreservation:
 
         assert result.isError is True
         text = _error_text(result.content)
-        assert "FIND" in text
+        lowered = text.lower()
+        assert "only find" in lowered
         _assert_no_leak(text)
+        # The message must NOT leak the parser's full command set. For an
+        # unrecognised verb the raw parser error reads "Expected FIND, COUNT,
+        # SELECT, or extension command" — naming COUNT / SELECT / extension
+        # would advertise commands the MCP surface deliberately hides. The
+        # input verb ("DROP") is not echoed, so none of these may appear.
+        assert "COUNT" not in text
+        assert "SELECT" not in text
+        assert "extension" not in lowered
 
 
 class TestMalformedFind:
-    """A malformed ``FIND`` returns the parse problem plus a valid example."""
+    """A malformed query is rejected with a FIND-only message + example.
 
-    async def test_incomplete_find_reports_problem_and_example(
+    The message is deliberately generic (FIND-only + a valid example) and
+    does NOT echo the parser's raw text, because the parser names the full
+    MindQL command set for an unrecognised verb — which the MCP surface must
+    not advertise. The trade-off (a malformed FIND loses the precise parse
+    detail) is accepted to keep the over-the-wire surface FIND-only.
+    """
+
+    async def test_incomplete_find_reports_find_only_and_example(
         self,
         store: SqliteEngravaCore,
     ) -> None:
@@ -252,10 +268,12 @@ class TestMalformedFind:
 
         assert result.isError is True
         text = _error_text(result.content)
-        # The specific parse problem is surfaced ...
-        assert "table name" in text
-        # ... alongside a valid FIND example to copy.
+        # FIND-only contract is stated, with a valid FIND example to copy ...
+        assert "only find" in text.lower()
         assert "FIND thoughts WHERE" in text
+        # ... and the parser's command set is never leaked.
+        assert "COUNT" not in text
+        assert "extension" not in text.lower()
         _assert_no_leak(text)
 
     async def test_unknown_table_reports_problem(

@@ -262,9 +262,15 @@ async def _tool_errors() -> AsyncIterator[None]:
         # and never invites raw SQL.
         raise ToolError(str(exc)) from exc
     except MindQLParseError as exc:
+        # Do NOT echo the parser's raw message: for an unrecognised verb the
+        # parser names the full MindQL command set ("Expected FIND, COUNT,
+        # SELECT, or extension command"), which would leak commands the MCP
+        # surface deliberately does not expose. query_memory accepts only
+        # FIND, so the client-facing message states that and shows a valid
+        # FIND example — never the parser's command list.
         msg = (
-            f"That query could not be parsed: {exc}. query_memory runs MindQL "
-            f"FIND queries; for example: {FIND_QUERY_EXAMPLE}"
+            "query_memory accepts only FIND queries and the query could not "
+            f"be parsed as one. Use the FIND command, for example: {FIND_QUERY_EXAMPLE}"
         )
         raise ToolError(msg) from exc
     except ThoughtNotFoundError as exc:
