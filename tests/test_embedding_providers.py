@@ -571,6 +571,196 @@ class TestOpenAIProvider:
         assert len(results) == 2
 
 
+class TestOpenAIProviderRetry:
+    """Transient-error retry behaviour for OpenAICompatibleProvider."""
+
+    @staticmethod
+    def _ok_response(embedding: list[float]) -> MagicMock:
+        """A 200 response carrying a single embedding at index 0."""
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"data": [{"index": 0, "embedding": embedding}]}
+        return response
+
+    @staticmethod
+    def _status_response(status_code: int) -> MagicMock:
+        """A non-200 response with a benign body (no secret material)."""
+        response = MagicMock()
+        response.status_code = status_code
+        response.text = "service unavailable"
+        return response
+
+    async def test_embedding_retries_then_succeeds(self) -> None:
+        """A read timeout twice, then a 200 — vectors returned after 3 attempts."""
+        import httpx
+
+        from engrava.embeddings.openai_compatible import OpenAICompatibleProvider
+
+        # A non-zero base delay so the backoff path is exercised; the
+        # asyncio.sleep patch keeps the test from sleeping for real.
+        provider = OpenAICompatibleProvider(
+            model_name="test-model",
+            base_url="https://api.test.com/v1",
+            api_key="sk-test",
+            base_retry_delay_s=1.0,
+        )
+
+        ok = self._ok_response([0.1, 0.2, 0.3])
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(
+            side_effect=[
+                httpx.ReadTimeout("read timed out"),
+                httpx.ReadTimeout("read timed out"),
+                ok,
+            ]
+        )
+        provider._client = mock_client
+
+        with patch("asyncio.sleep", new=AsyncMock()) as mock_sleep:
+            result = await provider.embed("hello")
+
+        assert result == [0.1, 0.2, 0.3]
+        assert provider.dimension == 3
+        assert mock_client.post.call_count == 3
+        # Two failed attempts → two backoff sleeps before the success.
+        assert mock_sleep.await_count == 2
+
+    async def test_embedding_retries_on_retryable_status(self) -> None:
+        """A 503 twice, then a 200 — success after retrying the status."""
+        from engrava.embeddings.openai_compatible import OpenAICompatibleProvider
+
+        provider = OpenAICompatibleProvider(
+            model_name="test-model",
+            base_url="https://api.test.com/v1",
+            api_key="sk-test",
+            base_retry_delay_s=1.0,
+        )
+
+        ok = self._ok_response([0.4, 0.5])
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(
+            side_effect=[
+                self._status_response(503),
+                self._status_response(503),
+                ok,
+            ]
+        )
+        provider._client = mock_client
+
+        with patch("asyncio.sleep", new=AsyncMock()) as mock_sleep:
+            result = await provider.embed("hello")
+
+        assert result == [0.4, 0.5]
+        assert mock_client.post.call_count == 3
+        assert mock_sleep.await_count == 2
+
+    async def test_embedding_persistent_timeout_raises(self) -> None:
+        """A read timeout on every attempt raises after max_attempts (no loop)."""
+        import httpx
+
+        from engrava.embeddings.openai_compatible import OpenAICompatibleProvider
+
+        fake_api_key = "sk-canary-token-value"
+        provider = OpenAICompatibleProvider(
+            model_name="test-model",
+            base_url="https://api.test.com/v1",
+            api_key=fake_api_key,
+            max_attempts=3,
+            base_retry_delay_s=0,
+        )
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=httpx.ReadTimeout("read timed out"))
+        provider._client = mock_client
+
+        with (
+            patch("asyncio.sleep", new=AsyncMock()),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            await provider.embed("hello")
+
+        # Bounded: exactly max_attempts calls, then a raise — no infinite loop.
+        assert mock_client.post.call_count == 3
+        # The raised error must not leak the API key or an Authorization header.
+        message = str(exc_info.value)
+        assert fake_api_key not in message
+        assert "Authorization" not in message
+        assert "Bearer" not in message
+
+    async def test_embedding_non_retryable_status_raises_immediately(self) -> None:
+        """A 401 raises on the first attempt — no retry for a non-transient status."""
+        from engrava.embeddings.openai_compatible import OpenAICompatibleProvider
+
+        provider = OpenAICompatibleProvider(
+            model_name="test-model",
+            base_url="https://api.test.com/v1",
+            api_key="sk-test",
+            base_retry_delay_s=0,
+        )
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=self._status_response(401))
+        provider._client = mock_client
+
+        with (
+            patch("asyncio.sleep", new=AsyncMock()) as mock_sleep,
+            pytest.raises(RuntimeError, match="401"),
+        ):
+            await provider.embed("hello")
+
+        # No retry on a non-retryable status: a single attempt, zero sleeps.
+        assert mock_client.post.call_count == 1
+        assert mock_sleep.await_count == 0
+
+    async def test_embedding_success_path_unchanged(self) -> None:
+        """A 200 on the first try — exactly one attempt and identical vectors."""
+        from engrava.embeddings.openai_compatible import OpenAICompatibleProvider
+
+        provider = OpenAICompatibleProvider(
+            model_name="test-model",
+            base_url="https://api.test.com/v1",
+            api_key="sk-test",
+        )
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=self._ok_response([0.1, 0.2, 0.3]))
+        provider._client = mock_client
+
+        with patch("asyncio.sleep", new=AsyncMock()) as mock_sleep:
+            result = await provider.embed("hello")
+
+        assert result == [0.1, 0.2, 0.3]
+        assert provider.dimension == 3
+        # Backward-compat lock: one attempt, never any backoff sleep.
+        mock_client.post.assert_called_once()
+        assert mock_sleep.await_count == 0
+
+    async def test_embedding_backoff_is_bounded(self) -> None:
+        """With base_retry_delay_s=0 the retry count is bounded by max_attempts."""
+        import httpx
+
+        from engrava.embeddings.openai_compatible import OpenAICompatibleProvider
+
+        provider = OpenAICompatibleProvider(
+            model_name="test-model",
+            base_url="https://api.test.com/v1",
+            api_key="sk-test",
+            max_attempts=5,
+            base_retry_delay_s=0,
+        )
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+        provider._client = mock_client
+
+        with pytest.raises(RuntimeError):
+            await provider.embed("hello")
+
+        # Assert the attempt COUNT, not wall-clock — base_retry_delay_s=0
+        # means no real sleeping occurs.
+        assert mock_client.post.call_count == 5
+
+
 class TestOllamaProvider:
     """Unit tests for OllamaProvider."""
 
