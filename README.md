@@ -199,6 +199,21 @@ async with EngravaManager(data_dir=Path("./data")) as mgr:
     # Completely isolated databases
 ```
 
+### MCP Server
+
+Expose a store to any MCP client — Claude Desktop, Claude Code, Cursor,
+Windsurf, VS Code — via the `engrava[mcp]` extra. A native stdio server (no HTTP
+shim) with read tools, optional write tools, attachable `engrava://` resources,
+and guided prompts:
+
+```bash
+pip install "engrava[mcp]"
+engrava-mcp        # spawned by your MCP client over stdio
+```
+
+→ See [`docs/guides/mcp.md`](docs/guides/mcp.md) for install, client
+configuration, the full tool/resource/prompt reference, and read-only mode.
+
 ## CLI
 
 ```bash
@@ -235,6 +250,7 @@ See the [CLI reference](docs/cli.md) for every command and option.
 - [Building a memory-backed agent](docs/guides/agent-memory.md) — the end-to-end agent turn loop (ingest → retrieve → generate → consolidate)
 - [Migrating from another memory system](docs/guides/migrating-from-other-memory.md) — concept mapping, porting calls, bulk import, and scoping/multi-tenancy
 - [Embeddings](docs/guides/embeddings.md) — wiring a real embedding provider (local / OpenAI / Ollama / HuggingFace / custom)
+- [MCP server](docs/guides/mcp.md) — expose a store to MCP clients (Claude Desktop, Claude Code, Cursor, Windsurf, VS Code): install, run, client config, tools/resources/prompts
 - [Configuration](docs/configuration.md) — YAML config format and options
 - [Upgrade Guide](docs/upgrade.md) — compatibility matrix, backups, and troubleshooting
 - [Extensions](docs/extensions.md) — Writing custom extensions and hooks

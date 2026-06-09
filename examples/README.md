@@ -23,6 +23,22 @@ download.
 | [`quickstart.py`](quickstart.py) | 5-minute end-to-end tour: in-memory store, percepts + utterances ingest, one dreaming cycle, hybrid-search query, top-K print. |
 | [`simple_agent.py`](simple_agent.py) | Lower-level walkthrough using a custom scoring hook, manual edges, and a fake embedding function — useful for understanding the API surface without the local-encoder dependency. |
 
+## MCP client configuration
+
+Sample `mcpServers` blocks for pointing an MCP client (Claude Desktop, Claude
+Code, Cursor, Windsurf, VS Code, …) at the engrava
+[MCP server](../docs/guides/mcp.md). Copy the one that matches your client and
+replace the store path with your own.
+
+| File | For |
+|---|---|
+| [`mcp-client-config.json`](mcp-client-config.json) | The default stdio block (Claude Desktop, Claude Code, Cursor, Windsurf, Cline, Codex, …). Points at an `engrava.yaml`. |
+| [`mcp-client-config.db-path.json`](mcp-client-config.db-path.json) | Same shape, but points at a bare SQLite file via `ENGRAVA_DB_PATH` (lexical search only). |
+| [`mcp-client-config.readonly.json`](mcp-client-config.readonly.json) | Read-only deployment — `ENGRAVA_MCP_READ_ONLY=true` hides the write tools. |
+| [`mcp-client-config.vscode.json`](mcp-client-config.vscode.json) | VS Code, which nests servers under an `mcp` key. |
+
+These require the MCP extra: `pip install "engrava[mcp]"`.
+
 Run them directly with the Python interpreter:
 
 ```bash
@@ -57,3 +73,6 @@ teal.`.
 - [`docs/benchmarks.md`](../docs/benchmarks.md) — the synthetic
   benchmark suite that reports dreaming's measured REFLECTION
   coverage on a representative workload.
+- [`docs/guides/mcp.md`](../docs/guides/mcp.md) — the MCP server:
+  install, run, client configuration, and the full
+  tool/resource/prompt reference.

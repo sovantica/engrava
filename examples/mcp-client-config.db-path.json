@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "engrava": {
+      "command": "engrava-mcp",
+      "env": {
+        "ENGRAVA_DB_PATH": "/absolute/path/to/agent-memory.db"
+      }
+    }
+  }
+}
