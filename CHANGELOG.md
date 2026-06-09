@@ -15,6 +15,21 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ### Fixed
 
+- **Transient errors from an OpenAI-compatible embeddings endpoint no
+  longer abort the whole call.** `OpenAICompatibleProvider` now retries a
+  single embeddings request with bounded exponential backoff when the
+  endpoint reports a transient failure — a read timeout or network blip,
+  or a transient HTTP status (`408`, `409`, `425`, `429`, `500`, `502`,
+  `503`, `504`). A short outage is absorbed instead of failing the
+  caller's ingest. Non-transient errors (such as `400`, `401`, `403`,
+  `404`) still surface immediately with no retry, and a transient failure
+  that persists across every attempt is still raised, so the call never
+  loops forever. The behaviour is tunable through two new keyword-only
+  constructor arguments, `max_attempts` (default `3`) and
+  `base_retry_delay_s` (default `1.0`); the defaults leave the success
+  path at a single request, so existing callers see no change. The other
+  embedding providers are unaffected.
+
 - **sqlite-vec backend no longer crashes on configuration.** Selecting the
   `sqlite-vec` vector backend (via `engrava[vec]`) previously raised a
   thread error when building a store from configuration, because the
