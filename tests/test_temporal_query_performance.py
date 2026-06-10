@@ -21,17 +21,22 @@ The NULL-tolerant predicates resolve to a SQL body of the shape::
 
     (valid_from IS NULL OR valid_from <= ?) AND (valid_until IS NULL OR ...)
 
-The ``column IS NULL OR column <op> ?`` disjunction is **not sargable**, so
-SQLite cannot use ``idx_thought_valid_from`` / ``idx_thought_valid_until`` /
-``idx_thought_valid_range`` for ``valid_now`` / ``valid_at`` / ``valid_within``
-— it performs a full ``SCAN thought``. This is an intentional consequence of
-NULL-tolerance (open/legacy rows with NULL bounds must remain visible), not a
-missing index: the indexes exist and are reachable. The closed-containment
-``valid_between`` predicate, whose body is ``valid_from IS NOT NULL AND
-valid_from >= ? AND valid_until IS NOT NULL AND valid_until <= ?``, *is*
-sargable and the planner does pick a valid-time index for it. This module
-asserts that reachability via ``valid_between`` so a future regression that
-drops the indexes is caught.
+The ``column IS NULL OR column <op> ?`` disjunction **is** index-usable —
+SQLite can satisfy it with a ``MULTI-INDEX OR`` (a union of an
+``IS NULL`` probe and a range probe over ``idx_thought_valid_range`` /
+``idx_thought_valid_from``). Whether the planner *chooses* that index or a
+full ``SCAN thought`` is a **cost decision driven by selectivity**: on a
+store where ``valid_now`` matches a large fraction of rows, a scan is
+genuinely cheaper than a multi-index union, so the planner (correctly)
+scans; on a store where the predicate is selective, or on sparse
+statistics, it uses the index. Both are correct query planning — neither
+is a defect, and neither is stable enough to assert as "always scans" or
+"always uses an index". The closed-containment ``valid_between`` predicate
+(``valid_from IS NOT NULL AND valid_from >= ? AND valid_until IS NOT NULL
+AND valid_until <= ?``) is unconditionally sargable and the planner picks a
+valid-time index for it regardless of stats; this module asserts that as the
+stable proof the indexes exist and are reachable, so a regression that
+silently drops them is caught.
 
 Why there is no ``< 5%`` wall-clock overhead assertion
 ------------------------------------------------------
@@ -199,6 +204,26 @@ def _table_scan_count(plan_details: list[str]) -> int:
     return sum(1 for detail in plan_details if detail.startswith("SCAN THOUGHT"))
 
 
+def _other_table_count(plan_details: list[str]) -> int:
+    """Count access steps (``SCAN`` / ``SEARCH``) over any table but ``thought``.
+
+    A single-table query touches only ``thought``. Any ``SCAN`` or ``SEARCH``
+    step naming a different table would mean the temporal predicate pulled in
+    a join or auxiliary table — the plan-shape regression we guard against.
+    Structural keywords without a table name (``MULTI-INDEX OR``, ``INDEX 1``)
+    are not access steps and are ignored.
+
+    Args:
+        plan_details: Upper-cased ``EXPLAIN QUERY PLAN`` detail lines.
+
+    Returns:
+        The number of ``SCAN``/``SEARCH`` steps whose target table is not
+        ``thought``.
+    """
+    access = [d for d in plan_details if d.startswith(("SCAN ", "SEARCH "))]
+    return sum(1 for detail in access if "THOUGHT" not in detail)
+
+
 class TestTemporalQueryPlanShape:
     """Structural plan-shape guarantees — deterministic, the primary contract."""
 
@@ -217,26 +242,33 @@ class TestTemporalQueryPlanShape:
 
         # Baseline plain FIND is a single full scan of thought.
         assert _table_scan_count(plain) == 1, plain
-        # The temporal predicate adds no second table scan ...
-        assert _table_scan_count(temporal) == 1, temporal
-        # ... and introduces no join / subquery / temp B-tree machinery.
+        # The temporal predicate adds no SECOND table scan — it stays a single
+        # access of thought, whether the planner chooses a scan (selectivity
+        # low) or a MULTI-INDEX OR (0 scans). Either way: at most one scan.
+        assert _table_scan_count(temporal) <= 1, temporal
+        # ... and introduces no join / subquery / temp B-tree machinery, and
+        # touches no other table (every table reference is to thought).
         joined = " ".join(temporal)
         assert "SUBQUERY" not in joined, temporal
         assert "TEMP B-TREE" not in joined, temporal
-        assert "USE TEMP B-TREE" not in joined, temporal
+        assert _other_table_count(temporal) == 0, temporal
 
-    async def test_null_tolerant_predicates_full_scan_is_intentional(
+    async def test_null_tolerant_predicates_stay_single_table(
         self,
         perf_conn: aiosqlite.Connection,
     ) -> None:
-        """The NULL-tolerant predicates resolve to a full scan, by design.
+        """The NULL-tolerant predicates never explode the plan beyond one table.
 
-        ``valid_now`` / ``valid_at`` / ``valid_within`` all use a
+        ``valid_now`` / ``valid_at`` / ``valid_within`` each use a
         ``column IS NULL OR column <op> ?`` disjunction to keep open-bound and
-        legacy (NULL) rows visible. That disjunction is not sargable, so the
-        planner cannot use a valid-time index and scans the table. This test
-        documents and locks that behaviour so the assertion in the
-        ``valid_between`` test (index *is* used) is unambiguous.
+        legacy (NULL) rows visible. The planner may satisfy this with a single
+        ``SCAN thought`` or a ``MULTI-INDEX OR`` over the valid-time indexes —
+        the choice is a cost decision driven by selectivity and table
+        statistics, and **both are correct**. What is invariant (and therefore
+        what we gate on) is that the predicate stays confined to the single
+        ``thought`` table: it never introduces a join, a correlated subquery,
+        a second table's scan, or a transient B-tree. We deliberately do **not**
+        assert scan-vs-index here, because that is not stable across stores.
         """
         for mindql in (
             "FIND thoughts WHERE valid_now",
@@ -244,8 +276,14 @@ class TestTemporalQueryPlanShape:
             f"FIND thoughts WHERE valid_within '{_T_JAN}' '{_T_JUN}'",
         ):
             plan = await _query_plan(perf_conn, mindql)
-            assert _table_scan_count(plan) == 1, (mindql, plan)
-            assert not any("USING INDEX" in detail for detail in plan), (mindql, plan)
+            joined = " ".join(plan)
+            # Single-table access only: at most one full scan of thought, and
+            # whatever index probes the planner adds all target thought.
+            assert _table_scan_count(plan) <= 1, (mindql, plan)
+            assert "SUBQUERY" not in joined, (mindql, plan)
+            assert "TEMP B-TREE" not in joined, (mindql, plan)
+            # No other table is scanned or searched (single-table access).
+            assert _other_table_count(plan) == 0, (mindql, plan)
 
     async def test_valid_between_reaches_a_valid_time_index(
         self,
