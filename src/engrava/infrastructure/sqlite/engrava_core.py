@@ -45,6 +45,7 @@ from engrava.domain.exceptions import (
     StaleDataError,
     ThoughtNotFoundError,
 )
+from engrava.domain.models._temporal import validate_iso8601_nullable
 from engrava.domain.models.action import ActionRecord
 from engrava.domain.models.edge import EdgeRecord
 from engrava.domain.models.embedding import EmbeddingRecord
@@ -1839,6 +1840,44 @@ class SqliteEngravaCore:
         await self._maybe_auto_cleanup(exclude_id=thought_id)
         return updated
 
+    async def invalidate_thought(
+        self,
+        thought_id: str,
+        valid_until: str,
+    ) -> ThoughtRecord:
+        """Close a thought's valid-time interval at the given instant.
+
+        Sets the thought's ``valid_until`` to ``valid_until``, marking the
+        end of the window during which the fact is considered true in the
+        world. This is a deterministic, valid-time-only operation:
+
+        * It is **not** a delete — the row and all of its history remain
+          stored and retrievable; only the valid-time upper bound changes.
+        * It performs **no** similarity search, automatic invalidation, or
+          model inference of any kind.
+        * It does **not** cascade to the thought's edges — invalidating a
+          thought leaves every connected edge's valid-time interval
+          untouched.
+        * It is **idempotent**: invalidating with the same ``valid_until``
+          twice converges to the same stored value.
+
+        Args:
+            thought_id: UUID of the thought to invalidate.
+            valid_until: ISO-8601 instant at which the fact stops being
+                valid. Stored as the thought's ``valid_until`` bound.
+
+        Returns:
+            The updated thought record.
+
+        Raises:
+            ThoughtNotFoundError: If the thought does not exist.
+            StaleDataError: If the row was modified since it was read.
+            ValueError: If ``valid_until`` is not a valid ISO-8601 timestamp.
+
+        """
+        normalized = validate_iso8601_nullable(valid_until)
+        return await self.update_thought(thought_id, valid_until=normalized)
+
     async def list_thoughts(
         self,
         *,
@@ -2103,6 +2142,41 @@ class SqliteEngravaCore:
 
         await self._maybe_commit()
         return updated
+
+    async def invalidate_edge(
+        self,
+        edge_id: str,
+        valid_until: str,
+    ) -> EdgeRecord:
+        """Close an edge's valid-time interval at the given instant.
+
+        Sets the edge's ``valid_until`` to ``valid_until``, marking the end
+        of the window during which the relation is considered true in the
+        world. Like :meth:`invalidate_thought`, this is a deterministic,
+        valid-time-only operation:
+
+        * It is **not** a delete — the edge row remains stored and
+          retrievable; only the valid-time upper bound changes.
+        * It performs **no** similarity search, automatic invalidation, or
+          model inference of any kind.
+        * It is **idempotent**: invalidating with the same ``valid_until``
+          twice converges to the same stored value.
+
+        Args:
+            edge_id: UUID of the edge to invalidate.
+            valid_until: ISO-8601 instant at which the relation stops being
+                valid. Stored as the edge's ``valid_until`` bound.
+
+        Returns:
+            The updated edge record.
+
+        Raises:
+            ValueError: If the edge does not exist, or ``valid_until`` is not
+                a valid ISO-8601 timestamp.
+
+        """
+        normalized = validate_iso8601_nullable(valid_until)
+        return await self.update_edge(edge_id, valid_until=normalized)
 
     async def get_edges(
         self,
