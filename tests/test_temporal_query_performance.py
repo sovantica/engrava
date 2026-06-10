@@ -191,6 +191,30 @@ async def _query_plan(conn: aiosqlite.Connection, mindql: str) -> list[str]:
     return [str(row["detail"]).upper() for row in rows]
 
 
+def _accessed_table(detail: str) -> str | None:
+    """Return the exact table token an access step targets, else ``None``.
+
+    An ``EXPLAIN QUERY PLAN`` access step reads ``SCAN <table>`` or
+    ``SEARCH <table> [USING INDEX ...]`` — the table is the whitespace-
+    delimited token immediately after the ``SCAN`` / ``SEARCH`` keyword.
+    Matching that **exact token** (rather than a substring) is essential:
+    a substring test for ``THOUGHT`` would also match the unrelated
+    ``THOUGHT_FTS`` full-text table. Structural keyword lines that are not
+    access steps (``MULTI-INDEX OR``, ``INDEX 1``) return ``None``.
+
+    Args:
+        detail: One upper-cased ``EXPLAIN QUERY PLAN`` detail line.
+
+    Returns:
+        The accessed table token (e.g. ``"THOUGHT"`` or ``"THOUGHT_FTS"``),
+        or ``None`` when the line is not a ``SCAN`` / ``SEARCH`` access step.
+    """
+    parts = detail.split()
+    if len(parts) < 2 or parts[0] not in ("SCAN", "SEARCH"):
+        return None
+    return parts[1]
+
+
 def _table_scan_count(plan_details: list[str]) -> int:
     """Count full-table ``SCAN`` steps over the ``thought`` table in a plan.
 
@@ -198,30 +222,62 @@ def _table_scan_count(plan_details: list[str]) -> int:
         plan_details: Upper-cased ``EXPLAIN QUERY PLAN`` detail lines.
 
     Returns:
-        The number of plan steps that are a full scan of ``thought`` (a step
-        beginning with ``SCAN THOUGHT``). An indexed ``SEARCH`` is not counted.
+        The number of plan steps that are a full scan of the ``thought``
+        table specifically (exact token match — ``SCAN THOUGHT_FTS`` does
+        NOT count). An indexed ``SEARCH`` is not counted.
     """
-    return sum(1 for detail in plan_details if detail.startswith("SCAN THOUGHT"))
+    return sum(
+        1
+        for detail in plan_details
+        if detail.startswith("SCAN ") and _accessed_table(detail) == "THOUGHT"
+    )
 
 
 def _other_table_count(plan_details: list[str]) -> int:
     """Count access steps (``SCAN`` / ``SEARCH``) over any table but ``thought``.
 
     A single-table query touches only ``thought``. Any ``SCAN`` or ``SEARCH``
-    step naming a different table would mean the temporal predicate pulled in
-    a join or auxiliary table — the plan-shape regression we guard against.
-    Structural keywords without a table name (``MULTI-INDEX OR``, ``INDEX 1``)
-    are not access steps and are ignored.
+    step whose **exact** target table is not ``thought`` would mean the
+    temporal predicate pulled in a join or auxiliary table (e.g. the
+    ``thought_fts`` full-text table) — the plan-shape regression we guard
+    against. Structural keyword lines without a table token are not access
+    steps and are ignored.
 
     Args:
         plan_details: Upper-cased ``EXPLAIN QUERY PLAN`` detail lines.
 
     Returns:
-        The number of ``SCAN``/``SEARCH`` steps whose target table is not
-        ``thought``.
+        The number of ``SCAN``/``SEARCH`` steps whose exact target table is
+        not ``thought``.
     """
-    access = [d for d in plan_details if d.startswith(("SCAN ", "SEARCH "))]
-    return sum(1 for detail in access if "THOUGHT" not in detail)
+    return sum(
+        1
+        for detail in plan_details
+        if (table := _accessed_table(detail)) is not None and table != "THOUGHT"
+    )
+
+
+class TestPlanHelpers:
+    """Unit guards for the plan-parsing helpers (exact table-token matching)."""
+
+    def test_other_table_count_distinguishes_thought_from_thought_fts(self) -> None:
+        """``THOUGHT_FTS`` is a different table, not the allowed ``THOUGHT``.
+
+        Regression guard: a substring test for ``THOUGHT`` would wrongly treat
+        an access of the ``thought_fts`` full-text table as the allowed
+        ``thought`` table. The helpers match the exact table token instead.
+        """
+        assert _other_table_count(["SEARCH THOUGHT_FTS USING INDEX X"]) == 1
+        assert _other_table_count(["SCAN THOUGHT"]) == 0
+        assert _other_table_count(["SEARCH THOUGHT USING INDEX idx_thought_valid_range"]) == 0
+        assert _other_table_count(["MULTI-INDEX OR", "INDEX 1", "SCAN THOUGHT"]) == 0
+        assert _other_table_count(["SCAN EDGE"]) == 1
+
+    def test_table_scan_count_matches_thought_exactly(self) -> None:
+        """A full scan of ``thought_fts`` is not a scan of ``thought``."""
+        assert _table_scan_count(["SCAN THOUGHT"]) == 1
+        assert _table_scan_count(["SCAN THOUGHT_FTS"]) == 0
+        assert _table_scan_count(["SEARCH THOUGHT USING INDEX X"]) == 0
 
 
 class TestTemporalQueryPlanShape:
