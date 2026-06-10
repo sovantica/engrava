@@ -1,7 +1,7 @@
 -- engrava: Core thought-graph schema (free-tier boundary — no internal-cognitive columns).
--- Version: core-12 (referential integrity: FK + ON DELETE CASCADE on edge/embedding/action → thought)
+-- Version: core-13 (valid-time axis: nullable valid_from / valid_until on thought + edge)
 
-PRAGMA user_version = 12;
+PRAGMA user_version = 13;
 
 CREATE TABLE IF NOT EXISTS thought (
     thought_id        TEXT    PRIMARY KEY,
@@ -25,7 +25,12 @@ CREATE TABLE IF NOT EXISTS thought (
     created_at        TEXT,
     updated_at        TEXT,
     expires_at        TEXT,
-    metadata_json     TEXT    NOT NULL DEFAULT '{}'
+    metadata_json     TEXT    NOT NULL DEFAULT '{}',
+    -- Valid-time (world-time) axis. Declared last so a freshly created
+    -- database matches the column order of one upgraded in place, where
+    -- ``ALTER TABLE ADD COLUMN`` can only append.
+    valid_from        TEXT,
+    valid_until       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS edge (
@@ -37,6 +42,8 @@ CREATE TABLE IF NOT EXISTS edge (
     created_cycle     INTEGER NOT NULL DEFAULT 0,
     source            TEXT NOT NULL DEFAULT 'EXPERIENCE',
     decay_multiplier  REAL NOT NULL DEFAULT 1.0,
+    valid_from        TEXT,
+    valid_until       TEXT,
     UNIQUE(from_thought_id, to_thought_id, edge_type),
     FOREIGN KEY (from_thought_id) REFERENCES thought(thought_id) ON DELETE CASCADE,
     FOREIGN KEY (to_thought_id) REFERENCES thought(thought_id) ON DELETE CASCADE
@@ -183,3 +190,24 @@ CREATE TABLE IF NOT EXISTS extension_schema_versions (
     migration_file    TEXT,
     extension_version TEXT
 );
+
+-- -------------------------------------------------------------------
+-- Valid-time (world-time) indexes for thought and edge
+-- -------------------------------------------------------------------
+-- The valid_from / valid_until columns form a second time axis ("valid
+-- time" — when a fact is true in the world) alongside the transaction
+-- time recorded by created_at. These indexes back range scans over that
+-- axis. valid_until is partial (only non-NULL upper bounds are indexed)
+-- because an open upper bound is the common case and incurs no overhead.
+-- A fresh-bootstrap database must carry the same indexes as one upgraded
+-- in place, so they are declared here as well as in the migration helper.
+
+CREATE INDEX IF NOT EXISTS idx_thought_valid_from ON thought(valid_from);
+CREATE INDEX IF NOT EXISTS idx_thought_valid_until ON thought(valid_until)
+    WHERE valid_until IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_thought_valid_range ON thought(valid_from, valid_until);
+
+CREATE INDEX IF NOT EXISTS idx_edge_valid_from ON edge(valid_from);
+CREATE INDEX IF NOT EXISTS idx_edge_valid_until ON edge(valid_until)
+    WHERE valid_until IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_edge_valid_range ON edge(valid_from, valid_until);

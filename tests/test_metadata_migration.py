@@ -3,8 +3,8 @@
 Mirrors ``test_dedup_migration.py``: exercises the
 ``_migrate_core_v10_to_v11`` helper directly (idempotence, ALTER
 TABLE add-column behaviour) and the full ``ensure_schema`` cascade
-so DBs at every supported source version converge on
-``user_version = 11`` with the ``metadata_json`` column populated by
+so DBs at every supported source version converge on the current head
+``user_version`` with the ``metadata_json`` column populated by
 the schema-level ``DEFAULT '{}'``.
 """
 
@@ -167,11 +167,11 @@ async def test_migrate_v10_to_v11_preserves_existing_rows_with_default(
 async def test_ensure_schema_fresh_db_lands_at_head(
     fresh_db: aiosqlite.Connection,
 ) -> None:
-    """Empty DB ends at ``user_version = 11`` with the metadata column."""
+    """Empty DB ends at the head ``user_version`` with the metadata column."""
     store = SqliteEngravaCore(fresh_db)
     await store.ensure_schema()
 
-    assert await _user_version(fresh_db) == 12
+    assert await _user_version(fresh_db) == 13
     assert "metadata_json" in await _table_columns(fresh_db, "thought")
 
 
@@ -185,22 +185,22 @@ async def test_ensure_schema_from_v10_to_head(
     store = SqliteEngravaCore(fresh_db)
     await store.ensure_schema()
 
-    assert await _user_version(fresh_db) == 12
+    assert await _user_version(fresh_db) == 13
     assert "metadata_json" in await _table_columns(fresh_db, "thought")
 
 
 async def test_ensure_schema_idempotent_at_head(
     fresh_db: aiosqlite.Connection,
 ) -> None:
-    """Repeat calls after reaching head stay at v11 without errors."""
+    """Repeat calls after reaching head stay at the head version without errors."""
     store = SqliteEngravaCore(fresh_db)
     await store.ensure_schema()
-    assert await _user_version(fresh_db) == 12
+    assert await _user_version(fresh_db) == 13
 
     for _ in range(3):
         await store.ensure_schema()
 
-    assert await _user_version(fresh_db) == 12
+    assert await _user_version(fresh_db) == 13
     assert "metadata_json" in await _table_columns(fresh_db, "thought")
 
 
@@ -248,7 +248,7 @@ async def test_ensure_schema_from_v10_with_legacy_row_then_insert_new(
 
 
 # ---------------------------------------------------------------------------
-# Cascade-from-any-version (1 parametrized — covers v3..v10 -> v11)
+# Cascade-from-any-version (1 parametrized — covers v3..v10 -> head)
 # ---------------------------------------------------------------------------
 
 
@@ -257,7 +257,7 @@ async def test_cascade_from_any_version_to_head(
     fresh_db: aiosqlite.Connection,
     source_version: int,
 ) -> None:
-    """A DB stamped at any historical core version cascades to v11.
+    """A DB stamped at any historical core version cascades to head.
 
     The historical schemas differ across versions in ways unrelated to
     the metadata column, so this test only seeds the ``user_version``
@@ -286,5 +286,5 @@ async def test_cascade_from_any_version_to_head(
     store = SqliteEngravaCore(fresh_db)
     await store.ensure_schema()
 
-    assert await _user_version(fresh_db) == 12
+    assert await _user_version(fresh_db) == 13
     assert "metadata_json" in await _table_columns(fresh_db, "thought")
