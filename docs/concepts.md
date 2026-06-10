@@ -244,4 +244,5 @@ observation = ThoughtRecord(
 - [Quick Start](quickstart.md) — create, link, and search in five minutes.
 - [Dreaming](dreaming.md) — how consolidation turns observations into reflections.
 - [Hybrid Search](search.md) — how the signals (including recency/cycle and priority) fuse into a ranking.
+- [The Bi-temporal Model](bitemporal.md) — the optional second time axis (valid time) and how it differs from the cycle.
 - [API Reference](api-reference.md) — the exact fields, enums, and methods.

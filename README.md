@@ -243,6 +243,7 @@ See the [CLI reference](docs/cli.md) for every command and option.
 ## Documentation
 
 - [Core Concepts](docs/concepts.md) — the mental model (thought, edge, reflection, cycle, …) — start here
+- [The Bi-temporal Model](docs/bitemporal.md) — the optional valid-time axis: query a fact as of any instant, `invalidate` without deleting
 - [Positioning](docs/positioning.md) — when Engrava is (and isn't) the right tool, and how it compares
 - [Quick Start](docs/quickstart.md) — 5-minute setup guide
 - [Tutorial](docs/tutorial.md) — build a small notes memory end to end

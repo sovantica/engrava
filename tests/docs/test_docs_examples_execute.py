@@ -76,6 +76,10 @@ EXECUTABLE_BLOCKS: tuple[tuple[str, str], ...] = (
     ("README.md", "async def main() -> None:"),
     ("docs/quickstart.md", 'print("Store ready!")'),
     ("docs/guides/migrating-from-other-memory.md", "Imported {total} thoughts."),
+    # docs/bitemporal.md — three self-contained valid-time examples.
+    ("docs/bitemporal.md", "# valid_until omitted -> open upper bound -> still valid"),
+    ("docs/bitemporal.md", "assert len(march.rows) == 1  # inside the valid window"),
+    ("docs/bitemporal.md", "await store.invalidate_thought("),
 )
 
 # Pages that build one example across a contiguous run of code blocks, identified
