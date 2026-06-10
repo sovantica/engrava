@@ -463,7 +463,7 @@ class SqliteEngravaCore:
         Applies the full ``schema_core.sql`` (including FTS5 virtual
         table and sync triggers) only when the database has not already
         been bootstrapped to schema version 3+.  Databases at older
-        versions are upgraded incrementally up to the current version (11).
+        versions are upgraded incrementally up to the current version (13).
 
         After core schema creation or upgrade, probes for the ``thought_fts``
         table and then runs any pending extension schema migrations for each
@@ -491,7 +491,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v9_to_v10()
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
-            await self._db.execute("PRAGMA user_version = 12")
+            await self._migrate_core_v12_to_v13()
+            await self._db.execute("PRAGMA user_version = 13")
             await self._db.commit()
         elif current_version < 4:  # noqa: PLR2004
             await self._migrate_core_v3_to_v4()
@@ -503,7 +504,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v9_to_v10()
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
-            await self._db.execute("PRAGMA user_version = 12")
+            await self._migrate_core_v12_to_v13()
+            await self._db.execute("PRAGMA user_version = 13")
             await self._db.commit()
         elif current_version < 5:  # noqa: PLR2004
             await self._migrate_core_v4_to_v5()
@@ -514,7 +516,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v9_to_v10()
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
-            await self._db.execute("PRAGMA user_version = 12")
+            await self._migrate_core_v12_to_v13()
+            await self._db.execute("PRAGMA user_version = 13")
             await self._db.commit()
         elif current_version < 6:  # noqa: PLR2004
             await self._migrate_core_v5_to_v6()
@@ -524,7 +527,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v9_to_v10()
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
-            await self._db.execute("PRAGMA user_version = 12")
+            await self._migrate_core_v12_to_v13()
+            await self._db.execute("PRAGMA user_version = 13")
             await self._db.commit()
         elif current_version < 7:  # noqa: PLR2004
             await self._migrate_core_v6_to_v7()
@@ -533,7 +537,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v9_to_v10()
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
-            await self._db.execute("PRAGMA user_version = 12")
+            await self._migrate_core_v12_to_v13()
+            await self._db.execute("PRAGMA user_version = 13")
             await self._db.commit()
         elif current_version < 8:  # noqa: PLR2004
             await self._migrate_core_v7_to_v8()
@@ -541,29 +546,38 @@ class SqliteEngravaCore:
             await self._migrate_core_v9_to_v10()
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
-            await self._db.execute("PRAGMA user_version = 12")
+            await self._migrate_core_v12_to_v13()
+            await self._db.execute("PRAGMA user_version = 13")
             await self._db.commit()
         elif current_version < 9:  # noqa: PLR2004
             await self._migrate_core_v8_to_v9()
             await self._migrate_core_v9_to_v10()
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
-            await self._db.execute("PRAGMA user_version = 12")
+            await self._migrate_core_v12_to_v13()
+            await self._db.execute("PRAGMA user_version = 13")
             await self._db.commit()
         elif current_version < 10:  # noqa: PLR2004
             await self._migrate_core_v9_to_v10()
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
-            await self._db.execute("PRAGMA user_version = 12")
+            await self._migrate_core_v12_to_v13()
+            await self._db.execute("PRAGMA user_version = 13")
             await self._db.commit()
         elif current_version < 11:  # noqa: PLR2004
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
-            await self._db.execute("PRAGMA user_version = 12")
+            await self._migrate_core_v12_to_v13()
+            await self._db.execute("PRAGMA user_version = 13")
             await self._db.commit()
         elif current_version < 12:  # noqa: PLR2004
             await self._migrate_core_v11_to_v12()
-            await self._db.execute("PRAGMA user_version = 12")
+            await self._migrate_core_v12_to_v13()
+            await self._db.execute("PRAGMA user_version = 13")
+            await self._db.commit()
+        elif current_version < 13:  # noqa: PLR2004
+            await self._migrate_core_v12_to_v13()
+            await self._db.execute("PRAGMA user_version = 13")
             await self._db.commit()
 
         # Ensure referential integrity is enforced for the lifetime of this
@@ -894,6 +908,73 @@ class SqliteEngravaCore:
         finally:
             await self._db.execute("PRAGMA foreign_keys=ON")
 
+    async def _migrate_core_v12_to_v13(self) -> None:
+        """Add nullable valid-time columns + indexes to thought and edge (core-13).
+
+        Introduces a second time axis ("valid time") alongside the
+        existing transaction time. ``created_at`` records *when a fact was
+        stored*; ``valid_from`` / ``valid_until`` record *when a fact is
+        true in the world*. Both new columns are nullable ISO-8601 TEXT.
+
+        Backfill is intentionally asymmetric:
+
+        * ``thought.valid_from`` is seeded from ``created_at`` for rows
+          that have a transaction timestamp, giving existing thoughts a
+          sensible default lower bound. ``valid_until`` is left ``NULL``
+          (open upper bound). Rows whose ``created_at`` is ``NULL``
+          (pre-timestamp legacy rows) keep ``valid_from = NULL`` — no
+          date is fabricated.
+        * ``edge`` rows are **not** backfilled. The edge table has no
+          ``created_at`` column; its only temporal field is
+          ``created_cycle``, which is an internal cognitive-cycle counter,
+          not a calendar timestamp. Synthesising a valid-time date from a
+          cycle number would invent information, so edges keep both
+          valid-time fields ``NULL`` (an open lower bound).
+
+        Idempotent: each ``ALTER TABLE ... ADD COLUMN`` is wrapped in
+        ``contextlib.suppress(Exception)`` so a re-run after the column
+        already exists is a no-op, and every index uses
+        ``CREATE INDEX IF NOT EXISTS``. Re-running the migration leaves
+        the schema unchanged.
+        """
+        # Only touch tables that exist. A partial bootstrap may carry just
+        # ``thought`` (the ``edge`` table is created lazily); operating on an
+        # absent ``edge`` would raise ``no such table``. ``thought`` is always
+        # present at this point. This mirrors the table-existence guards used
+        # by the earlier edge-touching migrations and ``_purge_orphan_children``.
+        tables = ["thought"]
+        if await self._table_exists("edge"):
+            tables.append("edge")
+
+        for table in tables:
+            for column in ("valid_from", "valid_until"):
+                with contextlib.suppress(Exception):  # Column may already exist.
+                    await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+
+        # Asymmetric backfill — thought only, sourced from transaction time.
+        # Rows with NULL created_at (legacy, pre-timestamp) keep NULL
+        # valid_from; no calendar date is fabricated for them.
+        await self._db.execute(
+            "UPDATE thought SET valid_from = created_at "
+            "WHERE created_at IS NOT NULL AND valid_from IS NULL"
+        )
+        # Edge has no created_at; created_cycle is internal cognitive time,
+        # not calendar time, so edges are deliberately left with NULL
+        # valid_from / valid_until (an open lower bound).
+
+        for table in tables:
+            await self._db.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{table}_valid_from ON {table}(valid_from)"
+            )
+            await self._db.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{table}_valid_until "
+                f"ON {table}(valid_until) WHERE valid_until IS NOT NULL"
+            )
+            await self._db.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{table}_valid_range "
+                f"ON {table}(valid_from, valid_until)"
+            )
+
     async def _fk_present(self, table: str, column: str) -> bool:
         """Return ``True`` when ``table`` carries an FK on ``column``."""
         cursor = await self._db.execute(f"PRAGMA foreign_key_list({table})")
@@ -1162,6 +1243,8 @@ class SqliteEngravaCore:
         created_at_raw = row["created_at"] if "created_at" in keys else None
         updated_at_raw = row["updated_at"] if "updated_at" in keys else None
         expires_at_raw = row["expires_at"] if "expires_at" in keys else None
+        valid_from_raw = row["valid_from"] if "valid_from" in keys else None
+        valid_until_raw = row["valid_until"] if "valid_until" in keys else None
         metadata_json_raw = row["metadata_json"] if "metadata_json" in keys else "{}"
         metadata_decoded: dict[str, MetadataValue] = (
             json.loads(metadata_json_raw) if metadata_json_raw else {}
@@ -1191,6 +1274,8 @@ class SqliteEngravaCore:
             created_at=created_at_raw,
             updated_at=updated_at_raw,
             expires_at=expires_at_raw,
+            valid_from=valid_from_raw,
+            valid_until=valid_until_raw,
             metadata=metadata_decoded,
         )
 
@@ -1231,8 +1316,9 @@ class SqliteEngravaCore:
         " confidence, embedding_ref, source_type, confirmation_count, "
         " consolidated_from, visibility, access_count, "
         " last_accessed_at, created_at, updated_at, expires_at, "
+        " valid_from, valid_until, "
         " metadata_json) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
 
     def _thought_to_core_params(self, thought: ThoughtRecord) -> tuple[object, ...]:
@@ -1275,6 +1361,8 @@ class SqliteEngravaCore:
             thought.created_at,
             thought.updated_at,
             thought.expires_at,
+            thought.valid_from,
+            thought.valid_until,
             json.dumps(thought.metadata, ensure_ascii=False),
         )
 
@@ -1287,6 +1375,7 @@ class SqliteEngravaCore:
         " consolidated_from = ?, visibility = ?,"
         " access_count = ?, last_accessed_at = ?,"
         " created_at = ?, updated_at = ?, expires_at = ?,"
+        " valid_from = ?, valid_until = ?,"
         " metadata_json = ? "
         "WHERE thought_id = ? AND updated_cycle = ?"
     )
@@ -1335,6 +1424,8 @@ class SqliteEngravaCore:
             updated.created_at,
             updated.updated_at,
             updated.expires_at,
+            updated.valid_from,
+            updated.valid_until,
             json.dumps(updated.metadata, ensure_ascii=False),
             thought_id,
             expected_cycle,
@@ -1922,8 +2013,8 @@ class SqliteEngravaCore:
             await self._db.execute(
                 "INSERT INTO edge "
                 "(edge_id, from_thought_id, to_thought_id, edge_type, weight, "
-                " created_cycle, source, decay_multiplier) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                " created_cycle, source, decay_multiplier, valid_from, valid_until) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     edge.edge_id,
                     edge.from_thought_id,
@@ -1933,6 +2024,8 @@ class SqliteEngravaCore:
                     edge.created_cycle,
                     edge.source.value,
                     edge.decay_multiplier,
+                    edge.valid_from,
+                    edge.valid_until,
                 ),
             )
         except aiosqlite.IntegrityError as exc:
@@ -1981,7 +2074,8 @@ class SqliteEngravaCore:
 
         await self._db.execute(
             "UPDATE edge SET from_thought_id = ?, to_thought_id = ?, edge_type = ?, "
-            "weight = ?, created_cycle = ?, source = ?, decay_multiplier = ? "
+            "weight = ?, created_cycle = ?, source = ?, decay_multiplier = ?, "
+            "valid_from = ?, valid_until = ? "
             "WHERE edge_id = ?",
             (
                 updated.from_thought_id,
@@ -1991,6 +2085,8 @@ class SqliteEngravaCore:
                 updated.created_cycle,
                 updated.source.value,
                 updated.decay_multiplier,
+                updated.valid_from,
+                updated.valid_until,
                 edge_id,
             ),
         )
@@ -3727,6 +3823,8 @@ def _row_to_edge(row: aiosqlite.Row) -> EdgeRecord:
     keys = row.keys()
     source_raw = row["source"] if "source" in keys else None
     decay_raw = row["decay_multiplier"] if "decay_multiplier" in keys else 1.0
+    valid_from_raw = row["valid_from"] if "valid_from" in keys else None
+    valid_until_raw = row["valid_until"] if "valid_until" in keys else None
     return EdgeRecord(
         edge_id=row["edge_id"],
         from_thought_id=row["from_thought_id"],
@@ -3736,6 +3834,8 @@ def _row_to_edge(row: aiosqlite.Row) -> EdgeRecord:
         created_cycle=row["created_cycle"],
         source=KnowledgeSource(source_raw) if source_raw else KnowledgeSource.EXPERIENCE,
         decay_multiplier=float(decay_raw) if decay_raw else 1.0,
+        valid_from=valid_from_raw,
+        valid_until=valid_until_raw,
     )
 
 

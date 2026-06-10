@@ -23,6 +23,7 @@ from engrava.domain.enums import (
     ThoughtVisibility,
 )
 from engrava.domain.exceptions import InvalidTransitionError
+from engrava.domain.models._temporal import validate_iso8601_nullable
 
 #: Allowed value types for ``ThoughtRecord.metadata`` entries.
 #:
@@ -74,7 +75,16 @@ class ThoughtRecord(BaseModel):
         last_accessed_at: ISO-8601 datetime of last explicit access (nullable).
         created_at: ISO-8601 datetime when the thought was persisted (nullable
             for thoughts created before timestamp tracking was added).
+            This is transaction time — when the fact was *recorded*.
         updated_at: ISO-8601 datetime of last mutation (nullable for legacy).
+        valid_from: ISO-8601 datetime marking the start of the interval
+            during which the fact is true in the world (valid time, the
+            second time axis). ``None`` means an open lower bound — the
+            fact is treated as valid from the beginning of time.
+        valid_until: ISO-8601 datetime marking the end of the interval
+            during which the fact is true in the world (valid time).
+            ``None`` means an open upper bound — the fact has no known
+            end and is treated as currently valid.
         metadata: Extensible structured attributes (e.g. ``role``, ``lang``,
             ``content_type``, ``session_id``, ``turn_index``, ``speaker``).
             Leaf values must be scalars (``str``, ``int``, ``float``,
@@ -123,6 +133,8 @@ class ThoughtRecord(BaseModel):
     created_at: str | None = None
     updated_at: str | None = None
     expires_at: str | None = None
+    valid_from: str | None = None
+    valid_until: str | None = None
     metadata: dict[str, MetadataValue] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -145,7 +157,14 @@ class ThoughtRecord(BaseModel):
             raise ValueError(msg)
         return v
 
-    @field_validator("created_at", "updated_at", "last_accessed_at", "expires_at")
+    @field_validator(
+        "created_at",
+        "updated_at",
+        "last_accessed_at",
+        "expires_at",
+        "valid_from",
+        "valid_until",
+    )
     @classmethod
     def _validate_iso8601_nullable(cls, v: str | None) -> str | None:
         """Validate ISO-8601 format and normalize to UTC when not None.
@@ -164,18 +183,7 @@ class ThoughtRecord(BaseModel):
             ValueError: If string is not valid ISO-8601.
 
         """
-        if v is None:
-            return v
-        try:
-            dt = datetime.datetime.fromisoformat(v)
-        except ValueError as exc:
-            msg = f"Must be ISO-8601 timestamp, got {v!r}"
-            raise ValueError(msg) from exc
-        # Normalize timezone-aware timestamps to UTC for safe TEXT ordering.
-        if dt.tzinfo is not None:
-            dt = dt.astimezone(datetime.UTC)
-            return dt.isoformat()
-        return v
+        return validate_iso8601_nullable(v)
 
     def is_active(self) -> bool:
         """Check if the thought is in ACTIVE lifecycle status.
