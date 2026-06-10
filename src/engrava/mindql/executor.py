@@ -6,16 +6,46 @@ or routes extension commands to registered handlers.
 
 from __future__ import annotations
 
+import contextvars
+import datetime
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from engrava.mindql.parser import MindQLCommand, MindQLOperator, MindQLParseError
+from engrava.mindql.parser import (
+    MindQLCommand,
+    MindQLOperator,
+    MindQLParseError,
+    TemporalPredicateKind,
+)
 
 if TYPE_CHECKING:
     import aiosqlite
 
     from engrava.domain.protocols.hooks import MindQLExtension
-    from engrava.mindql.parser import MindQLQuery
+    from engrava.mindql.parser import MindQLQuery, TemporalPredicate
+
+
+# Optional pinned "now" for ``valid_now`` resolution. When unset (the
+# default), ``valid_now`` resolves against the server clock at execution
+# time. Tests pin a deterministic instant via :func:`mindql_now.set`.
+mindql_now: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "mindql_now",
+    default=None,
+)
+
+
+def _resolve_now() -> str:
+    """Resolve the instant ``valid_now`` evaluates against.
+
+    Returns:
+        The pinned instant from the ``mindql_now`` context variable when set,
+        otherwise the current UTC time as an ISO-8601 string.
+
+    """
+    pinned = mindql_now.get()
+    if pinned is not None:
+        return pinned
+    return datetime.datetime.now(datetime.UTC).isoformat()
 
 
 # Columns that are safe to filter on (allowlist per table).
@@ -78,6 +108,10 @@ _OP_SQL: dict[MindQLOperator, str] = {
     MindQLOperator.GE: ">=",
     MindQLOperator.LE: "<=",
 }
+
+# Tables carrying the bi-temporal valid-time columns. Temporal predicates are
+# only meaningful against these; applying one to any other table is rejected.
+_TEMPORAL_TABLES: frozenset[str] = frozenset({"thought", "edge"})
 
 
 @dataclass(frozen=True)
@@ -261,6 +295,12 @@ class MindQLExecutor:
     ) -> tuple[list[str], list[object]]:
         """Build WHERE clauses and params, validating columns.
 
+        Ordinary ``field op value`` conditions and opt-in valid-time
+        temporal predicates are both emitted here, so every code path that
+        builds a query body (FIND and COUNT) gets temporal filtering for
+        free. The clauses are returned in source order: conditions first,
+        then temporal predicates.
+
         Args:
             table: Target table name.
             query: Parsed query.
@@ -269,7 +309,9 @@ class MindQLExecutor:
             Tuple of (clause strings, parameter values).
 
         Raises:
-            MindQLParseError: If a condition references a disallowed column.
+            MindQLParseError: If a condition references a disallowed column,
+                or a temporal predicate targets a table without valid-time
+                columns.
 
         """
         allowed = _ALLOWED_COLUMNS.get(table, frozenset())
@@ -284,4 +326,65 @@ class MindQLExecutor:
             clauses.append(f"{cond.field} {op_sql} ?")
             params.append(cond.value)
 
+        for predicate in query.temporal_predicates:
+            fragment, frag_params = self._build_temporal_clause(table, predicate)
+            clauses.append(fragment)
+            params.extend(frag_params)
+
         return clauses, params
+
+    @staticmethod
+    def _build_temporal_clause(
+        table: str,
+        predicate: TemporalPredicate,
+    ) -> tuple[str, list[object]]:
+        """Build the NULL-tolerant SQL fragment for one temporal predicate.
+
+        NULL ``valid_from`` is an open lower bound (negative infinity) and
+        NULL ``valid_until`` is an open upper bound (positive infinity).
+        ``valid_at`` / ``valid_now`` / ``valid_within`` are NULL-tolerant so
+        rows with an open bound stay visible; ``valid_between`` requires real
+        bounds on both ends and therefore excludes open-bound rows.
+
+        Args:
+            table: Target table name (must carry valid-time columns).
+            predicate: The parsed temporal predicate.
+
+        Returns:
+            Tuple of (SQL fragment, ordered parameter values).
+
+        Raises:
+            MindQLParseError: If ``table`` has no valid-time columns.
+
+        """
+        if table not in _TEMPORAL_TABLES:
+            msg = f"Temporal predicate not supported for table {table!r}"
+            raise MindQLParseError(msg)
+
+        kind = predicate.kind
+        if kind == TemporalPredicateKind.VALID_NOW:
+            now = _resolve_now()
+            return (
+                "(valid_from IS NULL OR valid_from <= ?) "
+                "AND (valid_until IS NULL OR valid_until > ?)",
+                [now, now],
+            )
+        if kind == TemporalPredicateKind.VALID_AT:
+            instant = predicate.start
+            return (
+                "(valid_from IS NULL OR valid_from <= ?) "
+                "AND (valid_until IS NULL OR valid_until > ?)",
+                [instant, instant],
+            )
+        if kind == TemporalPredicateKind.VALID_WITHIN:
+            return (
+                "(valid_from IS NULL OR valid_from < ?) "
+                "AND (valid_until IS NULL OR valid_until > ?)",
+                [predicate.end, predicate.start],
+            )
+        # VALID_BETWEEN — closed containment requiring real bounds on both ends.
+        return (
+            "valid_from IS NOT NULL AND valid_from >= ? "
+            "AND valid_until IS NOT NULL AND valid_until <= ?",
+            [predicate.start, predicate.end],
+        )
