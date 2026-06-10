@@ -72,6 +72,31 @@ SELECT thought_id, priority, essence FROM thought WHERE thought_type = 'BELIEF' 
 Only statements that begin with `SELECT` are permitted; anything else is
 rejected.
 
+## Valid-time predicates
+
+`FIND` and `COUNT` against the `thoughts` and `edges` tables accept four opt-in
+**valid-time** predicates in the `WHERE` clause, for querying *when a fact was
+true in the world* (the second time axis — see
+[The Bi-temporal Model](bitemporal.md) for the full semantics):
+
+```
+FIND thoughts WHERE valid_now
+FIND edges WHERE valid_at '2026-01-01T00:00:00+00:00'
+FIND thoughts WHERE priority = 'P1' AND valid_within '2026-01-01T00:00:00+00:00' '2026-02-01T00:00:00+00:00'
+FIND thoughts WHERE valid_between '2026-01-01T00:00:00+00:00' '2026-12-31T00:00:00+00:00'
+```
+
+- `valid_now` takes no argument; `valid_at` takes one ISO-8601 timestamp;
+  `valid_within` and `valid_between` take two.
+- They combine with ordinary conditions via `AND`.
+- `valid_now` / `valid_at` / `valid_within` are **NULL-tolerant** (a record with
+  an open `valid_from`/`valid_until` bound stays in the result); `valid_between`
+  requires real bounds on both ends and therefore excludes open-bound rows.
+- A query that uses **no** temporal predicate behaves exactly as before.
+
+The semantics, the open-interval (`NULL` = ±∞) rule, and `invalidate` are
+documented in full on [The Bi-temporal Model](bitemporal.md).
+
 ## Extension Commands
 
 Custom MindQL verbs are provided through an extension's
