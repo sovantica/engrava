@@ -70,8 +70,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_FTS_FIELD_FILTER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*:.+")
+#: A token is treated as an FTS5 column filter only when it targets a real
+#: indexed column. ``thought_fts`` indexes exactly ``essence`` and ``content``
+#: (see :meth:`SqliteEngravaCore.ensure_schema`); any other ``word:rest`` token
+#: (URLs like ``http://...``, timestamps like ``12:30``) would make FTS5 read a
+#: non-existent column and raise, so it is sanitized as a bare token instead.
+_FTS_FIELD_FILTER_RE = re.compile(r"^(?:essence|content):.+", re.IGNORECASE)
 _FTS_UNSAFE_CHAR_RE = re.compile(r"[^\w\-*]")
+#: Standalone uppercase boolean operators that switch a query into expert mode.
+#: Lowercase ``and``/``or``/``not`` are ordinary words, not operators.
+_FTS_BOOLEAN_OPERATORS = frozenset({"AND", "OR", "NOT"})
 _SUPPRESS_SEARCH_METRICS: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "engrava_suppress_search_metrics",
     default=False,
@@ -2718,12 +2726,24 @@ class SqliteEngravaCore:
     ) -> list[tuple[str, float]]:
         """Full-text search via SQLite FTS5 with BM25 ranking.
 
-        Returns an empty list when the FTS5 index is unavailable
-        (backward compat for databases that predate the migration).
+        Bare natural-language queries are matched with ``OR`` semantics: a
+        document is returned when it shares *any* content word with the query,
+        and BM25 IDF weighting ranks documents that share the most distinctive
+        words first. Function words ("what", "was", "my") therefore never block
+        a match. Expert syntax — quoted phrases, uppercase ``AND``/``OR``/
+        ``NOT``, and the ``essence:``/``content:`` column filters — is preserved
+        and matched exactly as written.
+
+        Returns an empty list when the FTS5 index is unavailable (backward
+        compat for databases that predate the migration), when the query
+        normalizes to no usable term, or when a malformed FTS5 expression slips
+        through; such errors are logged and degraded rather than propagated, so
+        a caller's other search arms can still serve the query.
 
         Args:
-            query: FTS5 query string (supports ``AND``, ``OR``,
-                ``NOT``, prefix ``*``, column filters, etc.).
+            query: User-facing query string. Bare questions are OR-matched;
+                quoted phrases, uppercase ``AND``/``OR``/``NOT`` and
+                ``essence:``/``content:`` column filters invoke expert syntax.
             top_k: Maximum number of results.
 
         Returns:
@@ -2732,6 +2752,7 @@ class SqliteEngravaCore:
 
         """
         import time as _time  # noqa: PLC0415
+        from sqlite3 import OperationalError  # noqa: PLC0415
 
         _t_start = _time.perf_counter()
         if not query or not query.strip():
@@ -2746,6 +2767,11 @@ class SqliteEngravaCore:
             return []
 
         normalized_query = _normalize_fts_query(query)
+        if not normalized_query:
+            # The query held no indexable term (e.g. only punctuation); an empty
+            # MATCH string is a syntax error in FTS5, so short-circuit to empty.
+            await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
+            return []
 
         # bm25() returns negative values; negate so higher = more relevant.
         sql = (
@@ -2760,11 +2786,23 @@ class SqliteEngravaCore:
             "ORDER BY score DESC "
             "LIMIT ?"
         )
-        cursor = await self._db.execute(
-            sql,
-            (normalized_query, datetime.datetime.now(datetime.UTC).isoformat(), top_k),
-        )
-        rows = await cursor.fetchall()
+        try:
+            cursor = await self._db.execute(
+                sql,
+                (normalized_query, datetime.datetime.now(datetime.UTC).isoformat(), top_k),
+            )
+            rows = await cursor.fetchall()
+        except OperationalError:
+            # Defense in depth: a residual malformed FTS5 expression must never
+            # propagate to the caller and break an otherwise-serviceable search
+            # (e.g. the vector arm of a hybrid query). Degrade to no FTS hits.
+            logger.warning(
+                "FTS MATCH failed for normalized query %r; returning no FTS results",
+                normalized_query,
+                exc_info=True,
+            )
+            await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
+            return []
         results = [(row["thought_id"], float(row["score"])) for row in rows]
         await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
         return results
@@ -3913,23 +3951,90 @@ def _row_to_edge(row: aiosqlite.Row) -> EdgeRecord:
     )
 
 
-def _normalize_fts_query(query: str) -> str:
-    """Normalize user-facing FTS queries to SQLite-compatible syntax.
+def _query_is_expert_syntax(query: str) -> bool:
+    """Return ``True`` when a query should be parsed as expert FTS5 syntax.
 
-    SQLite FTS5 treats hyphens as operators in bare tokens, which breaks
-    intuitive identifier-style prefix queries such as ``REQ-FUNC*``.
-    This normalizer preserves the public API contract by rewriting those
-    simple tokens to the accepted form ``"REQ-FUNC"*``.  It also strips
-    trailing natural-language punctuation like ``?`` and ``,`` from bare
-    tokens so user questions can be passed directly into FTS5.
+    A query is expert syntax when it contains any of:
+
+    * a quoted phrase (any ``"``),
+    * a standalone uppercase boolean operator (``AND``/``OR``/``NOT``), or
+    * a whitelisted column filter (``essence:``/``content:``).
+
+    Expert queries are normalized token-by-token and joined with spaces,
+    preserving FTS5's native operators, phrase matching, column filters and
+    implicit-AND semantics.
+
+    Bare natural-language queries (none of the above) are instead OR-joined so
+    function words cannot block a match; BM25's IDF weighting handles
+    uninformative tokens at ranking time.
+
+    Args:
+        query: The raw user-facing query string.
+
+    Returns:
+        ``True`` for expert syntax, ``False`` for a bare natural-language query.
+
     """
-    parts = query.split()
-    normalized_parts = [_normalize_fts_token(part) for part in parts]
-    return " ".join(part for part in normalized_parts if part)
+    if '"' in query:
+        return True
+    for token in query.split():
+        if token in _FTS_BOOLEAN_OPERATORS:
+            return True
+        if _FTS_FIELD_FILTER_RE.match(token.lstrip("(")):
+            return True
+    return False
+
+
+def _normalize_fts_query(query: str) -> str:
+    """Normalize a user-facing FTS query to SQLite FTS5-compatible syntax.
+
+    Two query classes are handled:
+
+    * **Expert syntax** (contains a quoted phrase or a standalone uppercase
+      ``AND``/``OR``/``NOT``): each token is normalized in place and the tokens
+      are joined with spaces, so FTS5's phrase matching, implicit AND, hyphen
+      handling and boolean operators all behave exactly as the caller wrote
+      them. Hyphenated identifiers such as ``REQ-FUNC*`` are still rewritten to
+      the accepted form ``"REQ-FUNC"*``.
+
+    * **Bare natural-language query** (no quotes, no uppercase operators): each
+      token expands to zero or more sanitized terms and the terms are joined
+      with ``OR``. This lets a question match any document sharing a content
+      word, instead of requiring every function word ("what", "was", "my") to
+      appear. BM25 IDF weighting keeps uninformative tokens from dominating the
+      ranking, so no stopword list or stemmer is needed in any language.
+
+    Unsafe characters (apostrophes, slashes, colons, ...) act as token
+    boundaries rather than being deleted, so contractions and clitics like
+    ``sister's`` or ``l'école`` split into matchable terms (``sister OR s``)
+    instead of becoming an unindexed merged token.
+
+    Args:
+        query: The raw user-facing query string.
+
+    Returns:
+        An FTS5 MATCH expression. May be empty when no usable term remains.
+
+    """
+    expert = _query_is_expert_syntax(query)
+    terms: list[str] = []
+    for token in query.split():
+        terms.extend(_normalize_fts_token(token, expert=expert))
+    joiner = " " if expert else " OR "
+    return joiner.join(terms)
 
 
 def _strip_fts_boundary_punctuation(raw: str) -> str:
-    """Strip unsupported leading and trailing punctuation from a bare token."""
+    """Strip unsupported leading and trailing punctuation from a bare token.
+
+    Args:
+        raw: A single unquoted token.
+
+    Returns:
+        The token with leading/trailing characters that FTS5 cannot start or
+        end a bare term with removed.
+
+    """
     while raw and not (raw[0].isalnum() or raw[0] in {"_", '"'}):
         raw = raw[1:]
 
@@ -3939,18 +4044,48 @@ def _strip_fts_boundary_punctuation(raw: str) -> str:
     return raw
 
 
-def _sanitize_fts_bare_token(raw: str) -> str:
-    """Remove unsupported FTS punctuation from an unquoted bare token."""
+def _sanitize_fts_bare_token(raw: str) -> list[str]:
+    """Split an unquoted bare token into safe FTS5 fragments.
+
+    Unsafe characters become fragment boundaries rather than being deleted, so
+    a contraction or clitic such as ``sister's`` splits into ``["sister", "s"]``
+    (which the ``unicode61`` tokenizer also produced at index time) instead of
+    merging into an unindexed ``sisters``.
+
+    Args:
+        raw: A single unquoted token, already paren-stripped.
+
+    Returns:
+        A list of non-empty safe fragments, in order. May be empty when the
+        token holds no indexable characters.
+
+    """
     stripped = _strip_fts_boundary_punctuation(raw)
-    return _FTS_UNSAFE_CHAR_RE.sub("", stripped)
+    split = _FTS_UNSAFE_CHAR_RE.sub(" ", stripped)
+    return [fragment for fragment in split.split() if fragment]
 
 
-def _normalize_fts_token(token: str) -> str:
-    """Normalize a single FTS token if it contains a hyphenated identifier."""
-    if not token or '"' in token:
-        return token
-    if token in {"AND", "OR", "NOT"}:
-        return token
+def _normalize_fts_token(token: str, *, expert: bool) -> list[str]:
+    """Normalize a single token into zero or more FTS5 terms.
+
+    Args:
+        token: A whitespace-delimited token from the raw query.
+        expert: ``True`` when the surrounding query is expert syntax. In expert
+            mode quoted phrases and uppercase operators pass through unchanged;
+            in bare mode every token is sanitized into plain OR-terms.
+
+    Returns:
+        The FTS5 terms this token contributes. A bare contraction may yield
+        several terms (``sister's`` -> ``["sister", "s"]``); an empty or
+        all-punctuation token yields ``[]``.
+
+    """
+    if not token:
+        return []
+    if expert and '"' in token:
+        return [token]
+    if expert and token in _FTS_BOOLEAN_OPERATORS:
+        return [token]
 
     leading = ""
     trailing = ""
@@ -3962,25 +4097,43 @@ def _normalize_fts_token(token: str) -> str:
         trailing = ")" + trailing
         raw = raw[:-1]
 
-    if _FTS_FIELD_FILTER_RE.match(raw):
-        normalized = f"{leading}{raw}{trailing}"
-    else:
-        raw = _sanitize_fts_bare_token(raw)
-        if not raw:
-            return ""
+    if expert and _FTS_FIELD_FILTER_RE.match(raw):
+        return [f"{leading}{raw}{trailing}"]
 
-        suffix = ""
-        if raw.endswith("*"):
-            raw = raw[:-1]
-            suffix = "*"
+    fragments = _sanitize_fts_bare_token(raw)
+    if not fragments:
+        return []
 
-        normalized = (
-            f'{leading}"{raw}"{suffix}{trailing}'
-            if "-" in raw
-            else f"{leading}{raw}{suffix}{trailing}"
-        )
+    terms = [_format_fts_bare_fragment(fragment) for fragment in fragments]
+    if expert:
+        # Expert mode keeps each original token as one term, re-attaching any
+        # parentheses the caller used for grouping.
+        terms[0] = f"{leading}{terms[0]}"
+        terms[-1] = f"{terms[-1]}{trailing}"
+    return terms
 
-    return normalized
+
+def _format_fts_bare_fragment(fragment: str) -> str:
+    """Format a single sanitized fragment as an FTS5 term.
+
+    Preserves a trailing ``*`` prefix marker and quotes hyphenated identifiers
+    so FTS5 does not read the hyphen as a column/operator.
+
+    Args:
+        fragment: A safe fragment containing only word characters, ``-`` or a
+            trailing ``*``.
+
+    Returns:
+        The fragment rewritten as a valid FTS5 term.
+
+    """
+    suffix = ""
+    if fragment.endswith("*"):
+        fragment = fragment[:-1]
+        suffix = "*"
+    if "-" in fragment:
+        return f'"{fragment}"{suffix}'
+    return f"{fragment}{suffix}"
 
 
 def _row_to_action(row: aiosqlite.Row) -> ActionRecord:
