@@ -15,6 +15,26 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ### Fixed
 
+- **Natural-language queries now reach the full-text index.** `search_fts`
+  previously joined the words of a bare query with FTS5's implicit `AND`, so a
+  question only matched documents that contained *every* word — including
+  function words like "what", "was" and "my" — and a relevantly-phrased answer
+  was missed. Bare queries are now matched with `OR`: a document is returned
+  when it shares any content word, and BM25's IDF weighting ranks the documents
+  that share the most distinctive words first, so no stopword list or stemmer is
+  needed in any language. Contractions and clitics no longer silently miss
+  (`sister's` matches a stored `sister's dog`; `l'école` matches `l'école
+  française`) because unsafe characters now split a token into separate terms
+  instead of being deleted into an unindexed word. Pasting a URL or a timestamp
+  into search no longer raises: only the real `essence:` and `content:` column
+  filters are honoured, while tokens such as `http://example.com` or `12:30` are
+  treated as ordinary search terms. Expert syntax is unchanged — quoted phrases,
+  uppercase `AND`/`OR`/`NOT`, hyphenated identifiers and the `essence:`/
+  `content:` column filters all keep their existing behaviour. As a final
+  safeguard, a malformed full-text expression is now logged and degraded to no
+  full-text hits instead of propagating, so the rest of a hybrid search still
+  returns results.
+
 - **Transient errors from an OpenAI-compatible embeddings endpoint no
   longer abort the whole call.** `OpenAICompatibleProvider` now retries a
   single embeddings request with bounded exponential backoff when the

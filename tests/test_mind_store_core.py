@@ -6,6 +6,7 @@ These tests use only engrava types and SqliteEngravaCore.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -31,6 +32,7 @@ from engrava import (
     VerificationStatus,
 )
 from engrava.domain.models.embedding import EmbeddingRecord
+from engrava.infrastructure.sqlite import engrava_core
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -804,3 +806,302 @@ class TestSearchFTS:
         results = await store.search_fts("coffee creamer $5?")
         assert len(results) == 1
         assert results[0][0] == "t-002"
+
+
+class TestSearchFTSNaturalLanguage:
+    """Natural-language queries reach the FTS index under OR-matching.
+
+    These tests pin the behaviour contract for bare (non-expert) queries:
+    function words must not block a match, contractions/clitics must not
+    silently miss, and pasted URLs/timestamps must never raise. Expert
+    syntax (quoted phrases, uppercase boolean operators, column filters)
+    is preserved unchanged by the no-regression class below.
+    """
+
+    async def test_function_words_do_not_block_match(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """An NL question matches a doc sharing only content tokens."""
+        await store.create_thought(
+            _make_thought(
+                "t-job",
+                essence="Career background",
+                content="Before this job I worked as a marketing specialist at a small startup",
+            )
+        )
+        results = await store.search_fts("what did I say about the marketing specialist job")
+        thought_ids = {r[0] for r in results}
+        assert "t-job" in thought_ids
+
+    async def test_distinctive_tokens_plus_function_words_match(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """Distinctive content tokens plus arbitrary function words still match."""
+        await store.create_thought(
+            _make_thought(
+                "t-dog",
+                essence="Pet anecdote",
+                content="I told you about my sisters dog last week",
+            )
+        )
+        results = await store.search_fts("what was the thing about my sisters dog")
+        thought_ids = {r[0] for r in results}
+        assert "t-dog" in thought_ids
+
+    async def test_contraction_query_matches(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """A possessive/contraction query splits on the clitic and still matches."""
+        await store.create_thought(
+            _make_thought(
+                "t-sister",
+                essence="Family note",
+                content="My sister's dog is a golden retriever",
+            )
+        )
+        results = await store.search_fts("sister's")
+        thought_ids = {r[0] for r in results}
+        assert "t-sister" in thought_ids
+
+    async def test_non_english_clitic_query_matches(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """A French elision query splits on the apostrophe and still matches."""
+        await store.create_thought(
+            _make_thought(
+                "t-ecole",
+                essence="Langue note",
+                content="l'école française est fermée",
+            )
+        )
+        results = await store.search_fts("l'école")
+        thought_ids = {r[0] for r in results}
+        assert "t-ecole" in thought_ids
+
+    async def test_url_query_does_not_raise(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """A pasted URL is tokenized, not read as a column filter — no crash."""
+        await store.create_thought(
+            _make_thought(
+                "t-url",
+                essence="Docs link",
+                content="see the example.com documentation for details",
+            )
+        )
+        results = await store.search_fts("see http://example.com docs")
+        assert isinstance(results, list)
+
+    async def test_url_fragments_become_useful_terms(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """URL fragments become OR-terms that match a doc mentioning the host."""
+        await store.create_thought(
+            _make_thought(
+                "t-url",
+                essence="Docs link",
+                content="see the example.com documentation for details",
+            )
+        )
+        results = await store.search_fts("see http://example.com docs")
+        thought_ids = {r[0] for r in results}
+        assert "t-url" in thought_ids
+
+    async def test_timestamp_query_does_not_raise(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """A bare timestamp token (``12:30``) is sanitized, never read as a column."""
+        await store.create_thought(
+            _make_thought(
+                "t-meeting",
+                essence="Calendar",
+                content="meeting scheduled at half past noon",
+            )
+        )
+        results = await store.search_fts("meeting at 12:30")
+        assert isinstance(results, list)
+
+    async def test_or_ranking_prefers_all_distinctive_tokens(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """A doc with all distinctive tokens outranks one with a single low-info token."""
+        await store.create_thought(
+            _make_thought(
+                "t-all",
+                essence="Marketing role",
+                content="the marketing specialist startup job summary",
+            )
+        )
+        await store.create_thought(
+            _make_thought(
+                "t-one",
+                essence="Unrelated",
+                content="a note about the job and nothing else relevant here",
+            )
+        )
+        results = await store.search_fts("marketing specialist startup job")
+        assert len(results) >= 2
+        assert results[0][0] == "t-all"
+
+    async def test_malformed_expression_degrades_to_empty(
+        self,
+        store: SqliteEngravaCore,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A residual malformed FTS5 expression degrades to no hits, not a crash."""
+        await store.create_thought(
+            _make_thought("t-x", essence="General", content="some indexable content")
+        )
+        # Force a syntactically invalid MATCH expression past the normalizer to
+        # exercise the defense-in-depth degradation in search_fts.
+        monkeypatch.setattr(
+            engrava_core,
+            "_normalize_fts_query",
+            lambda _query: 'unterminated "phrase',
+        )
+        with caplog.at_level(logging.WARNING):
+            results = await store.search_fts("anything")
+        assert results == []
+        assert any("FTS MATCH failed" in record.message for record in caplog.records)
+
+
+class TestSearchFTSExpertSyntaxPreserved:
+    """Expert FTS syntax keeps its current semantics after the OR change.
+
+    Each test here must pass both before and after the natural-language
+    OR-matching change: quoted phrases, hyphenated prefixes, uppercase
+    boolean operators, and whitelisted column filters are untouched.
+    """
+
+    async def test_quoted_phrase_keeps_phrase_semantics(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """A quoted phrase matches only adjacent terms, not scattered tokens."""
+        await store.create_thought(
+            _make_thought(
+                "t-adjacent",
+                essence="Outing",
+                content="we visited the dog park yesterday",
+            )
+        )
+        await store.create_thought(
+            _make_thought(
+                "t-scattered",
+                essence="Notes",
+                content="the dog slept while we walked to the car park",
+            )
+        )
+        results = await store.search_fts('"dog park"')
+        thought_ids = {r[0] for r in results}
+        assert thought_ids == {"t-adjacent"}
+
+    async def test_hyphenated_prefix_matches_identifier(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """A hyphenated prefix query still matches an identifier doc."""
+        await store.create_thought(
+            _make_thought(
+                "t-id",
+                essence="General",
+                content="REQ-FUNC-003 compliance",
+            )
+        )
+        results = await store.search_fts("REQ-FUNC*")
+        thought_ids = {r[0] for r in results}
+        assert "t-id" in thought_ids
+
+    async def test_uppercase_and_keeps_conjunction(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """``cats AND dogs`` requires both terms (expert mode)."""
+        await store.create_thought(
+            _make_thought("t-both", essence="Pets", content="cats and dogs together")
+        )
+        await store.create_thought(
+            _make_thought("t-cats", essence="Pets", content="just cats here")
+        )
+        results = await store.search_fts("cats AND dogs")
+        thought_ids = {r[0] for r in results}
+        assert thought_ids == {"t-both"}
+
+    async def test_lowercase_not_is_ordinary_term(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """Lowercase ``not`` is an ordinary OR-term, not a boolean operator."""
+        await store.create_thought(
+            _make_thought(
+                "t-trip",
+                essence="Travel",
+                content="why did the trip happen and where did we go",
+            )
+        )
+        # If 'not' were treated as a boolean NOT, this would error or exclude.
+        results = await store.search_fts("why did I not go")
+        thought_ids = {r[0] for r in results}
+        assert "t-trip" in thought_ids
+
+    async def test_whitelisted_essence_column_filter(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """``essence:meeting`` still filters on the essence column."""
+        await store.create_thought(
+            _make_thought("t-ess", essence="meeting agenda", content="unrelated body")
+        )
+        await store.create_thought(
+            _make_thought("t-body", essence="agenda", content="meeting body text")
+        )
+        results = await store.search_fts("essence:meeting")
+        thought_ids = {r[0] for r in results}
+        assert thought_ids == {"t-ess"}
+
+    async def test_whitelisted_content_column_filter(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """``content:meeting`` still filters on the content column."""
+        await store.create_thought(
+            _make_thought("t-ess", essence="meeting agenda", content="unrelated body")
+        )
+        await store.create_thought(
+            _make_thought("t-body", essence="agenda", content="meeting body text")
+        )
+        results = await store.search_fts("content:meeting")
+        thought_ids = {r[0] for r in results}
+        assert thought_ids == {"t-body"}
+
+    async def test_unknown_column_filter_is_sanitized(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """A non-whitelisted ``word:value`` token is sanitized — no column error."""
+        await store.create_thought(
+            _make_thought("t-rand", essence="General", content="randomword value pairing")
+        )
+        # Must not raise "no such column: randomword".
+        results = await store.search_fts("randomword:value")
+        thought_ids = {r[0] for r in results}
+        assert "t-rand" in thought_ids
+
+    async def test_empty_and_unsafe_queries_return_empty(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """Empty, whitespace-only, and only-unsafe-char queries return empty cleanly."""
+        await store.create_thought(_make_thought("t-x", essence="x", content="x"))
+        assert await store.search_fts("") == []
+        assert await store.search_fts("   ") == []
+        assert await store.search_fts("!!! @@@ ###") == []
