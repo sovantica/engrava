@@ -493,7 +493,7 @@ class TestSchemaMigration:
             cursor = await conn.execute("PRAGMA user_version")
             row = await cursor.fetchone()
             assert row is not None
-            assert int(row[0]) == 13
+            assert int(row[0]) == 14
 
             # _metadata table should exist.
             cursor = await conn.execute(

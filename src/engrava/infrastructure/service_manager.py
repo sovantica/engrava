@@ -298,6 +298,14 @@ class EngravaManager:
             if self._wal_mode:
                 await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("PRAGMA foreign_keys=ON")
+            # synchronous=NORMAL is the documented-safe companion to WAL: the
+            # database stays durable across an application crash and is only at
+            # risk of losing the most recent transactions on an OS crash or
+            # power loss, which is the standard recommendation for WAL.
+            await db.execute("PRAGMA synchronous=NORMAL")
+            # busy_timeout makes a second connection wait (up to 5s) for a lock
+            # instead of failing immediately with SQLITE_BUSY.
+            await db.execute("PRAGMA busy_timeout=5000")
             db.row_factory = aiosqlite.Row
 
             emb_config = self._resolve_embedding_config(service_name)
