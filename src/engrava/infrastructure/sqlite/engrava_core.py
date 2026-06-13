@@ -366,6 +366,14 @@ class SqliteEngravaCore:
             if config.wal_mode:
                 await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("PRAGMA foreign_keys=ON")
+            # synchronous=NORMAL is the documented-safe companion to WAL: the
+            # database stays durable across an application crash and is only at
+            # risk of losing the most recent transactions on an OS crash or
+            # power loss, which is the standard recommendation for WAL.
+            await db.execute("PRAGMA synchronous=NORMAL")
+            # busy_timeout makes a second connection wait (up to 5s) for a lock
+            # instead of failing immediately with SQLITE_BUSY.
+            await db.execute("PRAGMA busy_timeout=5000")
             db.row_factory = aiosqlite.Row
 
             hooks = resolve_hooks(config.hooks_class)
@@ -501,7 +509,7 @@ class SqliteEngravaCore:
         Applies the full ``schema_core.sql`` (including FTS5 virtual
         table and sync triggers) only when the database has not already
         been bootstrapped to schema version 3+.  Databases at older
-        versions are upgraded incrementally up to the current version (13).
+        versions are upgraded incrementally up to the current version (14).
 
         After core schema creation or upgrade, probes for the ``thought_fts``
         table and then runs any pending extension schema migrations for each
@@ -530,7 +538,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
             await self._migrate_core_v12_to_v13()
-            await self._db.execute("PRAGMA user_version = 13")
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
             await self._db.commit()
         elif current_version < 4:  # noqa: PLR2004
             await self._migrate_core_v3_to_v4()
@@ -543,7 +552,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
             await self._migrate_core_v12_to_v13()
-            await self._db.execute("PRAGMA user_version = 13")
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
             await self._db.commit()
         elif current_version < 5:  # noqa: PLR2004
             await self._migrate_core_v4_to_v5()
@@ -555,7 +565,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
             await self._migrate_core_v12_to_v13()
-            await self._db.execute("PRAGMA user_version = 13")
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
             await self._db.commit()
         elif current_version < 6:  # noqa: PLR2004
             await self._migrate_core_v5_to_v6()
@@ -566,7 +577,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
             await self._migrate_core_v12_to_v13()
-            await self._db.execute("PRAGMA user_version = 13")
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
             await self._db.commit()
         elif current_version < 7:  # noqa: PLR2004
             await self._migrate_core_v6_to_v7()
@@ -576,7 +588,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
             await self._migrate_core_v12_to_v13()
-            await self._db.execute("PRAGMA user_version = 13")
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
             await self._db.commit()
         elif current_version < 8:  # noqa: PLR2004
             await self._migrate_core_v7_to_v8()
@@ -585,7 +598,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
             await self._migrate_core_v12_to_v13()
-            await self._db.execute("PRAGMA user_version = 13")
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
             await self._db.commit()
         elif current_version < 9:  # noqa: PLR2004
             await self._migrate_core_v8_to_v9()
@@ -593,29 +607,38 @@ class SqliteEngravaCore:
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
             await self._migrate_core_v12_to_v13()
-            await self._db.execute("PRAGMA user_version = 13")
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
             await self._db.commit()
         elif current_version < 10:  # noqa: PLR2004
             await self._migrate_core_v9_to_v10()
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
             await self._migrate_core_v12_to_v13()
-            await self._db.execute("PRAGMA user_version = 13")
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
             await self._db.commit()
         elif current_version < 11:  # noqa: PLR2004
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
             await self._migrate_core_v12_to_v13()
-            await self._db.execute("PRAGMA user_version = 13")
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
             await self._db.commit()
         elif current_version < 12:  # noqa: PLR2004
             await self._migrate_core_v11_to_v12()
             await self._migrate_core_v12_to_v13()
-            await self._db.execute("PRAGMA user_version = 13")
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
             await self._db.commit()
         elif current_version < 13:  # noqa: PLR2004
             await self._migrate_core_v12_to_v13()
-            await self._db.execute("PRAGMA user_version = 13")
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
+            await self._db.commit()
+        elif current_version < 14:  # noqa: PLR2004
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
             await self._db.commit()
 
         # Ensure referential integrity is enforced for the lifetime of this
@@ -1013,6 +1036,60 @@ class SqliteEngravaCore:
                 f"ON {table}(valid_from, valid_until)"
             )
 
+    async def _migrate_core_v13_to_v14(self) -> None:
+        """Add hot-path indexes for the core read queries (core-14).
+
+        Purely additive: creates four indexes that back the equality
+        filters and the sort column hit on every common read, without
+        touching any row or column. The targets were chosen from the
+        actual ``WHERE`` / ``ORDER BY`` clauses in this module:
+
+        * ``idx_edge_to_thought`` on ``edge(to_thought_id)`` — ``get_edges``
+          (the inbound and both-direction modes) and the
+          reflection-consolidation scan filter the edge table on
+          ``to_thought_id``.
+        * ``idx_embedding_owner`` on ``embedding(owner_id)`` —
+          ``get_embedding`` looks an embedding up by its owner thought;
+          without this index the lookup is a full table scan, and it runs
+          inside three dreaming loops.
+        * ``idx_thought_updated_cycle`` on ``thought(updated_cycle)`` —
+          ``list_thoughts`` orders by ``updated_cycle`` on every call.
+        * ``idx_thought_type`` on ``thought(thought_type)`` —
+          ``thought_type`` equality is used by the reflection-id scan on
+          every search and by ``list_thoughts`` filtering.
+
+        Idempotent: every statement uses ``CREATE INDEX IF NOT EXISTS``, so
+        re-running the migration leaves the schema unchanged. The ``edge``
+        and ``embedding`` tables may be absent in a partial bootstrap (they
+        are created lazily), so each is guarded by ``_table_exists`` exactly
+        as ``_migrate_core_v12_to_v13`` guards ``edge``. The ``thought``
+        table is always present, but each indexed column is additionally
+        guarded by ``_column_exists`` so a minimal or hand-rolled legacy
+        schema that has not yet grown a column (for example a very old
+        database whose ``thought`` table predates ``updated_cycle``) skips
+        that single index instead of raising ``no such column``.
+        """
+        # ``thought`` is always present, but a minimal legacy schema may lack
+        # an indexed column; index only the columns that exist.
+        if await self._column_exists("thought", "updated_cycle"):
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_thought_updated_cycle ON thought(updated_cycle)"
+            )
+        if await self._column_exists("thought", "thought_type"):
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_thought_type ON thought(thought_type)"
+            )
+        # ``edge`` / ``embedding`` may be absent in a partial bootstrap;
+        # creating an index on a missing table would raise ``no such table``.
+        if await self._table_exists("edge"):
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_edge_to_thought ON edge(to_thought_id)"
+            )
+        if await self._table_exists("embedding"):
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_embedding_owner ON embedding(owner_id)"
+            )
+
     async def _fk_present(self, table: str, column: str) -> bool:
         """Return ``True`` when ``table`` carries an FK on ``column``."""
         cursor = await self._db.execute(f"PRAGMA foreign_key_list({table})")
@@ -1026,6 +1103,21 @@ class SqliteEngravaCore:
             (table,),
         )
         return await cursor.fetchone() is not None
+
+    async def _column_exists(self, table: str, column: str) -> bool:
+        """Return ``True`` when ``table`` has a column named ``column``.
+
+        Args:
+            table: The table to inspect. Must already exist.
+            column: The column name to look for.
+
+        Returns:
+            ``True`` if the column is present in ``PRAGMA table_info``.
+
+        """
+        cursor = await self._db.execute(f"PRAGMA table_info({table})")
+        rows = await cursor.fetchall()
+        return any(row["name"] == column for row in rows)
 
     async def _purge_orphan_children(self) -> None:
         """Delete orphan rows whose parent thought no longer exists.

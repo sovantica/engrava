@@ -1,7 +1,8 @@
 -- engrava: Core thought-graph schema (free-tier boundary — no internal-cognitive columns).
--- Version: core-13 (valid-time axis: nullable valid_from / valid_until on thought + edge)
+-- Version: core-14 (hot-path indexes: edge.to_thought_id, embedding.owner_id,
+--          thought.updated_cycle, thought.thought_type)
 
-PRAGMA user_version = 13;
+PRAGMA user_version = 14;
 
 CREATE TABLE IF NOT EXISTS thought (
     thought_id        TEXT    PRIMARY KEY,
@@ -211,3 +212,24 @@ CREATE INDEX IF NOT EXISTS idx_edge_valid_from ON edge(valid_from);
 CREATE INDEX IF NOT EXISTS idx_edge_valid_until ON edge(valid_until)
     WHERE valid_until IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_edge_valid_range ON edge(valid_from, valid_until);
+
+-- -------------------------------------------------------------------
+-- Hot-path indexes for the core read queries (core-14)
+-- -------------------------------------------------------------------
+-- These back the equality and sort columns hit on every common read:
+--   * idx_edge_to_thought   — get_edges (IN / BOTH direction) and the
+--     reflection-consolidation scan filter edge on to_thought_id.
+--   * idx_embedding_owner   — get_embedding looks up an embedding by its
+--     owner thought; without an index this is a full table scan, and it
+--     runs inside three dreaming loops.
+--   * idx_thought_updated_cycle — list_thoughts orders by updated_cycle on
+--     every call.
+--   * idx_thought_type      — thought_type equality is used by the
+--     reflection-id scan on every search and by list_thoughts filtering.
+-- A fresh-bootstrap database must carry the same indexes as one upgraded
+-- in place, so they are declared here as well as in the migration helper.
+
+CREATE INDEX IF NOT EXISTS idx_edge_to_thought ON edge(to_thought_id);
+CREATE INDEX IF NOT EXISTS idx_embedding_owner ON embedding(owner_id);
+CREATE INDEX IF NOT EXISTS idx_thought_updated_cycle ON thought(updated_cycle);
+CREATE INDEX IF NOT EXISTS idx_thought_type ON thought(thought_type);

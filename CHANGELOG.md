@@ -13,6 +13,21 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ## [Unreleased]
 
+### Performance
+
+- **Hot-path indexes and tuned SQLite PRAGMAs make the common reads faster.**
+  Four indexes now back the equality filters and the sort column hit on every
+  common read — looking up edges by their target thought, fetching a thought's
+  embedding, listing thoughts in recency order, and filtering thoughts by type
+  — turning what were full table scans into index lookups. The connection is
+  also opened with `synchronous=NORMAL` (the documented-safe companion to WAL:
+  durable across an application crash, only at risk of losing the most recent
+  transactions on an OS crash or power loss) and `busy_timeout=5000`, so a
+  second connection waits briefly for a lock instead of failing immediately
+  with a "database is locked" error. The index changes are an additive schema
+  migration that runs automatically on first open with zero data loss; see the
+  [upgrade guide](docs/upgrade.md#03---04).
+
 ### Fixed
 
 - **MindQL no longer mistypes quoted values or silently ignores malformed

@@ -170,6 +170,14 @@ What the migration does:
   (a legacy row) keeps `valid_from = NULL`. **Every existing edge** keeps both
   bounds `NULL` — the edge table has no calendar timestamp to source a date
   from, so the migration honestly leaves them open rather than fabricating one.
+- **Adds four hot-path indexes.** A second additive step creates indexes that
+  back the equality filters and the sort column hit on every common read
+  (edges by their target thought, a thought's embedding by owner, listing
+  thoughts in recency order, and filtering thoughts by type). This is a
+  pure index addition — **no row is read, modified, or removed**, and the row
+  counts are unchanged. The connection is also opened with `synchronous=NORMAL`
+  and `busy_timeout=5000` (a PRAGMA-only change with no on-disk effect). Like
+  the valid-time step, it runs automatically on first open with zero data loss.
 
 **Existing queries are unchanged.** A query that uses no temporal predicate
 behaves exactly as it did on 0.3. And because a `NULL` bound is treated as an
