@@ -353,15 +353,19 @@ def _parse_condition(part: str) -> Condition:
         MindQLParseError: If the fragment is not a valid condition.
 
     """
-    match = _CONDITION_RE.match(part)
+    match = _CONDITION_RE.fullmatch(part)
     if not match:
         msg = f"Invalid condition: {part!r}"
         raise MindQLParseError(msg)
     field_name = match.group(1)
     op_str = match.group(2)
-    # group 3 = quoted value, group 4 = unquoted value
-    raw_value: str = match.group(3) if match.group(3) is not None else match.group(4)
-    value: str | int | float = _coerce_value(raw_value)
+    # group 3 = quoted value, group 4 = unquoted value. A single-quoted literal
+    # is taken verbatim as a string; only the unquoted bare value is coerced to
+    # int/float, so e.g. ``'007'`` stays the string ``"007"`` instead of int 7.
+    quoted_value = match.group(3)
+    value: str | int | float = (
+        quoted_value if quoted_value is not None else _coerce_value(match.group(4))
+    )
     return Condition(
         field=field_name,
         operator=_OPERATOR_MAP[op_str],
