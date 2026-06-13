@@ -70,8 +70,71 @@ class SentenceTransformerProvider:
 
         logger.info("Loading SentenceTransformer model: %s", self._model_name)
         self._model = SentenceTransformer(self._model_name, device=self._device)
+        self._raise_max_seq_length(self._model)
         self._dimension = self._model.get_sentence_embedding_dimension()
         return self._model
+
+    @staticmethod
+    def _architecture_max_seq_length(model: Any) -> int | None:  # noqa: ANN401
+        """Read the underlying transformer's true maximum sequence length.
+
+        Inspects the first pipeline module's ``auto_model.config`` for
+        ``max_position_embeddings`` — the number of position embeddings the
+        architecture was trained with, i.e. the longest input it can encode
+        without an index error. Returns ``None`` when the value cannot be read
+        (non-standard module layout), in which case the caller leaves the
+        model's own limit untouched.
+
+        Args:
+            model: The loaded ``SentenceTransformer`` instance.
+
+        Returns:
+            The architecture's maximum sequence length, or ``None`` if it is
+            not discoverable.
+
+        """
+        try:
+            transformer_module = model[0]
+            value = transformer_module.auto_model.config.max_position_embeddings
+        except (KeyError, IndexError, TypeError, AttributeError):
+            return None
+        if isinstance(value, int) and value > 0:
+            return value
+        return None
+
+    def _raise_max_seq_length(self, model: Any) -> None:  # noqa: ANN401
+        """Lift a conservatively-low ``max_seq_length`` to the architecture max.
+
+        Some ``sentence-transformers`` checkpoints ship a ``max_seq_length``
+        far below the limit their backbone supports — the default
+        ``all-MiniLM-L12-v2`` reports ``128`` even though its BERT backbone has
+        ``max_position_embeddings == 512``. Left unchanged, the encoder
+        silently truncates any input past the shipped limit, so the tail of a
+        long thought is invisible to vector search and recall quietly degrades.
+
+        This reads the architecture's true maximum and raises
+        ``model.max_seq_length`` to it only when the current value is strictly
+        lower. The number is derived from the model — never hard-coded — so a
+        model that already reports its full limit is a no-op, and a model whose
+        architecture max cannot be read is left exactly as loaded.
+
+        Args:
+            model: The loaded ``SentenceTransformer`` instance to adjust.
+
+        """
+        architecture_max = self._architecture_max_seq_length(model)
+        if architecture_max is None:
+            return
+        current = model.get_max_seq_length()
+        if current is None or current < architecture_max:
+            model.max_seq_length = architecture_max
+            logger.info(
+                "Raised max_seq_length for %s from %s to architecture max %d "
+                "to avoid silent input truncation",
+                self._model_name,
+                current,
+                architecture_max,
+            )
 
     @property
     def dimension(self) -> int:

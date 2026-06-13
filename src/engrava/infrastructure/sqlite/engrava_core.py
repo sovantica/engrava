@@ -70,6 +70,35 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _build_embed_input(essence: str, content: str) -> str:
+    r"""Build the text payload to embed for a thought, avoiding duplication.
+
+    A common client (and benchmark) convention is to derive ``essence`` from
+    the opening of ``content`` (e.g. ``essence = content[:200]``). Naively
+    embedding ``f"{essence}\\n{content}"`` then encodes the turn's opening
+    twice, letting it dominate the vector and dilute the discriminative tail.
+
+    The rule is deliberately conservative: when the stripped ``essence`` is a
+    leading *prefix* of the stripped ``content`` it carries no new information,
+    so ``content`` is embedded alone. In every other case — including partial
+    overlaps that are not a clean prefix — the joined ``essence`` + ``content``
+    form is preserved, because a distinct essence is signal worth encoding.
+
+    Args:
+        essence: The thought's short summary / essence field.
+        content: The thought's full body text.
+
+    Returns:
+        ``content`` alone when ``essence`` is a prefix of it; otherwise the
+        newline-joined ``f"{essence}\\n{content}"`` payload.
+
+    """
+    if content.strip().startswith(essence.strip()):
+        return content
+    return f"{essence}\n{content}"
+
+
 #: A token is treated as an FTS5 column filter only when it targets a real
 #: indexed column. ``thought_fts`` indexes exactly ``essence`` and ``content``
 #: (see :meth:`SqliteEngravaCore.ensure_schema`); any other ``word:rest`` token
@@ -2393,7 +2422,8 @@ class SqliteEngravaCore:
     async def _auto_embed_thought(self, thought: ThoughtRecord) -> None:
         """Generate and store an embedding for a thought via the provider.
 
-        Combines ``essence`` and ``content`` into a single text payload,
+        Builds the embed payload via :func:`_build_embed_input` (which drops a
+        prefix-redundant ``essence`` to avoid double-counting the opening),
         embeds it via the configured provider, and persists the vector.
 
         Args:
@@ -2403,7 +2433,7 @@ class SqliteEngravaCore:
         provider = self._embedding_provider
         if provider is None:
             return  # pragma: no cover
-        text = f"{thought.essence}\n{thought.content}"
+        text = _build_embed_input(thought.essence, thought.content)
 
         vector = await provider.embed(text)
 
