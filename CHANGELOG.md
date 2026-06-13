@@ -15,6 +15,20 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ### Fixed
 
+- **MindQL no longer mistypes quoted values or silently ignores malformed
+  conditions.** A single-quoted WHERE value is now kept verbatim as a string,
+  so a zero-padded identifier such as `WHERE source = '007'` matches the stored
+  string `'007'` instead of being coerced to the integer `7` and matching
+  nothing; an *unquoted* bare value (for example `WHERE created_cycle = 12`) is
+  still coerced to a number as before. A WHERE fragment must now match the
+  `field op value` grammar in full: trailing content after a condition (such as
+  `WHERE priority = 'P1' OR 1=1`) previously matched only the leading prefix and
+  silently discarded the rest, which could change the result set unnoticed — it
+  now raises a parse error. Finally, a `FIND` query with no `LIMIT` clause is
+  capped at a sane default (100 rows) rather than running an unbounded scan; an
+  explicit `LIMIT` always overrides the default, and `COUNT` queries are
+  unaffected.
+
 - **Long memories are now embedded in full, and a thought's opening is no
   longer double-counted.** Two silent recall killers in the vector arm of
   search are fixed. First, when a thought's `essence` is just the opening of

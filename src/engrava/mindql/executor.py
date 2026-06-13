@@ -113,6 +113,12 @@ _OP_SQL: dict[MindQLOperator, str] = {
 # only meaningful against these; applying one to any other table is rejected.
 _TEMPORAL_TABLES: frozenset[str] = frozenset({"thought", "edge"})
 
+# Default row cap applied to a FIND query that carries no explicit LIMIT, so an
+# unqualified ``FIND thoughts`` cannot run an unbounded scan. An explicit
+# ``LIMIT`` in the query always overrides this. COUNT queries are unaffected —
+# they aggregate and never materialise the row set.
+DEFAULT_FIND_LIMIT = 100
+
 
 @dataclass(frozen=True)
 class MindQLResult:
@@ -274,6 +280,10 @@ class MindQLExecutor:
     ) -> tuple[str, list[object]]:
         """Build a parameterized SELECT SQL from a FIND query.
 
+        A ``LIMIT`` is always emitted: the query's own limit when it has one,
+        otherwise :data:`DEFAULT_FIND_LIMIT` so an unqualified FIND cannot run
+        an unbounded scan.
+
         Args:
             table: Target table name.
             query: Parsed FIND query.
@@ -284,7 +294,10 @@ class MindQLExecutor:
         """
         clauses, params = self._build_where(table, query)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-        limit = f" LIMIT {query.limit}" if query.limit is not None else ""
+        # An explicit LIMIT wins; otherwise cap the scan at DEFAULT_FIND_LIMIT
+        # so an unqualified FIND cannot run an unbounded query.
+        effective_limit = query.limit if query.limit is not None else DEFAULT_FIND_LIMIT
+        limit = f" LIMIT {effective_limit}"
         sql = f"SELECT * FROM {table}{where}{limit}"  # noqa: S608
         return sql, params
 

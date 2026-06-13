@@ -910,3 +910,169 @@ class TestBackwardCompatibility:
         store = SqliteEngravaCore(populated_db)
         result = await store.execute_mindql(parse("FIND thoughts"))
         assert len(result.rows) == 5
+
+
+# ---------------------------------------------------------------------------
+# Quoted-value typing: a single-quoted literal stays a string verbatim
+# ---------------------------------------------------------------------------
+
+
+class TestQuotedValueStaysString:
+    """A single-quoted WHERE value must keep its string type.
+
+    Only an *unquoted* bare value is coerced to ``int`` / ``float``; a value
+    the user wrapped in single quotes is taken verbatim as a string, so a
+    zero-padded identifier such as ``'007'`` is never silently turned into the
+    integer ``7``.
+    """
+
+    def test_quoted_numeric_value_is_string(self) -> None:
+        q = parse("FIND thoughts WHERE source = '12'")
+        assert q.conditions[0].value == "12"
+        assert isinstance(q.conditions[0].value, str)
+
+    def test_unquoted_numeric_value_still_coerces(self) -> None:
+        q = parse("FIND thoughts WHERE source = 12")
+        assert q.conditions[0].value == 12
+        assert isinstance(q.conditions[0].value, int)
+
+    def test_quoted_zero_padded_value_is_string(self) -> None:
+        q = parse("FIND thoughts WHERE source = '007'")
+        assert q.conditions[0].value == "007"
+        assert isinstance(q.conditions[0].value, str)
+
+    async def test_quoted_zero_padded_value_matches_stored_string(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(db)
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-zero-pad",
+                thought_type=ThoughtType.OBSERVATION,
+                essence="zero padded source",
+                content="zero padded source",
+                priority=Priority.P1,
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                created_cycle=1,
+                updated_cycle=1,
+                source="007",
+            )
+        )
+        result = await store.execute_mindql(parse("FIND thoughts WHERE source = '007'"))
+        # Pre-fix: '007' was coerced to int 7 and never matched the stored
+        # string '007', so this returned no rows.
+        assert {row["thought_id"] for row in result.rows} == {"t-zero-pad"}
+
+
+# ---------------------------------------------------------------------------
+# Strict condition matching: a fragment with trailing content is rejected
+# ---------------------------------------------------------------------------
+
+
+class TestConditionFullMatch:
+    """A WHERE fragment must match the condition grammar in full.
+
+    A prefix match used to silently discard any trailing content after the
+    first ``field op value`` token (for example ``priority = 'P1' OR 1=1``
+    parsed as just ``priority = 'P1'``). Such a fragment is now rejected so the
+    surplus never alters the result set unnoticed.
+    """
+
+    def test_trailing_content_after_condition_raises(self) -> None:
+        with pytest.raises(MindQLParseError, match="Invalid condition"):
+            parse("FIND thoughts WHERE priority = 'P1' OR 1=1")
+
+    def test_clean_single_condition_still_parses(self) -> None:
+        q = parse("FIND thoughts WHERE priority = 'P1'")
+        assert len(q.conditions) == 1
+        assert q.conditions[0].field == "priority"
+        assert q.conditions[0].value == "P1"
+
+    def test_clean_and_split_conditions_still_parse(self) -> None:
+        q = parse("FIND thoughts WHERE source = 'x' AND priority = 'P1'")
+        assert len(q.conditions) == 2
+        assert q.conditions[0].field == "source"
+        assert q.conditions[0].value == "x"
+        assert q.conditions[1].field == "priority"
+        assert q.conditions[1].value == "P1"
+
+
+# ---------------------------------------------------------------------------
+# Default LIMIT: an unbounded FIND is capped; an explicit LIMIT still wins
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultFindLimit:
+    """A FIND with no LIMIT is capped at the default; COUNT is unaffected."""
+
+    async def test_find_without_limit_capped_at_default(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        default = executor_module.DEFAULT_FIND_LIMIT
+        store = SqliteEngravaCore(db)
+        for i in range(default + 10):
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id=f"t-cap-{i:04d}",
+                    thought_type=ThoughtType.OBSERVATION,
+                    essence=f"essence {i}",
+                    content=f"content {i}",
+                    priority=Priority.P1,
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    created_cycle=1,
+                    updated_cycle=1,
+                    source="cap",
+                )
+            )
+        result = await store.execute_mindql(parse("FIND thoughts"))
+        # Pre-fix: the query was unbounded and returned every stored row.
+        assert len(result.rows) == default
+
+    async def test_explicit_limit_still_wins(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(db)
+        for i in range(20):
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id=f"t-lim-{i:04d}",
+                    thought_type=ThoughtType.OBSERVATION,
+                    essence=f"essence {i}",
+                    content=f"content {i}",
+                    priority=Priority.P1,
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    created_cycle=1,
+                    updated_cycle=1,
+                    source="lim",
+                )
+            )
+        result = await store.execute_mindql(parse("FIND thoughts LIMIT 5"))
+        assert len(result.rows) == 5
+
+    async def test_count_unaffected_by_default_limit(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        default = executor_module.DEFAULT_FIND_LIMIT
+        store = SqliteEngravaCore(db)
+        total = default + 10
+        for i in range(total):
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id=f"t-cnt-{i:04d}",
+                    thought_type=ThoughtType.OBSERVATION,
+                    essence=f"essence {i}",
+                    content=f"content {i}",
+                    priority=Priority.P1,
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    created_cycle=1,
+                    updated_cycle=1,
+                    source="cnt",
+                )
+            )
+        result = await store.execute_mindql(parse("COUNT thoughts"))
+        # COUNT does not apply the FIND default cap.
+        assert result.count == total
