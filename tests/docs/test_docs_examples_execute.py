@@ -55,6 +55,7 @@ editing the block means re-verifying the example.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from typing import TYPE_CHECKING
@@ -68,6 +69,33 @@ if TYPE_CHECKING:
 
 # Bound for every documentation subprocess so a hung example cannot wedge CI.
 _RUN_TIMEOUT_S = 120
+
+
+def _isolated_child_env() -> dict[str, str]:
+    """Return a deterministic, offline, single-threaded environment for a snippet.
+
+    Documentation snippets are run in a fresh subprocess. Forcing the offline
+    flags makes the run network-independent regardless of the caller's ambient
+    environment, and pinning the native thread pools keeps a snippet that
+    happens to import a heavy dependency from contending for native resources
+    with the rest of the suite.
+
+    Returns:
+        A copy of ``os.environ`` with the deterministic overrides applied.
+
+    """
+    env = dict(os.environ)
+    env.update(
+        {
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "TOKENIZERS_PARALLELISM": "false",
+        }
+    )
+    return env
+
 
 # Self-contained, executable blocks, identified by (markdown path, an anchor
 # substring that must appear in the block body). The anchor makes the binding
@@ -146,6 +174,10 @@ def _run_script(body: str, tmp_path: Path) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         timeout=_RUN_TIMEOUT_S,
+        # The snippets read nothing from stdin; closing it removes a stdin-
+        # inheritance wedge when the parent runs under pytest's output capture.
+        stdin=subprocess.DEVNULL,
+        env=_isolated_child_env(),
     )
 
 
