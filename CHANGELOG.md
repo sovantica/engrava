@@ -15,6 +15,23 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ### Fixed
 
+- **Long memories are now embedded in full, and a thought's opening is no
+  longer double-counted.** Two silent recall killers in the vector arm of
+  search are fixed. First, when a thought's `essence` is just the opening of
+  its `content` (a common convention, e.g. `essence = content[:200]`),
+  auto-embed used to concatenate the two and encode that opening twice, letting
+  it dominate the vector and dilute the discriminative tail; the redundant
+  prefix is now dropped and `content` is embedded alone, while a genuinely
+  distinct `essence` is still encoded alongside the content as before. Second,
+  the local `sentence-transformers` provider now raises `max_seq_length` to the
+  model's true architecture maximum after loading (derived from the model, not
+  hard-coded), instead of accepting a conservative shipped default — the bundled
+  `all-MiniLM-L12-v2` reported `128` while its backbone supports `512`, so the
+  tail of any longer thought was silently truncated away before encoding.
+  Existing stored embeddings are unaffected until a thought is re-written
+  (re-create or an `essence`/`content` update), at which point it is re-embedded
+  with the corrected input.
+
 - **Natural-language queries now reach the full-text index.** `search_fts`
   previously joined the words of a bare query with FTS5's implicit `AND`, so a
   question only matched documents that contained *every* word — including
