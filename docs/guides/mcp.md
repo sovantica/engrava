@@ -231,6 +231,13 @@ instead.
 passthrough (`SELECT`), aggregate `COUNT`, and any extension commands are
 rejected over the wire. See [MindQL](../mindql.md) for the `FIND` grammar.
 
+`query_memory` also accepts the **valid-time predicates** (`valid_now`,
+`valid_at`, `valid_within`, `valid_between`) in the `WHERE` clause, e.g.
+`FIND thoughts WHERE valid_now` or
+`FIND thoughts WHERE valid_at '2026-01-01T00:00:00+00:00'`. This is the only way
+to do point-in-time / time-travel filtering over MCP. See the
+[Bi-temporal Model](../bitemporal.md) for the semantics.
+
 ### Write tools (hidden in read-only mode)
 
 | Tool | Purpose | Key arguments | Annotation |
@@ -253,15 +260,17 @@ not idempotent. The valid `thought_type`, `lifecycle_status`, `priority`, and
 
 Where tools are *invoked*, **resources** are addressable `engrava://` URIs that a
 client surfaces as attachable context (drop them into a conversation, no tool
-call). Three resources are registered. They are reads by definition, so they are
-**always available** — they are *not* hidden by read-only mode — and each returns
-a JSON document (`application/json`).
+call). Three resources are registered — **two static** resources
+(`engrava://stats`, `engrava://recent`) and **one resource template**
+(`engrava://thought/{thought_id}`, parameterised by id). They are reads by
+definition, so they are **always available** — they are *not* hidden by read-only
+mode — and each returns a JSON document (`application/json`).
 
-| Resource | Returns |
-|---|---|
-| `engrava://thought/{thought_id}` | A single thought as JSON. Reading an unknown identifier yields a graceful not-found payload rather than an error. |
-| `engrava://stats` | Store-health counts and total size — the same payload as the `memory_stats` tool (both share one implementation, so they always agree). |
-| `engrava://recent` | The most-recently-updated thoughts (newest first) as JSON. |
+| Resource | Kind | Returns |
+|---|---|---|
+| `engrava://thought/{thought_id}` | template | A single thought as JSON. Reading an unknown identifier yields a graceful not-found payload rather than an error. |
+| `engrava://stats` | static | Store-health counts and total size — the same payload as the `memory_stats` tool (both share one implementation, so they always agree). |
+| `engrava://recent` | static | The most-recently-updated thoughts (newest first) as JSON. |
 
 ## Prompts
 
@@ -339,8 +348,10 @@ play.
 - The server is **single-writer**, like engrava itself — point it at a store that
   is not being written concurrently by another process (see
   [Concurrency](../concurrency.md)).
-- Tool errors are returned as clean, actionable messages (for example, an unknown
-  `thought_id`, or a non-`FIND` query) rather than raw tracebacks.
+- Tool errors are returned as clean, actionable messages — an unknown
+  `thought_id`, a non-`FIND` query, a duplicate `link_thoughts` edge, or an
+  invalid field value — rather than raw tracebacks, and they never expose internal
+  table/column names or other deployment internals.
 - Thoughts and edges created through the write tools start at cycle `0`: this API
   consumer has no notion of the agent [cycle clock](../concepts.md#cycle-the-agent-clock),
   which your application owns.

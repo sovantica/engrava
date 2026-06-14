@@ -47,6 +47,16 @@ Every thought carries **two** texts, and the split is deliberate:
 > tight `essence`, not the whole `content`. Putting the same long text in both
 > defeats the purpose. Think *headline* (`essence`) vs *article* (`content`).
 
+### `valid_from` / `valid_until` (optional valid time)
+
+A thought also carries two optional, nullable timestamps — `valid_from` and
+`valid_until` — that record **when the fact is true in the world**, a separate
+axis from when Engrava stored it (`created_at`) and from the [cycle](#cycle-the-agent-clock).
+Both default to `None` (an open interval = "valid for all time"), so you can
+ignore them entirely until you need point-in-time history. The same two fields
+exist on an [edge](#edge). See [The Bi-temporal Model](bitemporal.md) for the full
+semantics and the query predicates.
+
 ### Thought types
 
 `ThoughtType` is a closed set — choose the one that fits what you're storing:

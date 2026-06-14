@@ -148,8 +148,11 @@ predicates, and `invalidate`. From an upgrade standpoint, the change is
 
 **The migration runs on first open, with zero data loss.** The first time a
 0.4 process calls `ensure_schema()` (most apps already do this at startup), the
-core schema steps forward to the new version inside a transaction. `pip install
---upgrade engrava` plus your normal startup is all that is required:
+core schema steps forward from `user_version = 12` (the 0.3 schema) to
+`user_version = 14` in **two additive steps** (12 → 13 adds the valid-time
+columns and their indexes; 13 → 14 adds the hot-path indexes), each inside a
+transaction. `pip install --upgrade engrava` plus your normal startup is all that
+is required:
 
 ```bash
 pip install --upgrade engrava
@@ -179,13 +182,26 @@ What the migration does:
   and `busy_timeout=5000` (a PRAGMA-only change with no on-disk effect). Like
   the valid-time step, it runs automatically on first open with zero data loss.
 
-**Existing queries are unchanged.** A query that uses no temporal predicate
-behaves exactly as it did on 0.3. And because a `NULL` bound is treated as an
-**open interval end** (−∞ / +∞), the open-from rows above still match
+**Structured (MindQL) queries are unchanged.** A query that uses no temporal
+predicate behaves exactly as it did on 0.3. And because a `NULL` bound is treated
+as an **open interval end** (−∞ / +∞), the open-from rows above still match
 `valid_now` and `valid_at` queries — an un-dated fact is treated as "valid since
 the beginning of time", not as "excluded". So adopting valid time is incremental:
 you can start annotating new facts whenever you like, and the old ones keep
 surfacing in temporal queries until you choose to bound them.
+
+**Search behavior changes (no migration, but worth knowing).** Two 0.4 fixes to
+keyword/full-text search are not schema changes but do change results:
+
+- **Bare full-text queries now `OR`-match** instead of `AND`-matching, so a
+  natural-language query that returned *nothing* on 0.3 (because no document
+  contained *every* word) may now return results. This is the intended fix; if you
+  relied on strict all-words matching, use uppercase `AND` or a quoted phrase
+  explicitly. See [Keyword query syntax](search.md#keyword-query-syntax-fts).
+- Stored embeddings are **not** re-computed by the upgrade — the full-content
+  embedding fix and the `max_seq_length` fix take effect only when a thought is
+  re-written (re-created, or its `essence`/`content` updated), at which point it is
+  re-embedded with the corrected input. Existing vectors are untouched until then.
 
 > **Honest note about edges.** Because the upgrade cannot invent a `valid_from`
 > for an edge that never had a date, every edge migrated from 0.3 carries
@@ -193,6 +209,11 @@ surfacing in temporal queries until you choose to bound them.
 > still match `valid_now` / `valid_at`. They will **not** match `valid_between`
 > (which requires real bounds on both ends) until you set their bounds
 > explicitly. This is expected, not a defect.
+
+**New optional MCP server.** 0.4 also ships an optional Model Context Protocol
+server behind a new `mcp` extra — `pip install "engrava[mcp]"`. It is purely
+additive: plain `pip install engrava` is unaffected and existing code needs no
+change. See the [MCP server guide](guides/mcp.md).
 
 This is a schema-changing minor upgrade, so follow the
 [rolling-upgrades](#rolling-upgrades-multiple-workers) procedure (back up,

@@ -15,7 +15,10 @@ SELECT <raw read-only SQL>
 - The command verb (`FIND`, `COUNT`, `SELECT`) is case-insensitive.
 - `FIND` and `COUNT` **require a table name** as the second token.
 - A `WHERE` clause is `field operator value`; string values must be
-  single-quoted, bare numbers are coerced to `int`/`float`.
+  single-quoted, bare numbers are coerced to `int`/`float`. The quoting decides
+  the type: a single-quoted value is kept **verbatim as a string**, so a
+  zero-padded identifier like `source = '007'` matches the stored string `'007'`,
+  whereas an unquoted `created_cycle = 7` is coerced to the integer `7`.
 - Operators: `=`, `!=`, `>`, `<`, `>=`, `<=`. Conditions chain with `AND`.
 
 ### Queryable tables
@@ -43,6 +46,13 @@ Filterable `thought` columns include `thought_type`, `lifecycle_status`,
 `priority`, `essence`, `content`, `source`, `confidence`, `visibility`,
 `confirmation_count`, `created_cycle`, `updated_cycle`, and `thought_id`.
 A column outside the per-table allowlist raises `MindQLParseError`.
+
+**Default row cap.** A `FIND` with no `LIMIT` clause is capped at **100 rows**
+when it runs, so an unqualified `FIND thoughts` can never trigger an unbounded
+scan. The cap is applied at execution, not at parse time — `parse("FIND thoughts")`
+leaves `query.limit` as `None`, and the executor substitutes the default only if
+no explicit `LIMIT` is present. An explicit `LIMIT` always overrides the default;
+`COUNT` queries are unaffected (they aggregate and never materialise the rows).
 
 **Returns:** matching rows as dicts.
 
@@ -94,6 +104,13 @@ FIND thoughts WHERE valid_between '2026-01-01T00:00:00+00:00' '2026-12-31T00:00:
   requires real bounds on both ends and therefore excludes open-bound rows.
 - A query that uses **no** temporal predicate behaves exactly as before.
 
+> **Valid time is predicate-only, not a filterable column.** Query valid time
+> *only* through the four predicates above. `valid_from` and `valid_until` are not
+> in the per-table column allowlist, so an ordinary comparison such as
+> `WHERE valid_from = '2026-01-01T00:00:00+00:00'` is **rejected when the query
+> runs** (`MindQLParseError: Column 'valid_from' not allowed for table 'thought'`)
+> — use `valid_at` / `valid_within` / `valid_between` instead.
+
 The semantics, the open-interval (`NULL` = ±∞) rule, and `invalidate` are
 documented in full on [The Bi-temporal Model](bitemporal.md).
 
@@ -109,7 +126,8 @@ See [Extensions](extensions.md) for the registration flow.
 ### Parsing
 
 `parse()` returns a `MindQLQuery` plan. Its fields are `command`, `table`,
-`conditions`, `limit`, `raw_sql`, `extension_name`, and `extension_args`.
+`conditions`, `temporal_predicates` (the parsed valid-time predicates, empty when
+none are used), `limit`, `raw_sql`, `extension_name`, and `extension_args`.
 
 ```python
 from engrava import parse, MindQLParseError
@@ -152,6 +170,11 @@ print(f"Active thoughts: {count_result.count}")
   outside a table's allowlist.
 - Unknown command verbs raise `MindQLParseError` unless registered as an
   extension command.
+- A `WHERE` fragment must match the `field operator value` grammar **in full**.
+  Trailing content after a condition (for example `WHERE priority = 'P1' OR 1=1`)
+  is rejected with a `MindQLParseError` rather than silently parsing only the
+  leading `priority = 'P1'` and discarding the rest — so a malformed condition
+  can never quietly change the result set.
 
 ## CLI Usage
 

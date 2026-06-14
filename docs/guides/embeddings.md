@@ -13,7 +13,10 @@ works.
 ## Two things a provider gives you
 
 1. **Ingest-time embedding** — with `auto_embed=True`, every thought is embedded
-   on write, so it becomes findable by meaning.
+   on write, so it becomes findable by meaning. When the `essence` is just the
+   leading prefix of `content` (a common convention, e.g. `essence = content[:200]`),
+   only `content` is embedded — the redundant prefix is dropped so it can't dominate
+   the vector. A genuinely distinct `essence` is still embedded alongside `content`.
 2. **Query-time embedding** — at search time the query must also be a vector.
    `search_hybrid` takes the query *text* and, when a provider is configured,
    embeds it **for you** (unless you pass an explicit `query_vector`).
@@ -84,6 +87,13 @@ provider = SentenceTransformerProvider(
 No API key, no network after the first model download. Best default for
 self-hosting.
 
+On load, this provider raises the model's `max_seq_length` to the architecture's
+true maximum when the shipped checkpoint reports a conservatively-low value — the
+bundled `all-MiniLM-L12-v2`, for instance, ships `128` while its backbone supports
+`512`. Without this, the tail of any longer thought would be silently truncated
+before encoding. The value is read from the model, not hard-coded, so a model that
+already reports its real maximum is left unchanged.
+
 ### `OpenAICompatibleProvider` — OpenAI or any OpenAI-compatible API
 
 Calls an OpenAI-style `/embeddings` endpoint. Requires the `embeddings-openai`
@@ -106,6 +116,26 @@ provider = OpenAICompatibleProvider(
 
 `api_key` defaults to the `OPENAI_API_KEY` environment variable when omitted.
 Set `base_url` to target a compatible gateway (Azure OpenAI, a local proxy, etc.).
+
+**Automatic retry on transient failures.** This provider retries a request with
+bounded exponential backoff when the endpoint reports a transient failure — a read
+timeout or network blip, or a transient HTTP status (`408`, `409`, `425`, `429`,
+`500`, `502`, `503`, `504`) — so a short outage is absorbed instead of failing your
+ingest. Non-transient statuses (`400`, `401`, `403`, `404`) surface immediately
+with no retry, and a transient failure that persists across every attempt is still
+raised (the call never loops forever). Two keyword-only knobs tune it:
+`max_attempts` (default `3`) and `base_retry_delay_s` (default `1.0`); the defaults
+leave the success path at a single request, so existing callers see no change. This
+applies to `OpenAICompatibleProvider` only — `OllamaProvider` and
+`HuggingFaceProvider` do not retry.
+
+```python
+provider = OpenAICompatibleProvider(
+    model_name="text-embedding-3-small",
+    max_attempts=5,           # up to 5 tries on transient failures
+    base_retry_delay_s=0.5,   # exponential backoff starting at 0.5s
+)
+```
 
 ### `OllamaProvider` — local Ollama server
 
@@ -203,7 +233,7 @@ result = await store.search_similar(query_vec, top_k=5)
   `engrava restore --re-embed`).
 - **Dimension follows the model.** Local/HF providers infer it from the model;
   `CallbackProvider` requires you to declare `dimension` to match what your
-  callback returns. For the `sqlite-vec` ANN backend, set
+  callback returns. For the `sqlite-vec` vector backend, set
   `extensions.vector.dimension` in config to match.
 
 ## Config-driven equivalents

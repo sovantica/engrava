@@ -95,6 +95,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -104,9 +105,14 @@ import anyio
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
+from pydantic import ValidationError
 
 from engrava.domain.enums import EdgeType, LifecycleStatus, Priority, ThoughtType
-from engrava.domain.exceptions import ReferentialIntegrityError, ThoughtNotFoundError
+from engrava.domain.exceptions import (
+    InvalidTransitionError,
+    ReferentialIntegrityError,
+    ThoughtNotFoundError,
+)
 from engrava.domain.models.edge import EdgeRecord
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.mcp.config import ResolvedStore, resolve_store
@@ -237,7 +243,12 @@ async def _tool_errors() -> AsyncIterator[None]:
     The messages name only the documented configuration *environment
     variables* (never a filesystem path), carry no stack frames, and expose
     no internal symbol names, so a misuse reply leaks nothing about the
-    deployment.
+    deployment. In particular, a database constraint violation (a duplicate
+    ``link_thoughts`` edge), a domain-model validation error, and an illegal
+    lifecycle transition are mapped to curated messages here so the raw SQLite
+    table/column names, Pydantic's internal model details, and the internal
+    status-type name never reach the client; an unrecognised integrity error is
+    re-raised unchanged rather than described.
 
     Yields:
         ``None``; the caller runs the guarded tool body inside the ``with``.
@@ -279,6 +290,19 @@ async def _tool_errors() -> AsyncIterator[None]:
             "identifier, or use search_memory or list_memory to find it."
         )
         raise ToolError(msg) from exc
+    except InvalidTransitionError as exc:
+        # An illegal lifecycle change on update_thought (the wire status is
+        # coerced to the enum, so the state-machine guard fires). The raw
+        # message names the internal status type; surface the move in plain
+        # user terms instead. The state values are the public lifecycle names
+        # (CREATED/ACTIVE/DONE/ARCHIVED), not internal symbols.
+        msg = (
+            f"Cannot change lifecycle status from {exc.current_state} to "
+            f"{exc.target_state}: that transition is not allowed. The lifecycle "
+            "advances CREATED -> ACTIVE -> DONE -> ARCHIVED and cannot move "
+            "backwards or skip ahead."
+        )
+        raise ToolError(msg) from exc
     except ReferentialIntegrityError as exc:
         msg = (
             f"Cannot link thoughts: no thought exists with id "
@@ -286,6 +310,36 @@ async def _tool_errors() -> AsyncIterator[None]:
             "the identifier."
         )
         raise ToolError(msg) from exc
+    except ValidationError as exc:
+        # A field value rejected by the domain model (e.g. an essence below the
+        # minimum length, or a value outside an enum). Pydantic's own message
+        # names the internal model class and links errors.pydantic.dev, so it
+        # must NOT be echoed; surface the offending field names only.
+        fields = ", ".join(
+            ".".join(str(part) for part in err.get("loc", ())) for err in exc.errors()
+        )
+        detail = f" (check: {fields})" if fields else ""
+        msg = (
+            f"One or more fields are invalid{detail}. Correct the value(s) and "
+            "retry — see the tool's argument descriptions for the accepted "
+            "types and ranges."
+        )
+        raise ToolError(msg) from exc
+    except sqlite3.IntegrityError as exc:
+        # A constraint violation from the database. The raw message names the
+        # internal table and columns (e.g. a UNIQUE constraint over the edge
+        # endpoints), which must not reach the client. Map the reachable case —
+        # a duplicate edge from link_thoughts — to a schema-free message; any
+        # other integrity error is re-raised unchanged rather than silently
+        # described, so it is never masked.
+        if "UNIQUE" in str(exc):
+            msg = (
+                "An edge of that type already links those two thoughts. Edges "
+                "are unique per (source, target, type), so this link already "
+                "exists — no change was made."
+            )
+            raise ToolError(msg) from exc
+        raise
 
 
 class StoreProvider:
@@ -766,8 +820,9 @@ async def update_thought_impl(
         essence: New compact canonical text, if changing.
         content: New full content, if changing.
         priority: New urgency level, if changing.
-        lifecycle_status: New lifecycle state, if changing.  The store
-            validates that the transition is allowed.
+        lifecycle_status: New lifecycle state, if changing. Supplied as the
+            string name of a :class:`~engrava.LifecycleStatus` member; the
+            store validates that the transition is allowed.
         confidence: New reliability estimate in ``[0.0, 1.0]``, if changing.
 
     Returns:
@@ -777,7 +832,7 @@ async def update_thought_impl(
     Raises:
         ThoughtNotFoundError: If no thought has the given identifier.
         StaleDataError: If the thought changed concurrently.
-        InvalidTransitionError: If a lifecycle change is not permitted.
+        InvalidTransitionError: If the lifecycle change is not permitted.
 
     """
     changes: dict[str, object] = {}

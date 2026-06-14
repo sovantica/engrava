@@ -65,6 +65,7 @@ keyword arguments and does **not** return a UUID string.
 | `await list_thoughts(...)` | `list[ThoughtRecord]` | List with filters (keyword-only) |
 | `await count_thoughts(...)` | `int` | Count with filters (keyword-only) |
 | `await delete_thought(thought_id)` | `bool` | Hard delete; `True` if a row was removed |
+| `await invalidate_thought(thought_id, valid_until)` | `ThoughtRecord` | Close the thought's *valid-time* interval at the given ISO-8601 instant — deterministic, idempotent, non-cascading, and **not a delete** (the row stays on file and remains retrievable for instants before `valid_until`). Raises `ThoughtNotFoundError` if missing. See [Bi-temporal Model](bitemporal.md#invalidate-vs-delete) |
 | `await record_access(thought_id)` | `None` | Mark a thought as accessed — bumps `access_count` and sets `last_accessed_at`; raises `ThoughtNotFoundError` if missing. Drives the access-frequency dreaming signal. |
 
 ```python
@@ -119,6 +120,7 @@ not exist.
 | `await list_edges(*, edge_type=None, source=None, limit=5000)` | `list[EdgeRecord]` | List edges with optional filters |
 | `await update_edge(edge_id, **changes)` | `EdgeRecord` | Update edge fields |
 | `await delete_edge(edge_id)` | `bool` | Hard delete; `True` if a row was removed |
+| `await invalidate_edge(edge_id, valid_until)` | `EdgeRecord` | Close the edge's *valid-time* interval at the given ISO-8601 instant — deterministic, idempotent, and **not a delete** (the row stays on file). Invalidating a thought does **not** cascade to its edges; invalidate them separately. See [Bi-temporal Model](bitemporal.md#invalidate-vs-delete) |
 
 ```python
 import uuid
@@ -270,6 +272,8 @@ create modified copies.
 | `created_at` | `str \| None` | ISO-8601 datetime when persisted |
 | `updated_at` | `str \| None` | ISO-8601 datetime of last mutation |
 | `expires_at` | `str \| None` | ISO-8601 datetime when the thought expires (TTL) |
+| `valid_from` | `str \| None` | ISO-8601 start of the fact's real-world *valid time* (open lower bound when `None`); see [Bi-temporal Model](bitemporal.md) |
+| `valid_until` | `str \| None` | ISO-8601 end of *valid time*, **exclusive** (open upper bound when `None`); see [Bi-temporal Model](bitemporal.md) |
 | `metadata` | `dict[str, MetadataValue]` | Caller-supplied structured attributes (default `{}`) |
 
 #### `metadata` field
@@ -331,6 +335,8 @@ extension is recommended for filtering queries (`json_extract(metadata_json, '$.
 | `created_cycle` | `int` | Creation cycle |
 | `source` | `KnowledgeSource` | Provenance (default `EXPERIENCE`) |
 | `decay_multiplier` | `float` | Decay rate multiplier (default `1.0`) |
+| `valid_from` | `str \| None` | ISO-8601 start of the edge's real-world *valid time* (open lower bound when `None`); see [Bi-temporal Model](bitemporal.md) |
+| `valid_until` | `str \| None` | ISO-8601 end of *valid time*, **exclusive** (open upper bound when `None`); see [Bi-temporal Model](bitemporal.md) |
 
 ### `EmbeddingRecord`
 
@@ -466,6 +472,26 @@ class EmbeddingProviderProtocol(Protocol):
 ## MindQL
 
 See [MindQL](mindql.md) for the query language reference.
+
+### `execute_mindql` (on the store)
+
+`SqliteEngravaCore` exposes a convenience that runs a MindQL query directly
+against the store's own connection, so you don't have to construct a
+`MindQLExecutor` yourself. Like the executor, it takes a **parsed**
+`MindQLQuery` — `parse()` the string first.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `await execute_mindql(query, *, extensions=None)` | `MindQLResult` | Run a parsed `MindQLQuery` on the store's connection. `extensions` is an optional `dict[str, MindQLExtension]` registering extension commands. |
+
+```python
+from engrava import parse
+
+result = await store.execute_mindql(
+    parse("FIND thoughts WHERE lifecycle_status = 'ACTIVE' LIMIT 10")
+)
+print(result.rows)
+```
 
 ### `MindQLExecutor`
 

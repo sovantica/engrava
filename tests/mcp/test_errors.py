@@ -57,6 +57,23 @@ _LEAK_MARKERS = (
     "ReferentialIntegrityError",
     "SqliteEngravaCore",
     "lifespan",
+    # Database-constraint internals: a UNIQUE violation's raw message names the
+    # edge table and its columns — none of these may reach the client.
+    "IntegrityError",
+    "UNIQUE constraint",
+    "edge.from_thought_id",
+    "edge.to_thought_id",
+    "edge.edge_type",
+    # Domain-model-validation internals: Pydantic's raw message names the model
+    # class and links its docs site.
+    "ValidationError",
+    "ThoughtRecord",
+    "pydantic",
+    "errors.pydantic.dev",
+    # Lifecycle-transition internals: the raw InvalidTransitionError message
+    # names the internal status type.
+    "InvalidTransitionError",
+    "Invalid LifecycleStatus transition",
 )
 
 #: Phrases that would wrongly suggest raw SQL is runnable over the wire.
@@ -337,6 +354,137 @@ class TestLinkMissingEndpoint:
         assert "ghost-endpoint" in text
         # ... and the message leaks no path, stack frame, or class name.
         _assert_no_leak(text)
+
+
+class TestDuplicateEdge:
+    """A duplicate ``link_thoughts`` edge is mapped to a schema-free message."""
+
+    async def test_duplicate_link_reports_clean_message_no_schema(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        # The two seeded thoughts can be linked once; a second identical link
+        # violates the (source, target, type) UNIQUE constraint. The raw
+        # sqlite3 message names the edge table and its columns — the client
+        # must instead get a curated, schema-free message.
+        async with _client_for(store) as client:
+            first = await client.call_tool(
+                "link_thoughts",
+                {
+                    "from_thought_id": "thought-alpha",
+                    "to_thought_id": "thought-beta",
+                    "edge_type": "ASSOCIATED",
+                },
+            )
+            assert first.isError is False  # the first link succeeds
+
+            duplicate = await client.call_tool(
+                "link_thoughts",
+                {
+                    "from_thought_id": "thought-alpha",
+                    "to_thought_id": "thought-beta",
+                    "edge_type": "ASSOCIATED",
+                },
+            )
+
+        assert duplicate.isError is True
+        text = _error_text(duplicate.content)
+        # Actionable: it explains the uniqueness rule in user terms ...
+        assert "already" in text.lower()
+        # ... and leaks no table/column names, raw constraint text, or symbol.
+        _assert_no_leak(text)
+
+
+class TestInvalidFieldValue:
+    """An invalid field value is mapped without leaking Pydantic internals."""
+
+    async def test_empty_essence_reports_clean_validation_message(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        # ``essence`` has a minimum length; an empty string fails domain-model
+        # validation. The raw Pydantic error names the model class and links
+        # its docs site — the client must get a curated message instead.
+        async with _client_for(store) as client:
+            result = await client.call_tool(
+                "store_thought",
+                {"essence": "", "content": "some content"},
+            )
+
+        assert result.isError is True
+        text = _error_text(result.content)
+        # Actionable: it points at the offending field and says it is invalid ...
+        assert "invalid" in text.lower()
+        assert "essence" in text.lower()
+        # ... and leaks no Pydantic URL, model class name, or symbol.
+        _assert_no_leak(text)
+
+    async def test_out_of_range_confidence_reports_clean_message(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        # ``confidence`` is constrained to [0.0, 1.0] by the domain model (not
+        # by the tool's argument schema), so an out-of-range value reaches the
+        # tool body and is rejected there — exercising the ValidationError
+        # mapping. The curated message names the field, never the model.
+        async with _client_for(store) as client:
+            result = await client.call_tool(
+                "store_thought",
+                {"essence": "ok", "content": "c", "confidence": 5.0},
+            )
+
+        assert result.isError is True
+        text = _error_text(result.content)
+        assert "invalid" in text.lower()
+        assert "confidence" in text.lower()
+        _assert_no_leak(text)
+
+
+class TestIllegalTransition:
+    """An illegal lifecycle change is mapped without the internal type name."""
+
+    async def test_backwards_transition_reports_clean_message(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        # The seeded thoughts are ACTIVE; ACTIVE -> CREATED is backwards and
+        # illegal. FastMCP coerces the wire status to the LifecycleStatus enum,
+        # so the store's transition guard fires. The raw message names the
+        # internal status type — the client must get a curated message instead.
+        async with _client_for(store) as client:
+            result = await client.call_tool(
+                "update_thought",
+                {"thought_id": "thought-alpha", "lifecycle_status": "CREATED"},
+            )
+
+        assert result.isError is True
+        text = _error_text(result.content)
+        # Actionable: it states the move in plain terms (the public state names
+        # are fine; the internal type name is not) ...
+        assert "ACTIVE" in text
+        assert "CREATED" in text
+        assert "not allowed" in text.lower() or "cannot" in text.lower()
+        # ... and leaks neither the raw "Invalid LifecycleStatus transition"
+        # phrasing nor the exception class name.
+        _assert_no_leak(text)
+
+    async def test_illegal_transition_does_not_change_state(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        # The rejection is real: the thought stays ACTIVE after an illegal
+        # update attempt, confirming the guard blocks the write (not just the
+        # message wrapper).
+        async with _client_for(store) as client:
+            await client.call_tool(
+                "update_thought",
+                {"thought_id": "thought-alpha", "lifecycle_status": "CREATED"},
+            )
+            after = await client.call_tool("get_thought", {"thought_id": "thought-alpha"})
+
+        assert after.isError is False
+        assert after.structuredContent is not None
+        assert after.structuredContent["thought"]["lifecycle_status"] == "ACTIVE"
 
 
 class TestSuccessPathUnchanged:

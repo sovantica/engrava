@@ -13,6 +13,44 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ## [Unreleased]
 
+### Added
+
+- **Bi-temporal model: track when a fact is *true*, not just when you stored
+  it.** `ThoughtRecord` and `EdgeRecord` gain two optional, nullable ISO-8601
+  fields — `valid_from` and `valid_until` — describing the half-open real-world
+  interval during which a fact holds (the upper bound is exclusive; a `None`
+  bound is treated as ±∞, so facts you never annotate keep matching every query).
+  Four opt-in MindQL `WHERE` predicates query this *valid time* on the `thoughts`
+  and `edges` tables: `valid_now`, `valid_at <ts>`, `valid_within <start> <end>`
+  (interval overlap), and `valid_between <start> <end>` (fully contained — the one
+  predicate that excludes open-bounded rows). Two new store primitives,
+  `invalidate_thought(id, valid_until)` and `invalidate_edge(id, valid_until)`,
+  retire a fact by closing its interval instead of deleting it — deterministic,
+  idempotent, non-cascading, and fully auditable (the row stays on file and a
+  point-in-time query before the cut-off still finds it). Reflections built by
+  dreaming inherit their members' valid-time extent (open-on-either-side is
+  contagious). A query that uses no temporal predicate behaves exactly as before.
+  See the [Bi-temporal Model](docs/bitemporal.md) guide.
+
+- **MCP server: connect any MCP client to an engrava store.** A new optional
+  `mcp` extra (`pip install "engrava[mcp]"`) ships a Model Context Protocol
+  server that exposes a store over stdio to Claude Desktop, Claude Code, Cursor,
+  Windsurf, VS Code, and other MCP clients. Two entry points, `engrava-mcp` and
+  `python -m engrava.mcp`, build the same server. It registers eleven tools (six
+  read, five write), two static `engrava://` resources plus an
+  `engrava://thought/{thought_id}` resource template, and three prompt templates,
+  resolving its store from `ENGRAVA_MCP_CONFIG` (an `engrava.yaml`) or
+  `ENGRAVA_DB_PATH` (a bare database file). A read-only mode
+  (`ENGRAVA_MCP_READ_ONLY`) drops the five write tools entirely, leaving a
+  retrieval-only surface. The server is a pure API consumer — plain
+  `pip install engrava` is unaffected and stays dependency-light. See the
+  [MCP server](docs/guides/mcp.md) guide.
+
+- **`execute_mindql` on the store.** `SqliteEngravaCore.execute_mindql(query, *,
+  extensions=None)` runs a parsed `MindQLQuery` directly against the store's own
+  connection, returning a `MindQLResult` — a convenience over constructing a
+  `MindQLExecutor` by hand. See the [API Reference](docs/api-reference.md#mindql).
+
 ### Performance
 
 - **Hot-path indexes and tuned SQLite PRAGMAs make the common reads faster.**
