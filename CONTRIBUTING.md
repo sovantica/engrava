@@ -97,13 +97,8 @@ Public Engrava artifacts must stay free of internal tier references.
 - Avoid internal branded example names in comments, docstrings, snippets, and tests.
 - Prefer neutral names like `ThirdPartyHooks`, `CustomPlugin`, or `ConsumerApp`.
 
-Run the purity check before opening a PR:
-
-```bash
-python scripts/assert_purity.py
-```
-
-CI also runs the same check and will fail if a forbidden reference leaks into the public tree.
+Before opening a PR, re-read your diff against the three rules above and remove any internal
+reference. Maintainers verify this invariant during review.
 
 ## Code Style
 
