@@ -3676,7 +3676,7 @@ class SqliteEngravaCore:
                 excluded from results.
             reflection_boost: Multiplier applied to REFLECTION thought
                 scores. ``None`` uses the value from ``SearchConfig``
-                (default ``1.2``).
+                (default ``1.0``).
 
         Returns:
             ``HybridSearchResult`` with ranked results and diagnostics.

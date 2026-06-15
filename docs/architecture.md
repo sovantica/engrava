@@ -130,7 +130,7 @@ reasoners) belongs in consumers, not in engrava core.
 - `ConsolidationResult.reflections_created` is a new field (default `0`).
 - New `DreamingGates` fields: `min_cluster_size`, `cluster_similarity_threshold`,
   `cluster_algorithm`, `enable_reflections` — all backward-compatible defaults.
-- New `SearchConfig.reflection_boost` field (default `1.2`).
+- New `SearchConfig.reflection_boost` field (default `1.0`).
 - New `search_hybrid()` params: `include_reflections` (default `True`),
   `reflection_boost` (default `None` → uses config).
 - New `search_reflections_only()` helper method.

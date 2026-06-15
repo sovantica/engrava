@@ -787,13 +787,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`search_hybrid()` — `include_reflections` + `reflection_boost`** — callers
   can now pass `include_reflections=False` to exclude REFLECTION thoughts from
   hybrid search results, or a custom `reflection_boost` multiplier to re-rank
-  them.  The default boost (`SearchConfig.reflection_boost = 1.2`) gives
-  REFLECTION thoughts a mild up-ranking.
+  them.  The default boost (`SearchConfig.reflection_boost = 1.0`) leaves
+  REFLECTION thoughts competing on equal footing until raised.
 - **`search_reflections_only()`** — convenience method on `SqliteEngravaCore`
   that returns only `ThoughtType.REFLECTION` thoughts ranked by hybrid score.
 - **`list_edges()`** — new `SqliteEngravaCore` method for querying edges by
   optional `edge_type` / `source` filters with configurable `limit`.
-- **`SearchConfig.reflection_boost`** — new field (default `1.2`) parsed from
+- **`SearchConfig.reflection_boost`** — new field (default `1.0`) parsed from
   YAML `search.reflection_boost`.
 
 - **Dream-created edges** — `run_consolidation()` now creates
