@@ -119,8 +119,8 @@ class ThoughtRecord(BaseModel):
     content: str = Field(min_length=1)
     priority: Priority
     lifecycle_status: LifecycleStatus
-    created_cycle: int = Field(ge=0)
-    updated_cycle: int = Field(ge=0)
+    created_cycle: int = Field(default=0, ge=0)
+    updated_cycle: int = Field(default=0, ge=0)
     source: str = Field(min_length=1)
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     embedding_ref: str | None = None

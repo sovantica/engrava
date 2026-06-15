@@ -15,6 +15,18 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 
 ### Added
 
+- **`remember` and `recall`: store and retrieve in one call.** Two ergonomic
+  convenience methods on the store let you persist a string and get relevant
+  strings back without hand-building a `ThoughtRecord` or wiring up
+  `search_hybrid`. `remember(text, *, metadata=None, deduplicate=False)` stores
+  a string as a thought (deriving the essence from its opening) and honours
+  opt-in content deduplication; `recall(query, *, top_k=10, current_cycle=None)`
+  returns the ranked matches. Passing `current_cycle` to `recall` blends in the
+  recency signal; on a large store recalled without it, a single DEBUG log line
+  points out that a cycle would let recent thoughts rank higher. `ThoughtRecord`
+  now defaults `created_cycle` and `updated_cycle` to `0`, so callers that do
+  not track cognitive cycles can omit them.
+
 - **Bi-temporal model: track when a fact is *true*, not just when you stored
   it.** `ThoughtRecord` and `EdgeRecord` gain two optional, nullable ISO-8601
   fields — `valid_from` and `valid_until` — describing the half-open real-world
