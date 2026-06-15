@@ -136,15 +136,17 @@ returns the stored `ThoughtRecord`. `recall()` runs the same hybrid search as
 
 > **A note on time.** `recall()` leaves *recency* ranking off until you pass a
 > `current_cycle`. A *cycle* is a logical clock **you** own (see
-> [Cycle](concepts.md#cycle-the-agent-clock)): increment it once per turn, pass
-> it to `remember(..., created_cycle=n)` on write and `recall(..., current_cycle=n)`
-> on read, and newer memories start ranking ahead of older ones. Until then,
-> search ranks on keyword + vector + priority only — nothing is faked.
+> [Cycle](concepts.md#cycle-the-agent-clock)): increment it once per turn and pass
+> it to `recall(..., current_cycle=n)` on read, and newer memories start ranking
+> ahead of older ones. `remember()` stamps both cycle fields at `0`; when you need
+> to set the cycle on a *write*, build a `ThoughtRecord` with `created_cycle=n` and
+> call `create_thought()` (shown below). Until you supply a cycle, search ranks on
+> keyword + vector + priority only — nothing is faked.
 
 The rest of this page shows the full-control path: building a `ThoughtRecord`
 yourself, linking thoughts with edges, and querying with MindQL. Reach for it
 when you need to set fields `remember()` defaults for you (priority, thought
-type, metadata, the cycle clock).
+type, metadata, and the cycle clock on writes).
 
 ## Add Thoughts
 
