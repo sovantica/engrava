@@ -415,6 +415,31 @@ for thought_id, score in result.results:
     ...
 ```
 
+## Metadata Helpers
+
+Three exported helpers build the structured `metadata` dict that pins a
+thought's origin (self vs external, source id, language). They are pure
+functions — same arguments always return an equal dict — and you are free to
+pass a literal dict instead; the helpers exist to remove typo-driven shape
+mismatches at the call site.
+
+| Helper | Signature | Use for |
+|--------|-----------|---------|
+| `percept` | `percept(*, is_self=False, source_id=None, label=None, confidence="high", lang="en")` | Input arriving from outside (user message, document) |
+| `utterance` | `utterance(*, lang="en")` | The agent's own output sent to the world |
+| `thought` | `thought(*, lang="en")` | The agent's internal cognition (reflection, plan) |
+
+```python
+from engrava import percept
+
+metadata = percept(source_id="user-1", label="user")
+# -> {'perspective': 'percept',
+#     'source': {'is_self': False, 'confidence': 'high', 'id': 'user-1', 'label': 'user'},
+#     'lang': 'en', 'content_type': 'natural_language'}
+```
+
+Pass the returned dict as `ThoughtRecord(..., metadata=...)`.
+
 ## Enums
 
 All enums are `StrEnum` — JSON-serializable and stored as strings.
