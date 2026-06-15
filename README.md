@@ -40,13 +40,15 @@ pip install engrava[embeddings-openai] # OpenAI-compatible embeddings
 
 ### Basic Usage
 
+Store a memory and search for it in two calls — no IDs to generate, no record
+to assemble:
+
 ```python
 import asyncio
-import uuid
 
 import aiosqlite
 
-from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+from engrava import SqliteEngravaCore
 
 
 async def main() -> None:
@@ -56,28 +58,24 @@ async def main() -> None:
         store = SqliteEngravaCore(conn)
         await store.ensure_schema()
 
-        # Build a ThoughtRecord and persist it with create_thought.
-        observation = ThoughtRecord(
-            thought_id=str(uuid.uuid4()),
-            thought_type=ThoughtType.OBSERVATION,
-            essence="Python is great for AI",
-            content="Python's async ecosystem makes it ideal for AI agents.",
-            priority=Priority.P2,
-            lifecycle_status=LifecycleStatus.ACTIVE,
-            created_cycle=0,
-            updated_cycle=0,
-            source="human",
-        )
-        await store.create_thought(observation)
+        await store.remember("Python is great for AI agents")
+        await store.remember("SQLite needs no server")
 
-        # Retrieve it
-        thought = await store.get_thought(observation.thought_id)
-        if thought is not None:
-            print(f"Stored: {thought.essence}")
+        result = await store.recall("what language is good for agents?")
+        for thought_id, score in result.results:
+            thought = await store.get_thought(thought_id)
+            if thought is not None:
+                print(f"{thought.essence}  (score: {score:.3f})")
 
 
 asyncio.run(main())
 ```
+
+`remember()` stores the text as a thought (generating its ID for you) and
+returns the stored `ThoughtRecord`; `recall()` runs the same hybrid search as
+`search_hybrid()` and returns the ranked results. For full control — setting
+priority, thought type, metadata, or the cognitive cycle on a write — build a
+`ThoughtRecord` yourself and call `create_thought()`.
 
 From here, link thoughts with [typed edges](#edge-based-knowledge-graph),
 query them with [MindQL](#mindql-query-language), or run the full
