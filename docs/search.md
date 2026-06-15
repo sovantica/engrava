@@ -168,11 +168,12 @@ result = await store.search_hybrid(
 )
 ```
 
-### `reflection_boost` (default `SearchConfig.reflection_boost = 1.2`)
+### `reflection_boost` (default `SearchConfig.reflection_boost = 1.0`)
 
 When REFLECTIONs are included, their final score is multiplied by this
-factor.  The default `1.2` gives a modest upranking so high-level
-abstractions surface for broad queries without dominating narrow ones.
+factor.  The default `1.0` leaves REFLECTIONs competing on equal footing;
+raise it above `1.0` for a modest upranking so high-level abstractions
+surface for broad queries without dominating narrow ones.
 
 ```python
 # Stronger boost — reflections rank near the top for broad queries
@@ -194,7 +195,7 @@ Configure the default in YAML:
 
 ```yaml
 search:
-  reflection_boost: 1.2   # applies when reflection_boost not overridden per-call
+  reflection_boost: 1.0   # applies when reflection_boost not overridden per-call
 ```
 
 ### `search_reflections_only()`
