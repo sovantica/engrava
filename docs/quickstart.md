@@ -114,6 +114,38 @@ asyncio.run(main())
 > use `await SqliteEngravaCore.from_config("engrava.yaml")` (it opens and owns
 > the connection for you).
 
+## Store and search a memory — the short way
+
+`remember()` and `recall()` are the two-call path for getting started: store a
+piece of text, then search for it. No IDs to generate, no record to assemble.
+
+```python
+await store.remember("User prefers concise answers")
+await store.remember("User works in Berlin")
+
+result = await store.recall("what does the user prefer?")
+for thought_id, score in result.results:
+    record = await store.get_thought(thought_id)
+    if record is not None:
+        print(f"{record.essence}  (score: {score:.3f})")
+```
+
+`remember()` stores the text as a thought (generating its ID for you) and
+returns the stored `ThoughtRecord`. `recall()` runs the same hybrid search as
+`search_hybrid()` and returns the ranked results.
+
+> **A note on time.** `recall()` leaves *recency* ranking off until you pass a
+> `current_cycle`. A *cycle* is a logical clock **you** own (see
+> [Cycle](concepts.md#cycle-the-agent-clock)): increment it once per turn, pass
+> it to `remember(..., created_cycle=n)` on write and `recall(..., current_cycle=n)`
+> on read, and newer memories start ranking ahead of older ones. Until then,
+> search ranks on keyword + vector + priority only — nothing is faked.
+
+The rest of this page shows the full-control path: building a `ThoughtRecord`
+yourself, linking thoughts with edges, and querying with MindQL. Reach for it
+when you need to set fields `remember()` defaults for you (priority, thought
+type, metadata, the cycle clock).
+
 ## Add Thoughts
 
 ```python
