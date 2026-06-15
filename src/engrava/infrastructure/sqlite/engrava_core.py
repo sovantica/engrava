@@ -109,6 +109,12 @@ _FTS_UNSAFE_CHAR_RE = re.compile(r"[^\w\-*]")
 #: Standalone uppercase boolean operators that switch a query into expert mode.
 #: Lowercase ``and``/``or``/``not`` are ordinary words, not operators.
 _FTS_BOOLEAN_OPERATORS = frozenset({"AND", "OR", "NOT"})
+#: Thought-count above which :meth:`SqliteEngravaCore.recall` emits a one-time
+#: DEBUG nudge when called without ``current_cycle`` (so the recency signal is
+#: silently inactive). Below this the omission is unremarkable; past it, a store
+#: large enough to benefit from recency that never receives a cycle is worth a
+#: single diagnostic breadcrumb (never a warning, never repeated).
+_RECENCY_NUDGE_THRESHOLD = 25
 _SUPPRESS_SEARCH_METRICS: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "engrava_suppress_search_metrics",
     default=False,
@@ -229,6 +235,8 @@ class SqliteEngravaCore:
         # row-level locking.  Acquired only on the dedup branch — the
         # legacy ``deduplicate=False`` path stays lock-free.
         self._dedup_lock: asyncio.Lock = asyncio.Lock()
+        # Fires the recency-off nudge in ``recall`` at most once per instance.
+        self._recency_nudge_emitted: bool = False
 
     @property
     def journal(self) -> JournalWriter | None:
@@ -1775,6 +1783,104 @@ class SqliteEngravaCore:
 
         await self._maybe_auto_cleanup(exclude_id=thought.thought_id)
         return await self._hooks.on_store(thought)
+
+    async def remember(
+        self,
+        text: str,
+        *,
+        metadata: dict[str, MetadataValue] | None = None,
+        deduplicate: bool = False,
+    ) -> ThoughtRecord:
+        """Store a string as a thought with one call.
+
+        Ergonomic shorthand over :meth:`create_thought` for the common case
+        of persisting a bare string. A :class:`ThoughtRecord` is built with a
+        fresh UUID, ``content=text`` and ``essence=text[:200]`` (the compact
+        canonical prefix used in prompts), then handed to ``create_thought``.
+
+        The thought is created at the store's default cognitive cycle
+        (``created_cycle == updated_cycle == 0``); callers that track cognitive
+        cycles should build a :class:`ThoughtRecord` explicitly and call
+        ``create_thought`` so the cycle is recorded.
+
+        Args:
+            text: The content to remember. Becomes the thought's ``content``;
+                its opening (capped at 200 characters) becomes the ``essence``.
+            metadata: Optional structured attributes (e.g. ``speaker``,
+                ``lang``, ``session_id``). Defaults to an empty mapping.
+            deduplicate: When ``True`` and a thought with byte-identical
+                ``content`` already exists, its ``confirmation_count`` is
+                incremented and the existing record is returned instead of
+                inserting a duplicate (forwarded to
+                ``create_thought(deduplicate=True)``). Default ``False``
+                inserts a new row on every call.
+
+        Returns:
+            The persisted thought record (or the existing record with a bumped
+            ``confirmation_count`` when deduplication hits).
+
+        """
+        thought = ThoughtRecord(
+            thought_id=str(_uuid.uuid4()),
+            thought_type=ThoughtType.NOTE,
+            essence=text[:200],
+            content=text,
+            priority=Priority.P3,
+            lifecycle_status=LifecycleStatus.ACTIVE,
+            source="remember",
+            metadata=metadata or {},
+        )
+        return await self.create_thought(thought, deduplicate=deduplicate)
+
+    async def recall(
+        self,
+        query: str,
+        *,
+        top_k: int = 10,
+        current_cycle: int | None = None,
+    ) -> HybridSearchResult:
+        """Retrieve thoughts relevant to a query with one call.
+
+        Ergonomic shorthand over :meth:`search_hybrid` for the common
+        retrieval case: the query text is passed straight through with the
+        given ``top_k`` and ``current_cycle``.
+
+        When ``current_cycle`` is ``None`` the recency signal is inactive
+        (see ``search_hybrid``). A store that holds more than
+        ``_RECENCY_NUDGE_THRESHOLD`` thoughts and recalls without a cycle emits
+        a single DEBUG-level breadcrumb on the module logger — once per store
+        instance — pointing out that passing ``current_cycle`` would let recent
+        thoughts rank higher. It is never a warning and never repeats.
+
+        Args:
+            query: Natural-language text to search for.
+            top_k: Maximum number of results to return.
+            current_cycle: Current cognitive cycle. When provided, the recency
+                signal is blended into ranking; when ``None``, recency is
+                skipped.
+
+        Returns:
+            A ``HybridSearchResult`` with the ranked matches and the set of
+            backends that contributed.
+
+        """
+        if current_cycle is None and not self._recency_nudge_emitted:
+            count_cursor = await self._db.execute("SELECT COUNT(*) FROM thought")
+            count_row = await count_cursor.fetchone()
+            total = int(count_row[0]) if count_row is not None else 0
+            if total > _RECENCY_NUDGE_THRESHOLD:
+                self._recency_nudge_emitted = True
+                logger.debug(
+                    "recall() called without current_cycle on a store of %d thoughts; "
+                    "passing current_cycle enables the recency signal so recent thoughts "
+                    "rank higher",
+                    total,
+                )
+        return await self.search_hybrid(
+            query_text=query,
+            top_k=top_k,
+            current_cycle=current_cycle,
+        )
 
     async def cleanup_expired(
         self,
