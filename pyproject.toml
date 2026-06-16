@@ -50,7 +50,6 @@ Changelog = "https://github.com/sovantica/engrava/blob/main/CHANGELOG.md"
 [project.optional-dependencies]
 vec = ["sqlite-vec>=0.1.0,<0.2.0"]
 mcp = ["mcp>=1.27.0"]
-dreaming = []
 embeddings-local = ["sentence-transformers>=3.0.0", "torch>=2.0.0"]
 embeddings-openai = ["httpx>=0.27.0"]
 embeddings-ollama = ["httpx>=0.27.0"]
