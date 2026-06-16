@@ -34,7 +34,8 @@ Both execution shapes are **allowlist-driven**: a page runs only when it has an
 explicit entry in ``EXECUTABLE_BLOCKS`` or ``CONCATENATED_PAGES`` below. The
 opt-in lives entirely in this test module — there is no special fence syntax or
 marker in the Markdown — so the public docs (and the engrava.ai mirror) need no
-magic annotations to be executed (cf. AGENT_PRINCIPLES Principle 1).
+magic annotations to be executed: published Markdown stays clean of any
+test-only markers.
 
 * To execute a **single** self-contained block, add a
   ``(markdown_path, anchor_substring)`` entry to ``EXECUTABLE_BLOCKS``. The
