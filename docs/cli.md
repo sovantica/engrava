@@ -85,7 +85,11 @@ or registered extension commands:
 engrava query "FIND thoughts WHERE lifecycle_status = 'ACTIVE'"
 engrava query "COUNT thoughts WHERE priority = 'P1'"
 engrava --format json query "SELECT thought_id, essence FROM thought LIMIT 5"
+engrava query "FIND thoughts WHERE valid_now"          # only currently-valid facts
 ```
+
+The bi-temporal `valid_now`, `valid_at`, `valid_within`, and `valid_between`
+predicates work here too — see [MindQL](mindql.md) for their full semantics.
 
 ### `snapshot`
 
@@ -119,8 +123,9 @@ engrava --db /data/engrava.db snapshot --service tenant_a   # -> /data/tenant_a.
 engrava --config engrava.yaml snapshot --service tenant_a   # data_dir from config
 ```
 
-> A snapshot exports `thought`, `edge`, `embedding`, and `action` records — but
-> **not** the audit journal (`journal_entry`). See
+> A snapshot exports every column of the `thought`, `edge`, `embedding`, and
+> `action` records — including the bi-temporal `valid_from` / `valid_until`
+> fields — but **not** the audit journal (`journal_entry`). See
 > [Backup & Recovery](backup-and-recovery.md) for what this means and when to use
 > a physical file backup instead.
 

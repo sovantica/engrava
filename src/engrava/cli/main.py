@@ -11,9 +11,6 @@ Usage::
     engrava gc
     engrava migrate
     engrava export -o thoughts.json
-
-Related:
-    - REQ-OPS-018 (CLI tooling for engrava)
 """
 
 from __future__ import annotations
@@ -950,7 +947,11 @@ async def _gc_archived(
 )
 @click.pass_context
 def gc(ctx: click.Context, *, dry_run: bool, expired: bool) -> None:
-    """Garbage-collect archived thoughts and their orphaned edges."""
+    """Garbage-collect archived thoughts and their orphaned edges.
+
+    With ``--expired``, also clean up expired TTL thoughts first (archived
+    or deleted per the configured ``ttl.strategy``).
+    """
     cfg: EngravaCLIConfig = ctx.obj["config"]
 
     async def _gc() -> None:

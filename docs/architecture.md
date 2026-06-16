@@ -10,7 +10,7 @@ Imports flow **downward only**:
 
 ```
 ┌──────────────────────────────────────────────────┐
-│  CLI / Consumer apps, scripts, benchmarks        │
+│  CLI / MCP server / Consumer apps, scripts, …    │
 ├──────────────────────────────────────────────────┤
 │  Extensions / Embeddings / MindQL                │
 │  (dreaming, hooks, providers, query language)    │
@@ -33,6 +33,11 @@ Imports flow **downward only**:
 - **Embeddings** (`src/engrava/embeddings/`) — pluggable embedding
   providers.
 - **CLI** (`src/engrava/cli/`) — Click-based command-line interface.
+- **MCP server** (`src/engrava/mcp/`) — an optional [Model Context
+  Protocol](https://modelcontextprotocol.io) server behind the `mcp` extra. Like
+  the CLI it is a **top-layer API *consumer***, not part of engrava core: it wraps
+  the public async API over stdio so MCP clients (Claude Desktop, Cursor, …) can
+  use a store. See [MCP server](../docs/guides/mcp.md).
 
 ## Core Components
 
@@ -45,6 +50,11 @@ The primary store implementation.  Provides:
 - Embedding storage and vector similarity search
 - Full-text search (FTS5)
 - Hybrid search (5-signal fusion — see below)
+- **Bi-temporal valid time** — optional `valid_from` / `valid_until` bounds on
+  thoughts *and* edges (a second time axis: *when a fact is true*, distinct from
+  when it was recorded), queried via the four valid-time MindQL predicates, with
+  `invalidate_thought` / `invalidate_edge` to close an interval without deleting.
+  See [The Bi-temporal Model](../docs/bitemporal.md).
 - Schema management and migrations
 
 ### Hybrid Search (5-Signal Fusion)
@@ -121,19 +131,35 @@ reasoners) belongs in consumers, not in engrava core.
 - New `DreamingConfig.edges` block defaults to `enabled=True`.
 - Existing databases receive dream-created edges on the next
   consolidation run; no retroactive edge creation for historical data.
+- **REFLECTION clustering** (the third dreaming phase) also shipped in 0.3.0:
+  `run_consolidation()` clusters semantically related thoughts and creates
+  `ThoughtType.REFLECTION` meta-thoughts. Opt-out via
+  `DreamingGates.enable_reflections = False`. New fields —
+  `ConsolidationResult.reflections_created` (default `0`); `DreamingGates`
+  `min_cluster_size` / `cluster_similarity_threshold` / `cluster_algorithm` /
+  `enable_reflections`; `SearchConfig.reflection_boost` (default `1.0`);
+  `search_hybrid()` `include_reflections` (default `True`) and `reflection_boost`
+  (default `None` → uses config); the `search_reflections_only()` and
+  `thought_exists_by_source()` helpers — all with backward-compatible defaults.
+  REFLECTIONs are created on the next consolidation run; no retroactive clustering.
 
 ## Upgrade Path (v0.3 → v0.4)
 
-- **Additive only** — no breaking changes.
-- `run_consolidation()` gains a third phase (clustering + REFLECTION
-  creation).  Opt-out via `DreamingGates.enable_reflections = False`.
-- `ConsolidationResult.reflections_created` is a new field (default `0`).
-- New `DreamingGates` fields: `min_cluster_size`, `cluster_similarity_threshold`,
-  `cluster_algorithm`, `enable_reflections` — all backward-compatible defaults.
-- New `SearchConfig.reflection_boost` field (default `1.0`).
-- New `search_hybrid()` params: `include_reflections` (default `True`),
-  `reflection_boost` (default `None` → uses config).
-- New `search_reflections_only()` helper method.
-- New `thought_exists_by_source()` utility method.
-- Existing databases: no migration needed.  REFLECTIONs are created on
-  the next consolidation run; no retroactive clustering.
+- **Additive only** — no breaking changes; existing code is unaffected and a query
+  that uses no temporal predicate behaves exactly as before.
+- **Bi-temporal model.** Thoughts and edges gain two optional, nullable ISO-8601
+  fields, `valid_from` and `valid_until` (an open bound = ±∞). Four opt-in MindQL
+  `WHERE` predicates query *valid time* — `valid_now`, `valid_at`, `valid_within`,
+  `valid_between` — and `invalidate_thought` / `invalidate_edge` close an interval
+  without deleting. REFLECTIONs inherit their members' valid-time extent. The schema
+  migration is **additive** (`user_version 12 → 14`, two steps), zero data loss; a
+  legacy row keeps open (`NULL`) bounds and still matches point-in-time queries.
+  See [The Bi-temporal Model](../docs/bitemporal.md).
+- **MCP server.** A new optional `mcp` extra (`pip install "engrava[mcp]"`) ships a
+  Model Context Protocol server over stdio (`engrava-mcp`). It is a pure API
+  *consumer* — plain `pip install engrava` is unaffected and stays dependency-light.
+  See [MCP server](../docs/guides/mcp.md).
+- **`execute_mindql`** — a store-level convenience that runs a parsed `MindQLQuery`
+  against the store's own connection.
+- Existing databases: the valid-time columns and indexes are added automatically on
+  first open; no manual migration step.
