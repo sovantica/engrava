@@ -33,10 +33,16 @@ pip install engrava
 Optional extras:
 
 ```bash
-pip install engrava[vec]               # sqlite-vec vector search backend
-pip install engrava[embeddings-local]  # sentence-transformers embeddings
-pip install engrava[embeddings-openai] # OpenAI-compatible embeddings
+pip install engrava[vec]                # sqlite-vec vector search backend
+pip install engrava[mcp]                # MCP server (engrava-mcp) for Claude Desktop/Code, Cursor, …
+pip install engrava[embeddings-local]   # sentence-transformers embeddings (local model)
+pip install engrava[embeddings-openai]  # OpenAI-compatible embeddings API
+pip install engrava[embeddings-ollama]  # Ollama local embeddings server
+pip install engrava[embeddings-hf]      # HuggingFace Inference API embeddings
 ```
+
+Dreaming/consolidation and the knowledge graph need **no extra** — they are part
+of the base install.
 
 ### Basic Usage
 
