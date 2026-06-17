@@ -86,7 +86,7 @@ issues. Performance depends on index coverage and query patterns.
 ## `HybridSearchResult.backends_used` Is an Open Set
 
 `backends_used` is a `frozenset[str]` that may grow as new scoring signals
-are added (e.g. `"priority"` was added in v0.2.1). Do **not** compare it
+are added (e.g. `"priority"` was added in v0.3.0). Do **not** compare it
 with exact equality (`== {"fts5", "vector"}`). Use subset checks instead:
 
 ```python

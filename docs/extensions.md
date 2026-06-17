@@ -322,10 +322,12 @@ For deeper customization, subclass `SqliteEngravaCore` and override
 the template methods:
 
 ```python
+import aiosqlite
+
 from engrava import SqliteEngravaCore, ThoughtRecord
 
 class ExtendedStore(SqliteEngravaCore):
-    def _row_to_thought(self, row: dict) -> ThoughtRecord:
+    def _row_to_thought(self, row: aiosqlite.Row) -> ThoughtRecord:
         """Override to produce a richer model type."""
         # Add custom field mapping here
         return super()._row_to_thought(row)

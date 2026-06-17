@@ -89,8 +89,9 @@ embedding provider (see the [Embeddings guide](guides/embeddings.md)). If
 
 ## Keyword search returns too many results (I wanted all words to match)
 
-**Symptom.** A multi-word `search_fts` / `search_keywords` query returns documents
-that contain only *some* of the words, not all of them.
+**Symptom.** A multi-word `search_fts` query (or the MCP `search_keywords` tool that
+wraps it — note `search_keywords` is an MCP tool name, not a `SqliteEngravaCore`
+method) returns documents that contain only *some* of the words, not all of them.
 
 **Cause.** A **bare** keyword query is matched with `OR`, by design — a document
 matches when it shares *any* word, and BM25 ranks the ones sharing the most

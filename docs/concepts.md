@@ -139,9 +139,10 @@ turn / interaction / scheduled pass.
 
 Three fields use it:
 
-- **`created_cycle`** / **`updated_cycle`** — required on every `ThoughtRecord`
-  (the model enforces `updated_cycle >= created_cycle`). They stamp *when, in
-  your agent's logical time*, a thought appeared and last changed.
+- **`created_cycle`** / **`updated_cycle`** — optional on `ThoughtRecord`, both
+  default to `0` (so callers that don't track cognitive cycles can omit them);
+  when set, the model enforces `updated_cycle >= created_cycle`. They stamp
+  *when, in your agent's logical time*, a thought appeared and last changed.
 - **`current_cycle`** — the value you pass into `search_hybrid(...)` and
   `run_consolidation(...)` to tell Engrava "it is now tick N."
 
