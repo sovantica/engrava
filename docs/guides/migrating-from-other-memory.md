@@ -10,7 +10,7 @@ It covers three things:
 2. [Porting your write/read calls](#porting-your-calls) with before/after snippets.
 3. [Bulk-importing](#bulk-import) an existing corpus efficiently.
 
-It ends with [filtering, scoping & multi-tenancy](#filtering-scoping-and-multi-tenancy)
+It ends with [filtering, scoping & multi-tenancy](#filtering-scoping--multi-tenancy)
 — the one area where Engrava's defaults differ most from a hosted service, and
 what to do about it.
 
@@ -28,7 +28,7 @@ common concepts onto Engrava:
 | "Memory" / "record" / "document" | **`ThoughtRecord`** | The unit you store. Has `essence` (short) + `content` (full). |
 | "Memory type" / "role" | **`thought_type`** (`OBSERVATION`, `BELIEF`, `TASK`, …) | A small fixed taxonomy; see [Core Concepts](../concepts.md). |
 | Free-form metadata / `metadata={...}` | **`ThoughtRecord.metadata`** | An arbitrary JSON dict, persisted and round-tripped. |
-| "User id" / "session id" / namespace | A key inside **`metadata`** (or `source`) | Engrava has no built-in tenant field — see [scoping](#filtering-scoping-and-multi-tenancy). |
+| "User id" / "session id" / namespace | A key inside **`metadata`** (or `source`) | Engrava has no built-in tenant field — see [scoping](#filtering-scoping--multi-tenancy). |
 | Relationship / link between memories | **`EdgeRecord`** (typed, weighted) | First-class graph; edges also feed ranking. |
 | Embedding / vector | Stored on write only with `embedding_provider=...` **and** `auto_embed=True`; otherwise call `store_embedding(thought_id, vector)` yourself | See the [Embeddings guide](embeddings.md). |
 | Vector / similarity search | **`search_similar(query_vector, …)`** | Needs a ready query vector. |
@@ -88,7 +88,7 @@ for thought_id, score in result.results:
         print(score, record.essence)
 ```
 
-See [filtering, scoping & multi-tenancy](#filtering-scoping-and-multi-tenancy)
+See [filtering, scoping & multi-tenancy](#filtering-scoping--multi-tenancy)
 for why the post-filter is there and how to do it better.
 
 ## Bulk import

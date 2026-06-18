@@ -39,11 +39,23 @@ that loop, share it freely. (See
 
 When a connection can't immediately get the lock it needs (another writer holds
 it), SQLite waits up to the **busy timeout** before giving up with
-`database is locked`. Engrava inherits Python's `sqlite3` default of **5000 ms
-(5 s)** — it does not override it.
+`database is locked`.
 
-For workloads with more write contention you can raise it on your own connection
-before handing it to the store, or after `from_config` via the store's
+How the timeout is set depends on how the store opened its connection:
+
+- **`from_config` and `EngravaManager`** (engrava owns the connection) open it
+  with `PRAGMA busy_timeout=5000` **explicitly** — a second connection waits up to
+  **5 s** for a lock instead of failing immediately. These paths also set
+  `PRAGMA synchronous=NORMAL`, the documented-safe companion to WAL (durable
+  across an application crash; only the most recent transactions are at risk on an
+  OS crash or power loss).
+- **The manual `SqliteEngravaCore(conn)` constructor** (you own the connection)
+  changes none of these pragmas. The connection keeps whatever it was opened with;
+  Python's `sqlite3`/`aiosqlite` default `busy_timeout` already happens to be
+  **5000 ms**, and the default `synchronous` is `FULL`.
+
+For workloads with more write contention you can raise the timeout on your own
+connection before handing it to the store, or after `from_config` via the store's
 connection:
 
 ```python

@@ -12,8 +12,8 @@ checks run on each block:
    *not* to exist in engrava (fabricated enum members, removed/renamed
    symbols, wrong attribute names) must never appear in a doc code block.
    This is the inverse of a secret-scanner: it enumerates only **public,
-   nonexistent** identifiers, so it is safe on the public surface and cannot
-   leak anything (cf. AGENT_PRINCIPLES Principle 1).
+   nonexistent** identifiers, so it is safe to ship and cannot leak any
+   internal term.
 
 These guards are what would have caught the 0.3.x documentation drift
 (``thought_type="INSIGHT"``, ``create_edge(..., "ASSOCIATION")``,

@@ -114,6 +114,40 @@ asyncio.run(main())
 > use `await SqliteEngravaCore.from_config("engrava.yaml")` (it opens and owns
 > the connection for you).
 
+## Store and search a memory — the short way
+
+`remember()` and `recall()` are the two-call path for getting started: store a
+piece of text, then search for it. No IDs to generate, no record to assemble.
+
+```python
+await store.remember("User prefers concise answers")
+await store.remember("User works in Berlin")
+
+result = await store.recall("what does the user prefer?")
+for thought_id, score in result.results:
+    record = await store.get_thought(thought_id)
+    if record is not None:
+        print(f"{record.essence}  (score: {score:.3f})")
+```
+
+`remember()` stores the text as a thought (generating its ID for you) and
+returns the stored `ThoughtRecord`. `recall()` runs the same hybrid search as
+`search_hybrid()` and returns the ranked results.
+
+> **A note on time.** `recall()` leaves *recency* ranking off until you pass a
+> `current_cycle`. A *cycle* is a logical clock **you** own (see
+> [Cycle](concepts.md#cycle-the-agent-clock)): increment it once per turn and pass
+> it to `recall(..., current_cycle=n)` on read, and newer memories start ranking
+> ahead of older ones. `remember()` stamps both cycle fields at `0`; when you need
+> to set the cycle on a *write*, build a `ThoughtRecord` with `created_cycle=n` and
+> call `create_thought()` (shown below). Until you supply a cycle, search ranks on
+> keyword + vector + priority only — nothing is faked.
+
+The rest of this page shows the full-control path: building a `ThoughtRecord`
+yourself, linking thoughts with edges, and querying with MindQL. Reach for it
+when you need to set fields `remember()` defaults for you (priority, thought
+type, metadata, and the cycle clock on writes).
+
 ## Add Thoughts
 
 ```python
@@ -262,5 +296,6 @@ Build something next, then reach for the references:
 - [Configuration](configuration.md) — YAML-based setup for production use
 - [API Reference](api-reference.md) — full class and method reference
 - [MindQL](mindql.md) — complete query language reference
+- [MCP server](guides/mcp.md) — connect an MCP client (Claude Desktop, Cursor, …) to a store
 - [Troubleshooting](troubleshooting.md) — when something doesn't work as expected
 - [FAQ](faq.md) — quick answers to common questions

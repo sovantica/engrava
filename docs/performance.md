@@ -102,6 +102,37 @@ because the vectors are reused from the existing `embedding` table.
   equal your embedding model's output. Mixing dimensions corrupts results (see
   [Embedding Dimension Consistency](known-limitations.md#embedding-dimension-consistency)).
 
+## SQLite tuning & hot-path indexes
+
+Stores opened via `from_config` (and `EngravaManager`) come **pre-tuned** — you do
+not configure any of this:
+
+- **`synchronous=NORMAL`** — the documented-safe companion to WAL. It cuts an
+  `fsync` from every commit (lower write latency) while staying durable across an
+  application crash; only the most recent transactions are at risk on an OS crash
+  or power loss. (See [Concurrency](concurrency.md#busy-timeout).)
+- **`busy_timeout=5000`** — a second connection waits up to 5 s for a lock instead
+  of failing immediately with `database is locked`.
+- **Four hot-path indexes** back the equality filters and sort column that the
+  common reads hit, turning what were full-table scans into index lookups:
+
+  | Index | Column | Speeds up |
+  |---|---|---|
+  | `idx_edge_to_thought` | `edge(to_thought_id)` | `get_edges` (IN / BOTH) and the reflection-consolidation scan |
+  | `idx_embedding_owner` | `embedding(owner_id)` | `get_embedding` lookups by thought |
+  | `idx_thought_updated_cycle` | `thought(updated_cycle)` | `list_thoughts` recency ordering |
+  | `idx_thought_type` | `thought(thought_type)` | `thought_type` equality filters |
+
+The `0.4` schema also adds **valid-time indexes** so the
+[bi-temporal](bitemporal.md) predicates are index-backed: `valid_from`, a
+**partial** `valid_until` index (only non-`NULL` upper bounds are indexed — an open
+upper bound is the common case and stays overhead-free), and a composite
+`(valid_from, valid_until)` range index, on both the `thought` and `edge` tables.
+
+The indexes are created idempotently (`CREATE INDEX IF NOT EXISTS`) and an existing
+database gains them automatically through the additive `0.3 → 0.4` schema migration
+— zero data loss, no manual step. See the [Upgrade Guide](upgrade.md#03---04).
+
 ## Write throughput and bulk ingest
 
 By default each mutating call commits its own transaction. For a bulk load that

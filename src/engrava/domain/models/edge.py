@@ -8,6 +8,7 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from engrava.domain.enums import EdgeType, KnowledgeSource
+from engrava.domain.models._temporal import validate_iso8601_nullable
 
 
 class EdgeRecord(BaseModel):
@@ -22,6 +23,14 @@ class EdgeRecord(BaseModel):
         created_cycle: Cycle when this edge was created.
         source: Provenance of the edge (EXPERIENCE, SEEDED_LLM, DISTILLED_LLM).
         decay_multiplier: Multiplier for accelerated decay (1.0 normal).
+        valid_from: ISO-8601 datetime marking the start of the interval
+            during which the relation is true in the world (valid time).
+            ``None`` means an open lower bound — the relation is treated
+            as valid from the beginning of time.
+        valid_until: ISO-8601 datetime marking the end of the interval
+            during which the relation is true in the world (valid time).
+            ``None`` means an open upper bound — the relation has no
+            known end and is treated as currently valid.
 
     Examples:
         >>> edge = EdgeRecord(
@@ -45,6 +54,8 @@ class EdgeRecord(BaseModel):
     created_cycle: int = Field(ge=0)
     source: KnowledgeSource = KnowledgeSource.EXPERIENCE
     decay_multiplier: float = Field(default=1.0, ge=0.0)
+    valid_from: str | None = None
+    valid_until: str | None = None
 
     @field_validator("edge_id", "from_thought_id", "to_thought_id")
     @classmethod
@@ -54,3 +65,24 @@ class EdgeRecord(BaseModel):
             msg = "ID field must not be empty or whitespace"
             raise ValueError(msg)
         return v
+
+    @field_validator("valid_from", "valid_until")
+    @classmethod
+    def _validate_iso8601_nullable(cls, v: str | None) -> str | None:
+        """Validate ISO-8601 format and normalize to UTC when not None.
+
+        Uses the shared timestamp validator so edge valid-time fields
+        normalise timezone-aware values to UTC exactly like the thought
+        record's timestamp columns, keeping SQLite TEXT ordering correct.
+
+        Args:
+            v: Timestamp string or None.
+
+        Returns:
+            The validated (and UTC-normalized) string, or None.
+
+        Raises:
+            ValueError: If string is not valid ISO-8601.
+
+        """
+        return validate_iso8601_nullable(v)

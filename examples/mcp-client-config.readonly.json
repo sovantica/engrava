@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "engrava": {
+      "command": "engrava-mcp",
+      "env": {
+        "ENGRAVA_MCP_CONFIG": "/absolute/path/to/engrava.yaml",
+        "ENGRAVA_MCP_READ_ONLY": "true"
+      }
+    }
+  }
+}

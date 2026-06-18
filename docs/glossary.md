@@ -76,6 +76,25 @@ and dreaming's age gates. Leaving it at `None` makes recency inactive; freezing 
 at a constant makes recency useless and stalls dreaming. See
 [Core Concepts → Cycle](concepts.md#cycle-the-agent-clock).
 
+### Valid time
+
+The second of Engrava's two time axes: **when a fact is true in the world**, as
+opposed to **transaction time** (when Engrava recorded it — `created_at` /
+`updated_at`). Valid time is carried by two optional, nullable ISO-8601 fields,
+`valid_from` and `valid_until`, on both `ThoughtRecord` and `EdgeRecord`. They
+describe a half-open interval (`valid_until` is exclusive); a `None` bound means
+*open* (±∞), so an un-annotated record is "valid for all time". Queried through
+the `valid_now` / `valid_at` / `valid_within` / `valid_between` MindQL predicates.
+See [The Bi-temporal Model](bitemporal.md).
+
+### Transaction time
+
+When Engrava *recorded or last changed* a fact — the `created_at` / `updated_at`
+bookkeeping timestamps it sets automatically. It never moves backwards and you do
+not manage it; contrast with [valid time](#valid-time) (the real-world axis you
+set) and the [cycle](#cycle) (the logical agent clock). See
+[The Bi-temporal Model](bitemporal.md).
+
 ### Signal
 
 One scoring component that [hybrid search](#hybrid-search) computes for a

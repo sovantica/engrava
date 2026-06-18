@@ -148,11 +148,11 @@ class TestForeignKeysActuallyEnforced:
         assert rows[0]["from"] == "source_thought_id"
         assert rows[0]["on_delete"] == "CASCADE"
 
-    async def test_user_version_is_twelve(self, store: SqliteEngravaCore) -> None:
+    async def test_user_version_is_head(self, store: SqliteEngravaCore) -> None:
         cursor = await store._db.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 12
+        assert row[0] == 14
 
 
 class TestCreateEdgeRejectsOrphans:
@@ -429,7 +429,7 @@ class TestMigrationV11ToV12:
             await core.ensure_schema()
             version_row = await (await db.execute("PRAGMA user_version")).fetchone()
             assert version_row is not None
-            assert version_row[0] == 12
+            assert version_row[0] == 14
             for table, expected in (("edge", 1), ("embedding", 1), ("action", 1), ("thought", 2)):
                 row = await (
                     await db.execute(f"SELECT COUNT(*) FROM {table}")  # noqa: S608
@@ -508,7 +508,7 @@ class TestMigrationV11ToV12:
             await core.ensure_schema()  # second pass — must converge without error
             version_row = await (await db.execute("PRAGMA user_version")).fetchone()
             assert version_row is not None
-            assert version_row[0] == 12
+            assert version_row[0] == 14
             # FK declarations must still be exactly 2 on edge, not duplicated.
             rows = list(await (await db.execute("PRAGMA foreign_key_list(edge)")).fetchall())
             assert len(rows) == 2
@@ -662,7 +662,7 @@ class TestMigrationV11ToV12:
             await core.ensure_schema()
             version_row = await (await db.execute("PRAGMA user_version")).fetchone()
             assert version_row is not None
-            assert version_row[0] == 12
+            assert version_row[0] == 14
             for table, expected in (("edge", 1), ("embedding", 1), ("action", 1), ("thought", 2)):
                 row = await (
                     await db.execute(f"SELECT COUNT(*) FROM {table}")  # noqa: S608

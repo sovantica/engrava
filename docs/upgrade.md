@@ -128,6 +128,7 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 | 0.2.0 | 0.2.2 | Yes | Patch-level upgrade, no dedicated new extension migration layer |
 | 0.2.2 | 0.3.0 | Yes | Minor upgrade with extension migration tracking and upgrade CI coverage |
 | 0.3.0 | 0.3.1 | Yes | Patch-level upgrade; no schema change (`user_version` unchanged) — safe to roll across workers |
+| 0.3.x | 0.4.0 | Yes | **Schema-changing** minor upgrade — adds the valid-time columns (additive, zero data loss). Back up first and follow the [rolling-upgrades](#rolling-upgrades-multiple-workers) note |
 
 For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 `0.x.*` line do not change the schema and are low-risk; **minor** upgrades
@@ -135,6 +136,89 @@ For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 [rolling-upgrades](#rolling-upgrades-multiple-workers) note below.
 
 ## Version Notes
+
+### 0.3 -> 0.4
+
+Version 0.4 introduces a second time axis — **valid time** (`valid_from` /
+`valid_until`), the period during which a fact is true in the world — alongside
+the existing transaction time (`created_at`). See
+[The Bi-temporal Model](bitemporal.md) for the full feature, the four query
+predicates, and `invalidate`. From an upgrade standpoint, the change is
+**additive and automatic**:
+
+**The migration runs on first open, with zero data loss.** The first time a
+0.4 process calls `ensure_schema()` (most apps already do this at startup), the
+core schema steps forward from `user_version = 12` (the 0.3 schema) to
+`user_version = 14` in **two additive steps** (12 → 13 adds the valid-time
+columns and their indexes; 13 → 14 adds the hot-path indexes), each inside a
+transaction. `pip install --upgrade engrava` plus your normal startup is all that
+is required:
+
+```bash
+pip install --upgrade engrava
+# your app's existing ensure_schema() call performs the migration on first open
+```
+
+What the migration does:
+
+- **Adds two nullable columns** — `valid_from` and `valid_until` — to both the
+  `thought` and `edge` tables, plus supporting indexes. Nothing is dropped or
+  rewritten beyond adding columns; **no row is lost or modified in content**,
+  and the row counts are unchanged.
+- **Backfills existing thoughts conservatively.** A thought that has a recorded
+  `created_at` gets `valid_from` backfilled from it (its valid-time lower bound
+  starts where its transaction time started). `valid_until` is always left open
+  (`NULL`).
+- **Leaves legacy rows and all edges open-from.** A thought with no `created_at`
+  (a legacy row) keeps `valid_from = NULL`. **Every existing edge** keeps both
+  bounds `NULL` — the edge table has no calendar timestamp to source a date
+  from, so the migration honestly leaves them open rather than fabricating one.
+- **Adds four hot-path indexes.** A second additive step creates indexes that
+  back the equality filters and the sort column hit on every common read
+  (edges by their target thought, a thought's embedding by owner, listing
+  thoughts in recency order, and filtering thoughts by type). This is a
+  pure index addition — **no row is read, modified, or removed**, and the row
+  counts are unchanged. The connection is also opened with `synchronous=NORMAL`
+  and `busy_timeout=5000` (a PRAGMA-only change with no on-disk effect). Like
+  the valid-time step, it runs automatically on first open with zero data loss.
+
+**Structured (MindQL) queries are unchanged.** A query that uses no temporal
+predicate behaves exactly as it did on 0.3. And because a `NULL` bound is treated
+as an **open interval end** (−∞ / +∞), the open-from rows above still match
+`valid_now` and `valid_at` queries — an un-dated fact is treated as "valid since
+the beginning of time", not as "excluded". So adopting valid time is incremental:
+you can start annotating new facts whenever you like, and the old ones keep
+surfacing in temporal queries until you choose to bound them.
+
+**Search behavior changes (no migration, but worth knowing).** Two 0.4 fixes to
+keyword/full-text search are not schema changes but do change results:
+
+- **Bare full-text queries now `OR`-match** instead of `AND`-matching, so a
+  natural-language query that returned *nothing* on 0.3 (because no document
+  contained *every* word) may now return results. This is the intended fix; if you
+  relied on strict all-words matching, use uppercase `AND` or a quoted phrase
+  explicitly. See [Keyword query syntax](search.md#keyword-query-syntax-fts).
+- Stored embeddings are **not** re-computed by the upgrade — the full-content
+  embedding fix and the `max_seq_length` fix take effect only when a thought is
+  re-written (re-created, or its `essence`/`content` updated), at which point it is
+  re-embedded with the corrected input. Existing vectors are untouched until then.
+
+> **Honest note about edges.** Because the upgrade cannot invent a `valid_from`
+> for an edge that never had a date, every edge migrated from 0.3 carries
+> `valid_from = NULL`. That is the correct "open lower bound", so those edges
+> still match `valid_now` / `valid_at`. They will **not** match `valid_between`
+> (which requires real bounds on both ends) until you set their bounds
+> explicitly. This is expected, not a defect.
+
+**New optional MCP server.** 0.4 also ships an optional Model Context Protocol
+server behind a new `mcp` extra — `pip install "engrava[mcp]"`. It is purely
+additive: plain `pip install engrava` is unaffected and existing code needs no
+change. See the [MCP server guide](guides/mcp.md).
+
+This is a schema-changing minor upgrade, so follow the
+[rolling-upgrades](#rolling-upgrades-multiple-workers) procedure (back up,
+quiesce writers, migrate once, start new workers) if you run multiple processes
+against one database file.
 
 ### 0.3.0 -> 0.3.1
 

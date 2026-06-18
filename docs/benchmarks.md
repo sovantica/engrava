@@ -24,12 +24,12 @@ into REFLECTIONs. This benchmark measures three properties:
 2. **Direct retrieval neutrality (AC-9b, <= 0.05 in v0.3.0):** does
    dreaming preserve FTS/vector retrieval performance on questions with
    direct lexical answers? *Measures dreaming does NOT degrade baseline
-   competence.* (v0.4.0 tightens the ceiling.)
+   competence.* (A future release aims to tighten the ceiling.)
 
 3. **Sanity tolerance (AC-8, <= 0.05 in v0.3.0):** how much does dreaming
    influence retrieval on scenarios where consolidation is irrelevant?
-   *Measures absence of pathological behavior.* (v0.4.0 tightens the
-   ceiling.)
+   *Measures absence of pathological behavior.* (A future release aims to
+   tighten the ceiling.)
 
 ## Default invocation — Binding acceptance measurements
 
@@ -98,7 +98,7 @@ scenarios show ~10pp regression in the dreaming-ON arm:
 This is **expected v0.3.0 behavior**. REFLECTIONs participate in retrieval
 at parity (`reflection_boost=1.0`) and occasionally displace correct
 OBSERVATIONs from top-5 results for these specific scenario types.
-Ranking refinement landing in v0.4.0 will tighten this behavior — see the
+A planned ranking refinement will tighten this behavior — see the
 "Roadmap" section below.
 
 `abstract_theme_recall` showing 0.000 OFF and 0.000 ON is also expected:
@@ -116,7 +116,7 @@ mechanism and is verified at the data layer.
 
 ## Roadmap
 
-v0.4.0 will land a REFLECTION retrieval refinement that:
+A future release will land a REFLECTION retrieval refinement that:
 
 - Tightens **AC-9b direct neutrality** back to <= 0.02
 - Tightens **AC-8 sanity tolerance** back to <= 0.02

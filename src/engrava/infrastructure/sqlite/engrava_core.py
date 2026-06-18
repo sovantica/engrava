@@ -45,6 +45,7 @@ from engrava.domain.exceptions import (
     StaleDataError,
     ThoughtNotFoundError,
 )
+from engrava.domain.models._temporal import validate_iso8601_nullable
 from engrava.domain.models.action import ActionRecord
 from engrava.domain.models.edge import EdgeRecord
 from engrava.domain.models.embedding import EmbeddingRecord
@@ -62,12 +63,58 @@ if TYPE_CHECKING:
     from engrava.domain.models.metrics import EngravaMetrics, LatencyHistogram
     from engrava.domain.models.search import HybridSearchResult
     from engrava.domain.protocols.embedding_provider import EmbeddingProviderProtocol
+    from engrava.domain.protocols.hooks import MindQLExtension
     from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
+    from engrava.mindql.executor import MindQLResult
+    from engrava.mindql.parser import MindQLQuery
 
 logger = logging.getLogger(__name__)
 
-_FTS_FIELD_FILTER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*:.+")
+
+def _build_embed_input(essence: str, content: str) -> str:
+    r"""Build the text payload to embed for a thought, avoiding duplication.
+
+    A common client (and benchmark) convention is to derive ``essence`` from
+    the opening of ``content`` (e.g. ``essence = content[:200]``). Naively
+    embedding ``f"{essence}\\n{content}"`` then encodes the turn's opening
+    twice, letting it dominate the vector and dilute the discriminative tail.
+
+    The rule is deliberately conservative: when the stripped ``essence`` is a
+    leading *prefix* of the stripped ``content`` it carries no new information,
+    so ``content`` is embedded alone. In every other case — including partial
+    overlaps that are not a clean prefix — the joined ``essence`` + ``content``
+    form is preserved, because a distinct essence is signal worth encoding.
+
+    Args:
+        essence: The thought's short summary / essence field.
+        content: The thought's full body text.
+
+    Returns:
+        ``content`` alone when ``essence`` is a prefix of it; otherwise the
+        newline-joined ``f"{essence}\\n{content}"`` payload.
+
+    """
+    if content.strip().startswith(essence.strip()):
+        return content
+    return f"{essence}\n{content}"
+
+
+#: A token is treated as an FTS5 column filter only when it targets a real
+#: indexed column. ``thought_fts`` indexes exactly ``essence`` and ``content``
+#: (see :meth:`SqliteEngravaCore.ensure_schema`); any other ``word:rest`` token
+#: (URLs like ``http://...``, timestamps like ``12:30``) would make FTS5 read a
+#: non-existent column and raise, so it is sanitized as a bare token instead.
+_FTS_FIELD_FILTER_RE = re.compile(r"^(?:essence|content):.+", re.IGNORECASE)
 _FTS_UNSAFE_CHAR_RE = re.compile(r"[^\w\-*]")
+#: Standalone uppercase boolean operators that switch a query into expert mode.
+#: Lowercase ``and``/``or``/``not`` are ordinary words, not operators.
+_FTS_BOOLEAN_OPERATORS = frozenset({"AND", "OR", "NOT"})
+#: Thought-count above which :meth:`SqliteEngravaCore.recall` emits a one-time
+#: DEBUG nudge when called without ``current_cycle`` (so the recency signal is
+#: silently inactive). Below this the omission is unremarkable; past it, a store
+#: large enough to benefit from recency that never receives a cycle is worth a
+#: single diagnostic breadcrumb (never a warning, never repeated).
+_RECENCY_NUDGE_THRESHOLD = 25
 _SUPPRESS_SEARCH_METRICS: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "engrava_suppress_search_metrics",
     default=False,
@@ -188,6 +235,8 @@ class SqliteEngravaCore:
         # row-level locking.  Acquired only on the dedup branch — the
         # legacy ``deduplicate=False`` path stays lock-free.
         self._dedup_lock: asyncio.Lock = asyncio.Lock()
+        # Fires the recency-off nudge in ``recall`` at most once per instance.
+        self._recency_nudge_emitted: bool = False
 
     @property
     def journal(self) -> JournalWriter | None:
@@ -325,6 +374,14 @@ class SqliteEngravaCore:
             if config.wal_mode:
                 await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("PRAGMA foreign_keys=ON")
+            # synchronous=NORMAL is the documented-safe companion to WAL: the
+            # database stays durable across an application crash and is only at
+            # risk of losing the most recent transactions on an OS crash or
+            # power loss, which is the standard recommendation for WAL.
+            await db.execute("PRAGMA synchronous=NORMAL")
+            # busy_timeout makes a second connection wait (up to 5s) for a lock
+            # instead of failing immediately with SQLITE_BUSY.
+            await db.execute("PRAGMA busy_timeout=5000")
             db.row_factory = aiosqlite.Row
 
             hooks = resolve_hooks(config.hooks_class)
@@ -460,7 +517,7 @@ class SqliteEngravaCore:
         Applies the full ``schema_core.sql`` (including FTS5 virtual
         table and sync triggers) only when the database has not already
         been bootstrapped to schema version 3+.  Databases at older
-        versions are upgraded incrementally up to the current version (11).
+        versions are upgraded incrementally up to the current version (14).
 
         After core schema creation or upgrade, probes for the ``thought_fts``
         table and then runs any pending extension schema migrations for each
@@ -488,7 +545,9 @@ class SqliteEngravaCore:
             await self._migrate_core_v9_to_v10()
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
-            await self._db.execute("PRAGMA user_version = 12")
+            await self._migrate_core_v12_to_v13()
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
             await self._db.commit()
         elif current_version < 4:  # noqa: PLR2004
             await self._migrate_core_v3_to_v4()
@@ -500,7 +559,9 @@ class SqliteEngravaCore:
             await self._migrate_core_v9_to_v10()
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
-            await self._db.execute("PRAGMA user_version = 12")
+            await self._migrate_core_v12_to_v13()
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
             await self._db.commit()
         elif current_version < 5:  # noqa: PLR2004
             await self._migrate_core_v4_to_v5()
@@ -511,7 +572,9 @@ class SqliteEngravaCore:
             await self._migrate_core_v9_to_v10()
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
-            await self._db.execute("PRAGMA user_version = 12")
+            await self._migrate_core_v12_to_v13()
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
             await self._db.commit()
         elif current_version < 6:  # noqa: PLR2004
             await self._migrate_core_v5_to_v6()
@@ -521,7 +584,9 @@ class SqliteEngravaCore:
             await self._migrate_core_v9_to_v10()
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
-            await self._db.execute("PRAGMA user_version = 12")
+            await self._migrate_core_v12_to_v13()
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
             await self._db.commit()
         elif current_version < 7:  # noqa: PLR2004
             await self._migrate_core_v6_to_v7()
@@ -530,7 +595,9 @@ class SqliteEngravaCore:
             await self._migrate_core_v9_to_v10()
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
-            await self._db.execute("PRAGMA user_version = 12")
+            await self._migrate_core_v12_to_v13()
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
             await self._db.commit()
         elif current_version < 8:  # noqa: PLR2004
             await self._migrate_core_v7_to_v8()
@@ -538,29 +605,48 @@ class SqliteEngravaCore:
             await self._migrate_core_v9_to_v10()
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
-            await self._db.execute("PRAGMA user_version = 12")
+            await self._migrate_core_v12_to_v13()
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
             await self._db.commit()
         elif current_version < 9:  # noqa: PLR2004
             await self._migrate_core_v8_to_v9()
             await self._migrate_core_v9_to_v10()
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
-            await self._db.execute("PRAGMA user_version = 12")
+            await self._migrate_core_v12_to_v13()
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
             await self._db.commit()
         elif current_version < 10:  # noqa: PLR2004
             await self._migrate_core_v9_to_v10()
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
-            await self._db.execute("PRAGMA user_version = 12")
+            await self._migrate_core_v12_to_v13()
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
             await self._db.commit()
         elif current_version < 11:  # noqa: PLR2004
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
-            await self._db.execute("PRAGMA user_version = 12")
+            await self._migrate_core_v12_to_v13()
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
             await self._db.commit()
         elif current_version < 12:  # noqa: PLR2004
             await self._migrate_core_v11_to_v12()
-            await self._db.execute("PRAGMA user_version = 12")
+            await self._migrate_core_v12_to_v13()
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
+            await self._db.commit()
+        elif current_version < 13:  # noqa: PLR2004
+            await self._migrate_core_v12_to_v13()
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
+            await self._db.commit()
+        elif current_version < 14:  # noqa: PLR2004
+            await self._migrate_core_v13_to_v14()
+            await self._db.execute("PRAGMA user_version = 14")
             await self._db.commit()
 
         # Ensure referential integrity is enforced for the lifetime of this
@@ -891,6 +977,127 @@ class SqliteEngravaCore:
         finally:
             await self._db.execute("PRAGMA foreign_keys=ON")
 
+    async def _migrate_core_v12_to_v13(self) -> None:
+        """Add nullable valid-time columns + indexes to thought and edge (core-13).
+
+        Introduces a second time axis ("valid time") alongside the
+        existing transaction time. ``created_at`` records *when a fact was
+        stored*; ``valid_from`` / ``valid_until`` record *when a fact is
+        true in the world*. Both new columns are nullable ISO-8601 TEXT.
+
+        Backfill is intentionally asymmetric:
+
+        * ``thought.valid_from`` is seeded from ``created_at`` for rows
+          that have a transaction timestamp, giving existing thoughts a
+          sensible default lower bound. ``valid_until`` is left ``NULL``
+          (open upper bound). Rows whose ``created_at`` is ``NULL``
+          (pre-timestamp legacy rows) keep ``valid_from = NULL`` — no
+          date is fabricated.
+        * ``edge`` rows are **not** backfilled. The edge table has no
+          ``created_at`` column; its only temporal field is
+          ``created_cycle``, which is an internal cognitive-cycle counter,
+          not a calendar timestamp. Synthesising a valid-time date from a
+          cycle number would invent information, so edges keep both
+          valid-time fields ``NULL`` (an open lower bound).
+
+        Idempotent: each ``ALTER TABLE ... ADD COLUMN`` is wrapped in
+        ``contextlib.suppress(Exception)`` so a re-run after the column
+        already exists is a no-op, and every index uses
+        ``CREATE INDEX IF NOT EXISTS``. Re-running the migration leaves
+        the schema unchanged.
+        """
+        # Only touch tables that exist. A partial bootstrap may carry just
+        # ``thought`` (the ``edge`` table is created lazily); operating on an
+        # absent ``edge`` would raise ``no such table``. ``thought`` is always
+        # present at this point. This mirrors the table-existence guards used
+        # by the earlier edge-touching migrations and ``_purge_orphan_children``.
+        tables = ["thought"]
+        if await self._table_exists("edge"):
+            tables.append("edge")
+
+        for table in tables:
+            for column in ("valid_from", "valid_until"):
+                with contextlib.suppress(Exception):  # Column may already exist.
+                    await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+
+        # Asymmetric backfill — thought only, sourced from transaction time.
+        # Rows with NULL created_at (legacy, pre-timestamp) keep NULL
+        # valid_from; no calendar date is fabricated for them.
+        await self._db.execute(
+            "UPDATE thought SET valid_from = created_at "
+            "WHERE created_at IS NOT NULL AND valid_from IS NULL"
+        )
+        # Edge has no created_at; created_cycle is internal cognitive time,
+        # not calendar time, so edges are deliberately left with NULL
+        # valid_from / valid_until (an open lower bound).
+
+        for table in tables:
+            await self._db.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{table}_valid_from ON {table}(valid_from)"
+            )
+            await self._db.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{table}_valid_until "
+                f"ON {table}(valid_until) WHERE valid_until IS NOT NULL"
+            )
+            await self._db.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{table}_valid_range "
+                f"ON {table}(valid_from, valid_until)"
+            )
+
+    async def _migrate_core_v13_to_v14(self) -> None:
+        """Add hot-path indexes for the core read queries (core-14).
+
+        Purely additive: creates four indexes that back the equality
+        filters and the sort column hit on every common read, without
+        touching any row or column. The targets were chosen from the
+        actual ``WHERE`` / ``ORDER BY`` clauses in this module:
+
+        * ``idx_edge_to_thought`` on ``edge(to_thought_id)`` — ``get_edges``
+          (the inbound and both-direction modes) and the
+          reflection-consolidation scan filter the edge table on
+          ``to_thought_id``.
+        * ``idx_embedding_owner`` on ``embedding(owner_id)`` —
+          ``get_embedding`` looks an embedding up by its owner thought;
+          without this index the lookup is a full table scan, and it runs
+          inside three dreaming loops.
+        * ``idx_thought_updated_cycle`` on ``thought(updated_cycle)`` —
+          ``list_thoughts`` orders by ``updated_cycle`` on every call.
+        * ``idx_thought_type`` on ``thought(thought_type)`` —
+          ``thought_type`` equality is used by the reflection-id scan on
+          every search and by ``list_thoughts`` filtering.
+
+        Idempotent: every statement uses ``CREATE INDEX IF NOT EXISTS``, so
+        re-running the migration leaves the schema unchanged. The ``edge``
+        and ``embedding`` tables may be absent in a partial bootstrap (they
+        are created lazily), so each is guarded by ``_table_exists`` exactly
+        as ``_migrate_core_v12_to_v13`` guards ``edge``. The ``thought``
+        table is always present, but each indexed column is additionally
+        guarded by ``_column_exists`` so a minimal or hand-rolled legacy
+        schema that has not yet grown a column (for example a very old
+        database whose ``thought`` table predates ``updated_cycle``) skips
+        that single index instead of raising ``no such column``.
+        """
+        # ``thought`` is always present, but a minimal legacy schema may lack
+        # an indexed column; index only the columns that exist.
+        if await self._column_exists("thought", "updated_cycle"):
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_thought_updated_cycle ON thought(updated_cycle)"
+            )
+        if await self._column_exists("thought", "thought_type"):
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_thought_type ON thought(thought_type)"
+            )
+        # ``edge`` / ``embedding`` may be absent in a partial bootstrap;
+        # creating an index on a missing table would raise ``no such table``.
+        if await self._table_exists("edge"):
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_edge_to_thought ON edge(to_thought_id)"
+            )
+        if await self._table_exists("embedding"):
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_embedding_owner ON embedding(owner_id)"
+            )
+
     async def _fk_present(self, table: str, column: str) -> bool:
         """Return ``True`` when ``table`` carries an FK on ``column``."""
         cursor = await self._db.execute(f"PRAGMA foreign_key_list({table})")
@@ -904,6 +1111,21 @@ class SqliteEngravaCore:
             (table,),
         )
         return await cursor.fetchone() is not None
+
+    async def _column_exists(self, table: str, column: str) -> bool:
+        """Return ``True`` when ``table`` has a column named ``column``.
+
+        Args:
+            table: The table to inspect. Must already exist.
+            column: The column name to look for.
+
+        Returns:
+            ``True`` if the column is present in ``PRAGMA table_info``.
+
+        """
+        cursor = await self._db.execute(f"PRAGMA table_info({table})")
+        rows = await cursor.fetchall()
+        return any(row["name"] == column for row in rows)
 
     async def _purge_orphan_children(self) -> None:
         """Delete orphan rows whose parent thought no longer exists.
@@ -1159,6 +1381,8 @@ class SqliteEngravaCore:
         created_at_raw = row["created_at"] if "created_at" in keys else None
         updated_at_raw = row["updated_at"] if "updated_at" in keys else None
         expires_at_raw = row["expires_at"] if "expires_at" in keys else None
+        valid_from_raw = row["valid_from"] if "valid_from" in keys else None
+        valid_until_raw = row["valid_until"] if "valid_until" in keys else None
         metadata_json_raw = row["metadata_json"] if "metadata_json" in keys else "{}"
         metadata_decoded: dict[str, MetadataValue] = (
             json.loads(metadata_json_raw) if metadata_json_raw else {}
@@ -1188,6 +1412,8 @@ class SqliteEngravaCore:
             created_at=created_at_raw,
             updated_at=updated_at_raw,
             expires_at=expires_at_raw,
+            valid_from=valid_from_raw,
+            valid_until=valid_until_raw,
             metadata=metadata_decoded,
         )
 
@@ -1228,8 +1454,9 @@ class SqliteEngravaCore:
         " confidence, embedding_ref, source_type, confirmation_count, "
         " consolidated_from, visibility, access_count, "
         " last_accessed_at, created_at, updated_at, expires_at, "
+        " valid_from, valid_until, "
         " metadata_json) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
 
     def _thought_to_core_params(self, thought: ThoughtRecord) -> tuple[object, ...]:
@@ -1272,6 +1499,8 @@ class SqliteEngravaCore:
             thought.created_at,
             thought.updated_at,
             thought.expires_at,
+            thought.valid_from,
+            thought.valid_until,
             json.dumps(thought.metadata, ensure_ascii=False),
         )
 
@@ -1284,6 +1513,7 @@ class SqliteEngravaCore:
         " consolidated_from = ?, visibility = ?,"
         " access_count = ?, last_accessed_at = ?,"
         " created_at = ?, updated_at = ?, expires_at = ?,"
+        " valid_from = ?, valid_until = ?,"
         " metadata_json = ? "
         "WHERE thought_id = ? AND updated_cycle = ?"
     )
@@ -1332,6 +1562,8 @@ class SqliteEngravaCore:
             updated.created_at,
             updated.updated_at,
             updated.expires_at,
+            updated.valid_from,
+            updated.valid_until,
             json.dumps(updated.metadata, ensure_ascii=False),
             thought_id,
             expected_cycle,
@@ -1552,6 +1784,104 @@ class SqliteEngravaCore:
         await self._maybe_auto_cleanup(exclude_id=thought.thought_id)
         return await self._hooks.on_store(thought)
 
+    async def remember(
+        self,
+        text: str,
+        *,
+        metadata: dict[str, MetadataValue] | None = None,
+        deduplicate: bool = False,
+    ) -> ThoughtRecord:
+        """Store a string as a thought with one call.
+
+        Ergonomic shorthand over :meth:`create_thought` for the common case
+        of persisting a bare string. A :class:`ThoughtRecord` is built with a
+        fresh UUID, ``content=text`` and ``essence=text[:200]`` (the compact
+        canonical prefix used in prompts), then handed to ``create_thought``.
+
+        The thought is created at the store's default cognitive cycle
+        (``created_cycle == updated_cycle == 0``); callers that track cognitive
+        cycles should build a :class:`ThoughtRecord` explicitly and call
+        ``create_thought`` so the cycle is recorded.
+
+        Args:
+            text: The content to remember. Becomes the thought's ``content``;
+                its opening (capped at 200 characters) becomes the ``essence``.
+            metadata: Optional structured attributes (e.g. ``speaker``,
+                ``lang``, ``session_id``). Defaults to an empty mapping.
+            deduplicate: When ``True`` and a thought with byte-identical
+                ``content`` already exists, its ``confirmation_count`` is
+                incremented and the existing record is returned instead of
+                inserting a duplicate (forwarded to
+                ``create_thought(deduplicate=True)``). Default ``False``
+                inserts a new row on every call.
+
+        Returns:
+            The persisted thought record (or the existing record with a bumped
+            ``confirmation_count`` when deduplication hits).
+
+        """
+        thought = ThoughtRecord(
+            thought_id=str(_uuid.uuid4()),
+            thought_type=ThoughtType.NOTE,
+            essence=text[:200],
+            content=text,
+            priority=Priority.P3,
+            lifecycle_status=LifecycleStatus.ACTIVE,
+            source="remember",
+            metadata=metadata or {},
+        )
+        return await self.create_thought(thought, deduplicate=deduplicate)
+
+    async def recall(
+        self,
+        query: str,
+        *,
+        top_k: int = 10,
+        current_cycle: int | None = None,
+    ) -> HybridSearchResult:
+        """Retrieve thoughts relevant to a query with one call.
+
+        Ergonomic shorthand over :meth:`search_hybrid` for the common
+        retrieval case: the query text is passed straight through with the
+        given ``top_k`` and ``current_cycle``.
+
+        When ``current_cycle`` is ``None`` the recency signal is inactive
+        (see ``search_hybrid``). A store that holds more than
+        ``_RECENCY_NUDGE_THRESHOLD`` thoughts and recalls without a cycle emits
+        a single DEBUG-level breadcrumb on the module logger — once per store
+        instance — pointing out that passing ``current_cycle`` would let recent
+        thoughts rank higher. It is never a warning and never repeats.
+
+        Args:
+            query: Natural-language text to search for.
+            top_k: Maximum number of results to return.
+            current_cycle: Current cognitive cycle. When provided, the recency
+                signal is blended into ranking; when ``None``, recency is
+                skipped.
+
+        Returns:
+            A ``HybridSearchResult`` with the ranked matches and the set of
+            backends that contributed.
+
+        """
+        if current_cycle is None and not self._recency_nudge_emitted:
+            count_cursor = await self._db.execute("SELECT COUNT(*) FROM thought")
+            count_row = await count_cursor.fetchone()
+            total = int(count_row[0]) if count_row is not None else 0
+            if total > _RECENCY_NUDGE_THRESHOLD:
+                self._recency_nudge_emitted = True
+                logger.debug(
+                    "recall() called without current_cycle on a store of %d thoughts; "
+                    "passing current_cycle enables the recency signal so recent thoughts "
+                    "rank higher",
+                    total,
+                )
+        return await self.search_hybrid(
+            query_text=query,
+            top_k=top_k,
+            current_cycle=current_cycle,
+        )
+
     async def cleanup_expired(
         self,
         now: str | None = None,
@@ -1745,6 +2075,44 @@ class SqliteEngravaCore:
         await self._maybe_auto_cleanup(exclude_id=thought_id)
         return updated
 
+    async def invalidate_thought(
+        self,
+        thought_id: str,
+        valid_until: str,
+    ) -> ThoughtRecord:
+        """Close a thought's valid-time interval at the given instant.
+
+        Sets the thought's ``valid_until`` to ``valid_until``, marking the
+        end of the window during which the fact is considered true in the
+        world. This is a deterministic, valid-time-only operation:
+
+        * It is **not** a delete — the row and all of its history remain
+          stored and retrievable; only the valid-time upper bound changes.
+        * It performs **no** similarity search, automatic invalidation, or
+          model inference of any kind.
+        * It does **not** cascade to the thought's edges — invalidating a
+          thought leaves every connected edge's valid-time interval
+          untouched.
+        * It is **idempotent**: invalidating with the same ``valid_until``
+          twice converges to the same stored value.
+
+        Args:
+            thought_id: UUID of the thought to invalidate.
+            valid_until: ISO-8601 instant at which the fact stops being
+                valid. Stored as the thought's ``valid_until`` bound.
+
+        Returns:
+            The updated thought record.
+
+        Raises:
+            ThoughtNotFoundError: If the thought does not exist.
+            StaleDataError: If the row was modified since it was read.
+            ValueError: If ``valid_until`` is not a valid ISO-8601 timestamp.
+
+        """
+        normalized = validate_iso8601_nullable(valid_until)
+        return await self.update_thought(thought_id, valid_until=normalized)
+
     async def list_thoughts(
         self,
         *,
@@ -1919,8 +2287,8 @@ class SqliteEngravaCore:
             await self._db.execute(
                 "INSERT INTO edge "
                 "(edge_id, from_thought_id, to_thought_id, edge_type, weight, "
-                " created_cycle, source, decay_multiplier) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                " created_cycle, source, decay_multiplier, valid_from, valid_until) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     edge.edge_id,
                     edge.from_thought_id,
@@ -1930,6 +2298,8 @@ class SqliteEngravaCore:
                     edge.created_cycle,
                     edge.source.value,
                     edge.decay_multiplier,
+                    edge.valid_from,
+                    edge.valid_until,
                 ),
             )
         except aiosqlite.IntegrityError as exc:
@@ -1978,7 +2348,8 @@ class SqliteEngravaCore:
 
         await self._db.execute(
             "UPDATE edge SET from_thought_id = ?, to_thought_id = ?, edge_type = ?, "
-            "weight = ?, created_cycle = ?, source = ?, decay_multiplier = ? "
+            "weight = ?, created_cycle = ?, source = ?, decay_multiplier = ?, "
+            "valid_from = ?, valid_until = ? "
             "WHERE edge_id = ?",
             (
                 updated.from_thought_id,
@@ -1988,6 +2359,8 @@ class SqliteEngravaCore:
                 updated.created_cycle,
                 updated.source.value,
                 updated.decay_multiplier,
+                updated.valid_from,
+                updated.valid_until,
                 edge_id,
             ),
         )
@@ -2004,6 +2377,41 @@ class SqliteEngravaCore:
 
         await self._maybe_commit()
         return updated
+
+    async def invalidate_edge(
+        self,
+        edge_id: str,
+        valid_until: str,
+    ) -> EdgeRecord:
+        """Close an edge's valid-time interval at the given instant.
+
+        Sets the edge's ``valid_until`` to ``valid_until``, marking the end
+        of the window during which the relation is considered true in the
+        world. Like :meth:`invalidate_thought`, this is a deterministic,
+        valid-time-only operation:
+
+        * It is **not** a delete — the edge row remains stored and
+          retrievable; only the valid-time upper bound changes.
+        * It performs **no** similarity search, automatic invalidation, or
+          model inference of any kind.
+        * It is **idempotent**: invalidating with the same ``valid_until``
+          twice converges to the same stored value.
+
+        Args:
+            edge_id: UUID of the edge to invalidate.
+            valid_until: ISO-8601 instant at which the relation stops being
+                valid. Stored as the edge's ``valid_until`` bound.
+
+        Returns:
+            The updated edge record.
+
+        Raises:
+            ValueError: If the edge does not exist, or ``valid_until`` is not
+                a valid ISO-8601 timestamp.
+
+        """
+        normalized = validate_iso8601_nullable(valid_until)
+        return await self.update_edge(edge_id, valid_until=normalized)
 
     async def get_edges(
         self,
@@ -2212,7 +2620,8 @@ class SqliteEngravaCore:
     async def _auto_embed_thought(self, thought: ThoughtRecord) -> None:
         """Generate and store an embedding for a thought via the provider.
 
-        Combines ``essence`` and ``content`` into a single text payload,
+        Builds the embed payload via :func:`_build_embed_input` (which drops a
+        prefix-redundant ``essence`` to avoid double-counting the opening),
         embeds it via the configured provider, and persists the vector.
 
         Args:
@@ -2222,7 +2631,7 @@ class SqliteEngravaCore:
         provider = self._embedding_provider
         if provider is None:
             return  # pragma: no cover
-        text = f"{thought.essence}\n{thought.content}"
+        text = _build_embed_input(thought.essence, thought.content)
 
         vector = await provider.embed(text)
 
@@ -2545,12 +2954,24 @@ class SqliteEngravaCore:
     ) -> list[tuple[str, float]]:
         """Full-text search via SQLite FTS5 with BM25 ranking.
 
-        Returns an empty list when the FTS5 index is unavailable
-        (backward compat for databases that predate the migration).
+        Bare natural-language queries are matched with ``OR`` semantics: a
+        document is returned when it shares *any* content word with the query,
+        and BM25 IDF weighting ranks documents that share the most distinctive
+        words first. Function words ("what", "was", "my") therefore never block
+        a match. Expert syntax — quoted phrases, uppercase ``AND``/``OR``/
+        ``NOT``, and the ``essence:``/``content:`` column filters — is preserved
+        and matched exactly as written.
+
+        Returns an empty list when the FTS5 index is unavailable (backward
+        compat for databases that predate the migration), when the query
+        normalizes to no usable term, or when a malformed FTS5 expression slips
+        through; such errors are logged and degraded rather than propagated, so
+        a caller's other search arms can still serve the query.
 
         Args:
-            query: FTS5 query string (supports ``AND``, ``OR``,
-                ``NOT``, prefix ``*``, column filters, etc.).
+            query: User-facing query string. Bare questions are OR-matched;
+                quoted phrases, uppercase ``AND``/``OR``/``NOT`` and
+                ``essence:``/``content:`` column filters invoke expert syntax.
             top_k: Maximum number of results.
 
         Returns:
@@ -2559,6 +2980,7 @@ class SqliteEngravaCore:
 
         """
         import time as _time  # noqa: PLC0415
+        from sqlite3 import OperationalError  # noqa: PLC0415
 
         _t_start = _time.perf_counter()
         if not query or not query.strip():
@@ -2573,6 +2995,11 @@ class SqliteEngravaCore:
             return []
 
         normalized_query = _normalize_fts_query(query)
+        if not normalized_query:
+            # The query held no indexable term (e.g. only punctuation); an empty
+            # MATCH string is a syntax error in FTS5, so short-circuit to empty.
+            await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
+            return []
 
         # bm25() returns negative values; negate so higher = more relevant.
         sql = (
@@ -2587,14 +3014,73 @@ class SqliteEngravaCore:
             "ORDER BY score DESC "
             "LIMIT ?"
         )
-        cursor = await self._db.execute(
-            sql,
-            (normalized_query, datetime.datetime.now(datetime.UTC).isoformat(), top_k),
-        )
-        rows = await cursor.fetchall()
+        try:
+            cursor = await self._db.execute(
+                sql,
+                (normalized_query, datetime.datetime.now(datetime.UTC).isoformat(), top_k),
+            )
+            rows = await cursor.fetchall()
+        except OperationalError:
+            # Defense in depth: a residual malformed FTS5 expression must never
+            # propagate to the caller and break an otherwise-serviceable search
+            # (e.g. the vector arm of a hybrid query). Degrade to no FTS hits.
+            logger.warning(
+                "FTS MATCH failed for normalized query %r; returning no FTS results",
+                normalized_query,
+                exc_info=True,
+            )
+            await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
+            return []
         results = [(row["thought_id"], float(row["score"])) for row in rows]
         await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
         return results
+
+    # ------------------------------------------------------------------
+    # MindQL execution
+    # ------------------------------------------------------------------
+
+    async def execute_mindql(
+        self,
+        query: MindQLQuery,
+        *,
+        extensions: dict[str, MindQLExtension] | None = None,
+    ) -> MindQLResult:
+        """Execute an already-parsed MindQL query against this store's connection.
+
+        This is the store-level entry point for the MindQL execution
+        contract: it lets a caller whose connection is owned by this store
+        run MindQL without reaching into store internals. Parse the query
+        first with :func:`engrava.mindql.parse`.
+
+        This method performs **no command-level policy filtering** — it will
+        execute whatever command the parsed query carries (``FIND``,
+        ``COUNT``, ``SELECT``, or a registered extension command). Callers
+        that need to restrict the command set (for example an
+        over-the-wire consumer exposing ``FIND`` only) **must** validate
+        ``query.command`` *before* calling this method.
+
+        Args:
+            query: A parsed MindQL query.
+            extensions: Optional registered MindQL extension commands. When
+                omitted, no extension commands are available. Callers that
+                expose extension commands supply their own map (the store
+                holds no extension-command registry of its own).
+
+        Returns:
+            The ``MindQLResult`` produced by the executor, carrying
+            ``columns``, ``rows``, ``count``, and the executed ``command``.
+
+        Raises:
+            MindQLParseError: If the executor rejects the query at
+                execution time (for example a ``SELECT`` whose raw SQL is
+                not a ``SELECT`` statement, or a ``FIND`` referencing an
+                invalid column).
+
+        """
+        from engrava.mindql.executor import MindQLExecutor  # noqa: PLC0415
+
+        executor = MindQLExecutor(self._db, extensions=extensions or {})
+        return await executor.execute(query)
 
     # ------------------------------------------------------------------
     # Hybrid search (FTS5 + vector + recency fusion)
@@ -3190,7 +3676,7 @@ class SqliteEngravaCore:
                 excluded from results.
             reflection_boost: Multiplier applied to REFLECTION thought
                 scores. ``None`` uses the value from ``SearchConfig``
-                (default ``1.2``).
+                (default ``1.0``).
 
         Returns:
             ``HybridSearchResult`` with ranked results and diagnostics.
@@ -3677,6 +4163,8 @@ def _row_to_edge(row: aiosqlite.Row) -> EdgeRecord:
     keys = row.keys()
     source_raw = row["source"] if "source" in keys else None
     decay_raw = row["decay_multiplier"] if "decay_multiplier" in keys else 1.0
+    valid_from_raw = row["valid_from"] if "valid_from" in keys else None
+    valid_until_raw = row["valid_until"] if "valid_until" in keys else None
     return EdgeRecord(
         edge_id=row["edge_id"],
         from_thought_id=row["from_thought_id"],
@@ -3686,26 +4174,95 @@ def _row_to_edge(row: aiosqlite.Row) -> EdgeRecord:
         created_cycle=row["created_cycle"],
         source=KnowledgeSource(source_raw) if source_raw else KnowledgeSource.EXPERIENCE,
         decay_multiplier=float(decay_raw) if decay_raw else 1.0,
+        valid_from=valid_from_raw,
+        valid_until=valid_until_raw,
     )
 
 
-def _normalize_fts_query(query: str) -> str:
-    """Normalize user-facing FTS queries to SQLite-compatible syntax.
+def _query_is_expert_syntax(query: str) -> bool:
+    """Return ``True`` when a query should be parsed as expert FTS5 syntax.
 
-    SQLite FTS5 treats hyphens as operators in bare tokens, which breaks
-    intuitive identifier-style prefix queries such as ``REQ-FUNC*``.
-    This normalizer preserves the public API contract by rewriting those
-    simple tokens to the accepted form ``"REQ-FUNC"*``.  It also strips
-    trailing natural-language punctuation like ``?`` and ``,`` from bare
-    tokens so user questions can be passed directly into FTS5.
+    A query is expert syntax when it contains any of:
+
+    * a quoted phrase (any ``"``),
+    * a standalone uppercase boolean operator (``AND``/``OR``/``NOT``), or
+    * a whitelisted column filter (``essence:``/``content:``).
+
+    Expert queries are normalized token-by-token and joined with spaces,
+    preserving FTS5's native operators, phrase matching, column filters and
+    implicit-AND semantics.
+
+    Bare natural-language queries (none of the above) are instead OR-joined so
+    function words cannot block a match; BM25's IDF weighting handles
+    uninformative tokens at ranking time.
+
+    Args:
+        query: The raw user-facing query string.
+
+    Returns:
+        ``True`` for expert syntax, ``False`` for a bare natural-language query.
+
     """
-    parts = query.split()
-    normalized_parts = [_normalize_fts_token(part) for part in parts]
-    return " ".join(part for part in normalized_parts if part)
+    if '"' in query:
+        return True
+    for token in query.split():
+        if token in _FTS_BOOLEAN_OPERATORS:
+            return True
+        if _FTS_FIELD_FILTER_RE.match(token.lstrip("(")):
+            return True
+    return False
+
+
+def _normalize_fts_query(query: str) -> str:
+    """Normalize a user-facing FTS query to SQLite FTS5-compatible syntax.
+
+    Two query classes are handled:
+
+    * **Expert syntax** (contains a quoted phrase or a standalone uppercase
+      ``AND``/``OR``/``NOT``): each token is normalized in place and the tokens
+      are joined with spaces, so FTS5's phrase matching, implicit AND, hyphen
+      handling and boolean operators all behave exactly as the caller wrote
+      them. Hyphenated identifiers such as ``REQ-FUNC*`` are still rewritten to
+      the accepted form ``"REQ-FUNC"*``.
+
+    * **Bare natural-language query** (no quotes, no uppercase operators): each
+      token expands to zero or more sanitized terms and the terms are joined
+      with ``OR``. This lets a question match any document sharing a content
+      word, instead of requiring every function word ("what", "was", "my") to
+      appear. BM25 IDF weighting keeps uninformative tokens from dominating the
+      ranking, so no stopword list or stemmer is needed in any language.
+
+    Unsafe characters (apostrophes, slashes, colons, ...) act as token
+    boundaries rather than being deleted, so contractions and clitics like
+    ``sister's`` or ``l'école`` split into matchable terms (``sister OR s``)
+    instead of becoming an unindexed merged token.
+
+    Args:
+        query: The raw user-facing query string.
+
+    Returns:
+        An FTS5 MATCH expression. May be empty when no usable term remains.
+
+    """
+    expert = _query_is_expert_syntax(query)
+    terms: list[str] = []
+    for token in query.split():
+        terms.extend(_normalize_fts_token(token, expert=expert))
+    joiner = " " if expert else " OR "
+    return joiner.join(terms)
 
 
 def _strip_fts_boundary_punctuation(raw: str) -> str:
-    """Strip unsupported leading and trailing punctuation from a bare token."""
+    """Strip unsupported leading and trailing punctuation from a bare token.
+
+    Args:
+        raw: A single unquoted token.
+
+    Returns:
+        The token with leading/trailing characters that FTS5 cannot start or
+        end a bare term with removed.
+
+    """
     while raw and not (raw[0].isalnum() or raw[0] in {"_", '"'}):
         raw = raw[1:]
 
@@ -3715,18 +4272,48 @@ def _strip_fts_boundary_punctuation(raw: str) -> str:
     return raw
 
 
-def _sanitize_fts_bare_token(raw: str) -> str:
-    """Remove unsupported FTS punctuation from an unquoted bare token."""
+def _sanitize_fts_bare_token(raw: str) -> list[str]:
+    """Split an unquoted bare token into safe FTS5 fragments.
+
+    Unsafe characters become fragment boundaries rather than being deleted, so
+    a contraction or clitic such as ``sister's`` splits into ``["sister", "s"]``
+    (which the ``unicode61`` tokenizer also produced at index time) instead of
+    merging into an unindexed ``sisters``.
+
+    Args:
+        raw: A single unquoted token, already paren-stripped.
+
+    Returns:
+        A list of non-empty safe fragments, in order. May be empty when the
+        token holds no indexable characters.
+
+    """
     stripped = _strip_fts_boundary_punctuation(raw)
-    return _FTS_UNSAFE_CHAR_RE.sub("", stripped)
+    split = _FTS_UNSAFE_CHAR_RE.sub(" ", stripped)
+    return [fragment for fragment in split.split() if fragment]
 
 
-def _normalize_fts_token(token: str) -> str:
-    """Normalize a single FTS token if it contains a hyphenated identifier."""
-    if not token or '"' in token:
-        return token
-    if token in {"AND", "OR", "NOT"}:
-        return token
+def _normalize_fts_token(token: str, *, expert: bool) -> list[str]:
+    """Normalize a single token into zero or more FTS5 terms.
+
+    Args:
+        token: A whitespace-delimited token from the raw query.
+        expert: ``True`` when the surrounding query is expert syntax. In expert
+            mode quoted phrases and uppercase operators pass through unchanged;
+            in bare mode every token is sanitized into plain OR-terms.
+
+    Returns:
+        The FTS5 terms this token contributes. A bare contraction may yield
+        several terms (``sister's`` -> ``["sister", "s"]``); an empty or
+        all-punctuation token yields ``[]``.
+
+    """
+    if not token:
+        return []
+    if expert and '"' in token:
+        return [token]
+    if expert and token in _FTS_BOOLEAN_OPERATORS:
+        return [token]
 
     leading = ""
     trailing = ""
@@ -3738,25 +4325,43 @@ def _normalize_fts_token(token: str) -> str:
         trailing = ")" + trailing
         raw = raw[:-1]
 
-    if _FTS_FIELD_FILTER_RE.match(raw):
-        normalized = f"{leading}{raw}{trailing}"
-    else:
-        raw = _sanitize_fts_bare_token(raw)
-        if not raw:
-            return ""
+    if expert and _FTS_FIELD_FILTER_RE.match(raw):
+        return [f"{leading}{raw}{trailing}"]
 
-        suffix = ""
-        if raw.endswith("*"):
-            raw = raw[:-1]
-            suffix = "*"
+    fragments = _sanitize_fts_bare_token(raw)
+    if not fragments:
+        return []
 
-        normalized = (
-            f'{leading}"{raw}"{suffix}{trailing}'
-            if "-" in raw
-            else f"{leading}{raw}{suffix}{trailing}"
-        )
+    terms = [_format_fts_bare_fragment(fragment) for fragment in fragments]
+    if expert:
+        # Expert mode keeps each original token as one term, re-attaching any
+        # parentheses the caller used for grouping.
+        terms[0] = f"{leading}{terms[0]}"
+        terms[-1] = f"{terms[-1]}{trailing}"
+    return terms
 
-    return normalized
+
+def _format_fts_bare_fragment(fragment: str) -> str:
+    """Format a single sanitized fragment as an FTS5 term.
+
+    Preserves a trailing ``*`` prefix marker and quotes hyphenated identifiers
+    so FTS5 does not read the hyphen as a column/operator.
+
+    Args:
+        fragment: A safe fragment containing only word characters, ``-`` or a
+            trailing ``*``.
+
+    Returns:
+        The fragment rewritten as a valid FTS5 term.
+
+    """
+    suffix = ""
+    if fragment.endswith("*"):
+        fragment = fragment[:-1]
+        suffix = "*"
+    if "-" in fragment:
+        return f'"{fragment}"{suffix}'
+    return f"{fragment}{suffix}"
 
 
 def _row_to_action(row: aiosqlite.Row) -> ActionRecord:

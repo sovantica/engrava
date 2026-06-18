@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from engrava.domain.models.embedding import EmbeddingRecord
     from engrava.domain.models.metrics import EngravaMetrics
     from engrava.domain.models.search import HybridSearchResult
-    from engrava.domain.models.thought import ThoughtRecord
+    from engrava.domain.models.thought import MetadataValue, ThoughtRecord
     from engrava.domain.models.ttl import CleanupResult
 
 
@@ -56,6 +56,69 @@ class EngravaCoreProtocol(Protocol):
 
         Raises:
             ValueError: If a thought with the same ID already exists.
+
+        """
+        ...
+
+    async def remember(
+        self,
+        text: str,
+        *,
+        metadata: dict[str, MetadataValue] | None = None,
+        deduplicate: bool = False,
+    ) -> ThoughtRecord:
+        """Store a string as a thought with one call.
+
+        Ergonomic shorthand over :meth:`create_thought` for the common
+        case of persisting a bare string: implementations build a
+        :class:`ThoughtRecord` (deriving ``essence`` from the opening of
+        ``text``) and delegate to ``create_thought``.
+
+        The thought is created at the store's default cognitive cycle
+        (cycle ``0``); callers that track cycles should build a
+        :class:`ThoughtRecord` explicitly and use ``create_thought``.
+
+        Args:
+            text: The content to remember.  Becomes the thought's
+                ``content``; the opening is also used as its ``essence``.
+            metadata: Optional structured attributes (e.g. ``speaker``,
+                ``lang``, ``session_id``).  Defaults to an empty mapping.
+            deduplicate: When ``True`` and a thought with byte-identical
+                ``content`` already exists, its ``confirmation_count`` is
+                incremented and the existing record is returned instead of
+                inserting a duplicate (delegated to
+                ``create_thought(deduplicate=True)``).
+
+        Returns:
+            The persisted thought record (or the existing record with a
+            bumped ``confirmation_count`` when deduplication hits).
+
+        """
+        ...
+
+    async def recall(
+        self,
+        query: str,
+        *,
+        top_k: int = 10,
+        current_cycle: int | None = None,
+    ) -> HybridSearchResult:
+        """Retrieve thoughts relevant to a query with one call.
+
+        Ergonomic shorthand over :meth:`search_hybrid` for the common
+        retrieval case: implementations delegate to ``search_hybrid`` with
+        the query text and the given ``top_k``/``current_cycle``.
+
+        Args:
+            query: Natural-language text to search for.
+            top_k: Maximum number of results to return.
+            current_cycle: Current cognitive cycle.  When provided, the
+                recency signal is blended into ranking; when ``None``,
+                recency is skipped.
+
+        Returns:
+            A ``HybridSearchResult`` with the ranked matches and the set of
+            backends that contributed.
 
         """
         ...

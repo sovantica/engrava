@@ -267,12 +267,9 @@ of `DreamingGates`, `EdgeCreationConfig`, and `SearchConfig` fields.
 
 ## Reflections (meta-consolidation)
 
-> **v0.4.0**
-
-Starting from v0.4.0, `run_consolidation()` runs a **third phase** after
-promotion and edge creation: it clusters semantically related thoughts
-and creates **`ThoughtType.REFLECTION`** meta-thoughts that aggregate
-each cluster.
+`run_consolidation()` runs a **third phase** after promotion and edge
+creation: it clusters semantically related thoughts and creates
+**`ThoughtType.REFLECTION`** meta-thoughts that aggregate each cluster.
 
 ### What is a REFLECTION?
 
@@ -341,7 +338,7 @@ extensions:
       enable_reflections: true        # set to false to skip phase 3 entirely
 ```
 
-### `ConsolidationResult` fields (v0.4.0)
+### `ConsolidationResult` fields
 
 ```python
 result = await ext.run_consolidation(store, current_cycle=42)

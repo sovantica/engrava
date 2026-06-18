@@ -60,8 +60,15 @@ def _make(
     created_cycle: int = 0,
     updated_cycle: int = 0,
     priority: Priority = Priority.P3,
+    valid_from: str | None = None,
+    valid_until: str | None = None,
 ) -> ThoughtRecord:
-    """Minimal thought for clustering tests."""
+    """Minimal thought for clustering tests.
+
+    ``valid_from`` / ``valid_until`` default to ``None`` (open bounds) so
+    existing callers keep their old behaviour; the REFLECTION
+    valid-time-inheritance tests pass explicit ISO-8601 bounds.
+    """
     return ThoughtRecord(
         thought_id=thought_id,
         thought_type=ThoughtType.OBSERVATION,
@@ -72,6 +79,8 @@ def _make(
         created_cycle=created_cycle,
         updated_cycle=updated_cycle,
         source="test",
+        valid_from=valid_from,
+        valid_until=valid_until,
     )
 
 
@@ -335,6 +344,137 @@ class TestCreateReflections:
         emb = await store.get_embedding(reflections[0].thought_id)
         assert emb is not None
         assert emb.dimension == 3
+
+
+# Fixed UTC-normalised ISO-8601 instants for valid-time tests
+# (lexicographic == chronological by the domain's UTC-normalisation
+# invariant).
+_VT_EARLY = "2024-01-01T00:00:00+00:00"
+_VT_MID = "2024-02-01T00:00:00+00:00"
+_VT_LATE = "2024-03-01T00:00:00+00:00"
+_VT_LATEST = "2024-04-01T00:00:00+00:00"
+
+
+class TestReflectionValidTimeInheritance:
+    """A REFLECTION inherits a deterministic valid-time extent from members."""
+
+    async def test_persisted_reflection_carries_derived_extent(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        """All-finite members → REFLECTION gets MIN(from) / MAX(until)."""
+        t1 = await store.create_thought(
+            _make("t-vt-1", essence="extent A", valid_from=_VT_EARLY, valid_until=_VT_LATE)
+        )
+        t2 = await store.create_thought(
+            _make("t-vt-2", essence="extent B", valid_from=_VT_MID, valid_until=_VT_LATEST)
+        )
+        await store.store_embedding(t1.thought_id, [1.0, 0.0], model_name="test")
+        await store.store_embedding(t2.thought_id, [0.9, 0.1], model_name="test")
+
+        cluster = frozenset([t1.thought_id, t2.thought_id])
+        ext = DreamingExtension(config=_reflection_cfg())
+        await ext._create_reflections(store, [cluster], current_cycle=5)
+
+        reflections = await store.list_thoughts(thought_type=ThoughtType.REFLECTION)
+        assert len(reflections) == 1
+        r = reflections[0]
+        assert r.valid_from == _VT_EARLY
+        assert r.valid_until == _VT_LATEST
+
+    async def test_open_lower_bound_member_forces_open_from(self, store: SqliteEngravaCore) -> None:
+        """A member with valid_from None → REFLECTION valid_from None."""
+        t1 = await store.create_thought(
+            _make("t-vt-of-1", essence="open from", valid_from=None, valid_until=_VT_LATE)
+        )
+        t2 = await store.create_thought(
+            _make("t-vt-of-2", essence="finite", valid_from=_VT_MID, valid_until=_VT_LATEST)
+        )
+        await store.store_embedding(t1.thought_id, [1.0, 0.0], model_name="test")
+        await store.store_embedding(t2.thought_id, [0.9, 0.1], model_name="test")
+
+        cluster = frozenset([t1.thought_id, t2.thought_id])
+        ext = DreamingExtension(config=_reflection_cfg())
+        await ext._create_reflections(store, [cluster], current_cycle=5)
+
+        reflections = await store.list_thoughts(thought_type=ThoughtType.REFLECTION)
+        assert len(reflections) == 1
+        r = reflections[0]
+        assert r.valid_from is None
+        assert r.valid_until == _VT_LATEST
+
+    async def test_open_upper_bound_member_forces_open_until(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        """A member with valid_until None → REFLECTION valid_until None."""
+        t1 = await store.create_thought(
+            _make("t-vt-ou-1", essence="finite", valid_from=_VT_EARLY, valid_until=_VT_LATE)
+        )
+        t2 = await store.create_thought(
+            _make("t-vt-ou-2", essence="open until", valid_from=_VT_MID, valid_until=None)
+        )
+        await store.store_embedding(t1.thought_id, [1.0, 0.0], model_name="test")
+        await store.store_embedding(t2.thought_id, [0.9, 0.1], model_name="test")
+
+        cluster = frozenset([t1.thought_id, t2.thought_id])
+        ext = DreamingExtension(config=_reflection_cfg())
+        await ext._create_reflections(store, [cluster], current_cycle=5)
+
+        reflections = await store.list_thoughts(thought_type=ThoughtType.REFLECTION)
+        assert len(reflections) == 1
+        r = reflections[0]
+        assert r.valid_from == _VT_EARLY
+        assert r.valid_until is None
+
+    async def test_caller_override_beats_derived_extent(self, store: SqliteEngravaCore) -> None:
+        """Explicit override bounds win over the member-derived extent."""
+        t1 = await store.create_thought(
+            _make("t-vt-ov-1", essence="extent A", valid_from=_VT_EARLY, valid_until=_VT_LATE)
+        )
+        t2 = await store.create_thought(
+            _make("t-vt-ov-2", essence="extent B", valid_from=_VT_MID, valid_until=_VT_LATEST)
+        )
+        await store.store_embedding(t1.thought_id, [1.0, 0.0], model_name="test")
+        await store.store_embedding(t2.thought_id, [0.9, 0.1], model_name="test")
+
+        cluster = frozenset([t1.thought_id, t2.thought_id])
+        ext = DreamingExtension(config=_reflection_cfg())
+        await ext._create_reflections(
+            store,
+            [cluster],
+            current_cycle=5,
+            override_valid_from=_VT_MID,
+            override_valid_until=_VT_LATE,
+        )
+
+        reflections = await store.list_thoughts(thought_type=ThoughtType.REFLECTION)
+        assert len(reflections) == 1
+        r = reflections[0]
+        # Override pins both axes, ignoring the derived (early, latest).
+        assert r.valid_from == _VT_MID
+        assert r.valid_until == _VT_LATE
+
+    async def test_extent_is_deterministic_across_runs(self, store: SqliteEngravaCore) -> None:
+        """Re-deriving the same cluster twice yields the same extent."""
+        t1 = await store.create_thought(
+            _make("t-vt-det-1", essence="extent A", valid_from=_VT_EARLY, valid_until=_VT_LATE)
+        )
+        t2 = await store.create_thought(
+            _make("t-vt-det-2", essence="extent B", valid_from=_VT_MID, valid_until=_VT_LATEST)
+        )
+        await store.store_embedding(t1.thought_id, [1.0, 0.0], model_name="test")
+        await store.store_embedding(t2.thought_id, [0.9, 0.1], model_name="test")
+
+        cluster = frozenset([t1.thought_id, t2.thought_id])
+        ext = DreamingExtension(config=_reflection_cfg())
+        await ext._create_reflections(store, [cluster], current_cycle=5)
+        first = await store.list_thoughts(thought_type=ThoughtType.REFLECTION)
+        assert len(first) == 1
+        first_extent = (first[0].valid_from, first[0].valid_until)
+
+        # Idempotence skips a second REFLECTION for the same cluster, so
+        # assert the persisted extent equals the deterministic derivation
+        # for these member bounds — no clock or randomness involved.
+        assert first_extent == (_VT_EARLY, _VT_LATEST)
 
 
 # ---------------------------------------------------------------------------

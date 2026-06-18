@@ -47,6 +47,16 @@ Every thought carries **two** texts, and the split is deliberate:
 > tight `essence`, not the whole `content`. Putting the same long text in both
 > defeats the purpose. Think *headline* (`essence`) vs *article* (`content`).
 
+### `valid_from` / `valid_until` (optional valid time)
+
+A thought also carries two optional, nullable timestamps — `valid_from` and
+`valid_until` — that record **when the fact is true in the world**, a separate
+axis from when Engrava stored it (`created_at`) and from the [cycle](#cycle-the-agent-clock).
+Both default to `None` (an open interval = "valid for all time"), so you can
+ignore them entirely until you need point-in-time history. The same two fields
+exist on an [edge](#edge). See [The Bi-temporal Model](bitemporal.md) for the full
+semantics and the query predicates.
+
 ### Thought types
 
 `ThoughtType` is a closed set — choose the one that fits what you're storing:
@@ -129,9 +139,10 @@ turn / interaction / scheduled pass.
 
 Three fields use it:
 
-- **`created_cycle`** / **`updated_cycle`** — required on every `ThoughtRecord`
-  (the model enforces `updated_cycle >= created_cycle`). They stamp *when, in
-  your agent's logical time*, a thought appeared and last changed.
+- **`created_cycle`** / **`updated_cycle`** — optional on `ThoughtRecord`, both
+  default to `0` (so callers that don't track cognitive cycles can omit them);
+  when set, the model enforces `updated_cycle >= created_cycle`. They stamp
+  *when, in your agent's logical time*, a thought appeared and last changed.
 - **`current_cycle`** — the value you pass into `search_hybrid(...)` and
   `run_consolidation(...)` to tell Engrava "it is now tick N."
 
@@ -244,4 +255,5 @@ observation = ThoughtRecord(
 - [Quick Start](quickstart.md) — create, link, and search in five minutes.
 - [Dreaming](dreaming.md) — how consolidation turns observations into reflections.
 - [Hybrid Search](search.md) — how the signals (including recency/cycle and priority) fuse into a ranking.
+- [The Bi-temporal Model](bitemporal.md) — the optional second time axis (valid time) and how it differs from the cycle.
 - [API Reference](api-reference.md) — the exact fields, enums, and methods.
