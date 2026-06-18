@@ -37,13 +37,18 @@ jobs:
         env:
           BRANCH: ${{ github.head_ref }}
         run: |
-          # Schema: <type>/<kebab-description>
-          if [[ ! "$BRANCH" =~ ^(feature|fix|chore|docs|refactor|test|perf|release|hotfix)/[a-z0-9-]+$ ]]; then
+          # Schema: <type>/<kebab-description> for ordinary work branches;
+          # release/hotfix branches carry a semantic version (release/vX.Y.Z),
+          # so they have their own arm that permits the dots a kebab slug forbids.
+          KEBAB='^(feature|fix|chore|docs|refactor|test|perf)/[a-z0-9-]+$'
+          SEMVER='^(release|hotfix)/v[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.-]+)?(\+[a-z0-9.-]+)?$'
+          if [[ ! "$BRANCH" =~ $KEBAB && ! "$BRANCH" =~ $SEMVER ]]; then
             echo "Invalid branch name: '$BRANCH'"
             echo ""
-            echo "Required format: <type>/<kebab-description>"
-            echo "Allowed types: feature, fix, chore, docs, refactor, test, perf, release, hotfix"
-            echo "Description: lowercase, kebab-case, plain English"
+            echo "Required format:"
+            echo "  - work branches: <type>/<kebab-description>"
+            echo "    (types: feature, fix, chore, docs, refactor, test, perf; lowercase, kebab-case)"
+            echo "  - release/hotfix: release/v<X.Y.Z> or hotfix/v<X.Y.Z> (semantic version)"
             echo ""
             echo "See BRANCHING.md"
             exit 1
