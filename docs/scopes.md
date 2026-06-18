@@ -7,7 +7,7 @@ Example: `feat(dreaming): add priority signal to hybrid search`
 
 ## Scopes
 
-- `core` — domain models, core engine (`src/engrava/domain/`, `src/engrava/infrastructure/core/`)
+- `core` — domain models, core engine (`src/engrava/domain/`, `src/engrava/infrastructure/sqlite/`)
 - `domain` — domain-layer models and protocols (`src/engrava/domain/`)
 - `infra` — infrastructure layer (SQLite, persistence)
 - `dreaming` — consolidation cycle, reflection, edges, priority

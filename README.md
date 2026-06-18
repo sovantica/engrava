@@ -33,20 +33,28 @@ pip install engrava
 Optional extras:
 
 ```bash
-pip install engrava[vec]               # sqlite-vec vector search backend
-pip install engrava[embeddings-local]  # sentence-transformers embeddings
-pip install engrava[embeddings-openai] # OpenAI-compatible embeddings
+pip install engrava[vec]                # sqlite-vec vector search backend
+pip install engrava[mcp]                # MCP server (engrava-mcp) for Claude Desktop/Code, Cursor, …
+pip install engrava[embeddings-local]   # sentence-transformers embeddings (local model)
+pip install engrava[embeddings-openai]  # OpenAI-compatible embeddings API
+pip install engrava[embeddings-ollama]  # Ollama local embeddings server
+pip install engrava[embeddings-hf]      # HuggingFace Inference API embeddings
 ```
+
+Dreaming/consolidation and the knowledge graph need **no extra** — they are part
+of the base install.
 
 ### Basic Usage
 
+Store a memory and search for it in two calls — no IDs to generate, no record
+to assemble:
+
 ```python
 import asyncio
-import uuid
 
 import aiosqlite
 
-from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+from engrava import SqliteEngravaCore
 
 
 async def main() -> None:
@@ -56,28 +64,24 @@ async def main() -> None:
         store = SqliteEngravaCore(conn)
         await store.ensure_schema()
 
-        # Build a ThoughtRecord and persist it with create_thought.
-        observation = ThoughtRecord(
-            thought_id=str(uuid.uuid4()),
-            thought_type=ThoughtType.OBSERVATION,
-            essence="Python is great for AI",
-            content="Python's async ecosystem makes it ideal for AI agents.",
-            priority=Priority.P2,
-            lifecycle_status=LifecycleStatus.ACTIVE,
-            created_cycle=0,
-            updated_cycle=0,
-            source="human",
-        )
-        await store.create_thought(observation)
+        await store.remember("Python is great for AI agents")
+        await store.remember("SQLite needs no server")
 
-        # Retrieve it
-        thought = await store.get_thought(observation.thought_id)
-        if thought is not None:
-            print(f"Stored: {thought.essence}")
+        result = await store.recall("what language is good for agents?")
+        for thought_id, score in result.results:
+            thought = await store.get_thought(thought_id)
+            if thought is not None:
+                print(f"{thought.essence}  (score: {score:.3f})")
 
 
 asyncio.run(main())
 ```
+
+`remember()` stores the text as a thought (generating its ID for you) and
+returns the stored `ThoughtRecord`; `recall()` runs the same hybrid search as
+`search_hybrid()` and returns the ranked results. For full control — setting
+priority, thought type, metadata, or the cognitive cycle on a write — build a
+`ThoughtRecord` yourself and call `create_thought()`.
 
 From here, link thoughts with [typed edges](#edge-based-knowledge-graph),
 query them with [MindQL](#mindql-query-language), or run the full
@@ -199,6 +203,21 @@ async with EngravaManager(data_dir=Path("./data")) as mgr:
     # Completely isolated databases
 ```
 
+### MCP Server
+
+Expose a store to any MCP client — Claude Desktop, Claude Code, Cursor,
+Windsurf, VS Code — via the `engrava[mcp]` extra. A native stdio server (no HTTP
+shim) with read tools, optional write tools, attachable `engrava://` resources,
+and guided prompts:
+
+```bash
+pip install "engrava[mcp]"
+engrava-mcp        # spawned by your MCP client over stdio
+```
+
+→ See [`docs/guides/mcp.md`](docs/guides/mcp.md) for install, client
+configuration, the full tool/resource/prompt reference, and read-only mode.
+
 ## CLI
 
 ```bash
@@ -228,6 +247,7 @@ See the [CLI reference](docs/cli.md) for every command and option.
 ## Documentation
 
 - [Core Concepts](docs/concepts.md) — the mental model (thought, edge, reflection, cycle, …) — start here
+- [The Bi-temporal Model](docs/bitemporal.md) — the optional valid-time axis: query a fact as of any instant, `invalidate` without deleting
 - [Positioning](docs/positioning.md) — when Engrava is (and isn't) the right tool, and how it compares
 - [Quick Start](docs/quickstart.md) — 5-minute setup guide
 - [Tutorial](docs/tutorial.md) — build a small notes memory end to end
@@ -235,6 +255,7 @@ See the [CLI reference](docs/cli.md) for every command and option.
 - [Building a memory-backed agent](docs/guides/agent-memory.md) — the end-to-end agent turn loop (ingest → retrieve → generate → consolidate)
 - [Migrating from another memory system](docs/guides/migrating-from-other-memory.md) — concept mapping, porting calls, bulk import, and scoping/multi-tenancy
 - [Embeddings](docs/guides/embeddings.md) — wiring a real embedding provider (local / OpenAI / Ollama / HuggingFace / custom)
+- [MCP server](docs/guides/mcp.md) — expose a store to MCP clients (Claude Desktop, Claude Code, Cursor, Windsurf, VS Code): install, run, client config, tools/resources/prompts
 - [Configuration](docs/configuration.md) — YAML config format and options
 - [Upgrade Guide](docs/upgrade.md) — compatibility matrix, backups, and troubleshooting
 - [Extensions](docs/extensions.md) — Writing custom extensions and hooks

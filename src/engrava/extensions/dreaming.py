@@ -977,6 +977,9 @@ class DreamingExtension:
         clusters: list[frozenset[str]],
         current_cycle: int,
         candidate_corpus: list[str] | None = None,
+        *,
+        override_valid_from: str | None = None,
+        override_valid_until: str | None = None,
     ) -> int:
         """Create REFLECTION thoughts from clustered thought sets.
 
@@ -986,7 +989,10 @@ class DreamingExtension:
         2. Build structured content (top-N keywords + member IDs).
         3. Derive an idempotence hash from sorted member IDs.
         4. Skip if a REFLECTION with the same hash already exists.
-        5. Persist the REFLECTION thought, centroid embedding, and
+        5. Derive the REFLECTION's valid-time extent from its members
+           (see ``derive_reflection_extent``), unless the caller pins an
+           explicit override.
+        6. Persist the REFLECTION thought, centroid embedding, and
            ``CONSOLIDATED_FROM`` edges to each cluster member.
 
         Args:
@@ -1002,6 +1008,17 @@ class DreamingExtension:
                 empty-corpus behaviour, but production callsites should
                 always supply the corpus to keep the enrichment
                 substantive.
+            override_valid_from: When non-``None``, every REFLECTION
+                created in this call takes this ISO-8601 ``valid_from``
+                instead of the value derived from its members.  ``None``
+                (the default) means "derive from members" — it does
+                **not** force an open lower bound; an open lower bound is
+                only produced when the derivation itself yields ``None``.
+            override_valid_until: When non-``None``, every REFLECTION
+                created in this call takes this ISO-8601 ``valid_until``
+                instead of the derived value.  ``None`` (the default)
+                means "derive from members", mirroring
+                ``override_valid_from``.
 
         Returns:
             Number of new REFLECTION thoughts persisted.
@@ -1032,6 +1049,9 @@ class DreamingExtension:
         )
         from engrava.extensions.dreaming_reflection_content import (  # noqa: PLC0415
             build_reflection_content_v2,
+        )
+        from engrava.extensions.dreaming_reflection_extent import (  # noqa: PLC0415
+            derive_reflection_extent,
         )
 
         # Resolve cluster algorithm at the callsite — the dreaming
@@ -1309,6 +1329,24 @@ class DreamingExtension:
                 keywords = content_obj["keywords"]
                 essence = f"REFLECTION [{', '.join(keywords[:3])}]"[:200]
 
+                # --- Derive valid-time extent inherited from members ---
+                # ``member_thoughts`` is already resolved above (it drives
+                # the centroid + content build), so the bounds are read
+                # from records already in hand — no extra store round-trip.
+                # An explicit caller override wins over the derived value
+                # on each axis independently.
+                derived_valid_from, derived_valid_until = derive_reflection_extent(
+                    (t.valid_from, t.valid_until) for t in member_thoughts
+                )
+                reflection_valid_from = (
+                    override_valid_from if override_valid_from is not None else derived_valid_from
+                )
+                reflection_valid_until = (
+                    override_valid_until
+                    if override_valid_until is not None
+                    else derived_valid_until
+                )
+
                 # --- Create REFLECTION thought ---
                 reflection_id = str(uuid.uuid4())
                 reflection = ThoughtRecord(
@@ -1322,6 +1360,8 @@ class DreamingExtension:
                     updated_cycle=current_cycle,
                     source=f"dreaming:{cluster_hash}",
                     source_type=KnowledgeSource.DREAMING,
+                    valid_from=reflection_valid_from,
+                    valid_until=reflection_valid_until,
                 )
                 try:
                     await store.create_thought(reflection)

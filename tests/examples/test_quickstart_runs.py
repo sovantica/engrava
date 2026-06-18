@@ -29,6 +29,43 @@ requires_local_embeddings = pytest.mark.skipif(
 )
 
 
+def _isolated_child_env(**overrides: str) -> dict[str, str]:
+    """Return a deterministic, offline, single-threaded environment for a child.
+
+    ``quickstart.py`` loads ``sentence-transformers``/``torch`` in a fresh
+    subprocess. Two hazards make that spawn flaky if the child simply inherits
+    the ambient environment:
+
+    * **Network.** Without the offline flags a cold cache lets the encoder
+      reach for the HuggingFace Hub, so the test would block on a socket and
+      depend on the *caller* having exported the offline vars. Forcing them
+      here makes the suite network-independent by construction.
+    * **Native thread pools.** torch/OpenMP/MKL each spin up worker pools sized
+      to the host CPU. Pinning them to a single thread keeps a heavy model load
+      from contending for native resources with the rest of the suite — the
+      walkthrough does a one-shot encode where extra threads buy nothing.
+
+    Args:
+        **overrides: Extra variables to set on top of the isolated defaults.
+
+    Returns:
+        A copy of ``os.environ`` with the deterministic overrides applied.
+
+    """
+    env = dict(os.environ)
+    env.update(
+        {
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "TOKENIZERS_PARALLELISM": "false",
+        }
+    )
+    env.update(overrides)
+    return env
+
+
 def _run_example(script_name: str, timeout_s: float = 120.0) -> subprocess.CompletedProcess[str]:
     return subprocess.run(  # noqa: S603 — trusted invocation of the shipped example script
         [sys.executable, str(EXAMPLES_DIR / script_name)],
@@ -36,6 +73,10 @@ def _run_example(script_name: str, timeout_s: float = 120.0) -> subprocess.Compl
         capture_output=True,
         text=True,
         timeout=timeout_s,
+        # The example reads nothing from stdin; closing it removes a stdin-
+        # inheritance wedge when the parent runs under pytest's output capture.
+        stdin=subprocess.DEVNULL,
+        env=_isolated_child_env(),
     )
 
 
@@ -132,7 +173,7 @@ def test_quickstart_exits_with_actionable_message_without_extras(tmp_path: Path)
         "_orig = importlib.util.find_spec\n"
         "importlib.util.find_spec = _patched_find_spec\n",
     )
-    env = {**os.environ, "PYTHONPATH": str(tmp_path)}
+    env = _isolated_child_env(PYTHONPATH=str(tmp_path))
     result = subprocess.run(  # noqa: S603 — trusted invocation of the shipped example script
         [sys.executable, str(EXAMPLES_DIR / "quickstart.py")],
         check=False,
@@ -140,6 +181,7 @@ def test_quickstart_exits_with_actionable_message_without_extras(tmp_path: Path)
         text=True,
         env=env,
         timeout=30,
+        stdin=subprocess.DEVNULL,
     )
     assert result.returncode == 2, (
         f"expected exit code 2 when the extra is hidden; got {result.returncode}; "

@@ -253,7 +253,7 @@ nvtx = [
 
 [[package]]
 name = "engrava"
-version = "0.3.0"
+version = "0.3.1"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
@@ -271,6 +271,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "ruff" },
     { name = "sentence-transformers" },
+    { name = "sqlite-vec" },
     { name = "types-pyyaml" },
 ]
 embeddings-hf = [
@@ -299,7 +300,7 @@ requires-dist = [
     { name = "huggingface-hub", marker = "extra == 'embeddings-hf'", specifier = ">=0.24.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11.0" },
     { name = "numpy", specifier = ">=1.26.0" },
-    { name = "pydantic", specifier = ">=2.9.0" },
+    { name = "pydantic", specifier = ">=2.11.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0.0" },
@@ -307,6 +308,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.7.0" },
     { name = "sentence-transformers", marker = "extra == 'dev'", specifier = ">=3.0.0" },
     { name = "sentence-transformers", marker = "extra == 'embeddings-local'", specifier = ">=3.0.0" },
+    { name = "sqlite-vec", marker = "extra == 'dev'", specifier = ">=0.1.0,<0.2.0" },
     { name = "sqlite-vec", marker = "extra == 'vec'", specifier = ">=0.1.0,<0.2.0" },
     { name = "torch", marker = "extra == 'embeddings-local'", specifier = ">=2.0.0" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },

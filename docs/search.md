@@ -26,6 +26,46 @@ its weight is **redistributed proportionally** across active signals.
 - `graph_weight` is `0.0` → graph skipped, zero overhead.
 - All signals disabled → fallback to `list_thoughts(LIMIT top_k)`.
 
+## Keyword query syntax (FTS)
+
+The keyword signal — and the `search_fts()` method and the MCP `search_keywords`
+tool that expose it directly — runs your text against an SQLite FTS5 index. engrava
+normalises the query before handing it to FTS5, with two modes that switch
+automatically on what you type:
+
+**Bare queries are matched with `OR`.** A plain natural-language query like
+`what was my sister doing` is treated as a bag of words joined with `OR`, so a
+document matches when it shares **any** word. BM25's IDF weighting then ranks the
+documents that share the most *distinctive* words first, so common function words
+(`what`, `was`, `my`) carry little weight and need no stopword list or stemmer —
+this works in any language. (Before this, the words were joined with FTS5's
+implicit `AND`, so a question only matched documents containing *every* word and
+relevant answers were missed.)
+
+```python
+# Bare query -> OR-matched: finds docs sharing any content word, best-ranked first
+hits = await store.search_fts("what was my sister doing", top_k=10)
+```
+
+**Expert syntax is preserved unchanged.** If your query uses FTS5 operators, it is
+passed through as written:
+
+- **quoted phrases** — `"machine learning"` matches the exact phrase;
+- **uppercase booleans** — `AND`, `OR`, `NOT` (must be uppercase) compose terms,
+  e.g. `python AND NOT snake`;
+- **prefix** — a trailing `*` does prefix matching, e.g. `neur*`;
+- **column filters** — `essence:` and `content:` restrict a term to that column,
+  e.g. `content:berlin`.
+
+**Punctuation never raises.** Unsafe characters split a token into separate terms
+rather than breaking the query: a contraction like `sister's` becomes `sister OR
+s`, so it still matches a stored `sister's dog`. Pasting a URL or a timestamp is
+safe too — only the real `essence:` / `content:` column filters are honoured, so
+`http://example.com` and `12:30` are treated as ordinary search terms (they do
+**not** become spurious `http:` / `12:` column filters). A genuinely malformed
+full-text expression is logged and degraded to zero FTS hits, so the rest of a
+hybrid search still returns results.
+
 ## Graph-Aware Ranking
 
 The graph signal uses **1-hop-weighted neighbour boost**.  If a
@@ -110,8 +150,6 @@ of `SearchConfig` fields.
 
 ## Querying reflections
 
-> **v0.4.0**
-
 After `DreamingExtension.run_consolidation()` runs its clustering phase,
 `ThoughtType.REFLECTION` meta-thoughts exist in the store.  Three knobs
 control how hybrid search handles them.
@@ -130,11 +168,12 @@ result = await store.search_hybrid(
 )
 ```
 
-### `reflection_boost` (default `SearchConfig.reflection_boost = 1.2`)
+### `reflection_boost` (default `SearchConfig.reflection_boost = 1.0`)
 
 When REFLECTIONs are included, their final score is multiplied by this
-factor.  The default `1.2` gives a modest upranking so high-level
-abstractions surface for broad queries without dominating narrow ones.
+factor.  The default `1.0` leaves REFLECTIONs competing on equal footing;
+raise it above `1.0` for a modest upranking so high-level abstractions
+surface for broad queries without dominating narrow ones.
 
 ```python
 # Stronger boost — reflections rank near the top for broad queries
@@ -156,7 +195,7 @@ Configure the default in YAML:
 
 ```yaml
 search:
-  reflection_boost: 1.2   # applies when reflection_boost not overridden per-call
+  reflection_boost: 1.0   # applies when reflection_boost not overridden per-call
 ```
 
 ### `search_reflections_only()`

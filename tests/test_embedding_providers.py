@@ -33,6 +33,7 @@ from engrava.domain.enums import (
     ThoughtVisibility,
 )
 from engrava.domain.models.thought import ThoughtRecord
+from engrava.infrastructure.sqlite.engrava_core import _build_embed_input
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -240,6 +241,108 @@ class TestAutoEmbed:
 
 
 # ---------------------------------------------------------------------------
+# Embed-input construction (prefix de-duplication)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingProvider:
+    """Embedding provider that records the exact text passed to ``embed``.
+
+    Wraps a fixed-dimension constant vector so the only observable effect is
+    the captured input string — used to assert *what* text auto-embed sends
+    to the provider, independent of the vector arithmetic.
+    """
+
+    def __init__(self, dimension: int = 4, model_name: str = "recording") -> None:
+        self._dimension = dimension
+        self._model_name = model_name
+        self.captured: list[str] = []
+
+    @property
+    def dimension(self) -> int:
+        return self._dimension
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    async def embed(self, text: str) -> list[float]:
+        self.captured.append(text)
+        return [0.0] * self._dimension
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        return [await self.embed(t) for t in texts]
+
+
+class TestBuildEmbedInput:
+    """Unit tests for the prefix-dedup helper :func:`_build_embed_input`."""
+
+    def test_essence_is_prefix_returns_content_alone(self) -> None:
+        content = "The quick brown fox jumps over the lazy dog near the river."
+        essence = content[:20]
+        assert _build_embed_input(essence, content) == content
+
+    def test_essence_not_prefix_returns_joined(self) -> None:
+        essence = "A short distinct summary"
+        content = "An entirely different body of text with no overlap at the start."
+        assert _build_embed_input(essence, content) == f"{essence}\n{content}"
+
+    def test_prefix_ignoring_surrounding_whitespace(self) -> None:
+        content = "Header line then the rest of the body."
+        essence = "  Header line  "
+        # The stripped essence is a prefix of the stripped content, so the
+        # essence adds no new information and is dropped.
+        assert _build_embed_input(essence, content) == content
+
+    def test_partial_overlap_is_not_treated_as_prefix(self) -> None:
+        # Conservative: only the clear prefix case dedups. A shared word that
+        # is not a leading prefix keeps the joined form.
+        essence = "fox jumps"
+        content = "The quick brown fox jumps."
+        assert _build_embed_input(essence, content) == f"{essence}\n{content}"
+
+    def test_identical_essence_and_content_returns_content(self) -> None:
+        text = "Exactly the same on both fields."
+        assert _build_embed_input(text, text) == text
+
+
+class TestAutoEmbedInput:
+    """Integration tests asserting the exact text auto-embed sends."""
+
+    async def test_prefix_essence_not_double_embedded(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        recorder = _RecordingProvider(dimension=4, model_name="recording")
+        store = SqliteEngravaCore(db, embedding_provider=recorder, auto_embed=True)
+
+        content = "The deployment failed because the database migration timed out."
+        essence = content[:20]  # essence == content[:N]
+        await store.create_thought(
+            _make_thought(thought_id="t-prefix", essence=essence, content=content)
+        )
+
+        assert recorder.captured == [content]
+        # The opening must not appear twice in the embedded text.
+        assert recorder.captured[0].count(essence) == 1
+
+    async def test_distinct_essence_uses_joined_form(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        recorder = _RecordingProvider(dimension=4, model_name="recording")
+        store = SqliteEngravaCore(db, embedding_provider=recorder, auto_embed=True)
+
+        essence = "Outage postmortem summary"
+        content = "The deployment failed because the database migration timed out."
+        await store.create_thought(
+            _make_thought(thought_id="t-distinct", essence=essence, content=content)
+        )
+
+        assert recorder.captured == [f"{essence}\n{content}"]
+
+
+# ---------------------------------------------------------------------------
 # Model immutability (lazy lock)
 # ---------------------------------------------------------------------------
 
@@ -390,7 +493,7 @@ class TestSchemaMigration:
             cursor = await conn.execute("PRAGMA user_version")
             row = await cursor.fetchone()
             assert row is not None
-            assert int(row[0]) == 12
+            assert int(row[0]) == 14
 
             # _metadata table should exist.
             cursor = await conn.execute(
@@ -571,6 +674,196 @@ class TestOpenAIProvider:
         assert len(results) == 2
 
 
+class TestOpenAIProviderRetry:
+    """Transient-error retry behaviour for OpenAICompatibleProvider."""
+
+    @staticmethod
+    def _ok_response(embedding: list[float]) -> MagicMock:
+        """A 200 response carrying a single embedding at index 0."""
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"data": [{"index": 0, "embedding": embedding}]}
+        return response
+
+    @staticmethod
+    def _status_response(status_code: int) -> MagicMock:
+        """A non-200 response with a benign body (no secret material)."""
+        response = MagicMock()
+        response.status_code = status_code
+        response.text = "service unavailable"
+        return response
+
+    async def test_embedding_retries_then_succeeds(self) -> None:
+        """A read timeout twice, then a 200 — vectors returned after 3 attempts."""
+        import httpx
+
+        from engrava.embeddings.openai_compatible import OpenAICompatibleProvider
+
+        # A non-zero base delay so the backoff path is exercised; the
+        # asyncio.sleep patch keeps the test from sleeping for real.
+        provider = OpenAICompatibleProvider(
+            model_name="test-model",
+            base_url="https://api.test.com/v1",
+            api_key="sk-test",
+            base_retry_delay_s=1.0,
+        )
+
+        ok = self._ok_response([0.1, 0.2, 0.3])
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(
+            side_effect=[
+                httpx.ReadTimeout("read timed out"),
+                httpx.ReadTimeout("read timed out"),
+                ok,
+            ]
+        )
+        provider._client = mock_client
+
+        with patch("asyncio.sleep", new=AsyncMock()) as mock_sleep:
+            result = await provider.embed("hello")
+
+        assert result == [0.1, 0.2, 0.3]
+        assert provider.dimension == 3
+        assert mock_client.post.call_count == 3
+        # Two failed attempts → two backoff sleeps before the success.
+        assert mock_sleep.await_count == 2
+
+    async def test_embedding_retries_on_retryable_status(self) -> None:
+        """A 503 twice, then a 200 — success after retrying the status."""
+        from engrava.embeddings.openai_compatible import OpenAICompatibleProvider
+
+        provider = OpenAICompatibleProvider(
+            model_name="test-model",
+            base_url="https://api.test.com/v1",
+            api_key="sk-test",
+            base_retry_delay_s=1.0,
+        )
+
+        ok = self._ok_response([0.4, 0.5])
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(
+            side_effect=[
+                self._status_response(503),
+                self._status_response(503),
+                ok,
+            ]
+        )
+        provider._client = mock_client
+
+        with patch("asyncio.sleep", new=AsyncMock()) as mock_sleep:
+            result = await provider.embed("hello")
+
+        assert result == [0.4, 0.5]
+        assert mock_client.post.call_count == 3
+        assert mock_sleep.await_count == 2
+
+    async def test_embedding_persistent_timeout_raises(self) -> None:
+        """A read timeout on every attempt raises after max_attempts (no loop)."""
+        import httpx
+
+        from engrava.embeddings.openai_compatible import OpenAICompatibleProvider
+
+        fake_api_key = "sk-canary-token-value"
+        provider = OpenAICompatibleProvider(
+            model_name="test-model",
+            base_url="https://api.test.com/v1",
+            api_key=fake_api_key,
+            max_attempts=3,
+            base_retry_delay_s=0,
+        )
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=httpx.ReadTimeout("read timed out"))
+        provider._client = mock_client
+
+        with (
+            patch("asyncio.sleep", new=AsyncMock()),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            await provider.embed("hello")
+
+        # Bounded: exactly max_attempts calls, then a raise — no infinite loop.
+        assert mock_client.post.call_count == 3
+        # The raised error must not leak the API key or an Authorization header.
+        message = str(exc_info.value)
+        assert fake_api_key not in message
+        assert "Authorization" not in message
+        assert "Bearer" not in message
+
+    async def test_embedding_non_retryable_status_raises_immediately(self) -> None:
+        """A 401 raises on the first attempt — no retry for a non-transient status."""
+        from engrava.embeddings.openai_compatible import OpenAICompatibleProvider
+
+        provider = OpenAICompatibleProvider(
+            model_name="test-model",
+            base_url="https://api.test.com/v1",
+            api_key="sk-test",
+            base_retry_delay_s=0,
+        )
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=self._status_response(401))
+        provider._client = mock_client
+
+        with (
+            patch("asyncio.sleep", new=AsyncMock()) as mock_sleep,
+            pytest.raises(RuntimeError, match="401"),
+        ):
+            await provider.embed("hello")
+
+        # No retry on a non-retryable status: a single attempt, zero sleeps.
+        assert mock_client.post.call_count == 1
+        assert mock_sleep.await_count == 0
+
+    async def test_embedding_success_path_unchanged(self) -> None:
+        """A 200 on the first try — exactly one attempt and identical vectors."""
+        from engrava.embeddings.openai_compatible import OpenAICompatibleProvider
+
+        provider = OpenAICompatibleProvider(
+            model_name="test-model",
+            base_url="https://api.test.com/v1",
+            api_key="sk-test",
+        )
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=self._ok_response([0.1, 0.2, 0.3]))
+        provider._client = mock_client
+
+        with patch("asyncio.sleep", new=AsyncMock()) as mock_sleep:
+            result = await provider.embed("hello")
+
+        assert result == [0.1, 0.2, 0.3]
+        assert provider.dimension == 3
+        # Backward-compat lock: one attempt, never any backoff sleep.
+        mock_client.post.assert_called_once()
+        assert mock_sleep.await_count == 0
+
+    async def test_embedding_backoff_is_bounded(self) -> None:
+        """With base_retry_delay_s=0 the retry count is bounded by max_attempts."""
+        import httpx
+
+        from engrava.embeddings.openai_compatible import OpenAICompatibleProvider
+
+        provider = OpenAICompatibleProvider(
+            model_name="test-model",
+            base_url="https://api.test.com/v1",
+            api_key="sk-test",
+            max_attempts=5,
+            base_retry_delay_s=0,
+        )
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+        provider._client = mock_client
+
+        with pytest.raises(RuntimeError):
+            await provider.embed("hello")
+
+        # Assert the attempt COUNT, not wall-clock — base_retry_delay_s=0
+        # means no real sleeping occurs.
+        assert mock_client.post.call_count == 5
+
+
 class TestOllamaProvider:
     """Unit tests for OllamaProvider."""
 
@@ -673,6 +966,93 @@ class TestSentenceTransformerProvider:
             provider._model = mock_instance
             provider._dimension = 384
             assert provider.dimension == 384
+
+    def test_load_raises_max_seq_length_to_architecture_max(self) -> None:
+        """Loading lifts a conservative shipped limit up to the true maximum.
+
+        ``all-MiniLM-L12-v2`` ships ``get_max_seq_length() == 128`` while its
+        BERT backbone supports ``max_position_embeddings == 512``. The provider
+        must raise ``max_seq_length`` to the architecture maximum so long
+        inputs are not silently truncated at 128 word-pieces.
+        """
+        from engrava.embeddings.sentence_transformer import SentenceTransformerProvider
+
+        # Fake transformer module exposing the architecture's true max.
+        transformer_module = MagicMock()
+        transformer_module.auto_model.config.max_position_embeddings = 512
+
+        fake_model = MagicMock()
+        fake_model.get_max_seq_length.return_value = 128
+        fake_model.max_seq_length = 128
+        fake_model.get_sentence_embedding_dimension.return_value = 384
+        fake_model.tokenizer.model_max_length = 128
+        # ``model[0]`` returns the underlying transformer module.
+        fake_model.__getitem__.return_value = transformer_module
+
+        st_module = MagicMock()
+        st_module.SentenceTransformer.return_value = fake_model
+
+        provider = SentenceTransformerProvider(model_name="all-MiniLM-L12-v2")
+        with patch.dict("sys.modules", {"sentence_transformers": st_module}):
+            loaded = provider._load_model()
+
+        assert loaded.max_seq_length == 512
+
+    def test_load_keeps_max_seq_length_when_already_full(self) -> None:
+        """No-op when the model already reports its full architecture limit."""
+        from engrava.embeddings.sentence_transformer import SentenceTransformerProvider
+
+        transformer_module = MagicMock()
+        transformer_module.auto_model.config.max_position_embeddings = 256
+
+        fake_model = MagicMock()
+        fake_model.get_max_seq_length.return_value = 256
+        fake_model.max_seq_length = 256
+        fake_model.get_sentence_embedding_dimension.return_value = 384
+        fake_model.tokenizer.model_max_length = 256
+        fake_model.__getitem__.return_value = transformer_module
+
+        st_module = MagicMock()
+        st_module.SentenceTransformer.return_value = fake_model
+
+        provider = SentenceTransformerProvider(model_name="already-full")
+        with patch.dict("sys.modules", {"sentence_transformers": st_module}):
+            loaded = provider._load_model()
+
+        assert loaded.max_seq_length == 256
+
+    def test_load_leaves_max_seq_length_when_architecture_max_unreadable(self) -> None:
+        """Untouched when the architecture max cannot be discovered."""
+        from engrava.embeddings.sentence_transformer import SentenceTransformerProvider
+
+        # Indexing the model raises — the provider cannot read the true max.
+        fake_model = MagicMock()
+        fake_model.__getitem__.side_effect = IndexError("no modules")
+        fake_model.get_max_seq_length.return_value = 64
+        fake_model.max_seq_length = 64
+        fake_model.get_sentence_embedding_dimension.return_value = 384
+
+        st_module = MagicMock()
+        st_module.SentenceTransformer.return_value = fake_model
+
+        provider = SentenceTransformerProvider(model_name="unreadable")
+        with patch.dict("sys.modules", {"sentence_transformers": st_module}):
+            loaded = provider._load_model()
+
+        assert loaded.max_seq_length == 64
+
+    def test_architecture_max_ignores_non_positive_config_value(self) -> None:
+        """A missing/sentinel config value is treated as not discoverable."""
+        from engrava.embeddings.sentence_transformer import SentenceTransformerProvider
+
+        transformer_module = MagicMock()
+        # A non-positive sentinel (e.g. unset) must not be adopted as the max.
+        transformer_module.auto_model.config.max_position_embeddings = 0
+        fake_model = MagicMock()
+        fake_model.__getitem__.return_value = transformer_module
+
+        provider = SentenceTransformerProvider(model_name="bad-config")
+        assert provider._architecture_max_seq_length(fake_model) is None
 
 
 # ---------------------------------------------------------------------------

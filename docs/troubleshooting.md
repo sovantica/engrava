@@ -72,7 +72,8 @@ erroring when its prerequisite is missing. Work through this checklist:
 | You pass `query_text` but no provider and no `query_vector` | same as above — there is no vector to compare against. |
 | `current_cycle` is `None` | the **recency** signal is skipped (it cannot compute an age). |
 | `recency_weight` is `0.0` | recency is disabled even if `current_cycle` is set. |
-| The query shares no FTS tokens with any thought | FTS legitimately returns nothing — this is a real miss, not a bug. |
+| The query shares no FTS tokens with any thought | FTS legitimately returns nothing — this is a real miss, not a bug. Note a *bare* query is `OR`-matched (any shared word hits), so this is rarer than it looks; if you instead get **too many** hits, you may want strict matching — see below. |
+| You used lowercase `and` / `or` between words | These are **not** FTS5 operators — they are matched as ordinary words (and `OR`-joined like any bare query). Booleans must be **uppercase** (`AND`, `OR`, `NOT`). |
 
 Inspect which signals actually ran via `HybridSearchResult.backends_used`:
 
@@ -85,6 +86,40 @@ If `'vector'` is missing and you expected semantic matching, configure an
 embedding provider (see the [Embeddings guide](guides/embeddings.md)). If
 `'recency'` is missing, pass a non-`None` `current_cycle` **and** a
 `recency_weight > 0`.
+
+## Keyword search returns too many results (I wanted all words to match)
+
+**Symptom.** A multi-word `search_fts` query (or the MCP `search_keywords` tool that
+wraps it — note `search_keywords` is an MCP tool name, not a `SqliteEngravaCore`
+method) returns documents that contain only *some* of the words, not all of them.
+
+**Cause.** A **bare** keyword query is matched with `OR`, by design — a document
+matches when it shares *any* word, and BM25 ranks the ones sharing the most
+distinctive words first (see [Keyword query syntax](search.md#keyword-query-syntax-fts)).
+This is what lets natural-language questions find relevant answers; it is not a bug.
+
+**Fix.** When you genuinely need every term, use FTS5 expert syntax explicitly —
+**uppercase** `AND` between the words, or a quoted phrase for an exact sequence:
+
+```python
+# require both words
+await store.search_fts("python AND asyncio", top_k=10)
+# require an exact phrase
+await store.search_fts('"event loop"', top_k=10)
+```
+
+Lowercase `and`/`or` will **not** work — they are matched as ordinary words.
+
+## Pasting a URL, path, or timestamp into search
+
+**Symptom.** You expect a query containing `http://…`, `12:30`, or a Windows path
+to error or to be interpreted as an FTS column filter.
+
+**Cause / behaviour.** It does neither. Only the real `essence:` and `content:`
+column filters are honoured; any other `token:token` (a URL scheme, a clock time)
+is split into ordinary search terms, so the query is safe to run and a genuinely
+malformed FTS expression degrades to zero FTS hits rather than raising. No action
+needed — this is the intended robustness.
 
 ## Dreaming promotes nothing (consolidation is inert)
 
@@ -124,6 +159,29 @@ print(result.promoted_count)
 ```
 
 See [Dreaming](dreaming.md) for the full gate-and-signal model.
+
+## Embedding ingest fails against an OpenAI-compatible endpoint
+
+**Symptom.** Writes that auto-embed (or explicit embed calls) raise after a pause,
+either immediately or after a few seconds of retrying.
+
+**Cause / what to expect.** `OpenAICompatibleProvider` retries a request with
+bounded exponential backoff on a *transient* failure — a read timeout or network
+blip, or a transient HTTP status (`408`, `409`, `425`, `429`, `500`, `502`, `503`,
+`504`). Two outcomes:
+
+- **A transient failure that persists across every attempt** is raised as a
+  `RuntimeError` once `max_attempts` is exhausted (it never loops forever). If you
+  see this under sustained `429`s, you are being rate-limited — raise
+  `base_retry_delay_s`, lower your ingest concurrency, or batch more slowly.
+- **A non-transient status** (`400`, `401`, `403`, `404`) is surfaced
+  **immediately with no retry** — it indicates a request/auth/model error, not a
+  blip. Check your `api_key`, `base_url`, and `model_name`.
+
+**Fix.** Tune the retry budget on the provider (`max_attempts`, default `3`;
+`base_retry_delay_s`, default `1.0`), or address the underlying cause above. Only
+`OpenAICompatibleProvider` retries — `OllamaProvider` / `HuggingFaceProvider` do
+not. See the [Embeddings guide](guides/embeddings.md#openaicompatibleprovider--openai-or-any-openai-compatible-api).
 
 ## `EmbeddingModelMismatchError` when opening an existing database
 

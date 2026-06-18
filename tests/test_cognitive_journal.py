@@ -718,7 +718,7 @@ class TestSchemaMigration:
 
             cursor = await conn.execute("PRAGMA user_version")
             row = await cursor.fetchone()
-            assert row[0] == 12
+            assert row[0] == 14
         finally:
             await conn.close()
 
@@ -760,7 +760,7 @@ class TestSchemaMigration:
 
             cursor = await conn.execute("PRAGMA user_version")
             row = await cursor.fetchone()
-            assert row[0] == 12
+            assert row[0] == 14
         finally:
             await conn.close()
 
@@ -775,7 +775,7 @@ class TestSchemaMigration:
 
             cursor = await conn.execute("PRAGMA user_version")
             row = await cursor.fetchone()
-            assert row[0] == 12
+            assert row[0] == 14
         finally:
             await conn.close()
 

@@ -137,6 +137,33 @@ async def test_quickstart_search_returns_tuples() -> None:
         assert all(isinstance(tid, str) and isinstance(sc, float) for tid, sc in results)
 
 
+async def test_quickstart_remember_and_recall() -> None:
+    """quickstart 'Store and search a memory — the short way'.
+
+    remember() stores text as a thought (generating its id) and returns the
+    ThoughtRecord; recall() returns a HybridSearchResult whose ``results`` are
+    (thought_id, score) tuples. Without a ``current_cycle``, recall() leaves
+    recency off — the documented contract — so ``backends_used`` carries no
+    recency marker.
+    """
+    async with aiosqlite.connect(":memory:") as conn:
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        await store.ensure_schema()
+
+        stored = await store.remember("User prefers concise answers")
+        assert stored.thought_id  # generated for the caller
+        assert stored.essence == "User prefers concise answers"
+        await store.remember("User works in Berlin")
+
+        result = await store.recall("what does the user prefer?")
+        for thought_id, score in result.results:
+            assert isinstance(thought_id, str)
+            assert isinstance(score, float)
+        # Documented: recency stays off until a current_cycle is supplied.
+        assert "recency" not in result.backends_used
+
+
 async def test_quickstart_mindql_find_and_count() -> None:
     """README + quickstart + mindql.md MindQL usage.
 

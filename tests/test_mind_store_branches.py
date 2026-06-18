@@ -304,68 +304,114 @@ class TestResolveHybridDefaultsValidation:
 
 
 class TestNormalizeFtsToken:
-    """Edge cases in the FTS5 token normalizer."""
+    """Edge cases in the FTS5 token normalizer.
+
+    ``_normalize_fts_token`` returns the list of FTS5 terms a single token
+    expands to. A token may yield zero terms (all punctuation), one term
+    (a plain word), or several (a contraction split on its clitic). The
+    ``expert`` flag mirrors the surrounding query: expert syntax preserves
+    operators/phrases/column filters, bare syntax sanitizes everything.
+    """
+
+    # --- Expert-mode passthrough -------------------------------------------
 
     def test_and_keyword_passthrough(self) -> None:
-        assert _normalize_fts_token("AND") == "AND"
+        assert _normalize_fts_token("AND", expert=True) == ["AND"]
 
     def test_or_keyword_passthrough(self) -> None:
-        assert _normalize_fts_token("OR") == "OR"
+        assert _normalize_fts_token("OR", expert=True) == ["OR"]
 
     def test_not_keyword_passthrough(self) -> None:
-        assert _normalize_fts_token("NOT") == "NOT"
+        assert _normalize_fts_token("NOT", expert=True) == ["NOT"]
 
     def test_token_with_quotes_passthrough(self) -> None:
-        assert _normalize_fts_token('"already-quoted"') == '"already-quoted"'
+        assert _normalize_fts_token('"already-quoted"', expert=True) == ['"already-quoted"']
 
-    def test_token_with_colon_passthrough(self) -> None:
-        assert _normalize_fts_token("field:value") == "field:value"
+    def test_whitelisted_column_filter_passthrough(self) -> None:
+        assert _normalize_fts_token("essence:value", expert=True) == ["essence:value"]
+        assert _normalize_fts_token("content:value", expert=True) == ["content:value"]
+
+    def test_unknown_column_filter_is_sanitized(self) -> None:
+        # A non-whitelisted column would crash FTS5 ("no such column: field"),
+        # so it is split on the colon into bare OR-terms instead.
+        assert _normalize_fts_token("field:value", expert=True) == ["field", "value"]
 
     def test_natural_language_colon_is_sanitized(self) -> None:
-        assert _normalize_fts_token("events:") == "events"
+        assert _normalize_fts_token("events:", expert=True) == ["events"]
 
-    def test_empty_token_passthrough(self) -> None:
-        assert _normalize_fts_token("") == ""
+    def test_empty_token_yields_no_terms(self) -> None:
+        assert _normalize_fts_token("", expert=True) == []
+        assert _normalize_fts_token("", expert=False) == []
 
     def test_no_hyphen_passthrough(self) -> None:
-        assert _normalize_fts_token("simple") == "simple"
+        assert _normalize_fts_token("simple", expert=True) == ["simple"]
 
     def test_prefix_star_no_hyphen(self) -> None:
-        """Trailing '*' on a non-hyphenated token → left unchanged."""
-        assert _normalize_fts_token("prefix*") == "prefix*"
+        """Trailing '*' on a non-hyphenated token is preserved."""
+        assert _normalize_fts_token("prefix*", expert=True) == ["prefix*"]
 
     def test_hyphen_token_normalized(self) -> None:
-        assert _normalize_fts_token("REQ-FUNC") == '"REQ-FUNC"'
+        assert _normalize_fts_token("REQ-FUNC", expert=True) == ['"REQ-FUNC"']
 
     def test_hyphen_token_with_star(self) -> None:
-        assert _normalize_fts_token("REQ-FUNC*") == '"REQ-FUNC"*'
+        assert _normalize_fts_token("REQ-FUNC*", expert=True) == ['"REQ-FUNC"*']
 
     def test_parenthesized_hyphen_token(self) -> None:
-        assert _normalize_fts_token("(REQ-001)") == '("REQ-001")'
+        assert _normalize_fts_token("(REQ-001)", expert=True) == ['("REQ-001")']
 
     def test_leading_paren_only(self) -> None:
-        assert _normalize_fts_token("(REQ-001") == '("REQ-001"'
+        assert _normalize_fts_token("(REQ-001", expert=True) == ['("REQ-001"']
 
     def test_trailing_paren_only(self) -> None:
-        assert _normalize_fts_token("REQ-001)") == '"REQ-001")'
+        assert _normalize_fts_token("REQ-001)", expert=True) == ['"REQ-001")']
 
-    def test_full_query_normalization(self) -> None:
+    # --- Bare natural-language mode ----------------------------------------
+
+    def test_bare_no_hyphen_word(self) -> None:
+        assert _normalize_fts_token("simple", expert=False) == ["simple"]
+
+    def test_bare_contraction_splits_into_terms(self) -> None:
+        assert _normalize_fts_token("sister's", expert=False) == ["sister", "s"]
+
+    def test_bare_hyphen_token_is_quoted(self) -> None:
+        assert _normalize_fts_token("REQ-FUNC", expert=False) == ['"REQ-FUNC"']
+
+    def test_bare_url_splits_into_fragments(self) -> None:
+        # A pasted URL is never a column filter in bare mode; it splits on the
+        # colon, slashes and dots into useful OR-terms.
+        assert _normalize_fts_token("http://example.com", expert=False) == [
+            "http",
+            "example",
+            "com",
+        ]
+
+    def test_bare_only_punctuation_yields_no_terms(self) -> None:
+        assert _normalize_fts_token("!!!", expert=False) == []
+
+    # --- Whole-query normalization -----------------------------------------
+
+    def test_expert_query_joins_with_spaces(self) -> None:
+        # Uppercase operators trigger expert mode → space-joined implicit AND.
         result = _normalize_fts_query("REQ-001 AND simple-word OR OR")
         assert '"REQ-001"' in result
         assert '"simple-word"' in result
+        assert " AND " in result
         assert result.endswith("OR")
 
-    def test_currency_token_loses_dollar_prefix(self) -> None:
-        assert _normalize_fts_token("$5") == "5"
+    def test_bare_query_joins_with_or(self) -> None:
+        result = _normalize_fts_query("coffee creamer coupon")
+        assert result == "coffee OR creamer OR coupon"
 
-    def test_apostrophe_is_removed_from_bare_token(self) -> None:
-        assert _normalize_fts_token("Toyota's") == "Toyotas"
+    def test_currency_token_loses_dollar_prefix(self) -> None:
+        assert _normalize_fts_token("$5", expert=False) == ["5"]
 
     def test_question_with_currency_and_punctuation_normalizes(self) -> None:
         result = _normalize_fts_query("Where did I redeem a $5 coupon on coffee creamer?")
         assert "$" not in result
         assert "?" not in result
         assert "5" in result
+        # Bare query → OR-joined.
+        assert " OR " in result
 
 
 # ---------------------------------------------------------------------------
