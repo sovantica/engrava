@@ -85,7 +85,7 @@ priority, thought type, metadata, or the cognitive cycle on a write — build a
 
 From here, link thoughts with [typed edges](#edge-based-knowledge-graph),
 query them with [MindQL](#mindql-query-language), or run the full
-ingest → dream → search tour in the [Quick Start guide](docs/quickstart.md).
+ingest → dream → search tour in the [Quick Start guide](https://github.com/sovantica/engrava/blob/main/docs/quickstart.md).
 
 ### Configuration-Driven Setup
 
@@ -98,12 +98,12 @@ async with await SqliteEngravaCore.from_config("engrava.yaml") as store:
     thought = await store.get_thought("some-id")
 ```
 
-See [docs/configuration.md](docs/configuration.md) for the full YAML schema.
+See [docs/configuration.md](https://github.com/sovantica/engrava/blob/main/docs/configuration.md) for the full YAML schema.
 
 ## Upgrading
 
 Automatic schema migration runs on first connection. See the
-[upgrade guide](docs/upgrade.md) for compatibility notes, backup guidance, and
+[upgrade guide](https://github.com/sovantica/engrava/blob/main/docs/upgrade.md) for compatibility notes, backup guidance, and
 troubleshooting steps.
 
 ## Features
@@ -176,7 +176,7 @@ creates **REFLECTION thoughts** by clustering semantically related
 thoughts and computing centroid embeddings (no LLM required). Available
 since 0.3.0.
 
-→ See [`docs/benchmarks.md`](docs/benchmarks.md) for reproducible
+→ See [`docs/benchmarks.md`](https://github.com/sovantica/engrava/blob/main/docs/benchmarks.md) for reproducible
 evidence (synthetic benchmark suite runnable in ~5 minutes).
 
 ### Tamper-Evident Audit Trail
@@ -186,7 +186,7 @@ SHA-256-linked, before/after entry — off by default, one config flag to enable
 Query history with `store.journal.get_entries(...)` and validate the chain with
 `store.journal.verify_integrity()`.
 
-→ See [`docs/audit-trail.md`](docs/audit-trail.md) for enabling, querying,
+→ See [`docs/audit-trail.md`](https://github.com/sovantica/engrava/blob/main/docs/audit-trail.md) for enabling, querying,
 verification, and the security model (what "tamper-evident" does and does not
 guarantee).
 
@@ -215,7 +215,7 @@ pip install "engrava[mcp]"
 engrava-mcp        # spawned by your MCP client over stdio
 ```
 
-→ See [`docs/guides/mcp.md`](docs/guides/mcp.md) for install, client
+→ See [`docs/guides/mcp.md`](https://github.com/sovantica/engrava/blob/main/docs/guides/mcp.md) for install, client
 configuration, the full tool/resource/prompt reference, and read-only mode.
 
 ## CLI
@@ -233,7 +233,7 @@ engrava --db mydata.db export -o portable.json
 `engrava info` now renders the same metrics snapshot contract exposed by
 `await store.metrics()`.
 
-See the [CLI reference](docs/cli.md) for every command and option.
+See the [CLI reference](https://github.com/sovantica/engrava/blob/main/docs/cli.md) for every command and option.
 
 ## Architecture
 
@@ -246,33 +246,33 @@ See the [CLI reference](docs/cli.md) for every command and option.
 
 ## Documentation
 
-- [Core Concepts](docs/concepts.md) — the mental model (thought, edge, reflection, cycle, …) — start here
-- [The Bi-temporal Model](docs/bitemporal.md) — the optional valid-time axis: query a fact as of any instant, `invalidate` without deleting
-- [Positioning](docs/positioning.md) — when Engrava is (and isn't) the right tool, and how it compares
-- [Quick Start](docs/quickstart.md) — 5-minute setup guide
-- [Tutorial](docs/tutorial.md) — build a small notes memory end to end
-- [Recipes](docs/recipes/index.md) — copy-paste snippets for common tasks (store a turn, retrieve context, TTL, dedup, …)
-- [Building a memory-backed agent](docs/guides/agent-memory.md) — the end-to-end agent turn loop (ingest → retrieve → generate → consolidate)
-- [Migrating from another memory system](docs/guides/migrating-from-other-memory.md) — concept mapping, porting calls, bulk import, and scoping/multi-tenancy
-- [Embeddings](docs/guides/embeddings.md) — wiring a real embedding provider (local / OpenAI / Ollama / HuggingFace / custom)
-- [MCP server](docs/guides/mcp.md) — expose a store to MCP clients (Claude Desktop, Claude Code, Cursor, Windsurf, VS Code): install, run, client config, tools/resources/prompts
-- [Configuration](docs/configuration.md) — YAML config format and options
-- [Upgrade Guide](docs/upgrade.md) — compatibility matrix, backups, and troubleshooting
-- [Extensions](docs/extensions.md) — Writing custom extensions and hooks
-- [Observability](docs/observability.md) — Metrics snapshot API
-- [Audit Trail](docs/audit-trail.md) — Tamper-evident hash-chain journal (enabling, querying, verifying, security model)
-- [API Reference](docs/api-reference.md) — Full protocol and class reference
-- [CLI Reference](docs/cli.md) — every `engrava` command and option
-- [Glossary](docs/glossary.md) — quick definitions of every Engrava term
-- [MindQL](docs/mindql.md) — Query language syntax and examples
-- [Troubleshooting](docs/troubleshooting.md) — symptom → cause → fix for common errors
-- [FAQ](docs/faq.md) — quick answers (LLM/keys, embeddings-optional, scale, concurrency, backups, …)
-- [Performance & Scaling](docs/performance.md) — the vector-backend switch, bulk-ingest, and dreaming cost at scale
-- [Data Lifecycle & Retention](docs/data-lifecycle.md) — lifecycle states, TTL, archive-vs-delete, GDPR erasure, disk reclamation
-- [Deployment](docs/deployment.md) — process model, database files on disk, containers, graceful shutdown
-- [Concurrency](docs/concurrency.md) — the WAL single-writer model, busy timeout, and per-service isolation
-- [Backup & Recovery](docs/backup-and-recovery.md) — WAL-safe backups, snapshot vs file copy, restore verification
-- [Known Limitations](docs/known-limitations.md) — Platform notes and constraints
+- [Core Concepts](https://github.com/sovantica/engrava/blob/main/docs/concepts.md) — the mental model (thought, edge, reflection, cycle, …) — start here
+- [The Bi-temporal Model](https://github.com/sovantica/engrava/blob/main/docs/bitemporal.md) — the optional valid-time axis: query a fact as of any instant, `invalidate` without deleting
+- [Positioning](https://github.com/sovantica/engrava/blob/main/docs/positioning.md) — when Engrava is (and isn't) the right tool, and how it compares
+- [Quick Start](https://github.com/sovantica/engrava/blob/main/docs/quickstart.md) — 5-minute setup guide
+- [Tutorial](https://github.com/sovantica/engrava/blob/main/docs/tutorial.md) — build a small notes memory end to end
+- [Recipes](https://github.com/sovantica/engrava/blob/main/docs/recipes/index.md) — copy-paste snippets for common tasks (store a turn, retrieve context, TTL, dedup, …)
+- [Building a memory-backed agent](https://github.com/sovantica/engrava/blob/main/docs/guides/agent-memory.md) — the end-to-end agent turn loop (ingest → retrieve → generate → consolidate)
+- [Migrating from another memory system](https://github.com/sovantica/engrava/blob/main/docs/guides/migrating-from-other-memory.md) — concept mapping, porting calls, bulk import, and scoping/multi-tenancy
+- [Embeddings](https://github.com/sovantica/engrava/blob/main/docs/guides/embeddings.md) — wiring a real embedding provider (local / OpenAI / Ollama / HuggingFace / custom)
+- [MCP server](https://github.com/sovantica/engrava/blob/main/docs/guides/mcp.md) — expose a store to MCP clients (Claude Desktop, Claude Code, Cursor, Windsurf, VS Code): install, run, client config, tools/resources/prompts
+- [Configuration](https://github.com/sovantica/engrava/blob/main/docs/configuration.md) — YAML config format and options
+- [Upgrade Guide](https://github.com/sovantica/engrava/blob/main/docs/upgrade.md) — compatibility matrix, backups, and troubleshooting
+- [Extensions](https://github.com/sovantica/engrava/blob/main/docs/extensions.md) — Writing custom extensions and hooks
+- [Observability](https://github.com/sovantica/engrava/blob/main/docs/observability.md) — Metrics snapshot API
+- [Audit Trail](https://github.com/sovantica/engrava/blob/main/docs/audit-trail.md) — Tamper-evident hash-chain journal (enabling, querying, verifying, security model)
+- [API Reference](https://github.com/sovantica/engrava/blob/main/docs/api-reference.md) — Full protocol and class reference
+- [CLI Reference](https://github.com/sovantica/engrava/blob/main/docs/cli.md) — every `engrava` command and option
+- [Glossary](https://github.com/sovantica/engrava/blob/main/docs/glossary.md) — quick definitions of every Engrava term
+- [MindQL](https://github.com/sovantica/engrava/blob/main/docs/mindql.md) — Query language syntax and examples
+- [Troubleshooting](https://github.com/sovantica/engrava/blob/main/docs/troubleshooting.md) — symptom → cause → fix for common errors
+- [FAQ](https://github.com/sovantica/engrava/blob/main/docs/faq.md) — quick answers (LLM/keys, embeddings-optional, scale, concurrency, backups, …)
+- [Performance & Scaling](https://github.com/sovantica/engrava/blob/main/docs/performance.md) — the vector-backend switch, bulk-ingest, and dreaming cost at scale
+- [Data Lifecycle & Retention](https://github.com/sovantica/engrava/blob/main/docs/data-lifecycle.md) — lifecycle states, TTL, archive-vs-delete, GDPR erasure, disk reclamation
+- [Deployment](https://github.com/sovantica/engrava/blob/main/docs/deployment.md) — process model, database files on disk, containers, graceful shutdown
+- [Concurrency](https://github.com/sovantica/engrava/blob/main/docs/concurrency.md) — the WAL single-writer model, busy timeout, and per-service isolation
+- [Backup & Recovery](https://github.com/sovantica/engrava/blob/main/docs/backup-and-recovery.md) — WAL-safe backups, snapshot vs file copy, restore verification
+- [Known Limitations](https://github.com/sovantica/engrava/blob/main/docs/known-limitations.md) — Platform notes and constraints
 
 ## Development
 
@@ -286,4 +286,4 @@ pytest --cov                      # Test with coverage
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](https://github.com/sovantica/engrava/blob/main/LICENSE) for details.
