@@ -156,6 +156,46 @@ does not reference an existing thought
         )
 
 
+class InvalidFilterError(EngravaError):
+    """Raised when a metadata/visibility filter is invalid at construction.
+
+    Covers value-domain violations (a non-finite float, an out-of-range
+    integer, a scalar of an unsupported type), an empty
+    :class:`~engrava.domain.models.filters.VisibilityQueryFilter`, an
+    unsupported operator, and a predicate count beyond the documented
+    maximum. The error is always raised at *filter construction* — never
+    mid-query — so a compiled filter that reaches the store is known-good.
+
+    Args:
+        message: Human-readable description of why the filter is invalid.
+
+    """
+
+
+class InvalidFilterPathError(EngravaError):
+    r"""Raised when a filter path does not match the allowed grammar.
+
+    A predicate path must be a JSONPath of the restricted shape
+    ``$``, ``$.key`` or ``$[0]`` (dot-identifiers and bracketed array
+    indices only), validated against
+    ``^\$(\.[A-Za-z0-9_]+|\[[0-9]+\])*$``. Anything else (a bare key
+    with no ``$`` root, a wildcard, a quoted segment, an injection
+    attempt) is rejected at filter construction.
+
+    Args:
+        path: The offending path string.
+
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        super().__init__(
+            f"invalid filter path {path!r}: paths must match "
+            r"^\$(\.[A-Za-z0-9_]+|\[[0-9]+\])*$ "
+            "(e.g. '$', '$.session_id', '$.tags[0]')",
+        )
+
+
 class ExtensionMigrationError(EngravaError):
     """Raised when an extension schema migration fails.
 
