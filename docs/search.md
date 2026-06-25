@@ -143,6 +143,78 @@ result = await store.search_hybrid(
 )
 ```
 
+## Scoped retrieval
+
+`search_hybrid()` and `recall()` accept two optional, keyword-only filter
+arguments that scope the ranked query to rows whose `metadata` satisfies a
+typed predicate. Both default to `None` (no filtering, the candidate set is
+unchanged).
+
+```python
+from engrava import FieldOp, FieldPredicate, MetadataFilter, VisibilityQueryFilter
+
+# Equality / membership over your metadata keys (an AND of predicates):
+result = await store.search_hybrid(
+    "deployment runbook",
+    top_k=10,
+    filters=MetadataFilter(
+        [
+            FieldPredicate("$.project", FieldOp.EQ, "atlas"),
+            FieldPredicate("$.env", FieldOp.IN, ["staging", "prod"]),
+        ]
+    ),
+)
+
+# "Public, or mine" — admit public rows plus rows this user owns:
+result = await store.recall(
+    "deployment runbook",
+    top_k=10,
+    visibility=VisibilityQueryFilter(allowed={"public"}, owner="u1"),
+)
+```
+
+**Where the filter is applied.** The predicate runs **inside each search arm,
+before that arm's limit** — so a narrow filter still returns up to `top_k`
+matching rows and is never starved by out-of-filter candidates consuming the
+ranking budget. This is the key advantage over over-fetching and post-filtering
+(which can starve `top_k`) or a raw `json_extract` pre-filter (which loses the
+hybrid ranking).
+
+**Semantics:**
+
+- `filters` is a `MetadataFilter` — an `AND` of `FieldPredicate(path, op, value)`
+  over JSON paths (`$`, `$.key`, `$.key[0]`). Operators are `EQ` and `IN`.
+- `EQ None` matches both a missing path and an explicit JSON `null`. An empty
+  `IN` matches nothing. An empty `MetadataFilter` is a match-all no-op.
+- Values compare under **SQLite value equality**: booleans are stored as
+  integers, so `EQ True` matches a stored `1` (and `EQ False` matches `0`).
+- `visibility` is a `VisibilityQueryFilter(allowed, owner)` reading
+  `$.visibility` and `$.owner`. It composes with `filters` by `AND`; its `OR`
+  is bounded and parenthesised, so an `owner` match can never escape the
+  metadata `AND`.
+- Filter objects validate **at construction** (bad path, unsupported operator,
+  out-of-range integer, non-finite float, an all-empty `VisibilityQueryFilter`)
+  and raise `InvalidFilterError` / `InvalidFilterPathError` — never mid-query.
+
+> **A filter is a query refinement, not an isolation boundary.** It narrows what
+> a ranked query *considers*; it performs no authentication, authorization,
+> ownership validation, or write enforcement. The `visibility` filter reads only
+> the metadata your application wrote, and a caller can omit it or supply any
+> `owner`. **Do not use it to keep one tenant's data away from another** — for
+> tenant isolation give each tenant its own store via `EngravaManager`
+> (see [migrating-from-other-memory.md](guides/migrating-from-other-memory.md#filtering-scoping--multi-tenancy)).
+
+**Determinism.** Results are ordered by combined score descending, with ties
+broken by canonical `thought_id` ascending — a stable total order independent of
+the underlying scan order. (This tie-break is always applied, with or without a
+filter.)
+
+> **Note on BM25 scores.** The keyword arm's BM25 ranking uses store-global
+> corpus statistics. A filter changes which rows are *eligible*, but does not
+> recompute term frequencies over the filtered subset — relative scores are
+> still computed against the whole corpus. This is the intended behaviour for a
+> query refinement within one memory.
+
 ## Configuration Reference
 
 See [configuration.md](configuration.md) for the full YAML reference

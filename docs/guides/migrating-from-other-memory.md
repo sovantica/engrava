@@ -33,7 +33,8 @@ common concepts onto Engrava:
 | Embedding / vector | Stored on write only with `embedding_provider=...` **and** `auto_embed=True`; otherwise call `store_embedding(thought_id, vector)` yourself | See the [Embeddings guide](embeddings.md). |
 | Vector / similarity search | **`search_similar(query_vector, …)`** | Needs a ready query vector. |
 | Keyword / BM25 search | **`search_fts(query, …)`** | Returns `list[(thought_id, score)]`. |
-| Hybrid search | **`search_hybrid(query_text, …)`** | Fuses FTS + vector + recency + priority + graph. |
+| Hybrid search | **`search_hybrid(query_text, …)`** | Fuses FTS + vector + recency + priority + graph. Optional `filters=` / `visibility=` scope the ranked path — see [scoping](#filtering-scoping--multi-tenancy). |
+| Scoped / filtered search (`search(..., user_id=…)`) | **`filters=` / `visibility=`** on `search_hybrid` / `recall` | A query refinement on the ranked path, *not* tenant isolation; see [scoping](#filtering-scoping--multi-tenancy). |
 | Automatic summarisation / fact extraction | *(none — by design)* | Engrava does no LLM-side extraction; see [Non-goals](../positioning.md#non-goals). |
 | Decay / forgetting | TTL + lifecycle + the recency signal | See [Data lifecycle](../data-lifecycle.md) (TTL, archive-vs-delete, erasure) and the recency signal in [Search](../search.md). |
 | Summaries of clusters | **`REFLECTION`** thoughts via [dreaming](../dreaming.md) | Structural (centroid + keywords), not LLM prose. |
@@ -80,16 +81,24 @@ is the closest analogue to a managed hybrid search:
 # before (illustrative):
 #   hits = memory.search("what theme does the user like?", user_id="u1")
 
-# after (engrava) — note: search is unscoped; filter by user yourself:
-result = await store.search_hybrid("what theme does the user like?", top_k=10)
+# after (engrava) — scope the ranked path with a metadata filter:
+from engrava import FieldOp, FieldPredicate, MetadataFilter
+
+result = await store.search_hybrid(
+    "what theme does the user like?",
+    top_k=10,
+    filters=MetadataFilter([FieldPredicate("$.user_id", FieldOp.EQ, "u1")]),
+)
 for thought_id, score in result.results:
     record = await store.get_thought(thought_id)
-    if record is not None and record.metadata.get("user_id") == "u1":
+    if record is not None:
         print(score, record.essence)
 ```
 
-See [filtering, scoping & multi-tenancy](#filtering-scoping--multi-tenancy)
-for why the post-filter is there and how to do it better.
+The `filters=` argument scopes recall *inside* the ranked path, so you neither
+over-fetch nor lose ranking. It is a query refinement, **not** tenant isolation —
+see [filtering, scoping & multi-tenancy](#filtering-scoping--multi-tenancy) for
+the full set of patterns and when to reach for a store-per-tenant instead.
 
 ## Bulk import
 
@@ -172,11 +181,16 @@ for the throughput levers in detail.
 
 ## Filtering, scoping & multi-tenancy
 
-This is the most important difference from a hosted memory service. Engrava's
-**`search_hybrid` / `search_similar` / `search_fts` take no scope or metadata
-filter** — they rank across the entire store. There is no `user_id=` or
-`session_id=` argument on the ranked path. You scope retrieval yourself, and
-there are three patterns, with clear tradeoffs.
+This is the most important difference from a hosted memory service. By default,
+`search_similar` and `search_fts` rank across the entire store, and a hosted
+service's `user_id=` / `session_id=` scoping has no direct equivalent — you
+decide how to scope. There are four patterns, with clear tradeoffs.
+
+The most important distinction: **a metadata filter is a query refinement, not
+an isolation boundary.** If you need tenants kept genuinely separate, reach for
+**Option B** (a store per tenant) — not a metadata filter, which any caller can
+omit or change. Use a filter (**Option D**) to narrow *one* agent's own memory
+by project, session, or visibility.
 
 ### Option A — over-fetch, then post-filter (simplest)
 
@@ -254,17 +268,58 @@ rows = await cursor.fetchall()
   this path does **not** apply the hybrid ranking signals (it is a filter, not a
   ranked search). Treat the schema as semi-stable and re-check it across upgrades.
 
+### Option D — a metadata filter on the ranked path (scoped *and* ranked)
+
+`search_hybrid` and `recall` accept optional `filters=` and `visibility=`
+arguments. The filter is applied **inside each search arm, before its limit**, so
+it scopes recall *without* over-fetching (Option A) and *without* dropping below
+the ranked API (Option C). A narrow filter still returns up to `top_k` matching
+results — out-of-filter rows never consume the ranking budget.
+
+```python
+from engrava import FieldOp, FieldPredicate, MetadataFilter, VisibilityQueryFilter
+
+# Scope a ranked recall to one user (equality on a metadata key):
+result = await store.search_hybrid(
+    "dark mode",
+    top_k=5,
+    filters=MetadataFilter([FieldPredicate("$.user_id", FieldOp.EQ, "u1")]),
+)
+
+# "Public, or mine" — admit public rows plus rows this user owns:
+result = await store.recall(
+    "dark mode",
+    top_k=5,
+    visibility=VisibilityQueryFilter(allowed={"public"}, owner="u1"),
+)
+```
+
+`filters` is an `AND` of typed predicates (`EQ` / `IN`) over your `metadata`
+keys; `visibility` is the bounded "public-or-mine" shape reading `$.visibility`
+and `$.owner`. See [Scoped retrieval](../search.md#scoped-retrieval) for the full
+semantics.
+
+- **Pros:** scoped recall that keeps the hybrid ranking; no over-fetch, no raw
+  SQL; `top_k` is honoured within the filter.
+- **Cons:** **not an isolation boundary.** It refines what a query considers; it
+  enforces nothing. The `visibility` filter reads whatever your app wrote — it
+  performs no authentication, ownership validation, or write enforcement, and a
+  caller can omit it or forge `owner`. For genuine tenant separation use Option
+  B; never rely on a filter to keep one tenant's data away from another.
+
 ### Choosing
 
 | Situation | Use |
 |---|---|
 | Small/medium store, occasional scoping | **A** (over-fetch + post-filter) |
-| A handful of coarse tenants needing real isolation | **B** (store per tenant) |
+| Tenants that must be genuinely separate (isolation) | **B** (store per tenant) |
 | Scoped recall over a large store, ranking not required | **C** (raw `json_extract`) |
+| Scoped recall over one store that still needs ranking | **D** (`filters=` / `visibility=`) |
 
-> **Want a real filter on the ranked path?** Adding a scope/metadata argument to
-> `search_*` is a public-API change under consideration, not a current feature.
-> Until then, the patterns above are the supported approach.
+> **Isolation vs. filtering.** Option D narrows a ranked query within one store;
+> it is a convenience, not a security boundary. For cross-tenant isolation use a
+> store per tenant (Option B); shared-corpus access control with real
+> enforcement is a feature of the commercial tier.
 
 ## See also
 
