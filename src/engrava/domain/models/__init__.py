@@ -3,6 +3,13 @@
 from engrava.domain.models.action import ActionRecord
 from engrava.domain.models.edge import EdgeRecord
 from engrava.domain.models.embedding import EmbeddingRecord
+from engrava.domain.models.filters import (
+    FieldOp,
+    FieldPredicate,
+    FilterScalar,
+    MetadataFilter,
+    VisibilityQueryFilter,
+)
 from engrava.domain.models.metrics import (
     EdgeCounts,
     EngravaMetrics,
@@ -22,10 +29,15 @@ __all__ = [
     "EdgeRecord",
     "EmbeddingRecord",
     "EngravaMetrics",
+    "FieldOp",
+    "FieldPredicate",
+    "FilterScalar",
     "HybridSearchResult",
     "LatencyHistogram",
+    "MetadataFilter",
     "MetadataValue",
     "StorageFootprint",
     "ThoughtCounts",
     "ThoughtRecord",
+    "VisibilityQueryFilter",
 ]

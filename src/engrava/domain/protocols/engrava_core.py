@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from engrava.domain.models.edge import EdgeRecord
     from engrava.domain.models.embedding import EmbeddingRecord
+    from engrava.domain.models.filters import MetadataFilter, VisibilityQueryFilter
     from engrava.domain.models.metrics import EngravaMetrics
     from engrava.domain.models.search import HybridSearchResult
     from engrava.domain.models.thought import MetadataValue, ThoughtRecord
@@ -102,6 +103,8 @@ class EngravaCoreProtocol(Protocol):
         *,
         top_k: int = 10,
         current_cycle: int | None = None,
+        filters: MetadataFilter | None = None,
+        visibility: VisibilityQueryFilter | None = None,
     ) -> HybridSearchResult:
         """Retrieve thoughts relevant to a query with one call.
 
@@ -115,6 +118,13 @@ class EngravaCoreProtocol(Protocol):
             current_cycle: Current cognitive cycle.  When provided, the
                 recency signal is blended into ranking; when ``None``,
                 recency is skipped.
+            filters: Optional metadata filter (an ``AND`` of typed field
+                predicates over ``metadata``); delegated to
+                ``search_hybrid``. ``None`` leaves the candidate set
+                unchanged.
+            visibility: Optional bounded visibility query filter; delegated
+                to ``search_hybrid``. A query refinement, not access
+                control — it enforces nothing and is bypassable.
 
         Returns:
             A ``HybridSearchResult`` with the ranked matches and the set of
@@ -273,6 +283,8 @@ class EngravaCoreProtocol(Protocol):
         current_cycle: int | None = None,
         fts_top_k: int = 50,
         vector_top_k: int = 50,
+        filters: MetadataFilter | None = None,
+        visibility: VisibilityQueryFilter | None = None,
     ) -> HybridSearchResult:
         """Hybrid search combining FTS5 keyword + vector cosine similarity.
 
@@ -307,6 +319,15 @@ class EngravaCoreProtocol(Protocol):
             current_cycle: Current cycle number for recency calculation.
             fts_top_k: Max candidates from FTS5 before fusion.
             vector_top_k: Max candidates from vector search before fusion.
+            filters: Optional metadata filter (an ``AND`` of typed field
+                predicates over ``metadata``), applied in-arm before each
+                arm's limit so it never starves ``top_k``. ``None`` (or an
+                empty filter) leaves the candidate set unchanged.
+            visibility: Optional bounded visibility query filter for the
+                "public-or-mine" pattern. A query refinement, **not** access
+                control — it performs no authentication, authorization, or
+                ownership enforcement; the caller can forge ``owner``; it is
+                bypassable; it must not be used to protect tenant data.
 
         Returns:
             ``HybridSearchResult`` with ranked results and the set of

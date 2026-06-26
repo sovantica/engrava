@@ -49,6 +49,7 @@ from engrava.domain.models._temporal import validate_iso8601_nullable
 from engrava.domain.models.action import ActionRecord
 from engrava.domain.models.edge import EdgeRecord
 from engrava.domain.models.embedding import EmbeddingRecord
+from engrava.domain.models.filters import compile_effective_predicate
 from engrava.domain.models.thought import MetadataValue, ThoughtRecord
 from engrava.domain.models.ttl import CleanupResult, CleanupStrategy
 from engrava.domain.protocols.hooks import DefaultEngravaHooks, EngravaHooksProtocol
@@ -60,6 +61,7 @@ if TYPE_CHECKING:
 
     from engrava.config import MetricsConfig, SearchConfig
     from engrava.domain.manifest import ExtensionManifest
+    from engrava.domain.models.filters import MetadataFilter, VisibilityQueryFilter
     from engrava.domain.models.metrics import EngravaMetrics, LatencyHistogram
     from engrava.domain.models.search import HybridSearchResult
     from engrava.domain.protocols.embedding_provider import EmbeddingProviderProtocol
@@ -1838,6 +1840,8 @@ class SqliteEngravaCore:
         *,
         top_k: int = 10,
         current_cycle: int | None = None,
+        filters: MetadataFilter | None = None,
+        visibility: VisibilityQueryFilter | None = None,
     ) -> HybridSearchResult:
         """Retrieve thoughts relevant to a query with one call.
 
@@ -1858,6 +1862,19 @@ class SqliteEngravaCore:
             current_cycle: Current cognitive cycle. When provided, the recency
                 signal is blended into ranking; when ``None``, recency is
                 skipped.
+            filters: Optional :class:`~engrava.domain.models.filters.MetadataFilter`
+                — an ``AND`` of typed field predicates over ``metadata``;
+                delegated to :meth:`search_hybrid`. ``None`` (or an empty
+                filter) leaves the candidate set unchanged.
+            visibility: Optional
+                :class:`~engrava.domain.models.filters.VisibilityQueryFilter`
+                for the "public-or-mine" pattern; delegated to
+                :meth:`search_hybrid`. **This is a query filter, not access
+                control** — it performs no authentication, authorization,
+                ownership validation, or write enforcement; the caller can
+                forge ``owner``; it is bypassable by passing
+                ``visibility=None``, by using another API, or by issuing raw
+                SQL; it must not be used to protect tenant data.
 
         Returns:
             A ``HybridSearchResult`` with the ranked matches and the set of
@@ -1880,6 +1897,8 @@ class SqliteEngravaCore:
             query_text=query,
             top_k=top_k,
             current_cycle=current_cycle,
+            filters=filters,
+            visibility=visibility,
         )
 
     async def cleanup_expired(
@@ -2809,6 +2828,8 @@ class SqliteEngravaCore:
         query_vector: list[float],
         top_k: int = 10,
         threshold: float = 0.0,
+        *,
+        _filter_clause: tuple[str, list[object]] | None = None,
     ) -> list[tuple[str, float]]:
         """Cosine similarity search — delegates to sqlite-vec if available.
 
@@ -2821,15 +2842,26 @@ class SqliteEngravaCore:
             query_vector: Query embedding vector.
             top_k: Maximum number of results.
             threshold: Minimum cosine similarity score.
+            _filter_clause: Internal. A compiled
+                ``(sql_fragment, params)`` metadata predicate (referencing
+                ``t.metadata_json``). When supplied the exhaustive numpy path
+                is used unconditionally — even when a ``vec0`` backend is
+                configured — because the ``vec0`` ``MATCH`` query applies a
+                ``LIMIT`` *before* any metadata predicate could run, which
+                would yield wrong neighbours (filtering eligible rows must
+                precede cosine and top-k, never follow a ``LIMIT``). Supplied
+                by :meth:`search_hybrid`; not part of the public contract.
 
         Returns:
-            List of ``(thought_id, similarity_score)`` sorted descending.
+            List of ``(thought_id, similarity_score)`` sorted descending
+            (ties broken by ``thought_id`` ascending for a deterministic
+            total order).
 
         """
         import time as _time  # noqa: PLC0415
 
         _t_start = _time.perf_counter()
-        if self._vector_backend is not None:
+        if self._vector_backend is not None and _filter_clause is None:
             results = await self._vector_backend.search(
                 self._db,
                 query_vector,
@@ -2837,9 +2869,15 @@ class SqliteEngravaCore:
                 threshold,
             )
             filtered = await self._filter_expired_results(results)
+            filtered = _sort_scored_descending(filtered)
             await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
             return filtered
-        results = await self._search_similar_numpy(query_vector, top_k, threshold)
+        results = await self._search_similar_numpy(
+            query_vector,
+            top_k,
+            threshold,
+            _filter_clause=_filter_clause,
+        )
         await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
         return results
 
@@ -2887,20 +2925,37 @@ class SqliteEngravaCore:
         query_vector: list[float],
         top_k: int = 10,
         threshold: float = 0.0,
+        *,
+        _filter_clause: tuple[str, list[object]] | None = None,
     ) -> list[tuple[str, float]]:
         """Brute-force cosine similarity search (numpy-batched).
+
+        The arm order is mandatory (and the reason a metadata filter forces
+        this exhaustive path): SQL-filter the eligible rows, compute cosine
+        over **all** of them, then apply top-k. A ``LIMIT`` before cosine
+        would surface wrong neighbours.
 
         Args:
             query_vector: Query embedding vector.
             top_k: Maximum number of results.
             threshold: Minimum cosine similarity score.
+            _filter_clause: Internal. A compiled ``(sql_fragment, params)``
+                metadata predicate (referencing ``t.metadata_json``) injected
+                into the ``WHERE`` so cosine runs only over eligible rows.
 
         Returns:
-            List of ``(thought_id, similarity_score)`` sorted descending.
+            List of ``(thought_id, similarity_score)`` sorted descending
+            (ties broken by ``thought_id`` ascending).
 
         """
+        filter_sql = ""
+        filter_params: list[object] = []
+        if _filter_clause is not None:
+            filter_fragment, filter_params = _filter_clause
+            filter_sql = f"AND {filter_fragment} "
+
         cursor = await self._db.execute(
-            "SELECT e.owner_id, e.dimension, e.vector_blob "
+            "SELECT e.owner_id, e.dimension, e.vector_blob "  # noqa: S608
             "FROM embedding e "
             "JOIN thought t ON e.owner_id = t.thought_id "
             "WHERE e.owner_type = 'THOUGHT' "
@@ -2909,8 +2964,9 @@ class SqliteEngravaCore:
             # its cluster left the active set) must not over-recall on its
             # now-stale centroid. Only REFLECTIONs are gated on lifecycle
             # here; other thought types keep their existing recall behaviour.
-            "AND NOT (t.thought_type = 'REFLECTION' AND t.lifecycle_status != 'ACTIVE')",
-            (datetime.datetime.now(datetime.UTC).isoformat(),),
+            "AND NOT (t.thought_type = 'REFLECTION' AND t.lifecycle_status != 'ACTIVE') "
+            f"{filter_sql}",
+            (datetime.datetime.now(datetime.UTC).isoformat(), *filter_params),
         )
         rows = await cursor.fetchall()
         if not rows:
@@ -2940,7 +2996,9 @@ class SqliteEngravaCore:
             for i in range(len(owner_ids))
             if float(scores[i]) >= threshold
         ]
-        results.sort(key=lambda x: x[1], reverse=True)
+        # Cosine over all eligible rows is complete; apply the deterministic
+        # total order, then top-k.
+        results = _sort_scored_descending(results)
         return results[:top_k]
 
     # ------------------------------------------------------------------
@@ -2951,6 +3009,8 @@ class SqliteEngravaCore:
         self,
         query: str,
         top_k: int = 10,
+        *,
+        _filter_clause: tuple[str, list[object]] | None = None,
     ) -> list[tuple[str, float]]:
         """Full-text search via SQLite FTS5 with BM25 ranking.
 
@@ -2973,10 +3033,17 @@ class SqliteEngravaCore:
                 quoted phrases, uppercase ``AND``/``OR``/``NOT`` and
                 ``essence:``/``content:`` column filters invoke expert syntax.
             top_k: Maximum number of results.
+            _filter_clause: Internal. A compiled
+                ``(sql_fragment, params)`` metadata predicate (referencing
+                ``t.metadata_json``) injected into the ``WHERE`` *before* the
+                ``LIMIT`` so out-of-filter rows never consume the FTS arm's
+                budget. Supplied by :meth:`search_hybrid`; not part of the
+                public contract.
 
         Returns:
             List of ``(thought_id, bm25_score)`` sorted by relevance
-            (higher = more relevant).
+            (higher = more relevant; ties broken by ``thought_id`` ascending
+            for a deterministic total order).
 
         """
         import time as _time  # noqa: PLC0415
@@ -3001,9 +3068,18 @@ class SqliteEngravaCore:
             await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
             return []
 
+        filter_sql = ""
+        filter_params: list[object] = []
+        if _filter_clause is not None:
+            filter_fragment, filter_params = _filter_clause
+            # Injected before LIMIT: out-of-filter rows never consume the
+            # arm's budget. ``filter_fragment`` is its own json_valid-guarded
+            # CASE expression, safe to AND in directly.
+            filter_sql = f"AND {filter_fragment} "
+
         # bm25() returns negative values; negate so higher = more relevant.
         sql = (
-            "SELECT t.thought_id, -bm25(thought_fts) AS score "
+            "SELECT t.thought_id, -bm25(thought_fts) AS score "  # noqa: S608
             "FROM thought_fts "
             "JOIN thought t ON t.rowid = thought_fts.rowid "
             "WHERE thought_fts MATCH ? "
@@ -3011,13 +3087,20 @@ class SqliteEngravaCore:
             # Freshness floor: retired REFLECTIONs are excluded so a stale
             # synthesis does not out-rank fresh relevant thoughts.
             "AND NOT (t.thought_type = 'REFLECTION' AND t.lifecycle_status != 'ACTIVE') "
-            "ORDER BY score DESC "
+            f"{filter_sql}"
+            # Deterministic total order: BM25 first, then canonical thought_id.
+            "ORDER BY score DESC, t.thought_id ASC "
             "LIMIT ?"
         )
         try:
             cursor = await self._db.execute(
                 sql,
-                (normalized_query, datetime.datetime.now(datetime.UTC).isoformat(), top_k),
+                (
+                    normalized_query,
+                    datetime.datetime.now(datetime.UTC).isoformat(),
+                    *filter_params,
+                    top_k,
+                ),
             )
             rows = await cursor.fetchall()
         except OperationalError:
@@ -3448,6 +3531,7 @@ class SqliteEngravaCore:
         max_sources_per_reflection: int,
         reflection_source_ceiling: int,
         expansion_sources: dict[str, str] | None = None,
+        _filter_clause: tuple[str, list[object]] | None = None,
     ) -> int:
         """Expand candidate pool by pulling source OBSERVATIONs from top REFLECTIONs.
 
@@ -3478,6 +3562,10 @@ class SqliteEngravaCore:
             expansion_sources: Optional output mapping populated with
                 ``source_id -> parent_reflection_id`` for candidates that
                 were newly introduced by graph expansion.
+            _filter_clause: Internal. A compiled ``(sql_fragment, params)``
+                metadata predicate forwarded to :meth:`_filter_observation_ids`
+                so expansion-pulled OBSERVATIONs that fall outside the active
+                filter are never injected into ``combined``.
 
         Returns:
             Number of new or updated entries written into ``combined``.
@@ -3506,7 +3594,10 @@ class SqliteEngravaCore:
         )
         edge_rows = await cursor.fetchall()
 
-        obs_ids = await self._filter_observation_ids([str(r["to_thought_id"]) for r in edge_rows])
+        obs_ids = await self._filter_observation_ids(
+            [str(r["to_thought_id"]) for r in edge_rows],
+            _filter_clause=_filter_clause,
+        )
         if not obs_ids:
             return 0
 
@@ -3538,30 +3629,52 @@ class SqliteEngravaCore:
 
         return added
 
-    async def _filter_observation_ids(self, candidate_ids: list[str]) -> frozenset[str]:
+    async def _filter_observation_ids(
+        self,
+        candidate_ids: list[str],
+        *,
+        _filter_clause: tuple[str, list[object]] | None = None,
+    ) -> frozenset[str]:
         """Return the subset of ``candidate_ids`` whose thought_type is OBSERVATION.
 
         Used by ``_expand_via_consolidated_from`` to strip non-factual
         targets (TASK, REFLECTION, …) from the expansion pool before
         propagating scores.
 
+        When a metadata predicate is active it is re-applied here too: the
+        CONSOLIDATED_FROM expansion pulls brand-new OBSERVATION rows that
+        never passed an arm's ``WHERE``, so without this an out-of-filter
+        OBSERVATION could be injected into the result set. Re-applying the
+        same effective predicate keeps the eligibility invariant on the
+        expansion path.
+
         Args:
             candidate_ids: Unfiltered list of target thought IDs.
+            _filter_clause: Internal. A compiled ``(sql_fragment, params)``
+                metadata predicate (referencing the bare ``metadata_json``
+                column) injected into the ``WHERE``.
 
         Returns:
-            Frozenset containing only IDs of OBSERVATION-type thoughts.
-            Empty frozenset when ``candidate_ids`` is empty.
+            Frozenset containing only IDs of OBSERVATION-type thoughts that
+            also satisfy the active filter. Empty frozenset when
+            ``candidate_ids`` is empty.
 
         """
         unique = list(dict.fromkeys(candidate_ids))  # deduplicate, preserve insertion order
         if not unique:
             return frozenset()
+        filter_sql = ""
+        filter_params: list[object] = []
+        if _filter_clause is not None:
+            filter_fragment, filter_params = _filter_clause
+            filter_sql = f" AND {filter_fragment}"
         placeholders = ", ".join("?" for _ in unique)
         cursor = await self._db.execute(
             f"SELECT thought_id FROM thought"  # noqa: S608
             f" WHERE thought_type = 'OBSERVATION'"
-            f" AND thought_id IN ({placeholders})",
-            unique,
+            f" AND thought_id IN ({placeholders})"
+            f"{filter_sql}",
+            [*unique, *filter_params],
         )
         rows = await cursor.fetchall()
         return frozenset(str(r["thought_id"]) for r in rows)
@@ -3638,6 +3751,8 @@ class SqliteEngravaCore:
         graph_edge_decay: float | None = None,
         include_reflections: bool = True,
         reflection_boost: float | None = None,
+        filters: MetadataFilter | None = None,
+        visibility: VisibilityQueryFilter | None = None,
     ) -> HybridSearchResult:
         """Hybrid search combining FTS5 + vector + recency + priority + graph signals.
 
@@ -3646,6 +3761,15 @@ class SqliteEngravaCore:
         exponential recency decay, applies priority boost, then adds
         1-hop-weighted graph boost, and returns merged results
         sorted by combined score.
+
+        Optional ``filters`` / ``visibility`` scope the ranked query to rows
+        whose ``metadata`` satisfies a typed predicate. The predicate is
+        applied **in-arm, before each arm's limit** (and re-applied on the
+        consolidation-expansion path), so an out-of-filter row never enters
+        the candidate set, consumes an arm's budget, or contributes a signal
+        — and a narrow filter is not starved by out-of-filter candidates.
+        This is a **query capability, not a security boundary** (see
+        ``visibility`` below).
 
         Graceful degradation:
             - If FTS5 unavailable or ``query_text`` empty → FTS skipped.
@@ -3677,9 +3801,28 @@ class SqliteEngravaCore:
             reflection_boost: Multiplier applied to REFLECTION thought
                 scores. ``None`` uses the value from ``SearchConfig``
                 (default ``1.0``).
+            filters: Optional :class:`~engrava.domain.models.filters.MetadataFilter`
+                — an ``AND`` of typed field predicates over ``metadata``.
+                ``None`` (or an empty filter) leaves the candidate set
+                unchanged. The predicate is applied in-arm before each arm's
+                limit, so it never starves ``top_k``.
+            visibility: Optional
+                :class:`~engrava.domain.models.filters.VisibilityQueryFilter`
+                — the bounded ``(visibility IN … [OR owner = …])`` shape for
+                the "public-or-mine" pattern. **This is a query filter, not
+                access control.** It performs no authentication,
+                authorization, ownership validation, or write enforcement;
+                the caller supplies (and can forge) ``owner``; it is
+                bypassable by passing ``visibility=None``, by using another
+                API, or by issuing raw SQL. It must **not** be used to protect
+                tenant data — use a store per tenant (``EngravaManager``) for
+                isolation and the commercial RBAC tier for shared-corpus
+                access control.
 
         Returns:
-            ``HybridSearchResult`` with ranked results and diagnostics.
+            ``HybridSearchResult`` with ranked results and diagnostics. Tied
+            scores are ordered by canonical ``thought_id`` ascending, giving
+            a deterministic total order regardless of ``filters``.
 
         """
         import time as _time  # noqa: PLC0415
@@ -3687,6 +3830,16 @@ class SqliteEngravaCore:
         from engrava.domain.models.search import HybridSearchResult  # noqa: PLC0415
 
         _t_start = _time.perf_counter()
+
+        # Compile the effective metadata predicate once per column alias:
+        # the arms join ``thought t`` (t.metadata_json); the expansion stage
+        # queries ``thought`` unaliased (metadata_json). ``None`` when neither
+        # argument constrains anything, so the unfiltered query path is
+        # unchanged (apart from the always-on deterministic tie-break).
+        filter_clause_t = compile_effective_predicate(filters, visibility, column="t.metadata_json")
+        filter_clause_plain = compile_effective_predicate(
+            filters, visibility, column="metadata_json"
+        )
 
         backends_used: set[str] = set()
         (
@@ -3790,14 +3943,22 @@ class SqliteEngravaCore:
             # --- Gather FTS results ---
             if fts_active:
                 backends_used.add("fts5")
-                fts_results = await self.search_fts(query_text, top_k=fts_top_k)
+                fts_results = await self.search_fts(
+                    query_text,
+                    top_k=fts_top_k,
+                    _filter_clause=filter_clause_t,
+                )
             else:
                 fts_results = []
 
             # --- Gather vector results ---
             vec_results: list[tuple[str, float]] = []
             if effective_vector is not None:
-                vec_results = await self.search_similar(effective_vector, top_k=vector_top_k)
+                vec_results = await self.search_similar(
+                    effective_vector,
+                    top_k=vector_top_k,
+                    _filter_clause=filter_clause_t,
+                )
                 backends_used.add("vector")
         finally:
             _SUPPRESS_SEARCH_METRICS.reset(token)
@@ -3877,6 +4038,7 @@ class SqliteEngravaCore:
                     else 50
                 ),
                 expansion_sources=None,
+                _filter_clause=filter_clause_plain,
             )
             if _added > 0:
                 backends_used.add("graph_expansion")
@@ -3916,7 +4078,9 @@ class SqliteEngravaCore:
                 if rid in combined:
                     combined[rid] = combined[rid] * resolved_reflection_boost
 
-        ranked = sorted(combined.items(), key=lambda x: x[1], reverse=True)
+        # Deterministic total order: score descending, canonical thought_id
+        # ascending — invariant to dict/scan order.
+        ranked = _sort_scored_descending(list(combined.items()))
         final = ranked[:top_k]
 
         # --- reflection_topk_cap enforcement ---
@@ -3942,7 +4106,7 @@ class SqliteEngravaCore:
                     )
                 _fill = _off_list_obs[:_excess]
                 _kept = [(tid, s) for tid, s in final if tid not in _to_evict]
-                final = sorted(_kept + _fill, key=lambda x: x[1], reverse=True)[:top_k]
+                final = _sort_scored_descending(_kept + _fill)[:top_k]
 
         await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
 
@@ -4587,6 +4751,26 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     if norm_a == 0.0 or norm_b == 0.0:
         return 0.0
     return float(np.dot(va, vb) / (norm_a * norm_b))
+
+
+def _sort_scored_descending(
+    results: list[tuple[str, float]],
+) -> list[tuple[str, float]]:
+    """Sort ``(thought_id, score)`` pairs into a deterministic total order.
+
+    Primary key is score descending; ties are broken by canonical
+    ``thought_id`` ascending. This makes the order invariant to the
+    physical scan order of the underlying query (the determinism guarantee
+    for the ranked retrieval path).
+
+    Args:
+        results: ``(thought_id, score)`` pairs.
+
+    Returns:
+        A new list sorted by score descending, then ``thought_id`` ascending.
+
+    """
+    return sorted(results, key=lambda item: (-item[1], item[0]))
 
 
 def _normalize_min_max(

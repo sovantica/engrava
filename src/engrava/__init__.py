@@ -32,6 +32,8 @@ from engrava.domain.exceptions import (
     EmbeddingModelMismatchError,
     EngravaError,
     ExtensionMigrationError,
+    InvalidFilterError,
+    InvalidFilterPathError,
     InvalidTransitionError,
     ReadOnlyViolationError,
     StaleDataError,
@@ -41,6 +43,12 @@ from engrava.domain.manifest import ExtensionManifest
 from engrava.domain.models.action import ActionRecord
 from engrava.domain.models.edge import EdgeRecord
 from engrava.domain.models.embedding import EmbeddingRecord
+from engrava.domain.models.filters import (
+    FieldOp,
+    FieldPredicate,
+    MetadataFilter,
+    VisibilityQueryFilter,
+)
 from engrava.domain.models.journal import JournalEntry, JournalIntegrityResult
 from engrava.domain.models.metrics import (
     EdgeCounts,
@@ -121,9 +129,13 @@ __all__ = [
     "EngravaMetrics",
     "ExtensionManifest",
     "ExtensionMigrationError",
+    "FieldOp",
+    "FieldPredicate",
     "FrequencySignal",
     "HuggingFaceProvider",
     "HybridSearchResult",
+    "InvalidFilterError",
+    "InvalidFilterPathError",
     "InvalidTransitionError",
     "JournalConfig",
     "JournalEntry",
@@ -132,6 +144,7 @@ __all__ = [
     "KnowledgeSource",
     "LatencyHistogram",
     "LifecycleStatus",
+    "MetadataFilter",
     "MetricsConfig",
     "MindQLCommand",
     "MindQLExecutor",
@@ -170,6 +183,7 @@ __all__ = [
     "ThoughtType",
     "ThoughtVisibility",
     "VerificationStatus",
+    "VisibilityQueryFilter",
     "discover_manifests",
     "load_config",
     "parse",

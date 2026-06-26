@@ -287,9 +287,15 @@ class TestOffOnPair:
 # ---------------------------------------------------------------------------
 
 
-# Baseline captured pre-WS from release/v0.3.0 HEAD = bb407ac.  Any
-# accidental new export through ``engrava/__init__.py`` will surface as
-# a non-empty diff on this set.
+# Baseline of the legitimate package-level ``__all__``.  Any *accidental*
+# new export through ``engrava/__init__.py`` (e.g. benchmark code leaking
+# out) will surface as a non-empty diff on this set. Deliberate public-API
+# additions are recorded here when they ship.
+#
+# Baseline captured pre-WS from release/v0.3.0 HEAD = bb407ac, then extended
+# with the metadata-filter query surface (FieldOp / FieldPredicate /
+# MetadataFilter / VisibilityQueryFilter + the two typed filter errors), an
+# intentional, ratified public-API addition.
 _PRE_WS_ALL_BASELINE = frozenset(
     {
         "ActionRecord",
@@ -325,9 +331,13 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "EngravaMetrics",
         "ExtensionManifest",
         "ExtensionMigrationError",
+        "FieldOp",
+        "FieldPredicate",
         "FrequencySignal",
         "HuggingFaceProvider",
         "HybridSearchResult",
+        "InvalidFilterError",
+        "InvalidFilterPathError",
         "InvalidTransitionError",
         "JournalConfig",
         "JournalEntry",
@@ -336,6 +346,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "KnowledgeSource",
         "LatencyHistogram",
         "LifecycleStatus",
+        "MetadataFilter",
         "MetricsConfig",
         "MindQLCommand",
         "MindQLExecutor",
@@ -374,6 +385,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "ThoughtType",
         "ThoughtVisibility",
         "VerificationStatus",
+        "VisibilityQueryFilter",
         "discover_manifests",
         "load_config",
         "parse",
