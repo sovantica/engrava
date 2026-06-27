@@ -417,6 +417,19 @@ class TestParseSearchGraphExpansion:
         with pytest.raises(ConfigError):
             _parse_search({"graph_expansion_enabled": "yes"})
 
+    def test_collapse_pool_factor_default(self) -> None:
+        """collapse_pool_factor defaults to 4 when unspecified."""
+        assert _parse_search(None).collapse_pool_factor == 4
+
+    def test_collapse_pool_factor_explicit(self) -> None:
+        """An explicit collapse_pool_factor is wired through."""
+        assert _parse_search({"collapse_pool_factor": 6}).collapse_pool_factor == 6
+
+    def test_invalid_collapse_pool_factor_raises(self) -> None:
+        """A non-positive collapse_pool_factor raises ConfigError."""
+        with pytest.raises(ConfigError, match=r"collapse_pool_factor.*positive integer"):
+            _parse_search({"collapse_pool_factor": 0})
+
 
 # ---------------------------------------------------------------------------
 # Regression tests for the 4 gaps found in review (2026-04-23)

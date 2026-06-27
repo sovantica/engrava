@@ -548,6 +548,17 @@ class SearchConfig:
             excess REFLECTIONs are evicted and replaced by the highest-
             scoring off-list non-REFLECTION candidates. Set to ``1.0`` to
             disable the cap. Defaults to ``0.3``.
+        collapse_pool_factor: Bounded multiplier applied to each arm's
+            candidate budget (``fts_top_k`` / ``vector_top_k``) **only when**
+            a ``collapse_key`` is passed to ``search_hybrid()`` / ``recall()``.
+            De-fragmentation backfill can only draw from candidates the arms
+            produced; under heavy same-unit fragmentation the per-arm budgets
+            may be dominated by fragments of few units, leaving fewer than
+            ``top_k`` distinct units after collapse. Widening each arm by this
+            small, bounded factor gives collapse a deeper pool to backfill
+            distinct units from — never an unbounded over-fetch. Has no effect
+            on the ``collapse_key=None`` path. Must be ``>= 1``. Defaults
+            to ``4``.
 
     Examples:
         >>> cfg = SearchConfig()
@@ -582,6 +593,7 @@ class SearchConfig:
     graph_expansion_max_sources_per_reflection: int = 20
     graph_expansion_reflection_source_ceiling: int = 50
     reflection_topk_cap: float = 0.3
+    collapse_pool_factor: int = 4
 
 
 @dataclass(frozen=True)
@@ -1468,6 +1480,11 @@ def _parse_search(raw: Any) -> SearchConfig:  # noqa: ANN401
         msg = "'search.graph_expansion_reflection_source_ceiling' must be a positive integer"
         raise ConfigError(msg)
 
+    collapse_pool_factor = raw.get("collapse_pool_factor", 4)
+    if not isinstance(collapse_pool_factor, int) or collapse_pool_factor < 1:
+        msg = "'search.collapse_pool_factor' must be a positive integer"
+        raise ConfigError(msg)
+
     return SearchConfig(
         default_fts_weight=fts_w,
         default_vector_weight=vec_w,
@@ -1488,6 +1505,7 @@ def _parse_search(raw: Any) -> SearchConfig:  # noqa: ANN401
         graph_expansion_max_sources_per_reflection=expansion_max_sources,
         graph_expansion_reflection_source_ceiling=expansion_ceiling,
         reflection_topk_cap=reflection_topk_cap,
+        collapse_pool_factor=collapse_pool_factor,
     )
 
 

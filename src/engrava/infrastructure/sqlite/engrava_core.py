@@ -49,7 +49,7 @@ from engrava.domain.models._temporal import validate_iso8601_nullable
 from engrava.domain.models.action import ActionRecord
 from engrava.domain.models.edge import EdgeRecord
 from engrava.domain.models.embedding import EmbeddingRecord
-from engrava.domain.models.filters import compile_effective_predicate
+from engrava.domain.models.filters import _validate_path, compile_effective_predicate
 from engrava.domain.models.thought import MetadataValue, ThoughtRecord
 from engrava.domain.models.ttl import CleanupResult, CleanupStrategy
 from engrava.domain.protocols.hooks import DefaultEngravaHooks, EngravaHooksProtocol
@@ -1842,6 +1842,7 @@ class SqliteEngravaCore:
         current_cycle: int | None = None,
         filters: MetadataFilter | None = None,
         visibility: VisibilityQueryFilter | None = None,
+        collapse_key: str | Sequence[str] | None = None,
     ) -> HybridSearchResult:
         """Retrieve thoughts relevant to a query with one call.
 
@@ -1875,6 +1876,21 @@ class SqliteEngravaCore:
                 forge ``owner``; it is bypassable by passing
                 ``visibility=None``, by using another API, or by issuing raw
                 SQL; it must not be used to protect tenant data.
+            collapse_key: Optional de-fragmentation unit key (a single
+                metadata path or an ordered sequence forming a composite key);
+                delegated to :meth:`search_hybrid`. When set, only the single
+                best-ranked row per caller-defined unit reaches the result and
+                the freed slots are backfilled by deeper distinct units. This
+                is a **presentation / de-dup convenience, not a filter and not
+                isolation** — it does not change which rows are *eligible*, and
+                the collapse step itself mutates no score (it only drops
+                lower-ranked same-unit members). Note that *setting*
+                ``collapse_key`` also widens the internal candidate pool, which
+                — because the keyword arm is min-max normalized over the
+                candidate set — can rescale normalized fusion scores and shift
+                order among units; only ``collapse_key=None`` is byte-identical
+                to the unfiltered path. It is only as meaningful as the unit
+                metadata the application writes.
 
         Returns:
             A ``HybridSearchResult`` with the ranked matches and the set of
@@ -1899,6 +1915,7 @@ class SqliteEngravaCore:
             current_cycle=current_cycle,
             filters=filters,
             visibility=visibility,
+            collapse_key=collapse_key,
         )
 
     async def cleanup_expired(
@@ -3733,6 +3750,59 @@ class SqliteEngravaCore:
         recency_active = current_cycle is not None and recency_weight > 0.0
         return (fts_active, effective_vector, recency_active)
 
+    async def _fetch_collapse_unit_keys(
+        self,
+        *,
+        thought_ids: list[str],
+        paths: tuple[str, ...],
+    ) -> dict[str, tuple[object, ...] | None]:
+        """Fetch the de-fragmentation unit key per candidate id.
+
+        Issues one ``SELECT thought_id, json_extract(metadata_json, ?)[, …]``
+        over the candidate ids (same shape as the existing REFLECTION id
+        lookup). Each component is ``json_valid``-guarded, so a row holding
+        malformed ``metadata_json`` yields all-NULL components and is treated
+        as key-less. A unit key is ``None`` (key-less → its own unit, never
+        collapsed) when any component is NULL — a partial composite key is not
+        a shared identity.
+
+        Args:
+            thought_ids: Candidate ids to look up (the fused candidate set).
+            paths: The validated, ordered unit-key paths.
+
+        Returns:
+            Map from ``thought_id`` to its unit-key tuple, or ``None`` for a
+            key-less / partial-key / malformed-metadata row. Ids absent from
+            the table are simply omitted (callers treat missing as ``None``).
+
+        """
+        if not thought_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in thought_ids)
+        # Each path projects ``CASE WHEN json_valid(metadata_json) THEN
+        # json_extract(metadata_json, ?) ELSE NULL END`` so malformed JSON
+        # never aborts the query and folds to a NULL component. ``paths`` and
+        # ``thought_ids`` bind as parameters; the column is a fixed literal.
+        projections = ", ".join(
+            "CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json, ?) ELSE NULL END"
+            for _ in paths
+        )
+        params: list[object] = [*paths, *thought_ids]
+        cursor = await self._db.execute(
+            f"SELECT thought_id, {projections} FROM thought"  # noqa: S608
+            f" WHERE thought_id IN ({placeholders})",
+            params,
+        )
+        rows = await cursor.fetchall()
+        unit_keys: dict[str, tuple[object, ...] | None] = {}
+        n = len(paths)
+        for row in rows:
+            thought_id = str(row[0])
+            components = tuple(row[i + 1] for i in range(n))
+            # Any NULL component ⇒ key-less (own unit, never collapsed).
+            unit_keys[thought_id] = None if any(c is None for c in components) else components
+        return unit_keys
+
     async def search_hybrid(  # noqa: C901, PLR0912, PLR0915
         self,
         query_text: str,
@@ -3753,6 +3823,7 @@ class SqliteEngravaCore:
         reflection_boost: float | None = None,
         filters: MetadataFilter | None = None,
         visibility: VisibilityQueryFilter | None = None,
+        collapse_key: str | Sequence[str] | None = None,
     ) -> HybridSearchResult:
         """Hybrid search combining FTS5 + vector + recency + priority + graph signals.
 
@@ -3818,6 +3889,30 @@ class SqliteEngravaCore:
                 tenant data — use a store per tenant (``EngravaManager``) for
                 isolation and the commercial RBAC tier for shared-corpus
                 access control.
+            collapse_key: Optional de-fragmentation unit key — a single
+                metadata path (``"$.session_turn"``) or an ordered sequence of
+                paths forming a composite key (``["$.session_id",
+                "$.turn_index"]``). When set, among the already-ranked
+                candidates only the single highest-ranked row per unit reaches
+                the result, and the slots that frees are backfilled by deeper
+                *distinct* units — so the prompt sees one best row per
+                caller-defined unit plus more distinct units, instead of many
+                fragments of the same unit. This is a **presentation / de-dup
+                convenience, not a filter and not isolation**: it does not
+                change which rows are *eligible* (use ``filters`` /
+                ``visibility`` for that). The collapse step itself mutates no
+                score and only drops lower-ranked members of the same unit.
+                Note, however, that *setting* ``collapse_key`` also widens the
+                internal candidate pool (akin to a larger internal ``top_k``)
+                to give backfill more depth; because the keyword arm's scores
+                are min-max normalized over the candidate set, a wider pool can
+                rescale the normalized fusion scores and shift the order among
+                units. Only ``collapse_key=None`` leaves the candidate, score,
+                and order path byte-identical to the unfiltered query. It is
+                only as meaningful as the unit metadata the application writes —
+                a row whose key is missing or holds malformed metadata is
+                treated as its own unit and is never collapsed with another.
+                Each path is validated at call time.
 
         Returns:
             ``HybridSearchResult`` with ranked results and diagnostics. Tied
@@ -3840,6 +3935,22 @@ class SqliteEngravaCore:
         filter_clause_plain = compile_effective_predicate(
             filters, visibility, column="metadata_json"
         )
+
+        # Validate the de-fragmentation unit key (if any) at argument time —
+        # never mid-query (reuses the shared metadata path grammar). ``None``
+        # keeps the entire candidate/score/order path byte-identical to today's.
+        collapse_paths: tuple[str, ...] | None = None
+        if collapse_key is not None:
+            collapse_paths = _normalize_collapse_key(collapse_key)
+            # Bounded candidate-pool widening: when collapsing, fragments of
+            # few units can dominate the per-arm budgets, so widen each arm by
+            # a small, config-backed factor to give backfill a deeper distinct
+            # -unit pool. Bounded (small int) — never unbounded over-fetch.
+            collapse_pool_factor = (
+                self._search_config.collapse_pool_factor if self._search_config is not None else 4
+            )
+            fts_top_k = fts_top_k * collapse_pool_factor
+            vector_top_k = vector_top_k * collapse_pool_factor
 
         backends_used: set[str] = set()
         (
@@ -4081,9 +4192,26 @@ class SqliteEngravaCore:
         # Deterministic total order: score descending, canonical thought_id
         # ascending — invariant to dict/scan order.
         ranked = _sort_scored_descending(list(combined.items()))
+
+        # --- De-fragmentation collapse-by-unit + backfill ---
+        # Runs AFTER fusion + recency/priority/graph scoring + the
+        # CONSOLIDATED_FROM expansion and reflection boost, BEFORE the
+        # ``[:top_k]`` truncation and BEFORE reflection_topk_cap — the same
+        # locus and shape as the cap's evict-and-backfill. It touches neither
+        # arm's WHERE, no score, and no candidate set: it only removes
+        # lower-ranked members of the same caller-defined unit so deeper
+        # distinct units in ``ranked[top_k:]`` flow up into the window.
+        if collapse_paths is not None and combined:
+            unit_keys = await self._fetch_collapse_unit_keys(
+                thought_ids=list(combined),
+                paths=collapse_paths,
+            )
+            ranked = _collapse_ranked_by_unit(ranked, unit_keys)
         final = ranked[:top_k]
 
         # --- reflection_topk_cap enforcement ---
+        # Runs on the (possibly collapsed) ``ranked`` so the single backfill
+        # source is the collapsed off-list pool — no unit is double-counted.
         if include_reflections and resolved_reflection_topk_cap < 1.0 and reflection_ids:
             _max_ref_slots = max(0, int(top_k * resolved_reflection_topk_cap))
             _ref_in_final = [
@@ -4771,6 +4899,86 @@ def _sort_scored_descending(
 
     """
     return sorted(results, key=lambda item: (-item[1], item[0]))
+
+
+def _normalize_collapse_key(collapse_key: str | Sequence[str]) -> tuple[str, ...]:
+    """Normalize a ``collapse_key`` argument to a validated path tuple.
+
+    A single ``str`` becomes a one-element composite key; a sequence of
+    paths is kept in order. Every path is validated against the restricted
+    JSONPath grammar at **argument time** (never mid-query), reusing the
+    shared path validator, so a malformed path raises before any SQL runs.
+
+    Args:
+        collapse_key: A single metadata path (``"$.session_turn"``) or an
+            ordered sequence of paths forming a composite unit key
+            (``["$.session_id", "$.turn_index"]``).
+
+    Returns:
+        The ordered tuple of validated paths (length ``>= 1``).
+
+    Raises:
+        InvalidFilterPathError: If any path violates the path grammar, or
+            ``collapse_key`` is an empty sequence (no key to collapse on).
+
+    """
+    from engrava.domain.exceptions import InvalidFilterPathError  # noqa: PLC0415
+
+    paths: tuple[str, ...]
+    if isinstance(collapse_key, str):
+        paths = (collapse_key,)
+    else:
+        paths = tuple(collapse_key)
+        if not paths:
+            # An empty composite key has no grouping identity; reject it at
+            # argument time rather than silently behaving like collapse off.
+            msg = "<empty collapse_key sequence>"
+            raise InvalidFilterPathError(msg)
+    for path in paths:
+        _validate_path(path)
+    return paths
+
+
+def _collapse_ranked_by_unit(
+    ranked: list[tuple[str, float]],
+    unit_keys: dict[str, tuple[object, ...] | None],
+) -> list[tuple[str, float]]:
+    """Collapse a D8-ranked candidate list to one best row per unit.
+
+    Walks ``ranked`` top-down (it is already in the D8 total order, so the
+    first occurrence of a unit is its highest-ranked member). The first
+    member of each **non-None** unit key is the keeper; subsequent members of
+    the same unit are dropped. A row whose unit key is ``None`` (missing /
+    malformed metadata, or a composite with any-NULL component) is its OWN
+    unit and always passes through — never collapsed with another key-less
+    row, which would silently drop distinct rows.
+
+    The relative order of the surviving rows is preserved from ``ranked``
+    (already the D8 order), so no re-sort with a new rule is introduced;
+    keeper selection and final order both derive from the single D8 order.
+
+    Args:
+        ranked: ``(thought_id, score)`` pairs in D8 total order.
+        unit_keys: Map from ``thought_id`` to its unit-key tuple, or ``None``
+            for a key-less row. Missing ids are treated as ``None``.
+
+    Returns:
+        The collapsed ``(thought_id, score)`` list, D8 order preserved.
+
+    """
+    seen_units: set[tuple[object, ...]] = set()
+    collapsed: list[tuple[str, float]] = []
+    for thought_id, score in ranked:
+        unit = unit_keys.get(thought_id)
+        if unit is None:
+            # Key-less row: its own unit, never collapsed.
+            collapsed.append((thought_id, score))
+            continue
+        if unit in seen_units:
+            continue
+        seen_units.add(unit)
+        collapsed.append((thought_id, score))
+    return collapsed
 
 
 def _normalize_min_max(

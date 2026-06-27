@@ -10,6 +10,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from engrava.domain.models.edge import EdgeRecord
     from engrava.domain.models.embedding import EmbeddingRecord
     from engrava.domain.models.filters import MetadataFilter, VisibilityQueryFilter
@@ -105,6 +107,7 @@ class EngravaCoreProtocol(Protocol):
         current_cycle: int | None = None,
         filters: MetadataFilter | None = None,
         visibility: VisibilityQueryFilter | None = None,
+        collapse_key: str | Sequence[str] | None = None,
     ) -> HybridSearchResult:
         """Retrieve thoughts relevant to a query with one call.
 
@@ -125,6 +128,15 @@ class EngravaCoreProtocol(Protocol):
             visibility: Optional bounded visibility query filter; delegated
                 to ``search_hybrid``. A query refinement, not access
                 control — it enforces nothing and is bypassable.
+            collapse_key: Optional de-fragmentation unit key (a single
+                metadata path or an ordered sequence forming a composite key);
+                delegated to ``search_hybrid``. Keeps one best-ranked row per
+                caller-defined unit and backfills deeper distinct units. A
+                presentation / de-dup convenience, not a filter and not
+                isolation. The collapse step mutates no score, but *setting*
+                ``collapse_key`` widens the internal candidate pool, which can
+                rescale normalized fusion scores and shift order among units;
+                only ``collapse_key=None`` leaves the result path unchanged.
 
         Returns:
             A ``HybridSearchResult`` with the ranked matches and the set of
@@ -285,6 +297,7 @@ class EngravaCoreProtocol(Protocol):
         vector_top_k: int = 50,
         filters: MetadataFilter | None = None,
         visibility: VisibilityQueryFilter | None = None,
+        collapse_key: str | Sequence[str] | None = None,
     ) -> HybridSearchResult:
         """Hybrid search combining FTS5 keyword + vector cosine similarity.
 
@@ -328,6 +341,24 @@ class EngravaCoreProtocol(Protocol):
                 control — it performs no authentication, authorization, or
                 ownership enforcement; the caller can forge ``owner``; it is
                 bypassable; it must not be used to protect tenant data.
+            collapse_key: Optional de-fragmentation unit key — a single
+                metadata path or an ordered sequence of paths forming a
+                composite key. When set, among the already-ranked candidates
+                only the single best-ranked row per caller-defined unit reaches
+                the result and the freed slots are backfilled by deeper
+                distinct units. A **presentation / de-dup convenience, not a
+                filter and not isolation**: it does not change which rows are
+                *eligible*, and the collapse step itself mutates no score (it
+                only drops lower-ranked same-unit members). *Setting*
+                ``collapse_key`` does, however, widen the internal candidate
+                pool for deeper backfill, which — because the keyword arm is
+                min-max normalized over the candidate set — can rescale
+                normalized fusion scores and shift order among units; only
+                ``collapse_key=None`` leaves the candidate, score, and order
+                path byte-identical to the unfiltered query. It is only as
+                meaningful as the unit metadata the application writes (a
+                missing or malformed key ⇒ the row is its own unit, never
+                collapsed).
 
         Returns:
             ``HybridSearchResult`` with ranked results and the set of

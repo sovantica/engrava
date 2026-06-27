@@ -215,6 +215,72 @@ filter.)
 > still computed against the whole corpus. This is the intended behaviour for a
 > query refinement within one memory.
 
+### De-fragmentation / collapse
+
+`search_hybrid()` and `recall()` also accept an optional, keyword-only
+`collapse_key` that **de-duplicates fragments of the same logical unit** in the
+result. When many rows in your store describe the *same* thing — for example
+several chunks of one conversation turn, or several versions of one document —
+a plain ranked query can fill the top-`k` window with near-duplicates of one
+unit and push other, distinct units out. `collapse_key` keeps only the single
+best-ranked row per unit and lets deeper *distinct* units take the freed slots.
+
+```python
+# One best row per (caller-defined) unit; deeper distinct units backfill in.
+result = await store.recall(
+    "what did we decide about the rollout?",
+    top_k=10,
+    collapse_key="$.turn_id",            # a single metadata path
+)
+
+# Composite unit key — rows share a unit only if ALL components are equal:
+result = await store.search_hybrid(
+    "rollout decision",
+    top_k=10,
+    collapse_key=["$.session_id", "$.turn_index"],
+)
+```
+
+**What it does.** Among the already-ranked candidates, the highest-ranked row of
+each unit is kept; lower-ranked rows of that *same* unit are removed, and the
+slots they vacate are backfilled by the next distinct units. So the prompt sees
+one best row per unit plus more distinct units, instead of a pile of fragments
+of one unit. `collapse_key=None` (the default) leaves the result exactly
+unchanged.
+
+**Semantics:**
+
+- `collapse_key` is a single JSON path (`"$.turn_id"`) or an ordered sequence of
+  paths forming a **composite key** (`["$.session_id", "$.turn_index"]`). Paths
+  use the same grammar as `filters` (`$`, `$.key`, `$.key[0]`) and are validated
+  **at call time** — a malformed path raises `InvalidFilterPathError`, never
+  mid-query.
+- A row whose key is **missing**, holds malformed metadata, or (for a composite
+  key) is missing **any** component is treated as its **own** unit — it is never
+  collapsed with another row. Distinct key-less rows all survive.
+- The kept row per unit is the highest-ranked one under the same deterministic
+  order used everywhere on this path (combined score descending, then canonical
+  `thought_id` ascending), so the keeper and final order are stable across runs.
+- To give backfill a deeper pool to draw from, each search arm's candidate
+  budget is widened by a small, bounded factor **only while** `collapse_key` is
+  set (configurable as `search.collapse_pool_factor`, default `4`); the
+  `collapse_key=None` path is never widened. Because the keyword arm's scores
+  are min-max normalized over the candidate set, this wider pool can rescale the
+  normalized fusion scores and shift the relative order among units — so setting
+  `collapse_key` is not score-neutral even though the collapse step itself never
+  mutates a score. Only `collapse_key=None` is byte-identical to a plain query.
+
+> **Collapse is a presentation convenience, not a filter and not an isolation
+> boundary.** It does not change which rows are *eligible* (use `filters` /
+> `visibility` for that). The collapse step itself mutates no score — it only
+> decides which of the already-eligible rows is shown per unit, dropping
+> lower-ranked members of the same unit. (Setting `collapse_key` does widen the
+> internal candidate pool, which can affect normalized fusion scores and order,
+> as noted above.) It is only as meaningful as the unit metadata your
+> application writes: if two genuinely different rows carry the same key they
+> will be treated as one unit, and rows without the key are never merged.
+> Eligibility (`filters` / `visibility`) always applies first, then collapse.
+
 ## Configuration Reference
 
 See [configuration.md](configuration.md) for the full YAML reference
