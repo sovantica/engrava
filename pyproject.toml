@@ -31,7 +31,7 @@ classifiers = [
 dependencies = [
     "pydantic>=2.11.0",
     "aiosqlite>=0.20.0",
-    "numpy>=1.26.0",
+    "numpy>=1.26.0,<2.3",  # cap: numpy >=2.3 ships PEP 695 `type` stubs that break mypy --strict at the 3.11 target
     "click>=8.1.0",
     "PyYAML>=6.0",
 ]
