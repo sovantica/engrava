@@ -19,6 +19,10 @@ module.exports = {
   ignores: [
     (message) =>
       message.startsWith("Merge ") || message.startsWith("Revert "),
+    // Dependabot's auto-generated commit bodies (changelog URLs + the
+    // updated-dependencies block) routinely exceed body-max-line-length;
+    // exempt bot commits so dependency PRs stay green.
+    (message) => /Signed-off-by: dependabot\[bot\]/.test(message),
   ],
 
   rules: {
