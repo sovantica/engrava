@@ -75,7 +75,7 @@ jobs:
             conventional-changelog-conventionalcommits@7
       - name: Generate release app token
         id: app-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.ENGRAVA_RELEASE_APP_ID }}
           private-key: ${{ secrets.ENGRAVA_RELEASE_APP_PRIVATE_KEY }}
