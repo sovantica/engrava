@@ -6,10 +6,11 @@
 # assumes `engrava==<tag>` is already on PyPI by the time the tag is pushed,
 # because the registry validates that the referenced package version exists.
 #
-# Auth: GitHub OIDC (no secrets). The namespace io.github.sovantica/* is
-# auto-verified by org match. The first listing is done manually by a
-# maintainer (`mcp-publisher login github` + `publish`); this automates
-# re-publishing thereafter.
+# Auth: DNS. The namespace ai.sovantica/* is verified by a TXT record on the
+# apex of sovantica.ai; the Ed25519 private key is stored as the repo secret
+# MCP_DNS_PRIVATE_KEY. The first listing is done manually by a maintainer
+# (`mcp-publisher login dns` + `publish`); this automates re-publishing.
+# NOTE: this workflow fails until MCP_DNS_PRIVATE_KEY is set in repo secrets.
 name: Publish to MCP Registry
 
 on:
@@ -20,8 +21,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write # required for OIDC authentication
-      contents: read
+      contents: read # DNS auth uses MCP_DNS_PRIVATE_KEY; no id-token needed
 
     steps:
       - name: Checkout code
@@ -37,8 +37,10 @@ jobs:
           jq --arg v "$VERSION" '.version = $v | (.packages[] | .version) = $v' server.json > server.tmp
           mv server.tmp server.json
 
-      - name: Authenticate to MCP Registry (GitHub OIDC)
-        run: ./mcp-publisher login github-oidc
+      - name: Authenticate to MCP Registry (DNS)
+        run: ./mcp-publisher login dns --domain sovantica.ai --private-key "$MCP_DNS_PRIVATE_KEY"
+        env:
+          MCP_DNS_PRIVATE_KEY: ${{ secrets.MCP_DNS_PRIVATE_KEY }}
 
       - name: Publish server to MCP Registry
         run: ./mcp-publisher publish
