@@ -1,0 +1,44 @@
+# Publishes the Engrava MCP server entry to the official MCP Registry
+# (https://registry.modelcontextprotocol.io) on every release tag.
+#
+# This publishes ONLY the registry entry (server.json). The PyPI package
+# itself is published by the release flow (semantic-release); this workflow
+# assumes `engrava==<tag>` is already on PyPI by the time the tag is pushed,
+# because the registry validates that the referenced package version exists.
+#
+# Auth: GitHub OIDC (no secrets). The namespace io.github.sovantica/* is
+# auto-verified by org match. The first listing is done manually by a
+# maintainer (`mcp-publisher login github` + `publish`); this automates
+# re-publishing thereafter.
+name: Publish to MCP Registry
+
+on:
+  push:
+    tags: ["v*"] # release tags cut by the release flow, e.g. v0.4.1
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # required for OIDC authentication
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Sync server.json version to the release tag
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          jq --arg v "$VERSION" '.version = $v | (.packages[] | .version) = $v' server.json > server.tmp
+          mv server.tmp server.json
+
+      - name: Authenticate to MCP Registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server to MCP Registry
+        run: ./mcp-publisher publish
