@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.sovantica/engrava",
+  "name": "ai.sovantica/engrava",
   "description": "Tamper-evident audit, MindQL, and Action Records — embedded memory database for AI agents.",
   "repository": {
     "url": "https://github.com/sovantica/engrava",
