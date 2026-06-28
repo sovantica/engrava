@@ -88,3 +88,6 @@ pytest-out.txt
 
 # Local environment overrides.
 .env.*.local
+
+# MCP Registry DNS publishing key (ai.sovantica namespace) — never commit.
+*.pem
