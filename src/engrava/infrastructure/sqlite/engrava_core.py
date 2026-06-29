@@ -2863,11 +2863,17 @@ class SqliteEngravaCore:
                 ``(sql_fragment, params)`` metadata predicate (referencing
                 ``t.metadata_json``). When supplied the exhaustive numpy path
                 is used unconditionally — even when a ``vec0`` backend is
-                configured — because the ``vec0`` ``MATCH`` query applies a
-                ``LIMIT`` *before* any metadata predicate could run, which
-                would yield wrong neighbours (filtering eligible rows must
-                precede cosine and top-k, never follow a ``LIMIT``). Supplied
-                by :meth:`search_hybrid`; not part of the public contract.
+                configured. This is specific to how the predicate is shaped,
+                not a blanket ``vec0`` limitation: it is an arbitrary
+                ``metadata_json`` expression that can only run as a
+                post-``MATCH`` join, and the ``vec0`` table declares no
+                metadata columns, so the join would land *after* ``vec0``
+                applies its ``k``/``LIMIT`` — yielding wrong neighbours
+                (filtering eligible rows must precede cosine and top-k, never
+                follow a ``LIMIT``). (``vec0`` *can* apply ``k`` after a filter
+                on a *declared*, typed metadata column; this table declares
+                none.) Supplied by :meth:`search_hybrid`; not part of the
+                public contract.
 
         Returns:
             List of ``(thought_id, similarity_score)`` sorted descending
