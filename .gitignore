@@ -88,3 +88,6 @@ pytest-out.txt
 
 # Local environment overrides.
 .env.*.local
+
+# Publishing keys (e.g. MCP DNS Ed25519) — never commit.
+*.pem
