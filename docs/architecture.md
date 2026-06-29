@@ -10,7 +10,7 @@ Imports flow **downward only**:
 
 ```
 ┌──────────────────────────────────────────────────┐
-│  CLI / MCP server / Consumer apps, scripts, …    │
+│  CLI / Consumer apps, scripts, MCP server, …     │
 ├──────────────────────────────────────────────────┤
 │  Extensions / Embeddings / MindQL                │
 │  (dreaming, hooks, providers, query language)    │
@@ -33,11 +33,12 @@ Imports flow **downward only**:
 - **Embeddings** (`src/engrava/embeddings/`) — pluggable embedding
   providers.
 - **CLI** (`src/engrava/cli/`) — Click-based command-line interface.
-- **MCP server** (`src/engrava/mcp/`) — an optional [Model Context
-  Protocol](https://modelcontextprotocol.io) server behind the `mcp` extra. Like
-  the CLI it is a **top-layer API *consumer***, not part of engrava core: it wraps
-  the public async API over stdio so MCP clients (Claude Desktop, Cursor, …) can
-  use a store. See [MCP server](../docs/guides/mcp.md).
+
+The [Model Context Protocol](https://modelcontextprotocol.io) server ships as a
+separate package, [`engrava-mcp`](https://github.com/sovantica/engrava-mcp). Like
+the CLI it is a **top-layer API *consumer***, not part of engrava core: it wraps
+the public async API over stdio so MCP clients (Claude Desktop, Cursor, …) can
+use a store, and it depends on `engrava` rather than living inside it.
 
 ## Core Components
 
@@ -155,10 +156,11 @@ reasoners) belongs in consumers, not in engrava core.
   migration is **additive** (`user_version 12 → 14`, two steps), zero data loss; a
   legacy row keeps open (`NULL`) bounds and still matches point-in-time queries.
   See [The Bi-temporal Model](../docs/bitemporal.md).
-- **MCP server.** A new optional `mcp` extra (`pip install "engrava[mcp]"`) ships a
-  Model Context Protocol server over stdio (`engrava-mcp`). It is a pure API
-  *consumer* — plain `pip install engrava` is unaffected and stays dependency-light.
-  See [MCP server](../docs/guides/mcp.md).
+- **MCP server.** A Model Context Protocol server over stdio is available as a
+  separate package, [`engrava-mcp`](https://github.com/sovantica/engrava-mcp)
+  (`uvx engrava-mcp`). It is a pure API *consumer* — plain `pip install engrava`
+  stays dependency-light. (In 0.4 this shipped as an in-tree `engrava[mcp]` extra;
+  it moved to its own package in 0.5 — see the Upgrade Guide.)
 - **`execute_mindql`** — a store-level convenience that runs a parsed `MindQLQuery`
   against the store's own connection.
 - Existing databases: the valid-time columns and indexes are added automatically on

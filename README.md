@@ -34,7 +34,6 @@ Optional extras:
 
 ```bash
 pip install engrava[vec]                # sqlite-vec vector search backend
-pip install engrava[mcp]                # MCP server (engrava-mcp) for Claude Desktop/Code, Cursor, …
 pip install engrava[embeddings-local]   # sentence-transformers embeddings (local model)
 pip install engrava[embeddings-openai]  # OpenAI-compatible embeddings API
 pip install engrava[embeddings-ollama]  # Ollama local embeddings server
@@ -205,18 +204,21 @@ async with EngravaManager(data_dir=Path("./data")) as mgr:
 
 ### MCP Server
 
-Expose a store to any MCP client — Claude Desktop, Claude Code, Cursor,
-Windsurf, VS Code — via the `engrava[mcp]` extra. A native stdio server (no HTTP
-shim) with read tools, optional write tools, attachable `engrava://` resources,
-and guided prompts:
+Want Engrava as a memory server for your agent? The MCP server ships as its own
+package, **`engrava-mcp`** — a native stdio server (no HTTP shim) with read
+tools, optional write tools, attachable `engrava://` resources, and guided
+prompts, for any MCP client (Claude Desktop, Claude Code, Cursor, Windsurf,
+VS Code):
 
 ```bash
-pip install "engrava[mcp]"
-engrava-mcp        # spawned by your MCP client over stdio
+uvx engrava-mcp        # or: pip install engrava-mcp
 ```
 
-→ See [`docs/guides/mcp.md`](https://github.com/sovantica/engrava/blob/main/docs/guides/mcp.md) for install, client
-configuration, the full tool/resource/prompt reference, and read-only mode.
+`engrava-mcp` pulls `engrava` in transitively, so installing it also gives you
+the `import engrava` library. See the
+[`engrava-mcp` package](https://github.com/sovantica/engrava-mcp) for install,
+client configuration, the full tool/resource/prompt reference, and read-only
+mode.
 
 ## CLI
 
@@ -255,7 +257,7 @@ See the [CLI reference](https://github.com/sovantica/engrava/blob/main/docs/cli.
 - [Building a memory-backed agent](https://github.com/sovantica/engrava/blob/main/docs/guides/agent-memory.md) — the end-to-end agent turn loop (ingest → retrieve → generate → consolidate)
 - [Migrating from another memory system](https://github.com/sovantica/engrava/blob/main/docs/guides/migrating-from-other-memory.md) — concept mapping, porting calls, bulk import, and scoping/multi-tenancy
 - [Embeddings](https://github.com/sovantica/engrava/blob/main/docs/guides/embeddings.md) — wiring a real embedding provider (local / OpenAI / Ollama / HuggingFace / custom)
-- [MCP server](https://github.com/sovantica/engrava/blob/main/docs/guides/mcp.md) — expose a store to MCP clients (Claude Desktop, Claude Code, Cursor, Windsurf, VS Code): install, run, client config, tools/resources/prompts
+- [MCP server (`engrava-mcp`)](https://github.com/sovantica/engrava-mcp) — expose a store to MCP clients (Claude Desktop, Claude Code, Cursor, Windsurf, VS Code) via the standalone server package: install, run, client config, tools/resources/prompts
 - [Configuration](https://github.com/sovantica/engrava/blob/main/docs/configuration.md) — YAML config format and options
 - [Upgrade Guide](https://github.com/sovantica/engrava/blob/main/docs/upgrade.md) — compatibility matrix, backups, and troubleshooting
 - [Extensions](https://github.com/sovantica/engrava/blob/main/docs/extensions.md) — Writing custom extensions and hooks

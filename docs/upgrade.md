@@ -129,6 +129,7 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 | 0.2.2 | 0.3.0 | Yes | Minor upgrade with extension migration tracking and upgrade CI coverage |
 | 0.3.0 | 0.3.1 | Yes | Patch-level upgrade; no schema change (`user_version` unchanged) — safe to roll across workers |
 | 0.3.x | 0.4.0 | Yes | **Schema-changing** minor upgrade — adds the valid-time columns (additive, zero data loss). Back up first and follow the [rolling-upgrades](#rolling-upgrades-multiple-workers) note |
+| 0.4.x | 0.5.0 | Yes | Library upgrade is drop-in. **Breaking for MCP-server users only:** the `engrava[mcp]` extra and the in-engrava `engrava-mcp` command are removed — the server moved to the standalone [`engrava-mcp`](https://github.com/sovantica/engrava-mcp) package (see the 0.4 → 0.5 note) |
 
 For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 `0.x.*` line do not change the schema and are low-risk; **minor** upgrades
@@ -136,6 +137,43 @@ For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 [rolling-upgrades](#rolling-upgrades-multiple-workers) note below.
 
 ## Version Notes
+
+### 0.4 -> 0.5
+
+The library upgrade is drop-in: `pip install --upgrade engrava` and your normal
+startup. The schema migration, if any, runs automatically on first open as usual.
+
+**Breaking change for MCP-server users.** The Model Context Protocol server moved
+out of `engrava` into its own package, **`engrava-mcp`**. Removed from `engrava`
+in 0.5.0:
+
+- the `engrava[mcp]` optional-dependency extra, and
+- the in-engrava `engrava-mcp` console command.
+
+**Migrate as follows:**
+
+| Before (0.4) | After (0.5) |
+|---|---|
+| `pip install "engrava[mcp]"` | `pip install engrava-mcp` (or `uvx engrava-mcp`) |
+| `engrava-mcp` (installed by engrava) | `engrava-mcp` (installed by the `engrava-mcp` package) |
+| client `mcp.json`: `command: engrava-mcp` | client `mcp.json`: `command: uvx`, `args: ["engrava-mcp"]` |
+
+- **Watch out:** `pip install "engrava[mcp]"` against engrava 0.5 **does not fail**
+  — pip ignores the now-unknown extra and installs bare `engrava`, so you may think
+  the server was installed when it was not. Install `engrava-mcp` instead.
+- Update any pinned requirement strings (`engrava[mcp]>=...`) to depend on
+  `engrava-mcp`, not just reinstall.
+- **Store config is unchanged:** the server still reads `ENGRAVA_MCP_CONFIG`
+  (an `engrava.yaml`) or `ENGRAVA_DB_PATH`, and `ENGRAVA_MCP_READ_ONLY` still gates
+  the write tools.
+- `engrava-mcp` depends on `engrava>=0.5`, so if an app on engrava 0.4.x and an
+  `engrava-mcp` share one database file, upgrade the app to 0.5 too.
+- Don't run the old in-engrava `engrava-mcp` and the new `engrava-mcp` package
+  against the same store at once during the cutover.
+
+See the [`engrava-mcp` package](https://github.com/sovantica/engrava-mcp) for the
+full server documentation (install, client config, tools/resources/prompts,
+read-only mode).
 
 ### 0.3 -> 0.4
 
@@ -210,10 +248,11 @@ keyword/full-text search are not schema changes but do change results:
 > (which requires real bounds on both ends) until you set their bounds
 > explicitly. This is expected, not a defect.
 
-**New optional MCP server.** 0.4 also ships an optional Model Context Protocol
-server behind a new `mcp` extra — `pip install "engrava[mcp]"`. It is purely
-additive: plain `pip install engrava` is unaffected and existing code needs no
-change. See the [MCP server guide](guides/mcp.md).
+**MCP server.** 0.4 shipped an optional Model Context Protocol server behind an
+in-tree `engrava[mcp]` extra. As of 0.5 the server moved to its own package,
+[`engrava-mcp`](https://github.com/sovantica/engrava-mcp) (`uvx engrava-mcp`); the
+`engrava[mcp]` extra and the in-engrava `engrava-mcp` command are removed. See the
+0.4 → 0.5 notes below for migration.
 
 This is a schema-changing minor upgrade, so follow the
 [rolling-upgrades](#rolling-upgrades-multiple-workers) procedure (back up,
