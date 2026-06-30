@@ -47,6 +47,40 @@ no special handling.
 > [Known Limitations → sqlite-vec](known-limitations.md#sqlite-vec-pre-v1-status).
 > Measure your own p95 query latency and switch when it stops meeting your budget.
 
+## Filtered search and the vector fast path
+
+`search_hybrid()` / `recall()` with a `filters=` or `visibility=` argument scope
+the ranked query (see [Scoped retrieval](search.md#scoped-retrieval)). There is a
+performance consequence worth knowing.
+
+**An active filter disables the `sqlite-vec` fast path.** With no filter, the
+vector arm runs on the compiled `vec0` table. With a filter, the vector arm
+instead runs an **exhaustive NumPy cosine over the rows that match the filter** —
+because the filter is an arbitrary `metadata` predicate that `vec0` cannot apply
+before it picks its `k` nearest neighbours. The filtered cost is:
+
+- **~O(N_total)** for the scan that selects the eligible rows, **plus**
+- **O(N_eligible × dims)** for the cosine over those eligible embeddings.
+
+Note the first term: a selective filter shrinks the *cosine* work, but the
+eligibility scan still visits the whole embedding-bearing population. Both the
+filtered (NumPy) and unfiltered (`vec0`) paths are already **exhaustive** in the
+pinned `sqlite-vec` 0.1.x line (see
+[the brute-force ceiling](#the-brute-force-ceiling-and-how-to-pass-it)), so a
+filter is a **constant-factor** slowdown, not a change in scaling.
+
+**When it matters.** A *selective* filter (one project, one session, one user)
+keeps the eligible set small — the filtered path stays acceptable, and can be
+faster than scanning the whole `vec0` table when the filter is highly selective
+(the eligibility scan still runs, so this is not guaranteed). The slow corner is
+a **broad filter on a large
+store** at the same time — for example `visibility=` admitting *public-or-mine*
+where "mine" is most of the store, on a base approaching the brute-force ceiling.
+If that is your workload, prefer **one store per tenant** via `EngravaManager`
+(see [scoping & multi-tenancy](guides/migrating-from-other-memory.md#filtering-scoping--multi-tenancy)):
+each tenant's store is small, so the exhaustive scan stays small — and that is
+real isolation, which a metadata filter is **not**.
+
 ## Switching to sqlite-vec (incl. migrating an existing database)
 
 The migration is designed to be turnkey: your embeddings already live in the
