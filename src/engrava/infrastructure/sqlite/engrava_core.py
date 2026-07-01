@@ -4081,6 +4081,16 @@ class SqliteEngravaCore:
             _SUPPRESS_SEARCH_METRICS.reset(token)
 
         # --- Fuse scores ---
+        # Intentional, accepted arm-scale asymmetry: the FTS arm is min-max
+        # normalized to [0, 1] per query, while the vector arm is blended at its
+        # raw cosine scale (naturally [0, 1] with a non-negative threshold). The
+        # arms are deliberately NOT put on a common scale here: min-maxing the
+        # vector arm too would be a per-query re-scale that destroys the
+        # cross-query comparability of cosine (a strong 0.92 and a weak 0.40
+        # would both stretch to span [0, 1] within their own result set), and a
+        # global arm-weight recalibration was measured to move end-to-end
+        # accuracy by noise (and to regress multi-session). Symmetric re-scaling
+        # is therefore a deferred, separately-gated change, not done here.
         fts_normalized = _normalize_min_max(fts_results)
 
         # Semantic-only base scores for graph signal (max(fts, vector))
@@ -4992,8 +5002,15 @@ def _normalize_min_max(
 ) -> list[tuple[str, float]]:
     """Normalize scores to ``[0, 1]`` via min-max scaling.
 
-    When all scores are identical (``hi == lo``), every score becomes
-    ``1.0`` to avoid division by zero.
+    Min-max encodes each score's *relative position* within this arm's score
+    distribution. When all scores are identical (``hi == lo``) there is no
+    distribution — and therefore no information about relative quality — so
+    every score maps to the neutral midpoint ``0.5`` rather than being asserted
+    at maximum confidence. A neutral midpoint (a) removes the unjustified
+    top-of-arm boost a lone or all-tied match would otherwise receive in the
+    fused blend, and (b) keeps a non-zero contribution, so a match found *only*
+    by this arm is not demoted below the other arm's hits. ``0.5`` also avoids
+    the division-by-zero the ``hi == lo`` branch guards against.
 
     Args:
         results: ``(thought_id, raw_score)`` pairs.
@@ -5007,5 +5024,5 @@ def _normalize_min_max(
     scores = [s for _, s in results]
     lo, hi = min(scores), max(scores)
     if hi == lo:
-        return [(tid, 1.0) for tid, _ in results]
+        return [(tid, 0.5) for tid, _ in results]
     return [(tid, (s - lo) / (hi - lo)) for tid, s in results]

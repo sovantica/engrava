@@ -216,8 +216,10 @@ class TestNormalizeMinMax:
         assert _normalize_min_max([]) == []
 
     def test_single_item(self) -> None:
+        # Degenerate case (hi == lo): no score distribution, so the neutral
+        # midpoint 0.5 — not the maximum 1.0 — is the only defensible output.
         result = _normalize_min_max([("t1", 5.0)])
-        assert result == [("t1", 1.0)]
+        assert result == [("t1", 0.5)]
 
     def test_two_items(self) -> None:
         result = _normalize_min_max([("t1", 10.0), ("t2", 20.0)])
@@ -231,8 +233,9 @@ class TestNormalizeMinMax:
         assert result[2] == ("c", 1.0)
 
     def test_all_same_score(self) -> None:
+        # All-tied is the same degenerate case: neutral midpoint, not maximal.
         result = _normalize_min_max([("t1", 7.0), ("t2", 7.0), ("t3", 7.0)])
-        assert all(s == 1.0 for _, s in result)
+        assert all(s == 0.5 for _, s in result)
 
 
 # ===================================================================
@@ -313,6 +316,41 @@ class TestSearchHybrid:
         r = await store.search_hybrid("important", [0.0])
         for _, score in r.results:
             assert score >= 0.0
+
+    async def test_degenerate_fts_match_not_over_ranked(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        # Fusion-level regression for the degenerate min-max corner (D9).
+        # "only-fts" is the sole FTS match for a rare term (hi == lo → the
+        # degenerate branch) with an orthogonal, zero-cosine embedding;
+        # "only-vec" is not an FTS match but has a moderate cosine (0.4).
+        # With the old all-1.0 sentinel the degenerate lexical hit
+        # (1.0 * fts_w 0.3 = 0.30) OUT-RANKED the vector row
+        # (0.4 * vec_w 0.55 = 0.22); with the neutral 0.5 (0.5 * 0.3 = 0.15)
+        # the vector row correctly ranks first — and the degenerate row stays
+        # present (0.15, not demoted to the floor as the rejected 0.0 would).
+        only_fts = await store.create_thought(
+            _make("only-fts", essence="anomaly", content="the zorptastic anomaly report"),
+        )
+        only_vec = await store.create_thought(
+            _make("only-vec", essence="ordinary", content="an ordinary daily note"),
+        )
+        # query vector [1,0,0]: only-fts is orthogonal (cosine 0), only-vec 0.4.
+        await store.store_embedding(only_fts.thought_id, [0.0, 0.0, 1.0], model_name="test")
+        await store.store_embedding(
+            only_vec.thought_id,
+            [0.4, 0.9165151389911681, 0.0],
+            model_name="test",
+        )
+        r = await store.search_hybrid("zorptastic", [1.0, 0.0, 0.0])
+        order = [tid for tid, _ in r.results]
+        scores = dict(r.results)
+        # The moderate vector hit now ranks above the degenerate lexical hit
+        # (would FAIL on the pre-fix all-1.0 code, which over-ranks only-fts).
+        assert order.index("only-vec") < order.index("only-fts")
+        # The degenerate lexical hit is still present, above the floor.
+        assert scores["only-fts"] > 0.0
 
 
 # ===================================================================
