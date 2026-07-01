@@ -559,6 +559,17 @@ class SearchConfig:
             distinct units from — never an unbounded over-fetch. Has no effect
             on the ``collapse_key=None`` path. Must be ``>= 1``. Defaults
             to ``4``.
+        vec0_overfetch_factor: Bounded multiplier applied to ``top_k`` when the
+            sqlite-vec (``vec0``) vector backend serves ``search_similar()``.
+            ``vec0`` applies its ``k``/``LIMIT`` before expired thoughts and
+            retired REFLECTIONs can be filtered out, so fetching exactly
+            ``top_k`` would under-fill whenever nearby neighbours are non-live.
+            The arm over-fetches ``top_k * vec0_overfetch_factor`` (capped by an
+            absolute internal bound), applies the live-row filter, then trims to
+            ``top_k`` — giving the filter a deeper pool to survive from. This is
+            best-effort: an extreme store where nearly all nearest neighbours are
+            non-live can still under-fill. No effect on the numpy backend, which
+            filters eligibility before top-k. Must be ``>= 1``. Defaults to ``4``.
 
     Examples:
         >>> cfg = SearchConfig()
@@ -594,6 +605,7 @@ class SearchConfig:
     graph_expansion_reflection_source_ceiling: int = 50
     reflection_topk_cap: float = 0.3
     collapse_pool_factor: int = 4
+    vec0_overfetch_factor: int = 4
 
 
 @dataclass(frozen=True)
@@ -1413,6 +1425,29 @@ def _parse_nonneg_float(raw: dict[str, Any], key: str, default: float, section: 
     return float(val)
 
 
+def _parse_positive_int(raw: dict[str, Any], key: str, default: int, section: str) -> int:
+    """Extract and validate a positive integer from a raw YAML dict.
+
+    Args:
+        raw: Parsed YAML mapping.
+        key: Key to look up.
+        default: Default when key is absent.
+        section: Config section name for error messages.
+
+    Returns:
+        Validated integer value (``>= 1``).
+
+    Raises:
+        ConfigError: If the value is not an integer or is less than 1.
+
+    """
+    val = raw.get(key, default)
+    if not isinstance(val, int) or isinstance(val, bool) or val < 1:
+        msg = f"'{section}.{key}' must be a positive integer"
+        raise ConfigError(msg)
+    return val
+
+
 def _parse_search(raw: Any) -> SearchConfig:  # noqa: ANN401
     """Parse the ``search:`` YAML section.
 
@@ -1480,10 +1515,8 @@ def _parse_search(raw: Any) -> SearchConfig:  # noqa: ANN401
         msg = "'search.graph_expansion_reflection_source_ceiling' must be a positive integer"
         raise ConfigError(msg)
 
-    collapse_pool_factor = raw.get("collapse_pool_factor", 4)
-    if not isinstance(collapse_pool_factor, int) or collapse_pool_factor < 1:
-        msg = "'search.collapse_pool_factor' must be a positive integer"
-        raise ConfigError(msg)
+    collapse_pool_factor = _parse_positive_int(raw, "collapse_pool_factor", 4, "search")
+    vec0_overfetch_factor = _parse_positive_int(raw, "vec0_overfetch_factor", 4, "search")
 
     return SearchConfig(
         default_fts_weight=fts_w,
@@ -1506,6 +1539,7 @@ def _parse_search(raw: Any) -> SearchConfig:  # noqa: ANN401
         graph_expansion_reflection_source_ceiling=expansion_ceiling,
         reflection_topk_cap=reflection_topk_cap,
         collapse_pool_factor=collapse_pool_factor,
+        vec0_overfetch_factor=vec0_overfetch_factor,
     )
 
 

@@ -117,6 +117,17 @@ _FTS_BOOLEAN_OPERATORS = frozenset({"AND", "OR", "NOT"})
 #: large enough to benefit from recency that never receives a cycle is worth a
 #: single diagnostic breadcrumb (never a warning, never repeated).
 _RECENCY_NUDGE_THRESHOLD = 25
+#: Absolute upper bound on how many neighbours the sqlite-vec (vec0) arm may
+#: over-fetch before the live-row post-filter runs. The vec0 backend can only
+#: filter expired/retired rows *after* its ``LIMIT``, so it over-fetches
+#: ``top_k * vec0_overfetch_factor`` to give the filter a deeper pool to survive
+#: from. This cap keeps that fetch bounded: without it, when ``search_hybrid``
+#: has already widened ``vector_top_k`` via ``collapse_pool_factor``, the effect
+#: would compound into ``top_k * collapse_factor * overfetch_factor`` — an
+#: unbounded product. The cap turns the combined widening into a bounded maximum
+#: rather than a multiplicative blow-up. 500 comfortably exceeds realistic
+#: ``top_k`` values while capping worst-case scan/join work per query.
+_VEC0_OVERFETCH_CAP = 500
 _SUPPRESS_SEARCH_METRICS: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "engrava_suppress_search_metrics",
     default=False,
@@ -1985,10 +1996,15 @@ class SqliteEngravaCore:
             else:
                 # DELETE strategy.
                 before_row = await self._get_thought_row(tid) if self._journal is not None else None
+                # Capture the embedding rowid before the cascade drops the
+                # embedding row; the vec0 vector is not FK-reachable and would
+                # otherwise linger as a ghost.
+                vec_rowid = await self._embedding_rowid_for_thought(tid)
                 await self._db.execute(
                     "DELETE FROM thought WHERE thought_id = ?",
                     (tid,),
                 )
+                await self._purge_orphan_vector(vec_rowid)
                 if self._journal is not None and before_row is not None:
                     await self._journal.append(
                         mutation_type="DELETE_THOUGHT",
@@ -2279,8 +2295,16 @@ class SqliteEngravaCore:
         """
         before_row = await self._get_thought_row(thought_id) if self._journal is not None else None
 
+        # Capture the embedding rowid *before* the cascade removes the row: the
+        # vec0 vector table is not reachable by the embedding FK's ON DELETE
+        # CASCADE, so the vector must be deleted explicitly to avoid a ghost.
+        vec_rowid = await self._embedding_rowid_for_thought(thought_id)
+
         cursor = await self._db.execute("DELETE FROM thought WHERE thought_id = ?", (thought_id,))
         deleted = cursor.rowcount > 0
+
+        if deleted:
+            await self._purge_orphan_vector(vec_rowid)
 
         if deleted and self._journal is not None and before_row is not None:
             await self._journal.append(
@@ -2817,6 +2841,48 @@ class SqliteEngravaCore:
             created_at=created_at,
         )
 
+    async def _embedding_rowid_for_thought(self, thought_id: str) -> int | None:
+        """Resolve the ``embedding`` rowid backing a thought's vector, if any.
+
+        Must be called *before* a thought delete cascades the ``embedding``
+        row away, so the caller can subsequently purge the matching vec0
+        vector (which the FK cascade cannot reach). Returns ``None`` when no
+        vector backend is active (the numpy path needs no purge) or when the
+        thought has no embedding, so the caller can skip the purge entirely.
+
+        Args:
+            thought_id: UUID of the thought whose embedding rowid to resolve.
+
+        Returns:
+            The ``embedding`` rowid, or ``None`` if there is no vector backend
+            or no embedding row for the thought.
+
+        """
+        if self._vector_backend is None:
+            return None
+        cursor = await self._db.execute(
+            "SELECT rowid FROM embedding WHERE owner_type = 'THOUGHT' AND owner_id = ?",
+            (thought_id,),
+        )
+        row = await cursor.fetchone()
+        return int(row["rowid"]) if row is not None else None
+
+    async def _purge_orphan_vector(self, rowid: int | None) -> None:
+        """Remove a now-orphaned vec0 vector left behind by a thought delete.
+
+        Paired with :meth:`_embedding_rowid_for_thought`: the numpy backend
+        yields ``None`` (nothing to do — byte-identical to the pre-fix path),
+        while an active sqlite-vec backend deletes the vector whose FK-cascaded
+        ``embedding`` row has just been removed.
+
+        Args:
+            rowid: The vec0 rowid to delete, or ``None`` to no-op.
+
+        """
+        if self._vector_backend is None or rowid is None:
+            return
+        await self._vector_backend.delete_embedding(self._db, rowid=rowid)
+
     async def get_embedding(self, thought_id: str) -> EmbeddingRecord | None:
         """Retrieve the embedding for a thought, or None if not found.
 
@@ -2855,6 +2921,23 @@ class SqliteEngravaCore:
         ``vec0`` vector table serves the query.  Otherwise falls back to
         brute-force numpy cosine similarity.
 
+        Result completeness (sqlite-vec arm): vec0 applies its ``k``/``LIMIT``
+        before expired thoughts and retired REFLECTIONs can be filtered out
+        (that filter is a post-``MATCH`` join). To avoid returning fewer than
+        ``top_k`` live rows, the vec0 arm over-fetches a **bounded** multiple
+        of ``top_k`` (``search.vec0_overfetch_factor``, capped by
+        ``_VEC0_OVERFETCH_CAP``), applies the live-row filter, then trims to
+        ``top_k``. This is **best-effort, not a guarantee** — under-fill can
+        still occur in two cases: (1) a store where almost all of the nearest
+        ``vec0_overfetch_factor * top_k`` neighbours are expired/retired; and
+        (2) when ``top_k * vec0_overfetch_factor`` exceeds ``_VEC0_OVERFETCH_CAP``
+        (a large ``top_k``), the fetch is limited to the cap, so even a
+        moderate expiry rate among the nearest ``_VEC0_OVERFETCH_CAP`` neighbours
+        can leave fewer than ``top_k`` live rows. An exact filter-before-k for
+        vec0 is a separately-gated future change. The numpy arm already filters
+        eligibility inside the SQL ``WHERE`` before top-k and so does not need
+        this.
+
         Args:
             query_vector: Query embedding vector.
             top_k: Maximum number of results.
@@ -2885,14 +2968,27 @@ class SqliteEngravaCore:
 
         _t_start = _time.perf_counter()
         if self._vector_backend is not None and _filter_clause is None:
+            # Bounded over-fetch: vec0 applies its k/LIMIT *before* we can drop
+            # expired/retired rows (the live-row filter is a post-MATCH join),
+            # so fetching only ``top_k`` would under-fill whenever any of the
+            # nearest ``top_k`` neighbours turn out to be non-live. Fetch a
+            # bounded multiple instead, filter, sort, then trim to ``top_k`` so
+            # the trim keeps the highest-similarity *live* rows. The deeper live
+            # pool also now feeds the hybrid-fusion vector arm more completely
+            # (previously under-fed); for stores containing expired/retired rows
+            # this can shift the fused order — a more-correct pool, disclosed.
+            overfetch_factor = (
+                self._search_config.vec0_overfetch_factor if self._search_config is not None else 4
+            )
+            effective_fetch = min(top_k * overfetch_factor, _VEC0_OVERFETCH_CAP)
             results = await self._vector_backend.search(
                 self._db,
                 query_vector,
-                top_k,
+                effective_fetch,
                 threshold,
             )
             filtered = await self._filter_expired_results(results)
-            filtered = _sort_scored_descending(filtered)
+            filtered = _sort_scored_descending(filtered)[:top_k]
             await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
             return filtered
         results = await self._search_similar_numpy(
