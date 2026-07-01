@@ -24,7 +24,10 @@ from engrava.domain.protocols.hooks import MindQLExtension
 from engrava.mindql import executor as executor_module
 from engrava.mindql.executor import MindQLExecutor
 from engrava.mindql.parser import (
+    BoolExpr,
+    Comparison,
     Condition,
+    InCondition,
     MindQLCommand,
     MindQLOperator,
     MindQLParseError,
@@ -971,17 +974,32 @@ class TestQuotedValueStaysString:
 
 
 class TestConditionFullMatch:
-    """A WHERE fragment must match the condition grammar in full.
+    """A WHERE fragment must match an operand grammar in full.
 
     A prefix match used to silently discard any trailing content after the
-    first ``field op value`` token (for example ``priority = 'P1' OR 1=1``
-    parsed as just ``priority = 'P1'``). Such a fragment is now rejected so the
-    surplus never alters the result set unnoticed.
+    first ``field op value`` token. On the flat (pure-``AND``) path each
+    fragment is still matched in full. ``OR`` is now a first-class operator, so
+    ``priority = 'P1' OR 1=1`` parses as a boolean tree — but the injected
+    ``1=1`` operand names the non-column ``1``, which the per-table allowlist
+    rejects when the query runs, so the surplus can never quietly change the
+    result set.
     """
 
-    def test_trailing_content_after_condition_raises(self) -> None:
-        with pytest.raises(MindQLParseError, match="Invalid condition"):
-            parse("FIND thoughts WHERE priority = 'P1' OR 1=1")
+    def test_trailing_injection_operand_rejected_at_execution(self) -> None:
+        # ``OR 1=1`` is valid grammar now, but ``1`` is not an allowlisted
+        # column, so execution rejects it rather than widening the result set.
+        q = parse("FIND thoughts WHERE priority = 'P1' OR 1=1")
+        assert isinstance(q.where, BoolExpr)
+        assert q.where.op == "OR"
+
+    async def test_trailing_injection_operand_rejected_when_run(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        executor = MindQLExecutor(populated_db)
+        q = parse("FIND thoughts WHERE priority = 'P1' OR 1=1")
+        with pytest.raises(MindQLParseError, match="not allowed"):
+            await executor.execute(q)
 
     def test_clean_single_condition_still_parses(self) -> None:
         q = parse("FIND thoughts WHERE priority = 'P1'")
@@ -1076,3 +1094,767 @@ class TestDefaultFindLimit:
         result = await store.execute_mindql(parse("COUNT thoughts"))
         # COUNT does not apply the FIND default cap.
         assert result.count == total
+
+
+# ---------------------------------------------------------------------------
+# IN operator
+# ---------------------------------------------------------------------------
+
+
+class TestParserIn:
+    """Parsing of the ``field IN (v1, v2, …)`` operator."""
+
+    def test_in_quoted_values(self) -> None:
+        q = parse("FIND thoughts WHERE thought_type IN ('BELIEF', 'OBSERVATION')")
+        assert isinstance(q.where, InCondition)
+        assert q.where.field == "thought_type"
+        assert q.where.values == ("BELIEF", "OBSERVATION")
+        # The flat lists stay empty on the tree path.
+        assert q.conditions == []
+        assert q.temporal_predicates == []
+
+    def test_in_unquoted_values_coerced(self) -> None:
+        q = parse("FIND thoughts WHERE created_cycle IN (1, 2, 3)")
+        assert isinstance(q.where, InCondition)
+        assert q.where.values == (1, 2, 3)
+        assert all(isinstance(v, int) for v in q.where.values)
+
+    def test_in_quoted_value_stays_string(self) -> None:
+        q = parse("FIND thoughts WHERE source IN ('007')")
+        assert isinstance(q.where, InCondition)
+        assert q.where.values == ("007",)
+        assert isinstance(q.where.values[0], str)
+
+    def test_in_single_value(self) -> None:
+        q = parse("FIND thoughts WHERE priority IN ('P1')")
+        assert isinstance(q.where, InCondition)
+        assert q.where.values == ("P1",)
+
+    def test_empty_in_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="IN requires at least one value"):
+            parse("FIND thoughts WHERE priority IN ()")
+
+    def test_in_case_insensitive_keyword(self) -> None:
+        q = parse("FIND thoughts WHERE priority in ('P1', 'P2')")
+        assert isinstance(q.where, InCondition)
+        assert q.where.values == ("P1", "P2")
+
+
+class TestExecutorIn:
+    """Execution of the ``IN`` operator against a real database."""
+
+    async def test_in_selects_matching_rows(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        executor = MindQLExecutor(populated_db)
+        q = parse("FIND thoughts WHERE thought_id IN ('t-000', 't-002')")
+        result = await executor.execute(q)
+        assert {row["thought_id"] for row in result.rows} == {"t-000", "t-002"}
+
+    async def test_in_binds_every_value(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # EXPLAIN exposes the compiled SQL: every IN value must be a bound ``?``.
+        executor = MindQLExecutor(populated_db)
+        q = parse("EXPLAIN FIND thoughts WHERE thought_id IN ('t-000', 't-002')")
+        result = await executor.execute(q)
+        sql = result.rows[0]["sql"]
+        assert "thought_id IN (?, ?)" in sql
+        assert result.rows[0]["params"][:2] == ["t-000", "t-002"]
+
+    async def test_in_disallowed_column_rejected(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        executor = MindQLExecutor(populated_db)
+        q = parse("FIND thoughts WHERE bogus_col IN ('x')")
+        with pytest.raises(MindQLParseError, match="not allowed"):
+            await executor.execute(q)
+
+
+# ---------------------------------------------------------------------------
+# OR / AND precedence and parentheses
+# ---------------------------------------------------------------------------
+
+
+class TestParserBooleanExpression:
+    """Parsing of OR / AND precedence and parenthesised grouping."""
+
+    def test_and_binds_tighter_than_or(self) -> None:
+        # ``a = 1 OR b = 2 AND c = 3`` groups as ``a=1 OR (b=2 AND c=3)``.
+        q = parse(
+            "FIND thoughts WHERE priority = 'P1' OR lifecycle_status = 'ACTIVE' AND source = 'x'"
+        )
+        assert isinstance(q.where, BoolExpr)
+        assert q.where.op == "OR"
+        assert len(q.where.operands) == 2
+        left, right = q.where.operands
+        assert isinstance(left, Comparison)
+        assert left.field == "priority"
+        assert isinstance(right, BoolExpr)
+        assert right.op == "AND"
+        assert [op.field for op in right.operands if isinstance(op, Comparison)] == [
+            "lifecycle_status",
+            "source",
+        ]
+
+    def test_parentheses_override_precedence(self) -> None:
+        # Explicit parentheses group the OR before the AND.
+        q = parse("FIND thoughts WHERE (priority = 'P1' OR priority = 'P2') AND source = 'x'")
+        assert isinstance(q.where, BoolExpr)
+        assert q.where.op == "AND"
+        left, right = q.where.operands
+        assert isinstance(left, BoolExpr)
+        assert left.op == "OR"
+        assert isinstance(right, Comparison)
+        assert right.field == "source"
+
+    def test_temporal_predicate_is_an_operand(self) -> None:
+        q = parse(f"FIND thoughts WHERE priority = 'P1' OR valid_at '{_T_JAN}'")
+        assert isinstance(q.where, BoolExpr)
+        assert q.where.op == "OR"
+        _, right = q.where.operands
+        assert isinstance(right, TemporalPredicate)
+        assert right.kind == TemporalPredicateKind.VALID_AT
+
+    def test_in_is_an_operand(self) -> None:
+        q = parse(
+            "FIND thoughts WHERE priority = 'P1' OR thought_type IN ('BELIEF', 'OBSERVATION')"
+        )
+        assert isinstance(q.where, BoolExpr)
+        _, right = q.where.operands
+        assert isinstance(right, InCondition)
+
+    def test_nested_parentheses(self) -> None:
+        q = parse("FIND thoughts WHERE ((priority = 'P1'))")
+        assert isinstance(q.where, Comparison)
+        assert q.where.field == "priority"
+
+    def test_unbalanced_parentheses_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match=r"[Pp]arenthes"):
+            parse("FIND thoughts WHERE (priority = 'P1'")
+
+    def test_dangling_or_rejected(self) -> None:
+        with pytest.raises(MindQLParseError):
+            parse("FIND thoughts WHERE priority = 'P1' OR")
+
+
+class TestExecutorBooleanExpression:
+    """Execution of OR / AND / parenthesised WHERE trees."""
+
+    async def test_or_widens_result(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        executor = MindQLExecutor(populated_db)
+        q = parse("FIND thoughts WHERE thought_id = 't-000' OR thought_id = 't-004'")
+        result = await executor.execute(q)
+        assert {row["thought_id"] for row in result.rows} == {"t-000", "t-004"}
+
+    async def test_precedence_matches_sqlite(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # priority=P1 rows are t-000,t-001 (both ACTIVE). t-004 is ARCHIVED.
+        # ``priority='P1' OR lifecycle_status='ARCHIVED' AND priority='P2'``
+        # groups as P1 OR (ARCHIVED AND P2) → {t-000,t-001,t-004}.
+        executor = MindQLExecutor(populated_db)
+        q = parse(
+            "FIND thoughts WHERE priority = 'P1' "
+            "OR lifecycle_status = 'ARCHIVED' AND priority = 'P2'"
+        )
+        result = await executor.execute(q)
+        assert {row["thought_id"] for row in result.rows} == {"t-000", "t-001", "t-004"}
+
+    async def test_parentheses_change_result(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # (P1 OR P2) AND ACTIVE → active rows only (t-000..t-003).
+        executor = MindQLExecutor(populated_db)
+        q = parse(
+            "FIND thoughts WHERE (priority = 'P1' OR priority = 'P2') "
+            "AND lifecycle_status = 'ACTIVE'"
+        )
+        result = await executor.execute(q)
+        assert {row["thought_id"] for row in result.rows} == {
+            "t-000",
+            "t-001",
+            "t-002",
+            "t-003",
+        }
+
+    async def test_tree_temporal_predicate_composes(
+        self,
+        temporal_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(temporal_db)
+        # ``created_cycle = 1 OR valid_at MID`` — all rows are created_cycle 1,
+        # so the OR keeps every row (including the future one, via the left arm).
+        result = await store.execute_mindql(
+            parse(f"FIND thoughts WHERE created_cycle = 1 OR valid_at '{_T_MID}'")
+        )
+        ids = {row["thought_id"] for row in result.rows if "wire-" not in row["thought_id"]}
+        assert "t-future" in ids
+
+
+# ---------------------------------------------------------------------------
+# ORDER BY
+# ---------------------------------------------------------------------------
+
+
+class TestParserOrderBy:
+    """Parsing of the ORDER BY clause (FIND only)."""
+
+    def test_single_field_default_asc(self) -> None:
+        q = parse("FIND thoughts ORDER BY created_cycle")
+        assert q.order_by == (("created_cycle", "ASC"),)
+
+    def test_single_field_desc(self) -> None:
+        q = parse("FIND thoughts ORDER BY created_cycle DESC")
+        assert q.order_by == (("created_cycle", "DESC"),)
+
+    def test_multi_field(self) -> None:
+        q = parse("FIND thoughts ORDER BY priority ASC, created_cycle DESC")
+        assert q.order_by == (("priority", "ASC"), ("created_cycle", "DESC"))
+
+    def test_direction_case_insensitive(self) -> None:
+        q = parse("FIND thoughts ORDER BY created_cycle desc")
+        assert q.order_by == (("created_cycle", "DESC"),)
+
+    def test_order_by_with_where_and_limit(self) -> None:
+        q = parse("FIND thoughts WHERE priority = 'P1' ORDER BY created_cycle DESC LIMIT 3")
+        assert q.order_by == (("created_cycle", "DESC"),)
+        assert q.limit == 3
+        assert len(q.conditions) == 1
+
+    def test_order_by_rejected_on_count(self) -> None:
+        with pytest.raises(MindQLParseError, match="ORDER BY is only supported for FIND"):
+            parse("COUNT thoughts ORDER BY created_cycle")
+
+    def test_invalid_direction_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="Invalid ORDER BY direction"):
+            parse("FIND thoughts ORDER BY created_cycle SIDEWAYS")
+
+
+class TestExecutorOrderBy:
+    """Execution of ORDER BY, including allowlist enforcement on sort fields."""
+
+    async def test_order_by_desc_sorts_rows(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        executor = MindQLExecutor(populated_db)
+        q = parse("FIND thoughts ORDER BY created_cycle DESC")
+        result = await executor.execute(q)
+        cycles = [row["created_cycle"] for row in result.rows]
+        assert cycles == sorted(cycles, reverse=True)
+
+    async def test_order_by_multi_field(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        executor = MindQLExecutor(populated_db)
+        q = parse("FIND thoughts ORDER BY priority ASC, created_cycle DESC")
+        result = await executor.execute(q)
+        # Sort key emitted before LIMIT/OFFSET.
+        explain = await executor.execute(
+            parse("EXPLAIN FIND thoughts ORDER BY priority ASC, created_cycle DESC")
+        )
+        sql = explain.rows[0]["sql"]
+        assert "ORDER BY priority ASC, created_cycle DESC" in sql
+        assert sql.index("ORDER BY") < sql.index("LIMIT")
+        assert len(result.rows) == 5
+
+    async def test_order_by_non_allowlisted_field_rejected(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        executor = MindQLExecutor(populated_db)
+        q = parse("FIND thoughts ORDER BY bogus_col")
+        with pytest.raises(MindQLParseError, match="not allowed"):
+            await executor.execute(q)
+
+
+# ---------------------------------------------------------------------------
+# OFFSET
+# ---------------------------------------------------------------------------
+
+
+class TestParserOffset:
+    """Parsing of the OFFSET clause (FIND only)."""
+
+    def test_offset_with_limit(self) -> None:
+        q = parse("FIND thoughts LIMIT 2 OFFSET 1")
+        assert q.limit == 2
+        assert q.offset == 1
+
+    def test_offset_without_limit(self) -> None:
+        q = parse("FIND thoughts OFFSET 3")
+        assert q.offset == 3
+        assert q.limit is None
+
+    def test_offset_rejected_on_count(self) -> None:
+        with pytest.raises(MindQLParseError, match="OFFSET is only supported for FIND"):
+            parse("COUNT thoughts OFFSET 1")
+
+
+class TestExecutorOffset:
+    """Execution of OFFSET, including the default-LIMIT fallback."""
+
+    async def test_offset_skips_rows(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        executor = MindQLExecutor(populated_db)
+        full = await executor.execute(parse("FIND thoughts ORDER BY thought_id ASC"))
+        paged = await executor.execute(
+            parse("FIND thoughts ORDER BY thought_id ASC LIMIT 2 OFFSET 2")
+        )
+        assert [row["thought_id"] for row in paged.rows] == [
+            full.rows[2]["thought_id"],
+            full.rows[3]["thought_id"],
+        ]
+
+    async def test_offset_without_limit_uses_default_cap(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # SQLite requires LIMIT for OFFSET → default cap is applied as LIMIT.
+        executor = MindQLExecutor(populated_db)
+        explain = await executor.execute(parse("EXPLAIN FIND thoughts OFFSET 1"))
+        sql = explain.rows[0]["sql"]
+        assert f"LIMIT {executor_module.DEFAULT_FIND_LIMIT} OFFSET 1" in sql
+        result = await executor.execute(parse("FIND thoughts OFFSET 1"))
+        assert len(result.rows) == 4
+
+
+# ---------------------------------------------------------------------------
+# EXPLAIN prefix — compiles the plan and never executes it
+# ---------------------------------------------------------------------------
+
+
+class TestParserExplain:
+    """Parsing of the EXPLAIN prefix."""
+
+    def test_explain_find(self) -> None:
+        q = parse("EXPLAIN FIND thoughts WHERE priority = 'P1'")
+        assert q.explain is True
+        assert q.command == MindQLCommand.FIND
+
+    def test_explain_count(self) -> None:
+        q = parse("EXPLAIN COUNT thoughts")
+        assert q.explain is True
+        assert q.command == MindQLCommand.COUNT
+
+    def test_explain_select(self) -> None:
+        q = parse("EXPLAIN SELECT thought_id FROM thought")
+        assert q.explain is True
+        assert q.command == MindQLCommand.SELECT
+
+    def test_explain_case_insensitive(self) -> None:
+        q = parse("explain find thoughts")
+        assert q.explain is True
+
+    def test_explain_alone_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="EXPLAIN requires a query"):
+            parse("EXPLAIN")
+
+    def test_explain_extension_rejected(self) -> None:
+        # A plain extension command parses fine; only EXPLAIN + extension fails.
+        parse("PING x", known_extensions={"PING"})
+        with pytest.raises(MindQLParseError, match="EXPLAIN is only supported"):
+            parse("EXPLAIN PING x", known_extensions={"PING"})
+
+
+class TestExecutorExplain:
+    """EXPLAIN returns the compiled plan and NEVER executes."""
+
+    async def test_explain_find_returns_plan(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        executor = MindQLExecutor(populated_db)
+        result = await executor.execute(parse("EXPLAIN FIND thoughts WHERE priority = 'P1'"))
+        assert result.command == "EXPLAIN"
+        assert result.columns == ["sql", "params"]
+        row = result.rows[0]
+        assert row["sql"].startswith("SELECT * FROM thought WHERE priority = ?")
+        assert row["params"] == ["P1"]
+
+    async def test_explain_count_returns_plan(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        executor = MindQLExecutor(populated_db)
+        result = await executor.execute(parse("EXPLAIN COUNT thoughts WHERE priority = 'P1'"))
+        row = result.rows[0]
+        assert "SELECT COUNT(*)" in row["sql"]
+        assert row["params"] == ["P1"]
+
+    async def test_explain_select_returns_plan(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        executor = MindQLExecutor(populated_db)
+        result = await executor.execute(parse("EXPLAIN SELECT thought_id FROM thought"))
+        row = result.rows[0]
+        assert row["sql"] == "SELECT thought_id FROM thought"
+        assert row["params"] == []
+
+    async def test_explain_never_executes_side_effecting_select(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # The load-bearing safety invariant: EXPLAIN compiles and returns the
+        # plan WITHOUT touching the DB. An invalid / side-effecting SQL string
+        # would raise or mutate if executed — under EXPLAIN it does neither.
+        executor = MindQLExecutor(populated_db)
+        q = MindQLQuery(
+            command=MindQLCommand.SELECT,
+            raw_sql="SELECT this is not valid sql at all",
+            explain=True,
+        )
+        result = await executor.execute(q)
+        # No execution → no error, plan returned verbatim.
+        assert result.command == "EXPLAIN"
+        assert result.rows[0]["sql"] == "SELECT this is not valid sql at all"
+
+    async def test_explain_does_not_call_db_execute(
+        self,
+        populated_db: aiosqlite.Connection,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Spy: db.execute must never be called on an EXPLAIN path.
+        executor = MindQLExecutor(populated_db)
+        called = False
+        original_execute = populated_db.execute
+
+        async def _spy(*args: object, **kwargs: object) -> object:
+            nonlocal called
+            called = True
+            return await original_execute(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(populated_db, "execute", _spy)
+        await executor.execute(parse("EXPLAIN FIND thoughts WHERE priority = 'P1'"))
+        await executor.execute(parse("EXPLAIN COUNT thoughts"))
+        await executor.execute(parse("EXPLAIN SELECT thought_id FROM thought"))
+        assert called is False
+
+    async def test_explain_still_validates_columns(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # Compilation still enforces the allowlist, so an EXPLAIN of a bad
+        # column raises at compile time (without executing).
+        executor = MindQLExecutor(populated_db)
+        q = MindQLQuery(
+            command=MindQLCommand.FIND,
+            table="thought",
+            explain=True,
+            conditions=[
+                Condition(field="bogus", operator=MindQLOperator.EQ, value="x"),
+            ],
+        )
+        with pytest.raises(MindQLParseError, match="not allowed"):
+            await executor.execute(q)
+
+
+# ---------------------------------------------------------------------------
+# Parametrized SELECT passthrough + multi-statement hardening
+# ---------------------------------------------------------------------------
+
+
+class TestExecutorSelectParams:
+    """Bound parameters and multi-statement hardening on SELECT passthrough."""
+
+    async def test_select_with_bound_params(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        executor = MindQLExecutor(populated_db)
+        q = MindQLQuery(
+            command=MindQLCommand.SELECT,
+            raw_sql="SELECT thought_id FROM thought WHERE priority = ?",
+            select_params=("P1",),
+        )
+        result = await executor.execute(q)
+        assert {row["thought_id"] for row in result.rows} == {"t-000", "t-001"}
+
+    async def test_select_without_params_unchanged(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # select_params=None behaves exactly as before (no bound params).
+        executor = MindQLExecutor(populated_db)
+        q = parse("SELECT thought_id FROM thought WHERE lifecycle_status = 'ACTIVE'")
+        assert q.select_params is None
+        result = await executor.execute(q)
+        assert len(result.rows) == 4
+
+    async def test_trailing_semicolon_tolerated(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        executor = MindQLExecutor(populated_db)
+        q = MindQLQuery(
+            command=MindQLCommand.SELECT,
+            raw_sql="SELECT thought_id FROM thought;",
+        )
+        result = await executor.execute(q)
+        assert len(result.rows) == 5
+
+    async def test_multi_statement_rejected(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        executor = MindQLExecutor(populated_db)
+        q = MindQLQuery(
+            command=MindQLCommand.SELECT,
+            raw_sql="SELECT thought_id FROM thought; DROP TABLE thought",
+        )
+        with pytest.raises(MindQLParseError, match="single SELECT statement"):
+            await executor.execute(q)
+
+    async def test_non_select_still_rejected(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        executor = MindQLExecutor(populated_db)
+        q = MindQLQuery(command=MindQLCommand.SELECT, raw_sql="DELETE FROM thought")
+        with pytest.raises(MindQLParseError, match="Only SELECT"):
+            await executor.execute(q)
+
+
+# ---------------------------------------------------------------------------
+# Zero-regression: the pure-AND path leaves where=None and compiles identically
+# ---------------------------------------------------------------------------
+
+
+class TestZeroRegressionFlatPath:
+    """A pure-AND WHERE must keep the historical flat path (``where`` is None)."""
+
+    def test_simple_comparison_leaves_where_none(self) -> None:
+        q = parse("FIND thoughts WHERE priority = 'P1'")
+        assert q.where is None
+        assert len(q.conditions) == 1
+
+    def test_pure_and_leaves_where_none(self) -> None:
+        q = parse("FIND thoughts WHERE priority = 'P1' AND source = 'x'")
+        assert q.where is None
+        assert len(q.conditions) == 2
+
+    def test_temporal_pure_and_leaves_where_none(self) -> None:
+        q = parse(f"FIND thoughts WHERE priority = 'P1' AND valid_at '{_T_JAN}'")
+        assert q.where is None
+        assert len(q.conditions) == 1
+        assert len(q.temporal_predicates) == 1
+
+    async def test_flat_temporal_sql_identical_to_pre_feature(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # The compiled SQL for a pure-AND temporal query is byte-identical to
+        # what the historical flat builder produced (conditions then temporal).
+        executor = MindQLExecutor(populated_db)
+        explain = await executor.execute(
+            parse(f"EXPLAIN FIND thoughts WHERE priority = 'P1' AND valid_at '{_T_JAN}'")
+        )
+        sql = explain.rows[0]["sql"]
+        # A literal expected-SQL string for an equality assertion, not query
+        # construction — the value binds are ``?`` placeholders.
+        expected_sql = (
+            "SELECT * FROM thought WHERE priority = ? "  # noqa: S608
+            "AND (valid_from IS NULL OR valid_from <= ?) "
+            "AND (valid_until IS NULL OR valid_until > ?) "
+            f"LIMIT {executor_module.DEFAULT_FIND_LIMIT}"
+        )
+        assert sql == expected_sql
+        assert explain.rows[0]["params"] == ["P1", _T_JAN, _T_JAN]
+
+
+# ---------------------------------------------------------------------------
+# Parser edge cases (error paths and boundary tokenisation)
+# ---------------------------------------------------------------------------
+
+
+class TestParserEdgeCases:
+    """Boundary and error paths in the read-surface grammar."""
+
+    def test_empty_where_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="WHERE requires at least one"):
+            parse("FIND thoughts WHERE")
+
+    def test_empty_where_before_limit_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="WHERE requires at least one"):
+            parse("FIND thoughts WHERE LIMIT 5")
+
+    def test_garbage_tail_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="Expected WHERE, ORDER BY"):
+            parse("FIND thoughts BOGUS")
+
+    def test_trailing_and_ignored_on_flat_path(self) -> None:
+        # A trailing AND produces an empty fragment that is skipped.
+        q = parse("FIND thoughts WHERE priority = 'P1' AND ")
+        assert q.where is None
+        assert len(q.conditions) == 1
+
+    def test_invalid_order_by_field_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="Invalid ORDER BY field"):
+            parse("FIND thoughts ORDER BY na-me")
+
+    def test_empty_order_by_item_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="Malformed ORDER BY"):
+            parse("FIND thoughts ORDER BY priority, ")
+
+    def test_too_many_order_by_tokens_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="Malformed ORDER BY item"):
+            parse("FIND thoughts ORDER BY priority ASC EXTRA")
+
+    def test_invalid_condition_in_tree_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="Invalid condition"):
+            parse("FIND thoughts WHERE (garbage fragment) OR priority = 'P1'")
+
+    def test_quoted_value_with_boolean_words_not_split(self) -> None:
+        # 'A AND OR (B)' inside quotes stays one value on the tree path.
+        q = parse("FIND thoughts WHERE essence = 'A AND OR (B)' OR priority = 'P1'")
+        assert isinstance(q.where, BoolExpr)
+        left = q.where.operands[0]
+        assert isinstance(left, Comparison)
+        assert left.value == "A AND OR (B)"
+
+    def test_unterminated_string_in_where_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="Unterminated string"):
+            parse("FIND thoughts WHERE essence = 'oops OR priority = 'P1'")
+
+    def test_unterminated_in_list_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="Unterminated"):
+            parse("FIND thoughts WHERE priority IN ('P1'")
+
+    def test_in_with_trailing_comma_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="Malformed IN value list"):
+            parse("FIND thoughts WHERE priority IN ('P1',)")
+
+    def test_in_with_leading_comma_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="Malformed IN value list"):
+            parse("FIND thoughts WHERE priority IN (,'P1')")
+
+    def test_in_with_double_comma_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="Malformed IN value list"):
+            parse("FIND thoughts WHERE priority IN ('P1',,'P2')")
+
+    def test_in_missing_comma_between_values_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="Malformed IN value list"):
+            parse("FIND thoughts WHERE priority IN ('P1' 'P2')")
+
+    def test_in_unmatchable_value_rejected(self) -> None:
+        # A stray ``(`` where a value is expected matches no value token.
+        with pytest.raises(MindQLParseError, match="Malformed IN value list"):
+            parse("FIND thoughts WHERE priority IN ('P1', ()")
+
+    def test_stray_close_paren_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="Unexpected token"):
+            parse("FIND thoughts WHERE priority = 'P1' OR )")
+
+    def test_float_value_coercion(self) -> None:
+        q = parse("FIND thoughts WHERE confidence > 0.5")
+        assert q.conditions[0].value == 0.5
+        assert isinstance(q.conditions[0].value, float)
+
+    def test_in_unquoted_non_numeric_stays_string(self) -> None:
+        # A bare, non-numeric IN value coerces to itself (a string).
+        q = parse("FIND thoughts WHERE lifecycle_status IN (ACTIVE, ARCHIVED)")
+        assert isinstance(q.where, InCondition)
+        assert q.where.values == ("ACTIVE", "ARCHIVED")
+        assert all(isinstance(v, str) for v in q.where.values)
+
+    def test_in_unterminated_quote_inside_list_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="Unterminated string"):
+            parse("FIND thoughts WHERE priority IN ('P1) OR essence = 'x'")
+
+    def test_bare_quote_operand_tokenised_atomically(self) -> None:
+        # An operand beginning with a quote on the tree path must tokenise the
+        # quoted run atomically (never splitting on the OR inside it). The
+        # resulting fragment is not a valid comparison, so it is rejected as a
+        # condition rather than silently mis-split.
+        with pytest.raises(MindQLParseError, match="Invalid condition"):
+            parse("FIND thoughts WHERE 'a OR b' OR priority = 'P1'")
+
+
+class TestLexicalScanQuoteAwareness:
+    """Grammar tokens inside a string literal must not be mis-scanned.
+
+    ``OR`` / ``IN`` / parentheses inside a value literal must NOT force the
+    boolean-tree path (the query is still a single simple comparison → flat
+    path, ``where=None``), and a ``;`` inside a SELECT-passthrough literal must
+    NOT trip the single-statement guard.
+    """
+
+    def test_or_inside_value_literal_stays_flat_path(self) -> None:
+        q = parse("FIND thoughts WHERE content = 'A OR B'")
+        assert q.where is None
+        assert len(q.conditions) == 1
+        assert q.conditions[0].value == "A OR B"
+
+    def test_in_and_parens_inside_value_literal_stay_flat_path(self) -> None:
+        q = parse("FIND thoughts WHERE content = 'x IN (y)'")
+        assert q.where is None
+        assert q.conditions[0].value == "x IN (y)"
+
+    async def test_or_inside_literal_matches_correctly(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(db)
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="lit-or",
+                thought_type=ThoughtType.OBSERVATION,
+                essence="e",
+                content="A OR B",
+                priority=Priority.P1,
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                created_cycle=1,
+                updated_cycle=1,
+                source="test",
+                confidence=0.5,
+            )
+        )
+        executor = MindQLExecutor(db)
+        result = await executor.execute(parse("FIND thoughts WHERE content = 'A OR B'"))
+        assert [row["thought_id"] for row in result.rows] == ["lit-or"]
+
+    async def test_semicolon_inside_select_literal_allowed(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # A ';' inside a string literal is not a statement separator.
+        executor = MindQLExecutor(populated_db)
+        result = await executor.execute(parse("SELECT ';' AS s"))
+        assert result.rows == [{"s": ";"}]
+
+    async def test_real_second_statement_still_rejected(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        executor = MindQLExecutor(populated_db)
+        with pytest.raises(MindQLParseError, match="single SELECT"):
+            await executor.execute(parse("SELECT 1; DROP TABLE thought"))
+
+    def test_bare_unterminated_literal_rejected(self) -> None:
+        # An unterminated literal with no OR/IN/paren outside it must still be
+        # rejected precisely (routed to the tree tokeniser), not silently
+        # accepted by the flat path as a value beginning with a quote.
+        with pytest.raises(MindQLParseError, match="Unterminated string"):
+            parse("FIND thoughts WHERE content = 'unterminated")
+
+    def test_doubled_quote_escape_not_mis_scanned(self) -> None:
+        # A doubled ``''`` inside a literal is skipped by the lexical scan, so
+        # the ``OR`` inside the literal is not mistaken for grammar and the
+        # literal is seen as balanced (not unterminated). MindQL values do not
+        # support the ``''`` escape, so the fragment rejects cleanly rather
+        # than being mis-routed or silently accepted.
+        with pytest.raises(MindQLParseError):
+            parse("FIND thoughts WHERE content = 'it''s OR mine'")
