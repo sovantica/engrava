@@ -71,6 +71,14 @@ class DreamingGates:
             single-linkage fallback for sparse graphs).
         enable_reflections: When ``False``, skip the clustering + REFLECTION
             creation phase entirely.
+        cold_start_clustering: When ``True``, the ``"lpa"`` clustering path
+            falls back to cosine-similarity agglomerative clustering within
+            the same cycle whenever the ASSOCIATED edge graph is empty.
+            This lets dreaming form clusters (and therefore REFLECTIONs) on a
+            fresh or sparse graph, before any dream edges exist. Defaults to
+            ``False`` so the shipped ``"lpa"`` behaviour is unchanged — the
+            fallback is strictly opt-in and never alters cluster output when
+            edges are present.
         cluster_allowed_types: Thought types eligible to enter the
             agglomerative clustering candidate pool. Defaults to
             ``("OBSERVATION",)`` so REFLECTIONs created in earlier
@@ -154,6 +162,7 @@ class DreamingGates:
     cluster_similarity_threshold: float = 0.7
     cluster_algorithm: Literal["lpa", "agglomerative"] = "lpa"
     enable_reflections: bool = True
+    cold_start_clustering: bool = False
     cluster_allowed_types: tuple[str, ...] = ("OBSERVATION",)
     clustering_min_new_candidates: int = 50
     max_cluster_size: int | None = 200
@@ -1274,7 +1283,7 @@ def _parse_edge_creation(raw: object) -> EdgeCreationConfig:
     )
 
 
-def _parse_gates(raw: Any) -> DreamingGates:  # noqa: ANN401, C901, PLR0915
+def _parse_gates(raw: Any) -> DreamingGates:  # noqa: ANN401, C901, PLR0912, PLR0915
     """Parse the ``extensions.dreaming.gates`` section.
 
     Args:
@@ -1331,6 +1340,11 @@ def _parse_gates(raw: Any) -> DreamingGates:  # noqa: ANN401, C901, PLR0915
         msg = "'gates.enable_reflections' must be a boolean"
         raise ConfigError(msg)
 
+    cold_start_clustering = raw.get("cold_start_clustering", False)
+    if not isinstance(cold_start_clustering, bool):
+        msg = "'gates.cold_start_clustering' must be a boolean"
+        raise ConfigError(msg)
+
     _min_cluster_size_bound = 2
     max_cluster_size = raw.get("max_cluster_size", 200)
     if max_cluster_size is not None and (
@@ -1373,6 +1387,7 @@ def _parse_gates(raw: Any) -> DreamingGates:  # noqa: ANN401, C901, PLR0915
         cluster_similarity_threshold=float(cluster_threshold),
         cluster_algorithm=cluster_algorithm,
         enable_reflections=enable_reflections,
+        cold_start_clustering=cold_start_clustering,
         max_cluster_size=max_cluster_size,
         cluster_quality_gating_enabled=cluster_quality_gating_enabled,
         cluster_quality_persona_threshold=cluster_quality_persona_threshold,

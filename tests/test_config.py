@@ -35,6 +35,12 @@ class TestDreamingGates:
         with pytest.raises(AttributeError):
             gates.min_confirmations = 5  # type: ignore[misc]
 
+    def test_cold_start_clustering_defaults_off(self) -> None:
+        # The cold-start fallback is strictly opt-in; the shipped default
+        # keeps the LPA path byte-identical to today.
+        gates = DreamingGates()
+        assert gates.cold_start_clustering is False
+
     @pytest.mark.parametrize(
         "field_name",
         [
@@ -308,6 +314,37 @@ hooks:
             encoding="utf-8",
         )
         with pytest.raises(ConfigError, match=r"cluster_quality_persona_threshold"):
+            load_config(cfg_file)
+
+    def test_cold_start_clustering_yaml_override(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "cold_start.yaml"
+        cfg_file.write_text(
+            "database:\n  path: ./t.db\nextensions:\n  dreaming:\n"
+            "    enabled: true\n    gates:\n      cold_start_clustering: true\n",
+            encoding="utf-8",
+        )
+        config = load_config(cfg_file)
+        assert config.dreaming is not None
+        assert config.dreaming.gates.cold_start_clustering is True
+
+    def test_cold_start_clustering_defaults_false_when_absent(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "cold_start_absent.yaml"
+        cfg_file.write_text(
+            "database:\n  path: ./t.db\nextensions:\n  dreaming:\n    enabled: true\n",
+            encoding="utf-8",
+        )
+        config = load_config(cfg_file)
+        assert config.dreaming is not None
+        assert config.dreaming.gates.cold_start_clustering is False
+
+    def test_cold_start_clustering_rejects_non_bool(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "cold_start_bad.yaml"
+        cfg_file.write_text(
+            "database:\n  path: ./t.db\nextensions:\n  dreaming:\n"
+            "    gates:\n      cold_start_clustering: 3\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError, match=r"cold_start_clustering.*boolean"):
             load_config(cfg_file)
 
     def test_dreaming_defaults_when_empty_section(self, tmp_path: Path) -> None:

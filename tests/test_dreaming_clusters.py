@@ -264,6 +264,175 @@ class TestBuildClusters:
 
 
 # ---------------------------------------------------------------------------
+# Cold-start fallback — LPA path with an empty edge graph
+# ---------------------------------------------------------------------------
+
+
+def _cold_start_cfg(
+    *,
+    cold_start_clustering: bool = False,
+    min_cluster_size: int = 3,
+    max_cluster_size: int | None = 200,
+    cluster_similarity_threshold: float = 0.7,
+) -> DreamingConfig:
+    """LPA (default algorithm) config for cold-start fallback tests.
+
+    Keeps the shipped ``cluster_algorithm="lpa"`` and toggles only the
+    opt-in ``cold_start_clustering`` flag plus size gates. Content-quality
+    gating is disabled so these tests exercise the cluster-construction
+    contract, not the content gates (covered elsewhere).
+
+    Edge creation is disabled so the ASSOCIATED edge graph stays empty
+    across a full ``run_consolidation`` pass — otherwise promotion would
+    seed dream edges and the LPA path would no longer take the empty-graph
+    branch, defeating the point of the cold-start scenario.
+    """
+    return DreamingConfig(
+        enabled=True,
+        promote_threshold=0.0,
+        gates=DreamingGates(
+            min_age_cycles=0,
+            allow_zero_confirmation=True,
+            min_cluster_size=min_cluster_size,
+            max_cluster_size=max_cluster_size,
+            cluster_similarity_threshold=cluster_similarity_threshold,
+            cluster_algorithm="lpa",
+            enable_reflections=True,
+            cold_start_clustering=cold_start_clustering,
+            cluster_quality_gating_enabled=False,
+        ),
+        edges=EdgeCreationConfig(enabled=False),
+    )
+
+
+async def _seed_similar_observations(
+    store: SqliteEngravaCore,
+    *,
+    count: int,
+    prefix: str,
+) -> list[str]:
+    """Create ``count`` ACTIVE OBSERVATIONs with mutually similar embeddings.
+
+    Every member gets a near-identical unit vector (cosine ≈ 1.0, well above
+    the 0.7 threshold) so single-linkage agglomerative clustering groups them
+    into one cluster. No ASSOCIATED edges are created.
+    """
+    ids: list[str] = []
+    for i in range(count):
+        t = await store.create_thought(
+            _make(f"{prefix}-{i}", essence=f"topic {i}", content=f"content {i}")
+        )
+        # Tiny per-member perturbation keeps vectors distinct but cosine ≈ 1.0.
+        await store.store_embedding(
+            t.thought_id,
+            [1.0, 0.01 * i, 0.0, 0.0],
+            model_name="test",
+        )
+        ids.append(t.thought_id)
+    return ids
+
+
+class TestColdStartFallback:
+    """Opt-in agglomerative fallback when the LPA edge graph is empty."""
+
+    async def test_lpa_empty_graph_falls_back_when_enabled(self, store: SqliteEngravaCore) -> None:
+        """flag ON + no edges + similar OBSERVATIONs → cold-start clusters.
+
+        This is the core regression: on the pre-change code the LPA path
+        bails to ``[]`` because adjacency is empty, so no cluster forms even
+        though eligible OBSERVATIONs exist. With the fallback it clusters.
+        """
+        await _seed_similar_observations(store, count=3, prefix="t-cold")
+
+        ext = DreamingExtension(config=_cold_start_cfg(cold_start_clustering=True))
+        clusters = await ext._build_clusters(store, current_cycle=1)
+
+        assert len(clusters) >= 1
+        # All three similar OBSERVATIONs land in one cluster.
+        assert max(len(c) for c in clusters) == 3
+
+    async def test_consolidate_creates_reflection_via_fallback(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        """End-to-end: flag ON on a fresh graph yields >= 1 REFLECTION."""
+        await _seed_similar_observations(store, count=3, prefix="t-cold-e2e")
+
+        ext = DreamingExtension(config=_cold_start_cfg(cold_start_clustering=True))
+        result = await ext.run_consolidation(store, current_cycle=1)
+
+        assert result.reflections_created >= 1
+        reflections = await store.list_thoughts(thought_type=ThoughtType.REFLECTION)
+        assert len(reflections) >= 1
+
+    async def test_flag_off_is_byte_identical_noop(self, store: SqliteEngravaCore) -> None:
+        """Default (flag OFF): eligible candidates exist, no edges → still [].
+
+        Proves the shipped default surface is unchanged — the fallback never
+        fires unless explicitly enabled.
+        """
+        await _seed_similar_observations(store, count=3, prefix="t-off")
+
+        ext = DreamingExtension(config=_cold_start_cfg(cold_start_clustering=False))
+        clusters = await ext._build_clusters(store, current_cycle=1)
+        assert clusters == []
+
+    async def test_flag_on_empty_pool_returns_empty(self, store: SqliteEngravaCore) -> None:
+        """flag ON but no eligible candidates (empty store) → []."""
+        ext = DreamingExtension(config=_cold_start_cfg(cold_start_clustering=True))
+        clusters = await ext._build_clusters(store, current_cycle=1)
+        assert clusters == []
+
+    async def test_fallback_oversized_cluster_rejected(self, store: SqliteEngravaCore) -> None:
+        """A fallback cluster exceeding max_cluster_size is dropped by the gate."""
+        # Five mutually-similar OBSERVATIONs → one cluster of size 5, which
+        # exceeds max_cluster_size=4 and must be rejected (no bypass).
+        await _seed_similar_observations(store, count=5, prefix="t-big")
+
+        ext = DreamingExtension(
+            config=_cold_start_cfg(
+                cold_start_clustering=True,
+                min_cluster_size=2,
+                max_cluster_size=4,
+            )
+        )
+        clusters = await ext._build_clusters(store, current_cycle=1)
+        assert clusters == []
+
+    async def test_fallback_sub_min_cluster_rejected(self, store: SqliteEngravaCore) -> None:
+        """A fallback cluster smaller than min_cluster_size is filtered out."""
+        # Two similar OBSERVATIONs → cluster of size 2 < min_cluster_size=3.
+        await _seed_similar_observations(store, count=2, prefix="t-small")
+
+        ext = DreamingExtension(
+            config=_cold_start_cfg(cold_start_clustering=True, min_cluster_size=3)
+        )
+        clusters = await ext._build_clusters(store, current_cycle=1)
+        assert clusters == []
+
+    async def test_fallback_respects_candidates_limit(
+        self, store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The fallback candidate query is bounded by candidates_limit."""
+        await _seed_similar_observations(store, count=3, prefix="t-limit")
+
+        cfg = _cold_start_cfg(cold_start_clustering=True)
+        ext = DreamingExtension(config=cfg)
+
+        captured_limits: list[int] = []
+        original = store.list_thoughts
+
+        async def _spy(*, limit: int = 50, **kwargs: object) -> list[ThoughtRecord]:
+            captured_limits.append(limit)
+            return await original(limit=limit, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(store, "list_thoughts", _spy)
+        await ext._build_clusters(store, current_cycle=1)
+
+        # The candidate-pool query must use the configured cap.
+        assert cfg.candidates_limit in captured_limits
+
+
+# ---------------------------------------------------------------------------
 # Integration tests — REFLECTION thought persistence
 # ---------------------------------------------------------------------------
 

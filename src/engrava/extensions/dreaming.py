@@ -682,7 +682,10 @@ class DreamingExtension:
 
         Runs Label Propagation (LPA) over the ASSOCIATED edge graph.
         Falls back to cosine-similarity agglomerative clustering when
-        the graph is explicitly configured to use it.
+        the graph is explicitly configured to use it. When
+        ``cold_start_clustering`` is enabled and the LPA edge graph is
+        empty, the same agglomerative path runs within this cycle so
+        clustering still succeeds on a fresh or sparse graph.
 
         Args:
             store: The store instance to read edges and embeddings from.
@@ -704,43 +707,9 @@ class DreamingExtension:
 
         if algorithm == "agglomerative":
             # Graph-independent path: cluster ACTIVE candidates of the
-            # allowed types (default: OBSERVATION only).
-            # Excluding REFLECTION from the pool prevents the meta-reflection
-            # cascade where REFLECTIONs created in cycle N get re-clustered
-            # into even more abstract meta-REFLECTIONs in cycle N+1
-            # .
-            # Works even when no dream edges exist yet — this is the
-            # intended fallback for sparse-graph / first-run scenarios
-
-            allowed_types = gates.cluster_allowed_types
-            if len(allowed_types) == 1:
-                candidates = await store.list_thoughts(
-                    lifecycle_status="ACTIVE",
-                    thought_type=allowed_types[0],
-                    limit=self._config.candidates_limit,
-                )
-            else:
-                # Union over multiple types (rare path; keeps behaviour
-                # correct if operator opts into meta-consolidation).
-                candidates = []
-                for ttype in allowed_types:
-                    candidates.extend(
-                        await store.list_thoughts(
-                            lifecycle_status="ACTIVE",
-                            thought_type=ttype,
-                            limit=self._config.candidates_limit,
-                        )
-                    )
-            cluster_fn = (
-                self._agglomerative_clusters
-                if self._config.clustering_backend == "numpy"
-                else self._agglomerative_clusters_python_legacy
-            )
-            clusters = await cluster_fn(
-                store=store,
-                node_ids=[t.thought_id for t in candidates],
-                threshold=gates.cluster_similarity_threshold,
-            )
+            # allowed types (default: OBSERVATION only). See
+            # ``_cold_start_agglomerative_clusters`` for the pool build.
+            clusters = await self._cold_start_agglomerative_clusters(store)
         else:
             # LPA path: operates over the dream-created ASSOCIATED edge graph.
             all_edges = await store.list_edges(
@@ -755,9 +724,17 @@ class DreamingExtension:
                 adjacency.setdefault(b, set()).add(a)
 
             if not adjacency:
-                return []
-
-            clusters = _lpa_clusters(adjacency)
+                if gates.cold_start_clustering:
+                    logger.info(
+                        "Dreaming clustering: LPA edge graph empty at cycle %d; "
+                        "falling back to cold-start agglomerative clustering.",
+                        current_cycle,
+                    )
+                    clusters = await self._cold_start_agglomerative_clusters(store)
+                else:
+                    return []
+            else:
+                clusters = _lpa_clusters(adjacency)
 
         # Reject oversized clusters (single-link chaining guard).
         # Clusters exceeding max_cluster_size are dropped entirely — their
@@ -776,6 +753,66 @@ class DreamingExtension:
                 clusters = [c for c in clusters if len(c) <= max_size]
 
         return [c for c in clusters if len(c) >= min_size]
+
+    async def _cold_start_agglomerative_clusters(
+        self,
+        store: SqliteEngravaCore,
+    ) -> list[frozenset[str]]:
+        """Cluster the eligible candidate pool with agglomerative clustering.
+
+        Builds the candidate pool from ``ACTIVE`` thoughts of the configured
+        ``cluster_allowed_types`` (default: ``OBSERVATION`` only) and runs the
+        cosine-similarity agglomerative backend over it. This path is
+        graph-independent, so it produces clusters even when no dream
+        ``ASSOCIATED`` edges exist yet — the shared mechanism behind both the
+        explicit ``cluster_algorithm="agglomerative"`` mode and the opt-in
+        ``cold_start_clustering`` fallback for the ``"lpa"`` path.
+
+        Excluding ``REFLECTION`` from the default pool prevents the
+        meta-reflection cascade where REFLECTIONs created in cycle N get
+        re-clustered into even more abstract meta-REFLECTIONs in cycle N+1.
+
+        The candidate query is bounded by ``candidates_limit`` so a large
+        active set cannot make the O(n²) similarity matrix unbounded.
+
+        Args:
+            store: The store instance to read candidates and embeddings from.
+
+        Returns:
+            List of disjoint clusters, each a frozen set of thought IDs. An
+            empty list when no eligible candidates have stored embeddings.
+
+        """
+        gates = self._config.gates
+        allowed_types = gates.cluster_allowed_types
+        if len(allowed_types) == 1:
+            candidates = await store.list_thoughts(
+                lifecycle_status="ACTIVE",
+                thought_type=allowed_types[0],
+                limit=self._config.candidates_limit,
+            )
+        else:
+            # Union over multiple types (rare path; keeps behaviour
+            # correct if operator opts into meta-consolidation).
+            candidates = []
+            for ttype in allowed_types:
+                candidates.extend(
+                    await store.list_thoughts(
+                        lifecycle_status="ACTIVE",
+                        thought_type=ttype,
+                        limit=self._config.candidates_limit,
+                    )
+                )
+        cluster_fn = (
+            self._agglomerative_clusters
+            if self._config.clustering_backend == "numpy"
+            else self._agglomerative_clusters_python_legacy
+        )
+        return await cluster_fn(
+            store=store,
+            node_ids=[t.thought_id for t in candidates],
+            threshold=gates.cluster_similarity_threshold,
+        )
 
     @staticmethod
     async def _agglomerative_clusters(  # noqa: C901

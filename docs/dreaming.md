@@ -316,6 +316,27 @@ Two algorithms are available via `DreamingGates.cluster_algorithm`:
   via Union-Find.
 - Use when you want clustering before dreams have built up a graph.
 
+**Cold-start fallback (`cold_start_clustering`, default `false`)**
+
+The `"lpa"` path reads communities only from the ASSOCIATED dream-edge
+graph, and those edges appear only after promotions create them. On a
+fresh or sparse graph the edge set is empty, so LPA finds nothing and no
+REFLECTIONs are produced no matter how many eligible OBSERVATIONs exist.
+
+Set `cold_start_clustering: true` to opt into a fallback: when the LPA
+path finds the edge graph empty, it falls back **within the same cycle**
+to the cosine-similarity agglomerative clustering described above, run
+over the eligible ACTIVE candidate pool. This lets dreaming form
+clusters (and REFLECTIONs) before any dream edges exist.
+
+- **Default is `false`** — the shipped `"lpa"` behaviour is unchanged, and
+  the fallback never alters cluster output when edges are present.
+- The fallback reuses the exact agglomerative path, so its clusters flow
+  through the same `min_cluster_size` / `max_cluster_size` size gates and
+  the content-quality gates — nothing bypasses them.
+- The candidate pool is bounded by `candidates_limit`, so a large active
+  set does not make the fallback unbounded.
+
 ### Idempotence
 
 Before creating a REFLECTION, the extension derives a 16-hex content-hash
@@ -336,6 +357,8 @@ extensions:
       cluster_similarity_threshold: 0.7  # cosine threshold (agglomerative only)
       cluster_algorithm: lpa          # "lpa" or "agglomerative"
       enable_reflections: true        # set to false to skip phase 3 entirely
+      cold_start_clustering: false    # opt-in: LPA falls back to agglomerative
+                                      #   clustering when the edge graph is empty
 ```
 
 ### `ConsolidationResult` fields
