@@ -230,6 +230,46 @@ class InvalidFilterPathError(EngravaError):
         )
 
 
+class JournalIntegrityError(EngravaError):
+    """Raised when an on-open journal integrity check finds a broken chain.
+
+    Surfaced only when ``journal.verify_on_open`` is enabled: opening a
+    store via :meth:`SqliteEngravaCore.from_config` re-walks the persisted
+    hash chain after the schema is ensured, and raises this error instead
+    of returning a store when the chain does not verify. Carries the same
+    diagnostics as :class:`~engrava.domain.models.journal.JournalIntegrityResult`
+    so callers can report exactly where the chain first broke.
+
+    Args:
+        first_invalid_sequence: Sequence number of the first broken entry,
+            or ``None`` when the break is not attributable to a single row.
+        error_message: Human-readable description of the first inconsistency.
+
+    Examples:
+        >>> raise JournalIntegrityError(3, "Hash mismatch at sequence 3")
+        Traceback (most recent call last):
+            ...
+        engrava.domain.exceptions.JournalIntegrityError: \
+journal integrity check failed at sequence 3: Hash mismatch at sequence 3
+
+    """
+
+    def __init__(
+        self,
+        first_invalid_sequence: int | None,
+        error_message: str | None,
+    ) -> None:
+        self.first_invalid_sequence = first_invalid_sequence
+        self.error_message = error_message
+        location = (
+            f"at sequence {first_invalid_sequence}"
+            if first_invalid_sequence is not None
+            else "(sequence unknown)"
+        )
+        detail = error_message or "chain verification failed"
+        super().__init__(f"journal integrity check failed {location}: {detail}")
+
+
 class ExtensionMigrationError(EngravaError):
     """Raised when an extension schema migration fails.
 

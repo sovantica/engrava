@@ -684,6 +684,14 @@ class JournalConfig:
 
     Attributes:
         enabled: Whether journal recording is active.
+        verify_on_open: When ``True``, opening a store via
+            ``SqliteEngravaCore.from_config`` re-walks the persisted hash
+            chain after the schema is ensured and raises
+            ``JournalIntegrityError`` if it does not verify. Independent of
+            ``enabled`` — a chain recorded in an earlier session is still
+            checked. Default ``False`` (the open path is unchanged, so the
+            walk cost — which grows with the journal size — is never paid
+            unless opted in).
 
     Examples:
         >>> cfg = JournalConfig(enabled=True)
@@ -693,6 +701,7 @@ class JournalConfig:
     """
 
     enabled: bool = False
+    verify_on_open: bool = False
 
 
 @dataclass(frozen=True)
@@ -1809,7 +1818,12 @@ def _parse_journal(raw: Any) -> JournalConfig:  # noqa: ANN401
         msg = "'journal.enabled' must be a boolean"
         raise ConfigError(msg)
 
-    return JournalConfig(enabled=enabled)
+    verify_on_open = raw.get("verify_on_open", False)
+    if not isinstance(verify_on_open, bool):
+        msg = "'journal.verify_on_open' must be a boolean"
+        raise ConfigError(msg)
+
+    return JournalConfig(enabled=enabled, verify_on_open=verify_on_open)
 
 
 # ------------------------------------------------------------------

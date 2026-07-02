@@ -298,6 +298,8 @@ class TestOffOnPair:
 # intentional, ratified public-API addition. Later extended with the
 # opt-in asymmetric embedding-prefix surface (RoleAwareEmbeddingProvider
 # capability protocol + EmbeddingQueryPrefixMismatchError), an additive,
+# default-off public-API addition. Later extended with JournalIntegrityError,
+# raised by the opt-in on-open journal integrity check — an additive,
 # default-off public-API addition.
 _PRE_WS_ALL_BASELINE = frozenset(
     {
@@ -345,6 +347,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "InvalidTransitionError",
         "JournalConfig",
         "JournalEntry",
+        "JournalIntegrityError",
         "JournalIntegrityResult",
         "JournalWriter",
         "KnowledgeSource",

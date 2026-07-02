@@ -259,10 +259,12 @@ The hash-chain audit trail. Off by default. See [Audit Trail](audit-trail.md).
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | `bool` | `false` | Record every thought/edge mutation as a hash-linked journal entry |
+| `verify_on_open` | `bool` | `false` | Re-walk the persisted hash chain when opening via `from_config` and raise `JournalIntegrityError` if it does not verify. Independent of `enabled`; adds an `O(entries)` cost per open. See [Verifying automatically on open](audit-trail.md#verifying-automatically-on-open). |
 
 ```yaml
 journal:
   enabled: true
+  verify_on_open: true
 ```
 
 ### `ttl`

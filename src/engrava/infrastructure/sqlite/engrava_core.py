@@ -43,6 +43,7 @@ from engrava.domain.enums import (
 from engrava.domain.exceptions import (
     EmbeddingModelMismatchError,
     EmbeddingQueryPrefixMismatchError,
+    JournalIntegrityError,
     ReferentialIntegrityError,
     StaleDataError,
     ThoughtNotFoundError,
@@ -52,6 +53,7 @@ from engrava.domain.models.action import ActionRecord
 from engrava.domain.models.edge import EdgeRecord
 from engrava.domain.models.embedding import EmbeddingRecord
 from engrava.domain.models.filters import _validate_path, compile_effective_predicate
+from engrava.domain.models.journal import JournalIntegrityResult
 from engrava.domain.models.thought import MetadataValue, ThoughtRecord
 from engrava.domain.models.ttl import CleanupResult, CleanupStrategy
 from engrava.domain.protocols.embedding_provider import RoleAwareEmbeddingProvider
@@ -381,6 +383,36 @@ class SqliteEngravaCore:
         """
         return self._journal
 
+    async def verify_journal(self) -> JournalIntegrityResult:
+        """Verify the persisted hash-chain journal on disk.
+
+        Walks every ``journal_entry`` row in ``sequence_number`` order,
+        recomputes each SHA-256 hash, and checks the parent-hash linkage,
+        delegating to :meth:`JournalWriter.verify_integrity`.
+
+        The check reads the recorded chain **independent of whether
+        journaling is currently enabled**. Entries may have been written in
+        an earlier session with journaling on and the store reopened with it
+        off (:attr:`journal` is then ``None``); those recorded entries must
+        still be auditable, so when there is no active writer this constructs
+        a transient, read-only :class:`JournalWriter` over the same
+        connection to run the walk. An absent or empty chain verifies as
+        ``valid=True`` with ``entries_checked=0``.
+
+        Returns:
+            A :class:`JournalIntegrityResult` describing chain validity —
+            ``valid`` plus ``entries_checked``, and on a break the
+            ``first_invalid_sequence`` and ``error_message``.
+
+        Examples:
+            >>> result = await store.verify_journal()  # doctest: +SKIP
+            >>> result.valid  # doctest: +SKIP
+            True
+
+        """
+        journal = self._journal if self._journal is not None else JournalWriter(self._db)
+        return await journal.verify_integrity()
+
     async def _record_search_latency(self, latency_ms: float) -> None:
         """Record a completed public-search latency when metrics are enabled."""
         if self._metrics_config.enabled and not _SUPPRESS_SEARCH_METRICS.get():
@@ -497,6 +529,8 @@ class SqliteEngravaCore:
 
         Raises:
             ConfigError: If the config file is invalid.
+            JournalIntegrityError: If ``journal.verify_on_open`` is enabled
+                and the persisted hash chain fails verification.
 
         """
         from engrava.config import load_config, resolve_hooks  # noqa: PLC0415
@@ -548,6 +582,21 @@ class SqliteEngravaCore:
             )
             store._owns_connection = True
             await store.ensure_schema()
+
+            # Opt-in on-open integrity check. Runs only when explicitly
+            # enabled and only after the schema is ensured, so the
+            # ``journal_entry`` table is guaranteed to exist. Default-off ⇒
+            # the open path is byte-identical to before when disabled.
+            if config.journal.verify_on_open:
+                integrity = await store.verify_journal()
+                if not integrity.valid:
+                    # Raised inside the try so the enclosing handler closes the
+                    # connection before propagating — a leaked handle on a
+                    # rejected open would otherwise pin the WAL.
+                    raise JournalIntegrityError(  # noqa: TRY301
+                        integrity.first_invalid_sequence,
+                        integrity.error_message,
+                    )
 
             await store._configure_vector_backend(
                 backend_name=config.vector_backend,

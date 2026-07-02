@@ -1,10 +1,12 @@
 """``engrava`` — CLI entry point for engrava.
 
-Provides sub-commands: info, query, snapshot, restore, gc, migrate, export.
+Provides sub-commands: info, verify, query, snapshot, restore, gc,
+migrate, export.
 
 Usage::
 
     engrava --db ./my.db info
+    engrava --db ./my.db verify
     engrava query "SELECT * FROM thought WHERE lifecycle_status = 'ACTIVE'"
     engrava snapshot -o backup.jsonl
     engrava restore -i backup.jsonl
@@ -291,6 +293,55 @@ def info(ctx: click.Context) -> None:
             await conn.close()
 
     _run(_info())
+
+
+# ------------------------------------------------------------------
+# verify
+# ------------------------------------------------------------------
+
+
+@cli.command()
+@click.pass_context
+def verify(ctx: click.Context) -> None:
+    """Verify the audit journal's hash chain for the current database.
+
+    Walks every recorded ``journal_entry`` in sequence order, recomputes
+    each SHA-256 hash, and checks the parent-hash linkage. The chain is
+    verified regardless of whether journaling is currently enabled, so a
+    journal recorded in an earlier session is still auditable.
+
+    Exit code is ``0`` when the chain verifies and ``1`` when it does not
+    (or when the database is missing).
+    """
+    cfg: EngravaCLIConfig = ctx.obj["config"]
+
+    async def _verify() -> None:
+        if not cfg.db_path.exists():
+            click.echo(f"Database not found: {cfg.db_path}")
+            sys.exit(1)
+
+        conn = await _open_db(cfg)
+        try:
+            store = SqliteEngravaCore(conn)
+            result = await store.verify_journal()
+
+            if cfg.output_format == "json":
+                click.echo(json.dumps(asdict(result), indent=2))
+            elif result.valid:
+                click.echo(f"Journal integrity OK — {result.entries_checked} entries verified.")
+            else:
+                click.echo(
+                    f"Journal integrity FAILED at sequence {result.first_invalid_sequence}: "
+                    f"{result.error_message} "
+                    f"({result.entries_checked} entries checked)."
+                )
+
+            if not result.valid:
+                sys.exit(1)
+        finally:
+            await conn.close()
+
+    _run(_verify())
 
 
 # ------------------------------------------------------------------
