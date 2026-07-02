@@ -1,8 +1,10 @@
 -- engrava: Core thought-graph schema (free-tier boundary — no internal-cognitive columns).
--- Version: core-14 (hot-path indexes: edge.to_thought_id, embedding.owner_id,
---          thought.updated_cycle, thought.thought_type)
+-- Version: core-15 (composite inbound edge index edge(edge_type, to_thought_id)
+--          for edge-type-scoped inbound lookups; core-14 added the hot-path
+--          indexes edge.to_thought_id, embedding.owner_id, thought.updated_cycle,
+--          thought.thought_type)
 
-PRAGMA user_version = 14;
+PRAGMA user_version = 15;
 
 CREATE TABLE IF NOT EXISTS thought (
     thought_id        TEXT    PRIMARY KEY,
@@ -233,3 +235,17 @@ CREATE INDEX IF NOT EXISTS idx_edge_to_thought ON edge(to_thought_id);
 CREATE INDEX IF NOT EXISTS idx_embedding_owner ON embedding(owner_id);
 CREATE INDEX IF NOT EXISTS idx_thought_updated_cycle ON thought(updated_cycle);
 CREATE INDEX IF NOT EXISTS idx_thought_type ON thought(thought_type);
+
+-- -------------------------------------------------------------------
+-- Composite inbound edge index for edge-type-scoped lookups (core-15)
+-- -------------------------------------------------------------------
+-- Mirrors idx_edge_type_from on the destination side. Inbound scans that
+-- filter on both edge_type and to_thought_id (the CONSOLIDATED_FROM
+-- source-resolution query) otherwise seek to_thought_id via
+-- idx_edge_to_thought and test edge_type as a per-row residual; this
+-- composite lets one seek satisfy both predicates:
+--   SELECT ... FROM edge WHERE to_thought_id = ? AND edge_type = ?
+-- EXPLAIN QUERY PLAN then reports
+--   idx_edge_type_to (edge_type=? AND to_thought_id=?).
+
+CREATE INDEX IF NOT EXISTS idx_edge_type_to ON edge(edge_type, to_thought_id);

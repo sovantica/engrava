@@ -141,7 +141,15 @@ For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 ### 0.4 -> 0.5
 
 The library upgrade is drop-in: `pip install --upgrade engrava` and your normal
-startup. The schema migration, if any, runs automatically on first open as usual.
+startup. The schema migration runs automatically on first open as usual.
+
+**Schema change (additive, zero data loss).** 0.5 steps the core schema forward
+one step, `user_version = 14 → 15`, adding a single composite index
+`edge(edge_type, to_thought_id)` so edge-type-scoped inbound edge lookups seek
+on both columns instead of filtering `edge_type` as a residual. It touches no
+row, column, or query result — purely a query-plan improvement — and runs inside
+a transaction on the first `ensure_schema()`. Nothing to do beyond your normal
+startup.
 
 **Breaking change for MCP-server users.** The Model Context Protocol server moved
 out of `engrava` into its own package, **`engrava-mcp`**. Removed from `engrava`

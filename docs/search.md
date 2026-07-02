@@ -336,6 +336,28 @@ search:
   reflection_boost: 1.0   # applies when reflection_boost not overridden per-call
 ```
 
+### `reflection_topk_cap` (default `0.3`)
+
+Caps how much of the final top-K window `REFLECTION` thoughts may occupy. After
+all signals are applied, if reflections hold more than `top_k *
+reflection_topk_cap` slots, the lowest-scoring excess reflections are evicted
+and the freed slots are backfilled with the highest-scoring off-list
+non-reflection candidates. Set it to `1.0` to disable the cap.
+
+When the cap actually evicts, the result carries a programmatic signal and the
+event is logged at `INFO`:
+
+```python
+result = await store.search_hybrid("patterns in memory", query_vector=embedding, top_k=10)
+if result.reflections_evicted:
+    # e.g. cap=0.3 * top_k=10 → 3 reflection slots; extra reflections were evicted
+    print(f"{result.reflections_evicted} reflection(s) evicted by reflection_topk_cap")
+```
+
+`HybridSearchResult.reflections_evicted` is `0` on every query where the cap did
+not evict (its default), so existing consumers are unaffected; a positive value
+means the cap reshaped the top-K window.
+
 ### `search_reflections_only()`
 
 Convenience helper that returns **only** REFLECTION thoughts, scored by

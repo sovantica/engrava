@@ -25,6 +25,13 @@ class HybridSearchResult:
             query (e.g. ``{"fts5", "vector"}``).  A backend appears
             even if it returned zero results; absence means the backend
             was unavailable or not applicable.
+        reflections_evicted: Number of REFLECTION results the
+            ``reflection_topk_cap`` removed from the final top-K window and
+            backfilled with off-list non-REFLECTION candidates.  ``0`` (the
+            default) means the cap did not evict anything on this query — so
+            the ranked ``results`` are exactly what fusion + boosting
+            produced.  A positive value is a programmatic signal that the cap
+            reshaped the window; the same event is also logged at ``INFO``.
 
     Examples:
         >>> r = HybridSearchResult(
@@ -35,8 +42,11 @@ class HybridSearchResult:
         2
         >>> "fts5" in r.backends_used
         True
+        >>> r.reflections_evicted
+        0
 
     """
 
     results: list[tuple[str, float]] = field(default_factory=list)
     backends_used: frozenset[str] = field(default_factory=frozenset)
+    reflections_evicted: int = 0

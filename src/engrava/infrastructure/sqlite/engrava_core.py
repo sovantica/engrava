@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Self
 
 import aiosqlite
 import numpy as np
+import numpy.typing as npt
 
 from engrava.domain.enums import (
     ActionStatus,
@@ -241,6 +242,12 @@ _RECENCY_NUDGE_THRESHOLD = 25
 #: rather than a multiplicative blow-up. 500 comfortably exceeds realistic
 #: ``top_k`` values while capping worst-case scan/join work per query.
 _VEC0_OVERFETCH_CAP = 500
+#: Maximum host parameters bound into a single ``... IN (?, ?, …)`` statement.
+#: SQLite's historical compile-time default for ``SQLITE_MAX_VARIABLE_NUMBER``
+#: is 999; batched ``IN`` fetches chunk their id lists to this size so a large
+#: input set never exceeds the limit (newer SQLite raises the default, but
+#: staying at 999 is safe on every supported build).
+_SQLITE_MAX_VARS = 999
 _SUPPRESS_SEARCH_METRICS: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "engrava_suppress_search_metrics",
     default=False,
@@ -643,7 +650,7 @@ class SqliteEngravaCore:
         Applies the full ``schema_core.sql`` (including FTS5 virtual
         table and sync triggers) only when the database has not already
         been bootstrapped to schema version 3+.  Databases at older
-        versions are upgraded incrementally up to the current version (14).
+        versions are upgraded incrementally up to the current version (15).
 
         After core schema creation or upgrade, probes for the ``thought_fts``
         table and then runs any pending extension schema migrations for each
@@ -673,7 +680,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v11_to_v12()
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
-            await self._db.execute("PRAGMA user_version = 14")
+            await self._migrate_core_v14_to_v15()
+            await self._db.execute("PRAGMA user_version = 15")
             await self._db.commit()
         elif current_version < 4:  # noqa: PLR2004
             await self._migrate_core_v3_to_v4()
@@ -687,7 +695,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v11_to_v12()
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
-            await self._db.execute("PRAGMA user_version = 14")
+            await self._migrate_core_v14_to_v15()
+            await self._db.execute("PRAGMA user_version = 15")
             await self._db.commit()
         elif current_version < 5:  # noqa: PLR2004
             await self._migrate_core_v4_to_v5()
@@ -700,7 +709,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v11_to_v12()
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
-            await self._db.execute("PRAGMA user_version = 14")
+            await self._migrate_core_v14_to_v15()
+            await self._db.execute("PRAGMA user_version = 15")
             await self._db.commit()
         elif current_version < 6:  # noqa: PLR2004
             await self._migrate_core_v5_to_v6()
@@ -712,7 +722,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v11_to_v12()
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
-            await self._db.execute("PRAGMA user_version = 14")
+            await self._migrate_core_v14_to_v15()
+            await self._db.execute("PRAGMA user_version = 15")
             await self._db.commit()
         elif current_version < 7:  # noqa: PLR2004
             await self._migrate_core_v6_to_v7()
@@ -723,7 +734,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v11_to_v12()
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
-            await self._db.execute("PRAGMA user_version = 14")
+            await self._migrate_core_v14_to_v15()
+            await self._db.execute("PRAGMA user_version = 15")
             await self._db.commit()
         elif current_version < 8:  # noqa: PLR2004
             await self._migrate_core_v7_to_v8()
@@ -733,7 +745,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v11_to_v12()
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
-            await self._db.execute("PRAGMA user_version = 14")
+            await self._migrate_core_v14_to_v15()
+            await self._db.execute("PRAGMA user_version = 15")
             await self._db.commit()
         elif current_version < 9:  # noqa: PLR2004
             await self._migrate_core_v8_to_v9()
@@ -742,7 +755,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v11_to_v12()
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
-            await self._db.execute("PRAGMA user_version = 14")
+            await self._migrate_core_v14_to_v15()
+            await self._db.execute("PRAGMA user_version = 15")
             await self._db.commit()
         elif current_version < 10:  # noqa: PLR2004
             await self._migrate_core_v9_to_v10()
@@ -750,29 +764,38 @@ class SqliteEngravaCore:
             await self._migrate_core_v11_to_v12()
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
-            await self._db.execute("PRAGMA user_version = 14")
+            await self._migrate_core_v14_to_v15()
+            await self._db.execute("PRAGMA user_version = 15")
             await self._db.commit()
         elif current_version < 11:  # noqa: PLR2004
             await self._migrate_core_v10_to_v11()
             await self._migrate_core_v11_to_v12()
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
-            await self._db.execute("PRAGMA user_version = 14")
+            await self._migrate_core_v14_to_v15()
+            await self._db.execute("PRAGMA user_version = 15")
             await self._db.commit()
         elif current_version < 12:  # noqa: PLR2004
             await self._migrate_core_v11_to_v12()
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
-            await self._db.execute("PRAGMA user_version = 14")
+            await self._migrate_core_v14_to_v15()
+            await self._db.execute("PRAGMA user_version = 15")
             await self._db.commit()
         elif current_version < 13:  # noqa: PLR2004
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
-            await self._db.execute("PRAGMA user_version = 14")
+            await self._migrate_core_v14_to_v15()
+            await self._db.execute("PRAGMA user_version = 15")
             await self._db.commit()
         elif current_version < 14:  # noqa: PLR2004
             await self._migrate_core_v13_to_v14()
-            await self._db.execute("PRAGMA user_version = 14")
+            await self._migrate_core_v14_to_v15()
+            await self._db.execute("PRAGMA user_version = 15")
+            await self._db.commit()
+        elif current_version < 15:  # noqa: PLR2004
+            await self._migrate_core_v14_to_v15()
+            await self._db.execute("PRAGMA user_version = 15")
             await self._db.commit()
 
         # Ensure referential integrity is enforced for the lifetime of this
@@ -1222,6 +1245,30 @@ class SqliteEngravaCore:
         if await self._table_exists("embedding"):
             await self._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_embedding_owner ON embedding(owner_id)"
+            )
+
+    async def _migrate_core_v14_to_v15(self) -> None:
+        """Add the ``(edge_type, to_thought_id)`` composite edge index (core-15).
+
+        Purely additive. The inbound edge-type lookups
+        (``WHERE to_thought_id = ? AND edge_type = ?`` — the
+        ``CONSOLIDATED_FROM`` source-resolution scan) can only use the
+        single-column ``idx_edge_to_thought`` from core-14 to seek
+        ``to_thought_id`` and must then test ``edge_type`` as a residual per
+        matched row. This composite index mirrors ``idx_edge_type_from`` on the
+        destination side so both predicates are satisfied by one index seek —
+        ``EXPLAIN QUERY PLAN`` reports ``idx_edge_type_to (edge_type=? AND
+        to_thought_id=?)`` rather than a residual filter. No row, column, or
+        query changes; results are unaffected.
+
+        Idempotent — uses ``CREATE INDEX IF NOT EXISTS``. The ``edge`` table may
+        be absent in a partial bootstrap (it is created lazily), so the create
+        is guarded by ``_table_exists`` exactly as ``_migrate_core_v13_to_v14``
+        guards its ``edge`` index.
+        """
+        if await self._table_exists("edge"):
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_edge_type_to ON edge(edge_type, to_thought_id)"
             )
 
     async def _fk_present(self, table: str, column: str) -> bool:
@@ -3310,7 +3357,7 @@ class SqliteEngravaCore:
             f"{filter_sql}",
             (datetime.datetime.now(datetime.UTC).isoformat(), *filter_params),
         )
-        rows = await cursor.fetchall()
+        rows = list(await cursor.fetchall())
         if not rows:
             return []
 
@@ -3319,15 +3366,43 @@ class SqliteEngravaCore:
         if q_norm == 0.0:
             return []
 
-        owner_ids: list[str] = []
-        vectors: list[list[float]] = []
-        for row in rows:
-            dimension: int = row["dimension"]
-            blob: bytes = row["vector_blob"]
-            vectors.append(list(struct.unpack(f"{dimension}f", blob)))
-            owner_ids.append(row["owner_id"])
-
-        matrix = np.asarray(vectors, dtype=np.float64)
+        owner_ids = [str(row["owner_id"]) for row in rows]
+        # Batch-decode every blob with a single ``np.frombuffer`` instead of a
+        # per-row ``struct.unpack`` + ``list()``. The dtype is **native-endian**
+        # ``np.float32`` — the exact byte layout ``store_embedding`` writes with
+        # native ``struct.pack(f"{dim}f", …)`` — so the decode is bit-identical
+        # to the old ``struct.unpack(f"{dim}f", …)`` on every platform (both use
+        # the host byte order). Every embedding in a store shares one
+        # ``dimension`` (enforced by the model lock), so the blobs are joined and
+        # viewed as one ``(n, dimension)`` matrix in a single decode. If any blob
+        # is missing/short (a corrupt or truncated row), the fast path is
+        # abandoned for the original per-row decode so the exact prior
+        # skip/error behaviour is preserved.
+        first_dimension = int(rows[0]["dimension"])
+        expected_bytes = first_dimension * 4
+        blobs = [row["vector_blob"] for row in rows]
+        uniform = first_dimension > 0 and all(
+            int(row["dimension"]) == first_dimension and len(blob) == expected_bytes
+            for row, blob in zip(rows, blobs, strict=True)
+        )
+        matrix: npt.NDArray[np.float64]
+        if uniform:
+            # Decode as native float32 (bit-identical to the stored bytes), then
+            # widen to float64 so the norm/dot arithmetic below runs at exactly
+            # the same precision as the original per-row path (which built a
+            # float64 matrix). ``frombuffer`` returns a read-only view;
+            # ``astype`` produces the writable float64 copy the reduction expects.
+            matrix = (
+                np.frombuffer(b"".join(blobs), dtype=np.float32)
+                .reshape(len(rows), first_dimension)
+                .astype(np.float64)
+            )
+        else:
+            vectors: list[list[float]] = [
+                list(struct.unpack(f"{int(row['dimension'])}f", blob))
+                for row, blob in zip(rows, blobs, strict=True)
+            ]
+            matrix = np.asarray(vectors, dtype=np.float64)
         norms = np.linalg.norm(matrix, axis=1)
         dot_products = matrix @ query_arr
         safe_norms = np.where(norms > 0.0, norms, 1.0)
@@ -4548,21 +4623,20 @@ class SqliteEngravaCore:
         # --- reflection_topk_cap enforcement ---
         # Runs on the (possibly collapsed) ``ranked`` so the single backfill
         # source is the collapsed off-list pool — no unit is double-counted.
+        reflections_evicted = 0
         if include_reflections and resolved_reflection_topk_cap < 1.0 and reflection_ids:
             _max_ref_slots = max(0, int(top_k * resolved_reflection_topk_cap))
             _ref_in_final = [
                 (i, tid, s) for i, (tid, s) in enumerate(final) if tid in reflection_ids
             ]
             if len(_ref_in_final) > _max_ref_slots:
-                import logging as _logging_mod  # noqa: PLC0415
-
                 _excess = len(_ref_in_final) - _max_ref_slots
                 _to_evict = {
                     tid for _, tid, _ in sorted(_ref_in_final, key=lambda x: x[2])[:_excess]
                 }
                 _off_list_obs = [(tid, s) for tid, s in ranked[top_k:] if tid not in reflection_ids]
                 if len(_off_list_obs) < _excess:
-                    _logging_mod.getLogger(__name__).warning(
+                    logger.warning(
                         "reflection_topk_cap: %d excess REFLECTION(s) to evict but only %d "
                         "off-list non-REFLECTION candidates available — partial enforcement",
                         _excess,
@@ -4571,13 +4645,73 @@ class SqliteEngravaCore:
                 _fill = _off_list_obs[:_excess]
                 _kept = [(tid, s) for tid, s in final if tid not in _to_evict]
                 final = _sort_scored_descending(_kept + _fill)[:top_k]
+                # ``_to_evict`` REFLECTIONs are removed from the window
+                # unconditionally (independent of how many backfill candidates
+                # were available), so the evicted count is the excess.
+                reflections_evicted = len(_to_evict)
+                logger.info(
+                    "reflection_topk_cap: evicted %d REFLECTION(s) from the top-%d window "
+                    "(cap=%.3f, max reflection slots=%d)",
+                    reflections_evicted,
+                    top_k,
+                    resolved_reflection_topk_cap,
+                    _max_ref_slots,
+                )
 
         await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
 
         return HybridSearchResult(
             results=final,
             backends_used=frozenset(backends_used),
+            reflections_evicted=reflections_evicted,
         )
+
+    async def _batch_fetch_embedding_blobs(
+        self, thought_ids: list[str]
+    ) -> dict[str, tuple[int, bytes]]:
+        """Fetch ``(dimension, vector_blob)`` for many thoughts in one pass.
+
+        Replaces a per-id ``get_embedding`` loop with a single ``... IN (…)``
+        query per chunk. SQLite caps host parameters at ``_SQLITE_MAX_VARS`` per
+        statement, so the id list is chunked to stay within that limit for large
+        inputs. Ids with no embedding row are simply absent from the result —
+        the caller maps them to a zero score exactly as the per-row ``None``
+        branch did.
+
+        The default ``embedding_id`` is a deterministic function of the owner
+        (``uuid5(thought_id)``), so a thought has at most one embedding row and
+        the mapping is exact. To stay faithful even to the pathological case of
+        a caller writing several rows for one owner under explicit distinct
+        ``embedding_id`` values, rows are ordered by ``rowid`` and the first per
+        owner is kept — the same lowest-``rowid`` row a bare ``get_embedding``
+        ``fetchone()`` returns.
+
+        Args:
+            thought_ids: Thought ids whose embeddings to fetch.
+
+        Returns:
+            Mapping of ``thought_id`` to ``(dimension, vector_blob)`` for every
+            id that has a ``THOUGHT`` embedding row.
+
+        """
+        embeddings_by_id: dict[str, tuple[int, bytes]] = {}
+        for chunk_start in range(0, len(thought_ids), _SQLITE_MAX_VARS):
+            id_chunk = thought_ids[chunk_start : chunk_start + _SQLITE_MAX_VARS]
+            placeholders = ", ".join("?" for _ in id_chunk)
+            cursor = await self._db.execute(
+                f"SELECT owner_id, dimension, vector_blob FROM embedding"  # noqa: S608
+                f" WHERE owner_type = 'THOUGHT' AND owner_id IN ({placeholders})"
+                f" ORDER BY rowid",
+                id_chunk,
+            )
+            for row in await cursor.fetchall():
+                # ``setdefault`` keeps the first (lowest-rowid) row per owner,
+                # matching ``get_embedding``'s ``fetchone()`` under duplicates.
+                embeddings_by_id.setdefault(
+                    str(row["owner_id"]),
+                    (int(row["dimension"]), row["vector_blob"]),
+                )
+        return embeddings_by_id
 
     async def search_reflections_only(
         self,
@@ -4659,13 +4793,20 @@ class SqliteEngravaCore:
             )
 
         backends_used_set: set[str] = {"vector"}
+        # Batch-fetch every REFLECTION embedding in one pass instead of a
+        # per-id ``get_embedding`` round trip (was O(N) queries). The result is
+        # identical: an id with no embedding row is scored 0.0 exactly as the
+        # per-row ``emb is None`` branch did.
+        embeddings_by_id = await self._batch_fetch_embedding_blobs(reflection_ids)
+
         scores: list[tuple[str, float]] = []
         for rid in reflection_ids:
-            emb = await self.get_embedding(rid)
+            emb = embeddings_by_id.get(rid)
             if emb is None:
                 scores.append((rid, 0.0))
                 continue
-            vec = list(struct.unpack(f"{emb.dimension}f", emb.vector_blob))
+            _dimension, _blob = emb
+            vec = list(struct.unpack(f"{_dimension}f", _blob))
             v_norm = math.sqrt(sum(x * x for x in vec))
             if v_norm == 0.0:
                 scores.append((rid, 0.0))
