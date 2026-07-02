@@ -486,6 +486,15 @@ class EmbeddingConfig:
             or ``None`` for no built-in provider.
         model: Model name passed to the provider constructor.
         auto_embed: Automatically embed on ``create_thought``/``update_thought``.
+        require_embedding: When ``False`` (default), an auto-embed provider
+            failure logs a ``WARNING`` naming the thought and re-raises the
+            provider's own exception — byte-identical to the pre-existing
+            behaviour. When ``True``, that failure is normalised into a typed
+            :class:`~engrava.domain.exceptions.EmbeddingGenerationError`, the
+            explicit fail-fast an operator opts into (the thought is still
+            persisted, since auto-embed runs after the commit; the error
+            surfaces that it is unembedded). Only takes effect when
+            ``auto_embed`` is enabled.
         device: Compute device for local providers (``"cpu"``, ``"cuda"``).
         batch_size: Batch encoding size for local providers.
         base_url: Base URL for remote providers.
@@ -514,6 +523,7 @@ class EmbeddingConfig:
     provider: str | None = None
     model: str | None = None
     auto_embed: bool = False
+    require_embedding: bool = False
     device: str = "cpu"
     batch_size: int = 32
     base_url: str | None = None
@@ -1624,7 +1634,7 @@ def _resolve_env_var(value: str) -> str:
     return value
 
 
-def _parse_embeddings(raw: Any) -> EmbeddingConfig | None:  # noqa: ANN401, C901
+def _parse_embeddings(raw: Any) -> EmbeddingConfig | None:  # noqa: ANN401, C901, PLR0912
     """Parse the ``embeddings:`` YAML section.
 
     Args:
@@ -1659,6 +1669,11 @@ def _parse_embeddings(raw: Any) -> EmbeddingConfig | None:  # noqa: ANN401, C901
     auto_embed = raw.get("auto_embed", False)
     if not isinstance(auto_embed, bool):
         msg = "'embeddings.auto_embed' must be a boolean"
+        raise ConfigError(msg)
+
+    require_embedding = raw.get("require_embedding", False)
+    if not isinstance(require_embedding, bool):
+        msg = "'embeddings.require_embedding' must be a boolean"
         raise ConfigError(msg)
 
     device = raw.get("device", "cpu")
@@ -1698,6 +1713,7 @@ def _parse_embeddings(raw: Any) -> EmbeddingConfig | None:  # noqa: ANN401, C901
         provider=provider,
         model=model,
         auto_embed=auto_embed,
+        require_embedding=require_embedding,
         device=device,
         batch_size=batch_size,
         base_url=base_url,

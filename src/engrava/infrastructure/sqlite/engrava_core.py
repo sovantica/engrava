@@ -23,7 +23,7 @@ import struct
 import uuid as _uuid
 from importlib import resources
 from pathlib import Path
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, NoReturn, Self
 
 import aiosqlite
 import numpy as np
@@ -41,6 +41,7 @@ from engrava.domain.enums import (
     VerificationStatus,
 )
 from engrava.domain.exceptions import (
+    EmbeddingGenerationError,
     EmbeddingModelMismatchError,
     EmbeddingQueryPrefixMismatchError,
     JournalIntegrityError,
@@ -193,6 +194,31 @@ async def _embed_document(provider: object, text: str) -> list[float]:
     return await provider.embed(text)  # type: ignore[attr-defined,no-any-return]
 
 
+async def _embed_documents_batch(provider: object, texts: list[str]) -> list[list[float]]:
+    """Embed several documents in one provider call, role-aware when available.
+
+    The batch analogue of :func:`_embed_document`: a provider satisfying the
+    full :class:`RoleAwareEmbeddingProvider` capability encodes every text with
+    its document-role prefix via ``embed_document_batch``; any other provider
+    (including one that implements the capability only partially) falls back to
+    plain ``embed_batch`` — byte-identical to the per-document path. Dispatch
+    keys off the same whole-capability check as :func:`_embed_document`, so the
+    single-item and batch paths can never disagree about whether a provider is
+    prefixed, and the produced vectors match per-document embedding exactly.
+
+    Args:
+        provider: The embedding provider.
+        texts: The document texts to embed, in order.
+
+    Returns:
+        One embedding vector per input text, in the same order.
+
+    """
+    if isinstance(provider, RoleAwareEmbeddingProvider):
+        return await provider.embed_document_batch(texts)
+    return await provider.embed_batch(texts)  # type: ignore[attr-defined,no-any-return]
+
+
 async def _embed_query(provider: object, text: str) -> list[float]:
     """Embed a query, using the role-aware path when the provider has it.
 
@@ -310,6 +336,14 @@ class SqliteEngravaCore:
         hooks: Optional extension hooks; defaults to ``DefaultEngravaHooks``.
         embedding_provider: Optional async embedding provider for auto-embed.
         auto_embed: Whether to auto-embed on ``create_thought``/``update_thought``.
+        require_embedding: When ``False`` (default), an auto-embed provider
+            failure logs a ``WARNING`` naming the thought and re-raises the
+            provider's own exception (byte-identical to prior behaviour). When
+            ``True``, that failure is normalised into a typed
+            :class:`~engrava.domain.exceptions.EmbeddingGenerationError` — the
+            opt-in fail-fast. The thought is already committed either way, so
+            this governs how loudly the missing embedding is surfaced, not
+            whether the row is persisted. No effect unless ``auto_embed`` is on.
         search_config: Optional default hybrid-search weights from config.
         journal_enabled: Whether to record mutations in the hash-chain
             journal.  Defaults to ``False``.
@@ -331,6 +365,7 @@ class SqliteEngravaCore:
         *,
         embedding_provider: EmbeddingProviderProtocol | None = None,
         auto_embed: bool = False,
+        require_embedding: bool = False,
         search_config: SearchConfig | None = None,
         journal_enabled: bool = False,
         ttl_strategy: str = "archive",
@@ -348,6 +383,11 @@ class SqliteEngravaCore:
         self._owns_connection: bool = False
         self._embedding_provider: EmbeddingProviderProtocol | None = embedding_provider
         self._auto_embed: bool = auto_embed and embedding_provider is not None
+        self._require_embedding: bool = require_embedding
+        # Scoped to a single ``bulk_store`` call: suppresses ``create_thought``'s
+        # per-thought auto-embed so the batch path can embed all rows in one
+        # provider call after the insert loop. False for every other caller.
+        self._suppress_auto_embed: bool = False
         self._embedding_model_verified: bool = False
         self._search_config: SearchConfig | None = search_config
         self._journal_enabled: bool = journal_enabled
@@ -561,6 +601,7 @@ class SqliteEngravaCore:
 
             emb_provider = resolve_embedding_provider(config.embeddings)
             auto_embed = config.embeddings.auto_embed if config.embeddings else False
+            require_embedding = config.embeddings.require_embedding if config.embeddings else False
 
             manifests = resolve_manifests(
                 config.extension_manifest_paths,
@@ -572,6 +613,7 @@ class SqliteEngravaCore:
                 hooks=hooks,
                 embedding_provider=emb_provider,
                 auto_embed=auto_embed,
+                require_embedding=require_embedding,
                 search_config=config.search,
                 journal_enabled=config.journal.enabled,
                 ttl_strategy=config.ttl.strategy,
@@ -1667,6 +1709,20 @@ class SqliteEngravaCore:
     async def suspend_auto_commit(self) -> AsyncIterator[None]:
         """Context manager that disables per-method auto-commit.
 
+        Batches every write in the block into one transaction: the block
+        commits once on clean exit and rolls back entirely on any exception.
+
+        **Single-writer contract.** The store owns one connection and holds the
+        deferred-commit state on the instance, so a suspended-commit window is
+        not safe for a *second* writer running on the same store instance
+        concurrently: another coroutine's writes would interleave into this
+        block's transaction (and, under auto-embed, be affected by the batch's
+        embedding deferral). Drive writes on a given store instance from one
+        task at a time. This is the established contract that ``bulk_store``
+        and every deferred-commit caller rely on; concurrent same-instance
+        writers are unsupported (a separate connection per writer is the
+        supported concurrency model).
+
         Yields:
             None — the store operates in deferred-commit mode.
 
@@ -2110,11 +2166,341 @@ class SqliteEngravaCore:
         await self._maybe_commit()
 
         # Auto-embed when a provider is configured and auto_embed is on.
-        if self._auto_embed and self._embedding_provider is not None:
+        # ``_suppress_auto_embed`` lets ``bulk_store`` defer embedding to a
+        # single batch call after the insert loop without changing this path
+        # for any other caller (the flag is False in every non-bulk call).
+        if (
+            self._auto_embed
+            and self._embedding_provider is not None
+            and not self._suppress_auto_embed
+        ):
             await self._auto_embed_thought(thought)
 
         await self._maybe_auto_cleanup(exclude_id=thought.thought_id)
         return await self._hooks.on_store(thought)
+
+    async def get_or_create(
+        self,
+        thought: ThoughtRecord,
+        *,
+        expires_after_seconds: int | None = None,
+    ) -> tuple[ThoughtRecord, bool]:
+        """Fetch an existing thought by content hash, or create it.
+
+        A thin convenience over the existing content-hash deduplication that
+        removes the check-then-create round trip (and its TOCTOU window)
+        callers otherwise write by hand. The content hash is the same
+        byte-exact SHA-256 of ``content`` used by
+        ``create_thought(deduplicate=True)``:
+
+        * **Hit** — a thought with that hash already exists: it is returned
+          with ``created=False``. No new row is inserted; its
+          ``confirmation_count`` is bumped and ``updated_at`` refreshed,
+          identical to ``create_thought(deduplicate=True)`` so the two APIs
+          stay consistent.
+        * **Miss** — no such thought exists: it is inserted (running the
+          regular journal / auto-embed / cleanup pipeline) and returned with
+          ``created=True``.
+
+        The returned boolean is the value ``create_thought(deduplicate=True)``
+        cannot give back: it tells the caller *whether it created*, so an
+        idempotent "ensure this thought exists" call needs no follow-up query.
+
+        This does not modify the matched row's mutable fields from ``thought``
+        (metadata, priority, essence): a hit returns the stored record
+        unchanged apart from the confirmation bump. Use :meth:`upsert_by_hash`
+        when a match should adopt the incoming record's fields.
+
+        Args:
+            thought: The candidate thought. On a miss it is inserted verbatim
+                (with timestamps populated); on a hit only its ``content`` was
+                used, via the hash.
+            expires_after_seconds: Optional relative TTL applied only when the
+                thought is created (a hit never re-arms TTL). Mirrors
+                ``create_thought``'s parameter.
+
+        Returns:
+            A ``(record, created)`` tuple. ``created`` is ``True`` when a new
+            row was inserted, ``False`` when an existing thought was returned.
+
+        Raises:
+            ValueError: If ``thought.metadata`` violates the metadata-shape or
+                size invariants (validated up front on both the hit and miss
+                paths, matching ``create_thought(deduplicate=True)`` which
+                validates before it branches).
+
+        """
+        # Validate up front — before the hash probe — so an invalid-metadata
+        # candidate raises on a hit too, exactly as ``create_thought`` does
+        # (it validates at the top, ahead of the dedup branch). ``create_thought``
+        # re-validates on the miss/insert path; that is cheap and harmless.
+        _validate_metadata(thought.metadata)
+        async with self._dedup_lock:
+            existing = await self._get_thought_by_content_hash(
+                _compute_content_hash(thought.content),
+            )
+            if existing is not None:
+                return await self._increment_confirmation(existing), False
+            created = await self.create_thought(
+                thought,
+                expires_after_seconds=expires_after_seconds,
+                deduplicate=False,
+            )
+            return created, True
+
+    #: Mutable ``ThoughtRecord`` fields a content-hash upsert copies from the
+    #: incoming record onto a matched row. ``content`` is deliberately excluded
+    #: — it is the hash key, so a match already has byte-identical content —
+    #: as are identity/system-managed fields (ids, cycles, timestamps,
+    #: ``confirmation_count``, ``access_count``, valid-time bounds).
+    _UPSERT_MUTABLE_FIELDS = (
+        "thought_type",
+        "essence",
+        "priority",
+        "lifecycle_status",
+        "source",
+        "confidence",
+        "source_type",
+        "visibility",
+        "metadata",
+    )
+
+    async def upsert_by_hash(
+        self,
+        thought: ThoughtRecord,
+        *,
+        expires_after_seconds: int | None = None,
+    ) -> ThoughtRecord:
+        """Insert a thought, or update the matching row's mutable fields in place.
+
+        A content-hash upsert with genuine **update-on-match** semantics,
+        deliberately distinct from ``create_thought(deduplicate=True)``:
+
+        * ``create_thought(deduplicate=True)`` treats a hash hit as a *sighting*
+          of already-known content — it returns the stored record unchanged
+          apart from bumping ``confirmation_count`` (and ``updated_at``), and
+          discards the incoming record's other fields.
+        * ``upsert_by_hash`` treats a hash hit as a *newer version of the same
+          content* — it overwrites the stored row's mutable fields
+          (``essence``, ``priority``, ``metadata``, ``visibility``,
+          ``lifecycle_status``, ``source``, ``confidence``, ``source_type``,
+          ``thought_type``) from ``thought`` and returns the updated record. It
+          does **not** bump ``confirmation_count``: the call expresses "make the
+          stored thought look like this", not "I saw this again".
+
+        ``content`` itself is never written on the match branch — it is the hash
+        key, so a match already has byte-identical content. Identity and
+        system-managed fields (ids, cycles, timestamps, ``access_count``,
+        valid-time bounds) are also preserved. Only fields that *differ* from
+        the stored row are written, so an upsert whose mutable fields already
+        match the stored thought is a no-op that returns it untouched (and, in
+        particular, an unchanged ``lifecycle_status`` is never re-asserted,
+        which would otherwise be rejected as a same-state transition). The
+        update reuses :meth:`update_thought`, so it participates in
+        optimistic-concurrency control and re-embeds when ``essence`` changed,
+        exactly like any other edit. A miss delegates to :meth:`create_thought`
+        (regular insert / journal / auto-embed pipeline).
+
+        Choose :meth:`get_or_create` for "ensure it exists, don't touch it if it
+        does"; choose ``upsert_by_hash`` for "make the stored thought match this
+        record"; choose ``create_thought(deduplicate=True)`` for
+        confirmation-counting of repeated sightings.
+
+        Args:
+            thought: The desired thought state. On a miss it is inserted
+                verbatim; on a hit its mutable fields are copied onto the
+                existing row (keyed by ``content``).
+            expires_after_seconds: Optional relative TTL applied only when the
+                thought is created. A hit does not re-arm TTL (``expires_at`` is
+                a system-managed field left untouched), matching
+                :meth:`get_or_create`.
+
+        Returns:
+            The persisted thought record: the freshly inserted row on a miss, or
+            the updated existing row on a hit.
+
+        Raises:
+            ValueError: If ``thought.metadata`` violates the metadata-shape or
+                size invariants (validated up front on both the hit and miss
+                paths).
+            StaleDataError: If the matched row is modified concurrently between
+                the hash probe and the in-place update.
+
+        """
+        # Validate up front so an invalid-metadata candidate raises consistently
+        # on both the hit (update) and miss (insert) branches.
+        _validate_metadata(thought.metadata)
+        async with self._dedup_lock:
+            existing = await self._get_thought_by_content_hash(
+                _compute_content_hash(thought.content),
+            )
+            if existing is None:
+                return await self.create_thought(
+                    thought,
+                    expires_after_seconds=expires_after_seconds,
+                    deduplicate=False,
+                )
+            # Only the fields that actually differ are forwarded to
+            # ``update_thought``. This keeps the update minimal (no spurious OCC
+            # churn or re-embed when a field is unchanged) and, critically,
+            # never re-asserts an identical ``lifecycle_status`` — ``evolve``
+            # rejects same-state lifecycle transitions, so passing the stored
+            # value back verbatim would raise ``InvalidTransitionError``.
+            changes = {
+                field: getattr(thought, field)
+                for field in self._UPSERT_MUTABLE_FIELDS
+                if getattr(thought, field) != getattr(existing, field)
+            }
+            if not changes:
+                return existing
+            return await self.update_thought(existing.thought_id, **changes)
+
+    async def bulk_store(
+        self,
+        thoughts: list[ThoughtRecord],
+        *,
+        deduplicate: bool = False,
+    ) -> list[ThoughtRecord]:
+        """Persist many thoughts in a single all-or-nothing transaction.
+
+        The batch analogue of :meth:`create_thought` for ingest paths that
+        would otherwise loop ``create_thought`` (one commit — and, under
+        auto-embed, one embedding round trip — per thought). The whole loop
+        runs under :meth:`suspend_auto_commit`, so:
+
+        * **One commit** — every row commits together when the batch finishes,
+          not once per row.
+        * **All-or-nothing** — if any row raises (duplicate id, metadata
+          violation, an embedding failure under ``require_embedding=True``, …)
+          the entire transaction is rolled back and *nothing* is persisted; the
+          exception propagates. Partial batches never land.
+        * **Order preserved** — the returned list is in input order, element
+          *i* corresponding to ``thoughts[i]`` (or, under ``deduplicate=True``,
+          the existing record that ``thoughts[i]`` collapsed onto).
+
+        When auto-embed is active, the per-thought embed is suppressed during
+        the insert loop and all thoughts are embedded in **one** batch provider
+        call afterwards (role-aware ``embed_document_batch`` when the provider
+        exposes it, else ``embed_batch``; dispatched exactly like the
+        single-item path), still inside the same transaction. The resulting
+        vectors are byte-identical to embedding each thought individually. A
+        deduplication hit is not re-embedded (its content is unchanged), so only
+        the genuinely-inserted thoughts are batch-embedded. "Genuinely inserted"
+        is decided by row existence (a snapshot of the stored ids taken before
+        the batch, plus the ids inserted earlier in the same batch), so a dedup
+        hit is skipped even when the submitted record reuses an existing row's
+        id.
+
+        Like :meth:`suspend_auto_commit`, this call briefly toggles
+        store-instance state (the deferred-commit flag, and a flag that defers
+        per-thought embedding to the batch). The store owns a single connection
+        and is not built for a *second* writer to run on the same instance
+        concurrently with a batch; issue ``bulk_store`` from one task at a time
+        (matching the existing bulk-write contract).
+
+        Args:
+            thoughts: The thoughts to persist, in order. An empty list is a
+                no-op returning ``[]`` (no transaction is opened).
+            deduplicate: Applied per row exactly like
+                ``create_thought(deduplicate=True)`` — a row whose ``content``
+                hash already exists bumps that record's ``confirmation_count``
+                and yields the existing record instead of inserting.
+
+        Returns:
+            The persisted records in input order.
+
+        Raises:
+            ValueError: If any thought has a duplicate id or metadata that
+                violates the shape/size invariants (whole batch rolled back).
+            EmbeddingGenerationError: If batch auto-embed fails and
+                ``require_embedding`` is ``True`` (whole batch rolled back).
+
+        """
+        if not thoughts:
+            return []
+
+        embed_active = self._auto_embed and self._embedding_provider is not None
+
+        # Snapshot the ids that already exist so genuine inserts can be told
+        # apart from dedup hits deterministically — by *row existence*, never by
+        # instance identity. (Instance identity is unreliable: ``create_thought``
+        # rebuilds the record to populate timestamps, and a dedup hit can return
+        # a row whose id coincides with the submitted one.) Only rows whose id is
+        # absent here — and not yet inserted earlier in this same batch — are
+        # freshly inserted and thus need embedding.
+        pre_existing_ids: set[str] = set()
+        if embed_active:
+            pre_existing_ids = await self._existing_thought_ids()
+
+        async with self.suspend_auto_commit():
+            self._suppress_auto_embed = embed_active
+            try:
+                persisted: list[ThoughtRecord] = []
+                inserted: list[ThoughtRecord] = []
+                seen_before: set[str] = set(pre_existing_ids)
+                for thought in thoughts:
+                    record = await self.create_thought(thought, deduplicate=deduplicate)
+                    persisted.append(record)
+                    if embed_active and record.thought_id not in seen_before:
+                        inserted.append(record)
+                    seen_before.add(record.thought_id)
+                if embed_active and inserted:
+                    await self._batch_embed_thoughts(inserted)
+            finally:
+                self._suppress_auto_embed = False
+        return persisted
+
+    async def _existing_thought_ids(self) -> set[str]:
+        """Return the set of ``thought_id`` values currently in the table.
+
+        Used by :meth:`bulk_store` to snapshot row existence before a batch so
+        genuine inserts are distinguished from dedup hits by whether the row
+        already existed, independent of Pydantic instance identity.
+
+        Returns:
+            Every ``thought_id`` currently stored.
+
+        """
+        cursor = await self._db.execute("SELECT thought_id FROM thought")
+        rows = await cursor.fetchall()
+        return {str(row[0]) for row in rows}
+
+    async def _batch_embed_thoughts(self, inserted: list[ThoughtRecord]) -> None:
+        """Embed the freshly-inserted thoughts of a batch in one provider call.
+
+        Called from :meth:`bulk_store` after the insert loop, inside the same
+        transaction, with exactly the rows that were genuinely inserted (dedup
+        hits — which keep their stored embedding — are already excluded by the
+        caller's row-existence check).
+
+        The embed payloads are built with :func:`_build_embed_input` (same as
+        the single-item path) and encoded with :func:`_embed_documents_batch`
+        (one round trip, role-aware when the provider supports it). A provider
+        failure is routed through :meth:`_on_auto_embed_failure` so it is logged
+        and either re-raised or converted to :class:`EmbeddingGenerationError`
+        under ``require_embedding=True`` — and, because this runs inside
+        ``suspend_auto_commit``, that raise rolls the whole batch back.
+
+        Args:
+            inserted: The freshly-inserted records to embed, in input order.
+
+        """
+        provider = self._embedding_provider
+        if provider is None:
+            return  # pragma: no cover
+        if not inserted:
+            return  # pragma: no cover -- caller already guards on emptiness
+        texts = [_build_embed_input(t.essence, t.content) for t in inserted]
+        try:
+            vectors = await _embed_documents_batch(provider, texts)
+        except Exception as exc:  # noqa: BLE001 -- provider may raise any type; re-raised in handler
+            self._on_auto_embed_failure(inserted[0].thought_id, exc)
+        for record, vector in zip(inserted, vectors, strict=True):
+            await self.store_embedding(
+                record.thought_id,
+                vector,
+                model_name=provider.model_name,
+            )
 
     async def remember(
         self,
@@ -2996,6 +3382,36 @@ class SqliteEngravaCore:
     # Auto-embed helper
     # ------------------------------------------------------------------
 
+    def _on_auto_embed_failure(self, thought_id: str, exc: Exception) -> NoReturn:
+        """Surface an auto-embed provider failure, never silently.
+
+        Auto-embed runs *after* the thought (or batch) has already committed,
+        so a provider failure leaves the thought persisted but unembedded and
+        invisible to vector search. This handler makes that torn write visible:
+        it always emits a ``WARNING`` naming the thought id and the provider
+        error, then either re-raises the provider's own exception (default,
+        byte-identical to prior behaviour) or, under ``require_embedding=True``,
+        raises a typed :class:`EmbeddingGenerationError` — the opt-in fail-fast.
+
+        Args:
+            thought_id: UUID of the thought whose embedding failed.
+            exc: The exception raised by the embedding provider.
+
+        Raises:
+            EmbeddingGenerationError: When ``require_embedding`` is ``True``.
+            Exception: The provider's original exception otherwise.
+
+        """
+        logger.warning(
+            "Auto-embed failed for thought %s: %s. The thought is persisted "
+            "but has no embedding and is not reachable by vector search.",
+            thought_id,
+            exc,
+        )
+        if self._require_embedding:
+            raise EmbeddingGenerationError(thought_id, str(exc)) from exc
+        raise exc
+
     async def _auto_embed_thought(self, thought: ThoughtRecord) -> None:
         """Generate and store an embedding for a thought via the provider.
 
@@ -3003,8 +3419,20 @@ class SqliteEngravaCore:
         prefix-redundant ``essence`` to avoid double-counting the opening),
         embeds it via the configured provider, and persists the vector.
 
+        A provider failure is never silent: it is routed through
+        :meth:`_on_auto_embed_failure`, which logs a ``WARNING`` naming the
+        thought and then re-raises the provider error (default) or a typed
+        :class:`EmbeddingGenerationError` (when ``require_embedding=True``).
+        The commit ordering of the caller is unchanged — the thought is already
+        persisted when this runs, so on failure it remains stored but
+        unembedded.
+
         Args:
             thought: The thought to embed.
+
+        Raises:
+            EmbeddingGenerationError: When embedding fails and
+                ``require_embedding`` is ``True``.
 
         """
         provider = self._embedding_provider
@@ -3012,7 +3440,10 @@ class SqliteEngravaCore:
             return  # pragma: no cover
         text = _build_embed_input(thought.essence, thought.content)
 
-        vector = await _embed_document(provider, text)
+        try:
+            vector = await _embed_document(provider, text)
+        except Exception as exc:  # noqa: BLE001 -- provider may raise any type; re-raised in handler
+            self._on_auto_embed_failure(thought.thought_id, exc)
 
         await self.store_embedding(
             thought.thought_id,

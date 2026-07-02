@@ -300,7 +300,10 @@ class TestOffOnPair:
 # capability protocol + EmbeddingQueryPrefixMismatchError), an additive,
 # default-off public-API addition. Later extended with JournalIntegrityError,
 # raised by the opt-in on-open journal integrity check — an additive,
-# default-off public-API addition.
+# default-off public-API addition. Later extended with EmbeddingGenerationError,
+# the typed error surfaced by the additive ingest-ergonomics / embedding-
+# robustness surface (bulk_store / get_or_create / upsert_by_hash + the opt-in
+# require_embedding fail-fast), also additive and default-off.
 _PRE_WS_ALL_BASELINE = frozenset(
     {
         "ActionRecord",
@@ -325,6 +328,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "EdgeRecord",
         "EdgeType",
         "EmbeddingConfig",
+        "EmbeddingGenerationError",
         "EmbeddingModelMismatchError",
         "EmbeddingProviderProtocol",
         "EmbeddingQueryPrefixMismatchError",

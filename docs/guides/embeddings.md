@@ -61,6 +61,84 @@ async with await SqliteEngravaCore.from_config("engrava.yaml") as store:
     ...   # provider wired from config, auto_embed honoured
 ```
 
+### When auto-embed fails (the honest boundary)
+
+`create_thought` commits the thought **before** it auto-embeds. So if the
+embedding provider fails (network blip, rate limit, a crashing local model), the
+thought is already persisted — it just has no embedding, which means it is
+**invisible to vector search** until re-embedded. This is an existing property,
+not a new one, and it is surfaced two ways:
+
+- The failure is **never silent**: a `WARNING` naming the thought id and the
+  provider error is always logged, then the provider's own exception propagates
+  (unchanged default behaviour).
+- Set `require_embedding: true` (config) or `require_embedding=True` (constructor)
+  to turn that failure into a typed `EmbeddingGenerationError` — the explicit
+  fail-fast for operators who would rather the write raise loudly than leave an
+  unembedded thought behind. The thought is still committed either way; the flag
+  only governs how loudly the missing embedding is reported.
+
+```python
+import aiosqlite
+from engrava import SqliteEngravaCore, EmbeddingGenerationError
+
+async def strict_ingest(provider: object, text: str) -> None:
+    async with aiosqlite.connect("engrava.db") as conn:
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(
+            conn,
+            embedding_provider=provider,  # type: ignore[arg-type]
+            auto_embed=True,
+            require_embedding=True,  # embed failure -> EmbeddingGenerationError
+        )
+        await store.ensure_schema()
+        try:
+            await store.remember(text)
+        except EmbeddingGenerationError as exc:
+            # The thought exists but is unembedded; decide how to recover.
+            print(f"embed failed for {exc.thought_id}")
+```
+
+### Batch ingest embeds in one call
+
+`bulk_store` persists many thoughts in a single all-or-nothing transaction and,
+when `auto_embed` is on, embeds them all in **one** batch provider call (using
+the role-aware `embed_document_batch` when the provider exposes it, else
+`embed_batch`) instead of one round trip per thought. The stored vectors are
+identical to embedding each thought individually. `get_or_create` and
+`upsert_by_hash` are content-hash convenience writes over the same
+deduplication — see [the write-API guide](agent-memory.md) and the
+[API reference](../api-reference.md).
+
+```python
+import aiosqlite
+from engrava import SqliteEngravaCore, ThoughtRecord, ThoughtType, Priority, LifecycleStatus
+
+async def batch_ingest(provider: object, texts: list[str]) -> None:
+    async with aiosqlite.connect("engrava.db") as conn:
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(
+            conn,
+            embedding_provider=provider,  # type: ignore[arg-type]
+            auto_embed=True,
+        )
+        await store.ensure_schema()
+        thoughts = [
+            ThoughtRecord(
+                thought_id=f"t-{i}",
+                thought_type=ThoughtType.OBSERVATION,
+                essence=t[:200],
+                content=t,
+                priority=Priority.P3,
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                source="batch",
+            )
+            for i, t in enumerate(texts)
+        ]
+        # One transaction, one commit, one embed_batch call for the whole list.
+        await store.bulk_store(thoughts)
+```
+
 ## Providers
 
 Every provider implements the same async interface — `await provider.embed(text)`

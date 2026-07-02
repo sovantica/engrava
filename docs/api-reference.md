@@ -34,6 +34,7 @@ async with await SqliteEngravaCore.from_config("engrava.yaml") as store:
 | `hooks` | `EngravaHooksProtocol \| None` | `None` | Extension hooks (defaults to `DefaultEngravaHooks`) |
 | `embedding_provider` | `EmbeddingProviderProtocol \| None` | `None` | Provider used when `auto_embed=True` |
 | `auto_embed` | `bool` | `False` | Auto-embed thoughts on create/update |
+| `require_embedding` | `bool` | `False` | When `True`, an auto-embed provider failure raises `EmbeddingGenerationError` instead of only logging a `WARNING` and re-raising the provider error. The thought is committed before embedding either way, so this governs how loudly a missing embedding is reported, not whether the row persists. No effect unless `auto_embed=True`. |
 
 > The `SqliteEngravaCore(db_path=...)` form does **not** exist — pass a
 > connection, or use `await SqliteEngravaCore.from_config(path)`.
@@ -60,6 +61,9 @@ keyword arguments and does **not** return a UUID string.
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `await create_thought(thought, *, expires_after_seconds=None, deduplicate=False)` | `ThoughtRecord` | Persist a `ThoughtRecord`; returns the stored record. Raises `ValueError` if the ID already exists. |
+| `await get_or_create(thought, *, expires_after_seconds=None)` | `tuple[ThoughtRecord, bool]` | Content-hash convenience over dedup: returns `(existing, False)` on a hash hit (confirmation bumped, like `deduplicate=True`) or `(new, True)` on a miss. The `bool` tells you whether it created, removing the check-then-create round trip. Does not alter a matched row's fields. |
+| `await upsert_by_hash(thought, *, expires_after_seconds=None)` | `ThoughtRecord` | Update-on-match upsert: on a hash hit, overwrites the stored row's mutable fields (`essence`, `priority`, `metadata`, `visibility`, `lifecycle_status`, `source`, `confidence`, `source_type`, `thought_type`) from `thought` and returns it (**no** confirmation bump — distinct from `deduplicate=True`, which returns the stored record unchanged); on a miss, inserts. `content` is never rewritten (it is the hash key). |
+| `await bulk_store(thoughts, *, deduplicate=False)` | `list[ThoughtRecord]` | Transactional batch insert: the whole list commits **once** and is all-or-nothing (any row error rolls the batch back). Order preserved. Under `auto_embed`, all thoughts are embedded in one batch provider call. `deduplicate` applies per row. |
 | `await get_thought(thought_id)` | `ThoughtRecord \| None` | Retrieve by ID; `None` if not found |
 | `await update_thought(thought_id, **changes)` | `ThoughtRecord` | Optimistic-concurrency update; raises `ThoughtNotFoundError` / `StaleDataError` |
 | `await list_thoughts(...)` | `list[ThoughtRecord]` | List with filters (keyword-only) |
@@ -466,6 +470,7 @@ All enums are `StrEnum` — JSON-serializable and stored as strings.
 | `InvalidTransitionError` | `EngravaError` | Invalid lifecycle state transition |
 | `ReadOnlyViolationError` | `EngravaError` | Write attempt on read-only store |
 | `EmbeddingModelMismatchError` | `EngravaError` | Embedding model mismatch on restore |
+| `EmbeddingGenerationError` | `EngravaError` | Auto-embed failed under `require_embedding=True` (the thought is committed but unembedded); carries the failing `thought_id` |
 | `ExtensionMigrationError` | `EngravaError` | Extension schema migration failed (e.g. attempted downgrade) |
 
 > `create_edge` raises `ReferentialIntegrityError` when an endpoint thought

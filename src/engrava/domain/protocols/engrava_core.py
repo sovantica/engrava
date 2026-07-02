@@ -63,6 +63,86 @@ class EngravaCoreProtocol(Protocol):
         """
         ...
 
+    async def get_or_create(
+        self,
+        thought: ThoughtRecord,
+        *,
+        expires_after_seconds: int | None = None,
+    ) -> tuple[ThoughtRecord, bool]:
+        """Fetch an existing thought by content hash, or create it.
+
+        A convenience over content-hash deduplication that returns whether it
+        created, eliminating the caller's check-then-create round trip. On a
+        hash hit the existing record is returned with ``created=False`` (its
+        ``confirmation_count`` bumped, identical to
+        ``create_thought(deduplicate=True)``); on a miss a new row is inserted
+        and returned with ``created=True``. The matched row's mutable fields are
+        not altered from ``thought`` — use :meth:`upsert_by_hash` for that.
+
+        Args:
+            thought: The candidate thought (its ``content`` supplies the hash).
+            expires_after_seconds: Optional relative TTL applied only on create.
+
+        Returns:
+            A ``(record, created)`` tuple; ``created`` is ``True`` on insert.
+
+        """
+        ...
+
+    async def upsert_by_hash(
+        self,
+        thought: ThoughtRecord,
+        *,
+        expires_after_seconds: int | None = None,
+    ) -> ThoughtRecord:
+        """Insert a thought, or update the matching row's mutable fields in place.
+
+        Update-on-match content-hash upsert, distinct from
+        ``create_thought(deduplicate=True)``: on a hash hit the stored row's
+        mutable fields (``essence``, ``priority``, ``metadata``, ``visibility``,
+        ``lifecycle_status``, ``source``, ``confidence``, ``source_type``,
+        ``thought_type``) are overwritten from ``thought`` and the updated
+        record returned — ``confirmation_count`` is *not* bumped. ``content`` is
+        never rewritten (it is the hash key). A miss delegates to
+        :meth:`create_thought`.
+
+        Args:
+            thought: The desired thought state (its ``content`` supplies the
+                hash; its mutable fields are copied onto a matched row).
+            expires_after_seconds: Optional relative TTL applied only on insert.
+
+        Returns:
+            The freshly inserted row on a miss, or the updated existing row on a
+            hit.
+
+        """
+        ...
+
+    async def bulk_store(
+        self,
+        thoughts: list[ThoughtRecord],
+        *,
+        deduplicate: bool = False,
+    ) -> list[ThoughtRecord]:
+        """Persist many thoughts in one all-or-nothing transaction.
+
+        Batch analogue of :meth:`create_thought`: the whole loop commits once
+        (not per row) and is transactional — if any row raises, the entire batch
+        is rolled back and nothing is persisted. The returned list is in input
+        order. When auto-embed is active, all inserted thoughts are embedded in
+        a single batch provider call, producing vectors byte-identical to
+        per-thought embedding.
+
+        Args:
+            thoughts: The thoughts to persist, in order (empty list ⇒ ``[]``).
+            deduplicate: Applied per row like ``create_thought(deduplicate=True)``.
+
+        Returns:
+            The persisted records in input order.
+
+        """
+        ...
+
     async def remember(
         self,
         text: str,

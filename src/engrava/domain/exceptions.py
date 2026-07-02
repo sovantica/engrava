@@ -154,6 +154,36 @@ class EmbeddingQueryPrefixMismatchError(EngravaError):
         )
 
 
+class EmbeddingGenerationError(EngravaError):
+    """Raised when auto-embedding a thought fails under strict mode.
+
+    Auto-embed runs *after* ``create_thought`` (and the batch path)
+    has already committed the thought, so a provider failure would
+    otherwise leave the thought persisted without an embedding — a
+    silent, torn write invisible to vector search. By default the store
+    logs a ``WARNING`` naming the thought and re-raises the provider's
+    own exception (behaviour is unchanged for existing callers). When
+    the operator opts in via ``embeddings.require_embedding = true`` (or
+    ``require_embedding=True`` on the store), that failure is instead
+    normalised into this typed error — an explicit fail-fast signal that
+    the thought is persisted but unembedded.
+
+    Args:
+        thought_id: UUID of the thought whose embedding failed.
+        message: Human-readable description of the underlying failure,
+            typically derived from the provider's own exception.
+
+    """
+
+    def __init__(self, thought_id: str, message: str) -> None:
+        self.thought_id = thought_id
+        super().__init__(
+            f"Failed to auto-embed thought {thought_id}: {message}. "
+            f"The thought is persisted but has no embedding and is not "
+            f"reachable by vector search."
+        )
+
+
 class ReferentialIntegrityError(EngravaError):
     """Raised when a write would create or leave an orphan reference.
 

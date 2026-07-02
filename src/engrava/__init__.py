@@ -29,6 +29,7 @@ from engrava.domain.enums import (
     VerificationStatus,
 )
 from engrava.domain.exceptions import (
+    EmbeddingGenerationError,
     EmbeddingModelMismatchError,
     EmbeddingQueryPrefixMismatchError,
     EngravaError,
@@ -123,6 +124,7 @@ __all__ = [
     "EdgeRecord",
     "EdgeType",
     "EmbeddingConfig",
+    "EmbeddingGenerationError",
     "EmbeddingModelMismatchError",
     "EmbeddingProviderProtocol",
     "EmbeddingQueryPrefixMismatchError",

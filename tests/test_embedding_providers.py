@@ -551,6 +551,22 @@ class TestEmbeddingConfigParsing:
         with pytest.raises(ConfigError, match="batch_size"):
             _parse_embeddings({"batch_size": 0})
 
+    def test_parse_require_embedding_default_false(self) -> None:
+        cfg = _parse_embeddings({"provider": "sentence-transformer"})
+        assert cfg is not None
+        assert cfg.require_embedding is False
+
+    def test_parse_require_embedding_true(self) -> None:
+        cfg = _parse_embeddings(
+            {"provider": "sentence-transformer", "require_embedding": True},
+        )
+        assert cfg is not None
+        assert cfg.require_embedding is True
+
+    def test_parse_invalid_require_embedding(self) -> None:
+        with pytest.raises(ConfigError, match="require_embedding"):
+            _parse_embeddings({"require_embedding": "yes"})
+
     def test_parse_env_var_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("TEST_API_KEY", "sk-secret")
         cfg = _parse_embeddings(

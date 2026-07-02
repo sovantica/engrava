@@ -182,6 +182,7 @@ vector dimension lives under `extensions.vector.dimension`, not here.
 | `provider` | `str` | `null` | Provider type: `"sentence-transformer"`, `"openai-compatible"`, `"ollama"`, `"huggingface"` |
 | `model` | `str` | `null` | Model name or identifier |
 | `auto_embed` | `bool` | `false` | Auto-embed on `create_thought` / `update_thought` |
+| `require_embedding` | `bool` | `false` | Turn an auto-embed provider failure into a hard error. With the default `false`, a failure logs a `WARNING` naming the thought and re-raises the provider's own error; the thought is *already committed*, so it stays persisted without an embedding (invisible to vector search). Set `true` to instead raise a typed `EmbeddingGenerationError`, the explicit fail-fast an operator opts into. No effect unless `auto_embed` is on |
 | `device` | `str` | `"cpu"` | Compute device for local providers (`"cpu"`, `"cuda"`) |
 | `batch_size` | `int` | `32` | Batch encoding size for local providers |
 | `base_url` | `str` | `null` | Base URL for remote providers |
