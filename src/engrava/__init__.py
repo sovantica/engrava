@@ -30,6 +30,7 @@ from engrava.domain.enums import (
 )
 from engrava.domain.exceptions import (
     EmbeddingModelMismatchError,
+    EmbeddingQueryPrefixMismatchError,
     EngravaError,
     ExtensionMigrationError,
     InvalidFilterError,
@@ -62,7 +63,10 @@ from engrava.domain.models.search import HybridSearchResult
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.domain.models.thought import ThoughtRecord as CoreThoughtRecord
 from engrava.domain.models.ttl import CleanupResult, CleanupStrategy
-from engrava.domain.protocols.embedding_provider import EmbeddingProviderProtocol
+from engrava.domain.protocols.embedding_provider import (
+    EmbeddingProviderProtocol,
+    RoleAwareEmbeddingProvider,
+)
 from engrava.domain.protocols.engrava_core import EngravaCoreProtocol
 from engrava.domain.protocols.hooks import (
     DefaultEngravaHooks,
@@ -120,6 +124,7 @@ __all__ = [
     "EmbeddingConfig",
     "EmbeddingModelMismatchError",
     "EmbeddingProviderProtocol",
+    "EmbeddingQueryPrefixMismatchError",
     "EmbeddingRecord",
     "EngravaConfig",
     "EngravaCoreProtocol",
@@ -165,6 +170,7 @@ __all__ = [
     "ReadOnlyMindStore",
     "ReadOnlyViolationError",
     "RecencySignal",
+    "RoleAwareEmbeddingProvider",
     "ScoringContext",
     "SearchConfig",
     "SentenceTransformerProvider",

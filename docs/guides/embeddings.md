@@ -25,7 +25,9 @@ works.
 
 The corpus and the query must use **the same model / dimension** — once a store
 has embeddings for one model, writing with a different model raises
-`EmbeddingModelMismatchError`.
+`EmbeddingModelMismatchError`. For instruction-tuned models the corpus also pins
+the `document_prefix` it was built with (see
+[Asymmetric prefixes](#asymmetric-prefixes-for-instruction-tuned-models)).
 
 ## Wiring a provider
 
@@ -225,6 +227,65 @@ auto-embed: you must embed the query yourself first.
 query_vec = await provider.embed("trips to Japan")   # required — no auto-embed here
 result = await store.search_similar(query_vec, top_k=5)
 ```
+
+## Asymmetric prefixes for instruction-tuned models
+
+Some embedding models are **instruction-tuned**: they were trained with a
+mandatory role instruction on every input — typically `"query: "` on a search
+query and `"passage: "` (or `"search_document: "`) on a stored document. Running
+such a model without those instructions leaves noticeable retrieval quality on
+the table. This family includes E5, BGE, GTE, and Ollama's `nomic-embed-text`.
+
+`SentenceTransformerProvider`, `OllamaProvider`, and `HuggingFaceProvider` accept
+an optional, keyword-only `query_prefix` / `document_prefix` for exactly this.
+The document prefix is applied on every document-embed path (ingest auto-embed and
+the `engrava restore --re-embed` path); the query prefix on every query-embed path
+(`search_hybrid`, `recall`, and reflection search).
+
+```python
+provider = SentenceTransformerProvider(
+    model_name="intfloat/e5-base-v2",
+    query_prefix="query: ",
+    document_prefix="passage: ",
+)
+```
+
+Or in `engrava.yaml`:
+
+```yaml
+embeddings:
+  provider: sentence-transformer
+  model: intfloat/e5-base-v2
+  query_prefix: "query: "
+  document_prefix: "passage: "
+  auto_embed: true
+```
+
+A few rules make this safe to adopt incrementally:
+
+- **Opt-in and default-off.** Both prefixes default to empty. An empty prefix is a
+  literal passthrough — the text is embedded exactly as before, with no separator
+  or whitespace added — so a store with no prefixes configured (and every symmetric
+  model, including OpenAI) behaves byte-identically to prior versions. Nothing to
+  migrate.
+- **The symmetric OpenAI provider ignores prefixes entirely.** `OpenAICompatibleProvider`
+  has no prefix parameters; a `query_prefix` / `document_prefix` in config is simply
+  not passed to it.
+- **Changing `document_prefix` requires a deliberate re-embed.** The document prefix
+  is part of the corpus identity: change it and every stored vector would change.
+  Turning it on (or changing it) on a store that already holds vectors raises
+  `EmbeddingModelMismatchError` — Engrava never silently re-embeds. Re-embed on
+  purpose with `engrava restore --re-embed` (which now applies the configured
+  document prefix), or start a fresh store.
+- **Changing `query_prefix` alone does *not* re-embed anything** — it does not touch
+  stored vectors. But the corpus records the query prefix it was built to pair with,
+  so querying with a *divergent* query prefix raises `EmbeddingQueryPrefixMismatchError`
+  loudly at search time rather than silently degrading ranking. The fix is to restore
+  the matching query prefix (or deliberately re-embed with a new document prefix).
+- **Prefixes count toward the context window.** A configured prefix is prepended
+  before encoding, so a long document whose text *plus* prefix exceeds the model's
+  `max_seq_length` truncates exactly as an unprefixed over-length input would — there
+  is no special reservation for the prefix.
 
 ## Choosing a model and dimension
 

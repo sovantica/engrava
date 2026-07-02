@@ -18,6 +18,10 @@ from engrava import (
     EmbeddingConfig,
     EmbeddingModelMismatchError,
     EmbeddingProviderProtocol,
+    EmbeddingQueryPrefixMismatchError,
+    HuggingFaceProvider,
+    OllamaProvider,
+    SentenceTransformerProvider,
     SqliteEngravaCore,
 )
 from engrava.config import (
@@ -1216,3 +1220,677 @@ class TestFromConfigEmbeddings:
         async with await SqliteEngravaCore.from_config(cfg_path) as store:
             assert store._embedding_provider is None
             assert store._auto_embed is False
+
+
+# ---------------------------------------------------------------------------
+# Asymmetric role prefixes (query_prefix / document_prefix)
+# ---------------------------------------------------------------------------
+
+
+class _RolePrefixSpy:
+    """Role-aware fake provider recording the exact text it encodes.
+
+    Mirrors the real providers: the role methods prepend a non-empty prefix
+    (empty prefix is a literal passthrough that delegates to ``embed``) and
+    every encode routes through ``embed``, whose argument is captured. This
+    lets a test assert precisely which string reached the encoder on each
+    path — the document path must see ``document_prefix + text`` and the
+    query path ``query_prefix + text``.
+    """
+
+    def __init__(
+        self,
+        *,
+        query_prefix: str = "",
+        document_prefix: str = "",
+        dimension: int = 4,
+        model_name: str = "spy-model",
+    ) -> None:
+        self._query_prefix = query_prefix
+        self._document_prefix = document_prefix
+        self._dimension = dimension
+        self._model_name = model_name
+        self.embed_calls: list[str] = []
+
+    @property
+    def dimension(self) -> int:
+        return self._dimension
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    @property
+    def query_prefix(self) -> str:
+        return self._query_prefix
+
+    @property
+    def document_prefix(self) -> str:
+        return self._document_prefix
+
+    async def embed(self, text: str) -> list[float]:
+        self.embed_calls.append(text)
+        # Deterministic vector derived from text length so re-embeds differ.
+        return [float(len(text) % 7) / 7.0] * self._dimension
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        return [await self.embed(t) for t in texts]
+
+    async def embed_query(self, text: str) -> list[float]:
+        if not self._query_prefix:
+            return await self.embed(text)
+        return await self.embed(self._query_prefix + text)
+
+    async def embed_document(self, text: str) -> list[float]:
+        if not self._document_prefix:
+            return await self.embed(text)
+        return await self.embed(self._document_prefix + text)
+
+    async def embed_query_batch(self, texts: list[str]) -> list[list[float]]:
+        if not self._query_prefix:
+            return await self.embed_batch(texts)
+        return await self.embed_batch([self._query_prefix + t for t in texts])
+
+    async def embed_document_batch(self, texts: list[str]) -> list[list[float]]:
+        if not self._document_prefix:
+            return await self.embed_batch(texts)
+        return await self.embed_batch([self._document_prefix + t for t in texts])
+
+
+class _EmbedOnlyStub:
+    """Minimal ``embed``-only provider without the role capability.
+
+    Represents a third-party / legacy provider: it satisfies the mandatory
+    protocol but exposes no role methods, so the core must fall back to
+    ``embed`` for both document and query paths.
+    """
+
+    def __init__(self, dimension: int = 4, model_name: str = "embed-only") -> None:
+        self._dimension = dimension
+        self._model_name = model_name
+        self.embed_calls: list[str] = []
+
+    @property
+    def dimension(self) -> int:
+        return self._dimension
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    async def embed(self, text: str) -> list[float]:
+        self.embed_calls.append(text)
+        return [0.5] * self._dimension
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        return [await self.embed(t) for t in texts]
+
+
+class _PartialRoleProvider:
+    """A malformed provider: role *methods* present, prefix *properties* absent.
+
+    It does not satisfy the full :class:`RoleAwareEmbeddingProvider` capability
+    (no ``query_prefix`` / ``document_prefix``), so the core must treat it as a
+    plain provider and never call its role methods. If it did, a document could
+    be prefixed on the embed path while the model lock — reading prefixes from
+    the same provider — records no prefix, producing a silent asymmetry. The
+    role methods inject a sentinel prefix so a test can prove they were skipped.
+    """
+
+    def __init__(self, dimension: int = 4, model_name: str = "partial") -> None:
+        self._dimension = dimension
+        self._model_name = model_name
+        self.embed_calls: list[str] = []
+
+    @property
+    def dimension(self) -> int:
+        return self._dimension
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    async def embed(self, text: str) -> list[float]:
+        self.embed_calls.append(text)
+        return [0.5] * self._dimension
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        return [await self.embed(t) for t in texts]
+
+    async def embed_query(self, text: str) -> list[float]:
+        return await self.embed("SHOULD-NOT-APPEAR: " + text)
+
+    async def embed_document(self, text: str) -> list[float]:
+        return await self.embed("SHOULD-NOT-APPEAR: " + text)
+
+    async def embed_query_batch(self, texts: list[str]) -> list[list[float]]:
+        return await self.embed_batch(["SHOULD-NOT-APPEAR: " + t for t in texts])
+
+    async def embed_document_batch(self, texts: list[str]) -> list[list[float]]:
+        return await self.embed_batch(["SHOULD-NOT-APPEAR: " + t for t in texts])
+
+
+class TestRoleAwareProviderPrefixing:
+    """Unit tests for the opt-in asymmetric prefix on the real providers."""
+
+    async def test_sentence_transformer_role_methods_prepend_prefix(self) -> None:
+        calls: list[str] = []
+
+        async def _fake_embed(self: SentenceTransformerProvider, text: str) -> list[float]:
+            calls.append(text)
+            return [0.0] * 4
+
+        async def _fake_embed_batch(
+            self: SentenceTransformerProvider,
+            texts: list[str],
+        ) -> list[list[float]]:
+            calls.extend(texts)
+            return [[0.0] * 4 for _ in texts]
+
+        with (
+            patch.object(SentenceTransformerProvider, "embed", _fake_embed),
+            patch.object(SentenceTransformerProvider, "embed_batch", _fake_embed_batch),
+        ):
+            provider = SentenceTransformerProvider(
+                query_prefix="query: ",
+                document_prefix="passage: ",
+            )
+            await provider.embed_query("what is x")
+            await provider.embed_document("x is y")
+            await provider.embed_query_batch(["a", "b"])
+            await provider.embed_document_batch(["c"])
+
+        assert "query: what is x" in calls
+        assert "passage: x is y" in calls
+        # Batch role methods prepend per element.
+        assert "query: a" in calls
+        assert "query: b" in calls
+        assert "passage: c" in calls
+
+    async def test_empty_prefix_is_literal_passthrough(self) -> None:
+        """Empty prefixes call the raw embed path with no concatenation."""
+        calls: list[str] = []
+
+        async def _fake_embed(self: OllamaProvider, text: str) -> list[float]:
+            calls.append(text)
+            return [0.0] * 4
+
+        with patch.object(OllamaProvider, "embed", _fake_embed):
+            provider = OllamaProvider(dimension=4)  # no prefixes
+            await provider.embed_query("hello")
+            await provider.embed_document("world")
+
+        # Byte-identical to the raw text — no separator, no whitespace added.
+        assert calls == ["hello", "world"]
+
+    def test_prefix_relevant_providers_are_role_aware(self) -> None:
+        st = SentenceTransformerProvider(query_prefix="q: ", document_prefix="d: ")
+        ol = OllamaProvider(dimension=4, query_prefix="q: ", document_prefix="d: ")
+        hf = HuggingFaceProvider(dimension=4, query_prefix="q: ", document_prefix="d: ")
+        from engrava import RoleAwareEmbeddingProvider
+
+        assert isinstance(st, RoleAwareEmbeddingProvider)
+        assert isinstance(ol, RoleAwareEmbeddingProvider)
+        assert isinstance(hf, RoleAwareEmbeddingProvider)
+
+    def test_openai_provider_is_not_role_aware(self) -> None:
+        from engrava import RoleAwareEmbeddingProvider
+        from engrava.embeddings.openai_compatible import (
+            OpenAICompatibleProvider,
+        )
+
+        provider = OpenAICompatibleProvider(model_name="x", api_key="k")
+        assert not isinstance(provider, RoleAwareEmbeddingProvider)
+
+    def test_callback_provider_is_not_role_aware(
+        self,
+        callback_provider: CallbackProvider,
+    ) -> None:
+        from engrava import RoleAwareEmbeddingProvider
+
+        assert not isinstance(callback_provider, RoleAwareEmbeddingProvider)
+
+
+class TestRoleDispatchCoverage:
+    """The core dispatches the right role prefix on every embed path."""
+
+    async def test_document_path_uses_document_prefix(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        spy = _RolePrefixSpy(query_prefix="query: ", document_prefix="passage: ")
+        store = SqliteEngravaCore(db, embedding_provider=spy, auto_embed=True)
+        thought = _make_thought(essence="Cats", content="Cats purr when content.")
+        await store.create_thought(thought)
+
+        # The auto-embed document path encoded the document-prefixed text.
+        assert any(c.startswith("passage: ") for c in spy.embed_calls)
+        assert not any(c.startswith("query: ") for c in spy.embed_calls)
+
+    async def test_both_query_sites_use_query_prefix(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        spy = _RolePrefixSpy(query_prefix="query: ", document_prefix="passage: ")
+        store = SqliteEngravaCore(db, embedding_provider=spy, auto_embed=True)
+        await store.create_thought(_make_thought(content="Some content to embed."))
+        spy.embed_calls.clear()
+
+        # search_hybrid path.
+        await store.search_hybrid("find the thing", top_k=5)
+        assert spy.embed_calls == ["query: find the thing"]
+
+        spy.embed_calls.clear()
+        # search_reflections_only path (the second query site).
+        await store.search_reflections_only("reflect on this", top_k=5)
+        assert spy.embed_calls == ["query: reflect on this"]
+
+    async def test_recall_path_uses_query_prefix(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        spy = _RolePrefixSpy(query_prefix="query: ", document_prefix="passage: ")
+        store = SqliteEngravaCore(db, embedding_provider=spy, auto_embed=True)
+        await store.create_thought(_make_thought(content="Content for recall."))
+        spy.embed_calls.clear()
+
+        await store.recall("recall me", top_k=5)
+        assert spy.embed_calls == ["query: recall me"]
+
+    async def test_embed_only_provider_falls_back_to_embed(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """A provider without role methods keeps working via ``embed``."""
+        stub = _EmbedOnlyStub()
+        store = SqliteEngravaCore(db, embedding_provider=stub, auto_embed=True)
+        await store.create_thought(_make_thought(content="Body text."))
+        # Document path used plain embed (no prefix, raw text).
+        assert stub.embed_calls
+        assert all(not c.startswith(("query: ", "passage: ")) for c in stub.embed_calls)
+
+        stub.embed_calls.clear()
+        await store.search_hybrid("a query", top_k=5)
+        assert stub.embed_calls == ["a query"]
+
+
+class TestDefaultPathParity:
+    """Default-empty prefixes are byte-identical to no prefixing at all."""
+
+    async def test_role_methods_element_wise_identical_to_embed(self) -> None:
+        """With empty prefixes, role methods equal plain embed element-wise."""
+        provider = _RolePrefixSpy(query_prefix="", document_prefix="")
+        plain = await provider.embed("some text to encode")
+        as_query = await provider.embed_query("some text to encode")
+        as_document = await provider.embed_document("some text to encode")
+        assert as_query == plain
+        assert as_document == plain
+
+    async def test_stored_vector_and_ranking_identical(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        # Same underlying embed function on both stores; the only difference is
+        # whether the store reaches it through plain ``embed`` (no role
+        # capability) or through the empty-prefix role methods. Stored vectors
+        # and ranked order must match exactly — the default is a no-op.
+        provider_default = CallbackProvider(_dummy_embed, dimension=4, model_name="parity")
+        store = SqliteEngravaCore(db, embedding_provider=provider_default, auto_embed=True)
+
+        for i in range(3):
+            await store.create_thought(
+                _make_thought(
+                    thought_id=f"t-parity-{i}",
+                    essence=f"Essence {i}",
+                    content=f"Content number {i} about apples and oranges.",
+                )
+            )
+
+        result_default = await store.search_hybrid("apples", top_k=3)
+        order_default = list(result_default.results)
+        emb_default = await store.get_embedding("t-parity-0")
+
+        # Same again through an empty-prefix role-aware provider that wraps the
+        # identical ``_dummy_embed`` function.
+        conn2 = await aiosqlite.connect(":memory:")
+        conn2.row_factory = aiosqlite.Row
+        await conn2.execute("PRAGMA foreign_keys = ON")
+
+        class _RoleAwareDummy(_RolePrefixSpy):
+            async def embed(self, text: str) -> list[float]:
+                self.embed_calls.append(text)
+                return _dummy_embed(text)
+
+        store2_provider = _RoleAwareDummy(
+            query_prefix="",
+            document_prefix="",
+            model_name="parity",
+        )
+        store2 = SqliteEngravaCore(conn2, embedding_provider=store2_provider, auto_embed=True)
+        await store2.ensure_schema()
+        for i in range(3):
+            await store2.create_thought(
+                _make_thought(
+                    thought_id=f"t-parity-{i}",
+                    essence=f"Essence {i}",
+                    content=f"Content number {i} about apples and oranges.",
+                )
+            )
+        # Every recorded encode is the raw text — no prefix concatenation.
+        assert all(not c.startswith(("query: ", "passage: ")) for c in store2_provider.embed_calls)
+        result2 = await store2.search_hybrid("apples", top_k=3)
+        order2 = list(result2.results)
+        emb2 = await store2.get_embedding("t-parity-0")
+        assert order_default == order2
+        assert emb_default is not None
+        assert emb2 is not None
+        assert emb_default.vector_blob == emb2.vector_blob
+        await conn2.close()
+
+
+class TestProtocolNonBreakage:
+    """The mandatory protocol still matches embed-only / callback providers."""
+
+    def test_callback_still_satisfies_protocol(
+        self,
+        callback_provider: CallbackProvider,
+    ) -> None:
+        assert isinstance(callback_provider, EmbeddingProviderProtocol)
+
+    def test_embed_only_stub_satisfies_protocol(self) -> None:
+        assert isinstance(_EmbedOnlyStub(), EmbeddingProviderProtocol)
+
+    async def test_embed_only_stub_still_embeds(self) -> None:
+        stub = _EmbedOnlyStub()
+        vec = await stub.embed("hi")
+        assert len(vec) == 4
+
+
+class TestPartialRoleCapabilityFallsBack:
+    """A provider that implements the role capability only partially is plain.
+
+    Dispatch keys off the whole :class:`RoleAwareEmbeddingProvider` capability,
+    not per-method presence, so a partial provider is never prefixed on one
+    path while recorded as unprefixed by the model lock.
+    """
+
+    def test_partial_provider_is_not_role_aware(self) -> None:
+        from engrava import RoleAwareEmbeddingProvider
+
+        assert not isinstance(_PartialRoleProvider(), RoleAwareEmbeddingProvider)
+
+    async def test_partial_provider_document_path_falls_back_to_plain_embed(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        partial = _PartialRoleProvider()
+        store = SqliteEngravaCore(db, embedding_provider=partial, auto_embed=True)
+        await store.create_thought(_make_thought(content="Body text."))
+
+        # The document path used plain embed with the raw text — the partial
+        # provider's sentinel-injecting role methods were NOT used.
+        assert partial.embed_calls
+        assert all("SHOULD-NOT-APPEAR" not in c for c in partial.embed_calls)
+
+        # And the lock recorded no document-prefix fingerprint — consistent
+        # with plain treatment, so no latent identity/asymmetry mismatch.
+        cursor = await db.execute("SELECT key FROM _metadata")
+        keys = {row["key"] for row in await cursor.fetchall()}
+        assert "embedding_document_prefix_fingerprint" not in keys
+
+    async def test_partial_provider_query_path_falls_back_to_plain_embed(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        partial = _PartialRoleProvider()
+        store = SqliteEngravaCore(db, embedding_provider=partial, auto_embed=True)
+        await store.create_thought(_make_thought(content="Body text."))
+        partial.embed_calls.clear()
+
+        await store.search_hybrid("a query", top_k=5)
+        # Query path also fell back to plain embed — raw text, no sentinel.
+        assert partial.embed_calls == ["a query"]
+
+
+class TestDocumentPrefixModelLock:
+    """D3: document-prefix identity and query-prefix pairing in the lock."""
+
+    async def test_enabling_document_prefix_on_unprefixed_corpus_raises(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        # Build an unprefixed corpus.
+        plain = _RolePrefixSpy(model_name="lock-model")
+        store_a = SqliteEngravaCore(db, embedding_provider=plain, auto_embed=True)
+        await store_a.create_thought(_make_thought("t-lock-a"))
+
+        # Re-open with a document prefix on the same model — corpus identity
+        # changed, so the lock must raise.
+        prefixed = _RolePrefixSpy(model_name="lock-model", document_prefix="passage: ")
+        store_b = SqliteEngravaCore(db, embedding_provider=prefixed, auto_embed=True)
+        with pytest.raises(EmbeddingModelMismatchError):
+            await store_b.create_thought(_make_thought("t-lock-b"))
+
+    async def test_removing_document_prefix_also_raises(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        prefixed = _RolePrefixSpy(model_name="lock-model", document_prefix="passage: ")
+        store_a = SqliteEngravaCore(db, embedding_provider=prefixed, auto_embed=True)
+        await store_a.create_thought(_make_thought("t-lock-a"))
+
+        plain = _RolePrefixSpy(model_name="lock-model")
+        store_b = SqliteEngravaCore(db, embedding_provider=plain, auto_embed=True)
+        with pytest.raises(EmbeddingModelMismatchError):
+            await store_b.create_thought(_make_thought("t-lock-b"))
+
+    async def test_same_document_prefix_succeeds(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        first = _RolePrefixSpy(model_name="lock-model", document_prefix="passage: ")
+        store_a = SqliteEngravaCore(db, embedding_provider=first, auto_embed=True)
+        await store_a.create_thought(_make_thought("t-lock-a"))
+
+        second = _RolePrefixSpy(model_name="lock-model", document_prefix="passage: ")
+        store_b = SqliteEngravaCore(db, embedding_provider=second, auto_embed=True)
+        # No raise — identical corpus identity.
+        await store_b.create_thought(_make_thought("t-lock-b"))
+
+    async def test_query_prefix_only_change_does_not_force_reembed(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        # Corpus built with a query/document prefix pair.
+        first = _RolePrefixSpy(
+            model_name="lock-model",
+            document_prefix="passage: ",
+            query_prefix="query: ",
+        )
+        store_a = SqliteEngravaCore(db, embedding_provider=first, auto_embed=True)
+        await store_a.create_thought(_make_thought("t-lock-a"))
+
+        # Same document prefix (corpus identity unchanged), same query prefix:
+        # storing another document does NOT raise — no re-embed forced.
+        same = _RolePrefixSpy(
+            model_name="lock-model",
+            document_prefix="passage: ",
+            query_prefix="query: ",
+        )
+        store_b = SqliteEngravaCore(db, embedding_provider=same, auto_embed=True)
+        await store_b.create_thought(_make_thought("t-lock-b"))
+
+    async def test_divergent_query_prefix_raises_at_search_time(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        first = _RolePrefixSpy(
+            model_name="lock-model",
+            document_prefix="passage: ",
+            query_prefix="query: ",
+        )
+        store_a = SqliteEngravaCore(db, embedding_provider=first, auto_embed=True)
+        await store_a.create_thought(_make_thought("t-lock-a"))
+
+        # Same document prefix (so store works), but a divergent query prefix.
+        diverged = _RolePrefixSpy(
+            model_name="lock-model",
+            document_prefix="passage: ",
+            query_prefix="search: ",
+        )
+        store_b = SqliteEngravaCore(db, embedding_provider=diverged, auto_embed=True)
+        with pytest.raises(EmbeddingQueryPrefixMismatchError):
+            await store_b.search_hybrid("find it", top_k=5)
+
+    async def test_matching_query_prefix_search_succeeds(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        first = _RolePrefixSpy(
+            model_name="lock-model",
+            document_prefix="passage: ",
+            query_prefix="query: ",
+        )
+        store_a = SqliteEngravaCore(db, embedding_provider=first, auto_embed=True)
+        await store_a.create_thought(_make_thought("t-lock-a", content="Body."))
+
+        same = _RolePrefixSpy(
+            model_name="lock-model",
+            document_prefix="passage: ",
+            query_prefix="query: ",
+        )
+        store_b = SqliteEngravaCore(db, embedding_provider=same, auto_embed=True)
+        # Restoring the matching query prefix — no raise.
+        await store_b.search_hybrid("find it", top_k=5)
+
+    async def test_empty_prefixes_use_legacy_metadata_shape(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """Default (empty) prefixes write no fingerprint/pairing keys."""
+        plain = _RolePrefixSpy(model_name="lock-model")
+        store = SqliteEngravaCore(db, embedding_provider=plain, auto_embed=True)
+        await store.create_thought(_make_thought("t-legacy"))
+
+        cursor = await db.execute("SELECT key FROM _metadata ORDER BY key")
+        keys = {row["key"] for row in await cursor.fetchall()}
+        # Only the legacy keys — no prefix fingerprint or query-prefix key.
+        assert "embedding_model_name" in keys
+        assert "embedding_dimension" in keys
+        assert "embedding_document_prefix_fingerprint" not in keys
+        assert "embedding_query_prefix" not in keys
+
+    async def test_existing_unprefixed_store_never_false_trips(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """A store locked before this feature (plain CallbackProvider) reopens fine."""
+        provider = CallbackProvider(_dummy_embed, dimension=4, model_name="legacy-model")
+        store_a = SqliteEngravaCore(db, embedding_provider=provider, auto_embed=True)
+        await store_a.create_thought(_make_thought("t-a", content="Body."))
+
+        # Reopen with an equivalent plain provider — no prefixes anywhere.
+        provider_b = CallbackProvider(_dummy_embed, dimension=4, model_name="legacy-model")
+        store_b = SqliteEngravaCore(db, embedding_provider=provider_b, auto_embed=True)
+        await store_b.create_thought(_make_thought("t-b"))
+        # And searching does not trip the query-prefix pairing check.
+        await store_b.search_hybrid("body", top_k=5)
+
+    async def test_query_prefix_on_empty_store_does_not_trip(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """A query prefix on a not-yet-populated store never false-trips.
+
+        Before the first embedding is stored there is no corpus (no locked
+        model) to pair against, so a search must not raise even though the
+        provider carries a query prefix.
+        """
+        provider = _RolePrefixSpy(
+            model_name="lock-model",
+            document_prefix="passage: ",
+            query_prefix="query: ",
+        )
+        store = SqliteEngravaCore(db, embedding_provider=provider, auto_embed=True)
+        await store.ensure_schema()
+        # Empty corpus (nothing stored) → the pairing check is a no-op.
+        await store.search_hybrid("find something", top_k=5)
+
+
+class TestPrefixConfigParsing:
+    """D6: config parses the two prefixes and forwards them correctly."""
+
+    def test_parse_prefixes(self) -> None:
+        cfg = _parse_embeddings(
+            {
+                "provider": "sentence-transformer",
+                "query_prefix": "query: ",
+                "document_prefix": "passage: ",
+            }
+        )
+        assert cfg is not None
+        assert cfg.query_prefix == "query: "
+        assert cfg.document_prefix == "passage: "
+
+    def test_parse_prefixes_default_none(self) -> None:
+        cfg = _parse_embeddings({"provider": "sentence-transformer"})
+        assert cfg is not None
+        assert cfg.query_prefix is None
+        assert cfg.document_prefix is None
+
+    def test_parse_non_string_query_prefix_raises(self) -> None:
+        with pytest.raises(ConfigError, match="query_prefix"):
+            _parse_embeddings({"provider": "ollama", "query_prefix": 123})
+
+    def test_parse_non_string_document_prefix_raises(self) -> None:
+        with pytest.raises(ConfigError, match="document_prefix"):
+            _parse_embeddings({"provider": "ollama", "document_prefix": ["x"]})
+
+    def test_forwarded_to_sentence_transformer(self) -> None:
+        cfg = EmbeddingConfig(
+            provider="sentence-transformer",
+            query_prefix="query: ",
+            document_prefix="passage: ",
+        )
+        provider = resolve_embedding_provider(cfg)
+        assert provider is not None
+        assert provider.query_prefix == "query: "  # type: ignore[attr-defined]
+        assert provider.document_prefix == "passage: "  # type: ignore[attr-defined]
+
+    def test_forwarded_to_ollama(self) -> None:
+        cfg = EmbeddingConfig(
+            provider="ollama",
+            query_prefix="q: ",
+            document_prefix="d: ",
+        )
+        provider = resolve_embedding_provider(cfg)
+        assert provider is not None
+        assert provider.query_prefix == "q: "  # type: ignore[attr-defined]
+        assert provider.document_prefix == "d: "  # type: ignore[attr-defined]
+
+    def test_forwarded_to_huggingface(self) -> None:
+        cfg = EmbeddingConfig(
+            provider="huggingface",
+            query_prefix="q: ",
+            document_prefix="d: ",
+        )
+        provider = resolve_embedding_provider(cfg)
+        assert provider is not None
+        assert provider.query_prefix == "q: "  # type: ignore[attr-defined]
+        assert provider.document_prefix == "d: "  # type: ignore[attr-defined]
+
+    def test_openai_provider_receives_no_prefix(self) -> None:
+        """The symmetric OpenAI provider has no prefix attributes at all."""
+        from engrava import RoleAwareEmbeddingProvider
+
+        cfg = EmbeddingConfig(
+            provider="openai-compatible",
+            query_prefix="query: ",
+            document_prefix="passage: ",
+            api_key="sk-test",
+        )
+        provider = resolve_embedding_provider(cfg)
+        assert provider is not None
+        # No prefixing surface — structurally symmetric.
+        assert not isinstance(provider, RoleAwareEmbeddingProvider)
+        assert not hasattr(provider, "query_prefix")

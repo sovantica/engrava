@@ -594,6 +594,10 @@ async def _reembed_thoughts(
     import struct  # noqa: PLC0415
     import uuid as _uuid  # noqa: PLC0415
 
+    from engrava.infrastructure.sqlite.engrava_core import (  # noqa: PLC0415
+        _embed_document,
+    )
+
     count = 0
     for tid in thought_ids:
         cursor = await conn.execute(
@@ -603,7 +607,7 @@ async def _reembed_thoughts(
         if not row:
             continue
         text = f"{row[0]}\n{row[1]}"
-        vector = await embedding_provider.embed(text)
+        vector = await _embed_document(embedding_provider, text)
         blob = struct.pack(f"<{len(vector)}f", *vector)
         now = datetime.datetime.now(tz=datetime.UTC).isoformat()
         await conn.execute(

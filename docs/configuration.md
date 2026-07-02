@@ -112,6 +112,17 @@ vector dimension lives under `extensions.vector.dimension`, not here.
 | `batch_size` | `int` | `32` | Batch encoding size for local providers |
 | `base_url` | `str` | `null` | Base URL for remote providers |
 | `api_key` | `str` | `null` | API key for remote providers (supports `${ENV_VAR}`) |
+| `query_prefix` | `str` | `null` | Instruction prefix prepended to a search query before embedding (e.g. `"query: "`). Applies only to `sentence-transformer` / `ollama` / `huggingface`; `openai-compatible` ignores it. Empty/`null` is a literal passthrough — byte-identical to no prefixing |
+| `document_prefix` | `str` | `null` | Instruction prefix prepended to a stored thought before embedding (e.g. `"passage: "`). Same provider scope and passthrough guarantee as `query_prefix`. Changing this on an existing store changes every stored vector and requires a deliberate re-embed (the store raises rather than silently re-embedding) |
+
+> **Asymmetric prefixes are opt-in and for instruction-tuned models only.** Models
+> like E5, BGE, GTE, and Ollama's `nomic-embed-text` are trained with mandatory
+> role instructions (`"query: "` on the query, `"passage: "` on the document) and
+> retrieve worse when run without them. Leave both prefixes empty (the default) for
+> OpenAI and other symmetric models — the empty path is byte-identical to prior
+> behaviour, and no existing store needs migrating. See
+> [the embeddings guide](guides/embeddings.md#asymmetric-prefixes-for-instruction-tuned-models)
+> for the full re-embed policy.
 
 ### `dreaming`
 

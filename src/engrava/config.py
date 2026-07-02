@@ -481,6 +481,19 @@ class EmbeddingConfig:
         batch_size: Batch encoding size for local providers.
         base_url: Base URL for remote providers.
         api_key: API key for remote providers (supports ``${ENV_VAR}`` syntax).
+        query_prefix: Optional instruction prefix prepended to a search query
+            before embedding (e.g. ``"query: "`` for an E5 model). Applies
+            only to the asymmetric-capable providers (``sentence-transformer``,
+            ``ollama``, ``huggingface``); the symmetric ``openai-compatible``
+            provider ignores prefixing entirely. Empty/``None`` by default —
+            an empty prefix is a literal passthrough, byte-identical to no
+            prefixing.
+        document_prefix: Optional instruction prefix prepended to a stored
+            document before embedding (e.g. ``"passage: "``). Same provider
+            scope and passthrough guarantee as ``query_prefix``. Changing this
+            on an existing store changes every stored vector and requires a
+            deliberate re-embed — the store raises rather than silently
+            re-embedding.
 
     Examples:
         >>> cfg = EmbeddingConfig(provider="sentence-transformer")
@@ -496,6 +509,8 @@ class EmbeddingConfig:
     batch_size: int = 32
     base_url: str | None = None
     api_key: str | None = None
+    query_prefix: str | None = None
+    document_prefix: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1645,6 +1660,16 @@ def _parse_embeddings(raw: Any) -> EmbeddingConfig | None:  # noqa: ANN401, C901
             raise ConfigError(msg)
         api_key = _resolve_env_var(api_key_raw)
 
+    query_prefix = raw.get("query_prefix")
+    if query_prefix is not None and not isinstance(query_prefix, str):
+        msg = "'embeddings.query_prefix' must be a string"
+        raise ConfigError(msg)
+
+    document_prefix = raw.get("document_prefix")
+    if document_prefix is not None and not isinstance(document_prefix, str):
+        msg = "'embeddings.document_prefix' must be a string"
+        raise ConfigError(msg)
+
     return EmbeddingConfig(
         provider=provider,
         model=model,
@@ -1653,6 +1678,8 @@ def _parse_embeddings(raw: Any) -> EmbeddingConfig | None:  # noqa: ANN401, C901
         batch_size=batch_size,
         base_url=base_url,
         api_key=api_key,
+        query_prefix=query_prefix,
+        document_prefix=document_prefix,
     )
 
 
@@ -1691,6 +1718,8 @@ def resolve_embedding_provider(
             model_name=config.model or "all-MiniLM-L12-v2",
             device=config.device,
             batch_size=config.batch_size,
+            query_prefix=config.query_prefix or "",
+            document_prefix=config.document_prefix or "",
         )
 
     if provider_name == "openai-compatible":
@@ -1710,6 +1739,8 @@ def resolve_embedding_provider(
         return OllamaProvider(
             model_name=config.model or "nomic-embed-text",
             base_url=config.base_url or "http://localhost:11434",
+            query_prefix=config.query_prefix or "",
+            document_prefix=config.document_prefix or "",
         )
 
     if provider_name == "huggingface":
@@ -1726,6 +1757,8 @@ def resolve_embedding_provider(
         return HuggingFaceProvider(
             model_name=config.model or "sentence-transformers/all-MiniLM-L12-v2",
             api_key=config.api_key,
+            query_prefix=config.query_prefix or "",
+            document_prefix=config.document_prefix or "",
         )
 
     msg = f"Unknown embedding provider: {provider_name!r}"

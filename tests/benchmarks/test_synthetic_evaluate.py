@@ -295,7 +295,10 @@ class TestOffOnPair:
 # Baseline captured pre-WS from release/v0.3.0 HEAD = bb407ac, then extended
 # with the metadata-filter query surface (FieldOp / FieldPredicate /
 # MetadataFilter / VisibilityQueryFilter + the two typed filter errors), an
-# intentional, ratified public-API addition.
+# intentional, ratified public-API addition. Later extended with the
+# opt-in asymmetric embedding-prefix surface (RoleAwareEmbeddingProvider
+# capability protocol + EmbeddingQueryPrefixMismatchError), an additive,
+# default-off public-API addition.
 _PRE_WS_ALL_BASELINE = frozenset(
     {
         "ActionRecord",
@@ -322,6 +325,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "EmbeddingConfig",
         "EmbeddingModelMismatchError",
         "EmbeddingProviderProtocol",
+        "EmbeddingQueryPrefixMismatchError",
         "EmbeddingRecord",
         "EngravaConfig",
         "EngravaCoreProtocol",
@@ -367,6 +371,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "ReadOnlyMindStore",
         "ReadOnlyViolationError",
         "RecencySignal",
+        "RoleAwareEmbeddingProvider",
         "ScoringContext",
         "SearchConfig",
         "SentenceTransformerProvider",

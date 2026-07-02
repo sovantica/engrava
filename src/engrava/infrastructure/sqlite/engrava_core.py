@@ -41,6 +41,7 @@ from engrava.domain.enums import (
 )
 from engrava.domain.exceptions import (
     EmbeddingModelMismatchError,
+    EmbeddingQueryPrefixMismatchError,
     ReferentialIntegrityError,
     StaleDataError,
     ThoughtNotFoundError,
@@ -52,6 +53,7 @@ from engrava.domain.models.embedding import EmbeddingRecord
 from engrava.domain.models.filters import _validate_path, compile_effective_predicate
 from engrava.domain.models.thought import MetadataValue, ThoughtRecord
 from engrava.domain.models.ttl import CleanupResult, CleanupStrategy
+from engrava.domain.protocols.embedding_provider import RoleAwareEmbeddingProvider
 from engrava.domain.protocols.hooks import DefaultEngravaHooks, EngravaHooksProtocol
 from engrava.infrastructure.sqlite.centroid import CENTROID_MODEL_NAME, compute_centroid
 from engrava.infrastructure.sqlite.journal_writer import JournalWriter
@@ -99,6 +101,117 @@ def _build_embed_input(essence: str, content: str) -> str:
     if content.strip().startswith(essence.strip()):
         return content
     return f"{essence}\n{content}"
+
+
+#: ``_metadata`` key recording the fingerprint of the ``document_prefix`` the
+#: corpus was embedded with. Present only when a non-empty document prefix is
+#: active — an unprefixed corpus (the default) never writes it, so the
+#: ``_metadata`` shape is byte-identical to the legacy one and a pre-existing
+#: store never false-trips the lock.
+_METADATA_DOCUMENT_PREFIX_FINGERPRINT = "embedding_document_prefix_fingerprint"
+
+#: ``_metadata`` key recording the literal ``query_prefix`` the corpus was
+#: built to pair with. Present only when a non-empty query prefix is active.
+#: A divergent active query prefix raises a loud search-time mismatch; the
+#: stored document vectors are unaffected, so this never forces a re-embed.
+_METADATA_QUERY_PREFIX = "embedding_query_prefix"
+
+
+def _role_prefixes(provider: object) -> tuple[str, str]:
+    """Return the ``(query_prefix, document_prefix)`` a provider declares.
+
+    The role capability is treated as **all-or-nothing**: only a provider
+    that satisfies the full :class:`RoleAwareEmbeddingProvider` capability
+    (both prefixes *and* every role method) declares prefixes. A provider
+    without it — a user callback, a third-party class, the symmetric OpenAI
+    provider, or one that implements the capability only partially — reports
+    empty prefixes, the legacy, byte-identical behaviour. Detecting the
+    prefixes and dispatching the role methods (see :func:`_embed_document` /
+    :func:`_embed_query`) therefore key off the *same* capability check, so a
+    partial provider can never be prefixed on one path yet recorded as
+    unprefixed in ``_metadata``.
+
+    Args:
+        provider: The embedding provider to inspect.
+
+    Returns:
+        The ``(query_prefix, document_prefix)`` pair, each ``""`` when the
+        provider does not fully declare the role-aware capability.
+
+    """
+    if isinstance(provider, RoleAwareEmbeddingProvider):
+        return provider.query_prefix, provider.document_prefix
+    return "", ""
+
+
+def _document_prefix_fingerprint(document_prefix: str) -> str | None:
+    """Return a deterministic fingerprint of a non-empty document prefix.
+
+    An empty prefix maps to ``None`` — the legacy corpus identity — so the
+    lock records nothing extra and an existing unprefixed store is untouched.
+    A non-empty prefix hashes to a stable hex digest that changes whenever
+    the prefix changes, which is exactly when every stored vector would
+    change and the corpus needs re-embedding.
+
+    Args:
+        document_prefix: The active document-role prefix.
+
+    Returns:
+        A hex SHA-256 digest of the prefix, or ``None`` when the prefix is
+        empty.
+
+    """
+    if not document_prefix:
+        return None
+    return hashlib.sha256(document_prefix.encode("utf-8")).hexdigest()
+
+
+async def _embed_document(provider: object, text: str) -> list[float]:
+    """Embed a document, using the role-aware path when the provider has it.
+
+    Dispatches by the full :class:`RoleAwareEmbeddingProvider` capability: a
+    provider that satisfies it encodes ``text`` with its document-role
+    prefix; any other provider (including one that implements the capability
+    only partially) falls back to plain ``embed`` — byte-identical to before
+    this capability existed. Using the whole-capability check keeps dispatch
+    consistent with :func:`_role_prefixes`, so a provider can never be
+    prefixed here yet reported as unprefixed to the model lock.
+
+    Args:
+        provider: The embedding provider.
+        text: The document text to embed.
+
+    Returns:
+        The embedding vector.
+
+    """
+    if isinstance(provider, RoleAwareEmbeddingProvider):
+        return await provider.embed_document(text)
+    return await provider.embed(text)  # type: ignore[attr-defined,no-any-return]
+
+
+async def _embed_query(provider: object, text: str) -> list[float]:
+    """Embed a query, using the role-aware path when the provider has it.
+
+    Dispatches by the full :class:`RoleAwareEmbeddingProvider` capability: a
+    provider that satisfies it encodes ``text`` with its query-role prefix;
+    any other provider (including one that implements the capability only
+    partially) falls back to plain ``embed`` — byte-identical to before this
+    capability existed. Using the whole-capability check keeps dispatch
+    consistent with :func:`_role_prefixes` and the recorded query-prefix
+    pairing.
+
+    Args:
+        provider: The embedding provider.
+        text: The query text to embed.
+
+    Returns:
+        The embedding vector.
+
+    """
+    if isinstance(provider, RoleAwareEmbeddingProvider):
+        return await provider.embed_query(text)
+    return await provider.embed(text)  # type: ignore[attr-defined,no-any-return]
 
 
 #: A token is treated as an FTS5 column filter only when it targets a real
@@ -1269,15 +1382,31 @@ class SqliteEngravaCore:
         """Lazy-lock the embedding model on first ``store_embedding()``.
 
         On first call (no ``embedding_model_name`` in ``_metadata``), writes
-        the model name and dimension.  On subsequent calls, verifies the
-        provider matches the stored values.
+        the model name, dimension, and — only when the active provider
+        applies a non-empty ``document_prefix`` — the deterministic
+        fingerprint of that prefix and the ``query_prefix`` the corpus is
+        built to pair with. On subsequent calls, verifies the provider
+        matches the stored values.
+
+        The document-prefix fingerprint is part of the *corpus identity*:
+        changing the ``document_prefix`` changes what every stored vector
+        would be, so it must trigger a re-embed via
+        :class:`EmbeddingModelMismatchError`. The ``query_prefix`` does not
+        change stored vectors, so it is recorded for pairing but is verified
+        separately at search time (see :meth:`_ensure_query_prefix_pairs`),
+        never here.
+
+        Empty prefixes (the default) write nothing extra, so the
+        ``_metadata`` shape is byte-identical to the legacy one and a
+        pre-existing unprefixed store never false-trips the lock.
 
         Args:
             model_name: Model identifier from the current provider.
             dimension: Vector dimensionality from the current provider.
 
         Raises:
-            EmbeddingModelMismatchError: When the configured model differs
+            EmbeddingModelMismatchError: When the configured model, its
+                dimension, or its ``document_prefix`` fingerprint differs
                 from the one stored in ``_metadata``.
 
         """
@@ -1286,6 +1415,9 @@ class SqliteEngravaCore:
 
         # Ensure _metadata table exists (idempotent).
         await self._migrate_core_v4_to_v5()
+
+        _query_prefix, document_prefix = _role_prefixes(self._embedding_provider)
+        active_fingerprint = _document_prefix_fingerprint(document_prefix)
 
         cursor = await self._db.execute(
             "SELECT value FROM _metadata WHERE key = 'embedding_model_name'"
@@ -1302,6 +1434,18 @@ class SqliteEngravaCore:
                 "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
                 ("embedding_dimension", str(dimension)),
             )
+            # Only a non-empty document prefix records a fingerprint — an
+            # unprefixed corpus keeps the legacy _metadata shape untouched.
+            if active_fingerprint is not None:
+                await self._db.execute(
+                    "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
+                    (_METADATA_DOCUMENT_PREFIX_FINGERPRINT, active_fingerprint),
+                )
+            if _query_prefix:
+                await self._db.execute(
+                    "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
+                    (_METADATA_QUERY_PREFIX, _query_prefix),
+                )
             await self._maybe_commit()
         else:
             stored_model = row["value"]
@@ -1311,15 +1455,94 @@ class SqliteEngravaCore:
             dim_row = await dim_cursor.fetchone()
             stored_dimension = int(dim_row["value"]) if dim_row else 0
 
-            if stored_model != model_name or stored_dimension != dimension:
+            fp_cursor = await self._db.execute(
+                "SELECT value FROM _metadata WHERE key = ?",
+                (_METADATA_DOCUMENT_PREFIX_FINGERPRINT,),
+            )
+            fp_row = await fp_cursor.fetchone()
+            stored_fingerprint = fp_row["value"] if fp_row else None
+
+            if (
+                stored_model != model_name
+                or stored_dimension != dimension
+                or stored_fingerprint != active_fingerprint
+            ):
                 raise EmbeddingModelMismatchError(
-                    stored_model=stored_model,
-                    configured_model=model_name,
+                    stored_model=self._describe_corpus_model(stored_model, stored_fingerprint),
+                    configured_model=self._describe_corpus_model(model_name, active_fingerprint),
                     stored_dimension=stored_dimension,
                     configured_dimension=dimension,
                 )
 
         self._embedding_model_verified = True
+
+    @staticmethod
+    def _describe_corpus_model(model_name: str, fingerprint: str | None) -> str:
+        """Render a model identity that includes any document-prefix fingerprint.
+
+        Keeps the plain model name for an unprefixed corpus (legacy, matching
+        the value stored in ``_metadata``) and appends a short fingerprint tag
+        when a document prefix is active, so a prefix-only mismatch produces a
+        self-explanatory error rather than two identical model names.
+
+        Args:
+            model_name: The embedding model identifier.
+            fingerprint: The document-prefix fingerprint, or ``None`` when no
+                document prefix is active.
+
+        Returns:
+            The model name, suffixed with the document-prefix fingerprint when
+            one is present.
+
+        """
+        if fingerprint is None:
+            return model_name
+        return f"{model_name}+doc_prefix:{fingerprint[:12]}"
+
+    async def _ensure_query_prefix_pairs(self) -> None:
+        """Verify the active query prefix pairs with the stored corpus.
+
+        For an asymmetric model the query must be embedded with the
+        ``query_prefix`` the corpus was built to pair with. Because the query
+        prefix does not change any stored vector, a query-only change never
+        forces a re-embed — but a *divergent* active query prefix would
+        silently degrade ranking, so it is surfaced loudly here at search
+        time. Empty prefixes map to the legacy identity (no stored key), so a
+        pre-existing store or a symmetric provider never trips this check.
+        Until the corpus has locked an embedding model (its first stored
+        embedding), there is nothing to pair against, so the check is a
+        no-op — searching a not-yet-populated store with a query prefix
+        configured never trips.
+
+        Raises:
+            EmbeddingQueryPrefixMismatchError: When the provider's active
+                ``query_prefix`` differs from the one the corpus records.
+
+        """
+        active_query_prefix, _document_prefix = _role_prefixes(self._embedding_provider)
+
+        # No corpus locked yet (no embedding ever stored) → there is no
+        # recorded pairing to diverge from, so a configured query prefix on an
+        # empty store must not false-trip. Pairing is meaningful only once a
+        # corpus exists.
+        lock_cursor = await self._db.execute(
+            "SELECT value FROM _metadata WHERE key = 'embedding_model_name'"
+        )
+        if await lock_cursor.fetchone() is None:
+            return
+
+        cursor = await self._db.execute(
+            "SELECT value FROM _metadata WHERE key = ?",
+            (_METADATA_QUERY_PREFIX,),
+        )
+        row = await cursor.fetchone()
+        stored_query_prefix = row["value"] if row else ""
+
+        if stored_query_prefix != active_query_prefix:
+            raise EmbeddingQueryPrefixMismatchError(
+                stored_query_prefix=stored_query_prefix,
+                configured_query_prefix=active_query_prefix,
+            )
 
     async def verify_embedding_model(self) -> None:
         """Explicit eager check for embedding model compatibility.
@@ -2693,7 +2916,7 @@ class SqliteEngravaCore:
             return  # pragma: no cover
         text = _build_embed_input(thought.essence, thought.content)
 
-        vector = await provider.embed(text)
+        vector = await _embed_document(provider, text)
 
         await self.store_embedding(
             thought.thought_id,
@@ -3847,7 +4070,8 @@ class SqliteEngravaCore:
 
         effective_vector = query_vector
         if effective_vector is None and self._embedding_provider is not None and query_text.strip():
-            effective_vector = await self._embedding_provider.embed(query_text)
+            await self._ensure_query_prefix_pairs()
+            effective_vector = await _embed_query(self._embedding_provider, query_text)
 
         recency_active = current_cycle is not None and recency_weight > 0.0
         return (fts_active, effective_vector, recency_active)
@@ -4400,7 +4624,8 @@ class SqliteEngravaCore:
         # Resolve effective query vector (auto-embed if provider available)
         effective_vector = query_vector
         if effective_vector is None and self._embedding_provider is not None and query_text.strip():
-            effective_vector = await self._embedding_provider.embed(query_text)
+            await self._ensure_query_prefix_pairs()
+            effective_vector = await _embed_query(self._embedding_provider, query_text)
 
         # Fetch all REFLECTION thought IDs directly — complete, no pagination
         # gap. Retired REFLECTIONs (lifecycle != ACTIVE) are excluded by the

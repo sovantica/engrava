@@ -120,6 +120,40 @@ class EmbeddingModelMismatchError(EngravaError):
         )
 
 
+class EmbeddingQueryPrefixMismatchError(EngravaError):
+    """Raised when the active query prefix diverges from the corpus pairing.
+
+    For an asymmetric embedding model, a query is encoded with a
+    ``query_prefix`` (e.g. ``"query: "``) that must pair with the
+    ``document_prefix`` (e.g. ``"passage: "``) the stored corpus was
+    embedded with. Changing only the query prefix does not alter any stored
+    vector, so it does not require re-embedding — but querying with a prefix
+    that no longer matches the corpus silently degrades ranking. This error
+    surfaces that divergence loudly at search time. The fix is to restore the
+    query prefix the corpus was built to pair with, or to deliberately
+    re-embed the corpus with a new document prefix.
+
+    Args:
+        stored_query_prefix: Query prefix the corpus was built to pair with.
+        configured_query_prefix: Query prefix the current provider offers.
+
+    """
+
+    def __init__(
+        self,
+        stored_query_prefix: str,
+        configured_query_prefix: str,
+    ) -> None:
+        self.stored_query_prefix = stored_query_prefix
+        self.configured_query_prefix = configured_query_prefix
+        super().__init__(
+            f"Embedding query prefix mismatch: corpus was built to pair with "
+            f"query prefix {stored_query_prefix!r}, but the provider offers "
+            f"{configured_query_prefix!r}. Restore the matching query prefix, "
+            f"or deliberately re-embed the corpus with a new document prefix."
+        )
+
+
 class ReferentialIntegrityError(EngravaError):
     """Raised when a write would create or leave an orphan reference.
 
