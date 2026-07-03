@@ -307,7 +307,11 @@ class TestOffOnPair:
 # with ActionNotFoundError (raised by the new update_action lifecycle write) and
 # ActionOutcomeSignal (the action-outcome dreaming signal) — the additive,
 # default-off action-outcome feedback surface (inactive in any store that never
-# records a terminal action outcome).
+# records a terminal action outcome). Later extended with ProvenanceContext
+# (the typed, bounded, opt-in write-time provenance sub-model captured at
+# create_thought and made queryable but never consumed) — an additive,
+# default-off public-API addition (a thought with no provenance is byte-identical
+# to before it existed).
 _PRE_WS_ALL_BASELINE = frozenset(
     {
         "ActionNotFoundError",
@@ -380,6 +384,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "OllamaProvider",
         "OpenAICompatibleProvider",
         "Priority",
+        "ProvenanceContext",
         "ReadOnlyEngrava",
         "ReadOnlyMindStore",
         "ReadOnlyViolationError",

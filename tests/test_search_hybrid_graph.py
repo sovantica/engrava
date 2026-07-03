@@ -616,4 +616,4 @@ class TestExpansionGapFixes:
         await conn.close()
 
         assert row is not None, "idx_edge_type_from missing after v7->head migration"
-        assert int(version_row[0]) == 16
+        assert int(version_row[0]) == 17

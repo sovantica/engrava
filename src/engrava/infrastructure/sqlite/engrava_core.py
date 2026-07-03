@@ -56,6 +56,7 @@ from engrava.domain.models.edge import EdgeRecord
 from engrava.domain.models.embedding import EmbeddingRecord
 from engrava.domain.models.filters import _validate_path, compile_effective_predicate
 from engrava.domain.models.journal import JournalIntegrityResult
+from engrava.domain.models.provenance import ProvenanceContext
 from engrava.domain.models.thought import MetadataValue, ThoughtRecord
 from engrava.domain.models.ttl import CleanupResult, CleanupStrategy
 from engrava.domain.protocols.embedding_provider import RoleAwareEmbeddingProvider
@@ -954,7 +955,7 @@ class SqliteEngravaCore:
         Applies the full ``schema_core.sql`` (including FTS5 virtual
         table and sync triggers) only when the database has not already
         been bootstrapped to schema version 3+.  Databases at older
-        versions are upgraded incrementally up to the current version (16).
+        versions are upgraded incrementally up to the current version (17).
 
         After core schema creation or upgrade, probes for the ``thought_fts``
         table and then runs any pending extension schema migrations for each
@@ -986,7 +987,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
-            await self._db.execute("PRAGMA user_version = 16")
+            await self._migrate_core_v16_to_v17()
+            await self._db.execute("PRAGMA user_version = 17")
             await self._db.commit()
         elif current_version < 4:  # noqa: PLR2004
             await self._migrate_core_v3_to_v4()
@@ -1002,7 +1004,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
-            await self._db.execute("PRAGMA user_version = 16")
+            await self._migrate_core_v16_to_v17()
+            await self._db.execute("PRAGMA user_version = 17")
             await self._db.commit()
         elif current_version < 5:  # noqa: PLR2004
             await self._migrate_core_v4_to_v5()
@@ -1017,7 +1020,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
-            await self._db.execute("PRAGMA user_version = 16")
+            await self._migrate_core_v16_to_v17()
+            await self._db.execute("PRAGMA user_version = 17")
             await self._db.commit()
         elif current_version < 6:  # noqa: PLR2004
             await self._migrate_core_v5_to_v6()
@@ -1031,7 +1035,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
-            await self._db.execute("PRAGMA user_version = 16")
+            await self._migrate_core_v16_to_v17()
+            await self._db.execute("PRAGMA user_version = 17")
             await self._db.commit()
         elif current_version < 7:  # noqa: PLR2004
             await self._migrate_core_v6_to_v7()
@@ -1044,7 +1049,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
-            await self._db.execute("PRAGMA user_version = 16")
+            await self._migrate_core_v16_to_v17()
+            await self._db.execute("PRAGMA user_version = 17")
             await self._db.commit()
         elif current_version < 8:  # noqa: PLR2004
             await self._migrate_core_v7_to_v8()
@@ -1056,7 +1062,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
-            await self._db.execute("PRAGMA user_version = 16")
+            await self._migrate_core_v16_to_v17()
+            await self._db.execute("PRAGMA user_version = 17")
             await self._db.commit()
         elif current_version < 9:  # noqa: PLR2004
             await self._migrate_core_v8_to_v9()
@@ -1067,7 +1074,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
-            await self._db.execute("PRAGMA user_version = 16")
+            await self._migrate_core_v16_to_v17()
+            await self._db.execute("PRAGMA user_version = 17")
             await self._db.commit()
         elif current_version < 10:  # noqa: PLR2004
             await self._migrate_core_v9_to_v10()
@@ -1077,7 +1085,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
-            await self._db.execute("PRAGMA user_version = 16")
+            await self._migrate_core_v16_to_v17()
+            await self._db.execute("PRAGMA user_version = 17")
             await self._db.commit()
         elif current_version < 11:  # noqa: PLR2004
             await self._migrate_core_v10_to_v11()
@@ -1086,7 +1095,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
-            await self._db.execute("PRAGMA user_version = 16")
+            await self._migrate_core_v16_to_v17()
+            await self._db.execute("PRAGMA user_version = 17")
             await self._db.commit()
         elif current_version < 12:  # noqa: PLR2004
             await self._migrate_core_v11_to_v12()
@@ -1094,29 +1104,38 @@ class SqliteEngravaCore:
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
-            await self._db.execute("PRAGMA user_version = 16")
+            await self._migrate_core_v16_to_v17()
+            await self._db.execute("PRAGMA user_version = 17")
             await self._db.commit()
         elif current_version < 13:  # noqa: PLR2004
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
-            await self._db.execute("PRAGMA user_version = 16")
+            await self._migrate_core_v16_to_v17()
+            await self._db.execute("PRAGMA user_version = 17")
             await self._db.commit()
         elif current_version < 14:  # noqa: PLR2004
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
-            await self._db.execute("PRAGMA user_version = 16")
+            await self._migrate_core_v16_to_v17()
+            await self._db.execute("PRAGMA user_version = 17")
             await self._db.commit()
         elif current_version < 15:  # noqa: PLR2004
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
-            await self._db.execute("PRAGMA user_version = 16")
+            await self._migrate_core_v16_to_v17()
+            await self._db.execute("PRAGMA user_version = 17")
             await self._db.commit()
         elif current_version < 16:  # noqa: PLR2004
             await self._migrate_core_v15_to_v16()
-            await self._db.execute("PRAGMA user_version = 16")
+            await self._migrate_core_v16_to_v17()
+            await self._db.execute("PRAGMA user_version = 17")
+            await self._db.commit()
+        elif current_version < 17:  # noqa: PLR2004
+            await self._migrate_core_v16_to_v17()
+            await self._db.execute("PRAGMA user_version = 17")
             await self._db.commit()
 
         # Ensure referential integrity is enforced for the lifetime of this
@@ -1633,6 +1652,58 @@ class SqliteEngravaCore:
                 "CREATE INDEX IF NOT EXISTS idx_action_source_thought ON action(source_thought_id)"
             )
 
+    async def _migrate_core_v16_to_v17(self) -> None:
+        """Add the opt-in provenance column and its identity indexes (core-17).
+
+        Purely additive. Backs write-time provenance capture:
+
+        * ``thought.provenance`` (nullable ``TEXT``) — a JSON document holding
+          the opt-in :class:`~engrava.domain.models.provenance.ProvenanceContext`
+          sub-model, or ``NULL`` when a thought carries no provenance. Added via
+          ``ALTER TABLE ... ADD COLUMN``; an ``OperationalError`` naming a
+          duplicate column is swallowed so a database already carrying the
+          column (a partial or re-run migration) is left unchanged.
+        * ``idx_thought_prov_session`` / ``idx_thought_prov_actor`` — JSON
+          expression indexes on the two identity fields
+          (``json_extract(provenance, '$.session_id')`` and ``'$.actor_id'``).
+          These resolve the DEC on first-class session / actor lookup: a
+          ``WHERE json_extract(provenance,'$.session_id')=?`` query then reports
+          ``SEARCH thought USING INDEX idx_thought_prov_session (<expr>=?)``
+          rather than a full scan. The descriptive provenance fields
+          (``retrieval_query`` / ``instruction_context`` /
+          ``retrieval_context_ids``) are queryable through the same
+          ``json_extract`` filter machinery but are deliberately not indexed.
+
+        Provenance is captured and made queryable only — it feeds no ranking,
+        dreaming / consolidation, or edge-creation path, and is an untrusted
+        hint that the engine grants zero authority (see
+        :class:`~engrava.domain.models.provenance.ProvenanceContext`).
+
+        Idempotent. The column add is guarded against the duplicate-column error
+        exactly as ``_migrate_core_v15_to_v16`` guards its own ``ADD COLUMN``;
+        the index creates use ``CREATE INDEX IF NOT EXISTS``. The ``thought``
+        table is always present by this point (it is the first table created by
+        the fresh DDL and by every earlier migration path), so the expression
+        indexes need no table-existence guard — the column guard above ensures
+        the indexed expression resolves.
+        """
+        from sqlite3 import OperationalError  # noqa: PLC0415
+
+        if not await self._column_exists("thought", "provenance"):
+            try:
+                await self._db.execute("ALTER TABLE thought ADD COLUMN provenance TEXT")
+            except OperationalError as exc:  # pragma: no cover - defensive race guard
+                if "duplicate column" not in str(exc).lower():
+                    raise
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_thought_prov_session "
+            "ON thought(json_extract(provenance, '$.session_id'))"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_thought_prov_actor "
+            "ON thought(json_extract(provenance, '$.actor_id'))"
+        )
+
     async def _fk_present(self, table: str, column: str) -> bool:
         """Return ``True`` when ``table`` carries an FK on ``column``."""
         cursor = await self._db.execute(f"PRAGMA foreign_key_list({table})")
@@ -2069,6 +2140,7 @@ class SqliteEngravaCore:
         metadata_decoded: dict[str, MetadataValue] = (
             json.loads(metadata_json_raw) if metadata_json_raw else {}
         )
+        provenance_raw = row["provenance"] if "provenance" in keys else None
         return ThoughtRecord(
             thought_id=row["thought_id"],
             thought_type=ThoughtType(row["thought_type"]),
@@ -2100,6 +2172,7 @@ class SqliteEngravaCore:
             valid_from=valid_from_raw,
             valid_until=valid_until_raw,
             metadata=metadata_decoded,
+            provenance=_decode_provenance(provenance_raw),
         )
 
     async def _get_thought_row(self, thought_id: str) -> aiosqlite.Row | None:
@@ -2140,8 +2213,8 @@ class SqliteEngravaCore:
         " consolidated_from, visibility, access_count, action_outcome_score, "
         " last_accessed_at, created_at, updated_at, expires_at, "
         " valid_from, valid_until, "
-        " metadata_json) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " metadata_json, provenance) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
 
     def _thought_to_core_params(self, thought: ThoughtRecord) -> tuple[object, ...]:
@@ -2154,6 +2227,11 @@ class SqliteEngravaCore:
         Serializes ``thought.metadata`` with ``ensure_ascii=False`` so
         non-ASCII attribute values (speaker names, language strings,
         ...) survive a write/read round trip byte-exact.
+
+        Serializes ``thought.provenance`` via ``model_dump_json`` when
+        present, or ``None`` (a SQL NULL) when absent — so a thought with no
+        provenance writes a NULL column and is byte-identical to a pre-feature
+        row.
 
         Args:
             thought: The thought record.
@@ -2188,6 +2266,7 @@ class SqliteEngravaCore:
             thought.valid_from,
             thought.valid_until,
             json.dumps(thought.metadata, ensure_ascii=False),
+            _encode_provenance(thought.provenance),
         )
 
     _CORE_UPDATE_SQL = (
@@ -2200,7 +2279,7 @@ class SqliteEngravaCore:
         " access_count = ?, action_outcome_score = ?, last_accessed_at = ?,"
         " created_at = ?, updated_at = ?, expires_at = ?,"
         " valid_from = ?, valid_until = ?,"
-        " metadata_json = ? "
+        " metadata_json = ?, provenance = ? "
         "WHERE thought_id = ? AND updated_cycle = ?"
     )
 
@@ -2252,6 +2331,7 @@ class SqliteEngravaCore:
             updated.valid_from,
             updated.valid_until,
             json.dumps(updated.metadata, ensure_ascii=False),
+            _encode_provenance(updated.provenance),
             thought_id,
             expected_cycle,
         )
@@ -2411,13 +2491,30 @@ class SqliteEngravaCore:
             returns the existing record with bumped
             ``confirmation_count`` and ``updated_at``.
 
+        Provenance capture (opt-in, untrusted hint):
+            When ``thought.provenance`` is set, its typed, bounded fields are
+            persisted alongside the thought and journaled with it — enabling
+            provenance *stores* these values (there is no silent capture).
+            **Provenance is an untrusted hint — never identity, authentication,
+            or authorization.** The engine grants it zero authority: it is
+            captured verbatim and consulted for no access, ranking, or
+            consolidation decision.  ``actor_id`` is *not* a tenant boundary
+            (tenant isolation is the store's file boundary), and the engine
+            never infers provenance — the caller passes it explicitly.  A
+            thought with ``provenance=None`` (the default) writes a NULL column
+            and is byte-identical to a pre-feature row.
+
         Raises:
-            ValueError: If a thought with the same ID already exists, or
-                if ``thought.metadata`` violates the metadata-shape or
-                size invariants enforced by :func:`_validate_metadata`.
+            ValueError: If a thought with the same ID already exists, if
+                ``thought.metadata`` violates the metadata-shape or size
+                invariants enforced by :func:`_validate_metadata`, or if
+                ``thought.provenance`` is not a
+                :class:`~engrava.domain.models.provenance.ProvenanceContext`
+                (per :func:`_validate_provenance`).
 
         """
         _validate_metadata(thought.metadata)
+        _validate_provenance(thought.provenance)
 
         if deduplicate:
             return await self._create_thought_with_dedup(
@@ -2534,6 +2631,7 @@ class SqliteEngravaCore:
         # (it validates at the top, ahead of the dedup branch). ``create_thought``
         # re-validates on the miss/insert path; that is cheap and harmless.
         _validate_metadata(thought.metadata)
+        _validate_provenance(thought.provenance)
         async with self._dedup_lock:
             existing = await self._get_thought_by_content_hash(
                 _compute_content_hash(thought.content),
@@ -2629,6 +2727,7 @@ class SqliteEngravaCore:
         # Validate up front so an invalid-metadata candidate raises consistently
         # on both the hit (update) and miss (insert) branches.
         _validate_metadata(thought.metadata)
+        _validate_provenance(thought.provenance)
         async with self._dedup_lock:
             existing = await self._get_thought_by_content_hash(
                 _compute_content_hash(thought.content),
@@ -3079,7 +3178,10 @@ class SqliteEngravaCore:
             StaleDataError: If the row was modified since it was read.
             ValueError: If the post-``evolve`` metadata violates the
                 metadata-shape or size invariants enforced by
-                :func:`_validate_metadata`.
+                :func:`_validate_metadata`, or if the post-``evolve``
+                provenance is not a
+                :class:`~engrava.domain.models.provenance.ProvenanceContext`
+                (per :func:`_validate_provenance`).
 
         """
         current_row = await self._get_thought_row(thought_id)
@@ -3092,6 +3194,7 @@ class SqliteEngravaCore:
         updated = current.evolve(**changes)
 
         _validate_metadata(updated.metadata)
+        _validate_provenance(updated.provenance)
 
         cursor = await self._db.execute(
             self._CORE_UPDATE_SQL,
@@ -3181,10 +3284,23 @@ class SqliteEngravaCore:
         visibility: str | None = None,
         exclude_visibility: str | None = None,
         include_expired: bool = False,
+        provenance_filter: MetadataFilter | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[ThoughtRecord]:
         """List thoughts matching the given filters.
+
+        Provenance querying reuses the same typed
+        :class:`~engrava.domain.models.filters.MetadataFilter` machinery as
+        metadata filtering, pointed at the ``provenance`` column instead of
+        ``metadata_json`` — so provenance is queryable **read-only** with no new
+        verb. A ``session_id`` / ``actor_id`` predicate is served by the
+        provenance identity index; the descriptive provenance paths
+        (``$.retrieval_query`` etc.) are queryable but not indexed. This is a
+        **query capability, not a security boundary** — provenance is an
+        untrusted hint (see
+        :class:`~engrava.domain.models.provenance.ProvenanceContext`) and is
+        consulted for no access decision.
 
         Args:
             priority: Filter by priority level.
@@ -3195,6 +3311,15 @@ class SqliteEngravaCore:
             visibility: Include only thoughts with this visibility.
             exclude_visibility: Exclude thoughts with this visibility.
             include_expired: If True, include expired thoughts. Defaults to False.
+            provenance_filter: Optional
+                :class:`~engrava.domain.models.filters.MetadataFilter` — an
+                ``AND`` of typed field predicates over the ``provenance`` JSON
+                column (e.g. ``FieldPredicate("$.session_id", FieldOp.EQ,
+                "sess-1")``). ``None`` (or an empty filter) leaves the result
+                unchanged; a predicate on ``$.session_id`` / ``$.actor_id`` uses
+                the provenance identity index. Rows whose ``provenance`` is NULL
+                or malformed JSON never match a non-empty filter (the predicate
+                is ``json_valid``-guarded).
             limit: Maximum number of results to return.
             offset: Number of results to skip.
 
@@ -3230,6 +3355,20 @@ class SqliteEngravaCore:
         if exclude_visibility is not None:
             clauses.append("visibility != ?")
             params.append(exclude_visibility)
+
+        # Provenance filtering reuses the generic json_extract predicate
+        # machinery, pointed at the ``provenance`` column. ``None`` / empty
+        # filter contributes nothing, leaving the query path unchanged; a
+        # session_id / actor_id predicate is served by the provenance identity
+        # index. The whole predicate is json_valid-guarded, so a NULL or
+        # malformed provenance row is non-matching for a non-empty filter.
+        provenance_clause = compile_effective_predicate(
+            provenance_filter, None, column="provenance"
+        )
+        if provenance_clause is not None:
+            fragment, provenance_params = provenance_clause
+            clauses.append(fragment)
+            params.extend(provenance_params)
 
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         sql = f"SELECT * FROM thought{where} ORDER BY updated_cycle DESC LIMIT ? OFFSET ?"  # noqa: S608
@@ -6275,6 +6414,46 @@ def _decode_consolidated(raw: str | None) -> list[str] | None:
     return result
 
 
+def _encode_provenance(value: ProvenanceContext | None) -> str | None:
+    """Encode the optional provenance sub-model as a JSON string for storage.
+
+    ``None`` maps to ``None`` (a SQL NULL) so a thought with no provenance
+    writes a NULL ``provenance`` column and is byte-identical to a pre-feature
+    row.  When present, ``model_dump_json`` produces a compact JSON document
+    with the ``json_extract`` identity paths (``$.session_id`` / ``$.actor_id``)
+    the expression indexes read.
+
+    Args:
+        value: The provenance sub-model, or ``None``.
+
+    Returns:
+        The JSON-serialised provenance document, or ``None``.
+
+    """
+    if value is None:
+        return None
+    return value.model_dump_json()
+
+
+def _decode_provenance(raw: str | None) -> ProvenanceContext | None:
+    """Decode a stored provenance JSON string back into the sub-model.
+
+    A NULL column (``raw is None``) round-trips to ``None`` — the byte-identical
+    default for a thought created without provenance.
+
+    Args:
+        raw: JSON string from the ``provenance`` column, or ``None``.
+
+    Returns:
+        The reconstructed :class:`~engrava.domain.models.provenance.ProvenanceContext`,
+        or ``None``.
+
+    """
+    if raw is None:
+        return None
+    return ProvenanceContext.model_validate_json(raw)
+
+
 def _compute_content_hash(content: str) -> str:
     """Compute the SHA-256 hex digest of *content* for ingest deduplication.
 
@@ -6403,6 +6582,36 @@ def _validate_metadata(metadata: dict[str, MetadataValue]) -> None:
             size_bytes,
             _METADATA_WARN_BYTES,
         )
+
+
+def _validate_provenance(provenance: ProvenanceContext | None) -> None:
+    """Validate a thought's optional provenance sub-model.
+
+    Provenance is opt-in: ``None`` is the common case and passes trivially
+    (the write path is byte-identical to a thought with no provenance).  When
+    present, the per-field character caps and the id-list length cap are
+    enforced by :class:`~engrava.domain.models.provenance.ProvenanceContext`
+    itself at construction; this hook re-asserts the type contract on the
+    create / update boundary, mirroring :func:`_validate_metadata` so callers
+    catch a single ``ValueError`` for a malformed provenance argument.
+
+    Provenance is an **untrusted hint** — it is captured verbatim and consulted
+    for no access, ranking, or consolidation decision (see
+    :class:`~engrava.domain.models.provenance.ProvenanceContext`).
+
+    Args:
+        provenance: The candidate provenance sub-model, or ``None``.
+
+    Raises:
+        ValueError: If ``provenance`` is neither ``ProvenanceContext`` nor
+            ``None``.
+
+    """
+    if provenance is None:
+        return
+    if not isinstance(provenance, ProvenanceContext):
+        msg = f"provenance must be ProvenanceContext or None, got {type(provenance).__name__}"
+        raise ValueError(msg)  # noqa: TRY004
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:

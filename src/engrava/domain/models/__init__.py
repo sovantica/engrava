@@ -17,6 +17,7 @@ from engrava.domain.models.metrics import (
     StorageFootprint,
     ThoughtCounts,
 )
+from engrava.domain.models.provenance import ProvenanceContext
 from engrava.domain.models.search import HybridSearchResult
 from engrava.domain.models.thought import MetadataValue, ThoughtRecord
 from engrava.domain.models.ttl import CleanupResult, CleanupStrategy
@@ -36,6 +37,7 @@ __all__ = [
     "LatencyHistogram",
     "MetadataFilter",
     "MetadataValue",
+    "ProvenanceContext",
     "StorageFootprint",
     "ThoughtCounts",
     "ThoughtRecord",

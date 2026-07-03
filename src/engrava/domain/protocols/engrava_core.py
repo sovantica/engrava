@@ -267,6 +267,7 @@ class EngravaCoreProtocol(Protocol):
         visibility: str | None = None,
         exclude_visibility: str | None = None,
         include_expired: bool = False,
+        provenance_filter: MetadataFilter | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[ThoughtRecord]:
@@ -281,6 +282,12 @@ class EngravaCoreProtocol(Protocol):
             visibility: Include only thoughts with this visibility.
             exclude_visibility: Exclude thoughts with this visibility.
             include_expired: If True, include expired thoughts.
+            provenance_filter: Optional typed ``AND`` filter over the
+                ``provenance`` JSON column (read-only; reuses the metadata
+                filter machinery). ``None`` leaves the result unchanged. A
+                ``session_id`` / ``actor_id`` predicate uses the provenance
+                identity index. Provenance is an untrusted hint, not a security
+                boundary.
             limit: Maximum number of results to return.
             offset: Number of results to skip.
 

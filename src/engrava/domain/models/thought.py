@@ -24,6 +24,7 @@ from engrava.domain.enums import (
 )
 from engrava.domain.exceptions import InvalidTransitionError
 from engrava.domain.models._temporal import validate_iso8601_nullable
+from engrava.domain.models.provenance import ProvenanceContext
 
 #: Allowed value types for ``ThoughtRecord.metadata`` entries.
 #:
@@ -97,6 +98,16 @@ class ThoughtRecord(BaseModel):
             ``metadata["source"] = {"is_self": True, "confidence":
             "high", ...}``).  Lists and other rich containers are
             rejected at write time.  Defaults to an empty dict.
+        provenance: Optional :class:`~engrava.domain.models.provenance.ProvenanceContext`
+            capturing write-time provenance signals that are irrecoverable
+            once the thought is stored (the retrieval query / instruction
+            context that shaped a synthesis, the retrieved source-thought ids,
+            and the session / actor the thought was produced under).  ``None``
+            by default; when ``None`` the thought is byte-identical to one
+            created before provenance existed.  **Provenance is an untrusted
+            hint, never identity, authentication, or authorization** — the
+            engine grants it zero authority and consults it for no access,
+            ranking, or consolidation decision.
 
     Examples:
         >>> thought = ThoughtRecord(
@@ -141,6 +152,7 @@ class ThoughtRecord(BaseModel):
     valid_from: str | None = None
     valid_until: str | None = None
     metadata: dict[str, MetadataValue] = Field(default_factory=dict)
+    provenance: ProvenanceContext | None = Field(default=None)
 
     @model_validator(mode="after")
     def _validate_cycle_ordering(self) -> Self:

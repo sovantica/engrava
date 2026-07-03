@@ -62,6 +62,7 @@ from engrava.domain.models.metrics import (
     ThoughtCounts,
 )
 from engrava.domain.models.mutation_type import MutationType
+from engrava.domain.models.provenance import ProvenanceContext
 from engrava.domain.models.search import HybridSearchResult
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.domain.models.thought import ThoughtRecord as CoreThoughtRecord
@@ -174,6 +175,7 @@ __all__ = [
     "OllamaProvider",
     "OpenAICompatibleProvider",
     "Priority",
+    "ProvenanceContext",
     "ReadOnlyEngrava",
     "ReadOnlyMindStore",
     "ReadOnlyViolationError",

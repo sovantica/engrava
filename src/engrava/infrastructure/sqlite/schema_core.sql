@@ -1,12 +1,16 @@
 -- engrava: Core thought-graph schema (free-tier boundary — no internal-cognitive columns).
--- Version: core-16 (denormalised thought.action_outcome_score aggregate + the
---          idx_action_source_thought seek index that backs its recompute;
+-- Version: core-17 (opt-in thought.provenance capture column + the two JSON
+--          expression indexes idx_thought_prov_session / idx_thought_prov_actor
+--          on its identity fields; provenance is captured and queryable only —
+--          it feeds no ranking / dreaming / edge path;
+--          core-16 added the denormalised thought.action_outcome_score aggregate
+--          + the idx_action_source_thought seek index that backs its recompute;
 --          core-15 added the composite inbound edge index
 --          edge(edge_type, to_thought_id) for edge-type-scoped inbound lookups;
 --          core-14 added the hot-path indexes edge.to_thought_id,
 --          embedding.owner_id, thought.updated_cycle, thought.thought_type)
 
-PRAGMA user_version = 16;
+PRAGMA user_version = 17;
 
 CREATE TABLE IF NOT EXISTS thought (
     thought_id        TEXT    PRIMARY KEY,
@@ -39,7 +43,16 @@ CREATE TABLE IF NOT EXISTS thought (
     -- Denormalised action-outcome aggregate (core-16). Mean outcome value over
     -- the thought's terminal linked actions, or NULL when it has none. Appended
     -- last for the same column-order parity as the valid-time columns above.
-    action_outcome_score REAL
+    action_outcome_score REAL,
+    -- Opt-in write-time provenance capture (core-17). A JSON document holding
+    -- the ProvenanceContext sub-model (session_id / actor_id identity +
+    -- retrieval_query / instruction_context / retrieval_context_ids synthesis
+    -- context), or NULL when a thought carries no provenance — a NULL column is
+    -- byte-identical to a pre-core-17 row. Appended last for the same
+    -- column-order parity as the columns above. Provenance is an untrusted hint
+    -- granted zero authority: it is captured and made queryable only and feeds
+    -- no ranking / dreaming / edge-creation path.
+    provenance        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS edge (
@@ -269,3 +282,23 @@ CREATE INDEX IF NOT EXISTS idx_edge_type_to ON edge(edge_type, to_thought_id);
 -- place, so it is declared here as well as in the migration helper.
 
 CREATE INDEX IF NOT EXISTS idx_action_source_thought ON action(source_thought_id);
+
+-- -------------------------------------------------------------------
+-- Provenance identity indexes (core-17)
+-- -------------------------------------------------------------------
+-- JSON expression indexes on the two first-class identity fields of the opt-in
+-- provenance sub-model. They make session / actor lookup a seek rather than a
+-- full scan:
+--   SELECT ... FROM thought WHERE json_extract(provenance,'$.session_id') = ?
+-- EXPLAIN QUERY PLAN then reports
+--   SEARCH thought USING INDEX idx_thought_prov_session (<expr>=?).
+-- The descriptive provenance fields (retrieval_query / instruction_context /
+-- retrieval_context_ids) are queryable through the same json_extract filter
+-- machinery but are deliberately not indexed. A fresh-bootstrap database must
+-- carry the same indexes as one upgraded in place, so they are declared here as
+-- well as in the migration helper.
+
+CREATE INDEX IF NOT EXISTS idx_thought_prov_session
+    ON thought(json_extract(provenance, '$.session_id'));
+CREATE INDEX IF NOT EXISTS idx_thought_prov_actor
+    ON thought(json_extract(provenance, '$.actor_id'));
