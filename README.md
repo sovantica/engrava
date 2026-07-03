@@ -181,9 +181,9 @@ evidence (synthetic benchmark suite runnable in ~5 minutes).
 ### Tamper-Evident Thought/Edge Journal
 
 Opt-in hash-chain **journal** that records thought and edge mutations (plus
-action state-transitions) as SHA-256-linked, before/after entries — a
-tamper-evident thought/edge journal, **not** a whole-database audit (embeddings
-and action *creation* are not covered). Off by default, one config flag to
+action `status`/`verification_status` transitions) as SHA-256-linked, before/after
+entries — a tamper-evident thought/edge journal, **not** a whole-database audit
+(embeddings and action *creation* are not covered). Off by default, one config flag to
 enable. Query history with `store.journal.get_entries(...)` and validate the
 chain with `store.journal.verify_integrity()`.
 

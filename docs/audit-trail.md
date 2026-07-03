@@ -3,10 +3,10 @@
 Engrava can record changes to your thought-graph in an append-only,
 hash-linked **journal** — a **tamper-evident thought/edge journal** (not a
 whole-database audit). Each entry captures one mutation — insert / update /
-delete of a **thought** or **edge**, or an **action state-transition** — as a
-before/after delta, cryptographically chained to the previous entry with
-SHA-256. See [What gets recorded](#what-gets-recorded) for the exact scope
-(embeddings and action *creation* are not covered).
+delete of a **thought** or **edge**, or an **action `status`/`verification_status`
+transition** — as a before/after delta, cryptographically chained to the previous
+entry with SHA-256. See [What gets recorded](#what-gets-recorded) for the exact
+scope (embeddings and action *creation* are not covered).
 
 > **Read the [Security model](#security-model--guarantees) before relying on this
 > for compliance.** The chain detects accidental corruption and naive edits, but
@@ -55,10 +55,10 @@ journal-specific code.
 ## What gets recorded
 
 When journaling is enabled, the store records a journal entry **automatically**
-on every mutation of a thought or an edge — you do not call the journal
-yourself. The recorded `mutation_type` values (the `MutationType` enum) are:
+on every mutation of a thought or edge — and on an action state-transition — you
+do not call the journal yourself. The recorded `mutation_type` values are:
 
-| `MutationType` | When |
+| `mutation_type` | When |
 |---|---|
 | `INSERT_THOUGHT` | `create_thought()` |
 | `UPDATE_THOUGHT` | `update_thought()` |
@@ -66,7 +66,12 @@ yourself. The recorded `mutation_type` values (the `MutationType` enum) are:
 | `INSERT_EDGE` | `create_edge()` |
 | `UPDATE_EDGE` | `update_edge()` |
 | `DELETE_EDGE` | `delete_edge()` (only when a row was actually deleted) |
-| `UPDATE_ACTION` | `update_action()` — an action's `status` / `verification_status` transition |
+| `UPDATE_ACTION` | `update_action()` — only when an action's `status` / `verification_status` actually changes |
+
+> The first six values are members of the `MutationType` enum; `UPDATE_ACTION` is
+> a stored `mutation_type` **string** emitted by `update_action()` — the enum
+> itself is not extended. `mutation_type` is a free-text column, so verification
+> covers the entry regardless.
 
 Each entry's `delta` is a `{"before": ..., "after": ...}` dictionary: inserts
 have `before: null`, deletes have `after: null`, and updates carry both sides.
