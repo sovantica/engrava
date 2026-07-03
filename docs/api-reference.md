@@ -108,8 +108,65 @@ stored = await store.create_thought(record)
 | `limit` | `int` | Max results (`list_thoughts` only; default `50`) |
 | `offset` | `int` | Results to skip (`list_thoughts` only; default `0`) |
 
-> `list_thoughts` also supports `min_cycle`, `max_cycle`, `visibility`, and
-> `exclude_visibility`.
+> `list_thoughts` also supports `min_cycle`, `max_cycle`, `visibility`,
+> `exclude_visibility`, and `provenance_filter` (see
+> [Provenance capture](#provenance-capture)).
+
+##### Provenance capture
+
+Attach optional, typed write-time **provenance** to a thought — the signals that
+become irrecoverable once a synthesised thought exists (which session/actor
+produced it, what query and instruction shaped it, which thoughts it was built
+from). Set `ThoughtRecord.provenance` to a `ProvenanceContext` before
+`create_thought`; every field is optional and bounded, and the default `None` is
+byte-identical to not using provenance at all.
+
+```python
+from engrava.domain.models.provenance import ProvenanceContext
+
+record = ThoughtRecord(
+    # ... the usual fields ...
+    provenance=ProvenanceContext(
+        session_id="sess-42",                              # indexed identity hint
+        actor_id="agent-a",                                # indexed identity hint
+        retrieval_query="remote work trade-offs",          # ≤4096 chars
+        instruction_context="summarise for a busy exec",   # ≤4096 chars
+        retrieval_context_ids=["t-1", "t-2"],              # ≤128 ids, ≤256 chars each
+    ),
+)
+await store.create_thought(record)
+```
+
+| `ProvenanceContext` field | Type | Notes |
+|---|---|---|
+| `session_id` | `str \| None` | Session handle. **Indexed** for lookup. ≤256 chars |
+| `actor_id` | `str \| None` | Actor/agent handle. **Indexed**. ≤256 chars |
+| `retrieval_query` | `str \| None` | Query text that retrieved the feeding context. ≤4096 chars |
+| `instruction_context` | `str \| None` | Instruction / system-prompt fragment. ≤4096 chars |
+| `retrieval_context_ids` | `list[str] \| None` | Source thought ids. Queryable, not indexed. ≤128 × ≤256 chars |
+
+**Query by provenance.** `list_thoughts(provenance_filter=...)` takes a
+`MetadataFilter` — an `AND` of `FieldPredicate`s over the `provenance` JSON
+column. Predicates on `$.session_id` / `$.actor_id` use the provenance identity
+index; rows whose `provenance` is `NULL` or malformed JSON never match a
+non-empty filter.
+
+```python
+from engrava.domain.models.filters import FieldOp, FieldPredicate, MetadataFilter
+
+mine = await store.list_thoughts(
+    provenance_filter=MetadataFilter(
+        [FieldPredicate("$.session_id", FieldOp.EQ, "sess-42")]
+    ),
+)
+```
+
+> **Untrusted hint — never identity, authentication, or authorization.**
+> Provenance is descriptive-only: the engine grants it zero authority and
+> consults it for no access, ranking, or consolidation decision. `actor_id` is
+> **not** a tenant boundary — tenant isolation is the store's file boundary (one
+> store per tenant). The engine never infers provenance; the caller passes it
+> explicitly.
 
 #### Edge CRUD
 
