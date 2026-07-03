@@ -23,6 +23,7 @@ from engrava.extensions.dreaming_signals import (
     DEFAULT_SIGNALS,
     DreamingContext,
     DreamingSignalProtocol,
+    default_signal_active,
 )
 from engrava.infrastructure.sqlite.centroid import (
     CENTROID_MODEL_NAME,
@@ -77,6 +78,18 @@ class ConsolidationResult:
             (transitioned ACTIVE -> ARCHIVED) during this run because every
             one of their consolidated source thoughts had left the active
             set.
+        active_signal_weights: The **effective** per-signal weights used to
+            score this run — the configured weights after inactive
+            (structurally flat) signals have been dropped and their weight
+            redistributed onto the active signals (renormalised to sum to
+            ``1.0``; all-zero when no signal is active). A signal name absent
+            from this mapping, or mapped to ``0.0``, contributed nothing to
+            the promotion score this run. This is the programmatic companion
+            to the per-signal INFO log line.
+        flat_signals: Names of configured signals that were **inactive** this
+            run — their data source produced the same default value for every
+            candidate, so they carried no ranking information and their weight
+            was redistributed. Sorted for stable output.
 
     Examples:
         >>> r = ConsolidationResult(
@@ -102,6 +115,10 @@ class ConsolidationResult:
     """Fraction of total corpus at priority P1 after this consolidation run."""
     orphans_retired: int = 0
     """Number of orphaned REFLECTIONs retired (ACTIVE -> ARCHIVED) this run."""
+    active_signal_weights: dict[str, float] = field(default_factory=dict)
+    """Effective per-signal weights after inactive-signal redistribution."""
+    flat_signals: list[str] = field(default_factory=list)
+    """Configured signals that were structurally flat (no data source) this run."""
 
 
 # ------------------------------------------------------------------
@@ -226,7 +243,28 @@ class DreamingExtension:
             total_thoughts=len(candidates),
         )
 
+        # --- Reachable scoring: active-signal weight redistribution ---
+        # Computed ONCE over the candidate pool (pool-relative, not
+        # per-thought). Flat signals (no data source this run) contribute 0
+        # and their weight redistributes onto the active signals, mirroring
+        # the hybrid-search precedent ``_redistribute_hybrid_weights``.
+        active_weights, flat_signals = self._compute_active_weights(
+            candidates,
+            current_cycle=current_cycle,
+        )
+        if flat_signals:
+            logger.info(
+                "Dreaming scoring: %d signal(s) structurally flat this run (no data "
+                "source) — weight redistributed onto active signals: %s",
+                len(flat_signals),
+                flat_signals,
+            )
+
         # --- compute available P1 slots under fraction cap ---
+        # Population-level cap: ``current_p1_count`` is the existing P1
+        # population in the store, so ``available_slots`` already accounts for
+        # every P1 promoted by prior runs — repeated cycles cannot push the P1
+        # population past ``max_p1_fraction`` of the total.
         total_thoughts = await store.count_thoughts()
         current_p1_count = await store.count_thoughts(priority="P1")
         max_p1_count = max(1, int(total_thoughts * self._config.max_p1_fraction))
@@ -248,6 +286,7 @@ class DreamingExtension:
             current_cycle=current_cycle,
             available_slots=available_slots,
             promote_type_filter=self._build_promote_type_filter(),
+            active_weights=active_weights,
         )
 
         p1_fraction_after = (
@@ -307,6 +346,8 @@ class DreamingExtension:
             promotion_capped=promotion_capped,
             p1_fraction_after=p1_fraction_after,
             orphans_retired=orphans_retired,
+            active_signal_weights=active_weights,
+            flat_signals=flat_signals,
         )
 
     async def _sweep_orphan_reflections(self, store: SqliteEngravaCore) -> int:
@@ -396,6 +437,81 @@ class DreamingExtension:
 
         return retired
 
+    def _compute_active_weights(
+        self,
+        candidates: list[ThoughtRecord],
+        *,
+        current_cycle: int,
+    ) -> tuple[dict[str, float], list[str]]:
+        """Compute the redistributed per-signal weights for this run.
+
+        The promotion score is a **weighted average over the signals active
+        for the run**. A signal is active when its data source yields a
+        non-default value for at least one candidate in the pool (see
+        :func:`~engrava.extensions.dreaming_signals.default_signal_active`);
+        an inactive signal contributes the same constant to every candidate
+        and so carries no ranking information. This mirrors the hybrid-search
+        precedent ``_redistribute_hybrid_weights``: the configured weights of
+        the inactive signals are dropped and the remainder renormalised over
+        the active set, so flat signals fall out of the denominator instead of
+        dragging every score toward a constant.
+
+        Custom signals (registered via ``custom_signals``) have no
+        introspectable data source, so they are always treated as active — the
+        operator opted into them deliberately.
+
+        **Degenerate guard.** When no signal is active the returned weights are
+        all zero, so every score is ``0.0`` and nothing promotes — the exact
+        analogue of the precedent's ``active_weight == 0 -> zeros`` branch.
+
+        **Pool-relative, once per run.** Activeness is decided over the whole
+        candidate pool a single time; it is never recomputed per thought (a
+        per-thought active set would let one thought's data presence
+        over-promote thoughts that lack it).
+
+        Args:
+            candidates: The candidate pool for this consolidation run.
+            current_cycle: The run's cycle number (drives the cycle-based
+                ``recency`` / ``staleness`` activeness).
+
+        Returns:
+            A ``(weights, flat_signals)`` pair. ``weights`` maps every
+            configured signal name to its effective (renormalised) weight —
+            ``0.0`` for inactive signals; the active entries sum to ``1.0``
+            unless no signal is active (all-zero). ``flat_signals`` is the
+            sorted list of configured signals found inactive this run.
+
+        """
+        active_names: list[str] = []
+        flat_signals: list[str] = []
+        for name in self._signals:
+            if name in DEFAULT_SIGNALS:
+                is_active = default_signal_active(
+                    name,
+                    candidates,
+                    current_cycle=current_cycle,
+                    access_tracking_enabled=self._config.access_tracking_enabled,
+                )
+            else:
+                # Custom signal — no introspectable data source; treat as active.
+                is_active = True
+            if is_active:
+                active_names.append(name)
+            else:
+                flat_signals.append(name)
+
+        active_weight = sum(self._signals[name][1] for name in active_names)
+        if active_weight == 0.0:
+            # No active signal (or all active weights zero) -> nothing promotes.
+            weights = dict.fromkeys(self._signals, 0.0)
+            return weights, sorted(flat_signals)
+
+        weights = {
+            name: (self._signals[name][1] / active_weight if name in active_names else 0.0)
+            for name in self._signals
+        }
+        return weights, sorted(flat_signals)
+
     async def _apply_promotions(
         self,
         store: SqliteEngravaCore,
@@ -404,6 +520,7 @@ class DreamingExtension:
         current_cycle: int,
         available_slots: int,
         promote_type_filter: frozenset[object],
+        active_weights: dict[str, float],
     ) -> tuple[list[str], dict[str, float], int, bool]:
         """Score candidates and promote qualifying thoughts to P1.
 
@@ -418,6 +535,9 @@ class DreamingExtension:
             available_slots: Maximum number of new P1 promotions allowed.
             promote_type_filter: Frozenset of ``ThoughtType`` values eligible
                 for promotion (``promote_targets``).
+            active_weights: Redistributed per-signal weights for this run (see
+                :meth:`_compute_active_weights`), applied by
+                :meth:`_compute_score`.
 
         Returns:
             Tuple of ``(promoted_ids, scores, skipped_gate_count, promotion_capped)``.
@@ -430,7 +550,7 @@ class DreamingExtension:
         filtered_metadata = 0
 
         for thought in candidates:
-            score = self._compute_score(thought, ctx)
+            score = self._compute_score(thought, ctx, active_weights)
             scores[thought.thought_id] = score
 
             if not self._passes_gates(thought, current_cycle):
@@ -472,19 +592,47 @@ class DreamingExtension:
 
         return promoted, scores, skipped_gate, promotion_capped
 
-    def _compute_score(self, thought: ThoughtRecord, ctx: DreamingContext) -> float:
-        """Compute the weighted sum of all signal scores.
+    def _compute_score(
+        self,
+        thought: ThoughtRecord,
+        ctx: DreamingContext,
+        active_weights: dict[str, float] | None = None,
+    ) -> float:
+        """Compute the promotion score as a weighted average over the signals.
+
+        When ``active_weights`` is provided (the consolidation path always
+        passes it), the score is the weighted average over the signals **active
+        for the run** — inactive signals contribute ``0.0`` and their weight
+        has already been redistributed onto the active ones by
+        :meth:`_compute_active_weights`, so the effective weights sum to
+        ``1.0`` (all-zero when no signal is active, giving a ``0.0`` score that
+        promotes nothing). This is the reachable default scoring: a flat signal
+        no longer drags every score toward a constant.
+
+        When ``active_weights`` is ``None`` (direct callers / unit tests) the
+        raw configured weights are used unchanged — the historical weighted
+        sum. **This compatibility path reproduces the pre-fix, arithmetically
+        unreachable scoring** (a structurally-flat signal still consumes its
+        weight); it exists only for direct/legacy callers. The consolidation
+        path MUST pass the redistributed ``active_weights`` from
+        :meth:`_compute_active_weights` — it is the only production caller and
+        always does. Do not add a new production caller that omits them.
 
         Args:
             thought: The thought to score.
             ctx: Consolidation context.
+            active_weights: Effective per-signal weights for this run, or
+                ``None`` to use the raw configured weights.
 
         Returns:
             Weighted score (typically in ``[0.0, 1.0]``).
 
         """
         total = 0.0
-        for signal_fn, weight in self._signals.values():
+        for name, (signal_fn, raw_weight) in self._signals.items():
+            weight = raw_weight if active_weights is None else active_weights.get(name, 0.0)
+            if weight == 0.0:
+                continue
             total += signal_fn(thought, ctx) * weight
         return total
 

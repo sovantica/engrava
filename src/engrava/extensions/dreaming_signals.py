@@ -310,3 +310,52 @@ DEFAULT_SIGNALS: dict[str, type] = {
     "frequency": FrequencySignal,
 }
 """Registry mapping signal names to their default factory classes."""
+
+
+def default_signal_active(
+    name: str,
+    candidates: list[ThoughtRecord],
+    *,
+    current_cycle: int | None,
+    access_tracking_enabled: bool,
+) -> bool:
+    """Report whether a default signal has a data source for this run.
+
+    A signal is **active for a consolidation run** when its underlying data
+    source yields a non-default value for at least one candidate in the pool.
+    An inactive (structurally flat) signal contributes the same constant to
+    every candidate, so it carries no ranking information — its weight is
+    redistributed onto the active signals (see
+    :meth:`DreamingExtension._compute_active_weights`).
+
+    The predicate is **pool-relative and evaluated once per run**, never
+    per-thought: a per-thought active set would let a single thought's data
+    presence over-promote thoughts that lack it.
+
+    Args:
+        name: Default-signal name (one of :data:`DEFAULT_SIGNALS`).
+        candidates: The candidate pool for this consolidation run.
+        current_cycle: The run's cycle number, or ``None`` when the caller
+            did not supply one (cycle-based signals are then inactive).
+        access_tracking_enabled: Whether access tracking is enabled; the
+            ``frequency`` signal can only be active when it is.
+
+    Returns:
+        ``True`` when the named default signal is active for this run.
+
+    Raises:
+        KeyError: If ``name`` is not a recognised default signal.
+
+    """
+    if name not in DEFAULT_SIGNALS:
+        msg = f"not a default signal: {name!r}"
+        raise KeyError(msg)
+    if name in ("recency", "staleness"):
+        # Cycle-based decay/span — meaningful only with a run cycle.
+        return current_cycle is not None
+    if name == "confirmation":
+        return any(t.confirmation_count > 0 for t in candidates)
+    if name == "confidence":
+        return any(t.confidence is not None for t in candidates)
+    # frequency
+    return access_tracking_enabled and any(t.access_count > 0 for t in candidates)

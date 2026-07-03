@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     from engrava.domain.models.search import HybridSearchResult
     from engrava.domain.protocols.embedding_provider import EmbeddingProviderProtocol
     from engrava.domain.protocols.hooks import MindQLExtension
+    from engrava.extensions.dreaming import ConsolidationResult, DreamingExtension
     from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
     from engrava.mindql.executor import MindQLResult
     from engrava.mindql.parser import MindQLQuery
@@ -319,6 +320,94 @@ class _LatencyRingBuffer:
         )
 
 
+#: Default hard cap on the number of *distinct* thought ids the in-process
+#: access buffer holds before it evicts. The buffer is deliberately small — it
+#: only bridges reads to the next consolidation-cycle flush, and the counts are
+#: regenerable telemetry — so a modest cap bounds memory without losing
+#: material signal (a genuinely hot thought is re-accessed and re-buffered after
+#: an eviction). Deterministic FIFO eviction keeps behaviour reproducible.
+_ACCESS_BUFFER_DEFAULT_CAP = 10_000
+
+
+class _AccessBuffer:
+    """Bounded, instance-scoped buffer of pending thought-access deltas.
+
+    Retrieval paths append an access event here instead of issuing a
+    per-result ``UPDATE`` on the hot read path (which would turn a read into a
+    write). The buffer coalesces repeated accesses of the same thought into a
+    single ``(count_delta, last_seen_ts)`` entry and is drained by a single
+    batched ``UPDATE`` at the consolidation-cycle boundary (and on an explicit
+    flush or store close).
+
+    **Bounded with deterministic eviction.** At most ``cap`` distinct thought
+    ids are held. When a *new* id would exceed the cap, the oldest-inserted id
+    is evicted (FIFO) and the eviction is logged. Coalescing an access into an
+    id already in the buffer never triggers eviction.
+
+    **Single-writer scoped.** The buffer holds no lock: it is owned by one
+    store instance and, like every deferred-write path in the store, assumes a
+    single writer drives that instance (the documented concurrency contract).
+
+    Access counts are high-volume regenerable telemetry: they are **not**
+    journaled, and a crash before a flush simply undercounts — the signal
+    self-heals as access continues.
+
+    Args:
+        cap: Maximum number of distinct thought ids retained before eviction.
+
+    """
+
+    def __init__(self, cap: int = _ACCESS_BUFFER_DEFAULT_CAP) -> None:
+        self._cap = max(1, cap)
+        # Insertion-ordered so eviction is a deterministic FIFO pop.
+        self._pending: dict[str, tuple[int, str]] = {}
+        self._evicted_total = 0
+
+    def __len__(self) -> int:
+        return len(self._pending)
+
+    def record(self, thought_id: str, *, now: str) -> None:
+        """Buffer one access to ``thought_id`` seen at ``now``.
+
+        Coalesces into an existing entry (incrementing its delta and advancing
+        the last-seen timestamp) or inserts a new entry, evicting the
+        oldest-inserted id first when the cap would be exceeded.
+
+        Args:
+            thought_id: The retrieved thought's id.
+            now: ISO-8601 timestamp of this access.
+
+        """
+        existing = self._pending.get(thought_id)
+        if existing is not None:
+            self._pending[thought_id] = (existing[0] + 1, now)
+            return
+        if len(self._pending) >= self._cap:
+            evicted_id, _ = next(iter(self._pending.items()))
+            del self._pending[evicted_id]
+            self._evicted_total += 1
+            logger.warning(
+                "access buffer full (cap=%d); evicted pending access for thought %s "
+                "(%d evicted since open) — access counts are best-effort telemetry",
+                self._cap,
+                evicted_id,
+                self._evicted_total,
+            )
+        self._pending[thought_id] = (1, now)
+
+    def drain(self) -> list[tuple[str, int, str]]:
+        """Empty the buffer, returning ``(thought_id, count_delta, last_seen)``.
+
+        Returns:
+            The pending deltas as a list; the buffer is cleared. An empty list
+            when nothing was buffered.
+
+        """
+        drained = [(tid, delta, ts) for tid, (delta, ts) in self._pending.items()]
+        self._pending.clear()
+        return drained
+
+
 class SqliteEngravaCore:
     """Core SQLite persistence backend for thought-graph CRUD.
 
@@ -373,6 +462,7 @@ class SqliteEngravaCore:
         ttl_default_seconds: int | None = None,
         metrics_config: MetricsConfig | None = None,
         manifests: Sequence[ExtensionManifest] = (),
+        access_tracking_enabled: bool = False,
     ) -> None:
         self._db = db
         self._hooks: EngravaHooksProtocol = hooks or DefaultEngravaHooks()
@@ -412,6 +502,23 @@ class SqliteEngravaCore:
         self._dedup_lock: asyncio.Lock = asyncio.Lock()
         # Fires the recency-off nudge in ``recall`` at most once per instance.
         self._recency_nudge_emitted: bool = False
+        # Live access substrate (feeds the dreaming ``frequency`` signal).
+        # When enabled, retrieval paths buffer access events here — O(1), no DB
+        # write on the read path — and the buffer is flushed in one batched
+        # UPDATE at the consolidation-cycle boundary (and on explicit flush /
+        # close). Off by default; ``from_config`` turns it on when
+        # ``dreaming.enabled`` and ``dreaming.access_tracking_enabled``.
+        self._access_tracking_enabled: bool = access_tracking_enabled
+        self._access_buffer: _AccessBuffer = _AccessBuffer()
+        # Suppresses access buffering for reads issued *by* consolidation
+        # itself (its candidate scans / reflection-member resolution). Those
+        # are internal machinery, not caller retrievals, so they must not feed
+        # the frequency signal. Set only inside ``suppress_access_tracking``.
+        self._suppress_access_tracking: bool = False
+        # The dreaming extension, wired by ``from_config`` when dreaming is
+        # enabled so ``consolidate()`` can run a cycle without the caller
+        # constructing it. ``None`` for a manually-built store or dreaming-off.
+        self._dreaming_extension: DreamingExtension | None = None
 
     @property
     def journal(self) -> JournalWriter | None:
@@ -608,6 +715,16 @@ class SqliteEngravaCore:
                 discover=config.extension_discover,
             )
 
+            # Access tracking feeds the dreaming ``frequency`` signal. It is on
+            # only when dreaming is enabled AND its ``access_tracking_enabled``
+            # flag is set (the default). With dreaming off, tracking stays off,
+            # so the retrieval and scoring paths are byte-identical to today.
+            access_tracking_enabled = (
+                config.dreaming is not None
+                and config.dreaming.enabled
+                and config.dreaming.access_tracking_enabled
+            )
+
             store = cls(
                 db,
                 hooks=hooks,
@@ -621,8 +738,21 @@ class SqliteEngravaCore:
                 ttl_default_seconds=config.ttl.default_ttl_seconds,
                 metrics_config=config.metrics,
                 manifests=manifests,
+                access_tracking_enabled=access_tracking_enabled,
             )
             store._owns_connection = True
+
+            # Wire the dreaming extension when enabled so a YAML-only user can
+            # run a consolidation cycle via ``store.consolidate(...)`` without
+            # constructing ``DreamingExtension`` by hand. Off by default ⇒ no
+            # extension is built and dreaming never runs.
+            if config.dreaming is not None and config.dreaming.enabled:
+                from engrava.extensions.dreaming import (  # noqa: PLC0415
+                    DreamingExtension,
+                )
+
+                store._dreaming_extension = DreamingExtension(config=config.dreaming)
+
             await store.ensure_schema()
 
             # Opt-in on-open integrity check. Runs only when explicitly
@@ -653,9 +783,16 @@ class SqliteEngravaCore:
     async def close(self) -> None:
         """Close the database connection if owned by this instance.
 
-        No-op when the connection is caller-managed (i.e. created via
-        the manual constructor).
+        Flushes any pending access-buffer events first (best-effort — a flush
+        failure never blocks the close), then closes the connection when this
+        instance owns it. No-op on the connection when it is caller-managed
+        (i.e. created via the manual constructor).
         """
+        if self._access_tracking_enabled:
+            try:
+                await self.flush_access_buffer()
+            except Exception:  # noqa: BLE001
+                logger.debug("access-buffer flush on close failed; counts are best-effort")
         if self._owns_connection:
             await self._db.close()
 
@@ -1704,6 +1841,28 @@ class SqliteEngravaCore:
     # ------------------------------------------------------------------
     # Transaction control
     # ------------------------------------------------------------------
+
+    @contextlib.asynccontextmanager
+    async def suppress_access_tracking(self) -> AsyncIterator[None]:
+        """Context manager that suppresses access buffering for reads inside it.
+
+        Reads that a component issues as internal machinery — dreaming's own
+        candidate scans and reflection-member resolution — are not caller
+        retrievals and must not feed the ``frequency`` signal. Wrapping those
+        reads in this block keeps them out of the access buffer. No effect when
+        access tracking is disabled; restores the prior state on exit even on
+        error.
+
+        Yields:
+            None — access buffering is suppressed for the duration of the block.
+
+        """
+        previous = self._suppress_access_tracking
+        self._suppress_access_tracking = True
+        try:
+            yield
+        finally:
+            self._suppress_access_tracking = previous
 
     @contextlib.asynccontextmanager
     async def suspend_auto_commit(self) -> AsyncIterator[None]:
@@ -2760,6 +2919,7 @@ class SqliteEngravaCore:
         row = await self._get_thought_row(thought_id)
         if row is None:
             return None
+        self._buffer_accesses([thought_id])
         return await self._hooks.on_retrieve(self._row_to_thought(row))
 
     async def update_thought(self, thought_id: str, **changes: object) -> ThoughtRecord:
@@ -4925,6 +5085,7 @@ class SqliteEngravaCore:
 
             await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
 
+            self._buffer_accesses([tid for tid, _ in fallback])
             return HybridSearchResult(
                 results=fallback,
                 backends_used=frozenset(backends_used),
@@ -5140,6 +5301,7 @@ class SqliteEngravaCore:
 
         await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
 
+        self._buffer_accesses([tid for tid, _ in final])
         return HybridSearchResult(
             results=final,
             backends_used=frozenset(backends_used),
@@ -5258,6 +5420,7 @@ class SqliteEngravaCore:
         if effective_vector is None:
             # No scoring available — return unranked, capped at top_k
             await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
+            self._buffer_accesses(reflection_ids[:top_k])
             return HybridSearchResult(
                 results=[(rid, 0.0) for rid in reflection_ids[:top_k]],
                 backends_used=frozenset(),
@@ -5267,6 +5430,7 @@ class SqliteEngravaCore:
         q_norm = math.sqrt(sum(x * x for x in effective_vector))
         if q_norm == 0.0:
             await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
+            self._buffer_accesses(reflection_ids[:top_k])
             return HybridSearchResult(
                 results=[(rid, 0.0) for rid in reflection_ids[:top_k]],
                 backends_used=frozenset({"vector"}),
@@ -5314,8 +5478,10 @@ class SqliteEngravaCore:
 
         scores.sort(key=lambda x: x[1], reverse=True)
         await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
+        final_scores = scores[:top_k]
+        self._buffer_accesses([rid for rid, _ in final_scores])
         return HybridSearchResult(
-            results=scores[:top_k],
+            results=final_scores,
             backends_used=frozenset(backends_used_set),
         )
 
@@ -5345,6 +5511,111 @@ class SqliteEngravaCore:
         if cursor.rowcount == 0:
             raise ThoughtNotFoundError(thought_id)
         await self._maybe_commit()
+
+    def _buffer_accesses(self, thought_ids: list[str]) -> None:
+        """Buffer access events for retrieved thoughts (no DB write).
+
+        Called from the retrieval paths (search / recall / reflection search /
+        explicit ``get_thought``) with the ids a caller actually retrieved.
+        No-op unless access tracking is enabled. This never touches the
+        database — events accumulate in the bounded in-process buffer and are
+        applied in one batched ``UPDATE`` by :meth:`flush_access_buffer` at the
+        consolidation-cycle boundary (or an explicit flush / store close). The
+        existing per-id :meth:`record_access` is intentionally *not* called
+        here: batching is what keeps the read path free of per-result writes.
+
+        Args:
+            thought_ids: Ids just returned to the caller. Duplicates and empty
+                lists are handled by the buffer (coalesced / ignored).
+
+        """
+        if not self._access_tracking_enabled or self._suppress_access_tracking or not thought_ids:
+            return
+        now = datetime.datetime.now(datetime.UTC).isoformat()
+        for thought_id in thought_ids:
+            self._access_buffer.record(thought_id, now=now)
+
+    async def flush_access_buffer(self) -> int:
+        """Apply buffered access events in a single batched ``UPDATE``.
+
+        Drains the in-process access buffer and folds every pending
+        ``(count_delta, last_seen)`` into the ``thought`` table with one
+        ``executemany`` — the batched write the read path deferred. Ids whose
+        thought no longer exists are silently skipped (the row may have been
+        deleted since it was buffered; access counts are best-effort).
+
+        Access counts are high-volume regenerable telemetry, so these updates
+        are **not** written to the hash-chain journal — a deliberate exception
+        to the journal-every-mutation rule. A crash before a flush undercounts,
+        which self-heals as access continues.
+
+        Called automatically at the start of a dreaming consolidation cycle
+        (see :meth:`consolidate`) and on :meth:`close`; also safe to call
+        explicitly. A no-op returning ``0`` when tracking is disabled or the
+        buffer is empty.
+
+        Returns:
+            The number of buffered access **entries flushed** — the distinct
+            thought ids drained from the buffer. This counts entries submitted
+            to the batched ``UPDATE``, which is not necessarily the number of
+            rows actually updated: an id whose thought was deleted since it was
+            buffered matches no row, so it is flushed but updates nothing (the
+            counts are best-effort telemetry, so this is not reconciled).
+
+        """
+        if not self._access_tracking_enabled:
+            return 0
+        pending = self._access_buffer.drain()
+        if not pending:
+            return 0
+        # (delta, last_seen, thought_id) — matches the UPDATE parameter order.
+        params = [(delta, ts, tid) for tid, delta, ts in pending]
+        await self._db.executemany(
+            "UPDATE thought SET access_count = access_count + ?, "
+            "last_accessed_at = ? WHERE thought_id = ?",
+            params,
+        )
+        await self._maybe_commit()
+        logger.debug(
+            "flushed access buffer: %d thought(s) updated in one batch",
+            len(params),
+        )
+        return len(params)
+
+    async def consolidate(self, *, current_cycle: int) -> ConsolidationResult:
+        """Run one dreaming consolidation cycle on this store.
+
+        The invocable entry point for a store built via :meth:`from_config`
+        with ``dreaming.enabled`` — it lets a YAML-only caller run consolidation
+        without constructing a ``DreamingExtension`` by hand. It first flushes
+        any pending access-buffer events (so the ``frequency`` signal sees the
+        latest access counts this cycle), then runs the wired extension's
+        consolidation with access tracking suppressed for the extension's own
+        internal reads (its candidate scans / member resolution are machinery,
+        not caller retrievals, and must not feed the frequency signal).
+
+        Args:
+            current_cycle: The current cognitive cycle number, driving the
+                cycle-based recency / staleness signals and promotion age gates.
+
+        Returns:
+            The :class:`ConsolidationResult` for the run.
+
+        Raises:
+            RuntimeError: When dreaming is not enabled/wired on this store
+                (built manually, or ``dreaming.enabled`` is false) — there is
+                no extension to run.
+
+        """
+        if self._dreaming_extension is None:
+            msg = (
+                "consolidate() requires dreaming to be enabled: build the store via "
+                "from_config with extensions.dreaming.enabled = true"
+            )
+            raise RuntimeError(msg)
+        await self.flush_access_buffer()
+        async with self.suppress_access_tracking():
+            return await self._dreaming_extension.run_consolidation(self, current_cycle)
 
     # ------------------------------------------------------------------
     # ActionRecord CRUD

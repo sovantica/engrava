@@ -239,7 +239,16 @@ hooks:
         assert config.dreaming.enabled is True
         assert config.dreaming.schedule_every_n_cycles == 50
         assert config.dreaming.promote_threshold == 0.5
-        assert config.dreaming.signals == {"recency": 0.5, "confidence": 0.5}
+        # A partial ``signals:`` mapping MERGES onto the defaults (overriding
+        # only recency + confidence), so the other three keep their defaults
+        # rather than being zeroed out.
+        assert config.dreaming.signals == {
+            "recency": 0.5,
+            "confidence": 0.5,
+            "staleness": 0.20,
+            "confirmation": 0.20,
+            "frequency": 0.20,
+        }
         assert config.dreaming.gates.min_confirmations == 3
         assert config.dreaming.gates.min_age_cycles == 20
 

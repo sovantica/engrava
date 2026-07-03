@@ -387,6 +387,21 @@ class DreamingConfig:
             explicit ``content_type`` annotation, supply it at ingest
             time rather than expecting this filter to fail-close on
             unannotated records.
+        access_tracking_enabled: When ``True`` (default), retrieval paths
+            buffer an access event for every thought a caller actually
+            retrieves (search / recall / reflection search results and an
+            explicit ``get_thought``), and the buffered counts are flushed
+            in a single batched update at each consolidation-cycle boundary
+            (and on an explicit flush or store close).  This feeds the
+            ``frequency`` signal with data.  The read path never issues a
+            per-result database write — events accumulate in a bounded
+            in-process buffer, so the retrieval hot path stays read-only.
+            Set to ``False`` for throughput deployments that do not want the
+            buffering overhead; the ``frequency`` signal is then structurally
+            flat and its weight redistributes onto the other active signals.
+            Access counts are high-volume regenerable telemetry — they are
+            **not** written to the hash-chain journal, and a crash before a
+            flush undercounts (acceptable; it self-heals as access continues).
 
     Examples:
         >>> cfg = DreamingConfig(enabled=True, promote_threshold=0.6)
@@ -419,6 +434,7 @@ class DreamingConfig:
     boilerplate_threshold: float = 0.30
     boilerplate_min_corpus_size: int = 5
     boilerplate_min_keyphrases_per_refl: int = 1
+    access_tracking_enabled: bool = True
 
     def __post_init__(self) -> None:  # noqa: C901 -- each branch validates a distinct field; splitting would obscure validation locality
         """Validate field values on construction.
@@ -1239,11 +1255,48 @@ def _parse_dreaming(raw: Any) -> DreamingConfig | None:  # noqa: ANN401, C901, P
         raise ConfigError(msg)
     reflection_default_priority: Literal["P1", "P2", "P3"] = reflection_default_priority_raw
 
+    # A partial ``signals:`` mapping MERGES onto the defaults so overriding one
+    # weight does not silently zero the other four. An absent section keeps the
+    # full default set.
+    merged_signals = dict(_DEFAULT_DREAMING_SIGNALS)
+    if signals is not None:
+        merged_signals.update(signals)
+
+    eligible_perspectives = _parse_eligible_perspectives(raw.get("eligible_perspectives"))
+    self_filter_mode = _parse_self_filter_mode(raw.get("self_filter_mode"))
+    min_source_confidence = _parse_min_source_confidence(raw.get("min_source_confidence"))
+    excluded_content_types = _parse_content_type_set(
+        raw.get("excluded_content_types"),
+        "excluded_content_types",
+        default=frozenset({"code"}),
+    )
+    # ``default`` is non-None, so the parser never returns None on this call;
+    # narrow for the non-optional ``excluded_content_types`` field.
+    if excluded_content_types is None:  # pragma: no cover -- default is non-None
+        excluded_content_types = frozenset({"code"})
+    eligible_content_types = _parse_content_type_set(
+        raw.get("eligible_content_types"),
+        "eligible_content_types",
+        default=None,
+    )
+    boilerplate_threshold = _parse_dreaming_unit_float(raw, "boilerplate_threshold", 0.30)
+    boilerplate_min_corpus_size = _parse_dreaming_positive_int(
+        raw, "boilerplate_min_corpus_size", 5
+    )
+    boilerplate_min_keyphrases_per_refl = _parse_dreaming_nonneg_int(
+        raw, "boilerplate_min_keyphrases_per_refl", 1
+    )
+
+    access_tracking_enabled = raw.get("access_tracking_enabled", True)
+    if not isinstance(access_tracking_enabled, bool):
+        msg = "'extensions.dreaming.access_tracking_enabled' must be a boolean"
+        raise ConfigError(msg)
+
     return DreamingConfig(
         enabled=enabled,
         schedule_every_n_cycles=schedule,
         promote_threshold=float(threshold),
-        signals=signals if signals is not None else dict(_DEFAULT_DREAMING_SIGNALS),
+        signals=merged_signals,
         gates=gates,
         candidates_limit=candidates_limit,
         edges=edges,
@@ -1254,7 +1307,135 @@ def _parse_dreaming(raw: Any) -> DreamingConfig | None:  # noqa: ANN401, C901, P
         max_p1_fraction=float(max_p1_fraction),
         promote_targets=promote_targets,
         reflection_default_priority=reflection_default_priority,
+        eligible_perspectives=eligible_perspectives,
+        self_filter_mode=self_filter_mode,
+        min_source_confidence=min_source_confidence,
+        excluded_content_types=excluded_content_types,
+        eligible_content_types=eligible_content_types,
+        boilerplate_threshold=boilerplate_threshold,
+        boilerplate_min_corpus_size=boilerplate_min_corpus_size,
+        boilerplate_min_keyphrases_per_refl=boilerplate_min_keyphrases_per_refl,
+        access_tracking_enabled=access_tracking_enabled,
     )
+
+
+def _parse_eligible_perspectives(
+    raw: object,
+) -> frozenset[Literal["percept", "utterance", "thought"]] | None:
+    """Parse ``extensions.dreaming.eligible_perspectives``.
+
+    Args:
+        raw: Raw YAML value — a list/set of perspective strings, or ``None``.
+
+    Returns:
+        Frozenset of validated perspective literals, or ``None`` when the
+        filter is disabled (key absent / explicit ``null``).
+
+    Raises:
+        ConfigError: When the value is not a list of the allowed literals.
+
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        msg = "'extensions.dreaming.eligible_perspectives' must be a list of strings"
+        raise ConfigError(msg)
+    allowed = {"percept", "utterance", "thought"}
+    values: set[Literal["percept", "utterance", "thought"]] = set()
+    for entry in raw:
+        if entry not in allowed:
+            msg = (
+                "'extensions.dreaming.eligible_perspectives' entries must be "
+                "'percept', 'utterance', or 'thought'"
+            )
+            raise ConfigError(msg)
+        values.add(entry)
+    return frozenset(values)
+
+
+def _parse_self_filter_mode(raw: object) -> Literal["any", "self_only", "external_only"]:
+    """Parse ``extensions.dreaming.self_filter_mode`` (defaults to ``"any"``)."""
+    if raw is None:
+        return "any"
+    if raw not in ("any", "self_only", "external_only"):
+        msg = (
+            "'extensions.dreaming.self_filter_mode' must be 'any', 'self_only', or 'external_only'"
+        )
+        raise ConfigError(msg)
+    return raw
+
+
+def _parse_min_source_confidence(raw: object) -> Literal["high", "medium", "low"]:
+    """Parse ``extensions.dreaming.min_source_confidence`` (defaults to ``"low"``)."""
+    if raw is None:
+        return "low"
+    if raw not in ("high", "medium", "low"):
+        msg = "'extensions.dreaming.min_source_confidence' must be 'high', 'medium', or 'low'"
+        raise ConfigError(msg)
+    return raw
+
+
+def _parse_content_type_set(
+    raw: object,
+    key: str,
+    *,
+    default: frozenset[str] | None,
+) -> frozenset[str] | None:
+    """Parse a content-type string set for the dreaming filters.
+
+    Args:
+        raw: Raw YAML value — a list of content-type strings, or ``None``.
+        key: Field name (for error messages).
+        default: Value to return when the key is absent (``None`` or a
+            frozenset).  An explicit empty list yields an empty frozenset,
+            which is distinct from ``None`` for the positive-filter axis.
+
+    Returns:
+        Frozenset of content-type strings, or the default when absent.
+
+    Raises:
+        ConfigError: When the value is not a list of strings.
+
+    """
+    if raw is None:
+        return default
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        msg = f"'extensions.dreaming.{key}' must be a list of strings"
+        raise ConfigError(msg)
+    values: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, str):
+            msg = f"'extensions.dreaming.{key}' entries must be strings"
+            raise ConfigError(msg)
+        values.add(entry)
+    return frozenset(values)
+
+
+def _parse_dreaming_unit_float(raw: dict[str, Any], key: str, default: float) -> float:
+    """Parse a ``[0.0, 1.0]`` float from the ``dreaming`` mapping."""
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 <= value <= 1.0:
+        msg = f"'extensions.dreaming.{key}' must be a float in [0.0, 1.0]"
+        raise ConfigError(msg)
+    return float(value)
+
+
+def _parse_dreaming_positive_int(raw: dict[str, Any], key: str, default: int) -> int:
+    """Parse a ``>= 1`` integer from the ``dreaming`` mapping."""
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        msg = f"'extensions.dreaming.{key}' must be a positive integer"
+        raise ConfigError(msg)
+    return value
+
+
+def _parse_dreaming_nonneg_int(raw: dict[str, Any], key: str, default: int) -> int:
+    """Parse a ``>= 0`` integer from the ``dreaming`` mapping."""
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        msg = f"'extensions.dreaming.{key}' must be a non-negative integer"
+        raise ConfigError(msg)
+    return value
 
 
 def _parse_edge_creation(raw: object) -> EdgeCreationConfig:
@@ -1397,6 +1578,30 @@ def _parse_gates(raw: Any) -> DreamingGates:  # noqa: ANN401, C901, PLR0912, PLR
         msg = "'gates.cluster_quality_require_meaningful_keyphrases' must be a boolean"
         raise ConfigError(msg)
 
+    cluster_allowed_types_raw = raw.get("cluster_allowed_types", ("OBSERVATION",))
+    if not isinstance(cluster_allowed_types_raw, (list, tuple)):
+        msg = "'gates.cluster_allowed_types' must be a list of thought-type strings"
+        raise ConfigError(msg)
+    cluster_allowed_types_list: list[str] = []
+    for entry in cluster_allowed_types_raw:
+        if not isinstance(entry, str):
+            msg = "'gates.cluster_allowed_types' entries must be strings"
+            raise ConfigError(msg)
+        cluster_allowed_types_list.append(entry)
+    if not cluster_allowed_types_list:
+        msg = "'gates.cluster_allowed_types' must list at least one thought type"
+        raise ConfigError(msg)
+    cluster_allowed_types = tuple(cluster_allowed_types_list)
+
+    clustering_min_new_candidates = raw.get("clustering_min_new_candidates", 50)
+    if (
+        isinstance(clustering_min_new_candidates, bool)
+        or not isinstance(clustering_min_new_candidates, int)
+        or clustering_min_new_candidates < 0
+    ):
+        msg = "'gates.clustering_min_new_candidates' must be a non-negative integer"
+        raise ConfigError(msg)
+
     return DreamingGates(
         min_confirmations=min_conf,
         min_age_cycles=min_age,
@@ -1418,6 +1623,8 @@ def _parse_gates(raw: Any) -> DreamingGates:  # noqa: ANN401, C901, PLR0912, PLR
         cluster_quality_require_meaningful_keyphrases=(
             cluster_quality_require_meaningful_keyphrases
         ),
+        cluster_allowed_types=cluster_allowed_types,
+        clustering_min_new_candidates=clustering_min_new_candidates,
     )
 
 
