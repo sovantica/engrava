@@ -171,7 +171,7 @@ async def test_ensure_schema_fresh_db_lands_at_head(
     store = SqliteEngravaCore(fresh_db)
     await store.ensure_schema()
 
-    assert await _user_version(fresh_db) == 15
+    assert await _user_version(fresh_db) == 16
     assert "metadata_json" in await _table_columns(fresh_db, "thought")
 
 
@@ -185,7 +185,7 @@ async def test_ensure_schema_from_v10_to_head(
     store = SqliteEngravaCore(fresh_db)
     await store.ensure_schema()
 
-    assert await _user_version(fresh_db) == 15
+    assert await _user_version(fresh_db) == 16
     assert "metadata_json" in await _table_columns(fresh_db, "thought")
 
 
@@ -195,12 +195,12 @@ async def test_ensure_schema_idempotent_at_head(
     """Repeat calls after reaching head stay at the head version without errors."""
     store = SqliteEngravaCore(fresh_db)
     await store.ensure_schema()
-    assert await _user_version(fresh_db) == 15
+    assert await _user_version(fresh_db) == 16
 
     for _ in range(3):
         await store.ensure_schema()
 
-    assert await _user_version(fresh_db) == 15
+    assert await _user_version(fresh_db) == 16
     assert "metadata_json" in await _table_columns(fresh_db, "thought")
 
 
@@ -286,5 +286,5 @@ async def test_cascade_from_any_version_to_head(
     store = SqliteEngravaCore(fresh_db)
     await store.ensure_schema()
 
-    assert await _user_version(fresh_db) == 15
+    assert await _user_version(fresh_db) == 16
     assert "metadata_json" in await _table_columns(fresh_db, "thought")

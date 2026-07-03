@@ -41,6 +41,7 @@ from engrava.domain.enums import (
     VerificationStatus,
 )
 from engrava.domain.exceptions import (
+    ActionNotFoundError,
     EmbeddingGenerationError,
     EmbeddingModelMismatchError,
     EmbeddingQueryPrefixMismatchError,
@@ -78,6 +79,81 @@ if TYPE_CHECKING:
     from engrava.mindql.parser import MindQLQuery
 
 logger = logging.getLogger(__name__)
+
+#: Terminal action statuses — the only statuses that contribute to a thought's
+#: ``action_outcome_score`` aggregate. Non-terminal statuses (PLANNED,
+#: EXECUTING, BLOCKED) are excluded because their outcome is not yet decided.
+_TERMINAL_ACTION_STATUSES: frozenset[ActionStatus] = frozenset(
+    {ActionStatus.CONFIRMED, ActionStatus.FAILED}
+)
+
+#: Outcome value contributed by a CONFIRMED action, keyed by its verification
+#: status. A CONFIRMED action that verification later contradicts (FAILED)
+#: scores ``0.0``; a fully-verified success scores ``1.0``; every intermediate
+#: or not-yet-verified state is neutral (``0.5``) — succeeded-but-unverified is
+#: deliberately not rewarded as a full success. These numbers are the documented
+#: mapping; they live here as a single named table so they stay tunable and
+#: directly testable.
+_CONFIRMED_VERIFICATION_OUTCOME: dict[VerificationStatus, float] = {
+    VerificationStatus.CONFIRMED: 1.0,
+    VerificationStatus.PARTIAL: 0.5,
+    VerificationStatus.PENDING: 0.5,
+    VerificationStatus.UNVERIFIABLE: 0.5,
+    VerificationStatus.FAILED: 0.0,
+}
+
+
+def _action_outcome_value(action: ActionRecord) -> float | None:
+    """Return the outcome value of a single action, or ``None`` when undecided.
+
+    The value is defined only for a **terminal** action; a non-terminal
+    status (PLANNED, EXECUTING, BLOCKED) returns ``None`` and is excluded
+    from the aggregate.
+
+    For a terminal action:
+
+    * ``FAILED`` scores ``0.0`` regardless of verification.
+    * ``CONFIRMED`` is adjusted by verification via
+      :data:`_CONFIRMED_VERIFICATION_OUTCOME` — ``CONFIRMED`` verification
+      scores ``1.0``, ``FAILED`` verification (a contradiction) scores
+      ``0.0``, and every other verification state is a neutral ``0.5``.
+
+    Args:
+        action: The action to score.
+
+    Returns:
+        A float in ``[0.0, 1.0]`` for a terminal action, or ``None`` when
+        the action is non-terminal.
+
+    """
+    if action.status not in _TERMINAL_ACTION_STATUSES:
+        return None
+    if action.status is ActionStatus.FAILED:
+        return 0.0
+    # CONFIRMED status — adjusted by verification.
+    return _CONFIRMED_VERIFICATION_OUTCOME[action.verification_status]
+
+
+def _aggregate_action_outcome(actions: list[ActionRecord]) -> float | None:
+    """Return the mean outcome value over the terminal actions, or ``None``.
+
+    The aggregate is the arithmetic mean of :func:`_action_outcome_value`
+    over the actions whose status is terminal. A thought with no terminal
+    actions has no defined outcome and yields ``None`` (an all-non-terminal
+    or empty action set).
+
+    Args:
+        actions: All actions linked to one thought.
+
+    Returns:
+        The mean terminal outcome value in ``[0.0, 1.0]``, or ``None`` when
+        there are no terminal actions.
+
+    """
+    values = [v for v in (_action_outcome_value(a) for a in actions) if v is not None]
+    if not values:
+        return None
+    return sum(values) / len(values)
 
 
 def _build_embed_input(essence: str, content: str) -> str:
@@ -878,7 +954,7 @@ class SqliteEngravaCore:
         Applies the full ``schema_core.sql`` (including FTS5 virtual
         table and sync triggers) only when the database has not already
         been bootstrapped to schema version 3+.  Databases at older
-        versions are upgraded incrementally up to the current version (15).
+        versions are upgraded incrementally up to the current version (16).
 
         After core schema creation or upgrade, probes for the ``thought_fts``
         table and then runs any pending extension schema migrations for each
@@ -909,7 +985,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
-            await self._db.execute("PRAGMA user_version = 15")
+            await self._migrate_core_v15_to_v16()
+            await self._db.execute("PRAGMA user_version = 16")
             await self._db.commit()
         elif current_version < 4:  # noqa: PLR2004
             await self._migrate_core_v3_to_v4()
@@ -924,7 +1001,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
-            await self._db.execute("PRAGMA user_version = 15")
+            await self._migrate_core_v15_to_v16()
+            await self._db.execute("PRAGMA user_version = 16")
             await self._db.commit()
         elif current_version < 5:  # noqa: PLR2004
             await self._migrate_core_v4_to_v5()
@@ -938,7 +1016,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
-            await self._db.execute("PRAGMA user_version = 15")
+            await self._migrate_core_v15_to_v16()
+            await self._db.execute("PRAGMA user_version = 16")
             await self._db.commit()
         elif current_version < 6:  # noqa: PLR2004
             await self._migrate_core_v5_to_v6()
@@ -951,7 +1030,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
-            await self._db.execute("PRAGMA user_version = 15")
+            await self._migrate_core_v15_to_v16()
+            await self._db.execute("PRAGMA user_version = 16")
             await self._db.commit()
         elif current_version < 7:  # noqa: PLR2004
             await self._migrate_core_v6_to_v7()
@@ -963,7 +1043,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
-            await self._db.execute("PRAGMA user_version = 15")
+            await self._migrate_core_v15_to_v16()
+            await self._db.execute("PRAGMA user_version = 16")
             await self._db.commit()
         elif current_version < 8:  # noqa: PLR2004
             await self._migrate_core_v7_to_v8()
@@ -974,7 +1055,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
-            await self._db.execute("PRAGMA user_version = 15")
+            await self._migrate_core_v15_to_v16()
+            await self._db.execute("PRAGMA user_version = 16")
             await self._db.commit()
         elif current_version < 9:  # noqa: PLR2004
             await self._migrate_core_v8_to_v9()
@@ -984,7 +1066,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
-            await self._db.execute("PRAGMA user_version = 15")
+            await self._migrate_core_v15_to_v16()
+            await self._db.execute("PRAGMA user_version = 16")
             await self._db.commit()
         elif current_version < 10:  # noqa: PLR2004
             await self._migrate_core_v9_to_v10()
@@ -993,7 +1076,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
-            await self._db.execute("PRAGMA user_version = 15")
+            await self._migrate_core_v15_to_v16()
+            await self._db.execute("PRAGMA user_version = 16")
             await self._db.commit()
         elif current_version < 11:  # noqa: PLR2004
             await self._migrate_core_v10_to_v11()
@@ -1001,29 +1085,38 @@ class SqliteEngravaCore:
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
-            await self._db.execute("PRAGMA user_version = 15")
+            await self._migrate_core_v15_to_v16()
+            await self._db.execute("PRAGMA user_version = 16")
             await self._db.commit()
         elif current_version < 12:  # noqa: PLR2004
             await self._migrate_core_v11_to_v12()
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
-            await self._db.execute("PRAGMA user_version = 15")
+            await self._migrate_core_v15_to_v16()
+            await self._db.execute("PRAGMA user_version = 16")
             await self._db.commit()
         elif current_version < 13:  # noqa: PLR2004
             await self._migrate_core_v12_to_v13()
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
-            await self._db.execute("PRAGMA user_version = 15")
+            await self._migrate_core_v15_to_v16()
+            await self._db.execute("PRAGMA user_version = 16")
             await self._db.commit()
         elif current_version < 14:  # noqa: PLR2004
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
-            await self._db.execute("PRAGMA user_version = 15")
+            await self._migrate_core_v15_to_v16()
+            await self._db.execute("PRAGMA user_version = 16")
             await self._db.commit()
         elif current_version < 15:  # noqa: PLR2004
             await self._migrate_core_v14_to_v15()
-            await self._db.execute("PRAGMA user_version = 15")
+            await self._migrate_core_v15_to_v16()
+            await self._db.execute("PRAGMA user_version = 16")
+            await self._db.commit()
+        elif current_version < 16:  # noqa: PLR2004
+            await self._migrate_core_v15_to_v16()
+            await self._db.execute("PRAGMA user_version = 16")
             await self._db.commit()
 
         # Ensure referential integrity is enforced for the lifetime of this
@@ -1499,6 +1592,47 @@ class SqliteEngravaCore:
                 "CREATE INDEX IF NOT EXISTS idx_edge_type_to ON edge(edge_type, to_thought_id)"
             )
 
+    async def _migrate_core_v15_to_v16(self) -> None:
+        """Add the action-outcome aggregate column and its seek index (core-16).
+
+        Purely additive. Two independent changes back the action-outcome
+        feedback loop:
+
+        * ``thought.action_outcome_score`` (nullable ``REAL``) — the
+          denormalised mean outcome value over a thought's terminal linked
+          actions, or ``NULL`` when it has none. Added via
+          ``ALTER TABLE ... ADD COLUMN``; an ``OperationalError`` naming a
+          duplicate column is swallowed so a database already carrying the
+          column (a partial or re-run migration) is left unchanged.
+        * ``idx_action_source_thought`` on ``action(source_thought_id)`` — the
+          recompute resolves a thought's actions with
+          ``WHERE source_thought_id = ?``; without this index that lookup is a
+          full scan of the ``action`` table, and it runs on every
+          outcome-affecting write. ``EXPLAIN QUERY PLAN`` then reports
+          ``SEARCH action USING INDEX idx_action_source_thought
+          (source_thought_id=?)`` rather than a full scan.
+
+        Idempotent. The column add is guarded against the duplicate-column
+        error exactly as ``_migrate_core_v9_to_v10`` guards its own
+        ``ADD COLUMN``; the index create uses ``CREATE INDEX IF NOT EXISTS``.
+        The ``action`` table may be absent in a partial bootstrap (it is
+        created by the fresh DDL), so the index create is guarded by
+        ``_table_exists`` exactly as ``_migrate_core_v14_to_v15`` guards its
+        ``edge`` index.
+        """
+        from sqlite3 import OperationalError  # noqa: PLC0415
+
+        if not await self._column_exists("thought", "action_outcome_score"):
+            try:
+                await self._db.execute("ALTER TABLE thought ADD COLUMN action_outcome_score REAL")
+            except OperationalError as exc:  # pragma: no cover - defensive race guard
+                if "duplicate column" not in str(exc).lower():
+                    raise
+        if await self._table_exists("action"):
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_action_source_thought ON action(source_thought_id)"
+            )
+
     async def _fk_present(self, table: str, column: str) -> bool:
         """Return ``True`` when ``table`` carries an FK on ``column``."""
         cursor = await self._db.execute(f"PRAGMA foreign_key_list({table})")
@@ -1924,6 +2058,7 @@ class SqliteEngravaCore:
         consolidated_raw = row["consolidated_from"] if "consolidated_from" in keys else None
         visibility_raw = row["visibility"] if "visibility" in keys else "selective"
         access_count_raw = row["access_count"] if "access_count" in keys else 0
+        action_outcome_raw = row["action_outcome_score"] if "action_outcome_score" in keys else None
         last_accessed_at_raw = row["last_accessed_at"] if "last_accessed_at" in keys else None
         created_at_raw = row["created_at"] if "created_at" in keys else None
         updated_at_raw = row["updated_at"] if "updated_at" in keys else None
@@ -1955,6 +2090,9 @@ class SqliteEngravaCore:
                 ThoughtVisibility(visibility_raw) if visibility_raw else ThoughtVisibility.SELECTIVE
             ),
             access_count=int(access_count_raw) if access_count_raw else 0,
+            action_outcome_score=(
+                float(action_outcome_raw) if action_outcome_raw is not None else None
+            ),
             last_accessed_at=last_accessed_at_raw,
             created_at=created_at_raw,
             updated_at=updated_at_raw,
@@ -1999,11 +2137,11 @@ class SqliteEngravaCore:
         "(thought_id, thought_type, essence, content, content_hash, priority, "
         " lifecycle_status, created_cycle, updated_cycle, source, "
         " confidence, embedding_ref, source_type, confirmation_count, "
-        " consolidated_from, visibility, access_count, "
+        " consolidated_from, visibility, access_count, action_outcome_score, "
         " last_accessed_at, created_at, updated_at, expires_at, "
         " valid_from, valid_until, "
         " metadata_json) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
 
     def _thought_to_core_params(self, thought: ThoughtRecord) -> tuple[object, ...]:
@@ -2042,6 +2180,7 @@ class SqliteEngravaCore:
             _encode_consolidated(thought.consolidated_from),
             thought.visibility.value,
             thought.access_count,
+            thought.action_outcome_score,
             thought.last_accessed_at,
             thought.created_at,
             thought.updated_at,
@@ -2058,7 +2197,7 @@ class SqliteEngravaCore:
         " source = ?, confidence = ?, embedding_ref = ?,"
         " source_type = ?, confirmation_count = ?,"
         " consolidated_from = ?, visibility = ?,"
-        " access_count = ?, last_accessed_at = ?,"
+        " access_count = ?, action_outcome_score = ?, last_accessed_at = ?,"
         " created_at = ?, updated_at = ?, expires_at = ?,"
         " valid_from = ?, valid_until = ?,"
         " metadata_json = ? "
@@ -2105,6 +2244,7 @@ class SqliteEngravaCore:
             _encode_consolidated(updated.consolidated_from),
             updated.visibility.value,
             updated.access_count,
+            updated.action_outcome_score,
             updated.last_accessed_at,
             updated.created_at,
             updated.updated_at,
@@ -5624,6 +5764,14 @@ class SqliteEngravaCore:
     async def create_action(self, action: ActionRecord) -> ActionRecord:
         """Persist a new action record.
 
+        When the created action already has a **terminal** status
+        (``CONFIRMED`` / ``FAILED``) it is outcome-affecting, so the source
+        thought's ``action_outcome_score`` is recomputed in the same
+        transaction (see :meth:`_recompute_action_outcome`). A non-terminal
+        create leaves the score untouched, so an action-free — or
+        only-in-flight — store never writes an outcome score and stays
+        byte-identical to one built before this feature.
+
         Args:
             action: The action record to create.
 
@@ -5646,8 +5794,177 @@ class SqliteEngravaCore:
                 action.raw_metrics_json,
             ),
         )
+        if action.status in _TERMINAL_ACTION_STATUSES:
+            await self._recompute_action_outcome(action.source_thought_id)
         await self._maybe_commit()
         return action
+
+    async def update_action(
+        self,
+        action_id: str,
+        *,
+        status: ActionStatus | None = None,
+        verification_status: VerificationStatus | None = None,
+    ) -> ActionRecord:
+        """Advance a stored action's status and/or verification status.
+
+        The action's own state machine governs ``status`` changes: a change
+        is validated via :meth:`ActionRecord.evolve` (which calls
+        ``can_transition_to``), so an illegal jump (e.g. ``PLANNED`` →
+        ``CONFIRMED``) raises :class:`InvalidTransitionError`. Transition
+        validation applies **only when ``status`` actually changes** — a
+        verification-only update never touches the status machine and is
+        therefore permitted in **any** status, including a terminal
+        ``CONFIRMED`` / ``FAILED`` action (verification legitimately advances
+        while the status stays terminal). ``verification_status`` is not gated
+        by the lifecycle state: it may be set on a non-terminal action too, but
+        such an action contributes nothing to ``action_outcome_score`` (the
+        aggregate counts only terminal actions), so a premature verification
+        mark is harmless — it takes effect only once the action is terminal.
+
+        A **no-op** update — every supplied field already equals the stored
+        value — returns the unchanged record and is **fully side-effect-free**:
+        no persisted write, no journal entry, no feedback recompute, and (since
+        it writes nothing) no commit — it never flushes unrelated pending
+        writes on the connection.
+
+        On a real change the new status/verification is persisted, the
+        mutation is journaled as ``UPDATE_ACTION`` (only when journaling is
+        enabled), and the source thought's ``action_outcome_score`` is
+        recomputed when the change is **outcome-affecting** — that is, when
+        it lands a terminal status, or changes ``verification_status`` on an
+        already-terminal action. A purely non-terminal move (e.g.
+        ``PLANNED`` → ``EXECUTING``) is journaled but triggers no recompute.
+
+        Args:
+            action_id: UUID of the action to update.
+            status: New status, or ``None`` to leave the status unchanged.
+            verification_status: New verification status, or ``None`` to
+                leave it unchanged.
+
+        Returns:
+            The updated (or, for a no-op, the unchanged) action record.
+
+        Raises:
+            ActionNotFoundError: If the action does not exist.
+            InvalidTransitionError: If a real ``status`` change is illegal
+                per the action state machine.
+
+        """
+        current = await self._get_action(action_id)
+        if current is None:
+            raise ActionNotFoundError(action_id)
+
+        status_changes = status is not None and status != current.status
+        verification_changes = (
+            verification_status is not None and verification_status != current.verification_status
+        )
+        if not status_changes and not verification_changes:
+            # No-op: nothing to persist, journal, or recompute.
+            return current
+
+        changes: dict[str, object] = {}
+        if status_changes:
+            changes["status"] = status
+        if verification_changes:
+            changes["verification_status"] = verification_status
+        # ``evolve`` validates the status transition when ``status`` changes and
+        # is a no-op validation-wise for a verification-only change.
+        updated = current.evolve(**changes)
+
+        await self._db.execute(
+            "UPDATE action SET status = ?, verification_status = ? WHERE action_id = ?",
+            (updated.status.value, updated.verification_status.value, action_id),
+        )
+
+        if self._journal is not None:
+            await self._journal.append(
+                mutation_type="UPDATE_ACTION",
+                target_id=action_id,
+                delta={
+                    "before": {
+                        "status": current.status.value,
+                        "verification_status": current.verification_status.value,
+                    },
+                    "after": {
+                        "status": updated.status.value,
+                        "verification_status": updated.verification_status.value,
+                    },
+                },
+            )
+
+        # Outcome-affecting iff the change lands a terminal status, or changes
+        # verification on an already-terminal action. Because the aggregate
+        # reads both status and verification, a verification change on a
+        # terminal action IS outcome-affecting.
+        lands_terminal = status_changes and updated.status in _TERMINAL_ACTION_STATUSES
+        verifies_terminal = verification_changes and updated.status in _TERMINAL_ACTION_STATUSES
+        if lands_terminal or verifies_terminal:
+            await self._recompute_action_outcome(updated.source_thought_id)
+
+        await self._maybe_commit()
+        return updated
+
+    async def _get_action(self, action_id: str) -> ActionRecord | None:
+        """Fetch a single action by its ID, or ``None`` when absent.
+
+        Args:
+            action_id: UUID of the action.
+
+        Returns:
+            The action record, or ``None`` if not found.
+
+        """
+        cursor = await self._db.execute("SELECT * FROM action WHERE action_id = ?", (action_id,))
+        row = await cursor.fetchone()
+        return _row_to_action(row) if row is not None else None
+
+    async def _recompute_action_outcome(self, thought_id: str) -> None:
+        """Recompute and persist a thought's denormalised ``action_outcome_score``.
+
+        Full, idempotent recompute: reads **all** of the thought's actions
+        via :meth:`get_actions` (a seek on ``idx_action_source_thought``),
+        takes the mean outcome value over its terminal actions (see
+        :func:`_aggregate_action_outcome`), and writes the result directly to
+        ``thought.action_outcome_score``. Because the new value is a pure
+        function of the current action set, running it twice with no
+        intervening action change converges to the same score.
+
+        The write is a direct column update (it deliberately does not touch
+        ``updated_cycle`` or ``updated_at``, so it is not an optimistic-
+        concurrency mutation). When journaling is enabled the change is
+        journaled as an ``UPDATE_THOUGHT`` before/after delta over the single
+        column. A missing thought (already cascade-deleted) is a silent
+        no-op: the ``UPDATE`` simply matches no row.
+
+        Args:
+            thought_id: UUID of the thought whose score to recompute.
+
+        """
+        before_row = await self._get_thought_row(thought_id) if self._journal is not None else None
+
+        actions = await self.get_actions(thought_id)
+        new_score = _aggregate_action_outcome(actions)
+
+        cursor = await self._db.execute(
+            "UPDATE thought SET action_outcome_score = ? WHERE thought_id = ?",
+            (new_score, thought_id),
+        )
+        if cursor.rowcount == 0:
+            # Thought is gone (cascade-deleted) — nothing to journal.
+            return
+
+        if self._journal is not None and before_row is not None:
+            before = self._row_to_thought(before_row)
+            after = before.model_copy(update={"action_outcome_score": new_score})
+            await self._journal.append(
+                mutation_type="UPDATE_THOUGHT",
+                target_id=thought_id,
+                delta={
+                    "before": before.model_dump(mode="json"),
+                    "after": after.model_dump(mode="json"),
+                },
+            )
 
     async def get_actions(self, thought_id: str) -> list[ActionRecord]:
         """Retrieve actions linked to a thought.

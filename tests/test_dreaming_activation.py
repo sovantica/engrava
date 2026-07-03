@@ -103,13 +103,15 @@ class TestActiveWeightRedistribution:
         candidates = [_obs("a"), _obs("b")]  # unconfirmed, no confidence, no access
         weights, flat = ext._compute_active_weights(candidates, current_cycle=_CYCLE)
 
-        # confirmation / confidence / frequency carry no data → flat.
-        assert set(flat) == {"confirmation", "confidence", "frequency"}
+        # confirmation / confidence / frequency / action_outcome carry no
+        # data → flat (no candidate has an action outcome either).
+        assert set(flat) == {"confirmation", "confidence", "frequency", "action_outcome"}
         # Their weight redistributes onto recency (.25) + staleness (.20).
         assert weights["recency"] == pytest.approx(0.25 / 0.45)
         assert weights["staleness"] == pytest.approx(0.20 / 0.45)
         assert weights["confirmation"] == 0.0
         assert weights["frequency"] == 0.0
+        assert weights["action_outcome"] == 0.0
         assert sum(weights.values()) == pytest.approx(1.0)
 
     def test_degenerate_no_active_signal_yields_zero_weights(self) -> None:
@@ -117,7 +119,8 @@ class TestActiveWeightRedistribution:
         # current_cycle None → recency + staleness inactive; nothing else has data.
         weights, flat = ext._compute_active_weights([_obs("a")], current_cycle=None)  # type: ignore[arg-type]
         assert all(w == 0.0 for w in weights.values())
-        assert "recency" in flat and "staleness" in flat
+        assert "recency" in flat
+        assert "staleness" in flat
 
     def test_confirmation_becomes_active_when_a_candidate_is_confirmed(self) -> None:
         """Candidate-set dependence (intended): a confirmed peer activates the signal."""
@@ -156,9 +159,7 @@ class TestPromotionReachable:
         assert result.active_signal_weights["recency"] > 0.0
         assert "frequency" in result.flat_signals
 
-    async def test_candidate_set_dependence_end_to_end(
-        self, store: SqliteEngravaCore
-    ) -> None:
+    async def test_candidate_set_dependence_end_to_end(self, store: SqliteEngravaCore) -> None:
         """A confirmed peer can demote an unconfirmed thought below the gate.
 
         With confirmation flat, an unconfirmed recent thought scores ~1.0 and
@@ -183,9 +184,7 @@ class TestPromotionReachable:
         assert "confirmation" not in mixed.flat_signals
         await db2.close()
 
-    async def test_population_p1_cap_bounds_repeated_cycles(
-        self, store: SqliteEngravaCore
-    ) -> None:
+    async def test_population_p1_cap_bounds_repeated_cycles(self, store: SqliteEngravaCore) -> None:
         """Repeated cycles do not push the P1 population past max_p1_fraction."""
         ext = DreamingExtension(config=_activation_cfg(max_p1_fraction=0.25))
         for i in range(8):
@@ -207,32 +206,35 @@ class TestAccessSubstrate:
     async def test_retrieval_buffers_then_flush_increments_no_hot_write(
         self, store: SqliteEngravaCore
     ) -> None:
-        store._access_tracking_enabled = True  # noqa: SLF001 -- simulate from_config wiring
+        store._access_tracking_enabled = True
         await store.create_thought(_obs("t"))
 
         await store.get_thought("t")
         await store.get_thought("t")
         # No DB write on the read path yet — access_count still 0.
         row = await store.get_thought("t")  # a third buffered access
-        assert row is not None and row.access_count == 0
-        assert len(store._access_buffer) == 1  # noqa: SLF001
+        assert row is not None
+        assert row.access_count == 0
+        assert len(store._access_buffer) == 1
 
         updated = await store.flush_access_buffer()
         assert updated == 1
         after = await store.get_thought("t")  # buffers again, but DB already flushed
-        assert after is not None and after.access_count == 3  # noqa: PLR2004
+        assert after is not None
+        assert after.access_count == 3
 
     async def test_default_off_no_access_tracking_byte_identical(
         self, store: SqliteEngravaCore
     ) -> None:
         """Default store (tracking off) never buffers or writes access counts."""
-        assert store._access_tracking_enabled is False  # noqa: SLF001
+        assert store._access_tracking_enabled is False
         await store.create_thought(_obs("t"))
         await store.get_thought("t")
-        assert len(store._access_buffer) == 0  # noqa: SLF001
+        assert len(store._access_buffer) == 0
         assert await store.flush_access_buffer() == 0
         row = await store.get_thought("t")
-        assert row is not None and row.access_count == 0
+        assert row is not None
+        assert row.access_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -242,19 +244,20 @@ class TestAccessSubstrate:
 
 class TestConfigActivation:
     def test_partial_signals_merge_keeps_other_defaults(self) -> None:
-        """Overriding one signal weight must not zero the other four."""
+        """Overriding one signal weight must not zero the other five."""
         cfg = _parse_dreaming({"enabled": True, "signals": {"recency": 0.5}})
         assert cfg is not None
-        assert cfg.signals["recency"] == 0.5  # noqa: PLR2004
-        # The other four keep their defaults, not dropped.
+        assert cfg.signals["recency"] == 0.5
+        # The other five keep their defaults, not dropped.
         assert set(cfg.signals) == {
             "recency",
             "staleness",
             "confirmation",
             "confidence",
             "frequency",
+            "action_outcome",
         }
-        assert cfg.signals["staleness"] == 0.20  # noqa: PLR2004
+        assert cfg.signals["staleness"] == 0.20
 
     def test_new_dreaming_fields_parse_from_yaml(self) -> None:
         cfg = _parse_dreaming(
@@ -271,7 +274,7 @@ class TestConfigActivation:
         assert cfg.access_tracking_enabled is False
         assert cfg.self_filter_mode == "self_only"
         assert cfg.min_source_confidence == "high"
-        assert cfg.boilerplate_threshold == 0.5  # noqa: PLR2004
+        assert cfg.boilerplate_threshold == 0.5
         assert cfg.eligible_content_types == frozenset({"note", "fact"})
 
     def test_access_tracking_rejects_non_bool(self) -> None:
@@ -295,8 +298,8 @@ class TestConfigActivation:
         )
         store = await SqliteEngravaCore.from_config(cfg_file)
         try:
-            assert store._dreaming_extension is not None  # noqa: SLF001 -- wired
-            assert store._access_tracking_enabled is True  # noqa: SLF001
+            assert store._dreaming_extension is not None
+            assert store._access_tracking_enabled is True
             for i in range(4):
                 await store.create_thought(_obs(f"obs-{i}"))
             result = await store.consolidate(current_cycle=_CYCLE)

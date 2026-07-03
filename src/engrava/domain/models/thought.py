@@ -72,6 +72,10 @@ class ThoughtRecord(BaseModel):
         consolidated_from: JSON list of source thought IDs if consolidated.
         visibility: Inner/outer speech visibility (private, selective, public).
         access_count: Number of times this thought has been explicitly accessed.
+        action_outcome_score: Denormalised mean outcome value over this
+            thought's terminal linked actions, in ``[0.0, 1.0]``.  ``None``
+            when the thought has no terminal actions; recomputed whenever a
+            linked action reaches (or is verified in) a terminal state.
         last_accessed_at: ISO-8601 datetime of last explicit access (nullable).
         created_at: ISO-8601 datetime when the thought was persisted (nullable
             for thoughts created before timestamp tracking was added).
@@ -129,6 +133,7 @@ class ThoughtRecord(BaseModel):
     consolidated_from: list[str] | None = None
     visibility: ThoughtVisibility = ThoughtVisibility.SELECTIVE
     access_count: int = Field(default=0, ge=0)
+    action_outcome_score: float | None = Field(default=None, ge=0.0, le=1.0)
     last_accessed_at: str | None = None
     created_at: str | None = None
     updated_at: str | None = None

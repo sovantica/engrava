@@ -272,6 +272,7 @@ create modified copies.
 | `consolidated_from` | `list[str] \| None` | Source thought IDs if consolidated |
 | `visibility` | `ThoughtVisibility` | Access scope |
 | `access_count` | `int` | Times explicitly accessed |
+| `action_outcome_score` | `float \| None` | Mean outcome value (`[0.0, 1.0]`) over the thought's terminal linked actions; `None` when it has none. Maintained by the store when a linked action reaches a terminal state |
 | `last_accessed_at` | `str \| None` | ISO-8601 datetime of last access |
 | `created_at` | `str \| None` | ISO-8601 datetime when persisted |
 | `updated_at` | `str \| None` | ISO-8601 datetime of last mutation |
@@ -374,11 +375,19 @@ thought that prompted it, with execution and verification state.
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `await create_action(action)` | `ActionRecord` | Persist an `ActionRecord` |
+| `await update_action(action_id, *, status=None, verification_status=None)` | `ActionRecord` | Advance a stored action's `status` and/or `verification_status`. Validates the transition when `status` changes (illegal jump raises `InvalidTransitionError`); a verification-only update is allowed even on a terminal action. Raises `ActionNotFoundError` when the id is unknown. A supplied value equal to the stored one is a no-op. |
 | `await get_actions(thought_id)` | `list[ActionRecord]` | Actions linked to a thought |
 
 `ActionStatus` is a state machine: `PLANNED → EXECUTING → CONFIRMED` / `FAILED`,
 and `PLANNED → BLOCKED → PLANNED`. `can_transition_to(...)` / `evolve(...)`
-enforce valid transitions (an illegal change raises `InvalidTransitionError`).
+enforce valid transitions on the in-memory record, and `update_action(...)`
+enforces the same transitions when advancing the **stored** action (an illegal
+change raises `InvalidTransitionError`).
+
+When a linked action reaches a terminal state (`CONFIRMED` / `FAILED`), the
+source thought's `action_outcome_score` — the mean outcome value over its
+terminal actions, `None` when it has none — is recomputed. That score is also
+read by the optional `action_outcome` dreaming signal.
 
 ```python
 import uuid
@@ -394,9 +403,13 @@ action = ActionRecord(
 )
 await store.create_action(action)
 
-# advance through the lifecycle (frozen model → evolve returns a new instance):
-done = action.evolve(status=ActionStatus.EXECUTING).evolve(
-    status=ActionStatus.CONFIRMED
+# advance the STORED action through its lifecycle (journaled; validates each
+# transition). A terminal status recomputes the source thought's outcome score:
+await store.update_action(action.action_id, status=ActionStatus.EXECUTING)
+await store.update_action(action.action_id, status=ActionStatus.CONFIRMED)
+# verification can still advance while the status stays terminal:
+await store.update_action(
+    action.action_id, verification_status=VerificationStatus.CONFIRMED
 )
 
 actions = await store.get_actions(prompting_thought_id)

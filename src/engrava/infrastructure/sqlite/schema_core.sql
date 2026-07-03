@@ -1,10 +1,12 @@
 -- engrava: Core thought-graph schema (free-tier boundary — no internal-cognitive columns).
--- Version: core-15 (composite inbound edge index edge(edge_type, to_thought_id)
---          for edge-type-scoped inbound lookups; core-14 added the hot-path
---          indexes edge.to_thought_id, embedding.owner_id, thought.updated_cycle,
---          thought.thought_type)
+-- Version: core-16 (denormalised thought.action_outcome_score aggregate + the
+--          idx_action_source_thought seek index that backs its recompute;
+--          core-15 added the composite inbound edge index
+--          edge(edge_type, to_thought_id) for edge-type-scoped inbound lookups;
+--          core-14 added the hot-path indexes edge.to_thought_id,
+--          embedding.owner_id, thought.updated_cycle, thought.thought_type)
 
-PRAGMA user_version = 15;
+PRAGMA user_version = 16;
 
 CREATE TABLE IF NOT EXISTS thought (
     thought_id        TEXT    PRIMARY KEY,
@@ -33,7 +35,11 @@ CREATE TABLE IF NOT EXISTS thought (
     -- database matches the column order of one upgraded in place, where
     -- ``ALTER TABLE ADD COLUMN`` can only append.
     valid_from        TEXT,
-    valid_until       TEXT
+    valid_until       TEXT,
+    -- Denormalised action-outcome aggregate (core-16). Mean outcome value over
+    -- the thought's terminal linked actions, or NULL when it has none. Appended
+    -- last for the same column-order parity as the valid-time columns above.
+    action_outcome_score REAL
 );
 
 CREATE TABLE IF NOT EXISTS edge (
@@ -249,3 +255,17 @@ CREATE INDEX IF NOT EXISTS idx_thought_type ON thought(thought_type);
 --   idx_edge_type_to (edge_type=? AND to_thought_id=?).
 
 CREATE INDEX IF NOT EXISTS idx_edge_type_to ON edge(edge_type, to_thought_id);
+
+-- -------------------------------------------------------------------
+-- Action-by-source index for the outcome-score recompute (core-16)
+-- -------------------------------------------------------------------
+-- The action-outcome recompute resolves a thought's linked actions with
+--   SELECT ... FROM action WHERE source_thought_id = ?
+-- which, without an index, is a full scan of the action table. This index
+-- turns that lookup into a seek so the recompute stays cheap even as the
+-- action table grows. EXPLAIN QUERY PLAN then reports
+--   SEARCH action USING INDEX idx_action_source_thought (source_thought_id=?).
+-- A fresh-bootstrap database must carry the same index as one upgraded in
+-- place, so it is declared here as well as in the migration helper.
+
+CREATE INDEX IF NOT EXISTS idx_action_source_thought ON action(source_thought_id);

@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING, NoReturn
 from engrava.domain.exceptions import ReadOnlyViolationError
 
 if TYPE_CHECKING:
+    from engrava.domain.enums import ActionStatus, VerificationStatus
+    from engrava.domain.models.action import ActionRecord
     from engrava.domain.models.edge import EdgeRecord
     from engrava.domain.models.embedding import EmbeddingRecord
     from engrava.domain.models.metrics import EngravaMetrics
@@ -156,6 +158,18 @@ class ReadOnlyEngrava:
 
         """
         return await self._inner.get_embedding(thought_id)
+
+    async def get_actions(self, thought_id: str) -> list[ActionRecord]:
+        """Retrieve actions linked to a thought.
+
+        Args:
+            thought_id: UUID of the thought.
+
+        Returns:
+            List of action records.
+
+        """
+        return await self._inner.get_actions(thought_id)
 
     async def metrics(self) -> EngravaMetrics:
         """Return a point-in-time metrics snapshot from the wrapped store."""
@@ -307,6 +321,32 @@ class ReadOnlyEngrava:
 
         """
         msg = "store_embedding"
+        raise ReadOnlyViolationError(msg)
+
+    async def create_action(self, _action: ActionRecord) -> NoReturn:
+        """Blocked: read-only contexts do not allow writes.
+
+        Raises:
+            ReadOnlyViolationError: Always.
+
+        """
+        msg = "create_action"
+        raise ReadOnlyViolationError(msg)
+
+    async def update_action(
+        self,
+        _action_id: str,
+        *,
+        status: ActionStatus | None = None,  # noqa: ARG002
+        verification_status: VerificationStatus | None = None,  # noqa: ARG002
+    ) -> NoReturn:
+        """Blocked: read-only contexts do not allow writes.
+
+        Raises:
+            ReadOnlyViolationError: Always.
+
+        """
+        msg = "update_action"
         raise ReadOnlyViolationError(msg)
 
     async def cleanup_expired(

@@ -29,6 +29,7 @@ from engrava.domain.enums import (
     VerificationStatus,
 )
 from engrava.domain.exceptions import (
+    ActionNotFoundError,
     EmbeddingGenerationError,
     EmbeddingModelMismatchError,
     EmbeddingQueryPrefixMismatchError,
@@ -84,6 +85,7 @@ from engrava.embeddings.sentence_transformer import SentenceTransformerProvider
 from engrava.extensions.discovery import discover_manifests
 from engrava.extensions.dreaming import ConsolidationResult, DreamingExtension
 from engrava.extensions.dreaming_signals import (
+    ActionOutcomeSignal,
     ConfidenceSignal,
     ConfirmationSignal,
     DreamingContext,
@@ -102,6 +104,8 @@ from engrava.mindql.executor import MindQLExecutor, MindQLResult
 from engrava.mindql.parser import MindQLCommand, MindQLParseError, MindQLQuery, parse
 
 __all__ = [
+    "ActionNotFoundError",
+    "ActionOutcomeSignal",
     "ActionRecord",
     "ActionStatus",
     "ActionType",

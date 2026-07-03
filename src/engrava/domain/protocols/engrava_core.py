@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from engrava.domain.enums import ActionStatus, VerificationStatus
+    from engrava.domain.models.action import ActionRecord
     from engrava.domain.models.edge import EdgeRecord
     from engrava.domain.models.embedding import EmbeddingRecord
     from engrava.domain.models.filters import MetadataFilter, VisibilityQueryFilter
@@ -556,6 +558,55 @@ class EngravaCoreProtocol(Protocol):
 
         Returns:
             The EmbeddingRecord, or None if not found.
+
+        """
+        ...
+
+    async def create_action(self, action: ActionRecord) -> ActionRecord:
+        """Persist a new action record.
+
+        Args:
+            action: The action record to create.
+
+        Returns:
+            The persisted action record.
+
+        """
+        ...
+
+    async def update_action(
+        self,
+        action_id: str,
+        *,
+        status: ActionStatus | None = None,
+        verification_status: VerificationStatus | None = None,
+    ) -> ActionRecord:
+        """Advance a stored action's status and/or verification status.
+
+        Args:
+            action_id: UUID of the action to update.
+            status: New status, or ``None`` to leave the status unchanged.
+            verification_status: New verification status, or ``None`` to
+                leave it unchanged.
+
+        Returns:
+            The updated (or, for a no-op, the unchanged) action record.
+
+        Raises:
+            ActionNotFoundError: If the action does not exist.
+            InvalidTransitionError: If a real ``status`` change is illegal.
+
+        """
+        ...
+
+    async def get_actions(self, thought_id: str) -> list[ActionRecord]:
+        """Retrieve actions linked to a thought.
+
+        Args:
+            thought_id: UUID of the thought.
+
+        Returns:
+            List of action records.
 
         """
         ...

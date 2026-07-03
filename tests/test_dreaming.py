@@ -159,7 +159,7 @@ class TestDreamingExtension:
         cfg = DreamingConfig(enabled=True)
         ext = DreamingExtension(config=cfg)
         assert ext.config.enabled is True
-        assert len(ext._signals) == 5
+        assert len(ext._signals) == 6
 
     def test_unknown_signal_raises(self) -> None:
         cfg = DreamingConfig(

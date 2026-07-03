@@ -136,6 +136,15 @@ The weighted sum of all signal scores is compared against
 | `confirmation` | 0.20 | Ratio of `confirmation_count` to max (5). |
 | `confidence` | 0.15 | Thought's `confidence` field (default 0.5). |
 | `frequency` | 0.20 | Ratio of `access_count` to max (10). |
+| `action_outcome` | 0.15 | Thought's `action_outcome_score` — the mean outcome value over its terminal linked actions (`None` ⇒ contributes `0.0`). |
+
+A signal whose data source is flat across the whole candidate pool carries no
+ranking information, so it is dropped and its weight is redistributed over the
+active signals. `action_outcome` is therefore **inactive** — and its weight
+falls out of the denominator — in any store where no candidate has a recorded
+action outcome, so it never perturbs consolidation until actions are used. The
+default weights sum to more than 1.0 for this reason: they are relative
+priorities renormalised over the active set, not a probability distribution.
 
 Custom signals can be provided via `DreamingSignalProtocol`:
 

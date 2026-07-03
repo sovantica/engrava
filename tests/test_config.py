@@ -110,9 +110,10 @@ class TestDreamingConfig:
         assert cfg.enabled is False
         assert cfg.schedule_every_n_cycles == 100
         assert cfg.promote_threshold == 0.7
-        assert len(cfg.signals) == 5
+        assert len(cfg.signals) == 6
         assert cfg.signals["recency"] == 0.25
         assert cfg.signals["frequency"] == 0.20
+        assert cfg.signals["action_outcome"] == 0.15
         assert cfg.candidates_limit == 200
         assert cfg.top_keyphrases_count == 3
         assert cfg.top_member_excerpts_count == 5
@@ -240,7 +241,7 @@ hooks:
         assert config.dreaming.schedule_every_n_cycles == 50
         assert config.dreaming.promote_threshold == 0.5
         # A partial ``signals:`` mapping MERGES onto the defaults (overriding
-        # only recency + confidence), so the other three keep their defaults
+        # only recency + confidence), so the other four keep their defaults
         # rather than being zeroed out.
         assert config.dreaming.signals == {
             "recency": 0.5,
@@ -248,6 +249,7 @@ hooks:
             "staleness": 0.20,
             "confirmation": 0.20,
             "frequency": 0.20,
+            "action_outcome": 0.15,
         }
         assert config.dreaming.gates.min_confirmations == 3
         assert config.dreaming.gates.min_age_cycles == 20
@@ -366,7 +368,7 @@ hooks:
         assert config.dreaming is not None
         assert config.dreaming.enabled is True
         assert config.dreaming.schedule_every_n_cycles == 100
-        assert len(config.dreaming.signals) == 5
+        assert len(config.dreaming.signals) == 6
         assert config.dreaming.top_keyphrases_count == 3
         assert config.dreaming.top_member_excerpts_count == 5
 

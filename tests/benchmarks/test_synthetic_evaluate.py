@@ -303,9 +303,15 @@ class TestOffOnPair:
 # default-off public-API addition. Later extended with EmbeddingGenerationError,
 # the typed error surfaced by the additive ingest-ergonomics / embedding-
 # robustness surface (bulk_store / get_or_create / upsert_by_hash + the opt-in
-# require_embedding fail-fast), also additive and default-off.
+# require_embedding fail-fast), also additive and default-off. Later extended
+# with ActionNotFoundError (raised by the new update_action lifecycle write) and
+# ActionOutcomeSignal (the action-outcome dreaming signal) — the additive,
+# default-off action-outcome feedback surface (inactive in any store that never
+# records a terminal action outcome).
 _PRE_WS_ALL_BASELINE = frozenset(
     {
+        "ActionNotFoundError",
+        "ActionOutcomeSignal",
         "ActionRecord",
         "ActionStatus",
         "ActionType",

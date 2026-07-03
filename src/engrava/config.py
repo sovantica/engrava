@@ -40,8 +40,18 @@ _DEFAULT_DREAMING_SIGNALS: dict[str, float] = {
     "confirmation": 0.20,
     "confidence": 0.15,
     "frequency": 0.20,
+    "action_outcome": 0.15,
 }
-"""Default dreaming signal weights (CoreThoughtRecord fields only)."""
+"""Default dreaming signal weights (CoreThoughtRecord fields only).
+
+The six weights intentionally sum to more than 1.0. The scoring path
+renormalises over the signals that are *active* for a given run (an inactive
+signal — one whose data source is flat across the candidate pool — is dropped
+from the denominator), so the configured map is a set of relative priorities,
+not a probability distribution. In particular ``action_outcome`` is inactive in
+an action-free store, so the remaining five renormalise exactly as before this
+signal existed.
+"""
 
 
 # ------------------------------------------------------------------
@@ -248,7 +258,10 @@ class DreamingConfig:
         enabled: Whether dreaming consolidation is active.
         schedule_every_n_cycles: Consolidation cadence.
         promote_threshold: Weighted-score cutoff for promotion.
-        signals: Mapping of signal name to weight (must sum to ~1.0).
+        signals: Mapping of signal name to weight. Relative priorities, not
+            a probability distribution — the scoring path renormalises over
+            the signals active for each run, so the map need not sum to 1.0
+            (the shipped defaults sum to 1.15).
         gates: Gate thresholds for candidate filtering.
         candidates_limit: Maximum thoughts per consolidation pass.
         edges: Configuration for dream-created edges.
@@ -449,10 +462,17 @@ class DreamingConfig:
                 ``percept``/``utterance``/``thought`` enum.
 
         """
+        # Signal weights are relative priorities, not a probability
+        # distribution: the scoring path renormalises over the signals active
+        # for each run (see DreamingExtension._compute_active_weights), so the
+        # configured map need not sum to exactly 1.0 — the six shipped defaults
+        # deliberately sum to 1.15. The warning therefore flags only a sum far
+        # enough from the ~1.0 scale that a typo (a near-zero or an inflated
+        # map) is the likely cause, not a legitimately weighted set.
         weight_sum = sum(self.signals.values())
-        if abs(weight_sum - 1.0) > 0.05:  # noqa: PLR2004
+        if not 0.5 <= weight_sum <= 1.5:  # noqa: PLR2004
             logger.warning(
-                "Dreaming signal weights sum to %.3f (expected ~1.0); "
+                "Dreaming signal weights sum to %.3f (expected roughly 1.0); "
                 "scoring may behave unexpectedly",
                 weight_sum,
             )

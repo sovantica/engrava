@@ -50,6 +50,19 @@ class ThoughtNotFoundError(EngravaError):
         super().__init__(f"Thought not found: {thought_id}")
 
 
+class ActionNotFoundError(EngravaError):
+    """Raised when an action record is not found.
+
+    Args:
+        action_id: The ID that was not found.
+
+    """
+
+    def __init__(self, action_id: str) -> None:
+        self.action_id = action_id
+        super().__init__(f"Action not found: {action_id}")
+
+
 class StaleDataError(EngravaError):
     """Raised when an optimistic-concurrency check fails.
 
