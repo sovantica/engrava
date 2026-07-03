@@ -70,10 +70,12 @@ Walking the journey:
    a pile of observations into fewer, higher-level memories. (A REFLECTION whose
    source cluster later leaves the active set is automatically retired so a stale
    summary can't resurface.)
-6. **Improved retrieval.** All of this changes future
-   [hybrid search](search.md): the P1 memory ranks higher via the priority
-   signal, any new edges feed the opt-in graph signal, and reflections let one
-   high-level memory stand in for many raw ones.
+6. **How it shows up in retrieval.** All of this changes future
+   [hybrid search](search.md) *mechanically*: the P1 memory ranks higher via the
+   priority signal, any new edges feed the opt-in graph signal, and reflections
+   let one high-level memory stand in for many raw ones. These are deterministic
+   ranking effects — Engrava makes **no claim that dreaming improves retrieval
+   accuracy** on any benchmark (see [Known Limitations](known-limitations.md)).
 
 The rest of this page is the knob-by-knob reference for each phase.
 
