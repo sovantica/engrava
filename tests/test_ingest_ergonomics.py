@@ -823,6 +823,44 @@ async def test_bulk_store_strict_embed_failure_rolls_back(
     assert await _count(db, "SELECT COUNT(*) FROM embedding") == 0
 
 
+async def test_update_reembed_failure_warns_and_propagates_by_default(
+    db: aiosqlite.Connection,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A re-embed failure on ``update_thought`` warns (naming the id) and propagates.
+
+    Editing essence/content re-embeds. The create path's no-silent-skip
+    guarantee must hold on the update path too — and the torn write is worse
+    here (the row previously *had* a valid embedding, now left stale).
+    """
+    store = await _embedding_store(db, _SpyProvider())  # working provider first
+    await store.create_thought(_thought("t-upd-warn"))
+    assert await _count(db, "SELECT COUNT(*) FROM embedding") == 1
+
+    store._embedding_provider = _FailingProvider()  # provider goes offline
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(RuntimeError, match="provider offline"),
+    ):
+        await store.update_thought("t-upd-warn", content="new content forces a re-embed")
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("t-upd-warn" in r.getMessage() for r in warnings)
+
+
+async def test_update_reembed_failure_raises_typed_under_strict(
+    db: aiosqlite.Connection,
+) -> None:
+    """``require_embedding=True``: a re-embed failure on update raises the typed error."""
+    store = await _embedding_store(db, _SpyProvider(), require_embedding=True)
+    await store.create_thought(_thought("t-upd-strict"))
+
+    store._embedding_provider = _FailingProvider()
+    with pytest.raises(EmbeddingGenerationError) as exc_info:
+        await store.update_thought("t-upd-strict", content="new content forces a re-embed")
+    assert exc_info.value.thought_id == "t-upd-strict"
+
+
 # ---------------------------------------------------------------------------
 # Additive / no-regression: existing behaviour unchanged
 # ---------------------------------------------------------------------------
