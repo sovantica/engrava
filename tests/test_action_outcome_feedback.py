@@ -441,6 +441,27 @@ class TestRecomputeFiring:
         assert t is not None
         assert t.action_outcome_score == 0.5  # mean of 1.0 and 0.0
 
+    async def test_mean_excludes_non_terminal_actions(self, store: SqliteEngravaCore) -> None:
+        """A non-terminal action is excluded from the denominator, not counted as 0."""
+        await store.create_thought(_thought())
+        await store.create_action(
+            _action(
+                "ok",
+                status=ActionStatus.CONFIRMED,
+                verification_status=VerificationStatus.CONFIRMED,
+            )
+        )
+        await store.create_action(
+            _action(
+                "bad", status=ActionStatus.FAILED, verification_status=VerificationStatus.FAILED
+            )
+        )
+        await store.create_action(_action("pending", status=ActionStatus.PLANNED))  # excluded
+        t = await store.get_thought("t-001")
+        assert t is not None
+        # Mean of the two TERMINAL outcomes only (1.0, 0.0) -> 0.5; PLANNED is not a 0.
+        assert t.action_outcome_score == 0.5
+
     async def test_score_none_when_no_terminal_actions(self, store: SqliteEngravaCore) -> None:
         await store.create_thought(_thought())
         await store.create_action(_action("a", status=ActionStatus.PLANNED))
@@ -505,6 +526,35 @@ class TestJournaling:
         )
         kinds = [r[0] for r in await cursor.fetchall()]
         assert kinds[-2:] == ["UPDATE_ACTION", "UPDATE_THOUGHT"]
+
+    async def test_verification_change_on_non_terminal_action_does_not_recompute(
+        self, jstore: SqliteEngravaCore
+    ) -> None:
+        """A premature verification mark on a non-terminal action is harmless.
+
+        Setting ``verification_status`` on a PLANNED action is allowed but must
+        not fire a recompute: the action is non-terminal and contributes nothing
+        to the mean, so only the ``UPDATE_ACTION`` is journaled (no spurious
+        ``UPDATE_THOUGHT``) and the score stays ``None``. Guards the
+        ``verifies_terminal`` terminal-status check.
+        """
+        await jstore.create_thought(_thought())
+        await jstore.create_action(_action("a", status=ActionStatus.PLANNED))
+        before = await _journal_len(jstore)
+
+        await jstore.update_action("a", verification_status=VerificationStatus.CONFIRMED)
+
+        # Only the UPDATE_ACTION — no recompute UPDATE_THOUGHT.
+        assert await _journal_len(jstore) == before + 1
+        cursor = await jstore._db.execute(
+            "SELECT mutation_type FROM journal_entry ORDER BY sequence_number DESC LIMIT 1"
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == "UPDATE_ACTION"
+        t = await jstore.get_thought("t-001")
+        assert t is not None
+        assert t.action_outcome_score is None
 
     async def test_clean_chain_verifies(self, jstore: SqliteEngravaCore) -> None:
         await jstore.create_thought(_thought())
@@ -758,7 +808,10 @@ class TestActionUsingPromotion:
 class TestSchema:
     """core-16 migration: column, seek index, idempotency, version, cascade."""
 
-    async def test_fresh_db_is_v16(self, store: SqliteEngravaCore) -> None:
+    async def test_fresh_db_is_at_head_version(self, store: SqliteEngravaCore) -> None:
+        # A fresh DB is stamped at the head schema version. core-16 is this
+        # feature's migration; later migrations (provenance, hygiene) stack on
+        # top, so head is 18.
         cursor = await store._db.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
