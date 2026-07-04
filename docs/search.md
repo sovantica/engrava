@@ -270,6 +270,37 @@ unchanged.
   `collapse_key` is not score-neutral even though the collapse step itself never
   mutates a score. Only `collapse_key=None` is byte-identical to a plain query.
 
+**Keeping more than one row per unit (`collapse_max_per_unit`).** By default
+collapse keeps a *single* best row per unit. When a unit is genuinely a long,
+multi-part thing — say one long turn split into several chunks whose useful
+detail is spread across more than the top chunk — dropping every chunk but the
+best one can discard the part you actually need. The optional, keyword-only
+`collapse_max_per_unit` sets how many of a unit's highest-ranked rows may reach
+the result, so a long unit can keep its deeper rows while the remaining slots
+still backfill deeper *distinct* units:
+
+```python
+# Keep up to 2 rows of each unit; distinct deeper units still backfill.
+result = await store.search_hybrid(
+    "rollout decision",
+    top_k=20,
+    collapse_key="$.turn_id",
+    collapse_max_per_unit=2,
+)
+```
+
+- `None` (the default) keeps exactly one best row per unit — identical to
+  passing only `collapse_key`. An integer `>= 1` keeps up to that many of a
+  unit's highest-ranked rows; `1` is the single-best-row default.
+- It only takes effect together with `collapse_key` (there is no unit to
+  retain by otherwise), and is validated at call time — a value below `1` raises
+  `InvalidFilterError`.
+- It only relaxes the per-unit retention count. It never adds a row a search arm
+  did not produce, never mutates a score, and never merges or drops a *distinct*
+  unit as a side effect; the usual `top_k` truncation still applies, so distinct
+  units beyond `top_k` are dropped exactly as they are without it. Key-less rows
+  are unaffected — each is already its own unit.
+
 > **Collapse is a presentation convenience, not a filter and not an isolation
 > boundary.** It does not change which rows are *eligible* (use `filters` /
 > `visibility` for that). The collapse step itself mutates no score — it only
