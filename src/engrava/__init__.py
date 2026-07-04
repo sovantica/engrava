@@ -6,6 +6,7 @@ from engrava.config import (
     DreamingGates,
     EmbeddingConfig,
     EngravaConfig,
+    HygienePolicyConfig,
     JournalConfig,
     MetricsConfig,
     SearchConfig,
@@ -99,6 +100,7 @@ from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
 from engrava.infrastructure.read_only_store import ReadOnlyEngrava
 from engrava.infrastructure.service_manager import EngravaManager
 from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
+from engrava.infrastructure.sqlite.hygiene import EvictionReason, HygieneResult
 from engrava.infrastructure.sqlite.journal_writer import JournalWriter
 from engrava.metadata import percept, thought, utterance
 from engrava.mindql.executor import MindQLExecutor, MindQLResult
@@ -140,6 +142,7 @@ __all__ = [
     "EngravaHooksProtocol",
     "EngravaManager",
     "EngravaMetrics",
+    "EvictionReason",
     "ExtensionManifest",
     "ExtensionMigrationError",
     "FieldOp",
@@ -147,6 +150,8 @@ __all__ = [
     "FrequencySignal",
     "HuggingFaceProvider",
     "HybridSearchResult",
+    "HygienePolicyConfig",
+    "HygieneResult",
     "InvalidFilterError",
     "InvalidFilterPathError",
     "InvalidTransitionError",

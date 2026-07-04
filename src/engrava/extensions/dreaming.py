@@ -48,14 +48,6 @@ logger = logging.getLogger(__name__)
 _VECTORIZED_CLUSTERING_CHUNK_SIZE = 10_000
 
 
-# Page size for the orphan-REFLECTION sweep. The sweep must inspect *every*
-# ACTIVE REFLECTION (the retire contract is "for each ACTIVE REFLECTION"), so it
-# walks the full set one page at a time rather than relying on a single capped
-# page. Exposed as a module constant so tests can shrink it to exercise the
-# multi-page path on small synthetic inputs.
-_ORPHAN_SWEEP_PAGE_SIZE = 500
-
-
 # ------------------------------------------------------------------
 # Result value object
 # ------------------------------------------------------------------
@@ -353,40 +345,13 @@ class DreamingExtension:
     async def _sweep_orphan_reflections(self, store: SqliteEngravaCore) -> int:
         """Retire REFLECTIONs whose entire source cluster has left ACTIVE.
 
-        A REFLECTION is a derived synthesis of a live cluster. Once **every**
-        thought it was consolidated from is no longer ``ACTIVE`` (all
-        ``ARCHIVED``/``DONE`` — i.e. the synthesis now summarizes nothing
-        live), the REFLECTION is retired ``ACTIVE -> ARCHIVED`` so ordinary
-        ``gc`` can reclaim it (cascading its centroid embedding and
-        ``CONSOLIDATED_FROM`` edges).
-
-        **Full coverage.** The sweep inspects *every* ACTIVE REFLECTION, not
-        just the first page. ``list_thoughts`` orders by ``updated_cycle DESC``
-        and is capped per call, so a long-untouched orphan (low
-        ``updated_cycle``) can fall beyond a single capped page and never be
-        seen. To honour the "for each ACTIVE REFLECTION" contract regardless of
-        how many REFLECTIONs exist, the candidate set is collected by walking
-        successive pages (``limit``/``offset``) until a short page is returned.
-
-        **Collect-then-retire ordering.** All candidate ids are gathered into a
-        list *first*, and only then retired in a second pass. Retiring flips a
-        REFLECTION ``ACTIVE -> ARCHIVED``, which drops it out of the
-        ``lifecycle_status="ACTIVE"`` filter; mutating during pagination would
-        shift every later page's offset and silently skip rows. Collecting the
-        full set against a stable filter before any mutation avoids that
-        offset drift. Ids are de-duplicated defensively against ties in the
-        non-total ``updated_cycle`` ordering crossing a page boundary.
-
-        Guards:
-
-        * **100% threshold** — a REFLECTION with at least one still-ACTIVE
-          source is kept; the synthesis still summarizes live members.
-        * **At least one source** — a REFLECTION with zero
-          ``CONSOLIDATED_FROM`` edges (defensive: malformed/legacy) is never
-          retired by an all-non-ACTIVE rule firing over an empty set.
-
-        The check is a deterministic set query over each candidate's source
-        lifecycle statuses — no model call.
+        Thin delegation to the store-owned
+        :meth:`~engrava.infrastructure.sqlite.engrava_core.SqliteEngravaCore.retire_orphan_reflections`,
+        which is the single shared implementation (also used by the Memory
+        Hygiene GC stage). Orphan retirement is a store maintenance operation —
+        it reads and writes only lifecycle / edge state through public store
+        methods — so it lives on the store; this wrapper preserves the
+        consolidation call-site.
 
         Args:
             store: The store to sweep.
@@ -395,47 +360,7 @@ class DreamingExtension:
             Number of REFLECTIONs retired during this sweep.
 
         """
-        from engrava.domain.enums import LifecycleStatus  # noqa: PLC0415
-
-        # Phase 1 — collect EVERY ACTIVE REFLECTION id by paginating the full
-        # set. Done before any mutation so the ACTIVE filter stays stable and
-        # offsets do not drift (see the docstring's collect-then-retire note).
-        candidate_ids: list[str] = []
-        seen: set[str] = set()
-        offset = 0
-        while True:
-            page = await store.list_thoughts(
-                thought_type="REFLECTION",
-                lifecycle_status="ACTIVE",
-                limit=_ORPHAN_SWEEP_PAGE_SIZE,
-                offset=offset,
-            )
-            for reflection in page:
-                if reflection.thought_id not in seen:
-                    seen.add(reflection.thought_id)
-                    candidate_ids.append(reflection.thought_id)
-            if len(page) < _ORPHAN_SWEEP_PAGE_SIZE:
-                # Short (or empty) page -> the full set has been read.
-                break
-            offset += _ORPHAN_SWEEP_PAGE_SIZE
-
-        # Phase 2 — retire orphans. Safe to mutate now that the full candidate
-        # set is materialized.
-        retired = 0
-        for reflection_id in candidate_ids:
-            source_statuses = await store.consolidated_source_statuses(reflection_id)
-            # Require >= 1 source AND 100% of them non-ACTIVE.
-            if not source_statuses:
-                continue
-            if any(status == LifecycleStatus.ACTIVE.value for status in source_statuses):
-                continue
-            await store.update_thought(
-                reflection_id,
-                lifecycle_status=LifecycleStatus.ARCHIVED,
-            )
-            retired += 1
-
-        return retired
+        return await store.retire_orphan_reflections()
 
     def _compute_active_weights(
         self,

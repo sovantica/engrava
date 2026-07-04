@@ -108,6 +108,20 @@ class ThoughtRecord(BaseModel):
             hint, never identity, authentication, or authorization** — the
             engine grants it zero authority and consults it for no access,
             ranking, or consolidation decision.
+        pinned: Durable keep-intent marker.  When ``True`` the thought is
+            **never** auto-archived or auto-garbage-collected by the Memory
+            Hygiene forgetting loop, regardless of its keep-score.  Defaults to
+            ``False`` so every existing construction site and stored row is
+            unchanged.  ``pinned`` is the node-level never-forget flag;
+            ``confidence`` is explicitly *not* protection (a model-confidence
+            estimate is not a user keep-decision).
+        archived_at_cycle: The cognitive cycle at which the Memory Hygiene loop
+            archived this thought, or ``None`` when it was not archived by
+            hygiene.  Only hygiene sets it; a restore (un-archive) clears it back
+            to ``None``.  It backs the garbage-collection restore window
+            (``current_cycle - archived_at_cycle >= gc_min_archive_age_cycles``),
+            so a thought archived by any other path (TTL / manual) keeps
+            ``None`` and is never reaped by hygiene GC.  Defaults to ``None``.
 
     Examples:
         >>> thought = ThoughtRecord(
@@ -153,6 +167,8 @@ class ThoughtRecord(BaseModel):
     valid_until: str | None = None
     metadata: dict[str, MetadataValue] = Field(default_factory=dict)
     provenance: ProvenanceContext | None = Field(default=None)
+    pinned: bool = False
+    archived_at_cycle: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def _validate_cycle_ordering(self) -> Self:

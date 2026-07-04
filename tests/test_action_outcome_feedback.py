@@ -762,7 +762,7 @@ class TestSchema:
         cursor = await store._db.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert int(row[0]) == 17
+        assert int(row[0]) == 18
 
     async def test_column_and_index_present(self, store: SqliteEngravaCore) -> None:
         cursor = await store._db.execute("PRAGMA table_info(thought)")
@@ -783,7 +783,7 @@ class TestSchema:
             cursor = await conn.execute("PRAGMA user_version")
             row = await cursor.fetchone()
             assert row is not None
-            assert int(row[0]) == 17
+            assert int(row[0]) == 18
             # Column added exactly once (no duplicate-column crash on re-run).
             cursor = await conn.execute("PRAGMA table_info(thought)")
             names = [r["name"] for r in await cursor.fetchall()]
@@ -822,7 +822,7 @@ class TestSchema:
             cursor = await conn.execute("PRAGMA user_version")
             row = await cursor.fetchone()
             assert row is not None
-            assert int(row[0]) == 17
+            assert int(row[0]) == 18
             cursor = await conn.execute("PRAGMA table_info(thought)")
             cols = {r["name"] for r in await cursor.fetchall()}
             assert "action_outcome_score" in cols

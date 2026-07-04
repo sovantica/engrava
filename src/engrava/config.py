@@ -53,6 +53,27 @@ an action-free store, so the remaining five renormalise exactly as before this
 signal existed.
 """
 
+_DEFAULT_HYGIENE_SIGNALS: dict[str, float] = {
+    "recency": 0.30,
+    "frequency": 0.25,
+    "confirmation": 0.20,
+    "confidence": 0.15,
+    "staleness": 0.10,
+}
+"""Default keep-score signal weights for the Memory Hygiene loop.
+
+These five weights sum to ``1.0`` and are deliberately **distinct** from the
+dreaming promotion weights: hygiene carries its own weight vector and threshold
+so a change to one loop's tuning never silently perturbs the other, even though
+both read the same signal library. The weights are relative priorities, not a
+probability distribution — the keep-score path renormalises over the signals
+that are *active* for a given run (an inactive signal, one whose data source is
+flat across the candidate pool, is dropped from the denominator), mirroring the
+active-signal redistribution the dreaming scorer uses. A high keep-score marks a
+thought as worth retaining; a low keep-score (times the decay multiplier) is
+what drives an archive.
+"""
+
 
 # ------------------------------------------------------------------
 # Value objects
@@ -513,6 +534,160 @@ class DreamingConfig:
 
 
 @dataclass(frozen=True)
+class HygienePolicyConfig:
+    """Configuration for the deterministic Memory Hygiene forgetting loop.
+
+    Memory Hygiene is the subtractive counterpart to dreaming consolidation: a
+    deterministic, no-LLM, **opt-in** pass that archives cold/low-value thoughts
+    (and, separately opt-in, garbage-collects them after a restore window). It
+    reuses the dreaming signal library to compute a per-thought *keep-score*,
+    multiplies it by the ``decay_function`` hook, and archives thoughts whose
+    resulting *eviction-score* falls below ``eviction_threshold`` — unless the
+    thought is protected.
+
+    The whole capability is **default-OFF** (``enabled=False``): a store that
+    never enables it behaves exactly as before on every read/write path. The
+    default action is a **reversible archive**; physical deletion (GC) is a
+    second, independently opted-in stage (``auto_gc_enabled``) gated behind a
+    restore window.
+
+    Every default is chosen to fail *safe* (keep) rather than aggressive
+    (evict): a low threshold, top-priority protection on by default, a bounded
+    per-run eviction cap, a restore window before any deletion, a dry-run
+    preview mode, and a non-finite-decay fallback that can only ever keep.
+
+    Attributes:
+        enabled: Whether the hygiene pass runs. Default ``False`` — the whole
+            capability is inert until explicitly turned on, so an existing store
+            is unaffected.
+        eviction_threshold: Eviction-score cutoff (in ``[0.0, 1.0]``). A thought
+            is a candidate for archival when its ``eviction_score`` (keep-score
+            times decay) is strictly below this value and it is not protected.
+            Default ``0.20`` — a deliberately *low* bar so only clearly cold and
+            low-value thoughts fall beneath it.
+        protected_priorities: Priorities that are never auto-archived or
+            auto-GC'd regardless of score. Default ``("P1",)`` — the top tier,
+            where wrongly forgetting is the high-cost error. Config-tunable; set
+            to ``()`` for more aggressive hygiene. This is a *default*, not an
+            invariant (pinning is the invariant — see ``pinned`` on the thought
+            model).
+        signal_weights: Keep-score signal weights (relative priorities, not a
+            probability distribution). Defaults to the hygiene weight vector
+            (``recency 0.30, frequency 0.25, confirmation 0.20, confidence 0.15,
+            staleness 0.10``). The keep-score renormalises over the signals
+            *active* for a run, so a partial override merges onto the defaults.
+        check_every_n_cycles: Cadence gate for the *convenience* invocation from
+            ``consolidate()`` — the pass runs there only when
+            ``current_cycle % check_every_n_cycles == 0``. An explicit
+            ``run_hygiene`` call bypasses the cadence entirely. Default ``1``
+            (every cycle). Must be ``>= 1``.
+        max_evictions_per_run: Upper bound on the number of thoughts each stage
+            may act on per run (at most this many archived, and at most this
+            many GC'd). Bounds blast radius and runtime. When more candidates
+            qualify than the cap allows, the selected set is deterministic and
+            stable. Default ``100``. Must be ``>= 1``.
+        auto_gc_enabled: Whether the second (physical-delete) stage runs.
+            Default ``False`` — enabling hygiene must never implicitly enable
+            deletion. When ``False`` the pass only ever archives (fully
+            reversible).
+        gc_min_archive_age_cycles: The restore window, in cycles. A
+            hygiene-archived thought is GC-eligible only once
+            ``current_cycle - archived_at_cycle >= gc_min_archive_age_cycles``.
+            Computed from the explicit ``archived_at_cycle`` column, so a thought
+            archived by another path (TTL / manual, ``archived_at_cycle`` is
+            ``None``) is never auto-GC'd. Default ``10``. Must be ``>= 0``.
+        dry_run: When ``True`` the pass computes and returns the would-evict set
+            (with per-thought eviction reasons) **without mutating anything and
+            without journaling** — a safe preview before enabling for real.
+            Default ``False``.
+
+    Examples:
+        >>> cfg = HygienePolicyConfig(enabled=True, eviction_threshold=0.15)
+        >>> cfg.eviction_threshold
+        0.15
+        >>> HygienePolicyConfig().enabled
+        False
+
+    """
+
+    enabled: bool = False
+    eviction_threshold: float = 0.20
+    protected_priorities: tuple[str, ...] = ("P1",)
+    signal_weights: dict[str, float] = field(
+        default_factory=lambda: dict(_DEFAULT_HYGIENE_SIGNALS),
+    )
+    check_every_n_cycles: int = 1
+    max_evictions_per_run: int = 100
+    auto_gc_enabled: bool = False
+    gc_min_archive_age_cycles: int = 10
+    dry_run: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate field invariants on construction.
+
+        The YAML loader (:func:`_parse_hygiene`) performs the same checks
+        before reaching this dataclass — the duplication is intentional so a
+        direct ``HygienePolicyConfig(...)`` call from Python raises the same
+        errors a malformed YAML would, instead of silently accepting an
+        out-of-range value that would later mis-drive eviction.
+
+        Raises:
+            TypeError: When ``eviction_threshold`` is not a real number, or a
+                ``protected_priorities`` / ``signal_weights`` entry has the
+                wrong type.
+            ValueError: When ``eviction_threshold`` is outside ``[0.0, 1.0]``,
+                ``check_every_n_cycles`` or ``max_evictions_per_run`` is ``< 1``,
+                or ``gc_min_archive_age_cycles`` is ``< 0``.
+
+        """
+        # ``bool`` is an ``int`` subclass; reject it explicitly so ``True`` /
+        # ``False`` cannot impersonate ``1.0`` / ``0.0`` for the threshold.
+        if isinstance(self.eviction_threshold, bool) or not isinstance(
+            self.eviction_threshold,
+            (int, float),
+        ):
+            msg = "HygienePolicyConfig.eviction_threshold must be a float in [0.0, 1.0]"
+            raise TypeError(msg)
+        if not 0.0 <= self.eviction_threshold <= 1.0:
+            msg = "HygienePolicyConfig.eviction_threshold must be a float in [0.0, 1.0]"
+            raise ValueError(msg)
+        self._validate_collections()
+        if self.check_every_n_cycles < 1:
+            msg = "HygienePolicyConfig.check_every_n_cycles must be >= 1"
+            raise ValueError(msg)
+        if self.max_evictions_per_run < 1:
+            msg = "HygienePolicyConfig.max_evictions_per_run must be >= 1"
+            raise ValueError(msg)
+        if self.gc_min_archive_age_cycles < 0:
+            msg = "HygienePolicyConfig.gc_min_archive_age_cycles must be >= 0"
+            raise ValueError(msg)
+
+    def _validate_collections(self) -> None:
+        """Validate the ``protected_priorities`` and ``signal_weights`` entries.
+
+        Split out of :meth:`__post_init__` to keep each method's branch count
+        within the linter's complexity budget while preserving the same
+        direct-construction guards the YAML loader also applies.
+
+        Raises:
+            TypeError: When a ``protected_priorities`` entry is not a string, or
+                a ``signal_weights`` key is not a string / value is not numeric.
+
+        """
+        for priority in self.protected_priorities:
+            if not isinstance(priority, str):
+                msg = "HygienePolicyConfig.protected_priorities entries must be strings"
+                raise TypeError(msg)
+        for name, weight in self.signal_weights.items():
+            if not isinstance(name, str):
+                msg = "HygienePolicyConfig.signal_weights keys must be strings"
+                raise TypeError(msg)
+            if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+                msg = f"HygienePolicyConfig.signal_weights[{name!r}] must be numeric"
+                raise TypeError(msg)
+
+
+@dataclass(frozen=True)
 class EmbeddingConfig:
     """Configuration for the built-in embedding provider.
 
@@ -834,6 +1009,9 @@ class EngravaConfig:
             (compact ``vec0`` vector table — faster brute-force KNN, not ANN).
         embedding_dimension: Dimension of embedding vectors (e.g. 384 for MiniLM).
         dreaming: Optional dreaming-consolidation configuration.
+        hygiene_policy: Optional Memory Hygiene (deterministic forgetting)
+            configuration. ``None`` (default) or ``enabled=False`` leaves every
+            existing read/write path unchanged — the forgetting loop never runs.
         embeddings: Optional embedding-provider configuration.
         search: Hybrid search default weights.
         services: Optional multi-service configuration.
@@ -864,6 +1042,7 @@ class EngravaConfig:
     vector_backend: str = "numpy"
     embedding_dimension: int = 384
     dreaming: DreamingConfig | None = None
+    hygiene_policy: HygienePolicyConfig | None = None
     embeddings: EmbeddingConfig | None = None
     search: SearchConfig = field(default_factory=SearchConfig)
     services: ServicesConfig | None = None
@@ -980,6 +1159,9 @@ def _parse_config(raw: dict[str, Any]) -> EngravaConfig:
 
     dreaming_cfg = _parse_dreaming(ext_section.get("dreaming"))
 
+    # Memory Hygiene (deterministic forgetting) section.
+    hygiene_cfg = _parse_hygiene(raw.get("hygiene_policy"))
+
     # Embeddings section
     embeddings_cfg = _parse_embeddings(raw.get("embeddings"))
 
@@ -1017,6 +1199,7 @@ def _parse_config(raw: dict[str, Any]) -> EngravaConfig:
         vector_backend=vector_backend,
         embedding_dimension=embedding_dimension,
         dreaming=dreaming_cfg,
+        hygiene_policy=hygiene_cfg,
         embeddings=embeddings_cfg,
         search=search_cfg,
         services=services_cfg,
@@ -1456,6 +1639,161 @@ def _parse_dreaming_nonneg_int(raw: dict[str, Any], key: str, default: int) -> i
         msg = f"'extensions.dreaming.{key}' must be a non-negative integer"
         raise ConfigError(msg)
     return value
+
+
+def _parse_hygiene(raw: Any) -> HygienePolicyConfig | None:  # noqa: ANN401
+    """Parse the ``hygiene_policy:`` YAML section (deterministic forgetting).
+
+    Uses the same defensive machinery as :func:`_parse_dreaming` (bool-vs-number
+    guards, range checks, partial-override merge for the weight map), so a
+    malformed config is rejected with a typed :class:`ConfigError` at load time
+    rather than mis-driving eviction later.
+
+    Args:
+        raw: Raw YAML value for the ``hygiene_policy`` section (dict or None).
+
+    Returns:
+        Parsed :class:`HygienePolicyConfig`, or ``None`` when the section is
+        absent (the forgetting loop is then entirely inert).
+
+    Raises:
+        ConfigError: On invalid field types or values.
+
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        msg = "'hygiene_policy' must be a mapping"
+        raise ConfigError(msg)
+
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        msg = "'hygiene_policy.enabled' must be a boolean"
+        raise ConfigError(msg)
+
+    eviction_threshold = raw.get("eviction_threshold", 0.20)
+    if (
+        isinstance(eviction_threshold, bool)
+        or not isinstance(eviction_threshold, (int, float))
+        or not 0.0 <= eviction_threshold <= 1.0
+    ):
+        msg = "'hygiene_policy.eviction_threshold' must be a float in [0.0, 1.0]"
+        raise ConfigError(msg)
+
+    protected_priorities = _parse_protected_priorities(raw.get("protected_priorities"))
+
+    signal_weights = _parse_hygiene_signal_weights(raw.get("signal_weights"))
+
+    check_every_n_cycles = raw.get("check_every_n_cycles", 1)
+    if (
+        isinstance(check_every_n_cycles, bool)
+        or not isinstance(check_every_n_cycles, int)
+        or check_every_n_cycles < 1
+    ):
+        msg = "'hygiene_policy.check_every_n_cycles' must be a positive integer"
+        raise ConfigError(msg)
+
+    max_evictions_per_run = raw.get("max_evictions_per_run", 100)
+    if (
+        isinstance(max_evictions_per_run, bool)
+        or not isinstance(max_evictions_per_run, int)
+        or max_evictions_per_run < 1
+    ):
+        msg = "'hygiene_policy.max_evictions_per_run' must be a positive integer"
+        raise ConfigError(msg)
+
+    auto_gc_enabled = raw.get("auto_gc_enabled", False)
+    if not isinstance(auto_gc_enabled, bool):
+        msg = "'hygiene_policy.auto_gc_enabled' must be a boolean"
+        raise ConfigError(msg)
+
+    gc_min_archive_age_cycles = raw.get("gc_min_archive_age_cycles", 10)
+    if (
+        isinstance(gc_min_archive_age_cycles, bool)
+        or not isinstance(gc_min_archive_age_cycles, int)
+        or gc_min_archive_age_cycles < 0
+    ):
+        msg = "'hygiene_policy.gc_min_archive_age_cycles' must be a non-negative integer"
+        raise ConfigError(msg)
+
+    dry_run = raw.get("dry_run", False)
+    if not isinstance(dry_run, bool):
+        msg = "'hygiene_policy.dry_run' must be a boolean"
+        raise ConfigError(msg)
+
+    return HygienePolicyConfig(
+        enabled=enabled,
+        eviction_threshold=float(eviction_threshold),
+        protected_priorities=protected_priorities,
+        signal_weights=signal_weights,
+        check_every_n_cycles=check_every_n_cycles,
+        max_evictions_per_run=max_evictions_per_run,
+        auto_gc_enabled=auto_gc_enabled,
+        gc_min_archive_age_cycles=gc_min_archive_age_cycles,
+        dry_run=dry_run,
+    )
+
+
+def _parse_protected_priorities(raw: object) -> tuple[str, ...]:
+    """Parse ``hygiene_policy.protected_priorities`` (defaults to ``("P1",)``).
+
+    Args:
+        raw: Raw YAML value — a list of priority strings, an explicit empty
+            list (meaning *no* priority is protected), or ``None`` (absent →
+            the ``("P1",)`` default).
+
+    Returns:
+        Tuple of validated priority strings.
+
+    Raises:
+        ConfigError: When the value is not a list of strings.
+
+    """
+    if raw is None:
+        return ("P1",)
+    if not isinstance(raw, (list, tuple)):
+        msg = "'hygiene_policy.protected_priorities' must be a list of priority strings"
+        raise ConfigError(msg)
+    values: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            msg = "'hygiene_policy.protected_priorities' entries must be strings"
+            raise ConfigError(msg)
+        values.append(entry)
+    return tuple(values)
+
+
+def _parse_hygiene_signal_weights(raw: object) -> dict[str, float]:
+    """Parse ``hygiene_policy.signal_weights`` merging onto the hygiene defaults.
+
+    A partial mapping MERGES onto the defaults so overriding one weight does not
+    silently zero the others; an absent section keeps the full default vector.
+
+    Args:
+        raw: Raw YAML value — a mapping of signal name to weight, or ``None``.
+
+    Returns:
+        The merged weight mapping.
+
+    Raises:
+        ConfigError: When the value is not a mapping of string to number.
+
+    """
+    merged = dict(_DEFAULT_HYGIENE_SIGNALS)
+    if raw is None:
+        return merged
+    if not isinstance(raw, dict):
+        msg = "'hygiene_policy.signal_weights' must be a mapping of name→weight"
+        raise ConfigError(msg)
+    for name, weight in raw.items():
+        if not isinstance(name, str):
+            msg = f"Signal name must be a string, got {type(name).__name__}"
+            raise ConfigError(msg)
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+            msg = f"'hygiene_policy.signal_weights[{name!r}]' must be numeric"
+            raise ConfigError(msg)
+        merged[name] = float(weight)
+    return merged
 
 
 def _parse_edge_creation(raw: object) -> EdgeCreationConfig:

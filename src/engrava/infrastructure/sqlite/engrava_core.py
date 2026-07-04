@@ -61,13 +61,20 @@ from engrava.domain.models.thought import MetadataValue, ThoughtRecord
 from engrava.domain.models.ttl import CleanupResult, CleanupStrategy
 from engrava.domain.protocols.embedding_provider import RoleAwareEmbeddingProvider
 from engrava.domain.protocols.hooks import DefaultEngravaHooks, EngravaHooksProtocol
+from engrava.extensions.dreaming_signals import DreamingContext
 from engrava.infrastructure.sqlite.centroid import CENTROID_MODEL_NAME, compute_centroid
+from engrava.infrastructure.sqlite.hygiene import (
+    EvictionReason,
+    HygieneResult,
+    compute_active_hygiene_weights,
+    compute_keep_score,
+)
 from engrava.infrastructure.sqlite.journal_writer import JournalWriter
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Sequence
 
-    from engrava.config import MetricsConfig, SearchConfig
+    from engrava.config import HygienePolicyConfig, MetricsConfig, SearchConfig
     from engrava.domain.manifest import ExtensionManifest
     from engrava.domain.models.filters import MetadataFilter, VisibilityQueryFilter
     from engrava.domain.models.metrics import EngravaMetrics, LatencyHistogram
@@ -80,6 +87,16 @@ if TYPE_CHECKING:
     from engrava.mindql.parser import MindQLQuery
 
 logger = logging.getLogger(__name__)
+
+#: Page size for the full-table paginated scans that must inspect *every*
+#: matching row rather than relying on a single capped page: the
+#: orphan-REFLECTION sweep (:meth:`SqliteEngravaCore.retire_orphan_reflections`,
+#: contract "for each ACTIVE REFLECTION") and the Memory Hygiene candidate scan
+#: (:meth:`SqliteEngravaCore._hygiene_candidates`, which must score the whole
+#: ACTIVE/CREATED pool so the coldest thoughts — not an arbitrary page — are the
+#: ones selected under the per-run cap). Exposed as a module constant so tests
+#: can shrink it to exercise the multi-page path on small synthetic inputs.
+_ORPHAN_SWEEP_PAGE_SIZE = 500
 
 #: Terminal action statuses — the only statuses that contribute to a thought's
 #: ``action_outcome_score`` aggregate. Non-terminal statuses (PLANNED,
@@ -540,6 +557,7 @@ class SqliteEngravaCore:
         metrics_config: MetricsConfig | None = None,
         manifests: Sequence[ExtensionManifest] = (),
         access_tracking_enabled: bool = False,
+        hygiene_policy: HygienePolicyConfig | None = None,
     ) -> None:
         self._db = db
         self._hooks: EngravaHooksProtocol = hooks or DefaultEngravaHooks()
@@ -596,6 +614,11 @@ class SqliteEngravaCore:
         # enabled so ``consolidate()`` can run a cycle without the caller
         # constructing it. ``None`` for a manually-built store or dreaming-off.
         self._dreaming_extension: DreamingExtension | None = None
+        # Memory Hygiene (deterministic forgetting) policy. ``None`` (default)
+        # or ``enabled=False`` ⇒ the forgetting loop never runs and no existing
+        # read/write path changes. ``run_hygiene`` and the ``consolidate()``
+        # convenience invocation both no-op when this is ``None``/disabled.
+        self._hygiene_policy: HygienePolicyConfig | None = hygiene_policy
 
     @property
     def journal(self) -> JournalWriter | None:
@@ -816,6 +839,7 @@ class SqliteEngravaCore:
                 metrics_config=config.metrics,
                 manifests=manifests,
                 access_tracking_enabled=access_tracking_enabled,
+                hygiene_policy=config.hygiene_policy,
             )
             store._owns_connection = True
 
@@ -955,7 +979,7 @@ class SqliteEngravaCore:
         Applies the full ``schema_core.sql`` (including FTS5 virtual
         table and sync triggers) only when the database has not already
         been bootstrapped to schema version 3+.  Databases at older
-        versions are upgraded incrementally up to the current version (17).
+        versions are upgraded incrementally up to the current version (18).
 
         After core schema creation or upgrade, probes for the ``thought_fts``
         table and then runs any pending extension schema migrations for each
@@ -988,7 +1012,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
-            await self._db.execute("PRAGMA user_version = 17")
+            await self._migrate_core_v17_to_v18()
+            await self._db.execute("PRAGMA user_version = 18")
             await self._db.commit()
         elif current_version < 4:  # noqa: PLR2004
             await self._migrate_core_v3_to_v4()
@@ -1005,7 +1030,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
-            await self._db.execute("PRAGMA user_version = 17")
+            await self._migrate_core_v17_to_v18()
+            await self._db.execute("PRAGMA user_version = 18")
             await self._db.commit()
         elif current_version < 5:  # noqa: PLR2004
             await self._migrate_core_v4_to_v5()
@@ -1021,7 +1047,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
-            await self._db.execute("PRAGMA user_version = 17")
+            await self._migrate_core_v17_to_v18()
+            await self._db.execute("PRAGMA user_version = 18")
             await self._db.commit()
         elif current_version < 6:  # noqa: PLR2004
             await self._migrate_core_v5_to_v6()
@@ -1036,7 +1063,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
-            await self._db.execute("PRAGMA user_version = 17")
+            await self._migrate_core_v17_to_v18()
+            await self._db.execute("PRAGMA user_version = 18")
             await self._db.commit()
         elif current_version < 7:  # noqa: PLR2004
             await self._migrate_core_v6_to_v7()
@@ -1050,7 +1078,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
-            await self._db.execute("PRAGMA user_version = 17")
+            await self._migrate_core_v17_to_v18()
+            await self._db.execute("PRAGMA user_version = 18")
             await self._db.commit()
         elif current_version < 8:  # noqa: PLR2004
             await self._migrate_core_v7_to_v8()
@@ -1063,7 +1092,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
-            await self._db.execute("PRAGMA user_version = 17")
+            await self._migrate_core_v17_to_v18()
+            await self._db.execute("PRAGMA user_version = 18")
             await self._db.commit()
         elif current_version < 9:  # noqa: PLR2004
             await self._migrate_core_v8_to_v9()
@@ -1075,7 +1105,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
-            await self._db.execute("PRAGMA user_version = 17")
+            await self._migrate_core_v17_to_v18()
+            await self._db.execute("PRAGMA user_version = 18")
             await self._db.commit()
         elif current_version < 10:  # noqa: PLR2004
             await self._migrate_core_v9_to_v10()
@@ -1086,7 +1117,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
-            await self._db.execute("PRAGMA user_version = 17")
+            await self._migrate_core_v17_to_v18()
+            await self._db.execute("PRAGMA user_version = 18")
             await self._db.commit()
         elif current_version < 11:  # noqa: PLR2004
             await self._migrate_core_v10_to_v11()
@@ -1096,7 +1128,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
-            await self._db.execute("PRAGMA user_version = 17")
+            await self._migrate_core_v17_to_v18()
+            await self._db.execute("PRAGMA user_version = 18")
             await self._db.commit()
         elif current_version < 12:  # noqa: PLR2004
             await self._migrate_core_v11_to_v12()
@@ -1105,7 +1138,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
-            await self._db.execute("PRAGMA user_version = 17")
+            await self._migrate_core_v17_to_v18()
+            await self._db.execute("PRAGMA user_version = 18")
             await self._db.commit()
         elif current_version < 13:  # noqa: PLR2004
             await self._migrate_core_v12_to_v13()
@@ -1113,29 +1147,38 @@ class SqliteEngravaCore:
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
-            await self._db.execute("PRAGMA user_version = 17")
+            await self._migrate_core_v17_to_v18()
+            await self._db.execute("PRAGMA user_version = 18")
             await self._db.commit()
         elif current_version < 14:  # noqa: PLR2004
             await self._migrate_core_v13_to_v14()
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
-            await self._db.execute("PRAGMA user_version = 17")
+            await self._migrate_core_v17_to_v18()
+            await self._db.execute("PRAGMA user_version = 18")
             await self._db.commit()
         elif current_version < 15:  # noqa: PLR2004
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
-            await self._db.execute("PRAGMA user_version = 17")
+            await self._migrate_core_v17_to_v18()
+            await self._db.execute("PRAGMA user_version = 18")
             await self._db.commit()
         elif current_version < 16:  # noqa: PLR2004
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
-            await self._db.execute("PRAGMA user_version = 17")
+            await self._migrate_core_v17_to_v18()
+            await self._db.execute("PRAGMA user_version = 18")
             await self._db.commit()
         elif current_version < 17:  # noqa: PLR2004
             await self._migrate_core_v16_to_v17()
-            await self._db.execute("PRAGMA user_version = 17")
+            await self._migrate_core_v17_to_v18()
+            await self._db.execute("PRAGMA user_version = 18")
+            await self._db.commit()
+        elif current_version < 18:  # noqa: PLR2004
+            await self._migrate_core_v17_to_v18()
+            await self._db.execute("PRAGMA user_version = 18")
             await self._db.commit()
 
         # Ensure referential integrity is enforced for the lifetime of this
@@ -1704,6 +1747,49 @@ class SqliteEngravaCore:
             "ON thought(json_extract(provenance, '$.actor_id'))"
         )
 
+    async def _migrate_core_v17_to_v18(self) -> None:
+        """Add the Memory Hygiene forgetting-loop columns (core-18).
+
+        Purely additive. Two nullable/defaulted columns back the deterministic
+        forgetting loop:
+
+        * ``thought.pinned`` (``INTEGER NOT NULL DEFAULT 0``) — the durable
+          never-forget marker. A pinned thought is never auto-archived or
+          auto-GC'd by the hygiene loop. The ``DEFAULT 0`` means every existing
+          row reads back as ``pinned=False`` unchanged.
+        * ``thought.archived_at_cycle`` (nullable ``INTEGER``) — the cycle at
+          which the hygiene loop archived a thought, or ``NULL`` when it was not
+          archived by hygiene (a restore clears it back to ``NULL``). It backs
+          the GC restore window; a thought archived by any other path
+          (TTL / manual) keeps ``NULL`` and is never reaped by hygiene GC.
+
+        Both adds are guarded against the duplicate-column error exactly as
+        ``_migrate_core_v16_to_v17`` guards its own ``ADD COLUMN``, so a database
+        already carrying a column (a partial or re-run migration) is left
+        unchanged. No index is added — the hygiene loop scans the
+        already-indexed ``lifecycle_status`` / ``updated_cycle`` candidate set
+        and filters ``archived_at_cycle`` in Python, so no new expression index
+        is warranted. While hygiene stays disabled these columns are never read
+        on any existing path, so this is "no behavioural change while disabled",
+        not literally byte-identical bytes on disk.
+        """
+        from sqlite3 import OperationalError  # noqa: PLC0415
+
+        if not await self._column_exists("thought", "pinned"):
+            try:
+                await self._db.execute(
+                    "ALTER TABLE thought ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"
+                )
+            except OperationalError as exc:  # pragma: no cover - defensive race guard
+                if "duplicate column" not in str(exc).lower():
+                    raise
+        if not await self._column_exists("thought", "archived_at_cycle"):
+            try:
+                await self._db.execute("ALTER TABLE thought ADD COLUMN archived_at_cycle INTEGER")
+            except OperationalError as exc:  # pragma: no cover - defensive race guard
+                if "duplicate column" not in str(exc).lower():
+                    raise
+
     async def _fk_present(self, table: str, column: str) -> bool:
         """Return ``True`` when ``table`` carries an FK on ``column``."""
         cursor = await self._db.execute(f"PRAGMA foreign_key_list({table})")
@@ -2141,6 +2227,8 @@ class SqliteEngravaCore:
             json.loads(metadata_json_raw) if metadata_json_raw else {}
         )
         provenance_raw = row["provenance"] if "provenance" in keys else None
+        pinned_raw = row["pinned"] if "pinned" in keys else 0
+        archived_at_cycle_raw = row["archived_at_cycle"] if "archived_at_cycle" in keys else None
         return ThoughtRecord(
             thought_id=row["thought_id"],
             thought_type=ThoughtType(row["thought_type"]),
@@ -2173,6 +2261,10 @@ class SqliteEngravaCore:
             valid_until=valid_until_raw,
             metadata=metadata_decoded,
             provenance=_decode_provenance(provenance_raw),
+            pinned=bool(pinned_raw),
+            archived_at_cycle=(
+                int(archived_at_cycle_raw) if archived_at_cycle_raw is not None else None
+            ),
         )
 
     async def _get_thought_row(self, thought_id: str) -> aiosqlite.Row | None:
@@ -2213,8 +2305,9 @@ class SqliteEngravaCore:
         " consolidated_from, visibility, access_count, action_outcome_score, "
         " last_accessed_at, created_at, updated_at, expires_at, "
         " valid_from, valid_until, "
-        " metadata_json, provenance) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " metadata_json, provenance, pinned, archived_at_cycle) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+        "?, ?)"
     )
 
     def _thought_to_core_params(self, thought: ThoughtRecord) -> tuple[object, ...]:
@@ -2267,6 +2360,8 @@ class SqliteEngravaCore:
             thought.valid_until,
             json.dumps(thought.metadata, ensure_ascii=False),
             _encode_provenance(thought.provenance),
+            int(thought.pinned),
+            thought.archived_at_cycle,
         )
 
     _CORE_UPDATE_SQL = (
@@ -2279,7 +2374,7 @@ class SqliteEngravaCore:
         " access_count = ?, action_outcome_score = ?, last_accessed_at = ?,"
         " created_at = ?, updated_at = ?, expires_at = ?,"
         " valid_from = ?, valid_until = ?,"
-        " metadata_json = ?, provenance = ? "
+        " metadata_json = ?, provenance = ?, pinned = ?, archived_at_cycle = ? "
         "WHERE thought_id = ? AND updated_cycle = ?"
     )
 
@@ -2332,6 +2427,8 @@ class SqliteEngravaCore:
             updated.valid_until,
             json.dumps(updated.metadata, ensure_ascii=False),
             _encode_provenance(updated.provenance),
+            int(updated.pinned),
+            updated.archived_at_cycle,
             thought_id,
             expected_cycle,
         )
@@ -5861,6 +5958,573 @@ class SqliteEngravaCore:
         )
         return len(params)
 
+    # ------------------------------------------------------------------
+    # Memory Hygiene — deterministic forgetting loop
+    # ------------------------------------------------------------------
+
+    async def run_hygiene(self, *, current_cycle: int) -> HygieneResult:
+        """Run one Memory Hygiene pass — archive cold/low-value thoughts.
+
+        A standalone, deterministic, no-LLM forgetting pass: it scores every
+        eligible thought with a keep-score (the dreaming signal library under
+        the hygiene weight vector, with active-signal redistribution), multiplies
+        by the ``decay_function`` hook, and **archives** — reversibly — the
+        thoughts whose eviction-score falls below ``eviction_threshold`` and that
+        are not protected. When ``auto_gc_enabled`` it then physically
+        garbage-collects previously-archived thoughts past the restore window.
+
+        This is the store's primary forgetting entry point; it runs immediately
+        and **bypasses** ``check_every_n_cycles`` (that cadence gates only the
+        convenience invocation from :meth:`consolidate`). One run performs at most
+        one archive stage and at most one GC stage, each independently bounded by
+        ``max_evictions_per_run``.
+
+        Safety by construction (mirrors the config defaults):
+
+        * **Archive-not-delete.** The default action flips ``lifecycle_status``
+          to ``ARCHIVED`` (reversible, no data loss) via the same mechanism TTL
+          archival uses, and stamps ``archived_at_cycle = current_cycle``.
+        * **Protection.** A thought is never archived or GC'd when it is
+          ``pinned`` or its priority is in ``protected_priorities`` (default
+          ``P1``). ``confidence`` is *not* protection.
+        * **All-flat fallback.** When no keep-signal is active (e.g. a brand-new
+          store with no access history / confirmations / cycle span), the
+          keep-score is uninformative, so the pass archives **nothing**.
+        * **Decay clamp.** The ``decay_function`` return is clamped to
+          ``[0.0, 1.0]`` and a non-finite value is treated as ``1.0`` (no decay)
+          — decay can only lower a score toward archive, never resurrect one, and
+          a misbehaving custom hook can never cause a spurious eviction.
+        * **Deterministic capped selection.** Same store + config + cycle ⇒ the
+          identical eviction set; archive orders by ``eviction_score ASC,
+          updated_cycle ASC, thought_id ASC`` and GC by ``archived_at_cycle ASC,
+          thought_id ASC`` before the per-stage cap.
+        * **GC keys off hygiene's own bookkeeping.** Only thoughts with a
+          non-NULL ``archived_at_cycle`` (i.e. archived *by hygiene*) are ever
+          auto-GC'd — a TTL/manually-archived thought (``archived_at_cycle`` is
+          ``None``) is left alone.
+        * **Dry run.** When ``dry_run`` is set nothing is mutated and nothing is
+          journaled; the would-evict set is returned for preview.
+
+        This is cognitive hygiene, not compliance deletion: GC is best-effort,
+        cycle-based, and opt-in — it offers no deletion guarantee, legal hold,
+        or erasure receipt.
+
+        Args:
+            current_cycle: The current cognitive cycle number, driving the
+                cycle-based recency / staleness keep-signals and the GC restore
+                window.
+
+        Returns:
+            A :class:`~engrava.infrastructure.sqlite.hygiene.HygieneResult` with
+            the archived / GC'd counts, the number of candidates evaluated, the
+            ``dry_run`` flag, the would-evict preview (under ``dry_run``), and the
+            signals that were flat this run.
+
+        Raises:
+            RuntimeError: When no hygiene policy is configured on this store
+                (built without ``hygiene_policy`` / ``hygiene_policy`` is
+                ``None``) — there is nothing to run.
+
+        """
+        policy = self._hygiene_policy
+        if policy is None:
+            msg = (
+                "run_hygiene() requires a hygiene policy: build the store via "
+                "from_config with a hygiene_policy section (or pass hygiene_policy=...)."
+            )
+            raise RuntimeError(msg)
+
+        if not policy.enabled:
+            # ``enabled`` is a hard master switch: a disabled policy never forgets,
+            # even on an explicit ``run_hygiene()`` call — the fail-safe direction
+            # for a data-deleting loop. To preview or run, set ``enabled=True``
+            # (and ``dry_run=True`` for a non-mutating preview).
+            return HygieneResult()
+
+        candidates = await self._hygiene_candidates()
+        ctx = DreamingContext(current_cycle=current_cycle, total_thoughts=len(candidates))
+        active_weights, flat_signals = compute_active_hygiene_weights(
+            policy.signal_weights,
+            candidates,
+            current_cycle=current_cycle,
+            access_tracking_enabled=self._access_tracking_enabled,
+        )
+        has_active_signal = any(weight > 0.0 for weight in active_weights.values())
+
+        # All-flat fail-safe: an uninformative keep-score must never drive
+        # eviction, so archive nothing (but a GC stage may still reap already
+        # hygiene-archived thoughts whose restore window has elapsed).
+        would_evict: list[EvictionReason] = []
+        if has_active_signal:
+            would_evict = self._select_archive_candidates(
+                candidates,
+                ctx=ctx,
+                active_weights=active_weights,
+                policy=policy,
+                decay_multipliers=await self._hygiene_decay_multipliers(
+                    candidates,
+                    current_cycle=current_cycle,
+                ),
+            )
+
+        if policy.dry_run:
+            return HygieneResult(
+                archived_count=0,
+                gc_count=0,
+                candidates_evaluated=len(candidates),
+                dry_run=True,
+                would_evict=would_evict,
+                flat_signals=flat_signals,
+            )
+
+        archived_count = await self._hygiene_archive(
+            would_evict, policy=policy, current_cycle=current_cycle
+        )
+
+        gc_count = 0
+        if policy.auto_gc_enabled:
+            gc_count = await self._hygiene_gc(policy=policy, current_cycle=current_cycle)
+
+        if archived_count or gc_count:
+            await self._maybe_commit()
+
+        return HygieneResult(
+            archived_count=archived_count,
+            gc_count=gc_count,
+            candidates_evaluated=len(candidates),
+            dry_run=False,
+            would_evict=[],
+            flat_signals=flat_signals,
+        )
+
+    async def _hygiene_candidates(self) -> list[ThoughtRecord]:
+        """Collect the eviction candidate pool: every ACTIVE and CREATED thought.
+
+        Already-ARCHIVED / terminal thoughts are outside the candidate set (they
+        are not re-processed). The **whole** eligible pool must be scored — the
+        per-run cap bounds the *archived* set, not the *considered* set, so that
+        the coldest thoughts (not an arbitrary page) are the ones selected.
+        Both eligible lifecycles are walked one page at a time (mirroring the
+        orphan-reflection sweep) so no candidate is missed regardless of store
+        size. The frequency signal is not fed by these internal scans (access
+        tracking is suppressed for hygiene's own reads by the caller when
+        appropriate).
+
+        Returns:
+            The candidate thoughts (ACTIVE then CREATED), each pool fully
+            enumerated.
+
+        """
+        candidates: list[ThoughtRecord] = []
+        for lifecycle in (LifecycleStatus.ACTIVE, LifecycleStatus.CREATED):
+            offset = 0
+            while True:
+                page = await self.list_thoughts(
+                    lifecycle_status=lifecycle.value,
+                    limit=_ORPHAN_SWEEP_PAGE_SIZE,
+                    offset=offset,
+                )
+                candidates.extend(page)
+                if len(page) < _ORPHAN_SWEEP_PAGE_SIZE:
+                    break
+                offset += _ORPHAN_SWEEP_PAGE_SIZE
+        return candidates
+
+    async def _hygiene_decay_multipliers(
+        self,
+        candidates: list[ThoughtRecord],
+        *,
+        current_cycle: int,
+    ) -> dict[str, float]:
+        """Resolve the clamped decay multiplier for each candidate.
+
+        The ``decay_function`` hook is the third otherwise-dead hook; the hygiene
+        eviction score is its **only** call-site (it is never wired into search /
+        ranking / promotion). Its return is clamped to ``[0.0, 1.0]`` and a
+        non-finite value (``NaN`` / ``±inf``) is treated as ``1.0`` — the
+        fail-safe direction, since decay can then only lower a score toward
+        archive, never resurrect one above threshold or over-evict.
+
+        Args:
+            candidates: The candidate pool.
+            current_cycle: The current cycle (elapsed cycles are measured from
+                each thought's ``updated_cycle``).
+
+        Returns:
+            A mapping of ``thought_id`` to its clamped decay multiplier.
+
+        """
+        multipliers: dict[str, float] = {}
+        for thought in candidates:
+            elapsed = max(0, current_cycle - thought.updated_cycle)
+            raw = await self._hooks.decay_function(thought, elapsed)
+            multipliers[thought.thought_id] = _clamp_decay(raw)
+        return multipliers
+
+    def _select_archive_candidates(
+        self,
+        candidates: list[ThoughtRecord],
+        *,
+        ctx: DreamingContext,
+        active_weights: dict[str, float],
+        policy: HygienePolicyConfig,
+        decay_multipliers: dict[str, float],
+    ) -> list[EvictionReason]:
+        """Score candidates and pick the deterministic, capped archive set.
+
+        For each unprotected candidate, computes ``keep_score`` (weighted average
+        over the active signals) and ``eviction_score = keep_score * decay``, and
+        keeps those strictly below ``eviction_threshold``. The survivors are
+        ordered ``eviction_score ASC, updated_cycle ASC, thought_id ASC``
+        (lowest-value, oldest, id tiebreak) and truncated to
+        ``max_evictions_per_run`` — a stable set for a given store + config +
+        cycle.
+
+        Protected thoughts (``pinned`` or a priority in
+        ``protected_priorities``) are excluded up front and never scored into the
+        archive set.
+
+        Args:
+            candidates: The candidate pool.
+            ctx: The scoring context.
+            active_weights: The redistributed per-signal weights for this run.
+            policy: The active hygiene policy.
+            decay_multipliers: Per-thought clamped decay multipliers.
+
+        Returns:
+            The ordered, capped list of :class:`EvictionReason` for the thoughts
+            to archive.
+
+        """
+        scored: list[tuple[float, int, str, EvictionReason]] = []
+        for thought in candidates:
+            if _hygiene_protected(thought, policy):
+                continue
+            keep_score, per_signal = compute_keep_score(thought, ctx, active_weights)
+            decay = decay_multipliers[thought.thought_id]
+            eviction_score = keep_score * decay
+            if eviction_score >= policy.eviction_threshold:
+                continue
+            reason = EvictionReason(
+                thought_id=thought.thought_id,
+                keep_score=keep_score,
+                eviction_score=eviction_score,
+                decay_multiplier=decay,
+                threshold=policy.eviction_threshold,
+                signals=per_signal,
+            )
+            scored.append((eviction_score, thought.updated_cycle, thought.thought_id, reason))
+
+        scored.sort(key=lambda item: (item[0], item[1], item[2]))
+        return [reason for *_, reason in scored[: policy.max_evictions_per_run]]
+
+    async def _hygiene_archive(
+        self,
+        to_archive: list[EvictionReason],
+        *,
+        policy: HygienePolicyConfig,
+        current_cycle: int,
+    ) -> int:
+        """Archive the selected thoughts (Stage 1 — reversible, journaled).
+
+        Flips each thought ``* -> ARCHIVED`` via the existing archive mechanism
+        — a **direct lifecycle write**, exactly as TTL archival does in
+        :meth:`cleanup_expired` (an ``UPDATE`` of ``lifecycle_status`` /
+        ``expires_at``, not an ``evolve`` transition). Using the direct write is
+        deliberate: it lets a ``CREATED`` thought be archived even though the
+        lifecycle state machine only permits ``CREATED -> ACTIVE`` (the ADR's
+        candidate set is ACTIVE **and** CREATED), matching how TTL archival flips
+        any expired row regardless of its current state. The write also stamps
+        ``archived_at_cycle = current_cycle`` and clears ``expires_at`` so the
+        thought is no longer subject to TTL.
+
+        The mutation is recorded as an ordinary ``UPDATE_THOUGHT`` journal entry
+        — **no new mutation type** — with the forgetting rationale nested in the
+        delta under ``eviction_reason`` so the decision is reconstructable and
+        stays ``verify_journal``-covered. The journal ``after`` is reconstructed
+        with the string lifecycle value (as TTL archival does) so its ``evolve``
+        skips the state-machine check.
+
+        Args:
+            to_archive: The eviction reasons chosen by
+                :meth:`_select_archive_candidates`, already ordered and capped.
+            policy: The active hygiene policy — used for the write-time protection
+                re-check (a thought pinned / re-prioritised after selection).
+            current_cycle: The cycle stamped into ``archived_at_cycle``.
+
+        Returns:
+            The number of thoughts actually archived.
+
+        """
+        archived = 0
+        for reason in to_archive:
+            before_row = await self._get_thought_row(reason.thought_id)
+            if before_row is None:
+                continue
+            before = self._row_to_thought(before_row)
+            if _hygiene_protected(before, policy) or before.lifecycle_status not in (
+                LifecycleStatus.ACTIVE,
+                LifecycleStatus.CREATED,
+            ):
+                # Early time-of-check guard: a thought pinned, raised to a protected
+                # priority, or already transitioned between selection and here is
+                # skipped. The UPDATE below re-asserts the same predicate atomically.
+                continue
+            # Predicate-guarded write: the WHERE re-checks candidate lifecycle +
+            # unprotected at write time, so even a pin / re-prioritise landing
+            # between the check above and this UPDATE cannot archive a now-protected
+            # thought (closes the TOCTOU fully; ``rowcount == 0`` ⇒ raced, skip).
+            update_params: list[object] = [
+                LifecycleStatus.ARCHIVED.value,
+                current_cycle,
+                reason.thought_id,
+                LifecycleStatus.ACTIVE.value,
+                LifecycleStatus.CREATED.value,
+            ]
+            priority_guard = ""
+            if policy.protected_priorities:
+                placeholders = ", ".join("?" for _ in policy.protected_priorities)
+                priority_guard = f" AND priority NOT IN ({placeholders})"
+                update_params.extend(policy.protected_priorities)
+            cursor = await self._db.execute(
+                "UPDATE thought SET lifecycle_status = ?, "  # noqa: S608 - interpolation is only ``?`` placeholders
+                "expires_at = NULL, archived_at_cycle = ? "
+                "WHERE thought_id = ? AND lifecycle_status IN (?, ?) AND pinned = 0"
+                + priority_guard,
+                update_params,
+            )
+            if cursor.rowcount <= 0:
+                continue
+            archived += 1
+            if self._journal is not None:
+                after = before.evolve(
+                    lifecycle_status=LifecycleStatus.ARCHIVED.value,
+                    expires_at=None,
+                    archived_at_cycle=current_cycle,
+                )
+                await self._journal.append(
+                    mutation_type="UPDATE_THOUGHT",
+                    target_id=reason.thought_id,
+                    delta={
+                        "before": before.model_dump(mode="json"),
+                        "after": after.model_dump(mode="json"),
+                        "eviction_reason": reason.to_delta(),
+                    },
+                )
+        return archived
+
+    async def _hygiene_gc(
+        self,
+        *,
+        policy: HygienePolicyConfig,
+        current_cycle: int,
+    ) -> int:
+        """Physically delete hygiene-archived thoughts past the restore window.
+
+        Stage 2 — runs only when ``auto_gc_enabled``. A thought is GC-eligible
+        only when it was archived **by hygiene** (``archived_at_cycle IS NOT
+        NULL``), its restore window has elapsed
+        (``current_cycle - archived_at_cycle >= gc_min_archive_age_cycles``), and
+        it is not protected (``pinned`` or a protected priority). The eligible
+        set is ordered ``archived_at_cycle ASC, thought_id ASC`` (oldest-archived
+        first) and truncated to ``max_evictions_per_run``.
+
+        Deletion order per thought is **orphan-reflection sweep -> cascade delete
+        -> vec0 vector purge**: the sweep retires any REFLECTION whose entire
+        source cluster would become non-live so no dangling ``CONSOLIDATED_FROM``
+        synthesis is left, the cascade drops FK-reachable edges / embeddings /
+        actions, and the vec0 vector (outside the FK) is purged explicitly. The
+        delete is recorded as an ordinary ``DELETE_THOUGHT`` journal entry.
+
+        Args:
+            policy: The active hygiene policy (window, cap, protected priorities).
+            current_cycle: The current cycle (drives the window check).
+
+        Returns:
+            The number of thoughts physically deleted.
+
+        """
+        eligible = await self._hygiene_gc_eligible(policy=policy, current_cycle=current_cycle)
+        if not eligible:
+            return 0
+
+        # Retire orphan REFLECTIONs *before* any delete so a synthesis never
+        # outlives its whole source cluster with a dangling edge.
+        await self.retire_orphan_reflections()
+
+        gc_count = 0
+        for thought in eligible:
+            before_row = await self._get_thought_row(thought.thought_id)
+            if before_row is None:
+                continue
+            vec_rowid = await self._embedding_rowid_for_thought(thought.thought_id)
+            cursor = await self._db.execute(
+                "DELETE FROM thought WHERE thought_id = ?",
+                (thought.thought_id,),
+            )
+            if cursor.rowcount <= 0:
+                continue
+            await self._purge_orphan_vector(vec_rowid)
+            gc_count += 1
+            if self._journal is not None:
+                await self._journal.append(
+                    mutation_type="DELETE_THOUGHT",
+                    target_id=thought.thought_id,
+                    delta={
+                        "before": self._row_to_thought(before_row).model_dump(mode="json"),
+                        "after": None,
+                        "eviction_reason": {
+                            "mechanism": "hygiene",
+                            "stage": "gc",
+                            "archived_at_cycle": thought.archived_at_cycle,
+                            "gc_min_archive_age_cycles": policy.gc_min_archive_age_cycles,
+                        },
+                    },
+                )
+        return gc_count
+
+    async def _hygiene_gc_eligible(
+        self,
+        *,
+        policy: HygienePolicyConfig,
+        current_cycle: int,
+    ) -> list[ThoughtRecord]:
+        """Resolve the deterministic, capped GC-eligible set.
+
+        Selects ARCHIVED thoughts that hygiene archived (``archived_at_cycle IS
+        NOT NULL``) whose restore window has elapsed, excluding protected
+        thoughts, ordered ``archived_at_cycle ASC, thought_id ASC`` and capped at
+        ``max_evictions_per_run``. The window and ordering are computed in SQL off
+        the explicit ``archived_at_cycle`` column so a thought archived by any
+        other path (its ``archived_at_cycle`` is ``NULL``) is structurally
+        excluded.
+
+        Args:
+            policy: The active hygiene policy.
+            current_cycle: The current cycle.
+
+        Returns:
+            The GC-eligible thoughts in delete order.
+
+        """
+        max_archived_cycle = current_cycle - policy.gc_min_archive_age_cycles
+        # Exclude protected rows in SQL so the LIMIT is spent on genuinely
+        # reap-eligible thoughts — a protected hygiene-archived row (archived,
+        # then later pinned / raised to a protected priority) must not consume a
+        # cap slot and starve younger eligible rows. The Python re-check below
+        # stays as defence-in-depth.
+        params: list[object] = [LifecycleStatus.ARCHIVED.value, max_archived_cycle]
+        priority_clause = ""
+        if policy.protected_priorities:
+            placeholders = ", ".join("?" for _ in policy.protected_priorities)
+            priority_clause = f"  AND priority NOT IN ({placeholders}) "
+            params.extend(policy.protected_priorities)
+        params.append(policy.max_evictions_per_run)
+        cursor = await self._db.execute(
+            "SELECT * FROM thought "  # noqa: S608 - interpolation is only ``?`` placeholders
+            "WHERE lifecycle_status = ? "
+            "  AND archived_at_cycle IS NOT NULL "
+            "  AND archived_at_cycle <= ? "
+            "  AND pinned = 0 "
+            f"{priority_clause}"
+            "ORDER BY archived_at_cycle ASC, thought_id ASC "
+            "LIMIT ?",
+            params,
+        )
+        rows = await cursor.fetchall()
+        eligible: list[ThoughtRecord] = []
+        for row in rows:
+            thought = self._row_to_thought(row)
+            if _hygiene_protected(thought, policy):
+                continue
+            eligible.append(thought)
+        return eligible
+
+    async def retire_orphan_reflections(self) -> int:
+        """Retire REFLECTIONs whose entire source cluster has left ACTIVE.
+
+        A REFLECTION is a derived synthesis of a live cluster. Once **every**
+        thought it was consolidated from is no longer ``ACTIVE`` (all
+        ``ARCHIVED`` / ``DONE`` — i.e. the synthesis now summarises nothing
+        live), the REFLECTION is retired ``ACTIVE -> ARCHIVED`` so ordinary GC
+        can reclaim it (cascading its centroid embedding and
+        ``CONSOLIDATED_FROM`` edges). This is the shared store-owned
+        implementation used both by dreaming consolidation and by the Memory
+        Hygiene GC stage (run there **before** any delete so no REFLECTION is
+        left summarising a cluster the delete would empty).
+
+        **Full coverage.** The sweep inspects *every* ACTIVE REFLECTION, not just
+        the first page. ``list_thoughts`` orders by ``updated_cycle DESC`` and is
+        capped per call, so a long-untouched orphan (low ``updated_cycle``) can
+        fall beyond a single capped page and never be seen. To honour the
+        "for each ACTIVE REFLECTION" contract regardless of how many REFLECTIONs
+        exist, the candidate set is collected by walking successive pages
+        (``limit`` / ``offset``) until a short page is returned.
+
+        **Collect-then-retire ordering.** All candidate ids are gathered into a
+        list *first*, and only then retired in a second pass. Retiring flips a
+        REFLECTION ``ACTIVE -> ARCHIVED``, which drops it out of the
+        ``lifecycle_status="ACTIVE"`` filter; mutating during pagination would
+        shift every later page's offset and silently skip rows. Collecting the
+        full set against a stable filter before any mutation avoids that offset
+        drift. Ids are de-duplicated defensively against ties in the non-total
+        ``updated_cycle`` ordering crossing a page boundary.
+
+        Guards:
+
+        * **100% threshold** — a REFLECTION with at least one still-ACTIVE source
+          is kept; the synthesis still summarises live members.
+        * **At least one source** — a REFLECTION with zero ``CONSOLIDATED_FROM``
+          edges (defensive: malformed / legacy) is never retired by an
+          all-non-ACTIVE rule firing over an empty set.
+
+        The check is a deterministic set query over each candidate's source
+        lifecycle statuses — no model call.
+
+        Returns:
+            The number of REFLECTIONs retired during this sweep.
+
+        """
+        # Phase 1 — collect EVERY ACTIVE REFLECTION id by paginating the full
+        # set. Done before any mutation so the ACTIVE filter stays stable and
+        # offsets do not drift (see the collect-then-retire note above).
+        candidate_ids: list[str] = []
+        seen: set[str] = set()
+        offset = 0
+        while True:
+            page = await self.list_thoughts(
+                thought_type=ThoughtType.REFLECTION.value,
+                lifecycle_status=LifecycleStatus.ACTIVE.value,
+                limit=_ORPHAN_SWEEP_PAGE_SIZE,
+                offset=offset,
+            )
+            for reflection in page:
+                if reflection.thought_id not in seen:
+                    seen.add(reflection.thought_id)
+                    candidate_ids.append(reflection.thought_id)
+            if len(page) < _ORPHAN_SWEEP_PAGE_SIZE:
+                # Short (or empty) page -> the full set has been read.
+                break
+            offset += _ORPHAN_SWEEP_PAGE_SIZE
+
+        # Phase 2 — retire orphans. Safe to mutate now that the full candidate
+        # set is materialised.
+        retired = 0
+        for reflection_id in candidate_ids:
+            source_statuses = await self.consolidated_source_statuses(reflection_id)
+            # Require >= 1 source AND 100% of them non-ACTIVE.
+            if not source_statuses:
+                continue
+            if any(status == LifecycleStatus.ACTIVE.value for status in source_statuses):
+                continue
+            await self.update_thought(
+                reflection_id,
+                lifecycle_status=LifecycleStatus.ARCHIVED,
+            )
+            retired += 1
+
+        return retired
+
     async def consolidate(self, *, current_cycle: int) -> ConsolidationResult:
         """Run one dreaming consolidation cycle on this store.
 
@@ -5872,6 +6536,15 @@ class SqliteEngravaCore:
         consolidation with access tracking suppressed for the extension's own
         internal reads (its candidate scans / member resolution are machinery,
         not caller retrievals, and must not feed the frequency signal).
+
+        As an operator convenience, when a hygiene policy is configured with
+        ``enabled=True`` **and** this cycle satisfies the cadence
+        (``current_cycle % check_every_n_cycles == 0``), one Memory Hygiene pass
+        runs at the **end** of the cycle — after promotion and the
+        orphan-reflection sweep. The hygiene decision logic is independent of
+        whether promotion produced anything; its result is not folded into the
+        returned :class:`ConsolidationResult` (a hygiene-off store is unchanged).
+        An explicit :meth:`run_hygiene` call bypasses this cadence.
 
         Args:
             current_cycle: The current cognitive cycle number, driving the
@@ -5894,7 +6567,32 @@ class SqliteEngravaCore:
             raise RuntimeError(msg)
         await self.flush_access_buffer()
         async with self.suppress_access_tracking():
-            return await self._dreaming_extension.run_consolidation(self, current_cycle)
+            result = await self._dreaming_extension.run_consolidation(self, current_cycle)
+            if self._hygiene_due(current_cycle):
+                await self.run_hygiene(current_cycle=current_cycle)
+        return result
+
+    def _hygiene_due(self, current_cycle: int) -> bool:
+        """Report whether the ``consolidate()`` convenience hygiene pass runs.
+
+        The convenience invocation runs only when a hygiene policy is configured
+        and enabled and this cycle satisfies ``check_every_n_cycles`` (the cadence
+        gate applies **only** to this ``consolidate()``-driven invocation — an
+        explicit :meth:`run_hygiene` bypasses it).
+
+        Args:
+            current_cycle: The current cognitive cycle number.
+
+        Returns:
+            ``True`` when the cadence-gated hygiene pass should run this cycle.
+
+        """
+        policy = self._hygiene_policy
+        return (
+            policy is not None
+            and policy.enabled
+            and current_cycle % policy.check_every_n_cycles == 0
+        )
 
     # ------------------------------------------------------------------
     # ActionRecord CRUD
@@ -6412,6 +7110,45 @@ def _decode_consolidated(raw: str | None) -> list[str] | None:
         return None
     result: list[str] = json.loads(raw)
     return result
+
+
+def _clamp_decay(raw: float) -> float:
+    """Clamp a ``decay_function`` return into the fail-safe ``[0.0, 1.0]`` range.
+
+    A non-finite value (``NaN`` / ``±inf``) maps to ``1.0`` (no decay) — the
+    fail-safe direction, since decay can then only lower an eviction-score toward
+    archive, never resurrect one above threshold or cause a spurious eviction. A
+    finite value is clamped into ``[0.0, 1.0]``.
+
+    Args:
+        raw: The raw ``decay_function`` hook result.
+
+    Returns:
+        A decay multiplier in ``[0.0, 1.0]``.
+
+    """
+    if not math.isfinite(raw):
+        return 1.0
+    return max(0.0, min(1.0, raw))
+
+
+def _hygiene_protected(thought: ThoughtRecord, policy: HygienePolicyConfig) -> bool:
+    """Report whether a thought is protected from hygiene archival / GC.
+
+    A thought is protected when it is ``pinned`` (the durable never-forget
+    marker) or its priority is listed in ``protected_priorities`` (default
+    ``P1``). ``confidence`` is deliberately **not** consulted — a model-confidence
+    estimate is not a user keep-decision.
+
+    Args:
+        thought: The thought to test.
+        policy: The active hygiene policy (for ``protected_priorities``).
+
+    Returns:
+        ``True`` when the thought must never be auto-archived or auto-GC'd.
+
+    """
+    return thought.pinned or thought.priority.value in policy.protected_priorities
 
 
 def _encode_provenance(value: ProvenanceContext | None) -> str | None:

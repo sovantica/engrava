@@ -152,7 +152,7 @@ class TestForeignKeysActuallyEnforced:
         cursor = await store._db.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 17
+        assert row[0] == 18
 
 
 class TestCreateEdgeRejectsOrphans:
@@ -429,7 +429,7 @@ class TestMigrationV11ToV12:
             await core.ensure_schema()
             version_row = await (await db.execute("PRAGMA user_version")).fetchone()
             assert version_row is not None
-            assert version_row[0] == 17
+            assert version_row[0] == 18
             for table, expected in (("edge", 1), ("embedding", 1), ("action", 1), ("thought", 2)):
                 row = await (
                     await db.execute(f"SELECT COUNT(*) FROM {table}")  # noqa: S608
@@ -508,7 +508,7 @@ class TestMigrationV11ToV12:
             await core.ensure_schema()  # second pass — must converge without error
             version_row = await (await db.execute("PRAGMA user_version")).fetchone()
             assert version_row is not None
-            assert version_row[0] == 17
+            assert version_row[0] == 18
             # FK declarations must still be exactly 2 on edge, not duplicated.
             rows = list(await (await db.execute("PRAGMA foreign_key_list(edge)")).fetchall())
             assert len(rows) == 2
@@ -662,7 +662,7 @@ class TestMigrationV11ToV12:
             await core.ensure_schema()
             version_row = await (await db.execute("PRAGMA user_version")).fetchone()
             assert version_row is not None
-            assert version_row[0] == 17
+            assert version_row[0] == 18
             for table, expected in (("edge", 1), ("embedding", 1), ("action", 1), ("thought", 2)):
                 row = await (
                     await db.execute(f"SELECT COUNT(*) FROM {table}")  # noqa: S608

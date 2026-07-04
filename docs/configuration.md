@@ -286,6 +286,54 @@ ttl:
   default_ttl_seconds: 2592000   # 30 days
 ```
 
+### `hygiene_policy`
+
+The deterministic [Memory Hygiene](memory-hygiene.md) forgetting loop — a no-LLM
+pass that archives cold, low-value thoughts and, separately opt-in,
+garbage-collects them after a restore window. **Absent or `enabled: false` (the
+default) ⇒ the loop never runs and no read/write path changes.** Distinct from
+[`ttl`](#ttl): TTL expires by wall-clock `expires_at`; hygiene forgets by a
+signal-derived keep-score.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | `bool` | `false` | Master switch. When `false`, the forgetting loop is entirely inert. |
+| `eviction_threshold` | `float` | `0.20` | Archive a thought when its eviction-score (keep-score × decay) is below this. A deliberately low bar. |
+| `protected_priorities` | `list[str]` | `["P1"]` | Priorities never auto-archived or auto-GC'd. Set to `[]` for more aggressive hygiene. (Pinning is the hard never-forget marker.) |
+| `signal_weights` | `map[str, float]` | see below | Keep-score weights over the reusable signals. A partial map merges onto the defaults. |
+| `check_every_n_cycles` | `int` | `1` | Cadence for the convenience pass from `consolidate()` only — an explicit `run_hygiene` bypasses it. |
+| `max_evictions_per_run` | `int` | `100` | Caps **each** stage per run (≤ N archived and ≤ N GC'd). |
+| `auto_gc_enabled` | `bool` | `false` | Whether Stage 2 (physical delete) runs. Enabling hygiene never implicitly enables deletion. |
+| `gc_min_archive_age_cycles` | `int` | `10` | Restore window: a hygiene-archived thought is GC-eligible only after this many cycles. |
+| `dry_run` | `bool` | `false` | Preview mode — compute the would-archive set (returned with reasons) without mutating or journaling. |
+
+Default `signal_weights`: `recency 0.30`, `frequency 0.25`, `confirmation 0.20`,
+`confidence 0.15`, `staleness 0.10`. (`confidence` contributes to the keep-score
+but is **not** protection.)
+
+```yaml
+hygiene_policy:
+  enabled: false                 # OFF by default — the whole loop is opt-in
+  eviction_threshold: 0.20
+  protected_priorities: ["P1"]
+  signal_weights:
+    recency: 0.30
+    frequency: 0.25
+    confirmation: 0.20
+    confidence: 0.15
+    staleness: 0.10
+  check_every_n_cycles: 1
+  max_evictions_per_run: 100
+  auto_gc_enabled: false         # Stage 2 physical delete is separately opt-in
+  gc_min_archive_age_cycles: 10  # restore window before a GC is eligible
+  dry_run: false                 # set true to preview without mutating
+```
+
+> Garbage collection here is cognitive hygiene, not compliance deletion — it is
+> best-effort and offers no deletion guarantee. See
+> [Memory Hygiene](memory-hygiene.md) and
+> [Data lifecycle](data-lifecycle.md) for the full mechanics.
+
 ### `ingest`
 
 Ingest-layer behaviour (content-hash deduplication).

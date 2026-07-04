@@ -426,7 +426,7 @@ class TestCompositeEdgeIndex:
             cursor = await conn.execute("PRAGMA user_version")
             row = await cursor.fetchone()
             assert row is not None
-            assert int(row[0]) == 17
+            assert int(row[0]) == 18
 
             cursor = await conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_edge_type_to'"

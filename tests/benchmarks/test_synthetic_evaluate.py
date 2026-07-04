@@ -311,7 +311,10 @@ class TestOffOnPair:
 # (the typed, bounded, opt-in write-time provenance sub-model captured at
 # create_thought and made queryable but never consumed) — an additive,
 # default-off public-API addition (a thought with no provenance is byte-identical
-# to before it existed).
+# to before it existed). Later extended with the Memory Hygiene forgetting-loop
+# surface (HygienePolicyConfig / HygieneResult / EvictionReason), an additive,
+# default-off public-API addition (a store that never enables hygiene_policy is
+# unchanged on every read/write path).
 _PRE_WS_ALL_BASELINE = frozenset(
     {
         "ActionNotFoundError",
@@ -349,6 +352,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "EngravaHooksProtocol",
         "EngravaManager",
         "EngravaMetrics",
+        "EvictionReason",
         "ExtensionManifest",
         "ExtensionMigrationError",
         "FieldOp",
@@ -356,6 +360,8 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "FrequencySignal",
         "HuggingFaceProvider",
         "HybridSearchResult",
+        "HygienePolicyConfig",
+        "HygieneResult",
         "InvalidFilterError",
         "InvalidFilterPathError",
         "InvalidTransitionError",

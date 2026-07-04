@@ -1,8 +1,13 @@
 -- engrava: Core thought-graph schema (free-tier boundary — no internal-cognitive columns).
--- Version: core-17 (opt-in thought.provenance capture column + the two JSON
---          expression indexes idx_thought_prov_session / idx_thought_prov_actor
---          on its identity fields; provenance is captured and queryable only —
---          it feeds no ranking / dreaming / edge path;
+-- Version: core-18 (Memory Hygiene forgetting-loop columns thought.pinned +
+--          thought.archived_at_cycle; both nullable/defaulted so a store that
+--          never enables hygiene reads back unchanged — pinned is the durable
+--          never-forget marker, archived_at_cycle records the cycle hygiene
+--          archived a thought and backs the GC restore window;
+--          core-17 added the opt-in thought.provenance capture column + the two
+--          JSON expression indexes idx_thought_prov_session /
+--          idx_thought_prov_actor on its identity fields; provenance is captured
+--          and queryable only — it feeds no ranking / dreaming / edge path;
 --          core-16 added the denormalised thought.action_outcome_score aggregate
 --          + the idx_action_source_thought seek index that backs its recompute;
 --          core-15 added the composite inbound edge index
@@ -10,7 +15,7 @@
 --          core-14 added the hot-path indexes edge.to_thought_id,
 --          embedding.owner_id, thought.updated_cycle, thought.thought_type)
 
-PRAGMA user_version = 17;
+PRAGMA user_version = 18;
 
 CREATE TABLE IF NOT EXISTS thought (
     thought_id        TEXT    PRIMARY KEY,
@@ -52,7 +57,20 @@ CREATE TABLE IF NOT EXISTS thought (
     -- column-order parity as the columns above. Provenance is an untrusted hint
     -- granted zero authority: it is captured and made queryable only and feeds
     -- no ranking / dreaming / edge-creation path.
-    provenance        TEXT
+    provenance        TEXT,
+    -- Memory Hygiene forgetting-loop columns (core-18). Both nullable/defaulted
+    -- and appended last for the same column-order parity as the columns above,
+    -- so a database upgraded in place (ALTER ... ADD COLUMN can only append)
+    -- matches a freshly created one. ``pinned`` is the durable never-forget
+    -- marker: a pinned thought is never auto-archived or auto-GC'd by the
+    -- hygiene loop (default 0 = not pinned). ``archived_at_cycle`` records the
+    -- cycle at which the hygiene loop archived a thought (NULL when it was not
+    -- archived by hygiene — a restore clears it back to NULL); it backs the
+    -- GC restore window, so a thought archived by any other path (TTL / manual)
+    -- keeps NULL and is never reaped by hygiene GC. A store that never enables
+    -- hygiene leaves both at their defaults and reads back unchanged.
+    pinned            INTEGER NOT NULL DEFAULT 0,
+    archived_at_cycle INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS edge (
