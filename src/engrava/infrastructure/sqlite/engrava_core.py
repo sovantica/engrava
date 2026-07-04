@@ -646,6 +646,12 @@ class SqliteEngravaCore:
         connection to run the walk. An absent or empty chain verifies as
         ``valid=True`` with ``entries_checked=0``.
 
+        The walk verifies **linkage, not length**: a hash chain cannot detect a
+        truncated *tail* (the newest entries removed, or a crash before the
+        final flush), because the remaining prefix stays internally consistent.
+        Detecting a missing tail needs an external high-water-mark and is out of
+        scope here. Mid-chain tampering, deletion, and reordering are all caught.
+
         Returns:
             A :class:`JournalIntegrityResult` describing chain validity —
             ``valid`` plus ``entries_checked``, and on a break the
