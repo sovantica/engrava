@@ -9,6 +9,7 @@ default-off byte-identity guarantee.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -19,6 +20,7 @@ from engrava.config import DreamingConfig, DreamingGates, _parse_dreaming
 from engrava.domain.enums import LifecycleStatus, Priority, ThoughtType
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.extensions.dreaming import DreamingExtension
+from engrava.infrastructure.sqlite.engrava_core import _AccessBuffer
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -235,6 +237,77 @@ class TestAccessSubstrate:
         row = await store.get_thought("t")
         assert row is not None
         assert row.access_count == 0
+
+
+class TestAccessBuffer:
+    """Unit invariants of the bounded FIFO access buffer.
+
+    ``TestAccessSubstrate`` covers the store-level batching; these pin the
+    buffer's own load-bearing guarantees — bounded memory via oldest-inserted
+    eviction and lossless coalescing — that a revert to unbounded growth or
+    wrong-order eviction would otherwise leave green.
+    """
+
+    def test_coalesce_increments_delta_without_growing(self) -> None:
+        """Repeated accesses of one id coalesce into a single counted entry."""
+        buf = _AccessBuffer(cap=8)
+        for _ in range(3):
+            buf.record("a", now="t")
+        assert len(buf) == 1
+        assert buf.drain() == [("a", 3, "t")]
+
+    def test_drain_clears_the_buffer(self) -> None:
+        """drain returns the pending deltas once, then empties."""
+        buf = _AccessBuffer(cap=8)
+        buf.record("a", now="t0")
+        assert buf.drain() == [("a", 1, "t0")]
+        assert len(buf) == 0
+        assert buf.drain() == []
+
+    def test_fifo_evicts_oldest_inserted_at_cap(self) -> None:
+        """A new id beyond the cap evicts the oldest-inserted id (FIFO)."""
+        buf = _AccessBuffer(cap=3)
+        for tid in ("a", "b", "c"):
+            buf.record(tid, now="t")
+        buf.record("d", now="t")  # exceeds cap -> evict oldest-inserted ("a")
+        assert len(buf) == 3
+        assert {tid for tid, _, _ in buf.drain()} == {"b", "c", "d"}
+
+    def test_eviction_is_counted(self) -> None:
+        """Each eviction increments the running evicted-total."""
+        buf = _AccessBuffer(cap=1)
+        buf.record("a", now="t")
+        buf.record("b", now="t")  # evicts "a"
+        assert buf._evicted_total == 1
+        assert {tid for tid, _, _ in buf.drain()} == {"b"}
+
+    def test_coalesce_at_cap_never_evicts(self) -> None:
+        """Coalescing into an existing id at the cap must not evict a peer."""
+        buf = _AccessBuffer(cap=2)
+        buf.record("a", now="t")
+        buf.record("b", now="t")  # full
+        buf.record("a", now="t2")  # coalesce -> must NOT evict "b"
+        assert len(buf) == 2
+        assert buf._evicted_total == 0
+        assert {tid: delta for tid, delta, _ in buf.drain()} == {"a": 2, "b": 1}
+
+    def test_cap_floored_at_one(self) -> None:
+        """A non-positive cap is floored to 1, so the buffer stays bounded."""
+        buf = _AccessBuffer(cap=0)  # floored to 1
+        buf.record("a", now="t")
+        buf.record("b", now="t")  # evicts "a"
+        assert len(buf) == 1
+        assert {tid for tid, _, _ in buf.drain()} == {"b"}
+
+    def test_eviction_logs_warning_naming_the_id(self, caplog: pytest.LogCaptureFixture) -> None:
+        """An eviction emits a WARNING naming the dropped thought id."""
+        buf = _AccessBuffer(cap=1)
+        buf.record("keep-me-first", now="t")
+        with caplog.at_level(logging.WARNING, logger="engrava.infrastructure.sqlite.engrava_core"):
+            buf.record("second", now="t")
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("access buffer full" in m for m in messages)
+        assert any("keep-me-first" in m for m in messages)
 
 
 # ---------------------------------------------------------------------------
