@@ -312,6 +312,62 @@ result = await store.search_hybrid(
 > will be treated as one unit, and rows without the key are never merged.
 > Eligibility (`filters` / `visibility`) always applies first, then collapse.
 
+### Whole-turn assembly (a caller-side recipe)
+
+Collapse and `collapse_max_per_unit` decide *which rows* reach your prompt. If you
+also want the reader to see a unit's **contiguous** text — a whole conversation
+turn in order, not only the chunks that happened to rank — assemble it yourself
+from the results, using only the public API. engrava stores no intrinsic
+chunk-sequence, so this works exactly to the extent your ingest wrote **(a)** a
+stable unit key and **(b)** an orderable ordinal (e.g. a `chunk_index`) on each
+chunk.
+
+```python
+from engrava.domain.models.filters import FieldOp, FieldPredicate, MetadataFilter
+
+# 1. Retrieve as usual — collapse dedupes fragments; distinct units backfill.
+result = await store.search_hybrid(
+    "what did the assistant explain about retries?",
+    top_k=20,
+    collapse_key=["$.session_id", "$.turn_index"],
+    collapse_max_per_unit=2,
+)
+
+# 2. For a result you want in full, read its unit-key value from its own metadata,
+#    gather the unit's chunks with a metadata-filtered search, then order them by
+#    your ordinal and concatenate.
+async def assemble_unit(query: str, thought_id: str) -> str:
+    seed = await store.get_thought(thought_id)
+    assert seed is not None
+    unit = await store.recall(
+        query,                       # any query — the filter selects the unit
+        top_k=100,                   # generous, to cover the unit's chunk count
+        filters=MetadataFilter([
+            FieldPredicate("$.session_id", FieldOp.EQ, seed.metadata["session_id"]),
+            FieldPredicate("$.turn_index", FieldOp.EQ, seed.metadata["turn_index"]),
+        ]),
+    )
+    chunks = [await store.get_thought(tid) for tid, _score in unit.results]
+    ordered = sorted((c for c in chunks if c), key=lambda t: t.metadata["chunk_index"])
+    return "\n".join(t.content for t in ordered)
+```
+
+- **No new API, no result-shape change.** This uses only `get_thought` and the
+  metadata `filters=` you already have on `search_hybrid()`/`recall()` — the same
+  surface you call to read a result's text. `search_hybrid()`'s result stays
+  `(thought_id, score)` tuples.
+- **The metadata predicate lives on the ranked search surface**
+  (`search_hybrid`/`recall`/`search_similar` `filters=`), not on `list_thoughts`
+  (whose filters cover the built-in columns + provenance, not arbitrary metadata),
+  so gathering a unit's chunks is a filtered search with a generous `top_k`; the
+  ranking is irrelevant because you re-order by your own ordinal.
+- **Precondition (yours to guarantee).** Contiguous order is only as good as the
+  metadata you wrote: without a stable, orderable ordinal on each chunk, siblings
+  can be *fetched* but not meaningfully *ordered* — engrava has no chunk-sequence
+  concept of its own. Write the ordinal at ingest alongside the unit key.
+- **Where it runs.** Entirely on the results engrava already returned — prompt and
+  context assembly is your application's concern, not the store's.
+
 ## Configuration Reference
 
 See [configuration.md](configuration.md) for the full YAML reference
