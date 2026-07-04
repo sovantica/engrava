@@ -252,6 +252,54 @@ class TestEligibilityInvariant:
 
 
 # ---------------------------------------------------------------------------
+# Fallback arm eligibility (query-less / unindexable, no vector)
+# ---------------------------------------------------------------------------
+
+
+class TestFallbackArmEligibility:
+    """The query-less / unindexable fallback arm honours filters=/visibility=.
+
+    When neither the FTS arm nor the vector arm is active — an empty or
+    unindexable ``query_text`` with no ``query_vector`` and no embedding
+    provider (e.g. a recency-only scoped browse) — ``search_hybrid`` falls back
+    to a plain lifecycle-ordered scan. That fallback must apply the same
+    ``filters=`` / ``visibility=`` eligibility predicate as the main arms: the
+    docstring promises an out-of-filter row *never* enters the result set, with
+    no exemption for the fallback path.
+    """
+
+    async def test_fallback_path_applies_filters(self, store: SqliteEngravaCore) -> None:
+        """An empty-query recency-only call still excludes out-of-filter rows."""
+        await store.create_thought(_thought("in", essence="one", metadata={"project": "x"}))
+        await store.create_thought(_thought("out", essence="two", metadata={"project": "y"}))
+        # Empty query + no provider -> neither FTS nor vector arm active -> fallback.
+        result = await store.search_hybrid(
+            "",
+            top_k=10,
+            current_cycle=1,
+            filters=MetadataFilter([FieldPredicate("$.project", FieldOp.EQ, "x")]),
+        )
+        assert _ids(result.results) == ["in"]
+
+    async def test_fallback_path_applies_visibility(self, store: SqliteEngravaCore) -> None:
+        """The fallback honours the public-or-mine visibility group too."""
+        await store.create_thought(_thought("pub", essence="a", metadata={"visibility": "public"}))
+        await store.create_thought(
+            _thought("mine", essence="b", metadata={"visibility": "private", "owner": "alice"})
+        )
+        await store.create_thought(
+            _thought("theirs", essence="c", metadata={"visibility": "private", "owner": "bob"})
+        )
+        result = await store.search_hybrid(
+            "",
+            top_k=10,
+            current_cycle=1,
+            visibility=VisibilityQueryFilter({"public"}, owner="alice"),
+        )
+        assert set(_ids(result.results)) == {"pub", "mine"}
+
+
+# ---------------------------------------------------------------------------
 # No starvation / refill
 # ---------------------------------------------------------------------------
 
