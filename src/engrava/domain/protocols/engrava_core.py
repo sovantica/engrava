@@ -190,6 +190,7 @@ class EngravaCoreProtocol(Protocol):
         filters: MetadataFilter | None = None,
         visibility: VisibilityQueryFilter | None = None,
         collapse_key: str | Sequence[str] | None = None,
+        collapse_max_per_unit: int | None = None,
     ) -> HybridSearchResult:
         """Retrieve thoughts relevant to a query with one call.
 
@@ -219,6 +220,12 @@ class EngravaCoreProtocol(Protocol):
                 ``collapse_key`` widens the internal candidate pool, which can
                 rescale normalized fusion scores and shift order among units;
                 only ``collapse_key=None`` leaves the result path unchanged.
+            collapse_max_per_unit: Optional intra-unit retention depth for
+                ``collapse_key``; delegated to ``search_hybrid``. ``None``
+                (default) keeps one best row per unit; an integer ``>= 1`` keeps
+                up to that many highest-ranked members of a unit and backfills
+                the freed slots with deeper distinct units. Only effective with
+                ``collapse_key``; rejected when ``< 1``.
 
         Returns:
             A ``HybridSearchResult`` with the ranked matches and the set of
@@ -407,6 +414,7 @@ class EngravaCoreProtocol(Protocol):
         filters: MetadataFilter | None = None,
         visibility: VisibilityQueryFilter | None = None,
         collapse_key: str | Sequence[str] | None = None,
+        collapse_max_per_unit: int | None = None,
     ) -> HybridSearchResult:
         """Hybrid search combining FTS5 keyword + vector cosine similarity.
 
@@ -468,6 +476,15 @@ class EngravaCoreProtocol(Protocol):
                 meaningful as the unit metadata the application writes (a
                 missing or malformed key ⇒ the row is its own unit, never
                 collapsed).
+            collapse_max_per_unit: Optional intra-unit retention depth for
+                ``collapse_key`` — how many rows of one unit may reach the
+                result. ``None`` (default) keeps one best row per unit; an
+                integer ``>= 1`` keeps up to that many highest-ranked members of
+                a unit and lets the freed slots backfill deeper distinct units.
+                Only takes effect together with ``collapse_key``, only relaxes
+                the intra-unit count (never adds a non-candidate row, mutates a
+                score, or drops a distinct unit as a side effect), and is
+                rejected when ``< 1``.
 
         Returns:
             ``HybridSearchResult`` with ranked results and the set of

@@ -14,6 +14,10 @@ Covers, per the acceptance criteria:
 * Bounded candidate-pool widening + the ``None`` path being unaffected.
 * Composition with ``filters=`` / ``visibility=``.
 * Path validation raised at argument time.
+* ``collapse_max_per_unit`` deep-backfill retention: keeping N>1 members of a
+  unit (deeper same-unit rows) while distinct deeper units still backfill —
+  the ``None`` default staying byte-identical to single-keeper collapse, plus
+  the deeper-pool cliff regression this repairs.
 """
 
 from __future__ import annotations
@@ -33,7 +37,7 @@ from engrava.domain.enums import (
     Priority,
     ThoughtType,
 )
-from engrava.domain.exceptions import InvalidFilterPathError
+from engrava.domain.exceptions import InvalidFilterError, InvalidFilterPathError
 from engrava.domain.models.edge import EdgeRecord
 from engrava.domain.models.filters import (
     FieldOp,
@@ -45,6 +49,7 @@ from engrava.domain.models.thought import MetadataValue, ThoughtRecord
 from engrava.infrastructure.sqlite.engrava_core import (
     _collapse_ranked_by_unit,
     _normalize_collapse_key,
+    _retain_ranked_by_unit,
 )
 
 if TYPE_CHECKING:
@@ -179,6 +184,70 @@ class TestCollapseRankedByUnit:
         }
         out = _collapse_ranked_by_unit(ranked, keys)
         assert out == [("z", 0.9), ("y", 0.8)]
+
+
+class TestRetainRankedByUnit:
+    """The generalized retention helper: keep up to N members per unit."""
+
+    def test_max_one_equals_single_keeper_collapse(self) -> None:
+        """``max_per_unit=1`` reproduces ``_collapse_ranked_by_unit`` exactly."""
+        ranked = [("a", 0.9), ("b", 0.8), ("c", 0.7), ("d", 0.6)]
+        keys: dict[str, tuple[object, ...] | None] = {
+            "a": ("u1",),
+            "b": ("u1",),
+            "c": ("u2",),
+            "d": ("u2",),
+        }
+        assert _retain_ranked_by_unit(ranked, keys, max_per_unit=1) == _collapse_ranked_by_unit(
+            ranked, keys
+        )
+
+    def test_max_two_keeps_two_highest_ranked_per_unit(self) -> None:
+        """N=2 retains a unit's two highest-ranked members, drops the third."""
+        ranked = [("a", 0.9), ("b", 0.8), ("c", 0.7), ("d", 0.6)]
+        keys: dict[str, tuple[object, ...] | None] = {
+            "a": ("u1",),
+            "b": ("u1",),
+            "c": ("u1",),  # third member of u1 -> dropped
+            "d": ("u2",),
+        }
+        # a, b (two best of u1) survive; c (third) drops; d (u2) survives.
+        assert _retain_ranked_by_unit(ranked, keys, max_per_unit=2) == [
+            ("a", 0.9),
+            ("b", 0.8),
+            ("d", 0.6),
+        ]
+
+    def test_max_two_keyless_rows_all_survive(self) -> None:
+        """Key-less rows are each their own unit regardless of ``max_per_unit``."""
+        ranked = [("a", 0.9), ("b", 0.8), ("c", 0.7)]
+        keys: dict[str, tuple[object, ...] | None] = {"a": None, "b": None, "c": None}
+        assert _retain_ranked_by_unit(ranked, keys, max_per_unit=2) == ranked
+
+    def test_high_cap_never_drops_anything(self) -> None:
+        """A cap at/above a unit's member count leaves every member in place."""
+        ranked = [("a", 0.9), ("b", 0.8), ("c", 0.7)]
+        keys: dict[str, tuple[object, ...] | None] = {
+            "a": ("u1",),
+            "b": ("u1",),
+            "c": ("u1",),
+        }
+        assert _retain_ranked_by_unit(ranked, keys, max_per_unit=5) == ranked
+
+    def test_d8_order_preserved_under_retention(self) -> None:
+        """Survivor order follows the input D8 order under N>1 retention too."""
+        ranked = [("z", 0.9), ("y", 0.8), ("x", 0.7), ("w", 0.6)]
+        keys: dict[str, tuple[object, ...] | None] = {
+            "z": ("u1",),
+            "y": ("u2",),
+            "x": ("u1",),
+            "w": ("u1",),  # third member of u1 -> dropped at N=2
+        }
+        assert _retain_ranked_by_unit(ranked, keys, max_per_unit=2) == [
+            ("z", 0.9),
+            ("y", 0.8),
+            ("x", 0.7),
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -703,3 +772,366 @@ class TestCollapseAfterExpansion:
         returned = _ids(result.results)
         assert "graph_expansion" in result.backends_used
         assert len([tid for tid in returned if tid.startswith("src-")]) == 1
+
+
+# ---------------------------------------------------------------------------
+# collapse_max_per_unit — deep-backfill retention depth (A2 / A3 / A5-A7)
+# ---------------------------------------------------------------------------
+
+
+class TestMaxPerUnitArgumentValidation:
+    """The retention depth is validated at argument time (A10)."""
+
+    async def test_zero_rejected(self, store: SqliteEngravaCore) -> None:
+        """A retention count of 0 has no meaning and is rejected before any row."""
+        await store.create_thought(_thought("t1", essence="alpha", metadata={"unit": "u1"}))
+        with pytest.raises(InvalidFilterError):
+            await store.search_hybrid("alpha", collapse_key="$.unit", collapse_max_per_unit=0)
+
+    async def test_negative_rejected(self, store: SqliteEngravaCore) -> None:
+        """A negative retention count is rejected with the typed error."""
+        await store.create_thought(_thought("t1", essence="alpha", metadata={"unit": "u1"}))
+        with pytest.raises(InvalidFilterError):
+            await store.search_hybrid("alpha", collapse_key="$.unit", collapse_max_per_unit=-3)
+
+    async def test_rejected_even_without_collapse_key(self, store: SqliteEngravaCore) -> None:
+        """The value is validated regardless of whether collapse_key is present."""
+        await store.create_thought(_thought("t1", essence="alpha", metadata={"unit": "u1"}))
+        with pytest.raises(InvalidFilterError):
+            await store.search_hybrid("alpha", collapse_max_per_unit=0)
+
+
+class TestMaxPerUnitNoneParity:
+    """A2 — the new param defaults off with zero behaviour change."""
+
+    async def test_none_equals_single_keeper_collapse(self, store: SqliteEngravaCore) -> None:
+        """``collapse_max_per_unit=None`` == the plain single-keeper collapse path.
+
+        Same store, same ``collapse_key``: passing ``None`` explicitly must be
+        byte-identical (candidate set, scores, order) to omitting the param.
+        """
+        for unit in ("u1", "u2", "u3"):
+            for frag in ("a", "b", "c"):
+                await store.create_thought(
+                    _thought(f"{unit}-{frag}", essence="rho keyword", metadata={"unit": unit})
+                )
+        implicit = await store.search_hybrid("rho keyword", top_k=10, collapse_key="$.unit")
+        explicit_none = await store.search_hybrid(
+            "rho keyword", top_k=10, collapse_key="$.unit", collapse_max_per_unit=None
+        )
+        assert implicit.results == explicit_none.results
+
+    async def test_none_with_no_collapse_key_is_full_baseline_parity(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        """With no ``collapse_key``, the new param (any value) leaves the path untouched.
+
+        The retention count is inert without a unit key to retain by, so the
+        candidate/score/order path stays byte-identical to today's default.
+        """
+        for i in range(5):
+            await store.create_thought(
+                _thought(f"t{i}", essence=f"sigma symbol {i}", metadata={"unit": "u1"})
+            )
+        baseline = await store.search_hybrid("sigma", top_k=10)
+        with_param = await store.search_hybrid("sigma", top_k=10, collapse_max_per_unit=5)
+        assert baseline.results == with_param.results
+
+    async def test_max_one_equals_none(self, store: SqliteEngravaCore) -> None:
+        """``collapse_max_per_unit=1`` is exactly the single-keeper collapse."""
+        for unit in ("u1", "u2"):
+            for frag in ("a", "b"):
+                await store.create_thought(
+                    _thought(f"{unit}-{frag}", essence="omega word", metadata={"unit": unit})
+                )
+        keeper = await store.search_hybrid("omega", top_k=10, collapse_key="$.unit")
+        n1 = await store.search_hybrid(
+            "omega", top_k=10, collapse_key="$.unit", collapse_max_per_unit=1
+        )
+        assert keeper.results == n1.results
+
+
+class TestDeepBackfillCliffRegression:
+    """A3 — the per-defect regression: deeper distinct unit + deeper answer chunk.
+
+    Fully controlled ranks via the exhaustive vector arm (a ``no-fts-match``
+    query text isolates the vector arm, so BM25 length normalization never
+    perturbs the order). Cosine to the query ``[1, 0, 0, 0]`` gives a fixed
+    order ``u1-top > u1-ans > u1-c3 > u2-best``: a long unit ``u1`` (three
+    fragments, whose *answer* fact lives in the deeper ``u1-ans`` chunk, not the
+    top one) and a *distinct* gold unit ``u2`` whose best chunk sits past the
+    un-widened per-arm window (the rank-51 cliff, modelled by ``vector_top_k=2``).
+    """
+
+    @staticmethod
+    async def _seed(s: SqliteEngravaCore) -> None:
+        """Seed the long-turn + distinct-deeper-unit cliff store."""
+        rows = {
+            "u1-top": ([1.0, 0.02, 0.0, 0.0], "u1"),
+            "u1-ans": ([0.985, 0.17, 0.0, 0.0], "u1"),  # deeper *answer* chunk
+            "u1-c3": ([0.980, 0.20, 0.0, 0.0], "u1"),
+            "u2-best": ([0.900, 0.44, 0.0, 0.0], "u2"),  # distinct unit past the window
+        }
+        for tid, (vec, unit) in rows.items():
+            await s.create_thought(_thought(tid, essence=f"row {tid}", metadata={"unit": unit}))
+            await s.store_embedding(tid, vec)
+
+    async def test_today_none_path_misses_deeper_distinct_unit(self, tmp_path: Path) -> None:
+        """BEFORE (default path): the distinct deeper unit is unreachable.
+
+        ``collapse_key=None`` never widens the pool, so with ``vector_top_k=2``
+        the candidate set is only the two strongest ``u1`` fragments and the
+        distinct ``u2-best`` past the window is absent — exactly the cliff.
+        """
+        conn = await aiosqlite.connect(str(tmp_path / "cliff_none.db"))
+        conn.row_factory = aiosqlite.Row
+        s = SqliteEngravaCore(conn, search_config=SearchConfig(collapse_pool_factor=4))
+        await s.ensure_schema()
+        try:
+            await self._seed(s)
+            result = await s.search_hybrid(
+                "no-fts-match",
+                query_vector=[1.0, 0.0, 0.0, 0.0],
+                top_k=20,
+                fts_top_k=2,
+                vector_top_k=2,
+                collapse_key=None,
+            )
+            assert "u2-best" not in set(_ids(result.results))
+        finally:
+            await conn.close()
+
+    async def test_today_single_keeper_drops_deeper_answer_chunk(self, tmp_path: Path) -> None:
+        """BEFORE (single-keeper collapse): the long turn's deeper answer chunk is dropped.
+
+        ``collapse_key`` widens the pool (so ``u2-best`` is reachable) but keeps
+        exactly one row per unit, so the deeper ``u1-ans`` answer chunk is
+        evicted in favour of ``u1-top`` — the ss-assistant regression pattern.
+        """
+        conn = await aiosqlite.connect(str(tmp_path / "cliff_keeper.db"))
+        conn.row_factory = aiosqlite.Row
+        s = SqliteEngravaCore(conn, search_config=SearchConfig(collapse_pool_factor=4))
+        await s.ensure_schema()
+        try:
+            await self._seed(s)
+            result = await s.search_hybrid(
+                "no-fts-match",
+                query_vector=[1.0, 0.0, 0.0, 0.0],
+                top_k=20,
+                fts_top_k=2,
+                vector_top_k=2,
+                collapse_key="$.unit",
+            )
+            returned = set(_ids(result.results))
+            # Widening surfaces the distinct unit, but the deeper answer chunk is lost.
+            assert "u2-best" in returned
+            assert "u1-ans" not in returned
+        finally:
+            await conn.close()
+
+    async def test_h_a_surfaces_distinct_unit_and_keeps_answer_chunk(self, tmp_path: Path) -> None:
+        """AFTER (H-A on, N>=2): distinct deeper unit present AND answer chunk kept.
+
+        The widened pool still reaches ``u2-best`` (distinct-unit backfill), and
+        raising the retention depth to 2 keeps the deeper ``u1-ans`` answer chunk
+        alongside ``u1-top`` — repairing both halves of the defect at once.
+        """
+        conn = await aiosqlite.connect(str(tmp_path / "cliff_ha.db"))
+        conn.row_factory = aiosqlite.Row
+        s = SqliteEngravaCore(conn, search_config=SearchConfig(collapse_pool_factor=4))
+        await s.ensure_schema()
+        try:
+            await self._seed(s)
+            result = await s.search_hybrid(
+                "no-fts-match",
+                query_vector=[1.0, 0.0, 0.0, 0.0],
+                top_k=20,
+                fts_top_k=2,
+                vector_top_k=2,
+                collapse_key="$.unit",
+                collapse_max_per_unit=2,
+            )
+            returned = set(_ids(result.results))
+            assert "u2-best" in returned  # distinct deeper unit backfilled
+            assert "u1-ans" in returned  # long-turn deeper answer chunk retained
+            assert "u1-top" in returned  # the unit's top chunk is still there
+        finally:
+            await conn.close()
+
+
+class TestMaxPerUnitRecallNeutralityDeterminism:
+    """A5 — deeper retention never drops a distinct unit; A8 — deterministic."""
+
+    async def test_every_distinct_unit_still_present_under_n2(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        """N=2 retention never conflates or drops a *distinct* unit as a side effect."""
+        produced: set[str] = set()
+        for unit in ("u1", "u2", "u3"):
+            for frag in ("a", "b", "c"):
+                tid = f"{unit}-{frag}"
+                produced.add(tid)
+                await store.create_thought(
+                    _thought(tid, essence="nu keyword", metadata={"unit": unit})
+                )
+        result = await store.search_hybrid(
+            "nu keyword", top_k=20, collapse_key="$.unit", collapse_max_per_unit=2
+        )
+        returned = _ids(result.results)
+        units_seen = {tid.split("-")[0] for tid in returned}
+        assert units_seen == {"u1", "u2", "u3"}  # no distinct unit lost
+        assert set(returned) <= produced  # no phantom row
+        # Up to two members per unit (deeper retention), never more.
+        for unit in ("u1", "u2", "u3"):
+            assert len([tid for tid in returned if tid.startswith(unit)]) <= 2
+
+    async def test_scores_unchanged_under_deeper_retention(self, store: SqliteEngravaCore) -> None:
+        """Retained members keep the exact score they had without any collapse."""
+        await store.create_thought(_thought("d1", essence="mu one", metadata={"unit": "u1"}))
+        await store.create_thought(_thought("d2", essence="mu two", metadata={"unit": "u1"}))
+        await store.create_thought(_thought("d3", essence="mu three", metadata={"unit": "u2"}))
+        plain = dict((await store.search_hybrid("mu", top_k=10)).results)
+        retained = dict(
+            (
+                await store.search_hybrid(
+                    "mu", top_k=10, collapse_key="$.unit", collapse_max_per_unit=2
+                )
+            ).results
+        )
+        for tid, score in retained.items():
+            assert plain[tid] == score
+
+    async def test_deterministic_across_repeated_queries(self, store: SqliteEngravaCore) -> None:
+        """N=2 retention is invariant to physical scan order (stable across runs)."""
+        ids = [f"frag-{i:02d}" for i in range(8)]
+        for tid in [ids[5], ids[1], ids[7], ids[0], *ids]:
+            try:
+                await store.create_thought(
+                    _thought(tid, essence="xi-word", metadata={"unit": "u1"})
+                )
+            except ValueError:
+                continue
+        first = await store.search_hybrid(
+            "xi-word", top_k=10, collapse_key="$.unit", collapse_max_per_unit=2
+        )
+        second = await store.search_hybrid(
+            "xi-word", top_k=10, collapse_key="$.unit", collapse_max_per_unit=2
+        )
+        assert _ids(first.results) == _ids(second.results)
+        # All scores tie -> the two canonical lowest ids are the retained pair.
+        assert _ids(first.results) == ["frag-00", "frag-01"]
+
+
+class TestMaxPerUnitBoundedWidening:
+    """A6 — deeper retention still rides the bounded, config-backed widening."""
+
+    async def test_none_path_still_unwidened_with_param_set(self, tmp_path: Path) -> None:
+        """The param does not widen the pool on the ``collapse_key=None`` path.
+
+        Widening is gated on ``collapse_key`` alone; setting only
+        ``collapse_max_per_unit`` must leave the un-widened budget in force, so a
+        past-the-window row stays out.
+        """
+        conn = await aiosqlite.connect(str(tmp_path / "param_nowiden.db"))
+        conn.row_factory = aiosqlite.Row
+        s = SqliteEngravaCore(conn, search_config=SearchConfig(collapse_pool_factor=4))
+        await s.ensure_schema()
+        try:
+            await TestDeepBackfillCliffRegression._seed(s)
+            result = await s.search_hybrid(
+                "no-fts-match",
+                query_vector=[1.0, 0.0, 0.0, 0.0],
+                top_k=20,
+                fts_top_k=2,
+                vector_top_k=2,
+                collapse_key=None,
+                collapse_max_per_unit=2,
+            )
+            assert "u2-best" not in set(_ids(result.results))
+        finally:
+            await conn.close()
+
+    async def test_widening_factor_one_bounds_the_pool(self, tmp_path: Path) -> None:
+        """A ``collapse_pool_factor=1`` keeps the pool un-widened even under N=2.
+
+        Confirms the deep pool is the *bounded, configurable* widening — not an
+        unbounded over-fetch: with factor 1 the deeper distinct unit stays past
+        the window even with the retention lever on.
+        """
+        conn = await aiosqlite.connect(str(tmp_path / "factor_one.db"))
+        conn.row_factory = aiosqlite.Row
+        s = SqliteEngravaCore(conn, search_config=SearchConfig(collapse_pool_factor=1))
+        await s.ensure_schema()
+        try:
+            await TestDeepBackfillCliffRegression._seed(s)
+            result = await s.search_hybrid(
+                "no-fts-match",
+                query_vector=[1.0, 0.0, 0.0, 0.0],
+                top_k=20,
+                fts_top_k=2,
+                vector_top_k=2,
+                collapse_key="$.unit",
+                collapse_max_per_unit=2,
+            )
+            assert "u2-best" not in set(_ids(result.results))
+        finally:
+            await conn.close()
+
+
+class TestMaxPerUnitComposition:
+    """A7 — deeper retention composes with filters/visibility and the cap."""
+
+    async def test_composes_with_metadata_filter(self, store: SqliteEngravaCore) -> None:
+        """Out-of-filter rows never reach retention; in-filter unit keeps <= N."""
+        for frag in ("a", "b", "c"):
+            await store.create_thought(
+                _thought(f"in-{frag}", essence="pi word", metadata={"project": "x", "unit": "u1"})
+            )
+        await store.create_thought(
+            _thought("in-d", essence="pi word", metadata={"project": "x", "unit": "u2"})
+        )
+        await store.create_thought(
+            _thought("out", essence="pi word", metadata={"project": "y", "unit": "u1"})
+        )
+        result = await store.search_hybrid(
+            "pi",
+            top_k=10,
+            filters=MetadataFilter([FieldPredicate("$.project", FieldOp.EQ, "x")]),
+            collapse_key="$.unit",
+            collapse_max_per_unit=2,
+        )
+        returned = _ids(result.results)
+        assert "out" not in returned  # eligibility applied before retention
+        assert "in-d" in returned  # distinct in-filter unit present
+        # u1 keeps at most 2 in-filter fragments (never the out-of-filter one).
+        assert len([tid for tid in returned if tid.startswith("in-") and tid != "in-d"]) <= 2
+
+    async def test_cap_backfills_from_retained_off_list_no_double_count(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        """Collapse/retain runs before the reflection cap; no unit double-counted."""
+        for i in range(6):
+            await store.create_thought(
+                _thought(
+                    f"refl-{i}",
+                    essence="tau tau summary",
+                    thought_type=ThoughtType.REFLECTION,
+                    metadata={"unit": "r1"},
+                )
+            )
+        for u in range(1, 6):
+            await store.create_thought(
+                _thought(f"obs{u}", essence="tau summary", metadata={"unit": f"o{u}"})
+            )
+        result = await store.search_hybrid(
+            "tau summary",
+            top_k=5,
+            collapse_key="$.unit",
+            collapse_max_per_unit=2,
+        )
+        returned = _ids(result.results)
+        refl_in_final = [tid for tid in returned if tid.startswith("refl-")]
+        # cap = 0.3 with top_k=5 -> at most 1 reflection slot, even at N=2.
+        assert len(refl_in_final) <= 1
+        # No duplicate ids across the retention + cap backfill stages.
+        assert len(returned) == len(set(returned))

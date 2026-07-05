@@ -3065,6 +3065,7 @@ class SqliteEngravaCore:
         filters: MetadataFilter | None = None,
         visibility: VisibilityQueryFilter | None = None,
         collapse_key: str | Sequence[str] | None = None,
+        collapse_max_per_unit: int | None = None,
     ) -> HybridSearchResult:
         """Retrieve thoughts relevant to a query with one call.
 
@@ -3113,6 +3114,13 @@ class SqliteEngravaCore:
                 order among units; only ``collapse_key=None`` is byte-identical
                 to the unfiltered path. It is only as meaningful as the unit
                 metadata the application writes.
+            collapse_max_per_unit: Optional intra-unit retention depth for
+                ``collapse_key``; delegated to :meth:`search_hybrid`. ``None``
+                (the default) keeps one best row per unit; an integer ``>= 1``
+                keeps up to that many of a unit's highest-ranked rows and lets
+                the freed slots backfill deeper distinct units. Only takes
+                effect together with ``collapse_key``; a value ``< 1`` is
+                rejected.
 
         Returns:
             A ``HybridSearchResult`` with the ranked matches and the set of
@@ -3138,6 +3146,7 @@ class SqliteEngravaCore:
             filters=filters,
             visibility=visibility,
             collapse_key=collapse_key,
+            collapse_max_per_unit=collapse_max_per_unit,
         )
 
     async def cleanup_expired(
@@ -5355,6 +5364,7 @@ class SqliteEngravaCore:
         filters: MetadataFilter | None = None,
         visibility: VisibilityQueryFilter | None = None,
         collapse_key: str | Sequence[str] | None = None,
+        collapse_max_per_unit: int | None = None,
     ) -> HybridSearchResult:
         """Hybrid search combining FTS5 + vector + recency + priority + graph signals.
 
@@ -5444,6 +5454,23 @@ class SqliteEngravaCore:
                 a row whose key is missing or holds malformed metadata is
                 treated as its own unit and is never collapsed with another.
                 Each path is validated at call time.
+            collapse_max_per_unit: Optional cap on how many rows of a single
+                ``collapse_key`` unit may reach the result — the intra-unit
+                retention depth. Only takes effect **together with**
+                ``collapse_key`` (there is no unit to retain-by otherwise).
+                ``None`` (the default) keeps the single-keeper behaviour: at
+                most one best row per unit, identical to passing only
+                ``collapse_key``. An integer ``>= 1`` admits up to that many of
+                a unit's highest-ranked rows and lets the remaining slots
+                backfill deeper *distinct* units from the widened pool — so a
+                long fragmented unit can keep more than its single top row while
+                still surfacing more distinct units. This only relaxes the
+                intra-unit retention count; it never adds a row an arm did not
+                produce, never mutates a score, and never merges or drops a
+                *distinct* unit as a side effect (ordinary ``top_k`` truncation
+                still applies unchanged). Key-less rows are unaffected (each is
+                already its own unit). Validated at call time; a value ``< 1``
+                is rejected.
 
         Returns:
             ``HybridSearchResult`` with ranked results and diagnostics. Tied
@@ -5466,6 +5493,18 @@ class SqliteEngravaCore:
         filter_clause_plain = compile_effective_predicate(
             filters, visibility, column="metadata_json"
         )
+
+        # Validate the intra-unit retention depth at argument time (never
+        # mid-query), mirroring the collapse-key path-validation contract. A
+        # value below 1 has no meaning as a retention count, so reject it with a
+        # typed error. ``None`` keeps the single-keeper behaviour. The param is
+        # inert unless ``collapse_key`` is also set (no unit to retain-by), so
+        # it does not perturb the ``collapse_key=None`` byte-identical path.
+        if collapse_max_per_unit is not None and collapse_max_per_unit < 1:
+            from engrava.domain.exceptions import InvalidFilterError  # noqa: PLC0415
+
+            msg = f"collapse_max_per_unit must be >= 1, got {collapse_max_per_unit}"
+            raise InvalidFilterError(msg)
 
         # Validate the de-fragmentation unit key (if any) at argument time —
         # never mid-query (reuses the shared metadata path grammar). ``None``
@@ -5736,20 +5775,28 @@ class SqliteEngravaCore:
         # ascending — invariant to dict/scan order.
         ranked = _sort_scored_descending(list(combined.items()))
 
-        # --- De-fragmentation collapse-by-unit + backfill ---
+        # --- De-fragmentation retention-by-unit + backfill ---
         # Runs AFTER fusion + recency/priority/graph scoring + the
         # CONSOLIDATED_FROM expansion and reflection boost, BEFORE the
         # ``[:top_k]`` truncation and BEFORE reflection_topk_cap — the same
         # locus and shape as the cap's evict-and-backfill. It touches neither
-        # arm's WHERE, no score, and no candidate set: it only removes
+        # arm's WHERE, no score, and no candidate set: it only removes surplus
         # lower-ranked members of the same caller-defined unit so deeper
         # distinct units in ``ranked[top_k:]`` flow up into the window.
+        # ``collapse_max_per_unit`` sets how many members of a unit are kept:
+        # ``None`` => 1 (single-keeper collapse, byte-identical to before), an
+        # integer keeps that many (deeper same-unit rows survive while the freed
+        # slots still backfill distinct units).
         if collapse_paths is not None and combined:
             unit_keys = await self._fetch_collapse_unit_keys(
                 thought_ids=list(combined),
                 paths=collapse_paths,
             )
-            ranked = _collapse_ranked_by_unit(ranked, unit_keys)
+            ranked = _retain_ranked_by_unit(
+                ranked,
+                unit_keys,
+                max_per_unit=1 if collapse_max_per_unit is None else collapse_max_per_unit,
+            )
         final = ranked[:top_k]
 
         # --- reflection_topk_cap enforcement ---
@@ -7546,23 +7593,66 @@ def _normalize_collapse_key(collapse_key: str | Sequence[str]) -> tuple[str, ...
     return paths
 
 
+def _retain_ranked_by_unit(
+    ranked: list[tuple[str, float]],
+    unit_keys: dict[str, tuple[object, ...] | None],
+    max_per_unit: int,
+) -> list[tuple[str, float]]:
+    """Retain up to ``max_per_unit`` best rows per unit on a D8-ranked list.
+
+    Walks ``ranked`` top-down (it is already in the D8 total order, so the
+    members of each unit are visited highest-ranked first). A row is admitted
+    unless its unit key has already reached ``max_per_unit`` admitted members,
+    in which case the surplus lower-ranked member is dropped. A row whose unit
+    key is ``None`` (missing / malformed metadata, or a composite with any-NULL
+    component) is its OWN unit and always passes through — never grouped with
+    another key-less row, which would silently drop distinct rows.
+
+    ``max_per_unit == 1`` is the single-keeper collapse (exactly the
+    highest-ranked member per unit survives); ``max_per_unit > 1`` is a strict
+    relaxation that keeps a unit's deeper members too — the intra-unit
+    retention count is the only thing that changes, never which distinct units
+    are eligible. The relative order of the surviving rows is preserved from
+    ``ranked`` (already the D8 order), so no re-sort with a new rule is
+    introduced; retention and final order both derive from the single D8 order.
+
+    Args:
+        ranked: ``(thought_id, score)`` pairs in D8 total order.
+        unit_keys: Map from ``thought_id`` to its unit-key tuple, or ``None``
+            for a key-less row. Missing ids are treated as ``None``.
+        max_per_unit: Maximum admitted members per non-None unit (``>= 1``).
+
+    Returns:
+        The retained ``(thought_id, score)`` list, D8 order preserved.
+
+    """
+    unit_counts: dict[tuple[object, ...], int] = {}
+    retained: list[tuple[str, float]] = []
+    for thought_id, score in ranked:
+        unit = unit_keys.get(thought_id)
+        if unit is None:
+            # Key-less row: its own unit, never grouped with another.
+            retained.append((thought_id, score))
+            continue
+        admitted = unit_counts.get(unit, 0)
+        if admitted >= max_per_unit:
+            # Surplus lower-ranked member of an already-full unit: drop.
+            continue
+        unit_counts[unit] = admitted + 1
+        retained.append((thought_id, score))
+    return retained
+
+
 def _collapse_ranked_by_unit(
     ranked: list[tuple[str, float]],
     unit_keys: dict[str, tuple[object, ...] | None],
 ) -> list[tuple[str, float]]:
     """Collapse a D8-ranked candidate list to one best row per unit.
 
-    Walks ``ranked`` top-down (it is already in the D8 total order, so the
-    first occurrence of a unit is its highest-ranked member). The first
-    member of each **non-None** unit key is the keeper; subsequent members of
-    the same unit are dropped. A row whose unit key is ``None`` (missing /
-    malformed metadata, or a composite with any-NULL component) is its OWN
-    unit and always passes through — never collapsed with another key-less
-    row, which would silently drop distinct rows.
-
-    The relative order of the surviving rows is preserved from ``ranked``
-    (already the D8 order), so no re-sort with a new rule is introduced;
-    keeper selection and final order both derive from the single D8 order.
+    The single-keeper special case of :func:`_retain_ranked_by_unit`
+    (``max_per_unit=1``): the first (highest-ranked) member of each **non-None**
+    unit key is the keeper; subsequent members of the same unit are dropped.
+    Key-less rows (``None`` unit key) always pass through as their own unit.
 
     Args:
         ranked: ``(thought_id, score)`` pairs in D8 total order.
@@ -7573,19 +7663,7 @@ def _collapse_ranked_by_unit(
         The collapsed ``(thought_id, score)`` list, D8 order preserved.
 
     """
-    seen_units: set[tuple[object, ...]] = set()
-    collapsed: list[tuple[str, float]] = []
-    for thought_id, score in ranked:
-        unit = unit_keys.get(thought_id)
-        if unit is None:
-            # Key-less row: its own unit, never collapsed.
-            collapsed.append((thought_id, score))
-            continue
-        if unit in seen_units:
-            continue
-        seen_units.add(unit)
-        collapsed.append((thought_id, score))
-    return collapsed
+    return _retain_ranked_by_unit(ranked, unit_keys, max_per_unit=1)
 
 
 def _normalize_min_max(

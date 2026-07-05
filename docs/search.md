@@ -270,6 +270,37 @@ unchanged.
   `collapse_key` is not score-neutral even though the collapse step itself never
   mutates a score. Only `collapse_key=None` is byte-identical to a plain query.
 
+**Keeping more than one row per unit (`collapse_max_per_unit`).** By default
+collapse keeps a *single* best row per unit. When a unit is genuinely a long,
+multi-part thing — say one long turn split into several chunks whose useful
+detail is spread across more than the top chunk — dropping every chunk but the
+best one can discard the part you actually need. The optional, keyword-only
+`collapse_max_per_unit` sets how many of a unit's highest-ranked rows may reach
+the result, so a long unit can keep its deeper rows while the remaining slots
+still backfill deeper *distinct* units:
+
+```python
+# Keep up to 2 rows of each unit; distinct deeper units still backfill.
+result = await store.search_hybrid(
+    "rollout decision",
+    top_k=20,
+    collapse_key="$.turn_id",
+    collapse_max_per_unit=2,
+)
+```
+
+- `None` (the default) keeps exactly one best row per unit — identical to
+  passing only `collapse_key`. An integer `>= 1` keeps up to that many of a
+  unit's highest-ranked rows; `1` is the single-best-row default.
+- It only takes effect together with `collapse_key` (there is no unit to
+  retain by otherwise), and is validated at call time — a value below `1` raises
+  `InvalidFilterError`.
+- It only relaxes the per-unit retention count. It never adds a row a search arm
+  did not produce, never mutates a score, and never merges or drops a *distinct*
+  unit as a side effect; the usual `top_k` truncation still applies, so distinct
+  units beyond `top_k` are dropped exactly as they are without it. Key-less rows
+  are unaffected — each is already its own unit.
+
 > **Collapse is a presentation convenience, not a filter and not an isolation
 > boundary.** It does not change which rows are *eligible* (use `filters` /
 > `visibility` for that). The collapse step itself mutates no score — it only
@@ -280,6 +311,62 @@ unchanged.
 > application writes: if two genuinely different rows carry the same key they
 > will be treated as one unit, and rows without the key are never merged.
 > Eligibility (`filters` / `visibility`) always applies first, then collapse.
+
+### Whole-turn assembly (a caller-side recipe)
+
+Collapse and `collapse_max_per_unit` decide *which rows* reach your prompt. If you
+also want the reader to see a unit's **contiguous** text — a whole conversation
+turn in order, not only the chunks that happened to rank — assemble it yourself
+from the results, using only the public API. engrava stores no intrinsic
+chunk-sequence, so this works exactly to the extent your ingest wrote **(a)** a
+stable unit key and **(b)** an orderable ordinal (e.g. a `chunk_index`) on each
+chunk.
+
+```python
+from engrava.domain.models.filters import FieldOp, FieldPredicate, MetadataFilter
+
+# 1. Retrieve as usual — collapse dedupes fragments; distinct units backfill.
+result = await store.search_hybrid(
+    "what did the assistant explain about retries?",
+    top_k=20,
+    collapse_key=["$.session_id", "$.turn_index"],
+    collapse_max_per_unit=2,
+)
+
+# 2. For a result you want in full, read its unit-key value from its own metadata,
+#    gather the unit's chunks with a metadata-filtered search, then order them by
+#    your ordinal and concatenate.
+async def assemble_unit(query: str, thought_id: str) -> str:
+    seed = await store.get_thought(thought_id)
+    assert seed is not None
+    unit = await store.recall(
+        query,                       # any query — the filter selects the unit
+        top_k=100,                   # generous, to cover the unit's chunk count
+        filters=MetadataFilter([
+            FieldPredicate("$.session_id", FieldOp.EQ, seed.metadata["session_id"]),
+            FieldPredicate("$.turn_index", FieldOp.EQ, seed.metadata["turn_index"]),
+        ]),
+    )
+    chunks = [await store.get_thought(tid) for tid, _score in unit.results]
+    ordered = sorted((c for c in chunks if c), key=lambda t: t.metadata["chunk_index"])
+    return "\n".join(t.content for t in ordered)
+```
+
+- **No new API, no result-shape change.** This uses only `get_thought` and the
+  metadata `filters=` you already have on `search_hybrid()`/`recall()` — the same
+  surface you call to read a result's text. `search_hybrid()`'s result stays
+  `(thought_id, score)` tuples.
+- **The metadata predicate lives on the ranked search surface**
+  (`search_hybrid`/`recall`/`search_similar` `filters=`), not on `list_thoughts`
+  (whose filters cover the built-in columns + provenance, not arbitrary metadata),
+  so gathering a unit's chunks is a filtered search with a generous `top_k`; the
+  ranking is irrelevant because you re-order by your own ordinal.
+- **Precondition (yours to guarantee).** Contiguous order is only as good as the
+  metadata you wrote: without a stable, orderable ordinal on each chunk, siblings
+  can be *fetched* but not meaningfully *ordered* — engrava has no chunk-sequence
+  concept of its own. Write the ordinal at ingest alongside the unit key.
+- **Where it runs.** Entirely on the results engrava already returned — prompt and
+  context assembly is your application's concern, not the store's.
 
 ## Configuration Reference
 
