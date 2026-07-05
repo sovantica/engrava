@@ -508,6 +508,43 @@ class TestSqliteVecRealConnection:
             assert vid == nid
             assert abs(vscore - nscore) < 1e-5
 
+    async def test_sqlite_vec_tie_break_matches_numpy(self, tmp_path: Path) -> None:
+        """Score-tied rows resolve to the same canonical order on both backends.
+
+        The vec0 backend's own ``.search()`` sorts by score only; determinism on
+        a cosine tie relies on ``search_similar`` re-sorting via
+        ``_sort_scored_descending`` (score DESC, then thought_id ASC). Two rows
+        equidistant from the query must return in the same id order from vec0 and
+        numpy — and, for the tie, id-ascending.
+        """
+        dimension = 3
+        # Query on the x=y diagonal: [1,0,0] and [0,1,0] are exactly equidistant.
+        query = [1.0, 1.0, 0.0]
+        fixture: list[tuple[str, list[float]]] = [
+            ("tie-b", [0.0, 1.0, 0.0]),  # inserted b-before-a so scan order != id order
+            ("tie-a", [1.0, 0.0, 0.0]),
+            ("far", [0.0, 0.0, 1.0]),
+        ]
+
+        async def collect(backend: str) -> list[tuple[str, float]]:
+            store = await self._build_store(tmp_path, backend=backend, dimension=dimension)
+            try:
+                for tid, vec in fixture:
+                    await _make_thought(store, tid)
+                    await store.store_embedding(
+                        thought_id=tid, vector=vec, model_name=_PARITY_MODEL
+                    )
+                return await store.search_similar(query, top_k=len(fixture))
+            finally:
+                await store.close()
+
+        numpy_results = await collect("numpy")
+        vec_results = await collect("sqlite-vec")
+
+        assert [r[0] for r in vec_results] == [r[0] for r in numpy_results]
+        # The tie resolves id-ascending (tie-a before tie-b) on both backends.
+        assert [r[0] for r in numpy_results if r[0].startswith("tie-")] == ["tie-a", "tie-b"]
+
 
 async def _vec_rowids(store: SqliteEngravaCore) -> set[int]:
     """Return the set of rowids currently present in ``embedding_vec``."""
