@@ -487,8 +487,15 @@ class TestCollapseReflectionCapInteraction:
         )
         returned = _ids(result.results)
         refl_in_final = [tid for tid in returned if tid.startswith("refl-")]
+        obs_in_final = [tid for tid in returned if tid.startswith("obs")]
+        # The window is filled via backfill, not starved by collapse + cap.
+        assert len(returned) == 5
         # At most one reflection (collapse leaves one r1 keeper; cap allows <=1).
         assert len(refl_in_final) <= 1
+        # Backfill sources are DISTINCT observation units — never the collapsed-off
+        # r1 fragments (only the single r1 keeper can appear as a reflection).
+        assert len(obs_in_final) == len(set(obs_in_final))
+        assert len(refl_in_final) + len(obs_in_final) == 5
         # No duplicate ids (no double-count across the two backfill stages).
         assert len(returned) == len(set(returned))
 
