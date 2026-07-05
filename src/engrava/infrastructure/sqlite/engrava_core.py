@@ -646,6 +646,12 @@ class SqliteEngravaCore:
         connection to run the walk. An absent or empty chain verifies as
         ``valid=True`` with ``entries_checked=0``.
 
+        The walk verifies **linkage, not length**: a hash chain cannot detect a
+        truncated *tail* (the newest entries removed, or a crash before the
+        final flush), because the remaining prefix stays internally consistent.
+        Detecting a missing tail needs an external high-water-mark and is out of
+        scope here. Mid-chain tampering, deletion, and reordering are all caught.
+
         Returns:
             A :class:`JournalIntegrityResult` describing chain validity —
             ``valid`` plus ``entries_checked``, and on a break the
@@ -2989,6 +2995,10 @@ class SqliteEngravaCore:
         try:
             vectors = await _embed_documents_batch(provider, texts)
         except Exception as exc:  # noqa: BLE001 -- provider may raise any type; re-raised in handler
+            # Attribute the whole-batch failure to the first inserted id — a
+            # representative, valid lookup key (not a silent drop of the others).
+            # The raise rolls the entire batch back under suspend_auto_commit, so
+            # every inserted row is un-done regardless of which id is named.
             self._on_auto_embed_failure(inserted[0].thought_id, exc)
         for record, vector in zip(inserted, vectors, strict=True):
             await self.store_embedding(
@@ -5118,29 +5128,51 @@ class SqliteEngravaCore:
         top_k: int,
         current_cycle: int | None,
         recency_half_life: int,
+        filter_clause: tuple[str, list[object]] | None = None,
     ) -> list[tuple[str, float]]:
-        """Fallback results when neither FTS nor vector search is usable."""
-        thoughts = await self.list_thoughts(limit=top_k)
+        """Fallback results when neither FTS nor vector search is usable.
+
+        ``filter_clause`` is the compiled ``filters=`` / ``visibility=``
+        predicate; it is applied in-query so this query-less path enforces the
+        same eligibility as the FTS and vector arms (an out-of-filter row never
+        enters the result set). The predicate is threaded here directly — not
+        through the public ``list_thoughts`` — so raw-SQL fragments stay off the
+        public API surface.
+        """
+        clauses = ["(expires_at IS NULL OR expires_at > ?)"]
+        params: list[object] = [datetime.datetime.now(datetime.UTC).isoformat()]
+        if filter_clause is not None:
+            fragment, filter_params = filter_clause
+            clauses.append(fragment)
+            params.extend(filter_params)
+        where = " AND ".join(clauses)
+        params.append(top_k)
+        cursor = await self._db.execute(
+            "SELECT thought_id, thought_type, lifecycle_status, updated_cycle "  # noqa: S608
+            f"FROM thought WHERE {where} ORDER BY updated_cycle DESC LIMIT ?",
+            params,
+        )
+        rows = await cursor.fetchall()
         # Apply the REFLECTION freshness floor consistently with the FTS and
         # vector paths: a retired REFLECTION must not surface here either.
-        thoughts = [
-            thought
-            for thought in thoughts
+        live = [
+            row
+            for row in rows
             if not (
-                thought.thought_type == ThoughtType.REFLECTION
-                and thought.lifecycle_status != LifecycleStatus.ACTIVE
+                str(row["thought_type"]) == ThoughtType.REFLECTION.value
+                and str(row["lifecycle_status"]) != LifecycleStatus.ACTIVE.value
             )
         ]
         if current_cycle is None:
-            return [(thought.thought_id, 0.0) for thought in thoughts]
+            return [(str(row["thought_id"]), 0.0) for row in live]
 
         decay_rate = math.log(2) / recency_half_life
         ranked = [
             (
-                thought.thought_id,
-                math.exp(-decay_rate * max(current_cycle - thought.updated_cycle, 0)),
+                str(row["thought_id"]),
+                math.exp(-decay_rate * max(current_cycle - int(row["updated_cycle"]), 0)),
             )
-            for thought in thoughts
+            for row in live
         ]
         ranked.sort(key=lambda item: item[1], reverse=True)
         return ranked
@@ -5434,6 +5466,7 @@ class SqliteEngravaCore:
                 top_k=top_k,
                 current_cycle=current_cycle,
                 recency_half_life=resolved_recency_half_life,
+                filter_clause=filter_clause_plain,
             )
             if priority_active and fallback:
                 backends_used.add("priority")

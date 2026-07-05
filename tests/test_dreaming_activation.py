@@ -9,6 +9,7 @@ default-off byte-identity guarantee.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -19,6 +20,7 @@ from engrava.config import DreamingConfig, DreamingGates, _parse_dreaming
 from engrava.domain.enums import LifecycleStatus, Priority, ThoughtType
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.extensions.dreaming import DreamingExtension
+from engrava.infrastructure.sqlite.engrava_core import _AccessBuffer
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -38,6 +40,7 @@ def _obs(
     access_count: int = 0,
     created_cycle: int = 0,
     updated_cycle: int = _CYCLE,
+    action_outcome_score: float | None = None,
 ) -> ThoughtRecord:
     """A recent + mature ACTIVE OBSERVATION (recency = staleness = 1.0 at _CYCLE)."""
     return ThoughtRecord(
@@ -53,6 +56,7 @@ def _obs(
         confirmation_count=confirmation_count,
         confidence=confidence,
         access_count=access_count,
+        action_outcome_score=action_outcome_score,
     )
 
 
@@ -184,6 +188,34 @@ class TestPromotionReachable:
         assert "confirmation" not in mixed.flat_signals
         await db2.close()
 
+    async def test_action_outcome_signal_activates_end_to_end(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        """A candidate carrying an action outcome activates the 6th signal.
+
+        With no action outcomes in the pool the signal is flat (zero weight).
+        Introduce one candidate whose action_outcome_score is set and the signal
+        must activate end-to-end through run_consolidation — pinning
+        default_signal_active's action_outcome branch, which is otherwise
+        revert-safe to always-inactive (unit-flat coverage alone misses it).
+        """
+        ext = DreamingExtension(config=_activation_cfg())
+        await store.create_thought(_obs("no-outcome"))
+        solo = await ext.run_consolidation(store, current_cycle=_CYCLE)
+        assert "action_outcome" in solo.flat_signals  # flat: nobody has an outcome
+        assert solo.active_signal_weights["action_outcome"] == 0.0
+
+        db2 = await aiosqlite.connect(":memory:")
+        db2.row_factory = aiosqlite.Row
+        store2 = SqliteEngravaCore(db=db2)
+        await store2.ensure_schema()
+        await store2.create_thought(_obs("plain"))
+        await store2.create_thought(_obs("has-outcome", action_outcome_score=0.9))
+        mixed = await ext.run_consolidation(store2, current_cycle=_CYCLE)
+        assert "action_outcome" not in mixed.flat_signals  # activated by the peer
+        assert mixed.active_signal_weights["action_outcome"] > 0.0
+        await db2.close()
+
     async def test_population_p1_cap_bounds_repeated_cycles(self, store: SqliteEngravaCore) -> None:
         """Repeated cycles do not push the P1 population past max_p1_fraction."""
         ext = DreamingExtension(config=_activation_cfg(max_p1_fraction=0.25))
@@ -235,6 +267,110 @@ class TestAccessSubstrate:
         row = await store.get_thought("t")
         assert row is not None
         assert row.access_count == 0
+
+    async def test_access_flush_is_not_journaled(self) -> None:
+        """The batched access flush writes no journal entry and keeps the chain valid.
+
+        Access counts are high-volume regenerable telemetry, deliberately kept
+        out of the hash chain. A flush must neither append a journal entry nor
+        break verification — a future edit routing the flush through the
+        journaled path would otherwise pass silently.
+        """
+        db = await aiosqlite.connect(":memory:")
+        db.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(db=db, journal_enabled=True)
+        await store.ensure_schema()
+        store._access_tracking_enabled = True
+        await store.create_thought(_obs("t"))
+
+        async def _jlen() -> int:
+            cur = await store._db.execute("SELECT COUNT(*) FROM journal_entry")
+            row = await cur.fetchone()
+            assert row is not None
+            return int(row[0])
+
+        for _ in range(3):
+            await store.get_thought("t")
+        before = await _jlen()
+
+        flushed = await store.flush_access_buffer()
+
+        assert flushed == 1  # one distinct id drained
+        assert await _jlen() == before  # the batched UPDATE is NOT journaled
+        result = await store.verify_journal()
+        assert result.valid is True
+        await db.close()
+
+
+class TestAccessBuffer:
+    """Unit invariants of the bounded FIFO access buffer.
+
+    ``TestAccessSubstrate`` covers the store-level batching; these pin the
+    buffer's own load-bearing guarantees — bounded memory via oldest-inserted
+    eviction and lossless coalescing — that a revert to unbounded growth or
+    wrong-order eviction would otherwise leave green.
+    """
+
+    def test_coalesce_increments_delta_without_growing(self) -> None:
+        """Repeated accesses of one id coalesce into a single counted entry."""
+        buf = _AccessBuffer(cap=8)
+        for _ in range(3):
+            buf.record("a", now="t")
+        assert len(buf) == 1
+        assert buf.drain() == [("a", 3, "t")]
+
+    def test_drain_clears_the_buffer(self) -> None:
+        """drain returns the pending deltas once, then empties."""
+        buf = _AccessBuffer(cap=8)
+        buf.record("a", now="t0")
+        assert buf.drain() == [("a", 1, "t0")]
+        assert len(buf) == 0
+        assert buf.drain() == []
+
+    def test_fifo_evicts_oldest_inserted_at_cap(self) -> None:
+        """A new id beyond the cap evicts the oldest-inserted id (FIFO)."""
+        buf = _AccessBuffer(cap=3)
+        for tid in ("a", "b", "c"):
+            buf.record(tid, now="t")
+        buf.record("d", now="t")  # exceeds cap -> evict oldest-inserted ("a")
+        assert len(buf) == 3
+        assert {tid for tid, _, _ in buf.drain()} == {"b", "c", "d"}
+
+    def test_eviction_is_counted(self) -> None:
+        """Each eviction increments the running evicted-total."""
+        buf = _AccessBuffer(cap=1)
+        buf.record("a", now="t")
+        buf.record("b", now="t")  # evicts "a"
+        assert buf._evicted_total == 1
+        assert {tid for tid, _, _ in buf.drain()} == {"b"}
+
+    def test_coalesce_at_cap_never_evicts(self) -> None:
+        """Coalescing into an existing id at the cap must not evict a peer."""
+        buf = _AccessBuffer(cap=2)
+        buf.record("a", now="t")
+        buf.record("b", now="t")  # full
+        buf.record("a", now="t2")  # coalesce -> must NOT evict "b"
+        assert len(buf) == 2
+        assert buf._evicted_total == 0
+        assert {tid: delta for tid, delta, _ in buf.drain()} == {"a": 2, "b": 1}
+
+    def test_cap_floored_at_one(self) -> None:
+        """A non-positive cap is floored to 1, so the buffer stays bounded."""
+        buf = _AccessBuffer(cap=0)  # floored to 1
+        buf.record("a", now="t")
+        buf.record("b", now="t")  # evicts "a"
+        assert len(buf) == 1
+        assert {tid for tid, _, _ in buf.drain()} == {"b"}
+
+    def test_eviction_logs_warning_naming_the_id(self, caplog: pytest.LogCaptureFixture) -> None:
+        """An eviction emits a WARNING naming the dropped thought id."""
+        buf = _AccessBuffer(cap=1)
+        buf.record("keep-me-first", now="t")
+        with caplog.at_level(logging.WARNING, logger="engrava.infrastructure.sqlite.engrava_core"):
+            buf.record("second", now="t")
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("access buffer full" in m for m in messages)
+        assert any("keep-me-first" in m for m in messages)
 
 
 # ---------------------------------------------------------------------------

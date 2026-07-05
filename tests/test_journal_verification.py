@@ -98,6 +98,19 @@ async def _tamper(db_path: Path, sequence_number: int) -> None:
         await conn.close()
 
 
+async def _delete_tail(db_path: Path) -> None:
+    """Delete the highest-sequence journal row (append-only tail truncation)."""
+    conn = await aiosqlite.connect(str(db_path))
+    try:
+        await conn.execute(
+            "DELETE FROM journal_entry "
+            "WHERE sequence_number = (SELECT MAX(sequence_number) FROM journal_entry)"
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
 def _write_config(
     tmp_path: Path,
     db_path: Path,
@@ -149,6 +162,28 @@ class TestVerifyJournal:
             assert result.valid is False
             assert result.first_invalid_sequence == 2
             assert result.error_message is not None
+        finally:
+            await store._db.close()
+
+    async def test_tail_truncation_is_not_detected(self, tmp_path: Path) -> None:
+        """Deleting the newest entry leaves a valid prefix — a documented limit.
+
+        A hash chain proves each entry links to its parent, but nothing binds the
+        chain *length*: removing the tail (or a crash before the final flush)
+        leaves a still-consistent shorter chain. verify_journal cannot detect
+        this without an external high-water-mark. Pin the behaviour so the tamper
+        story is never mistaken for length integrity.
+        """
+        db_path = tmp_path / "truncated.db"
+        await _seed_chain(db_path)
+        await _delete_tail(db_path)  # drop the newest entry (4 -> 3 remain)
+
+        store = await _open(db_path, journal_enabled=True)
+        try:
+            result = await store.verify_journal()
+            assert result.valid is True  # prefix still verifies — truncation undetected
+            assert result.entries_checked == 3
+            assert result.first_invalid_sequence is None
         finally:
             await store._db.close()
 

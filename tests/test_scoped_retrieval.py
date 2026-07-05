@@ -252,12 +252,99 @@ class TestEligibilityInvariant:
 
 
 # ---------------------------------------------------------------------------
+# Fallback arm eligibility (query-less / unindexable, no vector)
+# ---------------------------------------------------------------------------
+
+
+class TestFallbackArmEligibility:
+    """The query-less / unindexable fallback arm honours filters=/visibility=.
+
+    When neither the FTS arm nor the vector arm is active — an empty or
+    unindexable ``query_text`` with no ``query_vector`` and no embedding
+    provider (e.g. a recency-only scoped browse) — ``search_hybrid`` falls back
+    to a plain lifecycle-ordered scan. That fallback must apply the same
+    ``filters=`` / ``visibility=`` eligibility predicate as the main arms: the
+    docstring promises an out-of-filter row *never* enters the result set, with
+    no exemption for the fallback path.
+    """
+
+    async def test_fallback_path_applies_filters(self, store: SqliteEngravaCore) -> None:
+        """An empty-query recency-only call still excludes out-of-filter rows."""
+        await store.create_thought(_thought("in", essence="one", metadata={"project": "x"}))
+        await store.create_thought(_thought("out", essence="two", metadata={"project": "y"}))
+        # Empty query + no provider -> neither FTS nor vector arm active -> fallback.
+        result = await store.search_hybrid(
+            "",
+            top_k=10,
+            current_cycle=1,
+            filters=MetadataFilter([FieldPredicate("$.project", FieldOp.EQ, "x")]),
+        )
+        assert _ids(result.results) == ["in"]
+
+    async def test_fallback_path_applies_visibility(self, store: SqliteEngravaCore) -> None:
+        """The fallback honours the public-or-mine visibility group too."""
+        await store.create_thought(_thought("pub", essence="a", metadata={"visibility": "public"}))
+        await store.create_thought(
+            _thought("mine", essence="b", metadata={"visibility": "private", "owner": "alice"})
+        )
+        await store.create_thought(
+            _thought("theirs", essence="c", metadata={"visibility": "private", "owner": "bob"})
+        )
+        result = await store.search_hybrid(
+            "",
+            top_k=10,
+            current_cycle=1,
+            visibility=VisibilityQueryFilter({"public"}, owner="alice"),
+        )
+        assert set(_ids(result.results)) == {"pub", "mine"}
+
+
+# ---------------------------------------------------------------------------
 # No starvation / refill
 # ---------------------------------------------------------------------------
 
 
 class TestNoStarvation:
     """A narrow filter returns up to top_k in-filter rows, never starved."""
+
+    async def test_filter_and_reflection_cap_compose(self, store: SqliteEngravaCore) -> None:
+        """A cap-freed reflection slot backfills only in-filter rows, never out-of-filter.
+
+        The reflection cap frees slots that backfill from ``ranked[top_k:]``; if
+        an out-of-filter row had wrongly entered the candidate set it could fill a
+        freed slot. With the filter applied in-arm, the backfill draws only from
+        in-filter non-reflections, and no out-of-filter row ever appears.
+        """
+        # In-filter reflections flood the window; in-filter observations backfill.
+        for i in range(6):
+            await store.create_thought(
+                _thought(
+                    f"refl-{i}",
+                    essence="tau summary",
+                    thought_type=ThoughtType.REFLECTION,
+                    metadata={"project": "x"},
+                )
+            )
+        for i in range(5):
+            await store.create_thought(
+                _thought(f"obs-{i}", essence="tau summary", metadata={"project": "x"})
+            )
+        # Out-of-filter rows that also match the query — must never appear.
+        for i in range(5):
+            await store.create_thought(
+                _thought(f"out-{i}", essence="tau summary", metadata={"project": "y"})
+            )
+        result = await store.search_hybrid(
+            "tau",
+            top_k=5,
+            filters=MetadataFilter([FieldPredicate("$.project", FieldOp.EQ, "x")]),
+        )
+        returned = _ids(result.results)
+        # No out-of-filter row ever backfills a freed slot.
+        assert all(not tid.startswith("out-") for tid in returned)
+        # The window is filled from in-filter rows; the cap bounds reflections.
+        assert len(returned) == 5
+        assert len([t for t in returned if t.startswith("refl-")]) <= 1
 
     async def test_narrow_filter_not_starved_by_out_of_filter_candidates(
         self, store: SqliteEngravaCore
@@ -349,7 +436,23 @@ class TestDeterminism:
 
 
 class TestTypedSemantics:
-    """EQ None, large IN, bool/int aliasing, malformed JSON."""
+    """EQ None, empty/large IN, bool/int aliasing, malformed JSON."""
+
+    async def test_empty_in_starves_the_arm_end_to_end(self, store: SqliteEngravaCore) -> None:
+        """An empty ``IN ()`` compiles to a ``0 = 1`` contradiction and returns nothing.
+
+        The value-object layer pins the compile; this pins that the contradiction
+        survives the json_valid-guarded predicate and starves the arm end-to-end,
+        even with rows that match the query text.
+        """
+        await store.create_thought(_thought("a", essence="sigma sunset", metadata={"n": 1}))
+        await store.create_thought(_thought("b", essence="sigma sunset", metadata={"n": 2}))
+        result = await store.search_hybrid(
+            "sigma",
+            top_k=10,
+            filters=MetadataFilter([FieldPredicate("$.n", FieldOp.IN, [])]),
+        )
+        assert result.results == []
 
     async def test_eq_none_matches_missing_and_json_null(self, store: SqliteEngravaCore) -> None:
         """EQ None matches both a missing key and an explicit JSON null."""
