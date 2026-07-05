@@ -2995,6 +2995,10 @@ class SqliteEngravaCore:
         try:
             vectors = await _embed_documents_batch(provider, texts)
         except Exception as exc:  # noqa: BLE001 -- provider may raise any type; re-raised in handler
+            # Attribute the whole-batch failure to the first inserted id — a
+            # representative, valid lookup key (not a silent drop of the others).
+            # The raise rolls the entire batch back under suspend_auto_commit, so
+            # every inserted row is un-done regardless of which id is named.
             self._on_auto_embed_failure(inserted[0].thought_id, exc)
         for record, vector in zip(inserted, vectors, strict=True):
             await self.store_embedding(

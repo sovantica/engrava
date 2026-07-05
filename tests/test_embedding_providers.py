@@ -614,14 +614,17 @@ class TestEmbeddingConfigParsing:
         assert provider is not None
         assert provider.model_name == "nomic-embed-text"
 
-    def test_resolve_sentence_transformer_missing(self) -> None:
+    def test_resolve_sentence_transformer_constructs(self) -> None:
+        """resolve builds the provider object; the heavy import is deferred.
+
+        The SentenceTransformer backend imports its dependency lazily (on first
+        embed, not at construction), so resolving only constructs the provider —
+        it does not require the package to be importable at resolve time. (This
+        is a construction check, not a missing-package check; a real
+        install-matrix probe for the ``[embeddings-local]`` extra belongs in the
+        paired validation suite.)
+        """
         cfg = EmbeddingConfig(provider="sentence-transformer")
-        with patch.dict("sys.modules", {"sentence_transformers": None}):
-            # SentenceTransformerProvider constructor doesn't import eagerly,
-            # so this will succeed. The import error happens at load time.
-            # We test via resolve which does the lazy import.
-            pass
-        # Just verify it creates the provider object (import available).
         provider = resolve_embedding_provider(cfg)
         assert provider is not None
 
