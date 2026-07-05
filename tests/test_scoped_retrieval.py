@@ -307,6 +307,45 @@ class TestFallbackArmEligibility:
 class TestNoStarvation:
     """A narrow filter returns up to top_k in-filter rows, never starved."""
 
+    async def test_filter_and_reflection_cap_compose(self, store: SqliteEngravaCore) -> None:
+        """A cap-freed reflection slot backfills only in-filter rows, never out-of-filter.
+
+        The reflection cap frees slots that backfill from ``ranked[top_k:]``; if
+        an out-of-filter row had wrongly entered the candidate set it could fill a
+        freed slot. With the filter applied in-arm, the backfill draws only from
+        in-filter non-reflections, and no out-of-filter row ever appears.
+        """
+        # In-filter reflections flood the window; in-filter observations backfill.
+        for i in range(6):
+            await store.create_thought(
+                _thought(
+                    f"refl-{i}",
+                    essence="tau summary",
+                    thought_type=ThoughtType.REFLECTION,
+                    metadata={"project": "x"},
+                )
+            )
+        for i in range(5):
+            await store.create_thought(
+                _thought(f"obs-{i}", essence="tau summary", metadata={"project": "x"})
+            )
+        # Out-of-filter rows that also match the query — must never appear.
+        for i in range(5):
+            await store.create_thought(
+                _thought(f"out-{i}", essence="tau summary", metadata={"project": "y"})
+            )
+        result = await store.search_hybrid(
+            "tau",
+            top_k=5,
+            filters=MetadataFilter([FieldPredicate("$.project", FieldOp.EQ, "x")]),
+        )
+        returned = _ids(result.results)
+        # No out-of-filter row ever backfills a freed slot.
+        assert all(not tid.startswith("out-") for tid in returned)
+        # The window is filled from in-filter rows; the cap bounds reflections.
+        assert len(returned) == 5
+        assert len([t for t in returned if t.startswith("refl-")]) <= 1
+
     async def test_narrow_filter_not_starved_by_out_of_filter_candidates(
         self, store: SqliteEngravaCore
     ) -> None:
