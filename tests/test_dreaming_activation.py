@@ -40,6 +40,7 @@ def _obs(
     access_count: int = 0,
     created_cycle: int = 0,
     updated_cycle: int = _CYCLE,
+    action_outcome_score: float | None = None,
 ) -> ThoughtRecord:
     """A recent + mature ACTIVE OBSERVATION (recency = staleness = 1.0 at _CYCLE)."""
     return ThoughtRecord(
@@ -55,6 +56,7 @@ def _obs(
         confirmation_count=confirmation_count,
         confidence=confidence,
         access_count=access_count,
+        action_outcome_score=action_outcome_score,
     )
 
 
@@ -186,6 +188,34 @@ class TestPromotionReachable:
         assert "confirmation" not in mixed.flat_signals
         await db2.close()
 
+    async def test_action_outcome_signal_activates_end_to_end(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        """A candidate carrying an action outcome activates the 6th signal.
+
+        With no action outcomes in the pool the signal is flat (zero weight).
+        Introduce one candidate whose action_outcome_score is set and the signal
+        must activate end-to-end through run_consolidation — pinning
+        default_signal_active's action_outcome branch, which is otherwise
+        revert-safe to always-inactive (unit-flat coverage alone misses it).
+        """
+        ext = DreamingExtension(config=_activation_cfg())
+        await store.create_thought(_obs("no-outcome"))
+        solo = await ext.run_consolidation(store, current_cycle=_CYCLE)
+        assert "action_outcome" in solo.flat_signals  # flat: nobody has an outcome
+        assert solo.active_signal_weights["action_outcome"] == 0.0
+
+        db2 = await aiosqlite.connect(":memory:")
+        db2.row_factory = aiosqlite.Row
+        store2 = SqliteEngravaCore(db=db2)
+        await store2.ensure_schema()
+        await store2.create_thought(_obs("plain"))
+        await store2.create_thought(_obs("has-outcome", action_outcome_score=0.9))
+        mixed = await ext.run_consolidation(store2, current_cycle=_CYCLE)
+        assert "action_outcome" not in mixed.flat_signals  # activated by the peer
+        assert mixed.active_signal_weights["action_outcome"] > 0.0
+        await db2.close()
+
     async def test_population_p1_cap_bounds_repeated_cycles(self, store: SqliteEngravaCore) -> None:
         """Repeated cycles do not push the P1 population past max_p1_fraction."""
         ext = DreamingExtension(config=_activation_cfg(max_p1_fraction=0.25))
@@ -237,6 +267,39 @@ class TestAccessSubstrate:
         row = await store.get_thought("t")
         assert row is not None
         assert row.access_count == 0
+
+    async def test_access_flush_is_not_journaled(self) -> None:
+        """The batched access flush writes no journal entry and keeps the chain valid.
+
+        Access counts are high-volume regenerable telemetry, deliberately kept
+        out of the hash chain. A flush must neither append a journal entry nor
+        break verification — a future edit routing the flush through the
+        journaled path would otherwise pass silently.
+        """
+        db = await aiosqlite.connect(":memory:")
+        db.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(db=db, journal_enabled=True)
+        await store.ensure_schema()
+        store._access_tracking_enabled = True
+        await store.create_thought(_obs("t"))
+
+        async def _jlen() -> int:
+            cur = await store._db.execute("SELECT COUNT(*) FROM journal_entry")
+            row = await cur.fetchone()
+            assert row is not None
+            return int(row[0])
+
+        for _ in range(3):
+            await store.get_thought("t")
+        before = await _jlen()
+
+        flushed = await store.flush_access_buffer()
+
+        assert flushed == 1  # one distinct id drained
+        assert await _jlen() == before  # the batched UPDATE is NOT journaled
+        result = await store.verify_journal()
+        assert result.valid is True
+        await db.close()
 
 
 class TestAccessBuffer:
