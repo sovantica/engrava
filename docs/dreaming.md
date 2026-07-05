@@ -100,6 +100,26 @@ result = await ext.run_consolidation(store, current_cycle=1)
 print(f"Promoted {result.promoted_count} thoughts")
 ```
 
+### From YAML config
+
+If you enable dreaming in `engrava.yaml`
+(`extensions.dreaming.enabled: true`) and build the store with
+`EngravaStore.from_config(...)`, you do **not** need to construct a
+`DreamingExtension` by hand — call `consolidate()` on the store directly:
+
+```python
+# store built via EngravaStore.from_config(config_with_dreaming_enabled)
+result = await store.consolidate(current_cycle=1)
+print(f"Promoted {result.promoted_count} thoughts")
+```
+
+`store.consolidate(current_cycle=...)` first flushes any pending
+access events (so the [`frequency`](#access-tracking-the-frequency-substrate)
+signal sees the latest access counts this cycle), then runs the configured
+extension. It raises `RuntimeError` if dreaming is not enabled/wired on the
+store (built manually, or `dreaming.enabled` is `false`) — there is no
+extension to run.
+
 ## Gates
 
 Before a thought is scored against the promotion threshold, it must
@@ -161,6 +181,25 @@ ext = DreamingExtension(
     custom_signals={"my_signal": MySignal()},
 )
 ```
+
+### Access tracking (the `frequency` substrate)
+
+The `frequency` signal scores a thought by its `access_count`. For that to be
+meaningful, reads have to be counted — otherwise `access_count` stays at 0 and
+`frequency` contributes nothing.
+
+When you build the store via `from_config` with dreaming enabled, retrieval
+paths record access automatically, controlled by
+`extensions.dreaming.access_tracking_enabled` (default **`true`**). To keep the
+read path fast, access events are buffered and flushed at the cycle boundary
+rather than written on every read; `store.consolidate()` flushes the buffer
+before scoring so the current cycle sees up-to-date counts. Access tracking is
+deliberately **not** journaled — the counts are regenerable telemetry, not part
+of the tamper-evident chain (see [Audit Trail](audit-trail.md)).
+
+Set `access_tracking_enabled: false` to leave `access_count` untouched (the
+`frequency` signal then stays inactive and its weight is redistributed over the
+remaining active signals, exactly as with any other inactive signal).
 
 ## Priority signal in search
 
