@@ -397,7 +397,23 @@ class TestDeterminism:
 
 
 class TestTypedSemantics:
-    """EQ None, large IN, bool/int aliasing, malformed JSON."""
+    """EQ None, empty/large IN, bool/int aliasing, malformed JSON."""
+
+    async def test_empty_in_starves_the_arm_end_to_end(self, store: SqliteEngravaCore) -> None:
+        """An empty ``IN ()`` compiles to a ``0 = 1`` contradiction and returns nothing.
+
+        The value-object layer pins the compile; this pins that the contradiction
+        survives the json_valid-guarded predicate and starves the arm end-to-end,
+        even with rows that match the query text.
+        """
+        await store.create_thought(_thought("a", essence="sigma sunset", metadata={"n": 1}))
+        await store.create_thought(_thought("b", essence="sigma sunset", metadata={"n": 2}))
+        result = await store.search_hybrid(
+            "sigma",
+            top_k=10,
+            filters=MetadataFilter([FieldPredicate("$.n", FieldOp.IN, [])]),
+        )
+        assert result.results == []
 
     async def test_eq_none_matches_missing_and_json_null(self, store: SqliteEngravaCore) -> None:
         """EQ None matches both a missing key and an explicit JSON null."""
