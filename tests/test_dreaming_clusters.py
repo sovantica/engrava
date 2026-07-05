@@ -181,7 +181,14 @@ class TestBuildClusters:
     """Integration tests for cluster building from graph edges."""
 
     async def test_empty_graph_returns_no_clusters(self, store: SqliteEngravaCore) -> None:
-        """No ASSOCIATED edges → no clusters."""
+        """No ASSOCIATED edges → no clusters.
+
+        Note: this is silent about cold-start clustering — the store is empty, so
+        ``_build_clusters`` returns ``[]`` regardless of the flag. The cold-start
+        default-OFF guarantee is guarded by
+        ``TestColdStartFallback.test_flag_off_is_byte_identical_noop`` (which
+        seeds a candidate pool), not by this empty-pool case.
+        """
         ext = DreamingExtension(config=_reflection_cfg())
         clusters = await ext._build_clusters(store, current_cycle=1)
         assert clusters == []
@@ -274,6 +281,7 @@ def _cold_start_cfg(
     min_cluster_size: int = 3,
     max_cluster_size: int | None = 200,
     cluster_similarity_threshold: float = 0.7,
+    cluster_quality_gating_enabled: bool = False,
 ) -> DreamingConfig:
     """LPA (default algorithm) config for cold-start fallback tests.
 
@@ -299,7 +307,7 @@ def _cold_start_cfg(
             cluster_algorithm="lpa",
             enable_reflections=True,
             cold_start_clustering=cold_start_clustering,
-            cluster_quality_gating_enabled=False,
+            cluster_quality_gating_enabled=cluster_quality_gating_enabled,
         ),
         edges=EdgeCreationConfig(enabled=False),
     )
@@ -408,6 +416,29 @@ class TestColdStartFallback:
         )
         clusters = await ext._build_clusters(store, current_cycle=1)
         assert clusters == []
+
+    async def test_cold_start_cluster_rejected_by_persona_gate(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        """A cold-start cluster is still subject to the content-quality gates.
+
+        Persona-only members cluster by embedding but are rejected by the persona
+        gate, so no reflection is created — the fallback clusters are not
+        gate-exempt.
+        """
+        cfg = _cold_start_cfg(cold_start_clustering=True, cluster_quality_gating_enabled=True)
+        ext = DreamingExtension(config=cfg)
+        personas = [
+            "Alice is a teacher.",
+            "Bob is a nurse.",
+            "Carol is an artist.",
+            "Dave is an engineer.",
+        ]
+        for i, text in enumerate(personas):
+            t = await store.create_thought(_make(f"persona-{i}", essence=text, content=text))
+            await store.store_embedding(t.thought_id, [1.0, 0.01 * i, 0.0, 0.0], model_name="test")
+        result = await ext.run_consolidation(store, current_cycle=1)
+        assert result.reflections_created == 0
 
     async def test_fallback_respects_candidates_limit(
         self, store: SqliteEngravaCore, monkeypatch: pytest.MonkeyPatch
