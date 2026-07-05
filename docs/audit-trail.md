@@ -1,9 +1,12 @@
 # Audit Trail (hash-chain journal)
 
-Engrava can record every change to your thought-graph in an append-only,
-hash-linked **journal** — a tamper-evident audit trail. Each entry captures one
-mutation (insert / update / delete of a thought or edge) as a before/after
-delta, and is cryptographically chained to the previous entry with SHA-256.
+Engrava can record changes to your thought-graph in an append-only,
+hash-linked **journal** — a **tamper-evident thought/edge journal** (not a
+whole-database audit). Each entry captures one mutation — insert / update /
+delete of a **thought** or **edge**, or an **action `status`/`verification_status`
+transition** — as a before/after delta, cryptographically chained to the previous
+entry with SHA-256. See [What gets recorded](#what-gets-recorded) for the exact
+scope (embeddings and action *creation* are not covered).
 
 > **Read the [Security model](#security-model--guarantees) before relying on this
 > for compliance.** The chain detects accidental corruption and naive edits, but
@@ -52,10 +55,10 @@ journal-specific code.
 ## What gets recorded
 
 When journaling is enabled, the store records a journal entry **automatically**
-on every mutation of a thought or an edge — you do not call the journal
-yourself. The recorded `mutation_type` values (the `MutationType` enum) are:
+on every mutation of a thought or edge — and on an action state-transition — you
+do not call the journal yourself. The recorded `mutation_type` values are:
 
-| `MutationType` | When |
+| `mutation_type` | When |
 |---|---|
 | `INSERT_THOUGHT` | `create_thought()` |
 | `UPDATE_THOUGHT` | `update_thought()` |
@@ -63,14 +66,27 @@ yourself. The recorded `mutation_type` values (the `MutationType` enum) are:
 | `INSERT_EDGE` | `create_edge()` |
 | `UPDATE_EDGE` | `update_edge()` |
 | `DELETE_EDGE` | `delete_edge()` (only when a row was actually deleted) |
+| `UPDATE_ACTION` | `update_action()` — only when an action's `status` / `verification_status` actually changes |
+
+> The first six values are members of the `MutationType` enum; `UPDATE_ACTION` is
+> a stored `mutation_type` **string** emitted by `update_action()` — the enum
+> itself is not extended. `mutation_type` is a free-text column, so verification
+> covers the entry regardless.
 
 Each entry's `delta` is a `{"before": ..., "after": ...}` dictionary: inserts
 have `before: null`, deletes have `after: null`, and updates carry both sides.
 
-> **Not recorded:** embeddings (`store_embedding`) and action records
-> (`create_action`) are **not** written to the journal — the audit trail covers
-> the thought-and-edge graph, not the embedding or action tables. This also
-> matters for backups — see [Backup note](#backup--retention-note).
+> **Recorded precisely — what the chain does and does not cover.** The journal
+> covers **thought and edge mutations** (insert / update / delete) and **action
+> state-transitions** (`update_action`). It does **not** record: embeddings
+> (`store_embedding`), **action *creation*** (`create_action` — only an action's
+> later transitions are journaled, not its initial insert), or read-derived
+> access telemetry (`access_count` / `last_accessed_at`, which is regenerable
+> and deliberately outside the chain). So this is a **tamper-evident
+> thought/edge/action-transition journal**, not a whole-database audit — verify
+> the parts it covers, and do not assume coverage of the embedding or
+> action-creation tables. This also matters for backups — see
+> [Backup note](#backup--retention-note).
 
 **TTL expiry is recorded.** `cleanup_expired()` (and the auto-cleanup it
 triggers) goes through the same journaled paths, so expiry of a thought is

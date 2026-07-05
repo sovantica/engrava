@@ -2,7 +2,7 @@
 
 > The memory database for AI agents.
 >
-> Graph memory, hybrid search, and a tamper-evident audit trail — one `pip install`, no server, no LLM.
+> Graph memory, hybrid search, and a tamper-evident thought/edge journal — one `pip install`, no server, no LLM.
 
 [![CI](https://github.com/sovantica/engrava/actions/workflows/ci.yml/badge.svg)](https://github.com/sovantica/engrava/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/engrava.svg)](https://pypi.org/project/engrava/)
@@ -178,12 +178,14 @@ since 0.3.0.
 → See [`docs/benchmarks.md`](https://github.com/sovantica/engrava/blob/main/docs/benchmarks.md) for reproducible
 evidence (synthetic benchmark suite runnable in ~5 minutes).
 
-### Tamper-Evident Audit Trail
+### Tamper-Evident Thought/Edge Journal
 
-Opt-in hash-chain **journal** that records every thought/edge mutation as a
-SHA-256-linked, before/after entry — off by default, one config flag to enable.
-Query history with `store.journal.get_entries(...)` and validate the chain with
-`store.journal.verify_integrity()`.
+Opt-in hash-chain **journal** that records thought and edge mutations (plus
+action `status`/`verification_status` transitions) as SHA-256-linked, before/after
+entries — a tamper-evident thought/edge journal, **not** a whole-database audit
+(embeddings and action *creation* are not covered). Off by default, one config flag to
+enable. Query history with `store.journal.get_entries(...)` and validate the
+chain with `store.journal.verify_integrity()`.
 
 → See [`docs/audit-trail.md`](https://github.com/sovantica/engrava/blob/main/docs/audit-trail.md) for enabling, querying,
 verification, and the security model (what "tamper-evident" does and does not
