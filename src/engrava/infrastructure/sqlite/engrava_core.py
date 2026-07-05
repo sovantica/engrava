@@ -3346,6 +3346,13 @@ class SqliteEngravaCore:
         no data loss. The move is journaled as an ``UPDATE_THOUGHT`` when
         journaling is enabled.
 
+        This is the **canonical** un-archive path — the only one that clears
+        ``archived_at_cycle``. The ``ARCHIVED -> ACTIVE`` edge is also reachable
+        through a raw ``update_thought(lifecycle_status=ACTIVE)``, but that
+        low-level write leaves ``archived_at_cycle`` set. That is harmless — the
+        marker is only consulted while a thought is ``ARCHIVED`` (hygiene GC
+        eligibility) — but it is not a tidy restore, so prefer this method.
+
         Args:
             thought_id: UUID of the archived thought to restore.
             current_cycle: Optional cycle to stamp as the new ``updated_cycle``;

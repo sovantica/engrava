@@ -710,13 +710,31 @@ class TestArchiveReversible:
             await s._db.close()
 
     async def test_restore_is_journaled_and_chain_verifies(self) -> None:
-        """The restore is journaled and the hash chain still verifies afterwards."""
+        """The restore writes exactly one UPDATE_THOUGHT entry; the chain verifies."""
         policy = HygienePolicyConfig(enabled=True, eviction_threshold=1.0)
         s = await _make_store(policy, journal_enabled=True)
         try:
             await s.create_thought(_thought("cold", updated_cycle=0))
             await s.run_hygiene(current_cycle=42)
+
+            async def _journal_count() -> int:
+                cur = await s._db.execute("SELECT COUNT(*) FROM journal_entry")
+                row = await cur.fetchone()
+                assert row is not None
+                return int(row[0])
+
+            before = await _journal_count()
             await s.restore_thought("cold")
+
+            # The restore actually journaled (one appended entry, not a no-op)...
+            assert await _journal_count() == before + 1
+            cur = await s._db.execute(
+                "SELECT mutation_type FROM journal_entry ORDER BY sequence_number DESC LIMIT 1"
+            )
+            row = await cur.fetchone()
+            assert row is not None
+            assert row[0] == "UPDATE_THOUGHT"
+            # ...and the chain still verifies after the restore.
             result = await s.verify_journal()
             assert result.valid is True
         finally:
