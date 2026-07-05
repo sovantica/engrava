@@ -3380,7 +3380,7 @@ class SqliteEngravaCore:
         normalized = validate_iso8601_nullable(valid_until)
         return await self.update_thought(thought_id, valid_until=normalized)
 
-    async def list_thoughts(  # noqa: C901 -- linear dispatch over many independent optional filters
+    async def list_thoughts(
         self,
         *,
         priority: str | None = None,
@@ -3394,7 +3394,6 @@ class SqliteEngravaCore:
         provenance_filter: MetadataFilter | None = None,
         limit: int = 50,
         offset: int = 0,
-        _filter_clause: tuple[str, list[object]] | None = None,
     ) -> list[ThoughtRecord]:
         """List thoughts matching the given filters.
 
@@ -3430,11 +3429,6 @@ class SqliteEngravaCore:
                 is ``json_valid``-guarded).
             limit: Maximum number of results to return.
             offset: Number of results to skip.
-            _filter_clause: Internal. A pre-compiled ``(sql_fragment, params)``
-                metadata predicate (from ``compile_effective_predicate`` over
-                ``metadata_json``) threaded by ``search_hybrid``'s fallback arm so
-                the query-less path enforces the same ``filters=`` / ``visibility=``
-                eligibility as the main arms. ``None`` leaves the query unchanged.
 
         Returns:
             List of matching thought records.
@@ -3482,14 +3476,6 @@ class SqliteEngravaCore:
             fragment, provenance_params = provenance_clause
             clauses.append(fragment)
             params.extend(provenance_params)
-
-        # Internal metadata/visibility predicate threaded from the search_hybrid
-        # fallback arm (see ``_filter_clause`` above). Applied identically to the
-        # main arms so the query-less path never leaks an out-of-filter row.
-        if _filter_clause is not None:
-            filter_fragment, filter_clause_params = _filter_clause
-            clauses.append(filter_fragment)
-            params.extend(filter_clause_params)
 
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         sql = f"SELECT * FROM thought{where} ORDER BY updated_cycle DESC LIMIT ? OFFSET ?"  # noqa: S608
@@ -5142,36 +5128,51 @@ class SqliteEngravaCore:
         top_k: int,
         current_cycle: int | None,
         recency_half_life: int,
-        _filter_clause: tuple[str, list[object]] | None = None,
+        filter_clause: tuple[str, list[object]] | None = None,
     ) -> list[tuple[str, float]]:
         """Fallback results when neither FTS nor vector search is usable.
 
-        ``_filter_clause`` is the compiled ``filters=`` / ``visibility=``
+        ``filter_clause`` is the compiled ``filters=`` / ``visibility=``
         predicate; it is applied in-query so this query-less path enforces the
         same eligibility as the FTS and vector arms (an out-of-filter row never
-        enters the result set).
+        enters the result set). The predicate is threaded here directly — not
+        through the public ``list_thoughts`` — so raw-SQL fragments stay off the
+        public API surface.
         """
-        thoughts = await self.list_thoughts(limit=top_k, _filter_clause=_filter_clause)
+        clauses = ["(expires_at IS NULL OR expires_at > ?)"]
+        params: list[object] = [datetime.datetime.now(datetime.UTC).isoformat()]
+        if filter_clause is not None:
+            fragment, filter_params = filter_clause
+            clauses.append(fragment)
+            params.extend(filter_params)
+        where = " AND ".join(clauses)
+        params.append(top_k)
+        cursor = await self._db.execute(
+            "SELECT thought_id, thought_type, lifecycle_status, updated_cycle "  # noqa: S608
+            f"FROM thought WHERE {where} ORDER BY updated_cycle DESC LIMIT ?",
+            params,
+        )
+        rows = await cursor.fetchall()
         # Apply the REFLECTION freshness floor consistently with the FTS and
         # vector paths: a retired REFLECTION must not surface here either.
-        thoughts = [
-            thought
-            for thought in thoughts
+        live = [
+            row
+            for row in rows
             if not (
-                thought.thought_type == ThoughtType.REFLECTION
-                and thought.lifecycle_status != LifecycleStatus.ACTIVE
+                str(row["thought_type"]) == ThoughtType.REFLECTION.value
+                and str(row["lifecycle_status"]) != LifecycleStatus.ACTIVE.value
             )
         ]
         if current_cycle is None:
-            return [(thought.thought_id, 0.0) for thought in thoughts]
+            return [(str(row["thought_id"]), 0.0) for row in live]
 
         decay_rate = math.log(2) / recency_half_life
         ranked = [
             (
-                thought.thought_id,
-                math.exp(-decay_rate * max(current_cycle - thought.updated_cycle, 0)),
+                str(row["thought_id"]),
+                math.exp(-decay_rate * max(current_cycle - int(row["updated_cycle"]), 0)),
             )
-            for thought in thoughts
+            for row in live
         ]
         ranked.sort(key=lambda item: item[1], reverse=True)
         return ranked
@@ -5465,7 +5466,7 @@ class SqliteEngravaCore:
                 top_k=top_k,
                 current_cycle=current_cycle,
                 recency_half_life=resolved_recency_half_life,
-                _filter_clause=filter_clause_plain,
+                filter_clause=filter_clause_plain,
             )
             if priority_active and fallback:
                 backends_used.add("priority")
