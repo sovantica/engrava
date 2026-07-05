@@ -115,8 +115,10 @@ Stage 1 (archive) is the **default action** and is fully reversible:
 - A below-threshold, unprotected thought flips to `ARCHIVED` and its
   `archived_at_cycle` is set to the current cycle. Its `expires_at` is cleared so
   it is no longer subject to [TTL](data-lifecycle.md).
-- **Restore** is a plain lifecycle write back to `ACTIVE` that clears
-  `archived_at_cycle` to `None`. No data was lost.
+- **Restore** un-archives a thought: `store.restore_thought(thought_id)` transitions
+  it back to `ACTIVE` (the `ARCHIVED → ACTIVE` lifecycle edge) and clears
+  `archived_at_cycle` to `None`. No data was lost. Restoring a thought that is not
+  archived raises `InvalidTransitionError`.
 
 Stage 2 (garbage collection) runs **only** when `auto_gc_enabled` is set —
 enabling hygiene never implicitly enables deletion:

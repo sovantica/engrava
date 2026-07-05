@@ -45,6 +45,7 @@ from engrava.domain.exceptions import (
     EmbeddingGenerationError,
     EmbeddingModelMismatchError,
     EmbeddingQueryPrefixMismatchError,
+    InvalidTransitionError,
     JournalIntegrityError,
     ReferentialIntegrityError,
     StaleDataError,
@@ -3342,6 +3343,87 @@ class SqliteEngravaCore:
         await self._maybe_auto_cleanup(exclude_id=thought_id)
         return updated
 
+    async def restore_thought(
+        self, thought_id: str, *, current_cycle: int | None = None
+    ) -> ThoughtRecord:
+        """Restore an archived thought to ``ACTIVE``, clearing its archive stamp.
+
+        The reversible counterpart to archival — whether the thought was
+        archived by the memory-hygiene loop (:meth:`run_hygiene`), TTL cleanup,
+        or a manual lifecycle change: an ``ARCHIVED`` thought transitions back to
+        ``ACTIVE`` through the lifecycle state machine and its
+        ``archived_at_cycle`` marker is cleared, so an archive round-trips with
+        no data loss. The move is journaled as an ``UPDATE_THOUGHT`` when
+        journaling is enabled.
+
+        This is the **canonical** un-archive path — the only one that clears
+        ``archived_at_cycle``. The ``ARCHIVED -> ACTIVE`` edge is also reachable
+        through a raw ``update_thought(lifecycle_status=ACTIVE)``, but that
+        low-level write leaves ``archived_at_cycle`` set. That is harmless — the
+        marker is only consulted while a thought is ``ARCHIVED`` (hygiene GC
+        eligibility) — but it is not a tidy restore, so prefer this method.
+
+        Args:
+            thought_id: UUID of the archived thought to restore.
+            current_cycle: Optional cycle to stamp as the new ``updated_cycle``;
+                when omitted the ``updated_cycle`` is left unchanged.
+
+        Returns:
+            The restored thought record (``lifecycle_status`` is ``ACTIVE``).
+
+        Raises:
+            ThoughtNotFoundError: If the thought does not exist.
+            InvalidTransitionError: If the thought is not currently ``ARCHIVED``.
+            StaleDataError: If the row was modified since it was read.
+
+        """
+        current_row = await self._get_thought_row(thought_id)
+        if current_row is None:
+            raise ThoughtNotFoundError(thought_id)
+        current = self._row_to_thought(current_row)
+
+        if current.lifecycle_status is not LifecycleStatus.ARCHIVED:
+            raise InvalidTransitionError(
+                entity_type="LifecycleStatus",
+                current_state=current.lifecycle_status.value,
+                target_state=LifecycleStatus.ACTIVE.value,
+            )
+
+        expected_cycle = current.updated_cycle
+        # Pass the enum (not its value) so ``evolve`` runs the state-machine
+        # transition check — the ARCHIVED -> ACTIVE edge is what makes the
+        # archive reversible.
+        changes: dict[str, object] = {
+            "lifecycle_status": LifecycleStatus.ACTIVE,
+            "archived_at_cycle": None,
+        }
+        if current_cycle is not None:
+            changes["updated_cycle"] = current_cycle
+        updated = current.evolve(**changes)
+
+        cursor = await self._db.execute(
+            self._CORE_UPDATE_SQL,
+            self._thought_to_core_update_params(updated, thought_id, expected_cycle),
+        )
+        if cursor.rowcount == 0:
+            raise StaleDataError(
+                entity_type="ThoughtRecord",
+                entity_id=thought_id,
+                expected_version=expected_cycle,
+            )
+
+        if self._journal is not None:
+            await self._journal.append(
+                mutation_type="UPDATE_THOUGHT",
+                target_id=thought_id,
+                delta={
+                    "before": current.model_dump(mode="json"),
+                    "after": updated.model_dump(mode="json"),
+                },
+            )
+        await self._maybe_commit()
+        return updated
+
     async def invalidate_thought(
         self,
         thought_id: str,
@@ -6133,7 +6215,7 @@ class SqliteEngravaCore:
     async def _hygiene_candidates(self) -> list[ThoughtRecord]:
         """Collect the eviction candidate pool: every ACTIVE and CREATED thought.
 
-        Already-ARCHIVED / terminal thoughts are outside the candidate set (they
+        Already-ARCHIVED and DONE thoughts are outside the candidate set (they
         are not re-processed). The **whole** eligible pool must be scored — the
         per-run cap bounds the *archived* set, not the *considered* set, so that
         the coldest thoughts (not an arbitrary page) are the ones selected.

@@ -256,6 +256,26 @@ class EngravaCoreProtocol(Protocol):
         """
         ...
 
+    async def restore_thought(
+        self, thought_id: str, *, current_cycle: int | None = None
+    ) -> ThoughtRecord:
+        """Restore an archived thought to ``ACTIVE``, clearing its archive stamp.
+
+        Args:
+            thought_id: UUID of the archived thought to restore.
+            current_cycle: Optional cycle to stamp as the new ``updated_cycle``.
+
+        Returns:
+            The restored thought record (``lifecycle_status`` is ``ACTIVE``).
+
+        Raises:
+            ThoughtNotFoundError: If the thought does not exist.
+            InvalidTransitionError: If the thought is not currently ``ARCHIVED``.
+            StaleDataError: If the row was modified by another writer.
+
+        """
+        ...
+
     async def list_thoughts(
         self,
         *,

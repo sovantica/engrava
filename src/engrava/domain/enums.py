@@ -107,7 +107,8 @@ class Priority(StrEnum):
 class LifecycleStatus(StrEnum):
     """Thought lifecycle states with enforced transitions (state machine).
 
-    CREATED -> ACTIVE -> DONE -> ARCHIVED.
+    CREATED -> ACTIVE -> DONE -> ARCHIVED, plus ARCHIVED -> ACTIVE to restore
+    (un-archive) a reversibly archived thought.
 
     Examples:
         >>> LifecycleStatus.CREATED.allowed_transitions()
@@ -115,7 +116,7 @@ class LifecycleStatus(StrEnum):
         >>> LifecycleStatus.ACTIVE.can_transition_to(LifecycleStatus.DONE)
         True
         >>> LifecycleStatus.ARCHIVED.can_transition_to(LifecycleStatus.ACTIVE)
-        False
+        True
 
     """
 
@@ -135,7 +136,7 @@ class LifecycleStatus(StrEnum):
             LifecycleStatus.CREATED: frozenset({LifecycleStatus.ACTIVE}),
             LifecycleStatus.ACTIVE: frozenset({LifecycleStatus.DONE, LifecycleStatus.ARCHIVED}),
             LifecycleStatus.DONE: frozenset({LifecycleStatus.ARCHIVED}),
-            LifecycleStatus.ARCHIVED: frozenset(),
+            LifecycleStatus.ARCHIVED: frozenset({LifecycleStatus.ACTIVE}),
         }
         return transitions[self]
 

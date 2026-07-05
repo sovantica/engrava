@@ -33,9 +33,11 @@ import pytest
 from engrava import (
     DreamingConfig,
     HygienePolicyConfig,
+    InvalidTransitionError,
     LifecycleStatus,
     Priority,
     SqliteEngravaCore,
+    ThoughtNotFoundError,
     ThoughtRecord,
     ThoughtType,
 )
@@ -637,25 +639,104 @@ class TestArchiveReversible:
             await s._db.close()
 
     async def test_restore_clears_archived_at_cycle(self) -> None:
-        """Un-archiving a hygiene-archived thought clears archived_at_cycle."""
+        """restore_thought un-archives a hygiene-archived thought and clears the stamp."""
         policy = HygienePolicyConfig(enabled=True, eviction_threshold=1.0)
         s = await _make_store(policy)
         try:
             await s.create_thought(_thought("cold", updated_cycle=0))
             await s.run_hygiene(current_cycle=42)
-            # Restore: ARCHIVED -> ACTIVE, clearing archived_at_cycle back to None.
-            # Uses the string lifecycle value (a direct write, the same
-            # state-machine bypass the archive uses), since ARCHIVED is terminal
-            # in the transition graph.
-            await s.update_thought(
-                "cold",
-                lifecycle_status=LifecycleStatus.ACTIVE.value,
-                archived_at_cycle=None,
-            )
-            restored = await s.get_thought("cold")
-            assert restored is not None
+            assert await _raw_lifecycle(s, "cold") == "ARCHIVED"
+
+            restored = await s.restore_thought("cold")
+
             assert restored.lifecycle_status is LifecycleStatus.ACTIVE
             assert restored.archived_at_cycle is None
+            assert await _raw_lifecycle(s, "cold") == "ACTIVE"
+            assert await _raw_archived_at_cycle(s, "cold") is None
+        finally:
+            await s._db.close()
+
+    async def test_archived_thought_transitions_to_active_via_state_machine(self) -> None:
+        """The ARCHIVED -> ACTIVE edge exists, so restore is not a bypass.
+
+        Regression: ARCHIVED was terminal (zero outbound transitions), so the
+        'reversible archive' contract only held by writing the raw string value
+        and skipping the transition check. The edge now exists, so evolving with
+        the ACTIVE *enum* (which runs the state-machine check) no longer raises.
+        """
+        assert LifecycleStatus.ARCHIVED.can_transition_to(LifecycleStatus.ACTIVE)
+        policy = HygienePolicyConfig(enabled=True, eviction_threshold=1.0)
+        s = await _make_store(policy)
+        try:
+            await s.create_thought(_thought("cold", updated_cycle=0))
+            await s.run_hygiene(current_cycle=42)
+            updated = await s.update_thought("cold", lifecycle_status=LifecycleStatus.ACTIVE)
+            assert updated.lifecycle_status is LifecycleStatus.ACTIVE
+        finally:
+            await s._db.close()
+
+    async def test_restore_round_trip_preserves_content(self) -> None:
+        """archive -> restore round-trips with no data loss."""
+        policy = HygienePolicyConfig(enabled=True, eviction_threshold=1.0)
+        s = await _make_store(policy)
+        try:
+            original = _thought("cold", updated_cycle=0)
+            await s.create_thought(original)
+            await s.run_hygiene(current_cycle=42)
+            restored = await s.restore_thought("cold")
+            assert restored.essence == original.essence
+            assert restored.content == original.content
+            assert restored.metadata == original.metadata
+        finally:
+            await s._db.close()
+
+    async def test_restore_non_archived_raises(self) -> None:
+        """Restoring a thought that is not ARCHIVED raises InvalidTransitionError."""
+        s = await _make_store(None)
+        try:
+            await s.create_thought(_thought("active", updated_cycle=0))
+            with pytest.raises(InvalidTransitionError):
+                await s.restore_thought("active")
+        finally:
+            await s._db.close()
+
+    async def test_restore_missing_raises(self) -> None:
+        """Restoring an unknown thought raises ThoughtNotFoundError."""
+        s = await _make_store(None)
+        try:
+            with pytest.raises(ThoughtNotFoundError):
+                await s.restore_thought("ghost")
+        finally:
+            await s._db.close()
+
+    async def test_restore_is_journaled_and_chain_verifies(self) -> None:
+        """The restore writes exactly one UPDATE_THOUGHT entry; the chain verifies."""
+        policy = HygienePolicyConfig(enabled=True, eviction_threshold=1.0)
+        s = await _make_store(policy, journal_enabled=True)
+        try:
+            await s.create_thought(_thought("cold", updated_cycle=0))
+            await s.run_hygiene(current_cycle=42)
+
+            async def _journal_count() -> int:
+                cur = await s._db.execute("SELECT COUNT(*) FROM journal_entry")
+                row = await cur.fetchone()
+                assert row is not None
+                return int(row[0])
+
+            before = await _journal_count()
+            await s.restore_thought("cold")
+
+            # The restore actually journaled (one appended entry, not a no-op)...
+            assert await _journal_count() == before + 1
+            cur = await s._db.execute(
+                "SELECT mutation_type FROM journal_entry ORDER BY sequence_number DESC LIMIT 1"
+            )
+            row = await cur.fetchone()
+            assert row is not None
+            assert row[0] == "UPDATE_THOUGHT"
+            # ...and the chain still verifies after the restore.
+            result = await s.verify_journal()
+            assert result.valid is True
         finally:
             await s._db.close()
 
