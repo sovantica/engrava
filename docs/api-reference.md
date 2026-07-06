@@ -66,6 +66,7 @@ keyword arguments and does **not** return a UUID string.
 | `await bulk_store(thoughts, *, deduplicate=False)` | `list[ThoughtRecord]` | Transactional batch insert: the whole list commits **once** and is all-or-nothing (any row error rolls the batch back). Order preserved. Under `auto_embed`, all thoughts are embedded in one batch provider call. `deduplicate` applies per row. |
 | `await get_thought(thought_id)` | `ThoughtRecord \| None` | Retrieve by ID; `None` if not found |
 | `await update_thought(thought_id, **changes)` | `ThoughtRecord` | Optimistic-concurrency update; raises `ThoughtNotFoundError` / `StaleDataError` |
+| `await restore_thought(thought_id, *, current_cycle=None)` | `ThoughtRecord` | Un-archive: transition an `ARCHIVED` thought back to `ACTIVE`, clearing its `archived_at_cycle` marker so an archive round-trips with no data loss. The reversible counterpart to the memory-hygiene / TTL / manual archive paths, journaled as an `UPDATE_THOUGHT`. Raises `ThoughtNotFoundError` if missing, `InvalidTransitionError` if the thought is not currently `ARCHIVED`, `StaleDataError` on a concurrent write. This is the **canonical** un-archive path (the only one that clears `archived_at_cycle`); a raw `update_thought(lifecycle_status=...)` back to `ACTIVE` leaves the marker set. |
 | `await list_thoughts(...)` | `list[ThoughtRecord]` | List with filters (keyword-only) |
 | `await count_thoughts(...)` | `int` | Count with filters (keyword-only) |
 | `await delete_thought(thought_id)` | `bool` | Hard delete; `True` if a row was removed |
@@ -88,6 +89,15 @@ record = ThoughtRecord(
     source="human",
 )
 stored = await store.create_thought(record)
+```
+
+```python
+from engrava import LifecycleStatus
+
+# Archive, then restore — a lossless round-trip.
+await store.update_thought(stored.thought_id, lifecycle_status=LifecycleStatus.ARCHIVED)
+restored = await store.restore_thought(stored.thought_id, current_cycle=42)
+assert restored.lifecycle_status is LifecycleStatus.ACTIVE
 ```
 
 ##### `create_thought` keyword-only options
@@ -249,6 +259,7 @@ returns a single `HybridSearchResult` container.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
+| `await recall(query, *, top_k=10, current_cycle=None, filters=None, visibility=None, collapse_key=None, collapse_max_per_unit=None)` | `HybridSearchResult` | Ergonomic shorthand over `search_hybrid` for the common retrieval case: passes the query text straight through and delegates the scoped-retrieval keywords below |
 | `await search_fts(query, top_k=10)` | `list[tuple[str, float]]` | FTS5/BM25 text search → `(thought_id, bm25_score)` |
 | `await search_hybrid(query_text, query_vector=None, *, top_k=10, ...)` | `HybridSearchResult` | Combined FTS + vector + recency + priority + graph |
 | `await search_reflections_only(query_text, *, top_k=10, ...)` | `HybridSearchResult` | Hybrid search restricted to REFLECTION thoughts |
@@ -257,6 +268,36 @@ returns a single `HybridSearchResult` container.
 `vector_weight`, `recency_weight`, `recency_half_life`, `current_cycle`,
 `fts_top_k`, `vector_top_k`, `priority_weight`, `graph_weight`,
 `graph_edge_decay`, `include_reflections` (default `True`), `reflection_boost`.
+
+##### Scoped & de-fragmented retrieval (keyword-only)
+
+Both `recall` and `search_hybrid` accept the same four opt-in keywords for
+narrowing and de-duplicating ranked results. Every one defaults to `None` and
+the `None` path is byte-identical to an unscoped query, so existing callers see
+no change.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `filters` | `MetadataFilter \| None` | Metadata scope — an `AND` of typed `FieldPredicate`s over the thought's `metadata`, applied *in-arm* before each arm's candidate limit so it never starves `top_k`. `None` (or an empty filter) leaves the candidate set unchanged. A query refinement, **not** a security boundary. |
+| `visibility` | `VisibilityQueryFilter \| None` | Bounded `(visibility IN … [OR owner = …])` refinement over `$.visibility` / `$.owner` — the "public-or-mine" pattern. **A query filter, not access control:** it performs no authentication, authorization, or ownership enforcement; the caller can forge `owner`; it is bypassable and must not be used to protect tenant data (use one store per tenant for isolation). |
+| `collapse_key` | `str \| Sequence[str] \| None` | Opt-in de-fragmentation unit key — a single metadata path (`"$.session_id"`) or an ordered sequence forming a composite key. When set, only the single best-ranked row per caller-defined unit reaches the result and the freed slots backfill deeper distinct units. A **presentation / de-dup convenience, not a filter and not isolation.** The collapse step mutates no score, but *setting* `collapse_key` widens the internal candidate pool, which can rescale the min-max-normalized keyword scores and shift order among units; only `collapse_key=None` leaves the path byte-identical. A missing/malformed key ⇒ the row is its own unit, never collapsed. |
+| `collapse_max_per_unit` | `int \| None` | Opt-in intra-unit retention depth for `collapse_key`. `None` (default) keeps one best row per unit; an integer `>= 1` keeps up to that many highest-ranked members of a unit and lets the freed slots backfill deeper distinct units. Only effective together with `collapse_key`; a value `< 1` is rejected. |
+
+```python
+from engrava import MetadataFilter, VisibilityQueryFilter
+from engrava import FieldOp, FieldPredicate
+
+# Scope recall to one session's memories, keep only "public" or my own rows,
+# and collapse per-turn fragments to one best row each.
+result = await store.recall(
+    "remote work trade-offs",
+    top_k=10,
+    filters=MetadataFilter([FieldPredicate("$.session_id", FieldOp.EQ, "sess-42")]),
+    visibility=VisibilityQueryFilter(frozenset({"public"}), owner="alice"),
+    collapse_key="$.session_turn",
+    collapse_max_per_unit=2,   # keep up to 2 rows per turn instead of 1
+)
+```
 
 #### Metrics & maintenance
 

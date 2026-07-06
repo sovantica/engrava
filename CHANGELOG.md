@@ -144,19 +144,52 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   contagious). A query that uses no temporal predicate behaves exactly as before.
   See the [Bi-temporal Model](docs/bitemporal.md) guide.
 
-- **MCP server: connect any MCP client to an engrava store.** A new optional
-  `mcp` extra (`pip install "engrava[mcp]"`) ships a Model Context Protocol
-  server that exposes a store over stdio to Claude Desktop, Claude Code, Cursor,
-  Windsurf, VS Code, and other MCP clients. Two entry points, `engrava-mcp` and
-  `python -m engrava.mcp`, build the same server. It registers eleven tools (six
-  read, five write), two static `engrava://` resources plus an
-  `engrava://thought/{thought_id}` resource template, and three prompt templates,
-  resolving its store from `ENGRAVA_MCP_CONFIG` (an `engrava.yaml`) or
-  `ENGRAVA_DB_PATH` (a bare database file). A read-only mode
-  (`ENGRAVA_MCP_READ_ONLY`) drops the five write tools entirely, leaving a
-  retrieval-only surface. The server is a pure API consumer — plain
-  `pip install engrava` is unaffected and stays dependency-light. See the
-  [MCP server](docs/guides/mcp.md) guide.
+- **Dreaming consolidation is now active.** The dreaming extension consolidates
+  clusters of related thoughts into REFLECTION summaries over a live access
+  substrate, with reachable scoring driving which clusters are promoted. See the
+  [dreaming guide](docs/dreaming.md).
+
+- **Opt-in memory-hygiene forgetting loop.** A deterministic, opt-in hygiene pass
+  archives low-value thoughts under a bounded budget, and `restore_thought(id, *,
+  current_cycle=None)` losslessly un-archives one back to `ACTIVE` (clearing its
+  `archived_at_cycle` marker) — the reversible counterpart to archival. Off by
+  default; a store that never enables it behaves exactly as before.
+
+- **Opt-in typed provenance capture at write time.** `ThoughtRecord.provenance`
+  accepts a `ProvenanceContext` recording the session/actor, retrieval query,
+  instruction context, and source-thought ids that shaped a synthesised thought;
+  `list_thoughts(provenance_filter=...)` queries it. Every field is optional and
+  the default `None` is byte-identical to not using provenance. It is a
+  descriptive hint only — never identity, authentication, or authorization. See
+  the [API Reference](docs/api-reference.md#provenance-capture).
+
+- **Action-outcome feedback loop and mutable action lifecycle.** Actions advance
+  through a journaled status lifecycle whose terminal states recompute the source
+  thought's outcome score, closing the loop between what an agent did and how its
+  memory is scored. See the [API Reference](docs/api-reference.md#actionrecord).
+
+- **Scoped and de-fragmented retrieval on `recall` / `search_hybrid`.** Ranked
+  retrieval gains four opt-in, keyword-only parameters: `filters` (a
+  `MetadataFilter` scoping candidates by typed metadata predicates), `visibility`
+  (a bounded `VisibilityQueryFilter` for the "public-or-mine" pattern — a query
+  refinement, **not** access control), `collapse_key` (de-fragmentation that
+  keeps one best-ranked row per caller-defined unit and backfills deeper distinct
+  units), and `collapse_max_per_unit` (opt-in intra-unit retention depth for
+  `collapse_key`). Each defaults to `None`, and the `None` path is byte-identical
+  to an unscoped query. See the
+  [API Reference](docs/api-reference.md#full-text--hybrid-search).
+
+- **Journal hash-chain verification via API, CLI, and an on-open gate.** The
+  append-only journal's tamper-evident hash chain can now be verified through a
+  public API, the CLI, and an optional check at store open.
+
+- **MindQL read-surface ergonomics.** The read surface gains `IN`, boolean
+  `WHERE`, `ORDER BY`, `OFFSET`, `EXPLAIN`, and a bounded `SELECT`, plus a
+  store-level `execute_mindql` entry point.
+
+- **Opt-in asymmetric query/document embedding prefixes.** Embedding providers
+  can apply distinct query- and document-side prefixes for models that expect
+  them; off by default.
 
 - **`execute_mindql` on the store.** `SqliteEngravaCore.execute_mindql(query, *,
   extensions=None)` runs a parsed `MindQLQuery` directly against the store's own
@@ -265,6 +298,16 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
   and the release pipeline verifies that the built wheel bundles its required
   package data before publishing to PyPI. These are tooling/CI changes only —
   no change to the installed package or its behaviour.
+
+### Removed
+
+- **BREAKING (MCP-server users only): the in-tree MCP server is removed.** The
+  `engrava[mcp]` optional-dependency extra, the in-engrava `engrava-mcp` console
+  script, and the in-tree server module are gone. `engrava` is now a pure library
+  with no MCP/web dependency stack; a plain `pip install engrava` is unaffected.
+  The server moved to the standalone [`engrava-mcp`](https://github.com/sovantica/engrava-mcp)
+  package (`uvx engrava-mcp`), which consumes engrava's public API. Migration is
+  documented in the [0.4 → 0.5 upgrade notes](docs/upgrade.md#04---05).
 
 ## 0.3.0 (2026-06-02)
 
