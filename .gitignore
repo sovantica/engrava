@@ -91,3 +91,6 @@ pytest-out.txt
 
 # Publishing keys (e.g. MCP DNS Ed25519) — never commit.
 *.pem
+
+# Local publisher binary — never commit.
+mcp-publisher
