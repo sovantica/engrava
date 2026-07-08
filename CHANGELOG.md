@@ -5,6 +5,91 @@ All notable changes to engrava will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## 0.5.0 (2026-07-08)
+
+* Merge branch 'docs/claim-and-audit-honesty' into release/v0.5.0 ([260ca89](https://github.com/sovantica/engrava/commit/260ca89))
+* Merge branch 'docs/dreaming-activation-and-provenance-docs' into release/v0.5.0 ([ebc8172](https://github.com/sovantica/engrava/commit/ebc8172))
+* Merge branch 'docs/v0.5.0-release-prep' into release/v0.5.0 ([4e94b85](https://github.com/sovantica/engrava/commit/4e94b85))
+* Merge branch 'feature/fallback-filter-fix-and-test-hardening' into release/v0.5.0 ([49dae4a](https://github.com/sovantica/engrava/commit/49dae4a))
+* Merge branch 'feature/pool-overfetch-backfill-assembly' into release/v0.5.0 ([835cfe0](https://github.com/sovantica/engrava/commit/835cfe0))
+* Merge branch 'fix/reversible-archive-restore' into release/v0.5.0 ([c16df75](https://github.com/sovantica/engrava/commit/c16df75))
+* Merge dev into main: CI action bumps (setup-python v6, cache v5) ([1d1494a](https://github.com/sovantica/engrava/commit/1d1494a))
+* Merge pull request #30 from sovantica/dev ([3fb9792](https://github.com/sovantica/engrava/commit/3fb9792)), closes [#30](https://github.com/sovantica/engrava/issues/30)
+* Merge pull request #43 from sovantica/release/v0.5.0 ([08d95f5](https://github.com/sovantica/engrava/commit/08d95f5)), closes [#43](https://github.com/sovantica/engrava/issues/43)
+* Merge remote-tracking branch 'origin/dev' into release/v0.5.0 ([fe78a66](https://github.com/sovantica/engrava/commit/fe78a66))
+* chore: gitignore *.pem so publishing keys are never committable ([dca2bf1](https://github.com/sovantica/engrava/commit/dca2bf1))
+* chore(config): extend commitlint scope allowlist and sync docs/scopes.md ([b83e544](https://github.com/sovantica/engrava/commit/b83e544))
+* chore(deps): bump actions/checkout from 5 to 7 (#32) ([53e5fcb](https://github.com/sovantica/engrava/commit/53e5fcb)), closes [#32](https://github.com/sovantica/engrava/issues/32)
+* chore(deps): bump actions/create-github-app-token from 2 to 3 (#31) ([dfd213f](https://github.com/sovantica/engrava/commit/dfd213f)), closes [#31](https://github.com/sovantica/engrava/issues/31)
+* chore(extensions): list Engrava on the official MCP Registry (server.json + OIDC publish) (#33) ([fbf6a18](https://github.com/sovantica/engrava/commit/fbf6a18)), closes [#33](https://github.com/sovantica/engrava/issues/33)
+* chore(extensions): remove the stale in-tree MCP registry artifacts (#42) ([1716c01](https://github.com/sovantica/engrava/commit/1716c01)), closes [#42](https://github.com/sovantica/engrava/issues/42) [33/#38](https://github.com/sovantica/engrava/issues/38)
+* chore(extensions): switch MCP Registry namespace to ai.sovantica (DNS auth) (#38) ([3511808](https://github.com/sovantica/engrava/commit/3511808)), closes [#38](https://github.com/sovantica/engrava/issues/38)
+* chore(gitignore): ignore the mcp-publisher binary ([9412ce3](https://github.com/sovantica/engrava/commit/9412ce3))
+* test(actions): cover non-terminal verification no-op and mixed-mean exclusion ([9fb0989](https://github.com/sovantica/engrava/commit/9fb0989))
+* test(docs): drop stale .consolidate phantom-guard entry (real since dreaming activation) ([77c0cd3](https://github.com/sovantica/engrava/commit/77c0cd3))
+* test(docs): execute or behaviour-assert every example; register compile-only blocks ([1531ed6](https://github.com/sovantica/engrava/commit/1531ed6))
+* test(dreaming): cover 6th-signal activation e2e and access-flush journal exclusion ([537502e](https://github.com/sovantica/engrava/commit/537502e))
+* test(dreaming): cover access-buffer cap/FIFO-eviction invariants ([df0f2e4](https://github.com/sovantica/engrava/commit/df0f2e4))
+* test(dreaming): cover cold-start clusters under content-quality gating ([49bc7bd](https://github.com/sovantica/engrava/commit/49bc7bd))
+* test(embeddings): cover require_embedding on the update_thought re-embed path ([66d1947](https://github.com/sovantica/engrava/commit/66d1947))
+* test(lifecycle): assert restore journals UPDATE_THOUGHT; document canonical path ([fcb4f67](https://github.com/sovantica/engrava/commit/fcb4f67))
+* test(perf): drop the SQLite-planner-formatting-dependent plan substring ([520681c](https://github.com/sovantica/engrava/commit/520681c))
+* test(search): cover empty-IN filter starvation end-to-end ([27a0ef3](https://github.com/sovantica/engrava/commit/27a0ef3))
+* test(search): cover filter x reflection-cap composition ([fb40cbc](https://github.com/sovantica/engrava/commit/fb40cbc))
+* test(search): cover scoped metadata-filtered retrieval ([893e66e](https://github.com/sovantica/engrava/commit/893e66e))
+* test(search): strengthen collapse x reflection-cap backfill assertion ([1ca1daf](https://github.com/sovantica/engrava/commit/1ca1daf))
+* test(vec0): pin cross-backend tie-break determinism at the backend boundary ([22bac37](https://github.com/sovantica/engrava/commit/22bac37))
+* docs: distinguish the UPDATE_ACTION journal string from the enum ([a3c84ba](https://github.com/sovantica/engrava/commit/a3c84ba))
+* docs: document dreaming activation — consolidate() and access tracking ([49d673a](https://github.com/sovantica/engrava/commit/49d673a))
+* docs: document the provenance-capture API ([ba12027](https://github.com/sovantica/engrava/commit/ba12027))
+* docs: fix post-0.5.0 drift — drop removed-MCP refs, correct scoped-retrieval claims ([6cc8cbb](https://github.com/sovantica/engrava/commit/6cc8cbb))
+* docs: note UPDATE_ACTION in the journal append docstring ([27c94bd](https://github.com/sovantica/engrava/commit/27c94bd))
+* docs: scope audit-trail and dreaming claims to their real boundaries ([0612cb1](https://github.com/sovantica/engrava/commit/0612cb1))
+* docs(api-reference): document restore_thought and scoped retrieval params ([1345ded](https://github.com/sovantica/engrava/commit/1345ded))
+* docs(changelog): curate 0.5.0 Unreleased block and mark MCP removal breaking ([5cf3a78](https://github.com/sovantica/engrava/commit/5cf3a78))
+* docs(changelog): remove the dead manual Unreleased section ([ff70668](https://github.com/sovantica/engrava/commit/ff70668))
+* docs(journal): disclose that verify_journal cannot detect tail truncation ([657c884](https://github.com/sovantica/engrava/commit/657c884))
+* docs(performance): document the filtered vector-arm trade-off and clarify the bypass rationale ([c9a2a82](https://github.com/sovantica/engrava/commit/c9a2a82))
+* docs(pyproject): align package description with the honest journal claim ([de1fa58](https://github.com/sovantica/engrava/commit/de1fa58))
+* docs(readme): quote extras in install commands so zsh does not glob ([32584bb](https://github.com/sovantica/engrava/commit/32584bb))
+* docs(search): add the whole-turn assembly caller-side recipe ([6c3339c](https://github.com/sovantica/engrava/commit/6c3339c))
+* docs(search): document scoped retrieval and the ranked-path filter ([cf0ab8f](https://github.com/sovantica/engrava/commit/cf0ab8f))
+* refactor(embeddings): clarify resolve-test intent and batch-embed failure id ([d066552](https://github.com/sovantica/engrava/commit/d066552))
+* refactor(search): confine fallback filter SQL to a private method ([465d076](https://github.com/sovantica/engrava/commit/465d076))
+* fix: use absolute GitHub links in README so PyPI does not 404 ([acf56bf](https://github.com/sovantica/engrava/commit/acf56bf))
+* fix(dreaming): add opt-in cold-start clustering fallback ([35aedab](https://github.com/sovantica/engrava/commit/35aedab))
+* fix(lifecycle): make archived thoughts restorable to ACTIVE ([88c2e3e](https://github.com/sovantica/engrava/commit/88c2e3e))
+* fix(search): apply filters/visibility in the query-less fallback arm ([2f0640e](https://github.com/sovantica/engrava/commit/2f0640e))
+* fix(search): correct the sqlite-vec backend — purge deleted vectors, fill top_k ([d884052](https://github.com/sovantica/engrava/commit/d884052))
+* fix(search): neutral midpoint for the degenerate min-max fusion case ([815f23b](https://github.com/sovantica/engrava/commit/815f23b))
+* feat: remove the in-tree MCP server (now the standalone engrava-mcp package) ([1417e91](https://github.com/sovantica/engrava/commit/1417e91))
+* feat(core): action-outcome feedback loop and mutable action lifecycle ([2008a3f](https://github.com/sovantica/engrava/commit/2008a3f))
+* feat(core): add opt-in deterministic memory-hygiene forgetting loop ([9167948](https://github.com/sovantica/engrava/commit/9167948))
+* feat(core): batch/get-or-create write primitives and embed-failure visibility ([e9c2021](https://github.com/sovantica/engrava/commit/e9c2021))
+* feat(core): opt-in typed provenance-context capture at create_thought ([b8b8fa3](https://github.com/sovantica/engrava/commit/b8b8fa3))
+* feat(dreaming): activate consolidation — reachable scoring + live access substrate ([5114f81](https://github.com/sovantica/engrava/commit/5114f81))
+* feat(embeddings): opt-in asymmetric query/document prefixes ([12e61fb](https://github.com/sovantica/engrava/commit/12e61fb))
+* feat(journal): expose hash-chain verification via API, CLI, and on-open gate ([b26f519](https://github.com/sovantica/engrava/commit/b26f519))
+* feat(mindql): read-surface ergonomics — IN, boolean WHERE, ORDER BY, OFFSET, EXPLAIN, bound SELECT ([eca5a74](https://github.com/sovantica/engrava/commit/eca5a74))
+* feat(search): add collapse_key de-fragmentation to hybrid retrieval ([6c80277](https://github.com/sovantica/engrava/commit/6c80277))
+* feat(search): add metadata and visibility filters to ranked retrieval ([a56fcc7](https://github.com/sovantica/engrava/commit/a56fcc7))
+* feat(search): add opt-in per-unit retention depth for collapse backfill ([e72cd22](https://github.com/sovantica/engrava/commit/e72cd22))
+* feat(search): batch read-path decode, inbound edge index, eviction visibility ([0e1b81f](https://github.com/sovantica/engrava/commit/0e1b81f))
+* merge: filtered vector-arm performance note into v0.5.0 ([a5cbdeb](https://github.com/sovantica/engrava/commit/a5cbdeb))
+* merge: scoped metadata-filtered ranked retrieval into v0.5.0 ([8743c7e](https://github.com/sovantica/engrava/commit/8743c7e))
+* ci(config): exempt dependabot commits from commitlint body-length (#36) ([462d468](https://github.com/sovantica/engrava/commit/462d468)), closes [#36](https://github.com/sovantica/engrava/issues/36)
+* ci(config): exempt dependabot commits from commitlint body-length (#36) ([2d391ee](https://github.com/sovantica/engrava/commit/2d391ee)), closes [#36](https://github.com/sovantica/engrava/issues/36)
+* build(deps): cap numpy <2.3 to keep mypy --strict green at the 3.11 target (#34) ([91be8d4](https://github.com/sovantica/engrava/commit/91be8d4)), closes [#34](https://github.com/sovantica/engrava/issues/34)
+* build(deps): cap numpy <2.3 to keep mypy --strict green at the 3.11 target (#34) ([dea6be6](https://github.com/sovantica/engrava/commit/dea6be6)), closes [#34](https://github.com/sovantica/engrava/issues/34)
+
+### BREAKING CHANGE
+
+* the in-tree MCP server is removed from engrava. The engrava[mcp]
+optional-dependency extra, the in-engrava engrava-mcp console script, and the
+in-tree server module are gone; a plain 'pip install engrava' is unaffected. The
+server moved to the standalone engrava-mcp package (uvx engrava-mcp), which
+consumes engrava's public API. Migrate per the docs/upgrade.md 0.4 -> 0.5 notes.
+
 ## 0.4.0 (2026-06-18)
 
 * Merge bi-temporal documentation and 0.3 to 0.4 upgrade notes into v0.4.0 ([a04b75c](https://github.com/sovantica/engrava/commit/a04b75c))
@@ -110,161 +195,6 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 * fix(vector): load sqlite-vec extension on the connection's worker thread ([457d2f7](https://github.com/sovantica/engrava/commit/457d2f7))
 * fix(vector): re-disable extension loading in finally after load attempt ([e9ab267](https://github.com/sovantica/engrava/commit/e9ab267))
 * docs: point documentation url to engrava.ai/docs ([aeeb3cb](https://github.com/sovantica/engrava/commit/aeeb3cb))
-
-## [Unreleased]
-
-### Added
-
-- **`remember` and `recall`: store and retrieve in one call.** Two ergonomic
-  convenience methods on the store let you persist a string and get relevant
-  strings back without hand-building a `ThoughtRecord` or wiring up
-  `search_hybrid`. `remember(text, *, metadata=None, deduplicate=False)` stores
-  a string as a thought (deriving the essence from its opening) and honours
-  opt-in content deduplication; `recall(query, *, top_k=10, current_cycle=None)`
-  returns the ranked matches. Passing `current_cycle` to `recall` blends in the
-  recency signal; on a large store recalled without it, a single DEBUG log line
-  points out that a cycle would let recent thoughts rank higher. `ThoughtRecord`
-  now defaults `created_cycle` and `updated_cycle` to `0`, so callers that do
-  not track cognitive cycles can omit them.
-
-- **Bi-temporal model: track when a fact is *true*, not just when you stored
-  it.** `ThoughtRecord` and `EdgeRecord` gain two optional, nullable ISO-8601
-  fields — `valid_from` and `valid_until` — describing the half-open real-world
-  interval during which a fact holds (the upper bound is exclusive; a `None`
-  bound is treated as ±∞, so facts you never annotate keep matching every query).
-  Four opt-in MindQL `WHERE` predicates query this *valid time* on the `thoughts`
-  and `edges` tables: `valid_now`, `valid_at <ts>`, `valid_within <start> <end>`
-  (interval overlap), and `valid_between <start> <end>` (fully contained — the one
-  predicate that excludes open-bounded rows). Two new store primitives,
-  `invalidate_thought(id, valid_until)` and `invalidate_edge(id, valid_until)`,
-  retire a fact by closing its interval instead of deleting it — deterministic,
-  idempotent, non-cascading, and fully auditable (the row stays on file and a
-  point-in-time query before the cut-off still finds it). Reflections built by
-  dreaming inherit their members' valid-time extent (open-on-either-side is
-  contagious). A query that uses no temporal predicate behaves exactly as before.
-  See the [Bi-temporal Model](docs/bitemporal.md) guide.
-
-- **MCP server: connect any MCP client to an engrava store.** A new optional
-  `mcp` extra (`pip install "engrava[mcp]"`) ships a Model Context Protocol
-  server that exposes a store over stdio to Claude Desktop, Claude Code, Cursor,
-  Windsurf, VS Code, and other MCP clients. Two entry points, `engrava-mcp` and
-  `python -m engrava.mcp`, build the same server. It registers eleven tools (six
-  read, five write), two static `engrava://` resources plus an
-  `engrava://thought/{thought_id}` resource template, and three prompt templates,
-  resolving its store from `ENGRAVA_MCP_CONFIG` (an `engrava.yaml`) or
-  `ENGRAVA_DB_PATH` (a bare database file). A read-only mode
-  (`ENGRAVA_MCP_READ_ONLY`) drops the five write tools entirely, leaving a
-  retrieval-only surface. The server is a pure API consumer — plain
-  `pip install engrava` is unaffected and stays dependency-light. See the
-  [MCP server](docs/guides/mcp.md) guide.
-
-- **`execute_mindql` on the store.** `SqliteEngravaCore.execute_mindql(query, *,
-  extensions=None)` runs a parsed `MindQLQuery` directly against the store's own
-  connection, returning a `MindQLResult` — a convenience over constructing a
-  `MindQLExecutor` by hand. See the [API Reference](docs/api-reference.md#mindql).
-
-### Performance
-
-- **Hot-path indexes and tuned SQLite PRAGMAs make the common reads faster.**
-  Four indexes now back the equality filters and the sort column hit on every
-  common read — looking up edges by their target thought, fetching a thought's
-  embedding, listing thoughts in recency order, and filtering thoughts by type
-  — turning what were full table scans into index lookups. The connection is
-  also opened with `synchronous=NORMAL` (the documented-safe companion to WAL:
-  durable across an application crash, only at risk of losing the most recent
-  transactions on an OS crash or power loss) and `busy_timeout=5000`, so a
-  second connection waits briefly for a lock instead of failing immediately
-  with a "database is locked" error. The index changes are an additive schema
-  migration that runs automatically on first open with zero data loss; see the
-  [upgrade guide](docs/upgrade.md#03---04).
-
-### Fixed
-
-- **MindQL no longer mistypes quoted values or silently ignores malformed
-  conditions.** A single-quoted WHERE value is now kept verbatim as a string,
-  so a zero-padded identifier such as `WHERE source = '007'` matches the stored
-  string `'007'` instead of being coerced to the integer `7` and matching
-  nothing; an *unquoted* bare value (for example `WHERE created_cycle = 12`) is
-  still coerced to a number as before. A WHERE fragment must now match the
-  `field op value` grammar in full: trailing content after a condition (such as
-  `WHERE priority = 'P1' OR 1=1`) previously matched only the leading prefix and
-  silently discarded the rest, which could change the result set unnoticed — it
-  now raises a parse error. Finally, a `FIND` query with no `LIMIT` clause is
-  capped at a sane default (100 rows) rather than running an unbounded scan; an
-  explicit `LIMIT` always overrides the default, and `COUNT` queries are
-  unaffected.
-
-- **Long memories are now embedded in full, and a thought's opening is no
-  longer double-counted.** Two silent recall killers in the vector arm of
-  search are fixed. First, when a thought's `essence` is just the opening of
-  its `content` (a common convention, e.g. `essence = content[:200]`),
-  auto-embed used to concatenate the two and encode that opening twice, letting
-  it dominate the vector and dilute the discriminative tail; the redundant
-  prefix is now dropped and `content` is embedded alone, while a genuinely
-  distinct `essence` is still encoded alongside the content as before. Second,
-  the local `sentence-transformers` provider now raises `max_seq_length` to the
-  model's true architecture maximum after loading (derived from the model, not
-  hard-coded), instead of accepting a conservative shipped default — the bundled
-  `all-MiniLM-L12-v2` reported `128` while its backbone supports `512`, so the
-  tail of any longer thought was silently truncated away before encoding.
-  Existing stored embeddings are unaffected until a thought is re-written
-  (re-create or an `essence`/`content` update), at which point it is re-embedded
-  with the corrected input.
-
-- **Natural-language queries now reach the full-text index.** `search_fts`
-  previously joined the words of a bare query with FTS5's implicit `AND`, so a
-  question only matched documents that contained *every* word — including
-  function words like "what", "was" and "my" — and a relevantly-phrased answer
-  was missed. Bare queries are now matched with `OR`: a document is returned
-  when it shares any content word, and BM25's IDF weighting ranks the documents
-  that share the most distinctive words first, so no stopword list or stemmer is
-  needed in any language. Contractions and clitics no longer silently miss
-  (`sister's` matches a stored `sister's dog`; `l'école` matches `l'école
-  française`) because unsafe characters now split a token into separate terms
-  instead of being deleted into an unindexed word. Pasting a URL or a timestamp
-  into search no longer raises: only the real `essence:` and `content:` column
-  filters are honoured, while tokens such as `http://example.com` or `12:30` are
-  treated as ordinary search terms. Expert syntax is unchanged — quoted phrases,
-  uppercase `AND`/`OR`/`NOT`, hyphenated identifiers and the `essence:`/
-  `content:` column filters all keep their existing behaviour. As a final
-  safeguard, a malformed full-text expression is now logged and degraded to no
-  full-text hits instead of propagating, so the rest of a hybrid search still
-  returns results.
-
-- **Transient errors from an OpenAI-compatible embeddings endpoint no
-  longer abort the whole call.** `OpenAICompatibleProvider` now retries a
-  single embeddings request with bounded exponential backoff when the
-  endpoint reports a transient failure — a read timeout or network blip,
-  or a transient HTTP status (`408`, `409`, `425`, `429`, `500`, `502`,
-  `503`, `504`). A short outage is absorbed instead of failing the
-  caller's ingest. Non-transient errors (such as `400`, `401`, `403`,
-  `404`) still surface immediately with no retry, and a transient failure
-  that persists across every attempt is still raised, so the call never
-  loops forever. The behaviour is tunable through two new keyword-only
-  constructor arguments, `max_attempts` (default `3`) and
-  `base_retry_delay_s` (default `1.0`); the defaults leave the success
-  path at a single request, so existing callers see no change. The other
-  embedding providers are unaffected.
-
-- **sqlite-vec backend no longer crashes on configuration.** Selecting the
-  `sqlite-vec` vector backend (via `engrava[vec]`) previously raised a
-  thread error when building a store from configuration, because the
-  extension was loaded on the calling thread instead of the connection's
-  own worker thread. The extension now loads on the worker thread that owns
-  the connection, so configuration succeeds; if the extension still cannot
-  be loaded for any reason, the store falls back to the built-in search
-  backend with a warning instead of raising. Extension loading is also
-  always re-disabled after the load attempt, even when the load fails, so a
-  connection is never left with extension loading enabled.
-
-### Changed
-
-- **CI hardening (maintenance, no runtime impact).** Continuous integration
-  now runs a generic secret scan (gitleaks, built-in rules) and a dependency
-  vulnerability audit (`pip-audit --strict`) on every push and pull request,
-  and the release pipeline verifies that the built wheel bundles its required
-  package data before publishing to PyPI. These are tooling/CI changes only —
-  no change to the installed package or its behaviour.
 
 ## 0.3.0 (2026-06-02)
 

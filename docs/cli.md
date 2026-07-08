@@ -35,6 +35,7 @@ engrava --db other.db info         # flag overrides the env var
 | Command | Purpose |
 |---|---|
 | [`info`](#info) | Show a metrics snapshot for the database. |
+| [`verify`](#verify) | Verify the audit journal's hash chain. |
 | [`query`](#query) | Run a MindQL query. |
 | [`snapshot`](#snapshot) | Export the whole database to a JSONL snapshot. |
 | [`restore`](#restore) | Restore a database from a JSONL snapshot. |
@@ -68,6 +69,32 @@ engrava --db engrava.db info
 
 Use this after an upgrade or a restore to confirm the database is readable and
 the counts look right.
+
+### `verify`
+
+Verifies the [audit journal](audit-trail.md)'s hash chain. It walks every
+recorded `journal_entry` in sequence order, recomputes each SHA-256 hash, and
+checks the parent-hash linkage. Takes no command-specific options. The chain is
+verified **regardless of whether journaling is currently enabled**, so a journal
+recorded in an earlier session is still auditable.
+
+```bash
+engrava --db engrava.db verify
+# Journal integrity OK — 128 entries verified.
+
+engrava --db engrava.db --format json verify
+# {"valid": true, "entries_checked": 128, ...}
+```
+
+The exit code is **`0`** when the chain verifies, **`1`** when it does not (the
+text output names the first broken `sequence`, and the JSON output carries
+`first_invalid_sequence` / `error_message`) or when the database is missing —
+so it drops straight into a CI job, a pre-backup hook, or a monitoring check. An
+empty or absent journal verifies as valid with `entries_checked: 0`.
+
+Read the [Security model](audit-trail.md#security-model--guarantees) first: this
+is a keyless in-file chain, so it detects accidental corruption and naive edits,
+not a chain-aware actor who rewrites the whole `.db`.
 
 ### `query`
 
@@ -217,11 +244,13 @@ engrava --db engrava.db export --status ACTIVE
 
 ## Journal verification
 
-There is **no `engrava verify` command** in this version. To verify the
-[audit journal](audit-trail.md)'s hash chain, use the Python API:
+Use [`engrava verify`](#verify) to verify the [audit journal](audit-trail.md)'s
+hash chain from the shell (exit `0` = intact, `1` = broken or missing database).
+The equivalent Python API is `store.verify_journal()` (the store-level
+convenience) or `store.journal.verify_integrity()` (via the writer directly):
 
 ```python
-result = await store.journal.verify_integrity()
+result = await store.verify_journal()
 print(result.valid)
 ```
 

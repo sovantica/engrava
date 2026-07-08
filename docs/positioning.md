@@ -4,7 +4,7 @@ Engrava is a **standalone embedded database for AI-agent memory**. It is built o
 SQLite and runs in-process: one `pip install`, no server, no LLM, no external
 services. It gives an agent a durable thought-graph with hybrid retrieval
 (full-text + vector + recency + priority + graph) and an optional tamper-evident
-audit trail.
+hash-chain journal.
 
 This page explains **when Engrava is the right tool**, when it isn't, and how it
 relates to the other memory options you might be choosing between.
@@ -45,11 +45,12 @@ relates to the other memory options you might be choosing between.
 - **You want the library to call an LLM for you.** Engrava does no LLM-side fact
   extraction, summarisation, or entity resolution (see [Non-goals](#non-goals)).
   It stores and retrieves what you give it; your agent decides what to write.
-- **You need per-tenant retrieval isolation on the ranked path out of the box.**
-  The `search_*` methods take no scope/metadata filter today — retrieval is
-  unscoped by default. There are good workarounds (over-fetch + post-filter,
-  one store per tenant, raw-SQL pre-filter); see the
-  [migration guide's scoping section](guides/migrating-from-other-memory.md#filtering-scoping-and-multi-tenancy).
+- **You need real per-tenant retrieval *isolation* out of the box.**
+  `search_hybrid`/`recall` now take optional `filters=`/`visibility=` to *scope* a
+  ranked query (project, session, visibility class) — but that is a query filter,
+  **not** a security boundary. True cross-tenant isolation is a store per tenant
+  (`EngravaManager`), not this filter; see the
+  [migration guide's scoping section](guides/migrating-from-other-memory.md#filtering-scoping--multi-tenancy).
 
 ## Non-goals
 
@@ -61,10 +62,11 @@ These are deliberate boundaries, not missing features:
   extension), above the storage layer. The one consolidation feature that *does*
   synthesise — [dreaming](dreaming.md) — is purely structural (clustering +
   centroids + keyword counts), with **no LLM involved**.
-- **Retrieval is unscoped by default.** `search_hybrid` / `search_similar` /
-  `search_fts` rank across the whole store; they accept no per-user or
-  per-session filter argument. Scoping is an application-level concern today —
-  see the [workarounds](guides/migrating-from-other-memory.md#filtering-scoping-and-multi-tenancy).
+- **Retrieval is unscoped by default.** Queries rank across the whole store unless
+  you scope them: `search_hybrid`/`recall` accept optional `filters=`/`visibility=`
+  (a query filter, not access control); `search_similar`/`search_fts` take no filter
+  argument. Real per-tenant isolation is a store per tenant (`EngravaManager`) —
+  see the [scoping section](guides/migrating-from-other-memory.md#filtering-scoping--multi-tenancy).
 - **Not a distributed system.** No clustering, replication, or cross-machine
   consistency. One file, one writer.
 - **Not an application framework.** Engrava is the memory layer. It does not

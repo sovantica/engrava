@@ -2,6 +2,33 @@
 
 This document covers platform-specific notes, constraints, and known issues.
 
+## Search is unscoped by default (multi-tenant caveat)
+
+`search_hybrid()` / `recall()` / `search_similar()` span the **entire store** by
+default — there is no implicit per-user or per-session boundary. If you keep
+multiple tenants' thoughts in one database file, an unfiltered search can return
+another tenant's memories.
+
+Two supported ways to isolate:
+
+- **A file per tenant** (the strongest boundary) — one store per tenant, managed
+  via `EngravaManager`. Isolation is then the file boundary itself.
+- **Scoped retrieval within one file** — pass `filters=` / `visibility=` to the
+  ranked search methods to constrain results to a metadata scope (e.g. an owner
+  or session key). See [Search](search.md#scoped-retrieval).
+
+Choose file-per-tenant when tenants must never share a file; use scoped filters
+for soft, in-file partitioning.
+
+## Dreaming / consolidation: mechanism, not a proven retrieval lift
+
+The `DreamingExtension` performs deterministic, no-LLM consolidation
+(promotion → priority boost, association edges, reflections). Those are real
+**mechanical** ranking effects, but Engrava makes **no claim that enabling
+dreaming improves retrieval accuracy** on any benchmark — its measured effect on
+our own runs was within noise. Enable it for the cognitive-hygiene mechanics it
+provides, not for an expected accuracy gain. See [Dreaming](dreaming.md).
+
 ## macOS SQLite Extension Loading
 
 macOS ships with a system SQLite that has extension loading disabled by default.

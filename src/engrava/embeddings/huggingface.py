@@ -2,6 +2,13 @@
 
 Requires the ``[embeddings-hf]`` extra (``huggingface_hub``).
 
+Optional asymmetric role prefixes (``query_prefix`` / ``document_prefix``)
+support instruction-tuned models (E5, BGE, GTE). A configured prefix is
+prepended to the text before feature extraction; a long document whose text
+plus prefix exceeds the model's ``max_seq_length`` truncates exactly as an
+unprefixed over-length input would — no special reservation is made for the
+prefix.
+
 Related:
 """
 
@@ -26,6 +33,14 @@ class HuggingFaceProvider:
         model_name: HuggingFace model identifier.
         api_key: HuggingFace API token. Falls back to ``HF_TOKEN`` env var.
         dimension: Expected vector dimensionality. Auto-detected on first call.
+        query_prefix: Optional instruction prefix prepended to a search
+            query before encoding (e.g. ``"query: "``). Keyword-only. Empty
+            by default — an empty prefix is a literal passthrough, so the
+            role-aware path is byte-identical to the plain ``embed`` path.
+            Only a non-empty prefix is prepended.
+        document_prefix: Optional instruction prefix prepended to a stored
+            document before encoding (e.g. ``"passage: "``). Keyword-only.
+            Empty by default, with the same passthrough guarantee.
 
     Examples:
         >>> provider = HuggingFaceProvider(dimension=384)
@@ -39,10 +54,15 @@ class HuggingFaceProvider:
         model_name: str = "sentence-transformers/all-MiniLM-L12-v2",
         api_key: str | None = None,
         dimension: int | None = None,
+        *,
+        query_prefix: str = "",
+        document_prefix: str = "",
     ) -> None:
         self._model_name = model_name
         self._api_key = api_key or os.environ.get("HF_TOKEN", "")
         self._dimension: int | None = dimension
+        self._query_prefix = query_prefix
+        self._document_prefix = document_prefix
         self._client: Any = None
 
     def _get_client(self) -> Any:  # noqa: ANN401
@@ -100,6 +120,16 @@ class HuggingFaceProvider:
         """
         return self._model_name
 
+    @property
+    def query_prefix(self) -> str:
+        """Return the query-role prefix (empty string when disabled)."""
+        return self._query_prefix
+
+    @property
+    def document_prefix(self) -> str:
+        """Return the document-role prefix (empty string when disabled)."""
+        return self._document_prefix
+
     def _embed_sync(self, text: str) -> list[float]:
         """Encode a single text synchronously.
 
@@ -156,3 +186,65 @@ class HuggingFaceProvider:
 
         """
         return await asyncio.to_thread(self._embed_batch_sync, texts)
+
+    async def embed_query(self, text: str) -> list[float]:
+        """Encode a search query, applying the query-role prefix.
+
+        With an empty ``query_prefix`` (the default) this delegates to the
+        plain :meth:`embed` path — byte-identical output, no concatenation.
+
+        Args:
+            text: The query text to embed.
+
+        Returns:
+            Embedding vector as a list of floats.
+
+        """
+        if not self._query_prefix:
+            return await self.embed(text)
+        return await self.embed(self._query_prefix + text)
+
+    async def embed_document(self, text: str) -> list[float]:
+        """Encode a stored document, applying the document-role prefix.
+
+        With an empty ``document_prefix`` (the default) this delegates to the
+        plain :meth:`embed` path — byte-identical output, no concatenation.
+
+        Args:
+            text: The document text to embed.
+
+        Returns:
+            Embedding vector as a list of floats.
+
+        """
+        if not self._document_prefix:
+            return await self.embed(text)
+        return await self.embed(self._document_prefix + text)
+
+    async def embed_query_batch(self, texts: list[str]) -> list[list[float]]:
+        """Encode multiple queries, applying the query-role prefix to each.
+
+        Args:
+            texts: The query texts to embed.
+
+        Returns:
+            List of embedding vectors.
+
+        """
+        if not self._query_prefix:
+            return await self.embed_batch(texts)
+        return await self.embed_batch([self._query_prefix + t for t in texts])
+
+    async def embed_document_batch(self, texts: list[str]) -> list[list[float]]:
+        """Encode multiple documents, applying the document-role prefix.
+
+        Args:
+            texts: The document texts to embed.
+
+        Returns:
+            List of embedding vectors.
+
+        """
+        if not self._document_prefix:
+            return await self.embed_batch(texts)
+        return await self.embed_batch([self._document_prefix + t for t in texts])

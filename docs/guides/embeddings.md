@@ -25,7 +25,9 @@ works.
 
 The corpus and the query must use **the same model / dimension** — once a store
 has embeddings for one model, writing with a different model raises
-`EmbeddingModelMismatchError`.
+`EmbeddingModelMismatchError`. For instruction-tuned models the corpus also pins
+the `document_prefix` it was built with (see
+[Asymmetric prefixes](#asymmetric-prefixes-for-instruction-tuned-models)).
 
 ## Wiring a provider
 
@@ -57,6 +59,84 @@ from engrava import SqliteEngravaCore
 
 async with await SqliteEngravaCore.from_config("engrava.yaml") as store:
     ...   # provider wired from config, auto_embed honoured
+```
+
+### When auto-embed fails (the honest boundary)
+
+`create_thought` commits the thought **before** it auto-embeds. So if the
+embedding provider fails (network blip, rate limit, a crashing local model), the
+thought is already persisted — it just has no embedding, which means it is
+**invisible to vector search** until re-embedded. This is an existing property,
+not a new one, and it is surfaced two ways:
+
+- The failure is **never silent**: a `WARNING` naming the thought id and the
+  provider error is always logged, then the provider's own exception propagates
+  (unchanged default behaviour).
+- Set `require_embedding: true` (config) or `require_embedding=True` (constructor)
+  to turn that failure into a typed `EmbeddingGenerationError` — the explicit
+  fail-fast for operators who would rather the write raise loudly than leave an
+  unembedded thought behind. The thought is still committed either way; the flag
+  only governs how loudly the missing embedding is reported.
+
+```python
+import aiosqlite
+from engrava import SqliteEngravaCore, EmbeddingGenerationError
+
+async def strict_ingest(provider: object, text: str) -> None:
+    async with aiosqlite.connect("engrava.db") as conn:
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(
+            conn,
+            embedding_provider=provider,  # type: ignore[arg-type]
+            auto_embed=True,
+            require_embedding=True,  # embed failure -> EmbeddingGenerationError
+        )
+        await store.ensure_schema()
+        try:
+            await store.remember(text)
+        except EmbeddingGenerationError as exc:
+            # The thought exists but is unembedded; decide how to recover.
+            print(f"embed failed for {exc.thought_id}")
+```
+
+### Batch ingest embeds in one call
+
+`bulk_store` persists many thoughts in a single all-or-nothing transaction and,
+when `auto_embed` is on, embeds them all in **one** batch provider call (using
+the role-aware `embed_document_batch` when the provider exposes it, else
+`embed_batch`) instead of one round trip per thought. The stored vectors are
+identical to embedding each thought individually. `get_or_create` and
+`upsert_by_hash` are content-hash convenience writes over the same
+deduplication — see [the write-API guide](agent-memory.md) and the
+[API reference](../api-reference.md).
+
+```python
+import aiosqlite
+from engrava import SqliteEngravaCore, ThoughtRecord, ThoughtType, Priority, LifecycleStatus
+
+async def batch_ingest(provider: object, texts: list[str]) -> None:
+    async with aiosqlite.connect("engrava.db") as conn:
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(
+            conn,
+            embedding_provider=provider,  # type: ignore[arg-type]
+            auto_embed=True,
+        )
+        await store.ensure_schema()
+        thoughts = [
+            ThoughtRecord(
+                thought_id=f"t-{i}",
+                thought_type=ThoughtType.OBSERVATION,
+                essence=t[:200],
+                content=t,
+                priority=Priority.P3,
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                source="batch",
+            )
+            for i, t in enumerate(texts)
+        ]
+        # One transaction, one commit, one embed_batch call for the whole list.
+        await store.bulk_store(thoughts)
 ```
 
 ## Providers
@@ -225,6 +305,65 @@ auto-embed: you must embed the query yourself first.
 query_vec = await provider.embed("trips to Japan")   # required — no auto-embed here
 result = await store.search_similar(query_vec, top_k=5)
 ```
+
+## Asymmetric prefixes for instruction-tuned models
+
+Some embedding models are **instruction-tuned**: they were trained with a
+mandatory role instruction on every input — typically `"query: "` on a search
+query and `"passage: "` (or `"search_document: "`) on a stored document. Running
+such a model without those instructions leaves noticeable retrieval quality on
+the table. This family includes E5, BGE, GTE, and Ollama's `nomic-embed-text`.
+
+`SentenceTransformerProvider`, `OllamaProvider`, and `HuggingFaceProvider` accept
+an optional, keyword-only `query_prefix` / `document_prefix` for exactly this.
+The document prefix is applied on every document-embed path (ingest auto-embed and
+the `engrava restore --re-embed` path); the query prefix on every query-embed path
+(`search_hybrid`, `recall`, and reflection search).
+
+```python
+provider = SentenceTransformerProvider(
+    model_name="intfloat/e5-base-v2",
+    query_prefix="query: ",
+    document_prefix="passage: ",
+)
+```
+
+Or in `engrava.yaml`:
+
+```yaml
+embeddings:
+  provider: sentence-transformer
+  model: intfloat/e5-base-v2
+  query_prefix: "query: "
+  document_prefix: "passage: "
+  auto_embed: true
+```
+
+A few rules make this safe to adopt incrementally:
+
+- **Opt-in and default-off.** Both prefixes default to empty. An empty prefix is a
+  literal passthrough — the text is embedded exactly as before, with no separator
+  or whitespace added — so a store with no prefixes configured (and every symmetric
+  model, including OpenAI) behaves byte-identically to prior versions. Nothing to
+  migrate.
+- **The symmetric OpenAI provider ignores prefixes entirely.** `OpenAICompatibleProvider`
+  has no prefix parameters; a `query_prefix` / `document_prefix` in config is simply
+  not passed to it.
+- **Changing `document_prefix` requires a deliberate re-embed.** The document prefix
+  is part of the corpus identity: change it and every stored vector would change.
+  Turning it on (or changing it) on a store that already holds vectors raises
+  `EmbeddingModelMismatchError` — Engrava never silently re-embeds. Re-embed on
+  purpose with `engrava restore --re-embed` (which now applies the configured
+  document prefix), or start a fresh store.
+- **Changing `query_prefix` alone does *not* re-embed anything** — it does not touch
+  stored vectors. But the corpus records the query prefix it was built to pair with,
+  so querying with a *divergent* query prefix raises `EmbeddingQueryPrefixMismatchError`
+  loudly at search time rather than silently degrading ranking. The fix is to restore
+  the matching query prefix (or deliberately re-embed with a new document prefix).
+- **Prefixes count toward the context window.** A configured prefix is prepended
+  before encoding, so a long document whose text *plus* prefix exceeds the model's
+  `max_seq_length` truncates exactly as an unprefixed over-length input would — there
+  is no special reservation for the prefix.
 
 ## Choosing a model and dimension
 

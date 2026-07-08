@@ -1,8 +1,21 @@
 -- engrava: Core thought-graph schema (free-tier boundary — no internal-cognitive columns).
--- Version: core-14 (hot-path indexes: edge.to_thought_id, embedding.owner_id,
---          thought.updated_cycle, thought.thought_type)
+-- Version: core-18 (Memory Hygiene forgetting-loop columns thought.pinned +
+--          thought.archived_at_cycle; both nullable/defaulted so a store that
+--          never enables hygiene reads back unchanged — pinned is the durable
+--          never-forget marker, archived_at_cycle records the cycle hygiene
+--          archived a thought and backs the GC restore window;
+--          core-17 added the opt-in thought.provenance capture column + the two
+--          JSON expression indexes idx_thought_prov_session /
+--          idx_thought_prov_actor on its identity fields; provenance is captured
+--          and queryable only — it feeds no ranking / dreaming / edge path;
+--          core-16 added the denormalised thought.action_outcome_score aggregate
+--          + the idx_action_source_thought seek index that backs its recompute;
+--          core-15 added the composite inbound edge index
+--          edge(edge_type, to_thought_id) for edge-type-scoped inbound lookups;
+--          core-14 added the hot-path indexes edge.to_thought_id,
+--          embedding.owner_id, thought.updated_cycle, thought.thought_type)
 
-PRAGMA user_version = 14;
+PRAGMA user_version = 18;
 
 CREATE TABLE IF NOT EXISTS thought (
     thought_id        TEXT    PRIMARY KEY,
@@ -31,7 +44,33 @@ CREATE TABLE IF NOT EXISTS thought (
     -- database matches the column order of one upgraded in place, where
     -- ``ALTER TABLE ADD COLUMN`` can only append.
     valid_from        TEXT,
-    valid_until       TEXT
+    valid_until       TEXT,
+    -- Denormalised action-outcome aggregate (core-16). Mean outcome value over
+    -- the thought's terminal linked actions, or NULL when it has none. Appended
+    -- last for the same column-order parity as the valid-time columns above.
+    action_outcome_score REAL,
+    -- Opt-in write-time provenance capture (core-17). A JSON document holding
+    -- the ProvenanceContext sub-model (session_id / actor_id identity +
+    -- retrieval_query / instruction_context / retrieval_context_ids synthesis
+    -- context), or NULL when a thought carries no provenance — a NULL column is
+    -- byte-identical to a pre-core-17 row. Appended last for the same
+    -- column-order parity as the columns above. Provenance is an untrusted hint
+    -- granted zero authority: it is captured and made queryable only and feeds
+    -- no ranking / dreaming / edge-creation path.
+    provenance        TEXT,
+    -- Memory Hygiene forgetting-loop columns (core-18). Both nullable/defaulted
+    -- and appended last for the same column-order parity as the columns above,
+    -- so a database upgraded in place (ALTER ... ADD COLUMN can only append)
+    -- matches a freshly created one. ``pinned`` is the durable never-forget
+    -- marker: a pinned thought is never auto-archived or auto-GC'd by the
+    -- hygiene loop (default 0 = not pinned). ``archived_at_cycle`` records the
+    -- cycle at which the hygiene loop archived a thought (NULL when it was not
+    -- archived by hygiene — a restore clears it back to NULL); it backs the
+    -- GC restore window, so a thought archived by any other path (TTL / manual)
+    -- keeps NULL and is never reaped by hygiene GC. A store that never enables
+    -- hygiene leaves both at their defaults and reads back unchanged.
+    pinned            INTEGER NOT NULL DEFAULT 0,
+    archived_at_cycle INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS edge (
@@ -233,3 +272,51 @@ CREATE INDEX IF NOT EXISTS idx_edge_to_thought ON edge(to_thought_id);
 CREATE INDEX IF NOT EXISTS idx_embedding_owner ON embedding(owner_id);
 CREATE INDEX IF NOT EXISTS idx_thought_updated_cycle ON thought(updated_cycle);
 CREATE INDEX IF NOT EXISTS idx_thought_type ON thought(thought_type);
+
+-- -------------------------------------------------------------------
+-- Composite inbound edge index for edge-type-scoped lookups (core-15)
+-- -------------------------------------------------------------------
+-- Mirrors idx_edge_type_from on the destination side. Inbound scans that
+-- filter on both edge_type and to_thought_id (the CONSOLIDATED_FROM
+-- source-resolution query) otherwise seek to_thought_id via
+-- idx_edge_to_thought and test edge_type as a per-row residual; this
+-- composite lets one seek satisfy both predicates:
+--   SELECT ... FROM edge WHERE to_thought_id = ? AND edge_type = ?
+-- EXPLAIN QUERY PLAN then reports
+--   idx_edge_type_to (edge_type=? AND to_thought_id=?).
+
+CREATE INDEX IF NOT EXISTS idx_edge_type_to ON edge(edge_type, to_thought_id);
+
+-- -------------------------------------------------------------------
+-- Action-by-source index for the outcome-score recompute (core-16)
+-- -------------------------------------------------------------------
+-- The action-outcome recompute resolves a thought's linked actions with
+--   SELECT ... FROM action WHERE source_thought_id = ?
+-- which, without an index, is a full scan of the action table. This index
+-- turns that lookup into a seek so the recompute stays cheap even as the
+-- action table grows. EXPLAIN QUERY PLAN then reports
+--   SEARCH action USING INDEX idx_action_source_thought (source_thought_id=?).
+-- A fresh-bootstrap database must carry the same index as one upgraded in
+-- place, so it is declared here as well as in the migration helper.
+
+CREATE INDEX IF NOT EXISTS idx_action_source_thought ON action(source_thought_id);
+
+-- -------------------------------------------------------------------
+-- Provenance identity indexes (core-17)
+-- -------------------------------------------------------------------
+-- JSON expression indexes on the two first-class identity fields of the opt-in
+-- provenance sub-model. They make session / actor lookup a seek rather than a
+-- full scan:
+--   SELECT ... FROM thought WHERE json_extract(provenance,'$.session_id') = ?
+-- EXPLAIN QUERY PLAN then reports
+--   SEARCH thought USING INDEX idx_thought_prov_session (<expr>=?).
+-- The descriptive provenance fields (retrieval_query / instruction_context /
+-- retrieval_context_ids) are queryable through the same json_extract filter
+-- machinery but are deliberately not indexed. A fresh-bootstrap database must
+-- carry the same indexes as one upgraded in place, so they are declared here as
+-- well as in the migration helper.
+
+CREATE INDEX IF NOT EXISTS idx_thought_prov_session
+    ON thought(json_extract(provenance, '$.session_id'));
+CREATE INDEX IF NOT EXISTS idx_thought_prov_actor
+    ON thought(json_extract(provenance, '$.actor_id'));

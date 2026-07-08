@@ -17,8 +17,10 @@ module.exports = {
   // Skip non-Conventional, git-generated commits. Belt-and-suspenders over
   // commitlint's defaultIgnores (which stays enabled).
   ignores: [
-    (message) =>
-      message.startsWith("Merge ") || message.startsWith("Revert "),
+    // Merge/revert commits are not Conventional Commits; skip them regardless of
+    // capitalisation or `merge:`/`revert:` styling (the 4-tier flow produces both
+    // "Merge branch…" auto-messages and hand-typed "merge: …" subjects).
+    (message) => /^(merge|revert)[\s:]/i.test(message),
     // Dependabot's auto-generated commit bodies (changelog URLs + the
     // updated-dependencies block) routinely exceed body-max-line-length;
     // exempt bot commits so dependency PRs stay green.
@@ -65,6 +67,20 @@ module.exports = {
         "release",
         "ci",
         "build",
+        // Additional scopes in use across the codebase + release history.
+        "embeddings",
+        "journal",
+        "lifecycle",
+        "vec0",
+        "actions",
+        "perf",
+        "performance",
+        // Project-artifact scopes (docs/config/meta files).
+        "readme",
+        "pyproject",
+        "changelog",
+        "gitignore",
+        "api-reference",
       ],
     ],
 

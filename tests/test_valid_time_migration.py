@@ -396,7 +396,7 @@ async def test_ensure_schema_fresh_db_lands_at_head(
     store = SqliteEngravaCore(fresh_db)
     await store.ensure_schema()
 
-    assert await _user_version(fresh_db) == 14
+    assert await _user_version(fresh_db) == 18
     assert {"valid_from", "valid_until"} <= await _table_columns(fresh_db, "thought")
     assert {"valid_from", "valid_until"} <= await _table_columns(fresh_db, "edge")
     for index_name in _ALL_VALID_INDEXES:
@@ -413,7 +413,7 @@ async def test_ensure_schema_from_v12_to_head(
     store = SqliteEngravaCore(fresh_db)
     await store.ensure_schema()
 
-    assert await _user_version(fresh_db) == 14
+    assert await _user_version(fresh_db) == 18
     assert {"valid_from", "valid_until"} <= await _table_columns(fresh_db, "thought")
     assert {"valid_from", "valid_until"} <= await _table_columns(fresh_db, "edge")
 
@@ -424,12 +424,12 @@ async def test_ensure_schema_idempotent_at_head(
     """Repeated ``ensure_schema`` calls stay at v13 without error."""
     store = SqliteEngravaCore(fresh_db)
     await store.ensure_schema()
-    assert await _user_version(fresh_db) == 14
+    assert await _user_version(fresh_db) == 18
 
     for _ in range(3):
         await store.ensure_schema()
 
-    assert await _user_version(fresh_db) == 14
+    assert await _user_version(fresh_db) == 18
 
 
 async def test_ensure_schema_from_v12_backfills_and_preserves_counts(
@@ -463,7 +463,7 @@ async def test_ensure_schema_from_v12_backfills_and_preserves_counts(
     store = SqliteEngravaCore(fresh_db)
     await store.ensure_schema()
 
-    assert await _user_version(fresh_db) == 14
+    assert await _user_version(fresh_db) == 18
     assert await _row_count(fresh_db, "thought") == 2
     assert await _row_count(fresh_db, "edge") == 1
 
@@ -489,7 +489,7 @@ async def test_cascade_from_any_version_to_head(
     fresh_db: aiosqlite.Connection,
     source_version: int,
 ) -> None:
-    """A DB stamped at any historical core version cascades to head v14.
+    """A DB stamped at any historical core version cascades to head v15.
 
     Only the ``user_version`` PRAGMA is seeded; ``ensure_schema`` walks
     the matching elif branch up to head, exactly as an in-place upgrade
@@ -504,7 +504,7 @@ async def test_cascade_from_any_version_to_head(
     store = SqliteEngravaCore(fresh_db)
     await store.ensure_schema()
 
-    assert await _user_version(fresh_db) == 14
+    assert await _user_version(fresh_db) == 18
     assert {"valid_from", "valid_until"} <= await _table_columns(fresh_db, "thought")
     assert {"valid_from", "valid_until"} <= await _table_columns(fresh_db, "edge")
 
@@ -532,7 +532,7 @@ async def test_fresh_equals_migrated_schema(table: str) -> None:
         await _bootstrap_core_at_v12(migrated)
         await SqliteEngravaCore(migrated).ensure_schema()
 
-        assert await _user_version(fresh) == await _user_version(migrated) == 14
+        assert await _user_version(fresh) == await _user_version(migrated) == 18
         assert await _table_info(fresh, table) == await _table_info(migrated, table)
         assert await _index_names(fresh, table) == await _index_names(migrated, table)
     finally:

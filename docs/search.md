@@ -28,8 +28,8 @@ its weight is **redistributed proportionally** across active signals.
 
 ## Keyword query syntax (FTS)
 
-The keyword signal — and the `search_fts()` method and the MCP `search_keywords`
-tool that expose it directly — runs your text against an SQLite FTS5 index. engrava
+The keyword signal — and the `search_fts()` method that exposes it directly —
+runs your text against an SQLite FTS5 index. engrava
 normalises the query before handing it to FTS5, with two modes that switch
 automatically on what you type:
 
@@ -143,6 +143,231 @@ result = await store.search_hybrid(
 )
 ```
 
+## Scoped retrieval
+
+`search_hybrid()` and `recall()` accept two optional, keyword-only filter
+arguments that scope the ranked query to rows whose `metadata` satisfies a
+typed predicate. Both default to `None` (no filtering, the candidate set is
+unchanged).
+
+```python
+from engrava import FieldOp, FieldPredicate, MetadataFilter, VisibilityQueryFilter
+
+# Equality / membership over your metadata keys (an AND of predicates):
+result = await store.search_hybrid(
+    "deployment runbook",
+    top_k=10,
+    filters=MetadataFilter(
+        [
+            FieldPredicate("$.project", FieldOp.EQ, "atlas"),
+            FieldPredicate("$.env", FieldOp.IN, ["staging", "prod"]),
+        ]
+    ),
+)
+
+# "Public, or mine" — admit public rows plus rows this user owns:
+result = await store.recall(
+    "deployment runbook",
+    top_k=10,
+    visibility=VisibilityQueryFilter(allowed={"public"}, owner="u1"),
+)
+```
+
+**Where the filter is applied.** The predicate runs **inside each search arm,
+before that arm's limit** — so a narrow filter still returns up to `top_k`
+matching rows and is never starved by out-of-filter candidates consuming the
+ranking budget. This is the key advantage over over-fetching and post-filtering
+(which can starve `top_k`) or a raw `json_extract` pre-filter (which loses the
+hybrid ranking).
+
+**Semantics:**
+
+- `filters` is a `MetadataFilter` — an `AND` of `FieldPredicate(path, op, value)`
+  over JSON paths (`$`, `$.key`, `$.key[0]`). Operators are `EQ` and `IN`.
+- `EQ None` matches both a missing path and an explicit JSON `null`. An empty
+  `IN` matches nothing. An empty `MetadataFilter` is a match-all no-op.
+- Values compare under **SQLite value equality**: booleans are stored as
+  integers, so `EQ True` matches a stored `1` (and `EQ False` matches `0`).
+- `visibility` is a `VisibilityQueryFilter(allowed, owner)` reading
+  `$.visibility` and `$.owner`. It composes with `filters` by `AND`; its `OR`
+  is bounded and parenthesised, so an `owner` match can never escape the
+  metadata `AND`.
+- Filter objects validate **at construction** (bad path, unsupported operator,
+  out-of-range integer, non-finite float, an all-empty `VisibilityQueryFilter`)
+  and raise `InvalidFilterError` / `InvalidFilterPathError` — never mid-query.
+
+> **A filter is a query refinement, not an isolation boundary.** It narrows what
+> a ranked query *considers*; it performs no authentication, authorization,
+> ownership validation, or write enforcement. The `visibility` filter reads only
+> the metadata your application wrote, and a caller can omit it or supply any
+> `owner`. **Do not use it to keep one tenant's data away from another** — for
+> tenant isolation give each tenant its own store via `EngravaManager`
+> (see [migrating-from-other-memory.md](guides/migrating-from-other-memory.md#filtering-scoping--multi-tenancy)).
+
+**Determinism.** Results are ordered by combined score descending, with ties
+broken by canonical `thought_id` ascending — a stable total order independent of
+the underlying scan order. (This tie-break is always applied, with or without a
+filter.)
+
+> **Note on BM25 scores.** The keyword arm's BM25 ranking uses store-global
+> corpus statistics. A filter changes which rows are *eligible*, but does not
+> recompute term frequencies over the filtered subset — relative scores are
+> still computed against the whole corpus. This is the intended behaviour for a
+> query refinement within one memory.
+
+### De-fragmentation / collapse
+
+`search_hybrid()` and `recall()` also accept an optional, keyword-only
+`collapse_key` that **de-duplicates fragments of the same logical unit** in the
+result. When many rows in your store describe the *same* thing — for example
+several chunks of one conversation turn, or several versions of one document —
+a plain ranked query can fill the top-`k` window with near-duplicates of one
+unit and push other, distinct units out. `collapse_key` keeps only the single
+best-ranked row per unit and lets deeper *distinct* units take the freed slots.
+
+```python
+# One best row per (caller-defined) unit; deeper distinct units backfill in.
+result = await store.recall(
+    "what did we decide about the rollout?",
+    top_k=10,
+    collapse_key="$.turn_id",            # a single metadata path
+)
+
+# Composite unit key — rows share a unit only if ALL components are equal:
+result = await store.search_hybrid(
+    "rollout decision",
+    top_k=10,
+    collapse_key=["$.session_id", "$.turn_index"],
+)
+```
+
+**What it does.** Among the already-ranked candidates, the highest-ranked row of
+each unit is kept; lower-ranked rows of that *same* unit are removed, and the
+slots they vacate are backfilled by the next distinct units. So the prompt sees
+one best row per unit plus more distinct units, instead of a pile of fragments
+of one unit. `collapse_key=None` (the default) leaves the result exactly
+unchanged.
+
+**Semantics:**
+
+- `collapse_key` is a single JSON path (`"$.turn_id"`) or an ordered sequence of
+  paths forming a **composite key** (`["$.session_id", "$.turn_index"]`). Paths
+  use the same grammar as `filters` (`$`, `$.key`, `$.key[0]`) and are validated
+  **at call time** — a malformed path raises `InvalidFilterPathError`, never
+  mid-query.
+- A row whose key is **missing**, holds malformed metadata, or (for a composite
+  key) is missing **any** component is treated as its **own** unit — it is never
+  collapsed with another row. Distinct key-less rows all survive.
+- The kept row per unit is the highest-ranked one under the same deterministic
+  order used everywhere on this path (combined score descending, then canonical
+  `thought_id` ascending), so the keeper and final order are stable across runs.
+- To give backfill a deeper pool to draw from, each search arm's candidate
+  budget is widened by a small, bounded factor **only while** `collapse_key` is
+  set (configurable as `search.collapse_pool_factor`, default `4`); the
+  `collapse_key=None` path is never widened. Because the keyword arm's scores
+  are min-max normalized over the candidate set, this wider pool can rescale the
+  normalized fusion scores and shift the relative order among units — so setting
+  `collapse_key` is not score-neutral even though the collapse step itself never
+  mutates a score. Only `collapse_key=None` is byte-identical to a plain query.
+
+**Keeping more than one row per unit (`collapse_max_per_unit`).** By default
+collapse keeps a *single* best row per unit. When a unit is genuinely a long,
+multi-part thing — say one long turn split into several chunks whose useful
+detail is spread across more than the top chunk — dropping every chunk but the
+best one can discard the part you actually need. The optional, keyword-only
+`collapse_max_per_unit` sets how many of a unit's highest-ranked rows may reach
+the result, so a long unit can keep its deeper rows while the remaining slots
+still backfill deeper *distinct* units:
+
+```python
+# Keep up to 2 rows of each unit; distinct deeper units still backfill.
+result = await store.search_hybrid(
+    "rollout decision",
+    top_k=20,
+    collapse_key="$.turn_id",
+    collapse_max_per_unit=2,
+)
+```
+
+- `None` (the default) keeps exactly one best row per unit — identical to
+  passing only `collapse_key`. An integer `>= 1` keeps up to that many of a
+  unit's highest-ranked rows; `1` is the single-best-row default.
+- It only takes effect together with `collapse_key` (there is no unit to
+  retain by otherwise), and is validated at call time — a value below `1` raises
+  `InvalidFilterError`.
+- It only relaxes the per-unit retention count. It never adds a row a search arm
+  did not produce, never mutates a score, and never merges or drops a *distinct*
+  unit as a side effect; the usual `top_k` truncation still applies, so distinct
+  units beyond `top_k` are dropped exactly as they are without it. Key-less rows
+  are unaffected — each is already its own unit.
+
+> **Collapse is a presentation convenience, not a filter and not an isolation
+> boundary.** It does not change which rows are *eligible* (use `filters` /
+> `visibility` for that). The collapse step itself mutates no score — it only
+> decides which of the already-eligible rows is shown per unit, dropping
+> lower-ranked members of the same unit. (Setting `collapse_key` does widen the
+> internal candidate pool, which can affect normalized fusion scores and order,
+> as noted above.) It is only as meaningful as the unit metadata your
+> application writes: if two genuinely different rows carry the same key they
+> will be treated as one unit, and rows without the key are never merged.
+> Eligibility (`filters` / `visibility`) always applies first, then collapse.
+
+### Whole-turn assembly (a caller-side recipe)
+
+Collapse and `collapse_max_per_unit` decide *which rows* reach your prompt. If you
+also want the reader to see a unit's **contiguous** text — a whole conversation
+turn in order, not only the chunks that happened to rank — assemble it yourself
+from the results, using only the public API. engrava stores no intrinsic
+chunk-sequence, so this works exactly to the extent your ingest wrote **(a)** a
+stable unit key and **(b)** an orderable ordinal (e.g. a `chunk_index`) on each
+chunk.
+
+```python
+from engrava.domain.models.filters import FieldOp, FieldPredicate, MetadataFilter
+
+# 1. Retrieve as usual — collapse dedupes fragments; distinct units backfill.
+result = await store.search_hybrid(
+    "what did the assistant explain about retries?",
+    top_k=20,
+    collapse_key=["$.session_id", "$.turn_index"],
+    collapse_max_per_unit=2,
+)
+
+# 2. For a result you want in full, read its unit-key value from its own metadata,
+#    gather the unit's chunks with a metadata-filtered search, then order them by
+#    your ordinal and concatenate.
+async def assemble_unit(query: str, thought_id: str) -> str:
+    seed = await store.get_thought(thought_id)
+    assert seed is not None
+    unit = await store.recall(
+        query,                       # any query — the filter selects the unit
+        top_k=100,                   # generous, to cover the unit's chunk count
+        filters=MetadataFilter([
+            FieldPredicate("$.session_id", FieldOp.EQ, seed.metadata["session_id"]),
+            FieldPredicate("$.turn_index", FieldOp.EQ, seed.metadata["turn_index"]),
+        ]),
+    )
+    chunks = [await store.get_thought(tid) for tid, _score in unit.results]
+    ordered = sorted((c for c in chunks if c), key=lambda t: t.metadata["chunk_index"])
+    return "\n".join(t.content for t in ordered)
+```
+
+- **No new API, no result-shape change.** This uses only `get_thought` and the
+  metadata `filters=` you already have on `search_hybrid()`/`recall()` — the same
+  surface you call to read a result's text. `search_hybrid()`'s result stays
+  `(thought_id, score)` tuples.
+- **The metadata predicate lives on the ranked search surface**
+  (`search_hybrid`/`recall`/`search_similar` `filters=`), not on `list_thoughts`
+  (whose filters cover the built-in columns + provenance, not arbitrary metadata),
+  so gathering a unit's chunks is a filtered search with a generous `top_k`; the
+  ranking is irrelevant because you re-order by your own ordinal.
+- **Precondition (yours to guarantee).** Contiguous order is only as good as the
+  metadata you wrote: without a stable, orderable ordinal on each chunk, siblings
+  can be *fetched* but not meaningfully *ordered* — engrava has no chunk-sequence
+  concept of its own. Write the ordinal at ingest alongside the unit key.
+- **Where it runs.** Entirely on the results engrava already returned — prompt and
+  context assembly is your application's concern, not the store's.
+
 ## Configuration Reference
 
 See [configuration.md](configuration.md) for the full YAML reference
@@ -197,6 +422,28 @@ Configure the default in YAML:
 search:
   reflection_boost: 1.0   # applies when reflection_boost not overridden per-call
 ```
+
+### `reflection_topk_cap` (default `0.3`)
+
+Caps how much of the final top-K window `REFLECTION` thoughts may occupy. After
+all signals are applied, if reflections hold more than `top_k *
+reflection_topk_cap` slots, the lowest-scoring excess reflections are evicted
+and the freed slots are backfilled with the highest-scoring off-list
+non-reflection candidates. Set it to `1.0` to disable the cap.
+
+When the cap actually evicts, the result carries a programmatic signal and the
+event is logged at `INFO`:
+
+```python
+result = await store.search_hybrid("patterns in memory", query_vector=embedding, top_k=10)
+if result.reflections_evicted:
+    # e.g. cap=0.3 * top_k=10 → 3 reflection slots; extra reflections were evicted
+    print(f"{result.reflections_evicted} reflection(s) evicted by reflection_topk_cap")
+```
+
+`HybridSearchResult.reflections_evicted` is `0` on every query where the cap did
+not evict (its default), so existing consumers are unaffected; a positive value
+means the cap reshaped the top-K window.
 
 ### `search_reflections_only()`
 

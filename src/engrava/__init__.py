@@ -6,6 +6,7 @@ from engrava.config import (
     DreamingGates,
     EmbeddingConfig,
     EngravaConfig,
+    HygienePolicyConfig,
     JournalConfig,
     MetricsConfig,
     SearchConfig,
@@ -29,10 +30,16 @@ from engrava.domain.enums import (
     VerificationStatus,
 )
 from engrava.domain.exceptions import (
+    ActionNotFoundError,
+    EmbeddingGenerationError,
     EmbeddingModelMismatchError,
+    EmbeddingQueryPrefixMismatchError,
     EngravaError,
     ExtensionMigrationError,
+    InvalidFilterError,
+    InvalidFilterPathError,
     InvalidTransitionError,
+    JournalIntegrityError,
     ReadOnlyViolationError,
     StaleDataError,
     ThoughtNotFoundError,
@@ -41,6 +48,12 @@ from engrava.domain.manifest import ExtensionManifest
 from engrava.domain.models.action import ActionRecord
 from engrava.domain.models.edge import EdgeRecord
 from engrava.domain.models.embedding import EmbeddingRecord
+from engrava.domain.models.filters import (
+    FieldOp,
+    FieldPredicate,
+    MetadataFilter,
+    VisibilityQueryFilter,
+)
 from engrava.domain.models.journal import JournalEntry, JournalIntegrityResult
 from engrava.domain.models.metrics import (
     EdgeCounts,
@@ -50,11 +63,15 @@ from engrava.domain.models.metrics import (
     ThoughtCounts,
 )
 from engrava.domain.models.mutation_type import MutationType
+from engrava.domain.models.provenance import ProvenanceContext
 from engrava.domain.models.search import HybridSearchResult
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.domain.models.thought import ThoughtRecord as CoreThoughtRecord
 from engrava.domain.models.ttl import CleanupResult, CleanupStrategy
-from engrava.domain.protocols.embedding_provider import EmbeddingProviderProtocol
+from engrava.domain.protocols.embedding_provider import (
+    EmbeddingProviderProtocol,
+    RoleAwareEmbeddingProvider,
+)
 from engrava.domain.protocols.engrava_core import EngravaCoreProtocol
 from engrava.domain.protocols.hooks import (
     DefaultEngravaHooks,
@@ -70,6 +87,7 @@ from engrava.embeddings.sentence_transformer import SentenceTransformerProvider
 from engrava.extensions.discovery import discover_manifests
 from engrava.extensions.dreaming import ConsolidationResult, DreamingExtension
 from engrava.extensions.dreaming_signals import (
+    ActionOutcomeSignal,
     ConfidenceSignal,
     ConfirmationSignal,
     DreamingContext,
@@ -82,12 +100,15 @@ from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
 from engrava.infrastructure.read_only_store import ReadOnlyEngrava
 from engrava.infrastructure.service_manager import EngravaManager
 from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
+from engrava.infrastructure.sqlite.hygiene import EvictionReason, HygieneResult
 from engrava.infrastructure.sqlite.journal_writer import JournalWriter
 from engrava.metadata import percept, thought, utterance
 from engrava.mindql.executor import MindQLExecutor, MindQLResult
 from engrava.mindql.parser import MindQLCommand, MindQLParseError, MindQLQuery, parse
 
 __all__ = [
+    "ActionNotFoundError",
+    "ActionOutcomeSignal",
     "ActionRecord",
     "ActionStatus",
     "ActionType",
@@ -110,8 +131,10 @@ __all__ = [
     "EdgeRecord",
     "EdgeType",
     "EmbeddingConfig",
+    "EmbeddingGenerationError",
     "EmbeddingModelMismatchError",
     "EmbeddingProviderProtocol",
+    "EmbeddingQueryPrefixMismatchError",
     "EmbeddingRecord",
     "EngravaConfig",
     "EngravaCoreProtocol",
@@ -119,19 +142,28 @@ __all__ = [
     "EngravaHooksProtocol",
     "EngravaManager",
     "EngravaMetrics",
+    "EvictionReason",
     "ExtensionManifest",
     "ExtensionMigrationError",
+    "FieldOp",
+    "FieldPredicate",
     "FrequencySignal",
     "HuggingFaceProvider",
     "HybridSearchResult",
+    "HygienePolicyConfig",
+    "HygieneResult",
+    "InvalidFilterError",
+    "InvalidFilterPathError",
     "InvalidTransitionError",
     "JournalConfig",
     "JournalEntry",
+    "JournalIntegrityError",
     "JournalIntegrityResult",
     "JournalWriter",
     "KnowledgeSource",
     "LatencyHistogram",
     "LifecycleStatus",
+    "MetadataFilter",
     "MetricsConfig",
     "MindQLCommand",
     "MindQLExecutor",
@@ -148,10 +180,12 @@ __all__ = [
     "OllamaProvider",
     "OpenAICompatibleProvider",
     "Priority",
+    "ProvenanceContext",
     "ReadOnlyEngrava",
     "ReadOnlyMindStore",
     "ReadOnlyViolationError",
     "RecencySignal",
+    "RoleAwareEmbeddingProvider",
     "ScoringContext",
     "SearchConfig",
     "SentenceTransformerProvider",
@@ -170,6 +204,7 @@ __all__ = [
     "ThoughtType",
     "ThoughtVisibility",
     "VerificationStatus",
+    "VisibilityQueryFilter",
     "discover_manifests",
     "load_config",
     "parse",

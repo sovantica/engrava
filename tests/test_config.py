@@ -35,6 +35,12 @@ class TestDreamingGates:
         with pytest.raises(AttributeError):
             gates.min_confirmations = 5  # type: ignore[misc]
 
+    def test_cold_start_clustering_defaults_off(self) -> None:
+        # The cold-start fallback is strictly opt-in; the shipped default
+        # keeps the LPA path byte-identical to today.
+        gates = DreamingGates()
+        assert gates.cold_start_clustering is False
+
     @pytest.mark.parametrize(
         "field_name",
         [
@@ -104,9 +110,10 @@ class TestDreamingConfig:
         assert cfg.enabled is False
         assert cfg.schedule_every_n_cycles == 100
         assert cfg.promote_threshold == 0.7
-        assert len(cfg.signals) == 5
+        assert len(cfg.signals) == 6
         assert cfg.signals["recency"] == 0.25
         assert cfg.signals["frequency"] == 0.20
+        assert cfg.signals["action_outcome"] == 0.15
         assert cfg.candidates_limit == 200
         assert cfg.top_keyphrases_count == 3
         assert cfg.top_member_excerpts_count == 5
@@ -233,7 +240,17 @@ hooks:
         assert config.dreaming.enabled is True
         assert config.dreaming.schedule_every_n_cycles == 50
         assert config.dreaming.promote_threshold == 0.5
-        assert config.dreaming.signals == {"recency": 0.5, "confidence": 0.5}
+        # A partial ``signals:`` mapping MERGES onto the defaults (overriding
+        # only recency + confidence), so the other four keep their defaults
+        # rather than being zeroed out.
+        assert config.dreaming.signals == {
+            "recency": 0.5,
+            "confidence": 0.5,
+            "staleness": 0.20,
+            "confirmation": 0.20,
+            "frequency": 0.20,
+            "action_outcome": 0.15,
+        }
         assert config.dreaming.gates.min_confirmations == 3
         assert config.dreaming.gates.min_age_cycles == 20
 
@@ -310,6 +327,37 @@ hooks:
         with pytest.raises(ConfigError, match=r"cluster_quality_persona_threshold"):
             load_config(cfg_file)
 
+    def test_cold_start_clustering_yaml_override(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "cold_start.yaml"
+        cfg_file.write_text(
+            "database:\n  path: ./t.db\nextensions:\n  dreaming:\n"
+            "    enabled: true\n    gates:\n      cold_start_clustering: true\n",
+            encoding="utf-8",
+        )
+        config = load_config(cfg_file)
+        assert config.dreaming is not None
+        assert config.dreaming.gates.cold_start_clustering is True
+
+    def test_cold_start_clustering_defaults_false_when_absent(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "cold_start_absent.yaml"
+        cfg_file.write_text(
+            "database:\n  path: ./t.db\nextensions:\n  dreaming:\n    enabled: true\n",
+            encoding="utf-8",
+        )
+        config = load_config(cfg_file)
+        assert config.dreaming is not None
+        assert config.dreaming.gates.cold_start_clustering is False
+
+    def test_cold_start_clustering_rejects_non_bool(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "cold_start_bad.yaml"
+        cfg_file.write_text(
+            "database:\n  path: ./t.db\nextensions:\n  dreaming:\n"
+            "    gates:\n      cold_start_clustering: 3\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError, match=r"cold_start_clustering.*boolean"):
+            load_config(cfg_file)
+
     def test_dreaming_defaults_when_empty_section(self, tmp_path: Path) -> None:
         cfg_file = tmp_path / "dreaming_empty.yaml"
         cfg_file.write_text(
@@ -320,7 +368,7 @@ hooks:
         assert config.dreaming is not None
         assert config.dreaming.enabled is True
         assert config.dreaming.schedule_every_n_cycles == 100
-        assert len(config.dreaming.signals) == 5
+        assert len(config.dreaming.signals) == 6
         assert config.dreaming.top_keyphrases_count == 3
         assert config.dreaming.top_member_excerpts_count == 5
 

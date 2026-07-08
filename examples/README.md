@@ -27,7 +27,7 @@ download.
 
 Sample `mcpServers` blocks for pointing an MCP client (Claude Desktop, Claude
 Code, Cursor, Windsurf, VS Code, …) at the engrava
-[MCP server](../docs/guides/mcp.md). Copy the one that matches your client and
+[MCP server](https://github.com/sovantica/engrava-mcp). Copy the one that matches your client and
 replace the store path with your own.
 
 | File | For |
@@ -37,7 +37,7 @@ replace the store path with your own.
 | [`mcp-client-config.readonly.json`](mcp-client-config.readonly.json) | Read-only deployment — `ENGRAVA_MCP_READ_ONLY=true` hides the write tools. |
 | [`mcp-client-config.vscode.json`](mcp-client-config.vscode.json) | VS Code, which nests servers under an `mcp` key. |
 
-These require the MCP extra: `pip install "engrava[mcp]"`.
+These drive the standalone [`engrava-mcp`](https://github.com/sovantica/engrava-mcp) server — install it with `uvx engrava-mcp` (or `pip install engrava-mcp`).
 
 Run them directly with the Python interpreter:
 
@@ -73,6 +73,6 @@ teal.`.
 - [`docs/benchmarks.md`](../docs/benchmarks.md) — the synthetic
   benchmark suite that reports dreaming's measured REFLECTION
   coverage on a representative workload.
-- [`docs/guides/mcp.md`](../docs/guides/mcp.md) — the MCP server:
-  install, run, client configuration, and the full
+- [`engrava-mcp`](https://github.com/sovantica/engrava-mcp) — the standalone
+  MCP server: install, run, client configuration, and the full
   tool/resource/prompt reference.
