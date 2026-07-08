@@ -583,6 +583,11 @@ All enums are `StrEnum` — JSON-serializable and stored as strings.
 | `EmbeddingModelMismatchError` | `EngravaError` | Embedding model mismatch on restore |
 | `EmbeddingGenerationError` | `EngravaError` | Auto-embed failed under `require_embedding=True` (the thought is committed but unembedded); carries the failing `thought_id` |
 | `ExtensionMigrationError` | `EngravaError` | Extension schema migration failed (e.g. attempted downgrade) |
+| `ActionNotFoundError` | `EngravaError` | Action record ID not found; carries the failing `action_id` |
+| `InvalidFilterError` | `EngravaError` | Metadata/visibility filter invalid at construction (bad value, empty filter, unsupported operator, or too many predicates) |
+| `InvalidFilterPathError` | `EngravaError` | Filter path does not match the allowed JSONPath grammar (`$`, `$.key`, `$[0]` only) |
+| `EmbeddingQueryPrefixMismatchError` | `EngravaError` | Active query prefix diverges from the corpus pairing, silently degrading ranking |
+| `JournalIntegrityError` | `EngravaError` | On-open journal check (`journal.verify_on_open`) found a broken hash chain; carries first-broken diagnostics |
 
 > `create_edge` raises `ReferentialIntegrityError` when an endpoint thought
 > does not exist. This exception is **not** re-exported from the top-level

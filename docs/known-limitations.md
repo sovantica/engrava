@@ -15,7 +15,7 @@ Two supported ways to isolate:
   via `EngravaManager`. Isolation is then the file boundary itself.
 - **Scoped retrieval within one file** — pass `filters=` / `visibility=` to the
   ranked search methods to constrain results to a metadata scope (e.g. an owner
-  or session key). See [Scopes](scopes.md) and [Search](search.md).
+  or session key). See [Search](search.md#scoped-retrieval).
 
 Choose file-per-tenant when tenants must never share a file; use scoped filters
 for soft, in-file partitioning.

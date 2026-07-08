@@ -81,7 +81,7 @@ provider = resolve_embedding_provider(config.embeddings)
 
 Controls hybrid search behavior (FTS5 + vector + recency + priority).
 
-All 19 `SearchConfig` fields are settable here; every one has a default, so the
+All 21 `SearchConfig` fields are settable here; every one has a default, so the
 whole section is optional.
 
 **Signal weights and per-priority boosts:**

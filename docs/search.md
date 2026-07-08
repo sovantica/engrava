@@ -28,8 +28,8 @@ its weight is **redistributed proportionally** across active signals.
 
 ## Keyword query syntax (FTS)
 
-The keyword signal — and the `search_fts()` method and the MCP `search_keywords`
-tool that expose it directly — runs your text against an SQLite FTS5 index. engrava
+The keyword signal — and the `search_fts()` method that exposes it directly —
+runs your text against an SQLite FTS5 index. engrava
 normalises the query before handing it to FTS5, with two modes that switch
 automatically on what you type:
 
