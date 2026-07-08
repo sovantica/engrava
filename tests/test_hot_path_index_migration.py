@@ -39,7 +39,7 @@ _NEW_EDGE_INDEXES = ("idx_edge_to_thought",)
 _NEW_EMBEDDING_INDEXES = ("idx_embedding_owner",)
 _ALL_NEW_INDEXES = _NEW_THOUGHT_INDEXES + _NEW_EDGE_INDEXES + _NEW_EMBEDDING_INDEXES
 
-_HEAD_VERSION = 14
+_HEAD_VERSION = 18
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +300,7 @@ async def test_migrate_v13_to_v14_tolerates_absent_indexed_column(
 async def test_ensure_schema_fresh_db_lands_at_head(
     fresh_db: aiosqlite.Connection,
 ) -> None:
-    """An empty DB bootstraps straight to v14 with all four new indexes."""
+    """An empty DB bootstraps straight to head with all four new indexes."""
     store = SqliteEngravaCore(fresh_db)
     await store.ensure_schema()
 
@@ -340,7 +340,7 @@ async def test_ensure_schema_from_empty_v13_base_to_head(
 async def test_ensure_schema_idempotent_at_head(
     fresh_db: aiosqlite.Connection,
 ) -> None:
-    """Repeated ``ensure_schema`` calls stay at v14 without error."""
+    """Repeated ``ensure_schema`` calls stay at head without error."""
     store = SqliteEngravaCore(fresh_db)
     await store.ensure_schema()
     assert await _user_version(fresh_db) == _HEAD_VERSION
@@ -358,7 +358,7 @@ async def test_cascade_from_any_version_to_head(
     fresh_db: aiosqlite.Connection,
     source_version: int,
 ) -> None:
-    """A DB stamped at any historical core version cascades to head v14.
+    """A DB stamped at any historical core version cascades to the head version.
 
     Only the ``user_version`` PRAGMA is seeded; ``ensure_schema`` walks
     the matching elif branch up to head, exactly as an in-place upgrade
@@ -421,13 +421,13 @@ async def test_ensure_schema_from_v13_preserves_row_counts(
 
 
 # ---------------------------------------------------------------------------
-# Fresh-v14 == migrated-v14 structural equivalence
+# Fresh-head == migrated-head structural equivalence
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("table", ["thought", "edge", "embedding"])
 async def test_fresh_equals_migrated_schema(table: str) -> None:
-    """A fresh-bootstrap v14 DB has the same index set as a migrated-v14 DB.
+    """A fresh-bootstrap head DB has the same index set as a migrated head DB.
 
     Compares the set of indexes for ``table`` between a database that ran
     the fresh-create DDL and one upgraded in place from v13. The migration

@@ -121,8 +121,11 @@ class JournalWriter:
 
         Args:
             mutation_type: One of INSERT_THOUGHT, UPDATE_THOUGHT,
-                DELETE_THOUGHT, INSERT_EDGE, UPDATE_EDGE, DELETE_EDGE.
-            target_id: The ``thought_id`` or ``edge_id`` affected.
+                DELETE_THOUGHT, INSERT_EDGE, UPDATE_EDGE, DELETE_EDGE, or
+                UPDATE_ACTION (an action ``status``/``verification_status``
+                state-transition). Action *creation* is not journaled.
+            target_id: The ``thought_id``, ``edge_id``, or ``action_id``
+                affected.
             delta: JSON-serializable diff
                 ``{"before": {...}, "after": {...}}``.
 

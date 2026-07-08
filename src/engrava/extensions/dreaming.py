@@ -23,6 +23,7 @@ from engrava.extensions.dreaming_signals import (
     DEFAULT_SIGNALS,
     DreamingContext,
     DreamingSignalProtocol,
+    default_signal_active,
 )
 from engrava.infrastructure.sqlite.centroid import (
     CENTROID_MODEL_NAME,
@@ -47,14 +48,6 @@ logger = logging.getLogger(__name__)
 _VECTORIZED_CLUSTERING_CHUNK_SIZE = 10_000
 
 
-# Page size for the orphan-REFLECTION sweep. The sweep must inspect *every*
-# ACTIVE REFLECTION (the retire contract is "for each ACTIVE REFLECTION"), so it
-# walks the full set one page at a time rather than relying on a single capped
-# page. Exposed as a module constant so tests can shrink it to exercise the
-# multi-page path on small synthetic inputs.
-_ORPHAN_SWEEP_PAGE_SIZE = 500
-
-
 # ------------------------------------------------------------------
 # Result value object
 # ------------------------------------------------------------------
@@ -77,6 +70,18 @@ class ConsolidationResult:
             (transitioned ACTIVE -> ARCHIVED) during this run because every
             one of their consolidated source thoughts had left the active
             set.
+        active_signal_weights: The **effective** per-signal weights used to
+            score this run — the configured weights after inactive
+            (structurally flat) signals have been dropped and their weight
+            redistributed onto the active signals (renormalised to sum to
+            ``1.0``; all-zero when no signal is active). A signal name absent
+            from this mapping, or mapped to ``0.0``, contributed nothing to
+            the promotion score this run. This is the programmatic companion
+            to the per-signal INFO log line.
+        flat_signals: Names of configured signals that were **inactive** this
+            run — their data source produced the same default value for every
+            candidate, so they carried no ranking information and their weight
+            was redistributed. Sorted for stable output.
 
     Examples:
         >>> r = ConsolidationResult(
@@ -102,6 +107,10 @@ class ConsolidationResult:
     """Fraction of total corpus at priority P1 after this consolidation run."""
     orphans_retired: int = 0
     """Number of orphaned REFLECTIONs retired (ACTIVE -> ARCHIVED) this run."""
+    active_signal_weights: dict[str, float] = field(default_factory=dict)
+    """Effective per-signal weights after inactive-signal redistribution."""
+    flat_signals: list[str] = field(default_factory=list)
+    """Configured signals that were structurally flat (no data source) this run."""
 
 
 # ------------------------------------------------------------------
@@ -226,7 +235,28 @@ class DreamingExtension:
             total_thoughts=len(candidates),
         )
 
+        # --- Reachable scoring: active-signal weight redistribution ---
+        # Computed ONCE over the candidate pool (pool-relative, not
+        # per-thought). Flat signals (no data source this run) contribute 0
+        # and their weight redistributes onto the active signals, mirroring
+        # the hybrid-search precedent ``_redistribute_hybrid_weights``.
+        active_weights, flat_signals = self._compute_active_weights(
+            candidates,
+            current_cycle=current_cycle,
+        )
+        if flat_signals:
+            logger.info(
+                "Dreaming scoring: %d signal(s) structurally flat this run (no data "
+                "source) — weight redistributed onto active signals: %s",
+                len(flat_signals),
+                flat_signals,
+            )
+
         # --- compute available P1 slots under fraction cap ---
+        # Population-level cap: ``current_p1_count`` is the existing P1
+        # population in the store, so ``available_slots`` already accounts for
+        # every P1 promoted by prior runs — repeated cycles cannot push the P1
+        # population past ``max_p1_fraction`` of the total.
         total_thoughts = await store.count_thoughts()
         current_p1_count = await store.count_thoughts(priority="P1")
         max_p1_count = max(1, int(total_thoughts * self._config.max_p1_fraction))
@@ -248,6 +278,7 @@ class DreamingExtension:
             current_cycle=current_cycle,
             available_slots=available_slots,
             promote_type_filter=self._build_promote_type_filter(),
+            active_weights=active_weights,
         )
 
         p1_fraction_after = (
@@ -307,45 +338,20 @@ class DreamingExtension:
             promotion_capped=promotion_capped,
             p1_fraction_after=p1_fraction_after,
             orphans_retired=orphans_retired,
+            active_signal_weights=active_weights,
+            flat_signals=flat_signals,
         )
 
     async def _sweep_orphan_reflections(self, store: SqliteEngravaCore) -> int:
         """Retire REFLECTIONs whose entire source cluster has left ACTIVE.
 
-        A REFLECTION is a derived synthesis of a live cluster. Once **every**
-        thought it was consolidated from is no longer ``ACTIVE`` (all
-        ``ARCHIVED``/``DONE`` — i.e. the synthesis now summarizes nothing
-        live), the REFLECTION is retired ``ACTIVE -> ARCHIVED`` so ordinary
-        ``gc`` can reclaim it (cascading its centroid embedding and
-        ``CONSOLIDATED_FROM`` edges).
-
-        **Full coverage.** The sweep inspects *every* ACTIVE REFLECTION, not
-        just the first page. ``list_thoughts`` orders by ``updated_cycle DESC``
-        and is capped per call, so a long-untouched orphan (low
-        ``updated_cycle``) can fall beyond a single capped page and never be
-        seen. To honour the "for each ACTIVE REFLECTION" contract regardless of
-        how many REFLECTIONs exist, the candidate set is collected by walking
-        successive pages (``limit``/``offset``) until a short page is returned.
-
-        **Collect-then-retire ordering.** All candidate ids are gathered into a
-        list *first*, and only then retired in a second pass. Retiring flips a
-        REFLECTION ``ACTIVE -> ARCHIVED``, which drops it out of the
-        ``lifecycle_status="ACTIVE"`` filter; mutating during pagination would
-        shift every later page's offset and silently skip rows. Collecting the
-        full set against a stable filter before any mutation avoids that
-        offset drift. Ids are de-duplicated defensively against ties in the
-        non-total ``updated_cycle`` ordering crossing a page boundary.
-
-        Guards:
-
-        * **100% threshold** — a REFLECTION with at least one still-ACTIVE
-          source is kept; the synthesis still summarizes live members.
-        * **At least one source** — a REFLECTION with zero
-          ``CONSOLIDATED_FROM`` edges (defensive: malformed/legacy) is never
-          retired by an all-non-ACTIVE rule firing over an empty set.
-
-        The check is a deterministic set query over each candidate's source
-        lifecycle statuses — no model call.
+        Thin delegation to the store-owned
+        :meth:`~engrava.infrastructure.sqlite.engrava_core.SqliteEngravaCore.retire_orphan_reflections`,
+        which is the single shared implementation (also used by the Memory
+        Hygiene GC stage). Orphan retirement is a store maintenance operation —
+        it reads and writes only lifecycle / edge state through public store
+        methods — so it lives on the store; this wrapper preserves the
+        consolidation call-site.
 
         Args:
             store: The store to sweep.
@@ -354,47 +360,82 @@ class DreamingExtension:
             Number of REFLECTIONs retired during this sweep.
 
         """
-        from engrava.domain.enums import LifecycleStatus  # noqa: PLC0415
+        return await store.retire_orphan_reflections()
 
-        # Phase 1 — collect EVERY ACTIVE REFLECTION id by paginating the full
-        # set. Done before any mutation so the ACTIVE filter stays stable and
-        # offsets do not drift (see the docstring's collect-then-retire note).
-        candidate_ids: list[str] = []
-        seen: set[str] = set()
-        offset = 0
-        while True:
-            page = await store.list_thoughts(
-                thought_type="REFLECTION",
-                lifecycle_status="ACTIVE",
-                limit=_ORPHAN_SWEEP_PAGE_SIZE,
-                offset=offset,
-            )
-            for reflection in page:
-                if reflection.thought_id not in seen:
-                    seen.add(reflection.thought_id)
-                    candidate_ids.append(reflection.thought_id)
-            if len(page) < _ORPHAN_SWEEP_PAGE_SIZE:
-                # Short (or empty) page -> the full set has been read.
-                break
-            offset += _ORPHAN_SWEEP_PAGE_SIZE
+    def _compute_active_weights(
+        self,
+        candidates: list[ThoughtRecord],
+        *,
+        current_cycle: int,
+    ) -> tuple[dict[str, float], list[str]]:
+        """Compute the redistributed per-signal weights for this run.
 
-        # Phase 2 — retire orphans. Safe to mutate now that the full candidate
-        # set is materialized.
-        retired = 0
-        for reflection_id in candidate_ids:
-            source_statuses = await store.consolidated_source_statuses(reflection_id)
-            # Require >= 1 source AND 100% of them non-ACTIVE.
-            if not source_statuses:
-                continue
-            if any(status == LifecycleStatus.ACTIVE.value for status in source_statuses):
-                continue
-            await store.update_thought(
-                reflection_id,
-                lifecycle_status=LifecycleStatus.ARCHIVED,
-            )
-            retired += 1
+        The promotion score is a **weighted average over the signals active
+        for the run**. A signal is active when its data source yields a
+        non-default value for at least one candidate in the pool (see
+        :func:`~engrava.extensions.dreaming_signals.default_signal_active`);
+        an inactive signal contributes the same constant to every candidate
+        and so carries no ranking information. This mirrors the hybrid-search
+        precedent ``_redistribute_hybrid_weights``: the configured weights of
+        the inactive signals are dropped and the remainder renormalised over
+        the active set, so flat signals fall out of the denominator instead of
+        dragging every score toward a constant.
 
-        return retired
+        Custom signals (registered via ``custom_signals``) have no
+        introspectable data source, so they are always treated as active — the
+        operator opted into them deliberately.
+
+        **Degenerate guard.** When no signal is active the returned weights are
+        all zero, so every score is ``0.0`` and nothing promotes — the exact
+        analogue of the precedent's ``active_weight == 0 -> zeros`` branch.
+
+        **Pool-relative, once per run.** Activeness is decided over the whole
+        candidate pool a single time; it is never recomputed per thought (a
+        per-thought active set would let one thought's data presence
+        over-promote thoughts that lack it).
+
+        Args:
+            candidates: The candidate pool for this consolidation run.
+            current_cycle: The run's cycle number (drives the cycle-based
+                ``recency`` / ``staleness`` activeness).
+
+        Returns:
+            A ``(weights, flat_signals)`` pair. ``weights`` maps every
+            configured signal name to its effective (renormalised) weight —
+            ``0.0`` for inactive signals; the active entries sum to ``1.0``
+            unless no signal is active (all-zero). ``flat_signals`` is the
+            sorted list of configured signals found inactive this run.
+
+        """
+        active_names: list[str] = []
+        flat_signals: list[str] = []
+        for name in self._signals:
+            if name in DEFAULT_SIGNALS:
+                is_active = default_signal_active(
+                    name,
+                    candidates,
+                    current_cycle=current_cycle,
+                    access_tracking_enabled=self._config.access_tracking_enabled,
+                )
+            else:
+                # Custom signal — no introspectable data source; treat as active.
+                is_active = True
+            if is_active:
+                active_names.append(name)
+            else:
+                flat_signals.append(name)
+
+        active_weight = sum(self._signals[name][1] for name in active_names)
+        if active_weight == 0.0:
+            # No active signal (or all active weights zero) -> nothing promotes.
+            weights = dict.fromkeys(self._signals, 0.0)
+            return weights, sorted(flat_signals)
+
+        weights = {
+            name: (self._signals[name][1] / active_weight if name in active_names else 0.0)
+            for name in self._signals
+        }
+        return weights, sorted(flat_signals)
 
     async def _apply_promotions(
         self,
@@ -404,6 +445,7 @@ class DreamingExtension:
         current_cycle: int,
         available_slots: int,
         promote_type_filter: frozenset[object],
+        active_weights: dict[str, float],
     ) -> tuple[list[str], dict[str, float], int, bool]:
         """Score candidates and promote qualifying thoughts to P1.
 
@@ -418,6 +460,9 @@ class DreamingExtension:
             available_slots: Maximum number of new P1 promotions allowed.
             promote_type_filter: Frozenset of ``ThoughtType`` values eligible
                 for promotion (``promote_targets``).
+            active_weights: Redistributed per-signal weights for this run (see
+                :meth:`_compute_active_weights`), applied by
+                :meth:`_compute_score`.
 
         Returns:
             Tuple of ``(promoted_ids, scores, skipped_gate_count, promotion_capped)``.
@@ -430,7 +475,7 @@ class DreamingExtension:
         filtered_metadata = 0
 
         for thought in candidates:
-            score = self._compute_score(thought, ctx)
+            score = self._compute_score(thought, ctx, active_weights)
             scores[thought.thought_id] = score
 
             if not self._passes_gates(thought, current_cycle):
@@ -472,19 +517,47 @@ class DreamingExtension:
 
         return promoted, scores, skipped_gate, promotion_capped
 
-    def _compute_score(self, thought: ThoughtRecord, ctx: DreamingContext) -> float:
-        """Compute the weighted sum of all signal scores.
+    def _compute_score(
+        self,
+        thought: ThoughtRecord,
+        ctx: DreamingContext,
+        active_weights: dict[str, float] | None = None,
+    ) -> float:
+        """Compute the promotion score as a weighted average over the signals.
+
+        When ``active_weights`` is provided (the consolidation path always
+        passes it), the score is the weighted average over the signals **active
+        for the run** — inactive signals contribute ``0.0`` and their weight
+        has already been redistributed onto the active ones by
+        :meth:`_compute_active_weights`, so the effective weights sum to
+        ``1.0`` (all-zero when no signal is active, giving a ``0.0`` score that
+        promotes nothing). This is the reachable default scoring: a flat signal
+        no longer drags every score toward a constant.
+
+        When ``active_weights`` is ``None`` (direct callers / unit tests) the
+        raw configured weights are used unchanged — the historical weighted
+        sum. **This compatibility path reproduces the pre-fix, arithmetically
+        unreachable scoring** (a structurally-flat signal still consumes its
+        weight); it exists only for direct/legacy callers. The consolidation
+        path MUST pass the redistributed ``active_weights`` from
+        :meth:`_compute_active_weights` — it is the only production caller and
+        always does. Do not add a new production caller that omits them.
 
         Args:
             thought: The thought to score.
             ctx: Consolidation context.
+            active_weights: Effective per-signal weights for this run, or
+                ``None`` to use the raw configured weights.
 
         Returns:
             Weighted score (typically in ``[0.0, 1.0]``).
 
         """
         total = 0.0
-        for signal_fn, weight in self._signals.values():
+        for name, (signal_fn, raw_weight) in self._signals.items():
+            weight = raw_weight if active_weights is None else active_weights.get(name, 0.0)
+            if weight == 0.0:
+                continue
             total += signal_fn(thought, ctx) * weight
         return total
 
@@ -682,7 +755,10 @@ class DreamingExtension:
 
         Runs Label Propagation (LPA) over the ASSOCIATED edge graph.
         Falls back to cosine-similarity agglomerative clustering when
-        the graph is explicitly configured to use it.
+        the graph is explicitly configured to use it. When
+        ``cold_start_clustering`` is enabled and the LPA edge graph is
+        empty, the same agglomerative path runs within this cycle so
+        clustering still succeeds on a fresh or sparse graph.
 
         Args:
             store: The store instance to read edges and embeddings from.
@@ -704,43 +780,9 @@ class DreamingExtension:
 
         if algorithm == "agglomerative":
             # Graph-independent path: cluster ACTIVE candidates of the
-            # allowed types (default: OBSERVATION only).
-            # Excluding REFLECTION from the pool prevents the meta-reflection
-            # cascade where REFLECTIONs created in cycle N get re-clustered
-            # into even more abstract meta-REFLECTIONs in cycle N+1
-            # .
-            # Works even when no dream edges exist yet — this is the
-            # intended fallback for sparse-graph / first-run scenarios
-
-            allowed_types = gates.cluster_allowed_types
-            if len(allowed_types) == 1:
-                candidates = await store.list_thoughts(
-                    lifecycle_status="ACTIVE",
-                    thought_type=allowed_types[0],
-                    limit=self._config.candidates_limit,
-                )
-            else:
-                # Union over multiple types (rare path; keeps behaviour
-                # correct if operator opts into meta-consolidation).
-                candidates = []
-                for ttype in allowed_types:
-                    candidates.extend(
-                        await store.list_thoughts(
-                            lifecycle_status="ACTIVE",
-                            thought_type=ttype,
-                            limit=self._config.candidates_limit,
-                        )
-                    )
-            cluster_fn = (
-                self._agglomerative_clusters
-                if self._config.clustering_backend == "numpy"
-                else self._agglomerative_clusters_python_legacy
-            )
-            clusters = await cluster_fn(
-                store=store,
-                node_ids=[t.thought_id for t in candidates],
-                threshold=gates.cluster_similarity_threshold,
-            )
+            # allowed types (default: OBSERVATION only). See
+            # ``_cold_start_agglomerative_clusters`` for the pool build.
+            clusters = await self._cold_start_agglomerative_clusters(store)
         else:
             # LPA path: operates over the dream-created ASSOCIATED edge graph.
             all_edges = await store.list_edges(
@@ -755,9 +797,17 @@ class DreamingExtension:
                 adjacency.setdefault(b, set()).add(a)
 
             if not adjacency:
-                return []
-
-            clusters = _lpa_clusters(adjacency)
+                if gates.cold_start_clustering:
+                    logger.info(
+                        "Dreaming clustering: LPA edge graph empty at cycle %d; "
+                        "falling back to cold-start agglomerative clustering.",
+                        current_cycle,
+                    )
+                    clusters = await self._cold_start_agglomerative_clusters(store)
+                else:
+                    return []
+            else:
+                clusters = _lpa_clusters(adjacency)
 
         # Reject oversized clusters (single-link chaining guard).
         # Clusters exceeding max_cluster_size are dropped entirely — their
@@ -776,6 +826,66 @@ class DreamingExtension:
                 clusters = [c for c in clusters if len(c) <= max_size]
 
         return [c for c in clusters if len(c) >= min_size]
+
+    async def _cold_start_agglomerative_clusters(
+        self,
+        store: SqliteEngravaCore,
+    ) -> list[frozenset[str]]:
+        """Cluster the eligible candidate pool with agglomerative clustering.
+
+        Builds the candidate pool from ``ACTIVE`` thoughts of the configured
+        ``cluster_allowed_types`` (default: ``OBSERVATION`` only) and runs the
+        cosine-similarity agglomerative backend over it. This path is
+        graph-independent, so it produces clusters even when no dream
+        ``ASSOCIATED`` edges exist yet — the shared mechanism behind both the
+        explicit ``cluster_algorithm="agglomerative"`` mode and the opt-in
+        ``cold_start_clustering`` fallback for the ``"lpa"`` path.
+
+        Excluding ``REFLECTION`` from the default pool prevents the
+        meta-reflection cascade where REFLECTIONs created in cycle N get
+        re-clustered into even more abstract meta-REFLECTIONs in cycle N+1.
+
+        The candidate query is bounded by ``candidates_limit`` so a large
+        active set cannot make the O(n²) similarity matrix unbounded.
+
+        Args:
+            store: The store instance to read candidates and embeddings from.
+
+        Returns:
+            List of disjoint clusters, each a frozen set of thought IDs. An
+            empty list when no eligible candidates have stored embeddings.
+
+        """
+        gates = self._config.gates
+        allowed_types = gates.cluster_allowed_types
+        if len(allowed_types) == 1:
+            candidates = await store.list_thoughts(
+                lifecycle_status="ACTIVE",
+                thought_type=allowed_types[0],
+                limit=self._config.candidates_limit,
+            )
+        else:
+            # Union over multiple types (rare path; keeps behaviour
+            # correct if operator opts into meta-consolidation).
+            candidates = []
+            for ttype in allowed_types:
+                candidates.extend(
+                    await store.list_thoughts(
+                        lifecycle_status="ACTIVE",
+                        thought_type=ttype,
+                        limit=self._config.candidates_limit,
+                    )
+                )
+        cluster_fn = (
+            self._agglomerative_clusters
+            if self._config.clustering_backend == "numpy"
+            else self._agglomerative_clusters_python_legacy
+        )
+        return await cluster_fn(
+            store=store,
+            node_ids=[t.thought_id for t in candidates],
+            threshold=gates.cluster_similarity_threshold,
+        )
 
     @staticmethod
     async def _agglomerative_clusters(  # noqa: C901

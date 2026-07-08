@@ -50,6 +50,19 @@ class ThoughtNotFoundError(EngravaError):
         super().__init__(f"Thought not found: {thought_id}")
 
 
+class ActionNotFoundError(EngravaError):
+    """Raised when an action record is not found.
+
+    Args:
+        action_id: The ID that was not found.
+
+    """
+
+    def __init__(self, action_id: str) -> None:
+        self.action_id = action_id
+        super().__init__(f"Action not found: {action_id}")
+
+
 class StaleDataError(EngravaError):
     """Raised when an optimistic-concurrency check fails.
 
@@ -120,6 +133,70 @@ class EmbeddingModelMismatchError(EngravaError):
         )
 
 
+class EmbeddingQueryPrefixMismatchError(EngravaError):
+    """Raised when the active query prefix diverges from the corpus pairing.
+
+    For an asymmetric embedding model, a query is encoded with a
+    ``query_prefix`` (e.g. ``"query: "``) that must pair with the
+    ``document_prefix`` (e.g. ``"passage: "``) the stored corpus was
+    embedded with. Changing only the query prefix does not alter any stored
+    vector, so it does not require re-embedding — but querying with a prefix
+    that no longer matches the corpus silently degrades ranking. This error
+    surfaces that divergence loudly at search time. The fix is to restore the
+    query prefix the corpus was built to pair with, or to deliberately
+    re-embed the corpus with a new document prefix.
+
+    Args:
+        stored_query_prefix: Query prefix the corpus was built to pair with.
+        configured_query_prefix: Query prefix the current provider offers.
+
+    """
+
+    def __init__(
+        self,
+        stored_query_prefix: str,
+        configured_query_prefix: str,
+    ) -> None:
+        self.stored_query_prefix = stored_query_prefix
+        self.configured_query_prefix = configured_query_prefix
+        super().__init__(
+            f"Embedding query prefix mismatch: corpus was built to pair with "
+            f"query prefix {stored_query_prefix!r}, but the provider offers "
+            f"{configured_query_prefix!r}. Restore the matching query prefix, "
+            f"or deliberately re-embed the corpus with a new document prefix."
+        )
+
+
+class EmbeddingGenerationError(EngravaError):
+    """Raised when auto-embedding a thought fails under strict mode.
+
+    Auto-embed runs *after* ``create_thought`` (and the batch path)
+    has already committed the thought, so a provider failure would
+    otherwise leave the thought persisted without an embedding — a
+    silent, torn write invisible to vector search. By default the store
+    logs a ``WARNING`` naming the thought and re-raises the provider's
+    own exception (behaviour is unchanged for existing callers). When
+    the operator opts in via ``embeddings.require_embedding = true`` (or
+    ``require_embedding=True`` on the store), that failure is instead
+    normalised into this typed error — an explicit fail-fast signal that
+    the thought is persisted but unembedded.
+
+    Args:
+        thought_id: UUID of the thought whose embedding failed.
+        message: Human-readable description of the underlying failure,
+            typically derived from the provider's own exception.
+
+    """
+
+    def __init__(self, thought_id: str, message: str) -> None:
+        self.thought_id = thought_id
+        super().__init__(
+            f"Failed to auto-embed thought {thought_id}: {message}. "
+            f"The thought is persisted but has no embedding and is not "
+            f"reachable by vector search."
+        )
+
+
 class ReferentialIntegrityError(EngravaError):
     """Raised when a write would create or leave an orphan reference.
 
@@ -154,6 +231,86 @@ does not reference an existing thought
             f"referential integrity violation: {entity_type}.{column}="
             f"{referenced_id!r} does not reference an existing thought",
         )
+
+
+class InvalidFilterError(EngravaError):
+    """Raised when a metadata/visibility filter is invalid at construction.
+
+    Covers value-domain violations (a non-finite float, an out-of-range
+    integer, a scalar of an unsupported type), an empty
+    :class:`~engrava.domain.models.filters.VisibilityQueryFilter`, an
+    unsupported operator, and a predicate count beyond the documented
+    maximum. The error is always raised at *filter construction* — never
+    mid-query — so a compiled filter that reaches the store is known-good.
+
+    Args:
+        message: Human-readable description of why the filter is invalid.
+
+    """
+
+
+class InvalidFilterPathError(EngravaError):
+    r"""Raised when a filter path does not match the allowed grammar.
+
+    A predicate path must be a JSONPath of the restricted shape
+    ``$``, ``$.key`` or ``$[0]`` (dot-identifiers and bracketed array
+    indices only), validated against
+    ``^\$(\.[A-Za-z0-9_]+|\[[0-9]+\])*$``. Anything else (a bare key
+    with no ``$`` root, a wildcard, a quoted segment, an injection
+    attempt) is rejected at filter construction.
+
+    Args:
+        path: The offending path string.
+
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        super().__init__(
+            f"invalid filter path {path!r}: paths must match "
+            r"^\$(\.[A-Za-z0-9_]+|\[[0-9]+\])*$ "
+            "(e.g. '$', '$.session_id', '$.tags[0]')",
+        )
+
+
+class JournalIntegrityError(EngravaError):
+    """Raised when an on-open journal integrity check finds a broken chain.
+
+    Surfaced only when ``journal.verify_on_open`` is enabled: opening a
+    store via :meth:`SqliteEngravaCore.from_config` re-walks the persisted
+    hash chain after the schema is ensured, and raises this error instead
+    of returning a store when the chain does not verify. Carries the same
+    diagnostics as :class:`~engrava.domain.models.journal.JournalIntegrityResult`
+    so callers can report exactly where the chain first broke.
+
+    Args:
+        first_invalid_sequence: Sequence number of the first broken entry,
+            or ``None`` when the break is not attributable to a single row.
+        error_message: Human-readable description of the first inconsistency.
+
+    Examples:
+        >>> raise JournalIntegrityError(3, "Hash mismatch at sequence 3")
+        Traceback (most recent call last):
+            ...
+        engrava.domain.exceptions.JournalIntegrityError: \
+journal integrity check failed at sequence 3: Hash mismatch at sequence 3
+
+    """
+
+    def __init__(
+        self,
+        first_invalid_sequence: int | None,
+        error_message: str | None,
+    ) -> None:
+        self.first_invalid_sequence = first_invalid_sequence
+        self.error_message = error_message
+        location = (
+            f"at sequence {first_invalid_sequence}"
+            if first_invalid_sequence is not None
+            else "(sequence unknown)"
+        )
+        detail = error_message or "chain verification failed"
+        super().__init__(f"journal integrity check failed {location}: {detail}")
 
 
 class ExtensionMigrationError(EngravaError):

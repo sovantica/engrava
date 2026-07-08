@@ -1,9 +1,12 @@
 # Audit Trail (hash-chain journal)
 
-Engrava can record every change to your thought-graph in an append-only,
-hash-linked **journal** — a tamper-evident audit trail. Each entry captures one
-mutation (insert / update / delete of a thought or edge) as a before/after
-delta, and is cryptographically chained to the previous entry with SHA-256.
+Engrava can record changes to your thought-graph in an append-only,
+hash-linked **journal** — a **tamper-evident thought/edge journal** (not a
+whole-database audit). Each entry captures one mutation — insert / update /
+delete of a **thought** or **edge**, or an **action `status`/`verification_status`
+transition** — as a before/after delta, cryptographically chained to the previous
+entry with SHA-256. See [What gets recorded](#what-gets-recorded) for the exact
+scope (embeddings and action *creation* are not covered).
 
 > **Read the [Security model](#security-model--guarantees) before relying on this
 > for compliance.** The chain detects accidental corruption and naive edits, but
@@ -52,10 +55,10 @@ journal-specific code.
 ## What gets recorded
 
 When journaling is enabled, the store records a journal entry **automatically**
-on every mutation of a thought or an edge — you do not call the journal
-yourself. The recorded `mutation_type` values (the `MutationType` enum) are:
+on every mutation of a thought or edge — and on an action state-transition — you
+do not call the journal yourself. The recorded `mutation_type` values are:
 
-| `MutationType` | When |
+| `mutation_type` | When |
 |---|---|
 | `INSERT_THOUGHT` | `create_thought()` |
 | `UPDATE_THOUGHT` | `update_thought()` |
@@ -63,14 +66,27 @@ yourself. The recorded `mutation_type` values (the `MutationType` enum) are:
 | `INSERT_EDGE` | `create_edge()` |
 | `UPDATE_EDGE` | `update_edge()` |
 | `DELETE_EDGE` | `delete_edge()` (only when a row was actually deleted) |
+| `UPDATE_ACTION` | `update_action()` — only when an action's `status` / `verification_status` actually changes |
+
+> The first six values are members of the `MutationType` enum; `UPDATE_ACTION` is
+> a stored `mutation_type` **string** emitted by `update_action()` — the enum
+> itself is not extended. `mutation_type` is a free-text column, so verification
+> covers the entry regardless.
 
 Each entry's `delta` is a `{"before": ..., "after": ...}` dictionary: inserts
 have `before: null`, deletes have `after: null`, and updates carry both sides.
 
-> **Not recorded:** embeddings (`store_embedding`) and action records
-> (`create_action`) are **not** written to the journal — the audit trail covers
-> the thought-and-edge graph, not the embedding or action tables. This also
-> matters for backups — see [Backup note](#backup--retention-note).
+> **Recorded precisely — what the chain does and does not cover.** The journal
+> covers **thought and edge mutations** (insert / update / delete) and **action
+> state-transitions** (`update_action`). It does **not** record: embeddings
+> (`store_embedding`), **action *creation*** (`create_action` — only an action's
+> later transitions are journaled, not its initial insert), or read-derived
+> access telemetry (`access_count` / `last_accessed_at`, which is regenerable
+> and deliberately outside the chain). So this is a **tamper-evident
+> thought/edge/action-transition journal**, not a whole-database audit — verify
+> the parts it covers, and do not assume coverage of the embedding or
+> action-creation tables. This also matters for backups — see
+> [Backup note](#backup--retention-note).
 
 **TTL expiry is recorded.** `cleanup_expired()` (and the auto-cleanup it
 triggers) goes through the same journaled paths, so expiry of a thought is
@@ -132,12 +148,18 @@ deletions = await store.journal.get_entries(
 
 ## Verifying integrity
 
-`store.journal.verify_integrity()` walks the whole chain in order, recomputes
-every hash, and checks the parent-hash linkage. It returns a
-`JournalIntegrityResult`:
+Verification walks the whole chain in order, recomputes every hash, and checks
+the parent-hash linkage, returning a `JournalIntegrityResult`. There are three
+ways to run it, all backed by the same walk:
+
+| Entry point | Use it when |
+|---|---|
+| `store.verify_journal()` | You have a store and want a one-call check. **Verifies the on-disk chain even when journaling is currently disabled** (see below). |
+| `store.journal.verify_integrity()` | You are already holding the `JournalWriter` (only available while journaling is enabled). |
+| [`engrava verify`](cli.md#verify) | From the shell / CI / a pre-backup hook — exit `0` = intact, `1` = broken or missing database. |
 
 ```python
-result = await store.journal.verify_integrity()
+result = await store.verify_journal()
 if result.valid:
     print(f"Chain OK — {result.entries_checked} entries verified.")
 else:
@@ -156,9 +178,48 @@ else:
 
 An empty journal verifies as `valid=True` with `entries_checked=0`.
 
+**Verification is independent of the current `journal.enabled` state.** Entries
+are recorded only while journaling is on, but once written they stay in the
+`journal_entry` table. `store.verify_journal()` (and `engrava verify`) audit
+whatever chain is on disk — so a database that had journaling enabled in an
+earlier session and reopened with it **off** (`store.journal is None`) is still
+fully auditable. (`store.journal.verify_integrity()` is unavailable in that case
+because `store.journal` is `None`; use `store.verify_journal()`.)
+
 **Run verification on a schedule** (e.g. before each backup, during incident
 response, or as a periodic monitoring check) rather than only ad hoc — that is
 what turns the chain from a passive structure into an active control.
+
+### Verifying automatically on open
+
+Set `journal.verify_on_open: true` to run the walk **once, when the store is
+opened** through `SqliteEngravaCore.from_config(...)`. The check runs after the
+schema is ensured and **raises `JournalIntegrityError`** (a subclass of
+`EngravaError`, carrying `first_invalid_sequence` and `error_message`) instead of
+returning a store when the chain does not verify — a fail-closed startup gate.
+
+```yaml
+journal:
+  enabled: true
+  verify_on_open: true   # refuse to open on a broken chain
+```
+
+```python
+from engrava import JournalIntegrityError, SqliteEngravaCore
+
+try:
+    async with await SqliteEngravaCore.from_config("engrava.yaml") as store:
+        ...
+except JournalIntegrityError as exc:
+    # Startup aborted: the on-disk journal did not verify.
+    print(f"broken at sequence {exc.first_invalid_sequence}: {exc.error_message}")
+```
+
+`verify_on_open` is **independent of `enabled`** (a recorded chain is checked
+even if journaling is now off) and **defaults to `false`**. Leave it off unless
+you want the gate: the walk is `O(entries)`, so on a large journal it adds a
+one-time cost to every open. For periodic rather than on-open checking, call
+`store.verify_journal()` / `engrava verify` on a schedule instead.
 
 ## Worked example
 

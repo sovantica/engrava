@@ -287,11 +287,38 @@ class TestOffOnPair:
 # ---------------------------------------------------------------------------
 
 
-# Baseline captured pre-WS from release/v0.3.0 HEAD = bb407ac.  Any
-# accidental new export through ``engrava/__init__.py`` will surface as
-# a non-empty diff on this set.
+# Baseline of the legitimate package-level ``__all__``.  Any *accidental*
+# new export through ``engrava/__init__.py`` (e.g. benchmark code leaking
+# out) will surface as a non-empty diff on this set. Deliberate public-API
+# additions are recorded here when they ship.
+#
+# Baseline captured pre-WS from release/v0.3.0 HEAD = bb407ac, then extended
+# with the metadata-filter query surface (FieldOp / FieldPredicate /
+# MetadataFilter / VisibilityQueryFilter + the two typed filter errors), an
+# intentional, ratified public-API addition. Later extended with the
+# opt-in asymmetric embedding-prefix surface (RoleAwareEmbeddingProvider
+# capability protocol + EmbeddingQueryPrefixMismatchError), an additive,
+# default-off public-API addition. Later extended with JournalIntegrityError,
+# raised by the opt-in on-open journal integrity check — an additive,
+# default-off public-API addition. Later extended with EmbeddingGenerationError,
+# the typed error surfaced by the additive ingest-ergonomics / embedding-
+# robustness surface (bulk_store / get_or_create / upsert_by_hash + the opt-in
+# require_embedding fail-fast), also additive and default-off. Later extended
+# with ActionNotFoundError (raised by the new update_action lifecycle write) and
+# ActionOutcomeSignal (the action-outcome dreaming signal) — the additive,
+# default-off action-outcome feedback surface (inactive in any store that never
+# records a terminal action outcome). Later extended with ProvenanceContext
+# (the typed, bounded, opt-in write-time provenance sub-model captured at
+# create_thought and made queryable but never consumed) — an additive,
+# default-off public-API addition (a thought with no provenance is byte-identical
+# to before it existed). Later extended with the Memory Hygiene forgetting-loop
+# surface (HygienePolicyConfig / HygieneResult / EvictionReason), an additive,
+# default-off public-API addition (a store that never enables hygiene_policy is
+# unchanged on every read/write path).
 _PRE_WS_ALL_BASELINE = frozenset(
     {
+        "ActionNotFoundError",
+        "ActionOutcomeSignal",
         "ActionRecord",
         "ActionStatus",
         "ActionType",
@@ -314,8 +341,10 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "EdgeRecord",
         "EdgeType",
         "EmbeddingConfig",
+        "EmbeddingGenerationError",
         "EmbeddingModelMismatchError",
         "EmbeddingProviderProtocol",
+        "EmbeddingQueryPrefixMismatchError",
         "EmbeddingRecord",
         "EngravaConfig",
         "EngravaCoreProtocol",
@@ -323,19 +352,28 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "EngravaHooksProtocol",
         "EngravaManager",
         "EngravaMetrics",
+        "EvictionReason",
         "ExtensionManifest",
         "ExtensionMigrationError",
+        "FieldOp",
+        "FieldPredicate",
         "FrequencySignal",
         "HuggingFaceProvider",
         "HybridSearchResult",
+        "HygienePolicyConfig",
+        "HygieneResult",
+        "InvalidFilterError",
+        "InvalidFilterPathError",
         "InvalidTransitionError",
         "JournalConfig",
         "JournalEntry",
+        "JournalIntegrityError",
         "JournalIntegrityResult",
         "JournalWriter",
         "KnowledgeSource",
         "LatencyHistogram",
         "LifecycleStatus",
+        "MetadataFilter",
         "MetricsConfig",
         "MindQLCommand",
         "MindQLExecutor",
@@ -352,10 +390,12 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "OllamaProvider",
         "OpenAICompatibleProvider",
         "Priority",
+        "ProvenanceContext",
         "ReadOnlyEngrava",
         "ReadOnlyMindStore",
         "ReadOnlyViolationError",
         "RecencySignal",
+        "RoleAwareEmbeddingProvider",
         "ScoringContext",
         "SearchConfig",
         "SentenceTransformerProvider",
@@ -374,6 +414,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "ThoughtType",
         "ThoughtVisibility",
         "VerificationStatus",
+        "VisibilityQueryFilter",
         "discover_manifests",
         "load_config",
         "parse",

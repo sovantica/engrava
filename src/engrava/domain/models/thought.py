@@ -24,6 +24,7 @@ from engrava.domain.enums import (
 )
 from engrava.domain.exceptions import InvalidTransitionError
 from engrava.domain.models._temporal import validate_iso8601_nullable
+from engrava.domain.models.provenance import ProvenanceContext
 
 #: Allowed value types for ``ThoughtRecord.metadata`` entries.
 #:
@@ -72,6 +73,10 @@ class ThoughtRecord(BaseModel):
         consolidated_from: JSON list of source thought IDs if consolidated.
         visibility: Inner/outer speech visibility (private, selective, public).
         access_count: Number of times this thought has been explicitly accessed.
+        action_outcome_score: Denormalised mean outcome value over this
+            thought's terminal linked actions, in ``[0.0, 1.0]``.  ``None``
+            when the thought has no terminal actions; recomputed whenever a
+            linked action reaches (or is verified in) a terminal state.
         last_accessed_at: ISO-8601 datetime of last explicit access (nullable).
         created_at: ISO-8601 datetime when the thought was persisted (nullable
             for thoughts created before timestamp tracking was added).
@@ -93,6 +98,30 @@ class ThoughtRecord(BaseModel):
             ``metadata["source"] = {"is_self": True, "confidence":
             "high", ...}``).  Lists and other rich containers are
             rejected at write time.  Defaults to an empty dict.
+        provenance: Optional :class:`~engrava.domain.models.provenance.ProvenanceContext`
+            capturing write-time provenance signals that are irrecoverable
+            once the thought is stored (the retrieval query / instruction
+            context that shaped a synthesis, the retrieved source-thought ids,
+            and the session / actor the thought was produced under).  ``None``
+            by default; when ``None`` the thought is byte-identical to one
+            created before provenance existed.  **Provenance is an untrusted
+            hint, never identity, authentication, or authorization** — the
+            engine grants it zero authority and consults it for no access,
+            ranking, or consolidation decision.
+        pinned: Durable keep-intent marker.  When ``True`` the thought is
+            **never** auto-archived or auto-garbage-collected by the Memory
+            Hygiene forgetting loop, regardless of its keep-score.  Defaults to
+            ``False`` so every existing construction site and stored row is
+            unchanged.  ``pinned`` is the node-level never-forget flag;
+            ``confidence`` is explicitly *not* protection (a model-confidence
+            estimate is not a user keep-decision).
+        archived_at_cycle: The cognitive cycle at which the Memory Hygiene loop
+            archived this thought, or ``None`` when it was not archived by
+            hygiene.  Only hygiene sets it; a restore (un-archive) clears it back
+            to ``None``.  It backs the garbage-collection restore window
+            (``current_cycle - archived_at_cycle >= gc_min_archive_age_cycles``),
+            so a thought archived by any other path (TTL / manual) keeps
+            ``None`` and is never reaped by hygiene GC.  Defaults to ``None``.
 
     Examples:
         >>> thought = ThoughtRecord(
@@ -129,6 +158,7 @@ class ThoughtRecord(BaseModel):
     consolidated_from: list[str] | None = None
     visibility: ThoughtVisibility = ThoughtVisibility.SELECTIVE
     access_count: int = Field(default=0, ge=0)
+    action_outcome_score: float | None = Field(default=None, ge=0.0, le=1.0)
     last_accessed_at: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
@@ -136,6 +166,9 @@ class ThoughtRecord(BaseModel):
     valid_from: str | None = None
     valid_until: str | None = None
     metadata: dict[str, MetadataValue] = Field(default_factory=dict)
+    provenance: ProvenanceContext | None = Field(default=None)
+    pinned: bool = False
+    archived_at_cycle: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def _validate_cycle_ordering(self) -> Self:

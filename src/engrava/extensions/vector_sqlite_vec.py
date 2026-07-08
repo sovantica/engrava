@@ -103,9 +103,33 @@ class SqliteVecSearchBackend:
                 (row["rowid"], vec_json),
             )
             count += 1
-        if count:
+        pruned = await self._prune_orphan_vectors(db)
+        if count or pruned:
             await db.commit()
         return count
+
+    async def _prune_orphan_vectors(self, db: aiosqlite.Connection) -> int:
+        """Delete ``embedding_vec`` rows whose rowid is absent from ``embedding``.
+
+        The ``embedding_vec`` virtual table is not reachable by the
+        ``embedding`` table's ``ON DELETE CASCADE`` foreign key, so a
+        thought delete (or any direct ``DELETE FROM embedding``) can leave a
+        vector behind as a ghost. Running as part of :meth:`sync_embeddings`
+        makes the backend self-healing: on next startup any accumulated
+        orphans are swept out. Idempotent and additive — a clean store
+        deletes nothing.
+
+        Args:
+            db: Active database connection with sqlite-vec loaded.
+
+        Returns:
+            Number of orphan vector rows deleted.
+
+        """
+        cursor = await db.execute(
+            "DELETE FROM embedding_vec WHERE rowid NOT IN (SELECT rowid FROM embedding)"
+        )
+        return cursor.rowcount if cursor.rowcount is not None and cursor.rowcount > 0 else 0
 
     async def search(
         self,
@@ -190,13 +214,35 @@ class SqliteVecSearchBackend:
         vec_json = "[" + ",".join(str(f) for f in vector) + "]"
         # DELETE + INSERT instead of INSERT OR REPLACE because vec0
         # virtual tables may not support ON CONFLICT semantics.
-        await db.execute(
-            "DELETE FROM embedding_vec WHERE rowid = ?",
-            (rowid,),
-        )
+        await self.delete_embedding(db, rowid=rowid)
         await db.execute(
             "INSERT INTO embedding_vec(rowid, embedding) VALUES (?, ?)",
             (rowid, vec_json),
+        )
+
+    async def delete_embedding(
+        self,
+        db: aiosqlite.Connection,
+        *,
+        rowid: int,
+    ) -> None:
+        """Delete a single vector from the ``vec0`` index by rowid.
+
+        The ``embedding_vec`` virtual table is not reachable by the
+        ``embedding`` table's ``ON DELETE CASCADE`` foreign key, so deleting
+        a thought (which cascades to its ``embedding`` row) does not remove
+        the corresponding vector. Callers on a thought-delete path must
+        invoke this explicitly to avoid leaving a ghost vector that would
+        otherwise keep occupying a KNN result slot forever.
+
+        Args:
+            db: Active database connection with sqlite-vec loaded.
+            rowid: The rowid (shared with the ``embedding`` table) to remove.
+
+        """
+        await db.execute(
+            "DELETE FROM embedding_vec WHERE rowid = ?",
+            (rowid,),
         )
 
 

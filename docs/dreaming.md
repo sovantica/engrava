@@ -70,10 +70,12 @@ Walking the journey:
    a pile of observations into fewer, higher-level memories. (A REFLECTION whose
    source cluster later leaves the active set is automatically retired so a stale
    summary can't resurface.)
-6. **Improved retrieval.** All of this changes future
-   [hybrid search](search.md): the P1 memory ranks higher via the priority
-   signal, any new edges feed the opt-in graph signal, and reflections let one
-   high-level memory stand in for many raw ones.
+6. **How it shows up in retrieval.** All of this changes future
+   [hybrid search](search.md) *mechanically*: the P1 memory ranks higher via the
+   priority signal, any new edges feed the opt-in graph signal, and reflections
+   let one high-level memory stand in for many raw ones. These are deterministic
+   ranking effects — Engrava makes **no claim that dreaming improves retrieval
+   accuracy** on any benchmark (see [Known Limitations](known-limitations.md)).
 
 The rest of this page is the knob-by-knob reference for each phase.
 
@@ -97,6 +99,26 @@ ext = DreamingExtension(config=config)
 result = await ext.run_consolidation(store, current_cycle=1)
 print(f"Promoted {result.promoted_count} thoughts")
 ```
+
+### From YAML config
+
+If you enable dreaming in `engrava.yaml`
+(`extensions.dreaming.enabled: true`) and build the store with
+`EngravaStore.from_config(...)`, you do **not** need to construct a
+`DreamingExtension` by hand — call `consolidate()` on the store directly:
+
+```python
+# store built via EngravaStore.from_config(config_with_dreaming_enabled)
+result = await store.consolidate(current_cycle=1)
+print(f"Promoted {result.promoted_count} thoughts")
+```
+
+`store.consolidate(current_cycle=...)` first flushes any pending
+access events (so the [`frequency`](#access-tracking-the-frequency-substrate)
+signal sees the latest access counts this cycle), then runs the configured
+extension. It raises `RuntimeError` if dreaming is not enabled/wired on the
+store (built manually, or `dreaming.enabled` is `false`) — there is no
+extension to run.
 
 ## Gates
 
@@ -136,6 +158,15 @@ The weighted sum of all signal scores is compared against
 | `confirmation` | 0.20 | Ratio of `confirmation_count` to max (5). |
 | `confidence` | 0.15 | Thought's `confidence` field (default 0.5). |
 | `frequency` | 0.20 | Ratio of `access_count` to max (10). |
+| `action_outcome` | 0.15 | Thought's `action_outcome_score` — the mean outcome value over its terminal linked actions (`None` ⇒ contributes `0.0`). |
+
+A signal whose data source is flat across the whole candidate pool carries no
+ranking information, so it is dropped and its weight is redistributed over the
+active signals. `action_outcome` is therefore **inactive** — and its weight
+falls out of the denominator — in any store where no candidate has a recorded
+action outcome, so it never perturbs consolidation until actions are used. The
+default weights sum to more than 1.0 for this reason: they are relative
+priorities renormalised over the active set, not a probability distribution.
 
 Custom signals can be provided via `DreamingSignalProtocol`:
 
@@ -150,6 +181,25 @@ ext = DreamingExtension(
     custom_signals={"my_signal": MySignal()},
 )
 ```
+
+### Access tracking (the `frequency` substrate)
+
+The `frequency` signal scores a thought by its `access_count`. For that to be
+meaningful, reads have to be counted — otherwise `access_count` stays at 0 and
+`frequency` contributes nothing.
+
+When you build the store via `from_config` with dreaming enabled, retrieval
+paths record access automatically, controlled by
+`extensions.dreaming.access_tracking_enabled` (default **`true`**). To keep the
+read path fast, access events are buffered and flushed at the cycle boundary
+rather than written on every read; `store.consolidate()` flushes the buffer
+before scoring so the current cycle sees up-to-date counts. Access tracking is
+deliberately **not** journaled — the counts are regenerable telemetry, not part
+of the tamper-evident chain (see [Audit Trail](audit-trail.md)).
+
+Set `access_tracking_enabled: false` to leave `access_count` untouched (the
+`frequency` signal then stays inactive and its weight is redistributed over the
+remaining active signals, exactly as with any other inactive signal).
 
 ## Priority signal in search
 
@@ -316,6 +366,27 @@ Two algorithms are available via `DreamingGates.cluster_algorithm`:
   via Union-Find.
 - Use when you want clustering before dreams have built up a graph.
 
+**Cold-start fallback (`cold_start_clustering`, default `false`)**
+
+The `"lpa"` path reads communities only from the ASSOCIATED dream-edge
+graph, and those edges appear only after promotions create them. On a
+fresh or sparse graph the edge set is empty, so LPA finds nothing and no
+REFLECTIONs are produced no matter how many eligible OBSERVATIONs exist.
+
+Set `cold_start_clustering: true` to opt into a fallback: when the LPA
+path finds the edge graph empty, it falls back **within the same cycle**
+to the cosine-similarity agglomerative clustering described above, run
+over the eligible ACTIVE candidate pool. This lets dreaming form
+clusters (and REFLECTIONs) before any dream edges exist.
+
+- **Default is `false`** — the shipped `"lpa"` behaviour is unchanged, and
+  the fallback never alters cluster output when edges are present.
+- The fallback reuses the exact agglomerative path, so its clusters flow
+  through the same `min_cluster_size` / `max_cluster_size` size gates and
+  the content-quality gates — nothing bypasses them.
+- The candidate pool is bounded by `candidates_limit`, so a large active
+  set does not make the fallback unbounded.
+
 ### Idempotence
 
 Before creating a REFLECTION, the extension derives a 16-hex content-hash
@@ -336,6 +407,8 @@ extensions:
       cluster_similarity_threshold: 0.7  # cosine threshold (agglomerative only)
       cluster_algorithm: lpa          # "lpa" or "agglomerative"
       enable_reflections: true        # set to false to skip phase 3 entirely
+      cold_start_clustering: false    # opt-in: LPA falls back to agglomerative
+                                      #   clustering when the edge graph is empty
 ```
 
 ### `ConsolidationResult` fields

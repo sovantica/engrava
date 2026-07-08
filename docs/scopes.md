@@ -24,6 +24,17 @@ Example: `feat(dreaming): add priority signal to hybrid search`
 - `release` — release tooling, semantic-release config
 - `ci` — CI workflows (also: commit type `ci:`)
 - `build` — build tooling (also: commit type `build:`)
+- `embeddings` — embedding providers / role prefixes (plural sibling of `embedding`)
+- `journal` — tamper-evident thought/edge journal + integrity verification
+- `lifecycle` — thought / action lifecycle and state transitions
+- `vec0` — sqlite-vec (`vec0`) vector backend specifics
+- `actions` — Action Records + action-outcome feedback
+- `perf` / `performance` — performance-oriented changes (as a scope; `perf:` is also a type)
+- `readme` — `README.md`
+- `pyproject` — `pyproject.toml` (package metadata)
+- `changelog` — `CHANGELOG.md`
+- `gitignore` — `.gitignore`
+- `api-reference` — `docs/api-reference.md`
 
 ## Adding a new scope
 

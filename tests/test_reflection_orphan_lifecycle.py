@@ -33,8 +33,8 @@ from engrava.domain.enums import (
 )
 from engrava.domain.models.edge import EdgeRecord
 from engrava.domain.models.thought import ThoughtRecord
-from engrava.extensions import dreaming
 from engrava.extensions.dreaming import DreamingExtension
+from engrava.infrastructure.sqlite import engrava_core
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -411,8 +411,10 @@ class TestSweepCoversAllActiveReflections:
         sweep only ever saw ``r-fresh`` and left ``r-orphan`` ACTIVE forever;
         the paginated full-coverage sweep walks every page and retires it.
         """
-        # Force single-row pagination so two REFLECTIONs span two pages.
-        monkeypatch.setattr(dreaming, "_ORPHAN_SWEEP_PAGE_SIZE", 1)
+        # Force single-row pagination so two REFLECTIONs span two pages. The
+        # sweep is store-owned (retire_orphan_reflections), so the page-size
+        # constant lives on the core module.
+        monkeypatch.setattr(engrava_core, "_ORPHAN_SWEEP_PAGE_SIZE", 1)
 
         # Most-recently-updated REFLECTION with a live source (first DESC page).
         await store.create_thought(_reflection_record("r-fresh", updated_cycle=10))

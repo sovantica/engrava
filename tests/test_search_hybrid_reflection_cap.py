@@ -394,3 +394,118 @@ class TestReflectionCapInvariant:
         assert len(obs_in_result) >= 1, (
             "Expected at least one OBSERVATION in top-5 with cap=0.3 and 5 OBSs in store"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestReflectionsEvictedField — the additive HybridSearchResult signal
+# ---------------------------------------------------------------------------
+
+
+class TestReflectionsEvictedField:
+    """The additive ``HybridSearchResult.reflections_evicted`` visibility field."""
+
+    async def _populate(
+        self,
+        store: SqliteEngravaCore,
+        *,
+        n_reflections: int,
+        n_obs: int,
+    ) -> tuple[list[str], list[str]]:
+        """Create REFLECTIONs and OBSs that both match the distinctive query.
+
+        The REFLECTION essence leads with the distinctive query word so the
+        REFLECTIONs out-rank the OBSs and flood the top-K window (forcing the
+        cap to evict), while the OBSs still match the term so off-list OBSs
+        remain available to backfill the freed slots.
+        """
+        reflection_ids: list[str] = []
+        for i in range(n_reflections):
+            r = await store.create_thought(
+                _reflection(
+                    str(uuid.uuid4()),
+                    essence=f"zephyr reflection insight {i}",
+                )
+            )
+            reflection_ids.append(r.thought_id)
+        obs_ids: list[str] = []
+        for i in range(n_obs):
+            o = await store.create_thought(
+                _obs(
+                    str(uuid.uuid4()),
+                    essence=f"zephyr observation note {i}",
+                )
+            )
+            obs_ids.append(o.thought_id)
+        return reflection_ids, obs_ids
+
+    async def test_eviction_sets_field_and_logs_info(
+        self,
+        store: SqliteEngravaCore,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """When the cap evicts, the field is > 0 and an INFO line is logged.
+
+        Setup: 8 REFLECTIONs and 4 OBSs all matching ``zephyr``; top_k=10,
+        cap=0.3 → 3 reflection slots. The REFLECTIONs flood the window, so five
+        of the eight are evicted; the field reports exactly 5 and the INFO
+        breadcrumb names the count.
+        """
+        reflection_ids, _obs_ids = await self._populate(store, n_reflections=8, n_obs=4)
+
+        with caplog.at_level(logging.INFO):
+            result = await store.search_hybrid(query_text="zephyr", top_k=10)
+
+        refs_in_result = [tid for tid, _ in result.results if tid in set(reflection_ids)]
+        # cap=0.3 * top_k=10 → 3 reflection slots; 8 flooded → 5 evicted.
+        assert result.reflections_evicted == 5
+        assert len(refs_in_result) == 3
+        info_records = [
+            rec
+            for rec in caplog.records
+            if rec.levelno == logging.INFO
+            and "reflection_topk_cap" in rec.message
+            and "evicted" in rec.message
+        ]
+        assert info_records, "Expected an INFO log naming the eviction"
+        assert "5" in info_records[0].message
+
+    async def test_no_eviction_leaves_field_zero(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """When the cap does not evict, the field stays at its default 0.
+
+        Setup: 2 REFLECTIONs (< 3 allowed slots) and 8 OBSs → no eviction.
+        """
+        await self._populate(store, n_reflections=2, n_obs=8)
+
+        result = await store.search_hybrid(query_text="zephyr", top_k=10)
+
+        assert result.reflections_evicted == 0
+
+    async def test_field_defaults_zero_for_existing_consumers(self) -> None:
+        """A default-constructed result exposes ``reflections_evicted == 0``.
+
+        Guards the additive, backward-compatible contract: every existing
+        constructor that omits the field sees the neutral default.
+        """
+        from engrava.domain.models.search import HybridSearchResult
+
+        assert HybridSearchResult().reflections_evicted == 0
+        assert (
+            HybridSearchResult(
+                results=[("t1", 0.9)], backends_used=frozenset({"fts5"})
+            ).reflections_evicted
+            == 0
+        )
+
+    async def test_cap_disabled_leaves_field_zero(
+        self,
+        store_cap1: SqliteEngravaCore,
+    ) -> None:
+        """With cap=1.0 (enforcement off) the field is never populated."""
+        await self._populate(store_cap1, n_reflections=8, n_obs=2)
+
+        result = await store_cap1.search_hybrid(query_text="zephyr", top_k=10)
+
+        assert result.reflections_evicted == 0

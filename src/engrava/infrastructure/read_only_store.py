@@ -7,7 +7,7 @@ read-only contexts where write access must be prevented).
 
 Design:
     Composition over inheritance — receives ``EngravaCoreProtocol`` in
-    the constructor and forwards 5 read methods.  Write methods (7) raise
+    the constructor and forwards 6 read methods.  Write methods (10) raise
     ``ReadOnlyViolationError`` unconditionally.
 """
 
@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING, NoReturn
 from engrava.domain.exceptions import ReadOnlyViolationError
 
 if TYPE_CHECKING:
+    from engrava.domain.enums import ActionStatus, VerificationStatus
+    from engrava.domain.models.action import ActionRecord
     from engrava.domain.models.edge import EdgeRecord
     from engrava.domain.models.embedding import EmbeddingRecord
     from engrava.domain.models.metrics import EngravaMetrics
@@ -157,6 +159,18 @@ class ReadOnlyEngrava:
         """
         return await self._inner.get_embedding(thought_id)
 
+    async def get_actions(self, thought_id: str) -> list[ActionRecord]:
+        """Retrieve actions linked to a thought.
+
+        Args:
+            thought_id: UUID of the thought.
+
+        Returns:
+            List of action records.
+
+        """
+        return await self._inner.get_actions(thought_id)
+
     async def metrics(self) -> EngravaMetrics:
         """Return a point-in-time metrics snapshot from the wrapped store."""
         return await self._inner.metrics()
@@ -183,6 +197,63 @@ class ReadOnlyEngrava:
 
         """
         msg = "create_thought"
+        raise ReadOnlyViolationError(msg)
+
+    async def get_or_create(
+        self,
+        _thought: ThoughtRecord,
+        *,
+        expires_after_seconds: int | None = None,  # noqa: ARG002 -- signature parity
+    ) -> NoReturn:
+        """Blocked: read-only contexts do not allow writes.
+
+        Accepts the same keywords as ``SqliteEngravaCore.get_or_create`` so a
+        pass-through call raises a coherent ``ReadOnlyViolationError`` rather
+        than an opaque ``TypeError``.
+
+        Raises:
+            ReadOnlyViolationError: Always.
+
+        """
+        msg = "get_or_create"
+        raise ReadOnlyViolationError(msg)
+
+    async def upsert_by_hash(
+        self,
+        _thought: ThoughtRecord,
+        *,
+        expires_after_seconds: int | None = None,  # noqa: ARG002 -- signature parity
+    ) -> NoReturn:
+        """Blocked: read-only contexts do not allow writes.
+
+        Accepts the same keywords as ``SqliteEngravaCore.upsert_by_hash`` so a
+        pass-through call raises a coherent ``ReadOnlyViolationError`` rather
+        than an opaque ``TypeError``.
+
+        Raises:
+            ReadOnlyViolationError: Always.
+
+        """
+        msg = "upsert_by_hash"
+        raise ReadOnlyViolationError(msg)
+
+    async def bulk_store(
+        self,
+        _thoughts: list[ThoughtRecord],
+        *,
+        deduplicate: bool = False,  # noqa: ARG002 -- signature parity
+    ) -> NoReturn:
+        """Blocked: read-only contexts do not allow writes.
+
+        Accepts the same keywords as ``SqliteEngravaCore.bulk_store`` so a
+        pass-through call raises a coherent ``ReadOnlyViolationError`` rather
+        than an opaque ``TypeError``.
+
+        Raises:
+            ReadOnlyViolationError: Always.
+
+        """
+        msg = "bulk_store"
         raise ReadOnlyViolationError(msg)
 
     async def update_thought(self, _thought_id: str, **_changes: object) -> NoReturn:
@@ -250,6 +321,32 @@ class ReadOnlyEngrava:
 
         """
         msg = "store_embedding"
+        raise ReadOnlyViolationError(msg)
+
+    async def create_action(self, _action: ActionRecord) -> NoReturn:
+        """Blocked: read-only contexts do not allow writes.
+
+        Raises:
+            ReadOnlyViolationError: Always.
+
+        """
+        msg = "create_action"
+        raise ReadOnlyViolationError(msg)
+
+    async def update_action(
+        self,
+        _action_id: str,
+        *,
+        status: ActionStatus | None = None,  # noqa: ARG002
+        verification_status: VerificationStatus | None = None,  # noqa: ARG002
+    ) -> NoReturn:
+        """Blocked: read-only contexts do not allow writes.
+
+        Raises:
+            ReadOnlyViolationError: Always.
+
+        """
+        msg = "update_action"
         raise ReadOnlyViolationError(msg)
 
     async def cleanup_expired(

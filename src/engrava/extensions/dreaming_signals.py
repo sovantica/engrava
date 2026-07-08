@@ -1,7 +1,7 @@
 """Dreaming signal definitions and protocol.
 
 Signals compute a normalized ``[0.0, 1.0]`` score for a thought during
-memory consolidation.  The five default signals operate **exclusively**
+memory consolidation.  The six default signals operate **exclusively**
 on ``CoreThoughtRecord`` fields — no external dependencies.
 
 Consumers can register custom signal functions (implementing
@@ -298,6 +298,50 @@ class FrequencySignal:
         return min(1.0, thought.access_count / self._max_accesses)
 
 
+class ActionOutcomeSignal:
+    """Score based on the denormalised ``action_outcome_score`` field.
+
+    Reads a thought's aggregated action-outcome value directly: a thought
+    whose linked actions succeeded (and verified) scores high, one whose
+    actions failed scores low. A thought with no terminal actions has a
+    ``None`` score and contributes ``0.0`` — but only when this signal is
+    active for the run (i.e. at least one candidate has an outcome). In an
+    action-free pool the signal is inactive and its weight is redistributed
+    onto the active signals, so it never nudges any score.
+
+    Examples:
+        >>> sig = ActionOutcomeSignal()
+        >>> ctx = DreamingContext(current_cycle=100, total_thoughts=50)
+        >>> from engrava.domain.models.thought import ThoughtRecord
+        >>> t = ThoughtRecord(
+        ...     thought_id="t1", thought_type="TASK", essence="test",
+        ...     content="test content", priority="P2",
+        ...     lifecycle_status="ACTIVE", created_cycle=0,
+        ...     updated_cycle=0, source="test", action_outcome_score=0.75,
+        ... )
+        >>> sig(t, ctx)
+        0.75
+
+    """
+
+    def __call__(
+        self,
+        thought: ThoughtRecord,
+        ctx: DreamingContext,  # noqa: ARG002
+    ) -> float:
+        """Return the thought's action-outcome score (or 0.0 if null).
+
+        Args:
+            thought: The thought record.
+            ctx: Consolidation context (unused).
+
+        Returns:
+            Float in ``[0.0, 1.0]``.
+
+        """
+        return thought.action_outcome_score if thought.action_outcome_score is not None else 0.0
+
+
 # ------------------------------------------------------------------
 # Default signal registry
 # ------------------------------------------------------------------
@@ -308,5 +352,60 @@ DEFAULT_SIGNALS: dict[str, type] = {
     "confirmation": ConfirmationSignal,
     "confidence": ConfidenceSignal,
     "frequency": FrequencySignal,
+    "action_outcome": ActionOutcomeSignal,
 }
 """Registry mapping signal names to their default factory classes."""
+
+
+def default_signal_active(
+    name: str,
+    candidates: list[ThoughtRecord],
+    *,
+    current_cycle: int | None,
+    access_tracking_enabled: bool,
+) -> bool:
+    """Report whether a default signal has a data source for this run.
+
+    A signal is **active for a consolidation run** when its underlying data
+    source yields a non-default value for at least one candidate in the pool.
+    An inactive (structurally flat) signal contributes the same constant to
+    every candidate, so it carries no ranking information — its weight is
+    redistributed onto the active signals (see
+    :meth:`DreamingExtension._compute_active_weights`).
+
+    The predicate is **pool-relative and evaluated once per run**, never
+    per-thought: a per-thought active set would let a single thought's data
+    presence over-promote thoughts that lack it.
+
+    Args:
+        name: Default-signal name (one of :data:`DEFAULT_SIGNALS`).
+        candidates: The candidate pool for this consolidation run.
+        current_cycle: The run's cycle number, or ``None`` when the caller
+            did not supply one (cycle-based signals are then inactive).
+        access_tracking_enabled: Whether access tracking is enabled; the
+            ``frequency`` signal can only be active when it is.
+
+    Returns:
+        ``True`` when the named default signal is active for this run.
+
+    Raises:
+        KeyError: If ``name`` is not a recognised default signal.
+
+    """
+    if name not in DEFAULT_SIGNALS:
+        msg = f"not a default signal: {name!r}"
+        raise KeyError(msg)
+    if name in ("recency", "staleness"):
+        # Cycle-based decay/span — meaningful only with a run cycle.
+        return current_cycle is not None
+    if name == "confirmation":
+        return any(t.confirmation_count > 0 for t in candidates)
+    if name == "confidence":
+        return any(t.confidence is not None for t in candidates)
+    if name == "action_outcome":
+        # Active only when at least one candidate carries an outcome aggregate.
+        # In an action-free pool every score is ``None`` so the signal is flat
+        # and drops out of the redistribution denominator.
+        return any(t.action_outcome_score is not None for t in candidates)
+    # frequency
+    return access_tracking_enabled and any(t.access_count > 0 for t in candidates)

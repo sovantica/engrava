@@ -34,6 +34,7 @@ async with await SqliteEngravaCore.from_config("engrava.yaml") as store:
 | `hooks` | `EngravaHooksProtocol \| None` | `None` | Extension hooks (defaults to `DefaultEngravaHooks`) |
 | `embedding_provider` | `EmbeddingProviderProtocol \| None` | `None` | Provider used when `auto_embed=True` |
 | `auto_embed` | `bool` | `False` | Auto-embed thoughts on create/update |
+| `require_embedding` | `bool` | `False` | When `True`, an auto-embed provider failure raises `EmbeddingGenerationError` instead of only logging a `WARNING` and re-raising the provider error. The thought is committed before embedding either way, so this governs how loudly a missing embedding is reported, not whether the row persists. No effect unless `auto_embed=True`. |
 
 > The `SqliteEngravaCore(db_path=...)` form does **not** exist — pass a
 > connection, or use `await SqliteEngravaCore.from_config(path)`.
@@ -60,8 +61,12 @@ keyword arguments and does **not** return a UUID string.
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `await create_thought(thought, *, expires_after_seconds=None, deduplicate=False)` | `ThoughtRecord` | Persist a `ThoughtRecord`; returns the stored record. Raises `ValueError` if the ID already exists. |
+| `await get_or_create(thought, *, expires_after_seconds=None)` | `tuple[ThoughtRecord, bool]` | Content-hash convenience over dedup: returns `(existing, False)` on a hash hit (confirmation bumped, like `deduplicate=True`) or `(new, True)` on a miss. The `bool` tells you whether it created, removing the check-then-create round trip. Does not alter a matched row's fields. |
+| `await upsert_by_hash(thought, *, expires_after_seconds=None)` | `ThoughtRecord` | Update-on-match upsert: on a hash hit, overwrites the stored row's mutable fields (`essence`, `priority`, `metadata`, `visibility`, `lifecycle_status`, `source`, `confidence`, `source_type`, `thought_type`) from `thought` and returns it (**no** confirmation bump — distinct from `deduplicate=True`, which returns the stored record unchanged); on a miss, inserts. `content` is never rewritten (it is the hash key). |
+| `await bulk_store(thoughts, *, deduplicate=False)` | `list[ThoughtRecord]` | Transactional batch insert: the whole list commits **once** and is all-or-nothing (any row error rolls the batch back). Order preserved. Under `auto_embed`, all thoughts are embedded in one batch provider call. `deduplicate` applies per row. |
 | `await get_thought(thought_id)` | `ThoughtRecord \| None` | Retrieve by ID; `None` if not found |
 | `await update_thought(thought_id, **changes)` | `ThoughtRecord` | Optimistic-concurrency update; raises `ThoughtNotFoundError` / `StaleDataError` |
+| `await restore_thought(thought_id, *, current_cycle=None)` | `ThoughtRecord` | Un-archive: transition an `ARCHIVED` thought back to `ACTIVE`, clearing its `archived_at_cycle` marker so an archive round-trips with no data loss. The reversible counterpart to the memory-hygiene / TTL / manual archive paths, journaled as an `UPDATE_THOUGHT`. Raises `ThoughtNotFoundError` if missing, `InvalidTransitionError` if the thought is not currently `ARCHIVED`, `StaleDataError` on a concurrent write. This is the **canonical** un-archive path (the only one that clears `archived_at_cycle`); a raw `update_thought(lifecycle_status=...)` back to `ACTIVE` leaves the marker set. |
 | `await list_thoughts(...)` | `list[ThoughtRecord]` | List with filters (keyword-only) |
 | `await count_thoughts(...)` | `int` | Count with filters (keyword-only) |
 | `await delete_thought(thought_id)` | `bool` | Hard delete; `True` if a row was removed |
@@ -86,6 +91,15 @@ record = ThoughtRecord(
 stored = await store.create_thought(record)
 ```
 
+```python
+from engrava import LifecycleStatus
+
+# Archive, then restore — a lossless round-trip.
+await store.update_thought(stored.thought_id, lifecycle_status=LifecycleStatus.ARCHIVED)
+restored = await store.restore_thought(stored.thought_id, current_cycle=42)
+assert restored.lifecycle_status is LifecycleStatus.ACTIVE
+```
+
 ##### `create_thought` keyword-only options
 
 | Parameter | Type | Default | Description |
@@ -104,8 +118,65 @@ stored = await store.create_thought(record)
 | `limit` | `int` | Max results (`list_thoughts` only; default `50`) |
 | `offset` | `int` | Results to skip (`list_thoughts` only; default `0`) |
 
-> `list_thoughts` also supports `min_cycle`, `max_cycle`, `visibility`, and
-> `exclude_visibility`.
+> `list_thoughts` also supports `min_cycle`, `max_cycle`, `visibility`,
+> `exclude_visibility`, and `provenance_filter` (see
+> [Provenance capture](#provenance-capture)).
+
+##### Provenance capture
+
+Attach optional, typed write-time **provenance** to a thought — the signals that
+become irrecoverable once a synthesised thought exists (which session/actor
+produced it, what query and instruction shaped it, which thoughts it was built
+from). Set `ThoughtRecord.provenance` to a `ProvenanceContext` before
+`create_thought`; every field is optional and bounded, and the default `None` is
+byte-identical to not using provenance at all.
+
+```python
+from engrava.domain.models.provenance import ProvenanceContext
+
+record = ThoughtRecord(
+    # ... the usual fields ...
+    provenance=ProvenanceContext(
+        session_id="sess-42",                              # indexed identity hint
+        actor_id="agent-a",                                # indexed identity hint
+        retrieval_query="remote work trade-offs",          # ≤4096 chars
+        instruction_context="summarise for a busy exec",   # ≤4096 chars
+        retrieval_context_ids=["t-1", "t-2"],              # ≤128 ids, ≤256 chars each
+    ),
+)
+await store.create_thought(record)
+```
+
+| `ProvenanceContext` field | Type | Notes |
+|---|---|---|
+| `session_id` | `str \| None` | Session handle. **Indexed** for lookup. ≤256 chars |
+| `actor_id` | `str \| None` | Actor/agent handle. **Indexed**. ≤256 chars |
+| `retrieval_query` | `str \| None` | Query text that retrieved the feeding context. ≤4096 chars |
+| `instruction_context` | `str \| None` | Instruction / system-prompt fragment. ≤4096 chars |
+| `retrieval_context_ids` | `list[str] \| None` | Source thought ids. Queryable, not indexed. ≤128 × ≤256 chars |
+
+**Query by provenance.** `list_thoughts(provenance_filter=...)` takes a
+`MetadataFilter` — an `AND` of `FieldPredicate`s over the `provenance` JSON
+column. Predicates on `$.session_id` / `$.actor_id` use the provenance identity
+index; rows whose `provenance` is `NULL` or malformed JSON never match a
+non-empty filter.
+
+```python
+from engrava.domain.models.filters import FieldOp, FieldPredicate, MetadataFilter
+
+mine = await store.list_thoughts(
+    provenance_filter=MetadataFilter(
+        [FieldPredicate("$.session_id", FieldOp.EQ, "sess-42")]
+    ),
+)
+```
+
+> **Untrusted hint — never identity, authentication, or authorization.**
+> Provenance is descriptive-only: the engine grants it zero authority and
+> consults it for no access, ranking, or consolidation decision. `actor_id` is
+> **not** a tenant boundary — tenant isolation is the store's file boundary (one
+> store per tenant). The engine never infers provenance; the caller passes it
+> explicitly.
 
 #### Edge CRUD
 
@@ -188,6 +259,7 @@ returns a single `HybridSearchResult` container.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
+| `await recall(query, *, top_k=10, current_cycle=None, filters=None, visibility=None, collapse_key=None, collapse_max_per_unit=None)` | `HybridSearchResult` | Ergonomic shorthand over `search_hybrid` for the common retrieval case: passes the query text straight through and delegates the scoped-retrieval keywords below |
 | `await search_fts(query, top_k=10)` | `list[tuple[str, float]]` | FTS5/BM25 text search → `(thought_id, bm25_score)` |
 | `await search_hybrid(query_text, query_vector=None, *, top_k=10, ...)` | `HybridSearchResult` | Combined FTS + vector + recency + priority + graph |
 | `await search_reflections_only(query_text, *, top_k=10, ...)` | `HybridSearchResult` | Hybrid search restricted to REFLECTION thoughts |
@@ -196,6 +268,36 @@ returns a single `HybridSearchResult` container.
 `vector_weight`, `recency_weight`, `recency_half_life`, `current_cycle`,
 `fts_top_k`, `vector_top_k`, `priority_weight`, `graph_weight`,
 `graph_edge_decay`, `include_reflections` (default `True`), `reflection_boost`.
+
+##### Scoped & de-fragmented retrieval (keyword-only)
+
+Both `recall` and `search_hybrid` accept the same four opt-in keywords for
+narrowing and de-duplicating ranked results. Every one defaults to `None` and
+the `None` path is byte-identical to an unscoped query, so existing callers see
+no change.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `filters` | `MetadataFilter \| None` | Metadata scope — an `AND` of typed `FieldPredicate`s over the thought's `metadata`, applied *in-arm* before each arm's candidate limit so it never starves `top_k`. `None` (or an empty filter) leaves the candidate set unchanged. A query refinement, **not** a security boundary. |
+| `visibility` | `VisibilityQueryFilter \| None` | Bounded `(visibility IN … [OR owner = …])` refinement over `$.visibility` / `$.owner` — the "public-or-mine" pattern. **A query filter, not access control:** it performs no authentication, authorization, or ownership enforcement; the caller can forge `owner`; it is bypassable and must not be used to protect tenant data (use one store per tenant for isolation). |
+| `collapse_key` | `str \| Sequence[str] \| None` | Opt-in de-fragmentation unit key — a single metadata path (`"$.session_id"`) or an ordered sequence forming a composite key. When set, only the single best-ranked row per caller-defined unit reaches the result and the freed slots backfill deeper distinct units. A **presentation / de-dup convenience, not a filter and not isolation.** The collapse step mutates no score, but *setting* `collapse_key` widens the internal candidate pool, which can rescale the min-max-normalized keyword scores and shift order among units; only `collapse_key=None` leaves the path byte-identical. A missing/malformed key ⇒ the row is its own unit, never collapsed. |
+| `collapse_max_per_unit` | `int \| None` | Opt-in intra-unit retention depth for `collapse_key`. `None` (default) keeps one best row per unit; an integer `>= 1` keeps up to that many highest-ranked members of a unit and lets the freed slots backfill deeper distinct units. Only effective together with `collapse_key`; a value `< 1` is rejected. |
+
+```python
+from engrava import MetadataFilter, VisibilityQueryFilter
+from engrava import FieldOp, FieldPredicate
+
+# Scope recall to one session's memories, keep only "public" or my own rows,
+# and collapse per-turn fragments to one best row each.
+result = await store.recall(
+    "remote work trade-offs",
+    top_k=10,
+    filters=MetadataFilter([FieldPredicate("$.session_id", FieldOp.EQ, "sess-42")]),
+    visibility=VisibilityQueryFilter(frozenset({"public"}), owner="alice"),
+    collapse_key="$.session_turn",
+    collapse_max_per_unit=2,   # keep up to 2 rows per turn instead of 1
+)
+```
 
 #### Metrics & maintenance
 
@@ -268,6 +370,7 @@ create modified copies.
 | `consolidated_from` | `list[str] \| None` | Source thought IDs if consolidated |
 | `visibility` | `ThoughtVisibility` | Access scope |
 | `access_count` | `int` | Times explicitly accessed |
+| `action_outcome_score` | `float \| None` | Mean outcome value (`[0.0, 1.0]`) over the thought's terminal linked actions; `None` when it has none. Maintained by the store when a linked action reaches a terminal state |
 | `last_accessed_at` | `str \| None` | ISO-8601 datetime of last access |
 | `created_at` | `str \| None` | ISO-8601 datetime when persisted |
 | `updated_at` | `str \| None` | ISO-8601 datetime of last mutation |
@@ -370,11 +473,19 @@ thought that prompted it, with execution and verification state.
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `await create_action(action)` | `ActionRecord` | Persist an `ActionRecord` |
+| `await update_action(action_id, *, status=None, verification_status=None)` | `ActionRecord` | Advance a stored action's `status` and/or `verification_status`. Validates the transition when `status` changes (illegal jump raises `InvalidTransitionError`); a verification-only update is allowed even on a terminal action. Raises `ActionNotFoundError` when the id is unknown. A supplied value equal to the stored one is a no-op. |
 | `await get_actions(thought_id)` | `list[ActionRecord]` | Actions linked to a thought |
 
 `ActionStatus` is a state machine: `PLANNED → EXECUTING → CONFIRMED` / `FAILED`,
 and `PLANNED → BLOCKED → PLANNED`. `can_transition_to(...)` / `evolve(...)`
-enforce valid transitions (an illegal change raises `InvalidTransitionError`).
+enforce valid transitions on the in-memory record, and `update_action(...)`
+enforces the same transitions when advancing the **stored** action (an illegal
+change raises `InvalidTransitionError`).
+
+When a linked action reaches a terminal state (`CONFIRMED` / `FAILED`), the
+source thought's `action_outcome_score` — the mean outcome value over its
+terminal actions, `None` when it has none — is recomputed. That score is also
+read by the optional `action_outcome` dreaming signal.
 
 ```python
 import uuid
@@ -390,9 +501,13 @@ action = ActionRecord(
 )
 await store.create_action(action)
 
-# advance through the lifecycle (frozen model → evolve returns a new instance):
-done = action.evolve(status=ActionStatus.EXECUTING).evolve(
-    status=ActionStatus.CONFIRMED
+# advance the STORED action through its lifecycle (journaled; validates each
+# transition). A terminal status recomputes the source thought's outcome score:
+await store.update_action(action.action_id, status=ActionStatus.EXECUTING)
+await store.update_action(action.action_id, status=ActionStatus.CONFIRMED)
+# verification can still advance while the status stays terminal:
+await store.update_action(
+    action.action_id, verification_status=VerificationStatus.CONFIRMED
 )
 
 actions = await store.get_actions(prompting_thought_id)
@@ -466,7 +581,13 @@ All enums are `StrEnum` — JSON-serializable and stored as strings.
 | `InvalidTransitionError` | `EngravaError` | Invalid lifecycle state transition |
 | `ReadOnlyViolationError` | `EngravaError` | Write attempt on read-only store |
 | `EmbeddingModelMismatchError` | `EngravaError` | Embedding model mismatch on restore |
+| `EmbeddingGenerationError` | `EngravaError` | Auto-embed failed under `require_embedding=True` (the thought is committed but unembedded); carries the failing `thought_id` |
 | `ExtensionMigrationError` | `EngravaError` | Extension schema migration failed (e.g. attempted downgrade) |
+| `ActionNotFoundError` | `EngravaError` | Action record ID not found; carries the failing `action_id` |
+| `InvalidFilterError` | `EngravaError` | Metadata/visibility filter invalid at construction (bad value, empty filter, unsupported operator, or too many predicates) |
+| `InvalidFilterPathError` | `EngravaError` | Filter path does not match the allowed JSONPath grammar (`$`, `$.key`, `$[0]` only) |
+| `EmbeddingQueryPrefixMismatchError` | `EngravaError` | Active query prefix diverges from the corpus pairing, silently degrading ranking |
+| `JournalIntegrityError` | `EngravaError` | On-open journal check (`journal.verify_on_open`) found a broken hash chain; carries first-broken diagnostics |
 
 > `create_edge` raises `ReferentialIntegrityError` when an endpoint thought
 > does not exist. This exception is **not** re-exported from the top-level

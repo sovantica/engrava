@@ -10,8 +10,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from engrava.domain.enums import ActionStatus, VerificationStatus
+    from engrava.domain.models.action import ActionRecord
     from engrava.domain.models.edge import EdgeRecord
     from engrava.domain.models.embedding import EmbeddingRecord
+    from engrava.domain.models.filters import MetadataFilter, VisibilityQueryFilter
     from engrava.domain.models.metrics import EngravaMetrics
     from engrava.domain.models.search import HybridSearchResult
     from engrava.domain.models.thought import MetadataValue, ThoughtRecord
@@ -60,6 +65,86 @@ class EngravaCoreProtocol(Protocol):
         """
         ...
 
+    async def get_or_create(
+        self,
+        thought: ThoughtRecord,
+        *,
+        expires_after_seconds: int | None = None,
+    ) -> tuple[ThoughtRecord, bool]:
+        """Fetch an existing thought by content hash, or create it.
+
+        A convenience over content-hash deduplication that returns whether it
+        created, eliminating the caller's check-then-create round trip. On a
+        hash hit the existing record is returned with ``created=False`` (its
+        ``confirmation_count`` bumped, identical to
+        ``create_thought(deduplicate=True)``); on a miss a new row is inserted
+        and returned with ``created=True``. The matched row's mutable fields are
+        not altered from ``thought`` — use :meth:`upsert_by_hash` for that.
+
+        Args:
+            thought: The candidate thought (its ``content`` supplies the hash).
+            expires_after_seconds: Optional relative TTL applied only on create.
+
+        Returns:
+            A ``(record, created)`` tuple; ``created`` is ``True`` on insert.
+
+        """
+        ...
+
+    async def upsert_by_hash(
+        self,
+        thought: ThoughtRecord,
+        *,
+        expires_after_seconds: int | None = None,
+    ) -> ThoughtRecord:
+        """Insert a thought, or update the matching row's mutable fields in place.
+
+        Update-on-match content-hash upsert, distinct from
+        ``create_thought(deduplicate=True)``: on a hash hit the stored row's
+        mutable fields (``essence``, ``priority``, ``metadata``, ``visibility``,
+        ``lifecycle_status``, ``source``, ``confidence``, ``source_type``,
+        ``thought_type``) are overwritten from ``thought`` and the updated
+        record returned — ``confirmation_count`` is *not* bumped. ``content`` is
+        never rewritten (it is the hash key). A miss delegates to
+        :meth:`create_thought`.
+
+        Args:
+            thought: The desired thought state (its ``content`` supplies the
+                hash; its mutable fields are copied onto a matched row).
+            expires_after_seconds: Optional relative TTL applied only on insert.
+
+        Returns:
+            The freshly inserted row on a miss, or the updated existing row on a
+            hit.
+
+        """
+        ...
+
+    async def bulk_store(
+        self,
+        thoughts: list[ThoughtRecord],
+        *,
+        deduplicate: bool = False,
+    ) -> list[ThoughtRecord]:
+        """Persist many thoughts in one all-or-nothing transaction.
+
+        Batch analogue of :meth:`create_thought`: the whole loop commits once
+        (not per row) and is transactional — if any row raises, the entire batch
+        is rolled back and nothing is persisted. The returned list is in input
+        order. When auto-embed is active, all inserted thoughts are embedded in
+        a single batch provider call, producing vectors byte-identical to
+        per-thought embedding.
+
+        Args:
+            thoughts: The thoughts to persist, in order (empty list ⇒ ``[]``).
+            deduplicate: Applied per row like ``create_thought(deduplicate=True)``.
+
+        Returns:
+            The persisted records in input order.
+
+        """
+        ...
+
     async def remember(
         self,
         text: str,
@@ -102,6 +187,10 @@ class EngravaCoreProtocol(Protocol):
         *,
         top_k: int = 10,
         current_cycle: int | None = None,
+        filters: MetadataFilter | None = None,
+        visibility: VisibilityQueryFilter | None = None,
+        collapse_key: str | Sequence[str] | None = None,
+        collapse_max_per_unit: int | None = None,
     ) -> HybridSearchResult:
         """Retrieve thoughts relevant to a query with one call.
 
@@ -115,6 +204,28 @@ class EngravaCoreProtocol(Protocol):
             current_cycle: Current cognitive cycle.  When provided, the
                 recency signal is blended into ranking; when ``None``,
                 recency is skipped.
+            filters: Optional metadata filter (an ``AND`` of typed field
+                predicates over ``metadata``); delegated to
+                ``search_hybrid``. ``None`` leaves the candidate set
+                unchanged.
+            visibility: Optional bounded visibility query filter; delegated
+                to ``search_hybrid``. A query refinement, not access
+                control — it enforces nothing and is bypassable.
+            collapse_key: Optional de-fragmentation unit key (a single
+                metadata path or an ordered sequence forming a composite key);
+                delegated to ``search_hybrid``. Keeps one best-ranked row per
+                caller-defined unit and backfills deeper distinct units. A
+                presentation / de-dup convenience, not a filter and not
+                isolation. The collapse step mutates no score, but *setting*
+                ``collapse_key`` widens the internal candidate pool, which can
+                rescale normalized fusion scores and shift order among units;
+                only ``collapse_key=None`` leaves the result path unchanged.
+            collapse_max_per_unit: Optional intra-unit retention depth for
+                ``collapse_key``; delegated to ``search_hybrid``. ``None``
+                (default) keeps one best row per unit; an integer ``>= 1`` keeps
+                up to that many highest-ranked members of a unit and backfills
+                the freed slots with deeper distinct units. Only effective with
+                ``collapse_key``; rejected when ``< 1``.
 
         Returns:
             A ``HybridSearchResult`` with the ranked matches and the set of
@@ -152,6 +263,26 @@ class EngravaCoreProtocol(Protocol):
         """
         ...
 
+    async def restore_thought(
+        self, thought_id: str, *, current_cycle: int | None = None
+    ) -> ThoughtRecord:
+        """Restore an archived thought to ``ACTIVE``, clearing its archive stamp.
+
+        Args:
+            thought_id: UUID of the archived thought to restore.
+            current_cycle: Optional cycle to stamp as the new ``updated_cycle``.
+
+        Returns:
+            The restored thought record (``lifecycle_status`` is ``ACTIVE``).
+
+        Raises:
+            ThoughtNotFoundError: If the thought does not exist.
+            InvalidTransitionError: If the thought is not currently ``ARCHIVED``.
+            StaleDataError: If the row was modified by another writer.
+
+        """
+        ...
+
     async def list_thoughts(
         self,
         *,
@@ -163,6 +294,7 @@ class EngravaCoreProtocol(Protocol):
         visibility: str | None = None,
         exclude_visibility: str | None = None,
         include_expired: bool = False,
+        provenance_filter: MetadataFilter | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[ThoughtRecord]:
@@ -177,6 +309,12 @@ class EngravaCoreProtocol(Protocol):
             visibility: Include only thoughts with this visibility.
             exclude_visibility: Exclude thoughts with this visibility.
             include_expired: If True, include expired thoughts.
+            provenance_filter: Optional typed ``AND`` filter over the
+                ``provenance`` JSON column (read-only; reuses the metadata
+                filter machinery). ``None`` leaves the result unchanged. A
+                ``session_id`` / ``actor_id`` predicate uses the provenance
+                identity index. Provenance is an untrusted hint, not a security
+                boundary.
             limit: Maximum number of results to return.
             offset: Number of results to skip.
 
@@ -273,6 +411,10 @@ class EngravaCoreProtocol(Protocol):
         current_cycle: int | None = None,
         fts_top_k: int = 50,
         vector_top_k: int = 50,
+        filters: MetadataFilter | None = None,
+        visibility: VisibilityQueryFilter | None = None,
+        collapse_key: str | Sequence[str] | None = None,
+        collapse_max_per_unit: int | None = None,
     ) -> HybridSearchResult:
         """Hybrid search combining FTS5 keyword + vector cosine similarity.
 
@@ -307,6 +449,42 @@ class EngravaCoreProtocol(Protocol):
             current_cycle: Current cycle number for recency calculation.
             fts_top_k: Max candidates from FTS5 before fusion.
             vector_top_k: Max candidates from vector search before fusion.
+            filters: Optional metadata filter (an ``AND`` of typed field
+                predicates over ``metadata``), applied in-arm before each
+                arm's limit so it never starves ``top_k``. ``None`` (or an
+                empty filter) leaves the candidate set unchanged.
+            visibility: Optional bounded visibility query filter for the
+                "public-or-mine" pattern. A query refinement, **not** access
+                control — it performs no authentication, authorization, or
+                ownership enforcement; the caller can forge ``owner``; it is
+                bypassable; it must not be used to protect tenant data.
+            collapse_key: Optional de-fragmentation unit key — a single
+                metadata path or an ordered sequence of paths forming a
+                composite key. When set, among the already-ranked candidates
+                only the single best-ranked row per caller-defined unit reaches
+                the result and the freed slots are backfilled by deeper
+                distinct units. A **presentation / de-dup convenience, not a
+                filter and not isolation**: it does not change which rows are
+                *eligible*, and the collapse step itself mutates no score (it
+                only drops lower-ranked same-unit members). *Setting*
+                ``collapse_key`` does, however, widen the internal candidate
+                pool for deeper backfill, which — because the keyword arm is
+                min-max normalized over the candidate set — can rescale
+                normalized fusion scores and shift order among units; only
+                ``collapse_key=None`` leaves the candidate, score, and order
+                path byte-identical to the unfiltered query. It is only as
+                meaningful as the unit metadata the application writes (a
+                missing or malformed key ⇒ the row is its own unit, never
+                collapsed).
+            collapse_max_per_unit: Optional intra-unit retention depth for
+                ``collapse_key`` — how many rows of one unit may reach the
+                result. ``None`` (default) keeps one best row per unit; an
+                integer ``>= 1`` keeps up to that many highest-ranked members of
+                a unit and lets the freed slots backfill deeper distinct units.
+                Only takes effect together with ``collapse_key``, only relaxes
+                the intra-unit count (never adds a non-candidate row, mutates a
+                score, or drops a distinct unit as a side effect), and is
+                rejected when ``< 1``.
 
         Returns:
             ``HybridSearchResult`` with ranked results and the set of
@@ -424,6 +602,55 @@ class EngravaCoreProtocol(Protocol):
 
         Returns:
             The EmbeddingRecord, or None if not found.
+
+        """
+        ...
+
+    async def create_action(self, action: ActionRecord) -> ActionRecord:
+        """Persist a new action record.
+
+        Args:
+            action: The action record to create.
+
+        Returns:
+            The persisted action record.
+
+        """
+        ...
+
+    async def update_action(
+        self,
+        action_id: str,
+        *,
+        status: ActionStatus | None = None,
+        verification_status: VerificationStatus | None = None,
+    ) -> ActionRecord:
+        """Advance a stored action's status and/or verification status.
+
+        Args:
+            action_id: UUID of the action to update.
+            status: New status, or ``None`` to leave the status unchanged.
+            verification_status: New verification status, or ``None`` to
+                leave it unchanged.
+
+        Returns:
+            The updated (or, for a no-op, the unchanged) action record.
+
+        Raises:
+            ActionNotFoundError: If the action does not exist.
+            InvalidTransitionError: If a real ``status`` change is illegal.
+
+        """
+        ...
+
+    async def get_actions(self, thought_id: str) -> list[ActionRecord]:
+        """Retrieve actions linked to a thought.
+
+        Args:
+            thought_id: UUID of the thought.
+
+        Returns:
+            List of action records.
 
         """
         ...

@@ -58,8 +58,6 @@ PHANTOM_TOKENS: dict[str, str] = {
     "db_path=": "an aiosqlite connection (SqliteEngravaCore(conn)) or from_config",
     ".row_count": ".count (MindQLResult.count)",
     "help_text=": "description= (MindQLExtension.description)",
-    # Removed / nonexistent methods
-    ".consolidate(": ".run_consolidation(",
     # Fabricated DreamingGates fields
     "min_confidence=": "min_confirmations= / promote_threshold=",
     "min_confirmation_count=": "min_confirmations=",
