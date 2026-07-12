@@ -85,7 +85,7 @@ jobs:
           cache: "pip"
       - name: Restore/Save HuggingFace cache
         id: hf-cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
           key: hf-${{ runner.os }}-sentence-transformers-all-MiniLM-L6-v2-v1
@@ -113,7 +113,7 @@ jobs:
       # on every matrix leg, so the tests run offline and make no Hub request.
       - name: Restore HuggingFace models
         id: hf-cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
           key: hf-${{ runner.os }}-sentence-transformers-all-MiniLM-L6-v2-v1
