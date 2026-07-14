@@ -314,7 +314,16 @@ class TestOffOnPair:
 # to before it existed). Later extended with the Memory Hygiene forgetting-loop
 # surface (HygienePolicyConfig / HygieneResult / EvictionReason), an additive,
 # default-off public-API addition (a store that never enables hygiene_policy is
-# unchanged on every read/write path).
+# unchanged on every read/write path). Later extended with the derived-records
+# extension-seam surface (DerivedRecordProducerProtocol / DerivedRecord /
+# DeriveContext / DeriveGates / DerivedRecordError, plus the StructuralSplitProducer
+# reference consumer), an additive, default-off public-API addition (with the seam
+# disabled, or the hooks object not a producer, every write path is byte-identical).
+# Later extended with ConnectionQuarantinedError, the typed error raised only when a
+# derived-child compensating rollback could not be guaranteed to complete under
+# cancellation (the connection is quarantined so a later operation cannot run on an
+# indeterminate transaction) — an additive, default-off public-API addition never
+# raised on any normal read/write path.
 _PRE_WS_ALL_BASELINE = frozenset(
     {
         "ActionNotFoundError",
@@ -328,10 +337,16 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "ConfidenceSignal",
         "ConfigError",
         "ConfirmationSignal",
+        "ConnectionQuarantinedError",
         "ConsolidationResult",
         "CoreThoughtRecord",
         "DefaultEngravaHooks",
         "DefaultMindStoreHooks",
+        "DeriveContext",
+        "DeriveGates",
+        "DerivedRecord",
+        "DerivedRecordError",
+        "DerivedRecordProducerProtocol",
         "DreamingConfig",
         "DreamingContext",
         "DreamingExtension",
@@ -407,6 +422,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "StaleDataError",
         "StalenessSignal",
         "StorageFootprint",
+        "StructuralSplitProducer",
         "TTLConfig",
         "ThoughtCounts",
         "ThoughtNotFoundError",

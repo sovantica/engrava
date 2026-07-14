@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
 
+from engrava.domain.protocols.derived_records import DeriveGates
 from engrava.domain.protocols.hooks import DefaultEngravaHooks
 
 if TYPE_CHECKING:
@@ -1019,6 +1020,11 @@ class EngravaConfig:
         ttl: TTL / auto-expiry configuration.
         metrics: Basic observability snapshot configuration.
         ingest: Ingest-layer configuration (content-hash deduplication).
+        derive: Derived-records extension-seam gates. ``enabled=False``
+            (default) leaves every write path byte-identical to a store without
+            the seam; enabling it lets a hooks object that implements
+            ``DerivedRecordProducerProtocol`` persist derived records after a
+            source store.
         extension_manifest_paths: Dotted import paths to
             ``ExtensionManifest`` objects to load on startup.  Each
             entry must use the form ``"module.path:ATTRIBUTE"``.  Loaded
@@ -1050,6 +1056,7 @@ class EngravaConfig:
     ttl: TTLConfig = field(default_factory=TTLConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     ingest: IngestConfig = field(default_factory=IngestConfig)
+    derive: DeriveGates = field(default_factory=DeriveGates)
     extension_manifest_paths: list[str] = field(default_factory=list)
     extension_discover: bool = False
 
@@ -1189,6 +1196,9 @@ def _parse_config(raw: dict[str, Any]) -> EngravaConfig:
     # Ingest section (content-hash deduplication)
     ingest_cfg = _parse_ingest(raw.get("ingest"))
 
+    # Derived-records extension-seam section
+    derive_cfg = _parse_derive(raw.get("derive"))
+
     # Manifests section
     ext_manifest_paths, ext_discover = _parse_manifests(raw.get("manifests"))
 
@@ -1207,6 +1217,7 @@ def _parse_config(raw: dict[str, Any]) -> EngravaConfig:
         ttl=ttl_cfg,
         metrics=metrics_cfg,
         ingest=ingest_cfg,
+        derive=derive_cfg,
         extension_manifest_paths=ext_manifest_paths,
         extension_discover=ext_discover,
     )
@@ -1257,6 +1268,53 @@ def _parse_ingest(raw: Any) -> IngestConfig:  # noqa: ANN401
         raise ConfigError(msg)
 
     return IngestConfig(deduplication_enabled=deduplication_enabled)
+
+
+# ------------------------------------------------------------------
+# Derived-records extension-seam config parser
+# ------------------------------------------------------------------
+
+
+def _parse_derive(raw: Any) -> DeriveGates:  # noqa: ANN401
+    """Parse the ``derive:`` YAML section into :class:`DeriveGates`.
+
+    Args:
+        raw: Raw YAML value for the ``derive`` section (dict or None).
+
+    Returns:
+        A validated :class:`DeriveGates` (the disabled default when the section
+        is absent).
+
+    Raises:
+        ConfigError: On invalid field types or values.
+
+    """
+    if raw is None:
+        return DeriveGates()
+    if not isinstance(raw, dict):
+        msg = "'derive' must be a mapping"
+        raise ConfigError(msg)
+
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        msg = "'derive.enabled' must be a boolean"
+        raise ConfigError(msg)
+
+    on_error = raw.get("on_error", "log")
+    if on_error not in ("raise", "log"):
+        msg = "'derive.on_error' must be 'raise' or 'log'"
+        raise ConfigError(msg)
+
+    max_derived = raw.get("max_derived_per_source", 32)
+    if isinstance(max_derived, bool) or not isinstance(max_derived, int) or max_derived < 1:
+        msg = "'derive.max_derived_per_source' must be a positive integer"
+        raise ConfigError(msg)
+
+    return DeriveGates(
+        enabled=enabled,
+        on_error=on_error,
+        max_derived_per_source=max_derived,
+    )
 
 
 # ------------------------------------------------------------------

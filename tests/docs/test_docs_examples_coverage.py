@@ -169,6 +169,26 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
         "Protocol-definition only",
     ),
     (
+        "docs/api-reference.md",
+        "class DerivedRecordProducerProtocol(Protocol)",
+        "Protocol-definition only",
+    ),
+    (
+        "docs/extension-hooks.md",
+        "-> Sequence[DerivedRecord]: ...",
+        "bare derive_records signature fragment; conformance asserted in the seam tests",
+    ),
+    (
+        "docs/extension-hooks.md",
+        "hooks=StructuralSplitProducer(),",
+        "opens a real on-disk database file; derived-records wiring illustrative",
+    ),
+    (
+        "docs/extension-hooks.md",
+        "class SentenceSplitter(DefaultEngravaHooks):",
+        "class-definition-only producer; the shipped StructuralSplitProducer is behaviour-tested",
+    ),
+    (
         "docs/audit-trail.md",
         "journaling is active",
         "requires an on-disk engrava.yaml; illustrative from_config wiring",

@@ -656,3 +656,60 @@ class TestSignalWeightSumValidation:
         with caplog.at_level("WARNING", logger="engrava.config"):
             DreamingConfig(signals={"a": 0.1, "b": 0.1})
         assert "signal weights sum" in caplog.text.lower()
+
+
+# ------------------------------------------------------------------
+# Derived-records extension-seam section
+# ------------------------------------------------------------------
+
+
+class TestDeriveConfig:
+    """Parsing of the ``derive:`` section into ``DeriveGates``."""
+
+    _BASE_YAML = "database:\n  path: ./engrava.sqlite3\n"
+
+    def test_absent_section_defaults_to_disabled(self, tmp_path: Path) -> None:
+        """No ``derive`` section ⇒ the seam is disabled by default."""
+        cfg_file = tmp_path / "engrava.yaml"
+        cfg_file.write_text(self._BASE_YAML, encoding="utf-8")
+        cfg = load_config(cfg_file)
+        assert cfg.derive.enabled is False
+        assert cfg.derive.on_error == "log"
+        assert cfg.derive.max_derived_per_source == 32
+
+    def test_full_section_parsed(self, tmp_path: Path) -> None:
+        """An explicit ``derive`` section populates every gate."""
+        cfg_file = tmp_path / "engrava.yaml"
+        cfg_file.write_text(
+            self._BASE_YAML
+            + "derive:\n  enabled: true\n  on_error: raise\n  max_derived_per_source: 8\n",
+            encoding="utf-8",
+        )
+        cfg = load_config(cfg_file)
+        assert cfg.derive.enabled is True
+        assert cfg.derive.on_error == "raise"
+        assert cfg.derive.max_derived_per_source == 8
+
+    def test_non_mapping_rejected(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "engrava.yaml"
+        cfg_file.write_text(self._BASE_YAML + "derive: nope\n", encoding="utf-8")
+        with pytest.raises(ConfigError, match="'derive' must be a mapping"):
+            load_config(cfg_file)
+
+    def test_bad_on_error_rejected(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "engrava.yaml"
+        cfg_file.write_text(
+            self._BASE_YAML + "derive:\n  on_error: explode\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError, match=r"derive\.on_error"):
+            load_config(cfg_file)
+
+    def test_bad_cap_rejected(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "engrava.yaml"
+        cfg_file.write_text(
+            self._BASE_YAML + "derive:\n  max_derived_per_source: 0\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ConfigError, match="max_derived_per_source"):
+            load_config(cfg_file)

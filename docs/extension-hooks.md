@@ -6,6 +6,7 @@ and transform data flowing through the core pipeline:
 | Interface | File | Semantic |
 |-----------|------|----------|
 | `EngravaHooksProtocol` | `domain/protocols/hooks.py` | **Transformation** — methods return modified data (custom scoring, MindQL extensions) |
+| `DerivedRecordProducerProtocol` | `domain/protocols/derived_records.py` | **Derivation** — return N derived records from one stored thought; core persists each as an ordinary thought (see §1A) |
 
 For higher-level extension patterns (embedding providers, custom MindQL commands)
 see [extensions.md](extensions.md).
@@ -38,6 +39,138 @@ but do not expect core to invoke them.
 | `score_function(thought, context)` | Custom relevance score | `float` | reserved — not called by core |
 | `decay_function(thought, elapsed_cycles)` | Per-thought decay factor | `float` in `[0.0, 1.0]` | reserved — not called by core |
 | `mindql_extension_registry()` | Register custom MindQL verbs | `dict[str, MindQLExtension]` | reserved — core wires MindQL verbs via `ExtensionManifest.mindql_extensions`, not this hook |
+
+---
+
+## 1A. Derived-records extension seam
+
+Sometimes an extension needs to turn **one** stored thought into **several**
+records — split a document into sections, distil an observation into atomic
+facts, extract structured items. `on_store` cannot express this: it is
+one-in / one-out. The derived-records seam fills that gap through a **separate,
+optional capability protocol** — `EngravaHooksProtocol` is unchanged, so an
+existing hooks class keeps working unchanged (byte-identical persisted results).
+
+### 1A.1 Contract
+
+Implement `derive_records` on your hooks object. Core detects the capability
+with `isinstance(hooks, DerivedRecordProducerProtocol)` (it is
+`@runtime_checkable`); if the method is absent, the seam is simply absent.
+
+```python
+async def derive_records(
+    self, thought: ThoughtRecord, ctx: DeriveContext
+) -> Sequence[DerivedRecord]: ...
+```
+
+- Called **only after the source thought is durable**, and only when the seam
+  is enabled (`DeriveGates.enabled`). If `on_store` raises, derivation never
+  runs.
+- The producer describes **what** to derive; core owns **how** it is persisted.
+  A `DerivedRecord` carries only producer-owned fields — a non-empty `content`,
+  `thought_type`, `priority`, a `metadata` payload, and the
+  `attach_provenance_edge` flag. Identity, the `essence`, timestamps, cycle, and
+  lifecycle status are assigned by core (the `essence` is derived from
+  `content`) and are **not representable** on the type, so there is nothing for a
+  producer to forge.
+- `DeriveContext` exposes only stable facts about the source
+  (`source_thought_id`, `source_content_hash`, `cycle_at_derivation`) plus an
+  informational `origin`. It exposes **no store handle**: a producer must not
+  persist, query, or mutate anything itself, and must not spawn background
+  tasks. Persistence is entirely core-controlled.
+- For exact idempotency, make the output a deterministic function of the source.
+
+### 1A.2 Persistence model
+
+Derivation is **source-first, per-child, deferred, and non-atomic**. For each
+returned record, in producer order, core runs the same lifecycle an ordinary
+thought gets: insert → commit → auto-embed → (if requested) attach the single
+`DERIVED_FROM` provenance edge (derived → source). A child's **row** commits as
+its own durable unit; its enrichment (embedding, edge) completes afterward, so a
+child can be durably present yet not-yet-enriched — a recoverable partial state,
+not atomic enrichment. A crash mid-family leaves a **partial but regenerable**
+result, recovered by re-running derivation (deterministic content-hash ids make a
+re-run idempotent: existing children/edges are reused, missing ones filled).
+
+The `DERIVED_FROM` edge records **content-level** provenance ("this content was
+produced by deriving from the source"), so a child that reuses an existing row
+is linked, not duplicated.
+
+**When derivation fires.** Only on a **durably auto-committed** create: a normal
+`create_thought` (dispatched inline right after its own commit) or a `bulk_store`
+insert (dispatched after the batch commits, per genuinely-new record — dedup /
+hash hits are excluded). A create issued **inside a caller-held
+`suspend_auto_commit()` window does not auto-derive** — the caller owns that open
+transaction and the source is not yet durable; trigger derivation with an
+explicit re-run / backfill once your transaction has committed. This is
+recoverability by explicit backfill, not automatic recovery.
+
+### 1A.3 Gates
+
+Configure the seam with `DeriveGates` (or the `derive:` YAML section):
+
+| Gate | Default | Meaning |
+|------|---------|---------|
+| `enabled` | `False` | Master switch. When off, the persisted results (DB + journal) are byte-identical to a store without the seam. |
+| `on_error` | `"log"` | `"log"` records a failure with ordinary logging and continues with the remaining children; `"raise"` re-raises after the source is durable, aborting the rest. |
+| `max_derived_per_source` | `32` | Core reads at most this many + 1 items and rejects an over-cap (or lazy/unbounded) return before any child is written. |
+
+Durability is decoupled from derivation: the source is **always** durable even
+when a producer or a child fails. With `on_error="raise"` the caller may see an
+error *while the source persists* (durability ≠ API success). `CancelledError`
+always propagates, regardless of `on_error`.
+
+### 1A.4 Example — a deterministic, dependency-free producer
+
+`StructuralSplitProducer` (shipped in `engrava.extensions.structural_split`) is
+a complete reference consumer: it splits a thought's content into paragraphs and
+derives one linked child per paragraph, running purely on the stored text — no
+model, no network, no external service.
+
+```python
+import aiosqlite
+from engrava import DeriveGates, SqliteEngravaCore, StructuralSplitProducer
+
+conn = await aiosqlite.connect("engrava.db")
+store = SqliteEngravaCore(
+    conn,
+    hooks=StructuralSplitProducer(),
+    derive_gates=DeriveGates(enabled=True),
+)
+await store.ensure_schema()
+# Storing a multi-paragraph thought now also persists one derived child per
+# paragraph, each carrying a DERIVED_FROM edge back to the source.
+```
+
+To write your own, subclass `DefaultEngravaHooks` and add `derive_records`:
+
+```python
+from collections.abc import Sequence
+
+from engrava import DerivedRecord, DeriveContext, Priority, ThoughtType
+from engrava.domain.models.thought import ThoughtRecord
+from engrava.domain.protocols.hooks import DefaultEngravaHooks
+
+
+class SentenceSplitter(DefaultEngravaHooks):
+    async def derive_records(
+        self, thought: ThoughtRecord, ctx: DeriveContext
+    ) -> Sequence[DerivedRecord]:
+        sentences = [s.strip() for s in thought.content.split(".") if s.strip()]
+        return [
+            DerivedRecord(
+                content=s,
+                thought_type=ThoughtType.OBSERVATION,
+                priority=Priority.P3,
+            )
+            for s in sentences
+        ]
+```
+
+`DerivedRecordProducerProtocol`, `DerivedRecord`, `DeriveContext`, and
+`DeriveGates` are public API under the `X.Y.x` stability guarantee (no breaking
+change within a patch series; breaking changes ship in a minor after a
+deprecation window).
 
 ---
 

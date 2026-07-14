@@ -23,6 +23,8 @@ from engrava.domain.models.journal import JournalEntry, JournalIntegrityResult
 if TYPE_CHECKING:
     import aiosqlite
 
+    from engrava.infrastructure.sqlite.connection_revocation import ConnectionRevocationToken
+
 
 class JournalWriter:
     """Append-only writer for hash-linked journal entries.
@@ -35,6 +37,12 @@ class JournalWriter:
     Args:
         db: An open aiosqlite connection with the ``journal_entry``
             table already created.
+        revocation: Optional shared revocation token. When the owning store
+            quarantines the connection it revokes this token, and every
+            connection-touching method here then fails hard with
+            :class:`~engrava.domain.exceptions.ConnectionQuarantinedError` —
+            so this holder of the real connection cannot bypass the store's
+            terminal quarantine. ``None`` (standalone use) disables the check.
 
     Examples:
         >>> writer = JournalWriter(db)  # doctest: +SKIP
@@ -48,9 +56,25 @@ class JournalWriter:
 
     _connection_locks: ClassVar[dict[int, asyncio.Lock]] = {}
 
-    def __init__(self, db: aiosqlite.Connection) -> None:
+    def __init__(
+        self,
+        db: aiosqlite.Connection,
+        *,
+        revocation: ConnectionRevocationToken | None = None,
+    ) -> None:
         self._db = db
+        self._revocation = revocation
         self._lock = self._connection_locks.setdefault(id(db), asyncio.Lock())
+
+    def _check_revoked(self) -> None:
+        """Fail hard if the shared connection has been revoked (quarantined).
+
+        Raises:
+            ConnectionQuarantinedError: When the revocation token is revoked.
+
+        """
+        if self._revocation is not None:
+            self._revocation.check()
 
     async def _get_latest_entry_state(self) -> tuple[int, str | None]:
         """Read the current chain tail from the database.
@@ -132,7 +156,12 @@ class JournalWriter:
         Returns:
             The persisted ``JournalEntry`` with computed hash.
 
+        Raises:
+            ConnectionQuarantinedError: When the shared connection has been
+                revoked (the owning store quarantined it).
+
         """
+        self._check_revoked()
         for _attempt in range(5):
             async with self._lock:
                 last_sequence, parent_hash = await self._get_latest_entry_state()
@@ -193,7 +222,12 @@ class JournalWriter:
         Returns:
             A ``JournalIntegrityResult`` describing chain validity.
 
+        Raises:
+            ConnectionQuarantinedError: When the shared connection has been
+                revoked (the owning store quarantined it).
+
         """
+        self._check_revoked()
         cursor = await self._db.execute(
             "SELECT entry_id, sequence_number, mutation_type, target_id, "
             "       delta, parent_hash, entry_hash, created_at "
@@ -270,7 +304,12 @@ class JournalWriter:
             List of matching ``JournalEntry`` objects ordered by
             ``sequence_number`` ascending.
 
+        Raises:
+            ConnectionQuarantinedError: When the shared connection has been
+                revoked (the owning store quarantined it).
+
         """
+        self._check_revoked()
         clauses: list[str] = []
         params: list[object] = []
 

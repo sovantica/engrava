@@ -95,6 +95,16 @@ background thread.
 For multi-service setups via `EngravaManager`, each service has its own
 database file with independent locking.
 
+Under this single-writer contract, if the store ever quarantines its connection
+(an internal safety response to an indeterminate transaction), quarantine
+revokes admission synchronously: every new operation on the store or its journal
+then fails fast with `ConnectionQuarantinedError`, so no write can flush an
+orphaned transaction. It does not retract an operation already in flight — a
+reader admitted just before quarantine may complete a possibly-stale read on the
+pre-quarantine connection (never a commit). During quarantine the physical
+connection close is a detached, best-effort cleanup; a permanently-hung close is
+only a pending-task lifecycle nicety, not a safety concern.
+
 ## Embedding Dimension Consistency
 
 All embeddings for a given database must use the same dimensionality. Mixing

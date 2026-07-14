@@ -347,3 +347,66 @@ class ExtensionMigrationError(EngravaError):
             prefix += f", file={migration_file!r}"
         prefix += "]"
         super().__init__(f"{prefix} {message}")
+
+
+class DerivedRecordError(EngravaError):
+    """Raised when the derived-records extension seam rejects a producer result.
+
+    Covers the deterministic, content-independent failure modes of the seam:
+    a returned sequence that exceeds ``DeriveGates.max_derived_per_source``,
+    or a derived record whose core-assigned identity would collide with its
+    own source thought (a self-referential ``DERIVED_FROM`` edge). It is
+    **not** used for producer-internal exceptions (those propagate or are
+    logged verbatim per ``DeriveGates.on_error``).
+
+    Args:
+        source_thought_id: Identity of the source thought whose derivation
+            was rejected.
+        message: Human-readable description of the rejection.
+
+    Examples:
+        >>> raise DerivedRecordError("t-1", "over cap")
+        Traceback (most recent call last):
+            ...
+        engrava.domain.exceptions.DerivedRecordError: [source='t-1'] over cap
+
+    """
+
+    def __init__(self, source_thought_id: str, message: str) -> None:
+        self.source_thought_id = source_thought_id
+        super().__init__(f"[source={source_thought_id!r}] {message}")
+
+
+class ConnectionQuarantinedError(EngravaError):
+    """Raised when the store's connection has been quarantined and is unusable.
+
+    A long-lived SQLite connection is quarantined when a compensating rollback
+    could not be guaranteed to complete — most critically when a cancellation
+    interrupted a per-child rollback in the derived-records seam and the
+    rollback ultimately failed, so the connection may still hold an open
+    transaction. Continuing to use such a connection could flush an orphaned
+    partial write or run later operations on an indeterminate transaction, so
+    every public operation fails fast with this error instead. The condition is
+    terminal for the store instance: a new store over a fresh connection must
+    be constructed to recover.
+
+    Scope: quarantine revokes *admission* — every NEW operation on the store or
+    its journal fails fast with this error, so no write/commit can flush an
+    orphaned transaction. It does not retract an operation already admitted
+    before revocation: under the single-writer contract overlapping writes are
+    unsupported, but a reader admitted just before revocation may complete its
+    in-flight read on the pre-revocation connection (a possibly-stale read,
+    never a commit).
+
+    Args:
+        reason: Human-readable description of why the connection was quarantined.
+
+    Examples:
+        >>> str(ConnectionQuarantinedError("open transaction"))
+        'connection quarantined: open transaction'
+
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"connection quarantined: {reason}")

@@ -31,6 +31,8 @@ from engrava.domain.enums import (
 )
 from engrava.domain.exceptions import (
     ActionNotFoundError,
+    ConnectionQuarantinedError,
+    DerivedRecordError,
     EmbeddingGenerationError,
     EmbeddingModelMismatchError,
     EmbeddingQueryPrefixMismatchError,
@@ -68,6 +70,12 @@ from engrava.domain.models.search import HybridSearchResult
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.domain.models.thought import ThoughtRecord as CoreThoughtRecord
 from engrava.domain.models.ttl import CleanupResult, CleanupStrategy
+from engrava.domain.protocols.derived_records import (
+    DeriveContext,
+    DerivedRecord,
+    DerivedRecordProducerProtocol,
+    DeriveGates,
+)
 from engrava.domain.protocols.embedding_provider import (
     EmbeddingProviderProtocol,
     RoleAwareEmbeddingProvider,
@@ -96,6 +104,7 @@ from engrava.extensions.dreaming_signals import (
     RecencySignal,
     StalenessSignal,
 )
+from engrava.extensions.structural_split import StructuralSplitProducer
 from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
 from engrava.infrastructure.read_only_store import ReadOnlyEngrava
 from engrava.infrastructure.service_manager import EngravaManager
@@ -118,10 +127,16 @@ __all__ = [
     "ConfidenceSignal",
     "ConfigError",
     "ConfirmationSignal",
+    "ConnectionQuarantinedError",
     "ConsolidationResult",
     "CoreThoughtRecord",
     "DefaultEngravaHooks",
     "DefaultMindStoreHooks",
+    "DeriveContext",
+    "DeriveGates",
+    "DerivedRecord",
+    "DerivedRecordError",
+    "DerivedRecordProducerProtocol",
     "DreamingConfig",
     "DreamingContext",
     "DreamingExtension",
@@ -197,6 +212,7 @@ __all__ = [
     "StaleDataError",
     "StalenessSignal",
     "StorageFootprint",
+    "StructuralSplitProducer",
     "TTLConfig",
     "ThoughtCounts",
     "ThoughtNotFoundError",

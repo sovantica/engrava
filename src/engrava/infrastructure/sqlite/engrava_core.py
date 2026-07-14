@@ -19,9 +19,12 @@ import json
 import logging
 import math
 import re
+import sqlite3
 import struct
+import unicodedata
 import uuid as _uuid
 from importlib import resources
+from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn, Self
 
@@ -42,6 +45,8 @@ from engrava.domain.enums import (
 )
 from engrava.domain.exceptions import (
     ActionNotFoundError,
+    ConnectionQuarantinedError,
+    DerivedRecordError,
     EmbeddingGenerationError,
     EmbeddingModelMismatchError,
     EmbeddingQueryPrefixMismatchError,
@@ -60,10 +65,17 @@ from engrava.domain.models.journal import JournalIntegrityResult
 from engrava.domain.models.provenance import ProvenanceContext
 from engrava.domain.models.thought import MetadataValue, ThoughtRecord
 from engrava.domain.models.ttl import CleanupResult, CleanupStrategy
+from engrava.domain.protocols.derived_records import (
+    DeriveContext,
+    DerivedRecord,
+    DerivedRecordProducerProtocol,
+    DeriveGates,
+)
 from engrava.domain.protocols.embedding_provider import RoleAwareEmbeddingProvider
 from engrava.domain.protocols.hooks import DefaultEngravaHooks, EngravaHooksProtocol
 from engrava.extensions.dreaming_signals import DreamingContext
 from engrava.infrastructure.sqlite.centroid import CENTROID_MODEL_NAME, compute_centroid
+from engrava.infrastructure.sqlite.connection_revocation import ConnectionRevocationToken
 from engrava.infrastructure.sqlite.hygiene import (
     EvictionReason,
     HygieneResult,
@@ -88,6 +100,214 @@ if TYPE_CHECKING:
     from engrava.mindql.parser import MindQLQuery
 
 logger = logging.getLogger(__name__)
+
+#: Recursion guard for the derived-records extension seam. Set for the duration
+#: of a ``derive_records`` dispatch and its per-child inserts; every write entry
+#: point consults it so that a write issued *during* derivation (including one a
+#: contract-violating producer performs) never dispatches a nested derivation.
+#: Depth is thereby bounded to at most one. A ``ContextVar`` (not a plain
+#: attribute) so the flag is task-local and safe under concurrent stores.
+_IN_DERIVATION: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "engrava_in_derivation",
+    default=False,
+)
+
+#: Informational label naming the write operation that triggered derivation.
+#: Purely descriptive (surfaced on ``DeriveContext.origin``); never consulted
+#: for recursion control or authorization.
+_DERIVATION_ORIGIN: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "engrava_derivation_origin",
+    default="create_thought",
+)
+
+#: Fixed namespaces for the deterministic identities the derived-records seam
+#: assigns. A derived thought's ``thought_id`` is ``uuid5`` over its content, so
+#: byte-identical derived content maps to one stored thought and re-running
+#: derivation is idempotent; the provenance edge id is ``uuid5`` over its
+#: endpoints + type, so a re-run reuses the same edge row.
+_DERIVED_THOUGHT_NAMESPACE = _uuid.UUID("d1f5e6a2-3b4c-5d6e-8f90-a1b2c3d4e5f6")
+_DERIVED_EDGE_NAMESPACE = _uuid.UUID("e2a6f7b3-4c5d-6e7f-9a01-b2c3d4e5f6a7")
+
+#: Upper bound on a derived thought's ``essence`` (matches the
+#: ``ThoughtRecord.essence`` field constraint).
+_DERIVED_ESSENCE_MAX_CHARS = 200
+
+
+def _essence_from_content(content: str) -> str:
+    """Derive a compact ``essence`` preview from a derived record's content.
+
+    The persisted thought stores the full ``content`` verbatim; the ``essence``
+    is only a short preview (the ``ThoughtRecord.essence`` bound is
+    :data:`_DERIVED_ESSENCE_MAX_CHARS` characters), so no information is lost by
+    truncating it. Truncation is **best-effort combining-mark-aware**, not full
+    Unicode grapheme-cluster segmentation: when the truncation boundary falls on
+    a combining mark, it backs off past the base+mark run so a base character is
+    not left without its mark. Multi-code-point graphemes beyond simple
+    base+combining sequences (e.g. emoji ZWJ sequences, regional-indicator pairs)
+    are not specially handled. ``content`` is guaranteed non-empty by
+    ``DerivedRecord`` validation, so the result is always a valid non-empty
+    essence.
+
+    Args:
+        content: The derived record's (non-empty) content.
+
+    Returns:
+        A non-empty essence preview of at most ``_DERIVED_ESSENCE_MAX_CHARS``
+        code points.
+
+    """
+    if len(content) <= _DERIVED_ESSENCE_MAX_CHARS:
+        # Short enough to preview verbatim — no truncation, nothing to sever.
+        return content
+    end = _DERIVED_ESSENCE_MAX_CHARS
+    while end > 0 and unicodedata.combining(content[end]):
+        end -= 1
+    if end == 0:
+        # Degenerate: a run of combining marks spans the whole boundary window,
+        # so there is no base character to cut after. Fall back to a raw
+        # code-point truncation — non-empty and no worse than the input's own
+        # structure — rather than emitting a single detached combining mark.
+        return content[:_DERIVED_ESSENCE_MAX_CHARS]
+    return content[:end]
+
+
+def _derived_thought_id(content: str) -> str:
+    """Return the deterministic identity of a derived thought for *content*.
+
+    A ``uuid5`` over the content, so byte-identical derived content maps to a
+    single stored thought (intra-family duplicates collapse; a re-run reuses the
+    same row).
+
+    Args:
+        content: The derived thought's full content.
+
+    Returns:
+        A canonical UUID string usable as a ``thought_id``.
+
+    """
+    return str(_uuid.uuid5(_DERIVED_THOUGHT_NAMESPACE, content))
+
+
+def _derived_edge_id(from_thought_id: str, to_thought_id: str) -> str:
+    """Return the deterministic identity of a ``DERIVED_FROM`` provenance edge.
+
+    A ``uuid5`` over the endpoints and edge type, so re-running derivation
+    reuses the same edge row (conflict-safe on both the primary key and the
+    ``(from, to, type)`` unique constraint).
+
+    Args:
+        from_thought_id: The derived (source-of-edge) thought id.
+        to_thought_id: The originating source thought id.
+
+    Returns:
+        A canonical UUID string usable as an ``edge_id``.
+
+    """
+    key = f"{from_thought_id}|{to_thought_id}|{EdgeType.DERIVED_FROM.value}"
+    return str(_uuid.uuid5(_DERIVED_EDGE_NAMESPACE, key))
+
+
+#: SQLite extended result codes that identify an identity collision the
+#: derived-records seam treats as conflict-as-reuse: a ``UNIQUE`` constraint
+#: (2067) or a ``PRIMARY KEY`` constraint (1555). Classified structurally via
+#: :attr:`sqlite3.Error.sqlite_errorcode` rather than by inspecting the message
+#: text, so the check is locale/driver-independent and never misclassifies a
+#: differently-worded constraint (e.g. a ``CHECK`` or ``FOREIGN KEY`` failure).
+_UNIQUE_CONSTRAINT_ERRORCODES: frozenset[int] = frozenset(
+    {
+        getattr(sqlite3, "SQLITE_CONSTRAINT_UNIQUE", 2067),
+        getattr(sqlite3, "SQLITE_CONSTRAINT_PRIMARYKEY", 1555),
+    },
+)
+
+
+def _is_unique_violation(exc: aiosqlite.IntegrityError) -> bool:
+    """Return ``True`` when *exc* is a UNIQUE / PRIMARY KEY constraint violation.
+
+    Used by the derived-records seam to treat an identity collision as reuse
+    (conflict-as-reuse) rather than an error, while letting other integrity
+    failures (e.g. FOREIGN KEY, CHECK) propagate. Classification uses SQLite's
+    extended result code (:attr:`sqlite3.Error.sqlite_errorcode`, available on
+    Python 3.11+) — a UNIQUE (2067) or PRIMARY KEY (1555) code — instead of
+    matching the message text, which is locale/driver-fragile and could
+    misclassify (e.g. a ``CHECK`` constraint whose name contains ``"unique"``).
+    A text match is used only as a fallback if the extended code is unavailable.
+
+    Args:
+        exc: The raised SQLite integrity error.
+
+    Returns:
+        ``True`` for a UNIQUE/PK violation, ``False`` otherwise (a FOREIGN KEY,
+        CHECK, or other integrity failure is *not* treated as a unique
+        violation and re-raises upstream).
+
+    """
+    errorcode = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(errorcode, int):
+        return errorcode in _UNIQUE_CONSTRAINT_ERRORCODES
+    # Fallback only when the extended result code is unavailable. Unreachable on
+    # the supported floor (Python >= 3.11 always exposes ``sqlite_errorcode``).
+    return "UNIQUE" in str(exc).upper()  # pragma: no cover
+
+
+class _DerivationRollbackError(Exception):
+    """Internal: a per-child rollback itself failed during derivation.
+
+    Signals that after a child persistence failure the compensating
+    ``rollback()`` also raised, leaving the transaction state indeterminate (the
+    failed child's pending insert/edge may still be open and could be flushed by
+    a later child's commit). The derivation dispatch must therefore abort
+    immediately — this exception is **non-continuable** and is never swallowed by
+    the ``on_error="log"`` continue branch. The original child failure is chained
+    as ``__cause__``. Private to this module; not part of the public API.
+
+    Args:
+        rollback_error: The exception raised by the failed ``rollback()``.
+
+    """
+
+    def __init__(self, rollback_error: BaseException) -> None:
+        super().__init__(f"rollback failed after a derived-child error: {rollback_error}")
+
+
+class _QuarantinedConnection:
+    """Terminal stand-in installed on a quarantined store's ``_db`` slot.
+
+    Once a store is quarantined its real connection is *detached* and this proxy
+    takes the ``_db`` slot. Every attribute access other than an idempotent
+    ``close`` raises :class:`ConnectionQuarantinedError`, so a quarantined store
+    fails hard on **any** core-initiated DB operation — ``commit``, ``execute``,
+    ``cursor``, a read, or one of the direct-commit sites that bypass the
+    :meth:`SqliteEngravaCore._maybe_commit` flag guard — **independent of whether
+    the physical connection actually closed**. This is what makes quarantine
+    terminal by construction rather than by a best-effort ``close()`` succeeding.
+
+    ``close`` is a no-op so store shutdown stays graceful after quarantine.
+    Private to this module; never part of the public API.
+
+    Args:
+        reason: Human-readable cause, surfaced on every raised error.
+
+    """
+
+    def __init__(self, reason: str) -> None:
+        self._reason = reason
+
+    async def close(self) -> None:
+        """Idempotent no-op — the real connection is already detached."""
+
+    def __getattr__(self, name: str) -> NoReturn:
+        """Reject every other attribute access on a quarantined connection.
+
+        Args:
+            name: The attribute being accessed (e.g. ``execute``/``commit``).
+
+        Raises:
+            ConnectionQuarantinedError: Always.
+
+        """
+        raise ConnectionQuarantinedError(self._reason)
+
 
 #: Page size for the full-table paginated scans that must inspect *every*
 #: matching row rather than relying on a single capped page: the
@@ -559,10 +779,30 @@ class SqliteEngravaCore:
         manifests: Sequence[ExtensionManifest] = (),
         access_tracking_enabled: bool = False,
         hygiene_policy: HygienePolicyConfig | None = None,
+        derive_gates: DeriveGates | None = None,
     ) -> None:
         self._db = db
         self._hooks: EngravaHooksProtocol = hooks or DefaultEngravaHooks()
         self._skip_auto_commit: bool = False
+        # Terminal quarantine state. Set only when a per-child compensating
+        # rollback in the derived-records seam did not cleanly complete (raised
+        # or was cancelled), so the long-lived connection may still hold an open
+        # transaction. Quarantine is terminal by construction:
+        #   * the flag makes guarded entry points + ``_maybe_commit`` fail fast;
+        #   * ``_db`` is swapped for a ``_QuarantinedConnection`` proxy so every
+        #     core-initiated op raises regardless of physical close; and
+        #   * the shared revocation token (below) makes every *other* holder of
+        #     the real connection (the JournalWriter) fail hard too.
+        # Never cleared — recovery requires a fresh connection + store.
+        self._connection_quarantined: bool = False
+        self._quarantine_reason: str | None = None
+        # Shared with the JournalWriter (and any future direct-connection holder)
+        # so quarantine revokes them all synchronously, independent of the
+        # best-effort physical close.
+        self._revocation = ConnectionRevocationToken()
+        # Retains the detached best-effort close task so it is neither GC'd while
+        # pending nor reported as an unretrieved-exception task.
+        self._quarantine_close_task: asyncio.Task[None] | None = None
         self._fts_available: bool = False
         self._fts_probed: bool = False
         self._vector_backend: SqliteVecSearchBackend | None = None
@@ -577,7 +817,9 @@ class SqliteEngravaCore:
         self._embedding_model_verified: bool = False
         self._search_config: SearchConfig | None = search_config
         self._journal_enabled: bool = journal_enabled
-        self._journal: JournalWriter | None = JournalWriter(db) if journal_enabled else None
+        self._journal: JournalWriter | None = (
+            JournalWriter(db, revocation=self._revocation) if journal_enabled else None
+        )
         self._ttl_strategy: str = ttl_strategy
         self._ttl_check_every_n: int = ttl_check_every_n
         self._ttl_default_seconds: int | None = ttl_default_seconds
@@ -620,6 +862,13 @@ class SqliteEngravaCore:
         # read/write path changes. ``run_hygiene`` and the ``consolidate()``
         # convenience invocation both no-op when this is ``None``/disabled.
         self._hygiene_policy: HygienePolicyConfig | None = hygiene_policy
+        # Derived-records extension seam. ``enabled=False`` (the default) ⇒ the
+        # seam is inert and every write path is byte-identical to a store
+        # without it. When enabled *and* the hooks object implements
+        # ``DerivedRecordProducerProtocol``, a successful source store is
+        # followed by a core-controlled, guarded, per-child persistence of the
+        # producer's derived records (see ``_dispatch_derivation``).
+        self._derive_gates: DeriveGates = derive_gates or DeriveGates()
 
     @property
     def journal(self) -> JournalWriter | None:
@@ -664,7 +913,11 @@ class SqliteEngravaCore:
             True
 
         """
-        journal = self._journal if self._journal is not None else JournalWriter(self._db)
+        journal = (
+            self._journal
+            if self._journal is not None
+            else JournalWriter(self._db, revocation=self._revocation)
+        )
         return await journal.verify_integrity()
 
     async def _record_search_latency(self, latency_ms: float) -> None:
@@ -847,6 +1100,7 @@ class SqliteEngravaCore:
                 manifests=manifests,
                 access_tracking_enabled=access_tracking_enabled,
                 hygiene_policy=config.hygiene_policy,
+                derive_gates=config.derive,
             )
             store._owns_connection = True
 
@@ -2180,6 +2434,13 @@ class SqliteEngravaCore:
         writers are unsupported (a separate connection per writer is the
         supported concurrency model).
 
+        Note on the derived-records seam: a create issued inside this block does
+        **not** auto-derive (the source is not yet durable and this block owns
+        the transaction). ``bulk_store`` dispatches derivation itself, locally,
+        after its batch commits; a caller writing inside its own
+        ``suspend_auto_commit`` window triggers derivation via an explicit
+        re-run/backfill (see :meth:`_dispatch_derivation`).
+
         Yields:
             None — the store operates in deferred-commit mode.
 
@@ -2195,8 +2456,143 @@ class SqliteEngravaCore:
         finally:
             self._skip_auto_commit = False
 
+    def _ensure_connection_usable(self) -> None:
+        """Fail fast when the connection has been quarantined.
+
+        Called at the start of public operations so a caller cannot run against
+        a connection whose transaction state is indeterminate (see
+        :attr:`_connection_quarantined`). It is also the universal write
+        backstop: :meth:`_maybe_commit` calls it before every commit, so no code
+        path — guarded entry point or not — can flush an orphaned transaction on
+        a quarantined connection.
+
+        Raises:
+            ConnectionQuarantinedError: When the connection has been quarantined.
+
+        """
+        if self._connection_quarantined:
+            raise ConnectionQuarantinedError(self._quarantine_reason or "connection unusable")
+
+    @staticmethod
+    async def _drain_shielded(task: asyncio.Task[None]) -> asyncio.CancelledError | None:
+        """Await a shielded task to completion, returning any cancellation of us.
+
+        The task is observed via a **single** :func:`asyncio.wait` waiter that is
+        awaited under :func:`asyncio.shield` and reused across every cancellation
+        of our await (no new waiter is spawned per cancellation). ``asyncio.wait``
+        surfaces the task's outcome without raising it, and the shielded waiter
+        keeps observing the task to the end no matter how many times *our* await
+        is cancelled. A cancellation of our await is captured and returned (never
+        swallowed) so the caller can honor it once the task is safely complete;
+        the task's own success/failure is left on the task for the caller.
+
+        Args:
+            task: The already-scheduled task to drain to completion.
+
+        Returns:
+            The last ``CancelledError`` raised into our await, or ``None``.
+
+        """
+        waiter = asyncio.ensure_future(asyncio.wait({task}))
+        cancelled: asyncio.CancelledError | None = None
+        while not waiter.done():
+            try:
+                await asyncio.shield(waiter)
+            except asyncio.CancelledError as cancel_exc:
+                cancelled = cancel_exc
+        # Consume the waiter's result so it is never an unretrieved exception.
+        with contextlib.suppress(BaseException):
+            waiter.result()
+        return cancelled
+
+    @staticmethod
+    def _consume_quarantine_close(task: asyncio.Task[None]) -> None:
+        """Done-callback that consumes the detached best-effort close outcome.
+
+        Retrieves any exception so the task is never reported as an
+        unretrieved-exception; a *cancelled* close task carries no exception to
+        retrieve and is left alone (``exception()`` would raise on it). The
+        outcome is irrelevant to correctness — the proxy + token already
+        guarantee terminality — so it is never re-raised.
+
+        Args:
+            task: The completed detached close task.
+
+        """
+        if not task.cancelled():
+            # Retrieve (and discard) any close failure so it is not logged as an
+            # unretrieved task exception.
+            task.exception()
+
+    async def _quarantine_connection(self, reason: str) -> None:
+        """Make the store terminally unusable, by construction and independent of close.
+
+        Kept ``async`` for call-site symmetry with the compensating-rollback flow
+        and so the "returns promptly even if close hangs" liveness contract is
+        awaitable in tests; it intentionally **awaits nothing** — every step is
+        synchronous and the physical close is *detached*.
+
+        Terminal-by-construction, in three synchronous steps (nothing here can be
+        cancelled or blocked, so a caller-frame cancellation is never swallowed —
+        it is simply delivered at the caller's next await and propagates):
+
+        1. Set the flag — guarded entry points and :meth:`_maybe_commit` fail fast
+           with a typed :class:`ConnectionQuarantinedError`.
+        2. Revoke the shared :class:`ConnectionRevocationToken` — every *other*
+           holder of the real connection (the :class:`JournalWriter`) fails hard
+           on its next connection-touching method, so it cannot bypass the proxy.
+        3. Detach the real connection, swap in a :class:`_QuarantinedConnection`
+           proxy (so every core-initiated op raises), and schedule a **bounded,
+           detached** best-effort close for resource cleanup. Quarantine returns
+           promptly even if that close hangs forever — safety never depends on it.
+           A done-callback consumes the close outcome so a failure/cancellation
+           is never an unretrieved-task warning, and the task is retained so it is
+           not GC'd while pending.
+
+        Idempotent: a second call is a no-op (already quarantined).
+
+        Guarantee / limitation: quarantine synchronously revokes *admission* —
+        every NEW operation on the store or its journal fails fast with
+        :class:`ConnectionQuarantinedError`, and direct core connection access is
+        terminal via the proxy — so no write/commit can flush an orphaned
+        transaction, regardless of whether the physical close succeeds. It does
+        NOT retract an operation already admitted before revocation: overlapping
+        writes on one store are unsupported (single-writer contract), but a
+        concurrent reader admitted just before revocation may complete its
+        in-flight read on the pre-revocation connection — a possibly-stale read,
+        never a commit.
+
+        Args:
+            reason: Human-readable cause, surfaced on every raised error.
+
+        """
+        if self._connection_quarantined:
+            return
+        self._connection_quarantined = True
+        self._quarantine_reason = reason
+        self._revocation.revoke(reason)
+        real_conn = self._db
+        self._db = _QuarantinedConnection(reason)  # type: ignore[assignment]  # terminal proxy
+        # Detached best-effort close: schedule and return; do NOT await it, so a
+        # hung close can never block quarantine (safety is already guaranteed by
+        # the proxy + token). Retain the task and consume its result via callback.
+        close_task = asyncio.get_running_loop().create_task(real_conn.close())
+        self._quarantine_close_task = close_task
+        close_task.add_done_callback(self._consume_quarantine_close)
+
     async def _maybe_commit(self) -> None:
-        """Commit if auto-commit is not suspended."""
+        """Commit if auto-commit is not suspended.
+
+        Fails fast with a typed error on a quarantined connection. This flag
+        check is the fast path for the common commit; the hard backstop is the
+        ``_QuarantinedConnection`` proxy on ``self._db`` — even a commit that
+        skipped this check would raise on ``self._db.commit()``.
+
+        Raises:
+            ConnectionQuarantinedError: When the connection has been quarantined.
+
+        """
+        self._ensure_connection_usable()
         if not self._skip_auto_commit:
             await self._db.commit()
 
@@ -2615,8 +3011,10 @@ class SqliteEngravaCore:
                 ``thought.provenance`` is not a
                 :class:`~engrava.domain.models.provenance.ProvenanceContext`
                 (per :func:`_validate_provenance`).
+            ConnectionQuarantinedError: When the connection has been quarantined.
 
         """
+        self._ensure_connection_usable()
         _validate_metadata(thought.metadata)
         _validate_provenance(thought.provenance)
 
@@ -2677,7 +3075,20 @@ class SqliteEngravaCore:
             await self._auto_embed_thought(thought)
 
         await self._maybe_auto_cleanup(exclude_id=thought.thought_id)
-        return await self._hooks.on_store(thought)
+        enriched = await self._hooks.on_store(thought)
+        # Derived-records seam. Dispatched inline only after the source's own
+        # commit and ``on_store`` have completed; the committed source
+        # (``thought``, the input to ``on_store`` — not its possibly-different
+        # return value) is what the producer derives from.
+        # ``_dispatch_derivation`` returns early (after at most a cheap
+        # enabled/capability check) unless the seam is enabled, the source's own
+        # commit actually happened (it does not dispatch inside a suspended-commit
+        # window — ``bulk_store`` dispatches after its batch commits), and the
+        # hooks object is a producer; so the disabled/absent path above yields
+        # byte-identical persisted results (DB + journal). If ``on_store`` raised,
+        # we never reach here and derivation does not run.
+        await self._dispatch_derivation(thought)
+        return enriched
 
     async def get_or_create(
         self,
@@ -2728,8 +3139,10 @@ class SqliteEngravaCore:
                 size invariants (validated up front on both the hit and miss
                 paths, matching ``create_thought(deduplicate=True)`` which
                 validates before it branches).
+            ConnectionQuarantinedError: When the connection has been quarantined.
 
         """
+        self._ensure_connection_usable()
         # Validate up front — before the hash probe — so an invalid-metadata
         # candidate raises on a hit too, exactly as ``create_thought`` does
         # (it validates at the top, ahead of the dedup branch). ``create_thought``
@@ -2742,11 +3155,15 @@ class SqliteEngravaCore:
             )
             if existing is not None:
                 return await self._increment_confirmation(existing), False
-            created = await self.create_thought(
-                thought,
-                expires_after_seconds=expires_after_seconds,
-                deduplicate=False,
-            )
+            origin_token = _DERIVATION_ORIGIN.set("get_or_create")
+            try:
+                created = await self.create_thought(
+                    thought,
+                    expires_after_seconds=expires_after_seconds,
+                    deduplicate=False,
+                )
+            finally:
+                _DERIVATION_ORIGIN.reset(origin_token)
             return created, True
 
     #: Mutable ``ThoughtRecord`` fields a content-hash upsert copies from the
@@ -2826,8 +3243,10 @@ class SqliteEngravaCore:
                 paths).
             StaleDataError: If the matched row is modified concurrently between
                 the hash probe and the in-place update.
+            ConnectionQuarantinedError: When the connection has been quarantined.
 
         """
+        self._ensure_connection_usable()
         # Validate up front so an invalid-metadata candidate raises consistently
         # on both the hit (update) and miss (insert) branches.
         _validate_metadata(thought.metadata)
@@ -2837,11 +3256,15 @@ class SqliteEngravaCore:
                 _compute_content_hash(thought.content),
             )
             if existing is None:
-                return await self.create_thought(
-                    thought,
-                    expires_after_seconds=expires_after_seconds,
-                    deduplicate=False,
-                )
+                origin_token = _DERIVATION_ORIGIN.set("upsert_by_hash")
+                try:
+                    return await self.create_thought(
+                        thought,
+                        expires_after_seconds=expires_after_seconds,
+                        deduplicate=False,
+                    )
+                finally:
+                    _DERIVATION_ORIGIN.reset(origin_token)
             # Only the fields that actually differ are forwarded to
             # ``update_thought``. This keeps the update minimal (no spurious OCC
             # churn or re-embed when a field is unchanged) and, critically,
@@ -2893,6 +3316,12 @@ class SqliteEngravaCore:
         hit is skipped even when the submitted record reuses an existing row's
         id.
 
+        When the derived-records seam is active, derivation is dispatched
+        **locally after the batch commits**, once per genuinely newly-created
+        record (a dedup / hash hit never derives — it returns before the
+        dispatch), so derivation runs only on durably-committed inserts, off the
+        batch transaction.
+
         Like :meth:`suspend_auto_commit`, this call briefly toggles
         store-instance state (the deferred-commit flag, and a flag that defers
         per-thought embedding to the batch). The store owns a single connection
@@ -2916,12 +3345,18 @@ class SqliteEngravaCore:
                 violates the shape/size invariants (whole batch rolled back).
             EmbeddingGenerationError: If batch auto-embed fails and
                 ``require_embedding`` is ``True`` (whole batch rolled back).
+            ConnectionQuarantinedError: When the connection has been quarantined.
 
         """
+        self._ensure_connection_usable()
         if not thoughts:
             return []
 
         embed_active = self._auto_embed and self._embedding_provider is not None
+        derivation_active = self._derive_gates.enabled and isinstance(
+            self._hooks,
+            DerivedRecordProducerProtocol,
+        )
 
         # Snapshot the ids that already exist so genuine inserts can be told
         # apart from dedup hits deterministically — by *row existence*, never by
@@ -2929,11 +3364,63 @@ class SqliteEngravaCore:
         # rebuilds the record to populate timestamps, and a dedup hit can return
         # a row whose id coincides with the submitted one.) Only rows whose id is
         # absent here — and not yet inserted earlier in this same batch — are
-        # freshly inserted and thus need embedding.
+        # freshly inserted, and thus the ones that need embedding and are eligible
+        # for derivation. Taken whenever embedding OR the derived-records seam is
+        # active, so a dedup hit never derives even with auto-embed off (D5).
         pre_existing_ids: set[str] = set()
-        if embed_active:
+        if embed_active or derivation_active:
             pre_existing_ids = await self._existing_thought_ids()
 
+        origin_token = _DERIVATION_ORIGIN.set("bulk_store")
+        try:
+            return await self._bulk_store_inner(
+                thoughts,
+                deduplicate=deduplicate,
+                embed_active=embed_active,
+                derivation_active=derivation_active,
+                pre_existing_ids=pre_existing_ids,
+            )
+        finally:
+            _DERIVATION_ORIGIN.reset(origin_token)
+
+    async def _bulk_store_inner(
+        self,
+        thoughts: list[ThoughtRecord],
+        *,
+        deduplicate: bool,
+        embed_active: bool,
+        derivation_active: bool,
+        pre_existing_ids: set[str],
+    ) -> list[ThoughtRecord]:
+        """Run the ``bulk_store`` insert loop under the derivation-origin label.
+
+        Extracted so the ``bulk_store`` public method stays a thin wrapper that
+        sets the informational ``DeriveContext.origin`` for the batch.
+
+        The insert loop runs under ``suspend_auto_commit`` (one transaction). Only
+        genuinely-inserted records — those whose id was absent before the batch
+        and not inserted earlier in it, i.e. dedup / hash hits excluded (D5) — are
+        collected as ``newly_created``. **After** the batch commits and is durable
+        (the ``async with`` has exited), derivation is dispatched locally, per
+        newly-created record, off the batch transaction, each child its own
+        guarded durable unit; a producer/child failure there can never roll back a
+        committed source or child (D3/D10). There is no shared instance buffer —
+        ``newly_created`` is a local variable of this call.
+
+        Args:
+            thoughts: The thoughts to persist, in order.
+            deduplicate: Per-row content-hash deduplication toggle.
+            embed_active: Whether auto-embed is active for this batch.
+            derivation_active: Whether the derived-records seam is active (used to
+                collect the newly-created records for post-commit dispatch).
+            pre_existing_ids: Ids present before the batch (for embed / derivation
+                new-insert selection).
+
+        Returns:
+            The persisted records in input order.
+
+        """
+        newly_created: list[ThoughtRecord] = []
         async with self.suspend_auto_commit():
             self._suppress_auto_embed = embed_active
             try:
@@ -2943,13 +3430,20 @@ class SqliteEngravaCore:
                 for thought in thoughts:
                     record = await self.create_thought(thought, deduplicate=deduplicate)
                     persisted.append(record)
-                    if embed_active and record.thought_id not in seen_before:
-                        inserted.append(record)
+                    if record.thought_id not in seen_before:
+                        if embed_active:
+                            inserted.append(record)
+                        if derivation_active:
+                            newly_created.append(record)
                     seen_before.add(record.thought_id)
                 if embed_active and inserted:
                     await self._batch_embed_thoughts(inserted)
             finally:
                 self._suppress_auto_embed = False
+        # Batch committed and durable now — dispatch derivation locally, off the
+        # transaction, for the records this call genuinely newly-created.
+        for record in newly_created:
+            await self._dispatch_derivation(record)
         return persisted
 
     async def _existing_thought_ids(self) -> set[str]:
@@ -2966,6 +3460,510 @@ class SqliteEngravaCore:
         cursor = await self._db.execute("SELECT thought_id FROM thought")
         rows = await cursor.fetchall()
         return {str(row[0]) for row in rows}
+
+    # ------------------------------------------------------------------
+    # Derived-records extension seam
+    # ------------------------------------------------------------------
+
+    async def _dispatch_derivation(self, source: ThoughtRecord) -> None:
+        """Persist an extension's derived records for a committed source thought.
+
+        Runs only when the seam is enabled, the source is durable (auto-commit is
+        not suspended), the recursion guard is clear, and the configured hooks
+        object implements
+        :class:`~engrava.domain.protocols.derived_records.DerivedRecordProducerProtocol`.
+        When any of those does not hold it returns without touching the store, so
+        the disabled/absent path produces byte-identical persisted results (DB +
+        journal) — it does at most a single cheap capability/enabled check before
+        returning, not zero extra work.
+
+        When called while auto-commit is suspended it returns without dispatching:
+        the source is not yet durable and derivation must never run inside a
+        transaction. ``bulk_store`` instead dispatches derivation locally, per
+        newly-created record, *after* its batch commits; a caller writing inside
+        its own ``suspend_auto_commit`` window triggers derivation via an explicit
+        re-run/backfill (ADR D8 — recoverability, not automatic recovery). A
+        dedup / hash hit never reaches this method (those return before the
+        dispatch call in ``create_thought``), so only genuine inserts derive (D5).
+
+        The recursion guard (:data:`_IN_DERIVATION`) is set for the whole
+        dispatch — including any nested public write a (contract-violating)
+        producer might issue — so derivation depth never exceeds one.
+
+        Args:
+            source: The committed source thought to derive from (the record that
+                was persisted, i.e. the input to ``on_store``).
+
+        """
+        if not self._derive_gates.enabled:
+            return
+        if _IN_DERIVATION.get():
+            return
+        if self._skip_auto_commit:
+            # Not yet durable (inside a suspended-commit window). Do not dispatch
+            # and do not buffer — bulk_store dispatches locally post-commit, and
+            # a caller-held transaction triggers derivation via explicit backfill.
+            return
+        if not isinstance(self._hooks, DerivedRecordProducerProtocol):
+            return
+        producer: DerivedRecordProducerProtocol = self._hooks
+        ctx = DeriveContext(
+            source_thought_id=source.thought_id,
+            source_content_hash=_compute_content_hash(source.content),
+            cycle_at_derivation=source.updated_cycle,
+            origin=_DERIVATION_ORIGIN.get(),
+        )
+        token = _IN_DERIVATION.set(True)
+        try:
+            await self._run_derivation(producer, source, ctx)
+        finally:
+            _IN_DERIVATION.reset(token)
+
+    async def _run_derivation(
+        self,
+        producer: DerivedRecordProducerProtocol,
+        source: ThoughtRecord,
+        ctx: DeriveContext,
+    ) -> None:
+        """Invoke the producer and persist its derived records per-child.
+
+        Fail-open: the source is already durable, so any failure here never
+        rolls it back. ``CancelledError`` always propagates (it is not an
+        ``on_error`` case). Under ``on_error="log"`` a producer failure is
+        logged and skipped, and a per-child failure is logged and the remaining
+        children continue; under ``on_error="raise"`` the error re-raises after
+        the source is safe, aborting the remaining children.
+
+        Args:
+            producer: The derived-record producer capability.
+            source: The committed source thought.
+            ctx: The derivation context.
+
+        """
+        on_error = self._derive_gates.on_error
+        records = await self._collect_derived(producer, source, ctx, on_error)
+        if records is None:
+            return
+        for record in records:
+            try:
+                await self._persist_derived_child(source, record, ctx)
+            except asyncio.CancelledError:
+                raise
+            except _DerivationRollbackError:
+                # Non-continuable: a per-child rollback failed, so the
+                # transaction state is indeterminate. Aborting the remaining
+                # children is mandatory regardless of ``on_error`` — a later
+                # child's commit could flush the failed child's pending work.
+                # But the source is already durably committed, so this must not
+                # escape a ``"log"`` policy as a caller-visible raise (fail-open,
+                # ADR D10): under ``"raise"`` propagate; under ``"log"`` log at
+                # error level and stop without re-raising. ``CancelledError`` is
+                # handled by its own branch above and always propagates.
+                if on_error == "raise":
+                    raise
+                logger.exception(
+                    "derived-record rollback failed for source %s; aborting remaining children",
+                    ctx.source_thought_id,
+                )
+                return
+            except Exception:
+                if on_error == "raise":
+                    raise
+                logger.warning(
+                    "derived-record persistence failed for source %s; continuing",
+                    ctx.source_thought_id,
+                    exc_info=True,
+                )
+
+    async def _collect_derived(
+        self,
+        producer: DerivedRecordProducerProtocol,
+        source: ThoughtRecord,
+        ctx: DeriveContext,
+        on_error: str,
+    ) -> list[DerivedRecord] | None:
+        """Invoke the producer, consume its sequence, and enforce the cap.
+
+        Both the ``derive_records`` call **and** the consumption of its returned
+        sequence run inside one fail-open guard: an exception raised while
+        producing *or while iterating* the result (e.g. a lazy sequence that
+        raises mid-iteration) is, under ``on_error="log"``, logged and swallowed
+        with the source left durable; under ``on_error="raise"`` it re-raises
+        after the source is safe. ``CancelledError`` always propagates. At most
+        ``max_derived_per_source + 1`` items are pulled, so a lazy or unbounded
+        sequence cannot flood the store; an over-cap return is rejected — before
+        any child is written — per ``on_error``.
+
+        Args:
+            producer: The derived-record producer capability.
+            source: The committed source thought.
+            ctx: The derivation context.
+            on_error: The active failure policy (``"raise"`` / ``"log"``).
+
+        Returns:
+            The bounded list of derived records, or ``None`` when the producer
+            failed, iteration failed, or an over-cap return was rejected under
+            ``on_error="log"``.
+
+        Raises:
+            DerivedRecordError: When the return is over-cap and
+                ``on_error="raise"``.
+
+        """
+        cap = self._derive_gates.max_derived_per_source
+        try:
+            raw = await producer.derive_records(source, ctx)
+            collected = list(islice(raw, cap + 1))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if on_error == "raise":
+                raise
+            logger.warning(
+                "derive_records failed for source %s; skipping derivation",
+                ctx.source_thought_id,
+                exc_info=True,
+            )
+            return None
+        if len(collected) > cap:
+            msg = f"producer returned more than max_derived_per_source={cap} records"
+            if on_error == "raise":
+                raise DerivedRecordError(source.thought_id, msg)
+            logger.warning("%s for source %s; skipping derivation", msg, ctx.source_thought_id)
+            return None
+        return collected
+
+    async def _persist_derived_child(
+        self,
+        source: ThoughtRecord,
+        record: DerivedRecord,
+        ctx: DeriveContext,
+    ) -> None:
+        """Persist a single derived record as an ordinary thought, per-child.
+
+        Runs the same lifecycle an ordinary thought gets — insert →
+        ``_maybe_commit`` → auto-embed → (optional) ``DERIVED_FROM`` edge — but
+        without re-entering ``on_store`` (derived records are core-persisted).
+        Insertion and the edge are conflict-safe at the DB level, so a child
+        colliding with an existing row is reused, not re-inserted.
+
+        Enrichment (embedding + edge) is completion-driven, not insert-driven:
+        the embedding is generated whenever the persisted row has none yet, and
+        the edge insert is conflict-safe. So a re-run over a child that committed
+        but never got enriched — e.g. a crash or cancellation between the child's
+        commit and its post-commit embedding/edge — completes the enrichment
+        idempotently (D8/D10 recoverability).
+
+        Enrichment always targets the **stored** row's own content, never the
+        producer's content. On a conflict-as-reuse hit the stored row may differ
+        from the producer's record (a caller can pre-create a thought whose id
+        equals a derived child's deterministic id but with different content), so
+        the embedding is computed from the re-read stored row — a producer-content
+        vector is never attached to a row whose content differs.
+
+        Per-child transaction isolation: a child's **row** commits as its own
+        durable unit; its enrichment (embedding, ``DERIVED_FROM`` edge) completes
+        afterward, so a child may be durably present yet not-yet-enriched — a
+        recoverable partial state (D10), not atomic enrichment. If any step
+        (insert, its journal append, embed, or edge insert) fails after writing
+        but before that step's own commit, the child's uncommitted mutations are
+        rolled back before the error propagates — so no half-written row/edge
+        (e.g. a row whose journal append failed) can be flushed by a later
+        child's commit, and the journal chain stays consistent. Earlier children
+        and the source are already committed, so the rollback discards only this
+        child's pending work.
+
+        Args:
+            source: The committed source thought.
+            record: The producer-owned derived record.
+            ctx: The derivation context.
+
+        Raises:
+            DerivedRecordError: When the derived identity would collide with the
+                source thought itself, or when a conflict-as-reuse hit lands on a
+                pre-existing row whose stored content differs from the derived
+                record (a foreign-identity collision — no provenance edge is
+                attached and the collision is surfaced per ``on_error``).
+
+        """
+        child_id = _derived_thought_id(record.content)
+        if child_id == source.thought_id:
+            # Pure pre-check — no database work has happened yet, nothing to undo.
+            raise DerivedRecordError(
+                source.thought_id,
+                "derived record identity collides with its source thought",
+            )
+        child = self._build_derived_thought(record, child_id, ctx, source)
+        reused_foreign = False
+        try:
+            await self._insert_derived_row(child)
+            # Re-read the stored row once: it is both the enrichment target (its
+            # own content, never the producer's) and the basis for the provenance
+            # identity-collision check below. On a conflict-as-reuse hit it may be
+            # a foreign row a caller pre-created at this deterministic id.
+            stored_row = await self._get_thought_row(child_id)
+            if (
+                self._auto_embed
+                and self._embedding_provider is not None
+                and not self._suppress_auto_embed
+                and stored_row is not None
+                and await self.get_embedding(child_id) is None
+            ):
+                # Embed the persisted row's actual content — not the producer's —
+                # so a reused foreign row never receives a producer-content vector.
+                await self._auto_embed_thought(self._row_to_thought(stored_row))
+            if record.attach_provenance_edge:
+                # Provenance guard: only attach the ``DERIVED_FROM`` edge when the
+                # stored row's content actually matches the derived record. A
+                # caller can pre-create a thought whose id equals
+                # ``uuid5(record.content)`` but with DIFFERENT content; reusing
+                # that row and still attaching the edge would assert a false
+                # "derived from source" provenance. On a mismatch treat it as an
+                # identity collision: skip the edge and surface it per
+                # ``on_error`` (mirroring the source-id collision above).
+                if stored_row is None or stored_row["content"] != record.content:
+                    reused_foreign = True
+                else:
+                    await self._insert_derived_edge(
+                        child_id,
+                        source.thought_id,
+                        ctx.cycle_at_derivation,
+                    )
+        except BaseException as original:
+            # Roll back this child's uncommitted partial (a written-but-not-yet-
+            # committed insert/edge, e.g. one whose journal append raised) so it
+            # cannot be flushed by a later child's commit. Earlier children and
+            # the source are committed, so a clean rollback discards only this
+            # child's pending work. On a clean rollback the helper returns and we
+            # re-raise the original so ``_run_derivation`` applies ``on_error``
+            # (log→continue / raise→abort); otherwise the helper raises.
+            await self._compensate_child_rollback(original)
+            raise
+        if reused_foreign:
+            # Foreign-identity collision: the conflict-as-reuse hit landed on a
+            # pre-existing row whose content differs from this derived record, so
+            # no provenance edge was attached. Surface it outside the
+            # compensating-rollback path — no uncommitted mutation is pending (the
+            # reuse insert aborted cleanly and any stored-row embedding already
+            # committed) — so ``_run_derivation`` applies ``on_error``
+            # (log→skip this child / raise→abort remaining), exactly like the
+            # source-id collision.
+            raise DerivedRecordError(
+                source.thought_id,
+                "derived record identity collides with an unrelated stored thought",
+            )
+
+    async def _compensate_child_rollback(self, original: BaseException) -> None:
+        """Roll back a failed derived child's uncommitted partial, cancel-safely.
+
+        Runs the compensating ``rollback`` as an independent task and awaits it
+        under :func:`asyncio.shield`, so a cancellation of *our* awaiting frame
+        never aborts the rollback itself. A half-completed rollback would leave
+        the long-lived connection mid-transaction — an orphaned partial that a
+        later operation could flush, or run atop as indeterminate state. If the
+        caller is cancelled during it, the still-running shielded task is awaited
+        to completion before the cancellation is honored; the cancellation is
+        never swallowed and always wins over ``original``.
+
+        The task's outcome is inspected structurally — :meth:`asyncio.Task.cancelled`
+        is checked *before* :meth:`asyncio.Task.exception` (which raises on a
+        cancelled task) — so a rollback failure is always detected, never let to
+        throw and bypass the quarantine/precedence logic.
+
+        Quarantine on *any* non-clean rollback: whenever the compensating
+        rollback does not cleanly complete (raised **or** cancelled), the
+        transaction is indeterminate regardless of whether the caller was
+        cancelled, so the connection is quarantined and hard-invalidated
+        (:meth:`_quarantine_connection`) before anything is surfaced. A clean
+        rollback never quarantines. This closes the hole where a non-cancelled
+        rollback failure (esp. under ``on_error="log"``, which logs and aborts)
+        would otherwise leave the store usable for a later, orphan-flushing
+        commit.
+
+        Args:
+            original: The child failure that triggered the compensating rollback.
+
+        Raises:
+            asyncio.CancelledError: When a cancellation (the caller's, or the
+                rollback task's own) is the outcome. The connection is
+                quarantined first if the rollback did not cleanly complete.
+            _DerivationRollbackError: When, on the non-cancelled path, the
+                rollback itself failed and ``original`` was not a cancellation —
+                a non-continuable abort of the whole dispatch (post-quarantine).
+
+        """
+        # Run the rollback as an independent, shielded task and drain it to
+        # completion, capturing any cancellation of our await.
+        rollback_task: asyncio.Task[None] = asyncio.ensure_future(self._db.rollback())
+        cancel_error = await self._drain_shielded(rollback_task)
+        # (#2) A cancelled rollback task would make ``exception()`` raise, so
+        # check ``cancelled()`` first and treat it as non-clean completion.
+        rollback_cancelled = rollback_task.cancelled()
+        rollback_exc = None if rollback_cancelled else rollback_task.exception()
+
+        # (#1) Any non-clean rollback → the transaction is indeterminate →
+        # quarantine before surfacing, whether or not the caller was cancelled. A
+        # clean rollback never quarantines. ``_quarantine_connection`` is
+        # synchronous-effect (detached close) so it cannot swallow ``cancel_error``.
+        if rollback_cancelled or rollback_exc is not None:
+            await self._quarantine_connection(
+                f"compensating rollback did not cleanly complete: "
+                f"{rollback_exc if rollback_exc is not None else 'cancelled'}",
+            )
+
+        if cancel_error is not None:
+            # The caller's cancellation is the visible outcome and takes precedence.
+            raise cancel_error from original
+        if rollback_cancelled:
+            # The rollback task itself was cancelled (its coroutine raised
+            # ``CancelledError``) → propagate a cancellation, never a
+            # ``_DerivationRollbackError``; ``original`` is chained as context.
+            raise asyncio.CancelledError from original
+        if rollback_exc is not None:
+            # Non-cancelled path: the rollback itself failed → abort the dispatch
+            # non-continuably (F2). A CancelledError ``original`` still wins.
+            if isinstance(original, asyncio.CancelledError):
+                raise original from rollback_exc
+            raise _DerivationRollbackError(rollback_exc) from original
+        # Clean rollback, no cancellation → the caller re-raises ``original``.
+
+    def _build_derived_thought(
+        self,
+        record: DerivedRecord,
+        child_id: str,
+        ctx: DeriveContext,
+        source: ThoughtRecord,
+    ) -> ThoughtRecord:
+        """Assemble the core ``ThoughtRecord`` for a derived child.
+
+        Core owns every system-managed field: identity (the deterministic
+        content hash), the ``essence`` (derived from content), timestamps, cycle
+        (from ``ctx``), and a ``CREATED`` lifecycle status. Provenance origin
+        (``source``/``source_type``) is inherited from the source thought. The
+        producer contributes only content, type, priority, and the metadata
+        payload.
+
+        Args:
+            record: The producer-owned derived record.
+            child_id: The deterministic child identity.
+            ctx: The derivation context (supplies the cycle).
+            source: The source thought (supplies provenance origin fields).
+
+        Returns:
+            A fully-populated core :class:`ThoughtRecord`.
+
+        """
+        now_iso = datetime.datetime.now(datetime.UTC).isoformat()
+        return ThoughtRecord(
+            thought_id=child_id,
+            thought_type=record.thought_type,
+            essence=_essence_from_content(record.content),
+            content=record.content,
+            priority=record.priority,
+            lifecycle_status=LifecycleStatus.CREATED,
+            created_cycle=ctx.cycle_at_derivation,
+            updated_cycle=ctx.cycle_at_derivation,
+            source=source.source,
+            source_type=source.source_type,
+            metadata=dict(record.metadata),
+            created_at=now_iso,
+            updated_at=now_iso,
+        )
+
+    async def _insert_derived_row(self, child: ThoughtRecord) -> None:
+        """Insert a derived child row conflict-safely (conflict-as-reuse).
+
+        A child whose deterministic identity already exists (a pre-existing row
+        or a concurrent/repeat derivation) is reused, not re-inserted — the
+        ``UNIQUE`` / primary-key violation is caught and treated as reuse.
+        Enrichment of a reused row is handled by the caller against the stored
+        row's own content. The conflicting ``INSERT`` statement is aborted by
+        SQLite (its own changes rolled back, the transaction preserved), so the
+        reuse early-return leaves no pending uncommitted mutation behind.
+
+        Args:
+            child: The derived thought to persist.
+
+        """
+        try:
+            await self._db.execute(
+                self._CORE_INSERT_SQL,
+                self._thought_to_core_params(child),
+            )
+        except aiosqlite.IntegrityError as exc:
+            if not _is_unique_violation(exc):
+                raise
+            return
+        if self._journal is not None:
+            await self._journal.append(
+                mutation_type="INSERT_THOUGHT",
+                target_id=child.thought_id,
+                delta={"before": None, "after": child.model_dump(mode="json")},
+            )
+        await self._maybe_commit()
+
+    async def _insert_derived_edge(
+        self,
+        from_thought_id: str,
+        to_thought_id: str,
+        cycle: int,
+    ) -> None:
+        """Attach the single ``DERIVED_FROM`` provenance edge, conflict-safely.
+
+        Records content-level provenance (derived → source). The edge is
+        conflict-safe on both its deterministic id and the ``(from, to, type)``
+        unique constraint, so a re-run or a concurrent derivation reuses the
+        existing edge rather than failing; SQLite aborts the conflicting
+        ``INSERT`` (rolling back only its own changes), so the reuse early-return
+        leaves no pending uncommitted mutation. A failure of the journal append
+        after the edge insert propagates to the caller, which rolls back this
+        child's pending edge insert (per-child isolation).
+
+        Args:
+            from_thought_id: The derived child id (edge origin).
+            to_thought_id: The source thought id (edge target).
+            cycle: The cycle to stamp on the edge.
+
+        """
+        edge = EdgeRecord(
+            edge_id=_derived_edge_id(from_thought_id, to_thought_id),
+            from_thought_id=from_thought_id,
+            to_thought_id=to_thought_id,
+            edge_type=EdgeType.DERIVED_FROM,
+            weight=1.0,
+            created_cycle=cycle,
+            source=KnowledgeSource.EXPERIENCE,
+        )
+        try:
+            await self._db.execute(
+                "INSERT INTO edge "
+                "(edge_id, from_thought_id, to_thought_id, edge_type, weight, "
+                " created_cycle, source, decay_multiplier, valid_from, valid_until) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    edge.edge_id,
+                    edge.from_thought_id,
+                    edge.to_thought_id,
+                    edge.edge_type.value,
+                    edge.weight,
+                    edge.created_cycle,
+                    edge.source.value,
+                    edge.decay_multiplier,
+                    edge.valid_from,
+                    edge.valid_until,
+                ),
+            )
+        except aiosqlite.IntegrityError as exc:
+            if not _is_unique_violation(exc):
+                raise
+            return
+        if self._journal is not None:
+            await self._journal.append(
+                mutation_type="INSERT_EDGE",
+                target_id=edge.edge_id,
+                delta={"before": None, "after": edge.model_dump(mode="json")},
+            )
+        await self._maybe_commit()
 
     async def _batch_embed_thoughts(self, inserted: list[ThoughtRecord]) -> None:
         """Embed the freshly-inserted thoughts of a batch in one provider call.
@@ -3271,7 +4269,11 @@ class SqliteEngravaCore:
         Returns:
             The thought record, or None if not found.
 
+        Raises:
+            ConnectionQuarantinedError: When the connection has been quarantined.
+
         """
+        self._ensure_connection_usable()
         row = await self._get_thought_row(thought_id)
         if row is None:
             return None
@@ -3299,8 +4301,10 @@ class SqliteEngravaCore:
                 provenance is not a
                 :class:`~engrava.domain.models.provenance.ProvenanceContext`
                 (per :func:`_validate_provenance`).
+            ConnectionQuarantinedError: When the connection has been quarantined.
 
         """
+        self._ensure_connection_usable()
         current_row = await self._get_thought_row(thought_id)
         if current_row is None:
             raise ThoughtNotFoundError(thought_id)
@@ -3634,7 +4638,11 @@ class SqliteEngravaCore:
         Returns:
             True if the thought was deleted, False if not found.
 
+        Raises:
+            ConnectionQuarantinedError: When the connection has been quarantined.
+
         """
+        self._ensure_connection_usable()
         before_row = await self._get_thought_row(thought_id) if self._journal is not None else None
 
         # Capture the embedding rowid *before* the cascade removes the row: the

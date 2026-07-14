@@ -588,6 +588,7 @@ All enums are `StrEnum` — JSON-serializable and stored as strings.
 | `InvalidFilterPathError` | `EngravaError` | Filter path does not match the allowed JSONPath grammar (`$`, `$.key`, `$[0]` only) |
 | `EmbeddingQueryPrefixMismatchError` | `EngravaError` | Active query prefix diverges from the corpus pairing, silently degrading ranking |
 | `JournalIntegrityError` | `EngravaError` | On-open journal check (`journal.verify_on_open`) found a broken hash chain; carries first-broken diagnostics |
+| `DerivedRecordError` | `EngravaError` | The derived-records seam rejected a producer result (over-cap return, or a derived identity colliding with its source); carries the failing `source_thought_id` |
 
 > `create_edge` raises `ReferentialIntegrityError` when an endpoint thought
 > does not exist. This exception is **not** re-exported from the top-level
@@ -603,6 +604,28 @@ The abstract interface for any engrava implementation.
 ### `EngravaHooksProtocol`
 
 Extension hook interface — see [Extensions](extensions.md).
+
+### `DerivedRecordProducerProtocol`
+
+Optional capability: return `N` derived records from one stored thought. Core
+persists each as an ordinary thought after the source is durable, through a
+core-owned, guarded, per-child lifecycle. See
+[Extension hooks §1A](extension-hooks.md#1a-derived-records-extension-seam).
+
+```python
+class DerivedRecordProducerProtocol(Protocol):
+    async def derive_records(
+        self, thought: ThoughtRecord, ctx: DeriveContext
+    ) -> Sequence[DerivedRecord]: ...
+```
+
+Companion generic types (all public, `X.Y.x`-stable): `DerivedRecord`
+(producer-owned non-empty `content` / `thought_type` / `priority` / `metadata` /
+`attach_provenance_edge`; core derives the `essence` and owns identity),
+`DeriveContext` (source id, content hash, cycle, informational `origin`; no
+store handle), and `DeriveGates`
+(`enabled`, `on_error`, `max_derived_per_source`). Configure via the `derive:`
+YAML section or the `derive_gates=` constructor argument.
 
 ### `EmbeddingProviderProtocol`
 
