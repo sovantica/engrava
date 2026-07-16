@@ -51,13 +51,16 @@ from engrava.domain.exceptions import (
     EmbeddingGenerationError,
     EmbeddingModelMismatchError,
     EmbeddingQueryPrefixMismatchError,
+    InvalidRecencyArgumentError,
     InvalidTransitionError,
     JournalIntegrityError,
+    RecencyModeConflictError,
     ReferentialIntegrityError,
     StaleDataError,
     ThoughtNotFoundError,
 )
 from engrava.domain.models._temporal import (
+    parse_iso8601_to_utc,
     validate_interval_ordering,
     validate_iso8601_nullable,
 )
@@ -580,6 +583,16 @@ _FTS_BOOLEAN_OPERATORS = frozenset({"AND", "OR", "NOT"})
 #: large enough to benefit from recency that never receives a cycle is worth a
 #: single diagnostic breadcrumb (never a warning, never repeated).
 _RECENCY_NUDGE_THRESHOLD = 25
+#: Default transaction-time recency half-life, in wall-clock seconds (7 days) —
+#: the fallback used only when no :class:`~engrava.config.SearchConfig` is wired.
+#: A reasonable agent-memory freshness scale; override per call via
+#: ``recency_now_half_life`` or store-wide via
+#: ``SearchConfig.recency_now_half_life_seconds``.
+_DEFAULT_RECENCY_NOW_HALF_LIFE_SECONDS = 604800
+#: Deterministic minimum transaction-time recency score. A row whose transaction
+#: timestamp is missing or malformed (legacy / imported data) is treated as
+#: maximally old and scores this — never a crash and never a host-clock read.
+_MIN_RECENCY_SCORE = 0.0
 #: Absolute upper bound on how many neighbours the sqlite-vec (vec0) arm may
 #: over-fetch before the live-row post-filter runs. The vec0 backend can only
 #: filter expired/retired rows *after* its ``LIMIT``, so it over-fetches
@@ -4224,6 +4237,8 @@ class SqliteEngravaCore:
         *,
         top_k: int = 10,
         current_cycle: int | None = None,
+        recency_now: str | None = None,
+        recency_now_half_life: int | None = None,
         filters: MetadataFilter | None = None,
         visibility: VisibilityQueryFilter | None = None,
         collapse_key: str | Sequence[str] | None = None,
@@ -4233,7 +4248,7 @@ class SqliteEngravaCore:
 
         Ergonomic shorthand over :meth:`search_hybrid` for the common
         retrieval case: the query text is passed straight through with the
-        given ``top_k`` and ``current_cycle``.
+        given ``top_k`` and recency reference.
 
         When ``current_cycle`` is ``None`` the recency signal is inactive
         (see ``search_hybrid``) — **unless** a ``cycle_provider`` is configured
@@ -4248,10 +4263,29 @@ class SqliteEngravaCore:
         Args:
             query: Natural-language text to search for.
             top_k: Maximum number of results to return.
-            current_cycle: Current cognitive cycle. When provided, the recency
-                signal is blended into ranking; when ``None``, recency is
+            current_cycle: Current cognitive cycle for **cognitive-cycle**
+                recency. When provided, the recency signal is blended into
+                ranking; when ``None`` (and no ``recency_now``), cycle recency is
                 skipped — unless a ``cycle_provider`` is configured, which then
-                supplies the cycle.
+                supplies the cycle. Mutually exclusive with ``recency_now``:
+                passing an **explicit** ``current_cycle`` together with
+                ``recency_now`` ⇒ :class:`RecencyModeConflictError`.
+            recency_now: Optional caller-supplied "now" instant (ISO-8601)
+                selecting **transaction-time** recency (age by ``updated_at`` /
+                ``created_at`` in wall-clock seconds); delegated to
+                :meth:`search_hybrid`. Takes precedence over a passive
+                ``cycle_provider`` (when supplied with no explicit
+                ``current_cycle``, the provider is not consulted). Because
+                ``recall`` carries no per-call recency weight, this axis only
+                affects ranking when the store's ``default_recency_weight`` is
+                ``> 0`` (exactly like the cycle case). The store reads no host
+                clock — omitting it leaves the axis off. ``None`` (default) is
+                byte-identical to before.
+            recency_now_half_life: Optional per-call transaction-time half-life
+                override, **in seconds** (default
+                ``SearchConfig.recency_now_half_life_seconds`` = 604800);
+                consulted only with ``recency_now``. Delegated to
+                :meth:`search_hybrid`.
             filters: Optional :class:`~engrava.domain.models.filters.MetadataFilter`
                 — an ``AND`` of typed field predicates over ``metadata``;
                 delegated to :meth:`search_hybrid`. ``None`` (or an empty
@@ -4292,14 +4326,22 @@ class SqliteEngravaCore:
             A ``HybridSearchResult`` with the ranked matches and the set of
             backends that contributed.
 
+        Raises:
+            RecencyModeConflictError: If both an **explicit** ``current_cycle``
+                and ``recency_now`` are supplied.
+            InvalidRecencyArgumentError: If ``recency_now`` is not a valid
+                ISO-8601 timestamp, or ``recency_now_half_life`` is not ``> 0``.
+
         """
-        # The nudge fires only when there is genuinely no cycle source: no
-        # explicit argument AND no configured provider. With a provider set,
-        # recency will be active via the resolution in ``search_hybrid``, so the
-        # "you forgot current_cycle" breadcrumb would mislead. With no provider
-        # (the default), this condition is byte-identical to before.
+        # The nudge fires only when there is genuinely no recency source: no
+        # explicit cycle, no configured provider, AND no transaction-time
+        # ``recency_now``. With any of those set, recency is (or can be) active
+        # via ``search_hybrid``, so the "you forgot current_cycle" breadcrumb
+        # would mislead. With none of them (the default), this condition is
+        # byte-identical to before.
         if (
             current_cycle is None
+            and recency_now is None
             and self._cycle_provider is None
             and not self._recency_nudge_emitted
         ):
@@ -4318,6 +4360,8 @@ class SqliteEngravaCore:
             query_text=query,
             top_k=top_k,
             current_cycle=current_cycle,
+            recency_now=recency_now,
+            recency_now_half_life=recency_now_half_life,
             filters=filters,
             visibility=visibility,
             collapse_key=collapse_key,
@@ -6063,6 +6107,61 @@ class SqliteEngravaCore:
             scores[thought_id] = math.exp(-decay_rate * age)
         return scores
 
+    async def _load_transaction_recency_scores(
+        self,
+        *,
+        thought_ids: set[str],
+        now: datetime.datetime,
+        half_life_seconds: float,
+    ) -> dict[str, float]:
+        """Load transaction-time recency scores for a candidate set of thought IDs.
+
+        The transaction-time analogue of :meth:`_load_recency_scores`: each row's
+        freshness is measured from its ``updated_at`` (falling back to
+        ``created_at`` when ``updated_at`` is ``NULL``) against the
+        caller-supplied ``now`` instant, in wall-clock seconds — the store reads
+        no host clock. The score is
+        ``exp(-ln2 * age_seconds / half_life_seconds)`` with
+        ``age_seconds = max((now - ts), 0)`` (a future-dated row clamps to age
+        ``0``), the same exponential-half-life shape the cycle scorer uses.
+
+        A row whose timestamp is missing or malformed (legacy / imported data)
+        scores the deterministic minimum (:data:`_MIN_RECENCY_SCORE`) — treated
+        as maximally old, never a crash.
+
+        Args:
+            thought_ids: Candidate thought IDs to score.
+            now: The caller-supplied "now" instant, already UTC-normalised.
+            half_life_seconds: Positive wall-clock half-life, in seconds.
+
+        Returns:
+            Mapping of ``thought_id`` to a recency score in ``[0.0, 1.0]``.
+
+        """
+        if not thought_ids:
+            return {}
+
+        decay_rate = math.log(2) / half_life_seconds
+        placeholders = ", ".join("?" for _ in thought_ids)
+        sql = (
+            f"SELECT thought_id, updated_at, created_at FROM thought "  # noqa: S608
+            f"WHERE thought_id IN ({placeholders})"
+        )
+        cursor = await self._db.execute(sql, list(thought_ids))
+        rows = await cursor.fetchall()
+
+        scores: dict[str, float] = {}
+        for row in rows:
+            thought_id = str(row["thought_id"])
+            raw_ts = row["updated_at"] if row["updated_at"] is not None else row["created_at"]
+            ts = _parse_row_timestamp(raw_ts)
+            if ts is None:
+                scores[thought_id] = _MIN_RECENCY_SCORE
+                continue
+            age_seconds = max((now - ts).total_seconds(), 0.0)
+            scores[thought_id] = math.exp(-decay_rate * age_seconds)
+        return scores
+
     async def _load_priority_scores(
         self,
         *,
@@ -6424,9 +6523,19 @@ class SqliteEngravaCore:
         top_k: int,
         current_cycle: int | None,
         recency_half_life: int,
+        transaction_now: datetime.datetime | None = None,
+        transaction_half_life_seconds: float = 0.0,
         filter_clause: tuple[str, list[object]] | None = None,
     ) -> list[tuple[str, float]]:
         """Fallback results when neither FTS nor vector search is usable.
+
+        Ranks the candidate window by whichever recency axis is active:
+        transaction time (``transaction_now`` supplied — the row window is
+        pre-ordered by ``COALESCE(updated_at, created_at)`` so the truncation
+        keeps the most-recently-written rows), cognitive cycle
+        (``current_cycle`` supplied — pre-ordered by ``updated_cycle``), or
+        neither (a flat ``0.0`` score). The two axes are mutually exclusive by
+        the time this runs (``search_hybrid`` rejects both references upfront).
 
         ``filter_clause`` is the compiled ``filters=`` / ``visibility=``
         predicate; it is applied in-query so this query-less path enforces the
@@ -6443,9 +6552,19 @@ class SqliteEngravaCore:
             params.extend(filter_params)
         where = " AND ".join(clauses)
         params.append(top_k)
+        # Pre-order the truncation window by the active recency axis so the
+        # ``LIMIT`` keeps the freshest rows: transaction time orders by the
+        # write timestamp (NULLs sort last under DESC), cycle time by the
+        # cognitive cycle. The clause is one of two fixed literals — never
+        # caller input — so it carries no injection surface.
+        order_by = (
+            "COALESCE(updated_at, created_at) DESC"
+            if transaction_now is not None
+            else "updated_cycle DESC"
+        )
         cursor = await self._db.execute(
-            "SELECT thought_id, thought_type, lifecycle_status, updated_cycle "  # noqa: S608
-            f"FROM thought WHERE {where} ORDER BY updated_cycle DESC LIMIT ?",
+            "SELECT thought_id, thought_type, lifecycle_status, updated_cycle, "  # noqa: S608
+            f"updated_at, created_at FROM thought WHERE {where} ORDER BY {order_by} LIMIT ?",
             params,
         )
         rows = await cursor.fetchall()
@@ -6459,6 +6578,20 @@ class SqliteEngravaCore:
                 and str(row["lifecycle_status"]) != LifecycleStatus.ACTIVE.value
             )
         ]
+        if transaction_now is not None:
+            decay_rate = math.log(2) / transaction_half_life_seconds
+            ranked = []
+            for row in live:
+                raw_ts = row["updated_at"] if row["updated_at"] is not None else row["created_at"]
+                ts = _parse_row_timestamp(raw_ts)
+                score = (
+                    _MIN_RECENCY_SCORE
+                    if ts is None
+                    else math.exp(-decay_rate * max((transaction_now - ts).total_seconds(), 0.0))
+                )
+                ranked.append((str(row["thought_id"]), score))
+            ranked.sort(key=lambda item: item[1], reverse=True)
+            return ranked
         if current_cycle is None:
             return [(str(row["thought_id"]), 0.0) for row in live]
 
@@ -6479,9 +6612,16 @@ class SqliteEngravaCore:
         query_text: str,
         query_vector: list[float] | None,
         current_cycle: int | None,
+        transaction_now: datetime.datetime | None,
         recency_weight: float,
     ) -> tuple[bool, list[float] | None, bool]:
-        """Resolve active hybrid-search components for the current query."""
+        """Resolve active hybrid-search components for the current query.
+
+        Recency is active when a reference for **either** axis is present — the
+        cognitive ``current_cycle`` or the transaction-time ``transaction_now``
+        (never both; the two are mutually exclusive by the time this runs) — and
+        the recency weight is positive.
+        """
         if not self._fts_probed:
             await self._probe_fts()
 
@@ -6492,7 +6632,8 @@ class SqliteEngravaCore:
             await self._ensure_query_prefix_pairs()
             effective_vector = await _embed_query(self._embedding_provider, query_text)
 
-        recency_active = current_cycle is not None and recency_weight > 0.0
+        recency_reference_present = current_cycle is not None or transaction_now is not None
+        recency_active = recency_reference_present and recency_weight > 0.0
         return (fts_active, effective_vector, recency_active)
 
     async def _fetch_collapse_unit_keys(
@@ -6559,6 +6700,8 @@ class SqliteEngravaCore:
         recency_weight: float | None = None,
         recency_half_life: int | None = None,
         current_cycle: int | None = None,
+        recency_now: str | None = None,
+        recency_now_half_life: int | None = None,
         fts_top_k: int = 50,
         vector_top_k: int = 50,
         priority_weight: float | None = None,
@@ -6588,11 +6731,22 @@ class SqliteEngravaCore:
         This is a **query capability, not a security boundary** (see
         ``visibility`` below).
 
+        Recency has two separately-typed axes; a query selects **exactly one**
+        reference (supplying both raises :class:`RecencyModeConflictError`):
+
+            - **Cognitive-cycle recency** — ``current_cycle`` (explicit or
+              resolved from a configured ``cycle_provider``); ages rows by
+              ``updated_cycle``.
+            - **Transaction-time recency** — ``recency_now`` (a caller-supplied
+              ISO-8601 instant); ages rows by ``updated_at`` (falling back to
+              ``created_at``) in wall-clock seconds. The store reads **no** host
+              clock — a missing ``recency_now`` simply leaves this axis off.
+
         Graceful degradation:
             - If FTS5 unavailable or ``query_text`` empty → FTS skipped.
             - If ``query_vector`` is ``None`` and no provider → vector skipped.
-            - If ``current_cycle`` is ``None`` and no ``cycle_provider`` is
-              configured → recency skipped.
+            - If neither recency reference is present (no ``current_cycle`` /
+              ``cycle_provider`` and no ``recency_now``) → recency skipped.
             - If ``priority_weight`` is ``0.0`` → priority skipped.
             - If ``graph_weight`` is ``0.0`` → graph skipped.
             - Disabled weights redistributed proportionally to active signals.
@@ -6608,11 +6762,35 @@ class SqliteEngravaCore:
             vector_weight: Optional vector fusion-weight override.
             recency_weight: Optional recency fusion-weight override.
             recency_half_life: Optional recency half-life override.
-            current_cycle: Current cycle number for recency calculation. When
-                omitted (``None``), it is pulled from a configured
-                ``cycle_provider`` if one is set — an explicit value (including
-                ``0``) always wins, and with neither a value nor a provider
-                recency is skipped.
+            current_cycle: Current cycle number for **cognitive-cycle** recency.
+                When omitted (``None``) *and* no ``recency_now`` is passed, it is
+                pulled from a configured ``cycle_provider`` if one is set — an
+                explicit value (including ``0``) always wins, and with neither a
+                value nor a provider cycle recency is skipped. Mutually exclusive
+                with ``recency_now``: passing an **explicit** ``current_cycle``
+                together with ``recency_now`` raises
+                :class:`RecencyModeConflictError`.
+            recency_now: Caller-supplied "now" instant (ISO-8601) selecting
+                **transaction-time** recency, which ages rows by ``updated_at``
+                (falling back to ``created_at``) in wall-clock seconds. It takes
+                precedence over a **passive** ``cycle_provider``: when
+                ``recency_now`` is supplied and no explicit ``current_cycle`` was
+                passed, the provider's ``current_cycle()`` is **not** called and
+                cycle recency is off. Parsed and UTC-normalised via the shared
+                temporal helper (a naive value is interpreted as UTC; the host
+                timezone is never consulted); a malformed value raises
+                :class:`InvalidRecencyArgumentError`. The store reads no host
+                clock: omitting ``recency_now`` simply leaves this axis off (there
+                is no "use current time" fallback). A row with a missing or
+                malformed timestamp scores the deterministic minimum (treated as
+                maximally old). ``None`` (default) keeps the existing behaviour
+                byte-for-byte.
+            recency_now_half_life: Optional per-call override for the
+                transaction-time half-life, **in wall-clock seconds** (distinct
+                from ``recency_half_life``, which is in cycles). Consulted only
+                when ``recency_now`` is supplied; ``None`` uses
+                ``SearchConfig.recency_now_half_life_seconds`` (default 604800 =
+                7 days). Must be ``> 0``.
             fts_top_k: Max candidates from FTS5 before fusion.
             vector_top_k: Max candidates from vector search before fusion.
             priority_weight: Optional priority fusion-weight override.
@@ -6685,7 +6863,17 @@ class SqliteEngravaCore:
         Returns:
             ``HybridSearchResult`` with ranked results and diagnostics. Tied
             scores are ordered by canonical ``thought_id`` ascending, giving
-            a deterministic total order regardless of ``filters``.
+            a deterministic total order regardless of ``filters`` — so equal
+            recency scores (identical timestamps, or future-dated rows both
+            clamped to age ``0``) resolve deterministically.
+
+        Raises:
+            RecencyModeConflictError: If both an **explicit** ``current_cycle``
+                and ``recency_now`` are supplied.
+            InvalidRecencyArgumentError: If ``recency_now`` is not a valid
+                ISO-8601 timestamp, or ``recency_now_half_life`` is not ``> 0``.
+            ValueError: If a fusion weight is negative or ``recency_half_life``
+                (the cognitive-cycle half-life) is not a positive integer.
 
         """
         import time as _time  # noqa: PLC0415
@@ -6694,12 +6882,52 @@ class SqliteEngravaCore:
 
         _t_start = _time.perf_counter()
 
-        # Resolve the effective cognitive cycle once, up front: an explicit
-        # current_cycle wins (even 0); else pull from a configured cycle
-        # provider; else None (recency stays off — unchanged). Reassigning the
-        # local here means every downstream consumer (_resolve_hybrid_state,
-        # _fallback_hybrid_results, _load_recency_scores) sees the resolved value.
-        current_cycle = self._resolve_current_cycle(current_cycle)
+        # --- Recency axis selection (cognitive cycle XOR transaction time) ---
+        # Two separately-typed recency references; a query selects exactly one.
+        # Precedence is explicit-wins, and a configured cycle_provider is PASSIVE:
+        #   * explicit recency_now  -> transaction-time recency; the provider is
+        #     NOT consulted and current_cycle stays None;
+        #   * explicit current_cycle -> cognitive-cycle recency;
+        #   * neither explicit reference -> a configured provider supplies the
+        #     cycle (else None, recency off — unchanged).
+        # Supplying BOTH explicit references is a conflicting request rejected
+        # with a stable typed error — the axes measure age against incomparable
+        # clocks and are never silently combined. The conflict is checked on the
+        # RAW arguments (before provider resolution), so a store that configures a
+        # provider can still opt into transaction recency by passing recency_now.
+        if current_cycle is not None and recency_now is not None:
+            conflict = (
+                "pass current_cycle for cognitive-cycle recency or recency_now for "
+                "transaction-time recency, never both"
+            )
+            raise RecencyModeConflictError(conflict)
+        transaction_now: datetime.datetime | None = None
+        resolved_recency_now_half_life = 0.0
+        if recency_now is not None:
+            # Transaction recency wins; the passive cycle_provider is NOT consulted
+            # (current_cycle stays None). Parse + UTC-normalise the caller's "now"
+            # at the boundary (naive => UTC; host tz never read); a malformed value
+            # is a bad API argument — the store never invents a clock for this axis.
+            transaction_now = _parse_recency_now(recency_now)
+            resolved_recency_now_half_life = float(
+                recency_now_half_life
+                if recency_now_half_life is not None
+                else (
+                    self._search_config.recency_now_half_life_seconds
+                    if self._search_config is not None
+                    else _DEFAULT_RECENCY_NOW_HALF_LIFE_SECONDS
+                )
+            )
+            if resolved_recency_now_half_life <= 0.0:
+                msg = "recency_now_half_life must be a positive number of seconds"
+                raise InvalidRecencyArgumentError(msg)
+        else:
+            # No transaction reference: resolve the cognitive cycle once (an
+            # explicit current_cycle wins even at 0; else a configured provider;
+            # else None). Reassigning the local here means every downstream
+            # consumer (_resolve_hybrid_state, _fallback_hybrid_results,
+            # _load_recency_scores) sees the resolved value.
+            current_cycle = self._resolve_current_cycle(current_cycle)
 
         # Compile the effective metadata predicate once per column alias:
         # the arms join ``thought t`` (t.metadata_json); the expansion stage
@@ -6772,6 +7000,7 @@ class SqliteEngravaCore:
             query_text=query_text,
             query_vector=query_vector,
             current_cycle=current_cycle,
+            transaction_now=transaction_now,
             recency_weight=resolved_recency_weight,
         )
         vector_active = effective_vector is not None
@@ -6800,10 +7029,17 @@ class SqliteEngravaCore:
         if not fts_active and not vector_active:
             if recency_active:
                 backends_used.add("recency")
+            # Gate the transaction axis on ``recency_active`` so a weight-0
+            # ``recency_now`` stays inert on this query-less path too: passing
+            # ``transaction_now=None`` when recency is inactive falls the fallback
+            # through to its neutral (flat-score, updated_cycle-ordered) branch,
+            # byte-identical to a query with no recency reference.
             fallback = await self._fallback_hybrid_results(
                 top_k=top_k,
                 current_cycle=current_cycle,
                 recency_half_life=resolved_recency_half_life,
+                transaction_now=transaction_now if recency_active else None,
+                transaction_half_life_seconds=resolved_recency_now_half_life,
                 filter_clause=filter_clause_plain,
             )
             if priority_active and fallback:
@@ -6889,14 +7125,21 @@ class SqliteEngravaCore:
         for tid, score in vec_results:
             combined[tid] = combined.get(tid, 0.0) + score * eff_vec_w
 
-        # --- Recency signal ---
+        # --- Recency signal (the one active axis: transaction time or cycle) ---
         if recency_active:
             backends_used.add("recency")
-            recency_scores = await self._load_recency_scores(
-                thought_ids=set(combined.keys()),
-                current_cycle=current_cycle if current_cycle is not None else 0,
-                recency_half_life=resolved_recency_half_life,
-            )
+            if transaction_now is not None:
+                recency_scores = await self._load_transaction_recency_scores(
+                    thought_ids=set(combined.keys()),
+                    now=transaction_now,
+                    half_life_seconds=resolved_recency_now_half_life,
+                )
+            else:
+                recency_scores = await self._load_recency_scores(
+                    thought_ids=set(combined.keys()),
+                    current_cycle=current_cycle if current_cycle is not None else 0,
+                    recency_half_life=resolved_recency_half_life,
+                )
             for thought_id, recency_score in recency_scores.items():
                 combined[thought_id] = combined.get(thought_id, 0.0) + recency_score * eff_rec_w
 
@@ -8774,6 +9017,57 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     if norm_a == 0.0 or norm_b == 0.0:
         return 0.0
     return float(np.dot(va, vb) / (norm_a * norm_b))
+
+
+def _parse_recency_now(value: str) -> datetime.datetime:
+    """Parse the caller-supplied transaction-recency ``now`` instant.
+
+    Normalises via the shared temporal helper: UTC-normalised, a naive value
+    interpreted as UTC, and the **host timezone is never consulted**. A value
+    that is not a valid ISO-8601 timestamp is a malformed API argument and
+    raises :class:`InvalidRecencyArgumentError` at the call boundary — the
+    transaction-time recency axis never falls back to a host clock.
+
+    Args:
+        value: The caller's ``recency_now`` argument (an ISO-8601 string).
+
+    Returns:
+        The parsed instant as a timezone-aware ``datetime`` in UTC.
+
+    Raises:
+        InvalidRecencyArgumentError: If ``value`` is not a valid ISO-8601
+            timestamp (the underlying parser error is chained as ``__cause__``).
+
+    """
+    try:
+        return parse_iso8601_to_utc(value)
+    except (ValueError, TypeError) as exc:
+        msg = f"recency_now must be an ISO-8601 timestamp, got {value!r}"
+        raise InvalidRecencyArgumentError(msg) from exc
+
+
+def _parse_row_timestamp(value: object) -> datetime.datetime | None:
+    """Parse a stored transaction-time row timestamp, tolerating bad data.
+
+    Returns the UTC-normalised instant, or ``None`` when the stored value is
+    missing (SQL ``NULL``) or malformed (a legacy / imported row). Callers map a
+    ``None`` result to the deterministic minimum recency score — the row is
+    treated as maximally old — so bad row data never crashes the ranking path
+    and never triggers a host-clock read.
+
+    Args:
+        value: The raw ``updated_at`` / ``created_at`` column value.
+
+    Returns:
+        The parsed instant, or ``None`` when the value is missing or malformed.
+
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        return parse_iso8601_to_utc(value)
+    except ValueError:
+        return None
 
 
 def _sort_scored_descending(

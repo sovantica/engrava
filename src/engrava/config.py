@@ -757,7 +757,12 @@ class SearchConfig:
         default_recency_weight: Default recency signal weight.
         default_priority_weight: Default priority signal weight.
         default_graph_weight: Default graph-neighbour signal weight.
-        recency_half_life: Cycles for the recency score to halve.
+        recency_half_life: Cycles for the cognitive-cycle recency score to
+            halve (the ``current_cycle`` axis).
+        recency_now_half_life_seconds: Wall-clock seconds for the
+            transaction-time recency score to halve (the ``recency_now`` axis).
+            Only consulted when a query supplies ``recency_now``; expressed in
+            seconds (never cycles). Defaults to ``604800`` (7 days).
         priority_boost_p1: Score multiplier for P1 thoughts.
         priority_boost_p2: Score multiplier for P2 thoughts.
         priority_boost_p3: Score multiplier for P3 thoughts.
@@ -837,6 +842,7 @@ class SearchConfig:
     default_priority_weight: float = 0.05
     default_graph_weight: float = 0.0
     recency_half_life: int = 50
+    recency_now_half_life_seconds: int = 604800
     priority_boost_p1: float = 1.0
     priority_boost_p2: float = 0.6
     priority_boost_p3: float = 0.3
@@ -2149,6 +2155,10 @@ def _parse_search(raw: Any) -> SearchConfig:  # noqa: ANN401
         msg = "'search.recency_half_life' must be a positive integer"
         raise ConfigError(msg)
 
+    recency_now_half_life_seconds = _parse_positive_int(
+        raw, "recency_now_half_life_seconds", 604800, "search"
+    )
+
     boost_p1 = _parse_nonneg_float(raw, "priority_boost_p1", 1.0, "search")
     boost_p2 = _parse_nonneg_float(raw, "priority_boost_p2", 0.6, "search")
     boost_p3 = _parse_nonneg_float(raw, "priority_boost_p3", 0.3, "search")
@@ -2197,6 +2207,7 @@ def _parse_search(raw: Any) -> SearchConfig:  # noqa: ANN401
         default_priority_weight=pri_w,
         default_graph_weight=graph_w,
         recency_half_life=half_life,
+        recency_now_half_life_seconds=recency_now_half_life_seconds,
         priority_boost_p1=boost_p1,
         priority_boost_p2=boost_p2,
         priority_boost_p3=boost_p3,

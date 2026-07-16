@@ -187,6 +187,8 @@ class EngravaCoreProtocol(Protocol):
         *,
         top_k: int = 10,
         current_cycle: int | None = None,
+        recency_now: str | None = None,
+        recency_now_half_life: int | None = None,
         filters: MetadataFilter | None = None,
         visibility: VisibilityQueryFilter | None = None,
         collapse_key: str | Sequence[str] | None = None,
@@ -196,14 +198,22 @@ class EngravaCoreProtocol(Protocol):
 
         Ergonomic shorthand over :meth:`search_hybrid` for the common
         retrieval case: implementations delegate to ``search_hybrid`` with
-        the query text and the given ``top_k``/``current_cycle``.
+        the query text and the given ``top_k`` and recency reference.
 
         Args:
             query: Natural-language text to search for.
             top_k: Maximum number of results to return.
-            current_cycle: Current cognitive cycle.  When provided, the
-                recency signal is blended into ranking; when ``None``,
-                recency is skipped.
+            current_cycle: Current cognitive cycle (cognitive-cycle recency).
+                When provided, the recency signal is blended into ranking; when
+                ``None``, cycle recency is skipped. Mutually exclusive with
+                ``recency_now``: both **explicit** ⇒ ``RecencyModeConflictError``.
+            recency_now: Optional caller-supplied "now" instant (ISO-8601)
+                selecting transaction-time recency (age by ``updated_at`` /
+                ``created_at`` in wall-clock seconds); takes precedence over a
+                passive ``cycle_provider``. The core reads no host clock —
+                omitting it leaves the axis off.
+            recency_now_half_life: Optional transaction-time half-life override,
+                in seconds; consulted only with ``recency_now``.
             filters: Optional metadata filter (an ``AND`` of typed field
                 predicates over ``metadata``); delegated to
                 ``search_hybrid``. ``None`` leaves the candidate set
@@ -409,6 +419,8 @@ class EngravaCoreProtocol(Protocol):
         recency_weight: float | None = None,
         recency_half_life: int | None = None,
         current_cycle: int | None = None,
+        recency_now: str | None = None,
+        recency_now_half_life: int | None = None,
         fts_top_k: int = 50,
         vector_top_k: int = 50,
         filters: MetadataFilter | None = None,
@@ -432,9 +444,17 @@ class EngravaCoreProtocol(Protocol):
             - If no embeddings exist, returns pure FTS5 results.
             - If ``query_vector`` is ``None`` and no embedding provider
               is configured, vector search is skipped.
-            - If ``current_cycle`` is ``None``, recency is skipped.
+            - If neither recency reference (``current_cycle`` or
+              ``recency_now``) is present, recency is skipped.
             - Disabled component weights are redistributed
               proportionally to active components.
+
+        Recency has two separately-typed axes; a query selects **exactly one**
+        reference — the cognitive ``current_cycle`` or the transaction-time
+        ``recency_now``. An explicit ``recency_now`` takes precedence over a
+        passive ``cycle_provider``; supplying both **explicit** references raises
+        ``RecencyModeConflictError``. The core reads no host clock: a missing
+        ``recency_now`` simply leaves the transaction axis off.
 
         Args:
             query_text: Text query for FTS5 keyword search.
@@ -445,8 +465,19 @@ class EngravaCoreProtocol(Protocol):
             fts_weight: Optional FTS5 fusion-weight override.
             vector_weight: Optional vector fusion-weight override.
             recency_weight: Optional recency fusion-weight override.
-            recency_half_life: Optional recency half-life override.
-            current_cycle: Current cycle number for recency calculation.
+            recency_half_life: Optional cognitive-cycle recency half-life
+                override (in cycles).
+            current_cycle: Current cycle number for cognitive-cycle recency.
+                Mutually exclusive with ``recency_now``.
+            recency_now: Optional caller-supplied "now" instant (ISO-8601)
+                selecting transaction-time recency (age by ``updated_at`` /
+                ``created_at`` in wall-clock seconds); takes precedence over a
+                passive ``cycle_provider``. Parsed / UTC-normalised via the
+                shared temporal helper (naive as UTC; host tz never consulted);
+                malformed ⇒ ``InvalidRecencyArgumentError``.
+            recency_now_half_life: Optional transaction-time half-life override,
+                in seconds (default 604800 = 7 days); consulted only with
+                ``recency_now``.
             fts_top_k: Max candidates from FTS5 before fusion.
             vector_top_k: Max candidates from vector search before fusion.
             filters: Optional metadata filter (an ``AND`` of typed field

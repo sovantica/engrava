@@ -329,6 +329,14 @@ class TestOffOnPair:
 # providers + the typed CycleProviderError), an additive, default-off public-API
 # addition — a store that configures no cycle_provider pulls no cycle and is
 # unchanged on every read/write path.
+# Later extended with the second, separately-typed transaction-time recency axis
+# (the opt-in keyword-only recency_now / recency_now_half_life on search_hybrid /
+# recall + the protocol), which adds two typed public exceptions:
+# RecencyModeConflictError (raised only when a query supplies both explicit recency
+# references — the cognitive current_cycle and the transaction-time recency_now)
+# and InvalidRecencyArgumentError (raised only for a malformed recency_now or a
+# non-positive recency_now_half_life). Both are additive and default-off — never
+# raised on any single-axis (or no-recency) read/write path.
 _PRE_WS_ALL_BASELINE = frozenset(
     {
         "ActionNotFoundError",
@@ -387,6 +395,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "HygieneResult",
         "InvalidFilterError",
         "InvalidFilterPathError",
+        "InvalidRecencyArgumentError",
         "InvalidTransitionError",
         "JournalConfig",
         "JournalEntry",
@@ -418,6 +427,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "ReadOnlyEngrava",
         "ReadOnlyMindStore",
         "ReadOnlyViolationError",
+        "RecencyModeConflictError",
         "RecencySignal",
         "RoleAwareEmbeddingProvider",
         "ScoringContext",

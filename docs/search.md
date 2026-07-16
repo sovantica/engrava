@@ -9,7 +9,7 @@ into a single ranked result list.
 |---|--------|------------|---------|--------|
 | 1 | **FTS5 keyword** | `default_fts_weight` | `0.30` | BM25 full-text score (min-max normalized) |
 | 2 | **Vector similarity** | `default_vector_weight` | `0.55` | Cosine similarity from embedding search |
-| 3 | **Recency** | `default_recency_weight` | `0.10` | Exponential decay based on `current_cycle` |
+| 3 | **Recency** | `default_recency_weight` | `0.10` | Exponential decay along one recency axis — cognitive-cycle (`current_cycle`) or transaction-time (`recency_now`); see [Two recency axes](#two-recency-axes) |
 | 4 | **Priority** | `default_priority_weight` | `0.05` | Boost multiplier per priority level (P1–P4) |
 | 5 | **Graph** | `default_graph_weight` | `0.00` | 1-hop-weighted neighbour boost (opt-in) |
 
@@ -21,10 +21,58 @@ its weight is **redistributed proportionally** across active signals.
 
 - FTS5 unavailable or empty query → FTS skipped.
 - `query_vector` is `None` and no embedding provider → vector skipped.
-- `current_cycle` is `None` → recency skipped.
+- Neither recency reference present (no `current_cycle` and no `recency_now`) → recency skipped.
 - `priority_weight` is `0.0` → priority skipped.
 - `graph_weight` is `0.0` → graph skipped, zero overhead.
 - All signals disabled → fallback to `list_thoughts(LIMIT top_k)`.
+
+## Two recency axes
+
+Recency ranks along **two separately-typed axes**, and a query picks **exactly
+one** — the default (passing neither reference) leaves recency off, unchanged:
+
+| Axis | Reference | Ages a row by | Half-life unit | For |
+|---|---|---|---|---|
+| **Cognitive-cycle** | `current_cycle` | `updated_cycle` vs the cycle | cycles (`recency_half_life`) | agents that own and advance a logical cycle |
+| **Transaction-time** | `recency_now` | `updated_at` (→ `created_at`) vs the instant | seconds (`recency_now_half_life`) | "recently stored" — wall-time recency on any store |
+
+Both use the same exponential half-life decay; only the clock differs. The
+transaction-time axis makes "recently written" rankable even on a store where
+every row shares one cognitive cycle (the common case for externally-written
+memories) — the signal cycle-recency cannot express there.
+
+`recency_now` is a caller-supplied ISO-8601 instant: engrava's core reads **no
+wall clock** in ranking, so retrieval stays deterministic and replayable (same
+store + same `recency_now` → same ranking). A naive value is interpreted as UTC
+(the host timezone is never consulted); a malformed `recency_now` (or a
+non-positive `recency_now_half_life`) raises `InvalidRecencyArgumentError`. A row
+whose `updated_at`/`created_at` is missing or malformed is treated as maximally
+old (the minimum recency score). An explicit `recency_now` **takes precedence
+over a passive `cycle_provider`** (the provider is not consulted when
+`recency_now` is supplied with no explicit `current_cycle`); supplying **both
+explicit** references — `current_cycle` *and* `recency_now` — raises
+`RecencyModeConflictError`.
+
+```python
+# Transaction-time recency: rank by how recently each memory was written,
+# relative to a caller-supplied "now" (a 24-hour freshness half-life).
+from datetime import UTC, datetime
+
+results = await store.search_hybrid(
+    "incident timeline",
+    recency_now=datetime.now(UTC).isoformat(),  # the caller owns "now"
+    recency_weight=0.4,
+    recency_now_half_life=86400,  # seconds (1 day); default 604800 (7 days)
+)
+```
+
+The units never mix: a wall-clock age is never subtracted from a cognitive
+cycle. To use transaction-time recency on a store that has a cycle provider
+configured, **pass `recency_now` while omitting an explicit `current_cycle`** —
+the provider is passive and is not consulted, so the query ranks by transaction
+time. (Omitting `recency_now` instead selects the provider's cognitive-cycle
+recency.) You only hit `RecencyModeConflictError` if you explicitly pass *both*
+`current_cycle` and `recency_now`.
 
 ## Keyword query syntax (FTS)
 

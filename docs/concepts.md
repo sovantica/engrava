@@ -171,6 +171,42 @@ dreaming's age/scheduling gates (`min_age_cycles`, `schedule_every_n_cycles`,
 > [`max_cycle()`](#recovering-the-counter-max_cycle) so it stays monotonic across
 > process restarts.
 
+### The other recency axis: transaction time (`recency_now`)
+
+The cognitive cycle is *one* of two recency axes. If your consumer has **no
+natural cadence** — it never advances a cycle, so every write lands at cycle `0`
+— cycle recency is degenerate (every row looks equally fresh). For that case,
+rank by **transaction time** instead: pass `recency_now` (a caller-supplied
+ISO-8601 instant) to `search_hybrid` / `recall`, and engrava ages each row by
+its `updated_at` (falling back to `created_at`) in wall-clock seconds. This
+expresses "recently *stored*" — the signal cycle recency cannot give a
+single-cycle store.
+
+- **You pick exactly one axis per query.** `current_cycle` selects cycle
+  recency; `recency_now` selects transaction-time recency. An explicit
+  `recency_now` **takes precedence over a passive `cycle_provider`**: when you
+  pass `recency_now` and no explicit `current_cycle`, the provider is *not*
+  consulted, so a provider-configured store can still opt into transaction
+  recency. Supplying **both explicit** references
+  (`current_cycle` *and* `recency_now`) raises `RecencyModeConflictError` — the
+  two clocks are never silently combined.
+- **The caller owns "now".** engrava's core reads no wall clock in ranking, so
+  retrieval stays deterministic and replayable (same store + same `recency_now`
+  → same ranking). A naive `recency_now` is interpreted as UTC (the host
+  timezone is never consulted); a malformed `recency_now` (or a non-positive
+  `recency_now_half_life`) raises `InvalidRecencyArgumentError`; a row with a
+  missing or malformed `updated_at`/`created_at` is treated as maximally old.
+- **The half-life is in seconds** here (`recency_now_half_life`, default 604800 =
+  7 days), never cycles — the units never mix. See
+  [Hybrid Search → Two recency axes](search.md#two-recency-axes) for a worked
+  example.
+
+This is a separately-typed second axis, not a replacement: a consumer with a
+real cadence keeps using `current_cycle`; one without simply supplies
+`recency_now` at query time. The three time axes engrava keeps distinct
+(transaction time, valid time, cognitive cycle) are unchanged — recency ranking
+can now read the transaction-time axis *as well as* the cognitive-cycle axis.
+
 ### Injecting the cycle once (the cycle provider)
 
 Threading `current_cycle` through every `search_hybrid` / `recall` /

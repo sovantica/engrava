@@ -410,6 +410,65 @@ class CycleProviderError(EngravaError):
         super().__init__(f"invalid cycle provider value: {reason}")
 
 
+class RecencyModeConflictError(EngravaError):
+    """Raised when a query explicitly supplies both recency reference axes.
+
+    Engrava ranks recency along two separately-typed axes, and a single query
+    selects **exactly one** reference:
+
+    * **cognitive-cycle recency** — chosen by an explicit ``current_cycle``, or
+      (when neither reference is passed) pulled from a configured cycle provider;
+    * **transaction-time recency** — chosen by a caller-supplied ``recency_now``
+      instant, which **takes precedence over a passive cycle provider**.
+
+    The two axes measure age against incomparable clocks (a cognitive tick count
+    versus wall-clock time) and are **never silently combined**. The conflict
+    fires only when the caller **explicitly** supplies **both** ``current_cycle``
+    and ``recency_now``; a configured cycle provider is passive and yields to an
+    explicit ``recency_now`` (it is not consulted), so a provider-configured
+    store *can* still use transaction-time recency. To do so, pass ``recency_now``
+    and omit an explicit ``current_cycle`` — the provider is then not consulted.
+
+    Args:
+        reason: Human-readable description of the conflicting request.
+
+    Examples:
+        >>> str(RecencyModeConflictError("current_cycle and recency_now both set"))
+        'conflicting recency references: current_cycle and recency_now both set'
+
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"conflicting recency references: {reason}")
+
+
+class InvalidRecencyArgumentError(EngravaError):
+    """Raised when a transaction-time recency argument is malformed.
+
+    Covers a ``recency_now`` that is not a valid ISO-8601 timestamp and a
+    non-positive ``recency_now_half_life``. It is raised at the ``search_hybrid``
+    / ``recall`` call boundary (never mid-ranking), a typed sibling of
+    :class:`RecencyModeConflictError` so callers can catch a specific engrava
+    error rather than a bare ``ValueError``. For a malformed timestamp the
+    underlying parser error is chained as the ``__cause__``.
+
+    Args:
+        message: Human-readable description of the invalid argument.
+
+    Examples:
+        >>> raise InvalidRecencyArgumentError("recency_now must be ISO-8601")
+        Traceback (most recent call last):
+            ...
+        engrava.domain.exceptions.InvalidRecencyArgumentError: \
+recency_now must be ISO-8601
+
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
 class ConnectionQuarantinedError(EngravaError):
     """Raised when the store's connection has been quarantined and is unusable.
 

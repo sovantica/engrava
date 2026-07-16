@@ -590,6 +590,12 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "docs/search.md",
+        "the caller owns",
+        "fragment assuming a store; transaction-time recency asserted in "
+        "test_transaction_recency.py",
+    ),
+    (
+        "docs/search.md",
         "OR-matched",
         "fragment assuming a store; search_fts asserted in the quickstart search test",
     ),
