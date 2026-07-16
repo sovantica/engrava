@@ -175,6 +175,20 @@ class ReadOnlyEngrava:
         """Return a point-in-time metrics snapshot from the wrapped store."""
         return await self._inner.metrics()
 
+    async def max_cycle(self) -> int:
+        """Return the wrapped store's cognitive-cycle high-water mark.
+
+        A read-only recovery accessor — ``MAX(thought.updated_cycle)`` unioned
+        with ``MAX(edge.created_cycle)``, or ``0`` on an empty store — delegated
+        verbatim to the wrapped store.
+
+        Returns:
+            The maximum cognitive cycle stored, or ``0`` when the store holds no
+            cycle-bearing records.
+
+        """
+        return await self._inner.max_cycle()
+
     # ── Write operations (blocked) ───────────────────────────────────
 
     async def create_thought(

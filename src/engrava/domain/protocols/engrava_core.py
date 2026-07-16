@@ -497,6 +497,26 @@ class EngravaCoreProtocol(Protocol):
         """Return a point-in-time snapshot of store health and workload metrics."""
         ...
 
+    async def max_cycle(self) -> int:
+        """Return the store's cognitive-cycle high-water mark.
+
+        The maximum cognitive cycle across **every** cycle-bearing record —
+        ``MAX(thought.updated_cycle)`` unioned with ``MAX(edge.created_cycle)``
+        — i.e. the true store high-water mark, not merely the thought maximum
+        (an edge created at a higher cycle than any thought still counts).
+
+        This is a read-only recovery accessor: a consumer that advances its own
+        cognitive cycle can resume its counter from this value across process
+        restarts. On an empty store — or one where every record is stamped
+        cycle ``0`` — it returns ``0``.
+
+        Returns:
+            The maximum cognitive cycle stored, or ``0`` when the store holds no
+            cycle-bearing records.
+
+        """
+        ...
+
     async def record_access(self, thought_id: str) -> None:
         """Record an explicit access to a thought.
 

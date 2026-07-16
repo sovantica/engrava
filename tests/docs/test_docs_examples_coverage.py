@@ -219,6 +219,16 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
         "illustrative ThoughtRecord field tour; construction asserted in the CRUD tests",
     ),
     (
+        "docs/concepts.md",
+        "cycle_provider=StaticCycleProvider(0)",
+        "undefined conn; opt-in cycle-provider wiring (behaviour in cycle-provider tests)",
+    ),
+    (
+        "docs/concepts.md",
+        "resume_from = await store.max_cycle()",
+        "fragment assuming a store; max_cycle recovery asserted in the cycle-provider tests",
+    ),
+    (
         "docs/concurrency.md",
         "PRAGMA busy_timeout",
         "opens a real on-disk database file; illustrative connection tuning",

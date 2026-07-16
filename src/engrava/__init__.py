@@ -18,6 +18,11 @@ from engrava.config import (
     resolve_hooks,
     resolve_manifests,
 )
+from engrava.cycle_providers import (
+    CallableCycleProvider,
+    MaxCycleProvider,
+    StaticCycleProvider,
+)
 from engrava.domain.enums import (
     ActionStatus,
     ActionType,
@@ -32,6 +37,7 @@ from engrava.domain.enums import (
 from engrava.domain.exceptions import (
     ActionNotFoundError,
     ConnectionQuarantinedError,
+    CycleProviderError,
     DerivedRecordError,
     EmbeddingGenerationError,
     EmbeddingModelMismatchError,
@@ -70,6 +76,7 @@ from engrava.domain.models.search import HybridSearchResult
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.domain.models.thought import ThoughtRecord as CoreThoughtRecord
 from engrava.domain.models.ttl import CleanupResult, CleanupStrategy
+from engrava.domain.protocols.cycle_provider import CycleProvider
 from engrava.domain.protocols.derived_records import (
     DeriveContext,
     DerivedRecord,
@@ -121,6 +128,7 @@ __all__ = [
     "ActionRecord",
     "ActionStatus",
     "ActionType",
+    "CallableCycleProvider",
     "CallbackProvider",
     "CleanupResult",
     "CleanupStrategy",
@@ -130,6 +138,8 @@ __all__ = [
     "ConnectionQuarantinedError",
     "ConsolidationResult",
     "CoreThoughtRecord",
+    "CycleProvider",
+    "CycleProviderError",
     "DefaultEngravaHooks",
     "DefaultMindStoreHooks",
     "DeriveContext",
@@ -178,6 +188,7 @@ __all__ = [
     "KnowledgeSource",
     "LatencyHistogram",
     "LifecycleStatus",
+    "MaxCycleProvider",
     "MetadataFilter",
     "MetricsConfig",
     "MindQLCommand",
@@ -211,6 +222,7 @@ __all__ = [
     "SqliteVecSearchBackend",
     "StaleDataError",
     "StalenessSignal",
+    "StaticCycleProvider",
     "StorageFootprint",
     "StructuralSplitProducer",
     "TTLConfig",

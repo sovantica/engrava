@@ -46,6 +46,7 @@ from engrava.domain.enums import (
 from engrava.domain.exceptions import (
     ActionNotFoundError,
     ConnectionQuarantinedError,
+    CycleProviderError,
     DerivedRecordError,
     EmbeddingGenerationError,
     EmbeddingModelMismatchError,
@@ -95,6 +96,7 @@ if TYPE_CHECKING:
     from engrava.domain.models.filters import MetadataFilter, VisibilityQueryFilter
     from engrava.domain.models.metrics import EngravaMetrics, LatencyHistogram
     from engrava.domain.models.search import HybridSearchResult
+    from engrava.domain.protocols.cycle_provider import CycleProvider
     from engrava.domain.protocols.embedding_provider import EmbeddingProviderProtocol
     from engrava.domain.protocols.hooks import MindQLExtension
     from engrava.extensions.dreaming import ConsolidationResult, DreamingExtension
@@ -726,6 +728,38 @@ class _AccessBuffer:
         return drained
 
 
+def _validate_provider_cycle(value: object) -> int:
+    """Validate a value pulled from a ``CycleProvider`` at the trust boundary.
+
+    A ``runtime_checkable`` protocol verifies only that a provider *has* a
+    ``current_cycle`` method — never that the value it returns is a usable
+    cognitive cycle. So the store validates the pulled value here, at the
+    resolution boundary: it must be a real ``int`` (``bool`` is rejected even
+    though it subclasses ``int``) and non-negative (matching the
+    ``created_cycle`` / ``updated_cycle`` ``ge=0`` invariant).
+
+    Args:
+        value: The raw value returned by ``cycle_provider.current_cycle()``.
+
+    Returns:
+        The validated cycle as an ``int``.
+
+    Raises:
+        CycleProviderError: When ``value`` is not an ``int`` (including a
+            ``bool``) or is negative.
+
+    """
+    # ``type(value) is int`` — deliberately not ``isinstance`` — so a ``bool``
+    # (a subclass of ``int``) is rejected rather than silently coerced.
+    if type(value) is not int:
+        msg = f"expected int, got {type(value).__name__}"
+        raise CycleProviderError(msg)
+    if value < 0:
+        msg = f"expected a non-negative cycle, got {value}"
+        raise CycleProviderError(msg)
+    return value
+
+
 class SqliteEngravaCore:
     """Core SQLite persistence backend for thought-graph CRUD.
 
@@ -762,6 +796,18 @@ class SqliteEngravaCore:
         manifests: Extension manifests whose ``schema_migrations`` will be
             applied after core schema bootstrap.  Pass an empty
             sequence (default) to skip extension migrations entirely.
+        cycle_provider: Optional, **runtime-only** opt-in cognitive-cycle
+            source (a live
+            :class:`~engrava.domain.protocols.cycle_provider.CycleProvider`
+            object, never serialized config). When configured, the read /
+            eligibility paths (``search_hybrid`` / ``recall`` recency,
+            ``consolidate``, ``run_hygiene``) pull ``current_cycle`` from it
+            **only** when the caller did not pass one explicitly — an explicit
+            ``current_cycle`` (including ``0``) always wins. ``None`` (default)
+            preserves today's behaviour byte-for-byte: no cycle is pulled and
+            recency / age-gating stay off unless a cycle is passed per call. The
+            provider is **read-time only** — it never stamps ``created_cycle`` /
+            ``updated_cycle`` on writes.
 
     """
 
@@ -783,6 +829,7 @@ class SqliteEngravaCore:
         access_tracking_enabled: bool = False,
         hygiene_policy: HygienePolicyConfig | None = None,
         derive_gates: DeriveGates | None = None,
+        cycle_provider: CycleProvider | None = None,
     ) -> None:
         self._db = db
         self._hooks: EngravaHooksProtocol = hooks or DefaultEngravaHooks()
@@ -872,6 +919,13 @@ class SqliteEngravaCore:
         # followed by a core-controlled, guarded, per-child persistence of the
         # producer's derived records (see ``_dispatch_derivation``).
         self._derive_gates: DeriveGates = derive_gates or DeriveGates()
+        # Opt-in, runtime-only cognitive-cycle source. When set, the read /
+        # eligibility paths pull ``current_cycle`` from it only when the caller
+        # omitted one (an explicit ``current_cycle`` — including ``0`` — wins);
+        # the pulled value is validated (``_validate_provider_cycle``). It is
+        # never consulted for write-side cycle stamping and is never serialized
+        # into config (a live object). ``None`` ⇒ today's behaviour unchanged.
+        self._cycle_provider: CycleProvider | None = cycle_provider
 
     @property
     def journal(self) -> JournalWriter | None:
@@ -1011,6 +1065,104 @@ class SqliteEngravaCore:
             search_latency=latency_snapshot,
         )
 
+    async def max_cycle(self) -> int:
+        """Return the store's cognitive-cycle high-water mark.
+
+        The maximum cognitive cycle across **every** cycle-bearing record —
+        ``MAX(thought.updated_cycle)`` unioned with ``MAX(edge.created_cycle)``
+        — i.e. the true store high-water mark. It is *not* thought-only: an edge
+        created at a higher cycle than any thought would otherwise under-report
+        the mark, so both record kinds are unioned.
+
+        A read-only recovery accessor: a consumer that advances its own
+        cognitive cycle can resume its counter from this value across process
+        restarts (and it backs
+        :class:`~engrava.cycle_providers.MaxCycleProvider`). On an empty store —
+        or one where every record is stamped cycle ``0`` (the chicken-and-egg
+        case: a writer that never advances the cycle recovers ``0``) — it
+        returns ``0``.
+
+        Returns:
+            The maximum cognitive cycle stored, or ``0`` when the store holds no
+            cycle-bearing records.
+
+        """
+        # COALESCE folds the all-NULL empty-store case (and a store with no
+        # edges, whose MAX(created_cycle) is NULL) to 0. Fixed SQL, no params.
+        cursor = await self._db.execute(
+            "SELECT COALESCE(MAX(high), 0) FROM ("
+            "  SELECT MAX(updated_cycle) AS high FROM thought"
+            "  UNION ALL"
+            "  SELECT MAX(created_cycle) AS high FROM edge"
+            ")"
+        )
+        row = await cursor.fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def _resolve_current_cycle(self, current_cycle: int | None) -> int | None:
+        """Resolve the effective cognitive cycle for a read / eligibility path.
+
+        The **single** resolution point for the cycle-consuming paths, so the
+        rule lives in one place. Order (never truthiness — an explicit ``0`` is
+        a valid cycle and must win, never fall through):
+
+        1. ``current_cycle is not None`` → use it as passed (unchanged).
+        2. else, a ``cycle_provider`` is configured → pull and **validate** its
+           value (:func:`_validate_provider_cycle`).
+        3. else ``None`` — today's behaviour (recency signal off; no
+           age-gating). No invented default.
+
+        Args:
+            current_cycle: The cycle the caller passed for this call, or
+                ``None`` to defer to the configured provider (if any).
+
+        Returns:
+            The resolved cycle, or ``None`` when no cycle was passed and no
+            provider is configured.
+
+        Raises:
+            CycleProviderError: When a configured provider returns an invalid
+                value (not an ``int``, a ``bool``, or negative).
+
+        """
+        if current_cycle is not None:
+            return current_cycle
+        if self._cycle_provider is None:
+            return None
+        return _validate_provider_cycle(self._cycle_provider.current_cycle())
+
+    def _require_current_cycle(self, current_cycle: int | None, *, operation: str) -> int:
+        """Resolve a cycle for a path that cannot run without one.
+
+        Wraps :meth:`_resolve_current_cycle` for ``consolidate`` / ``run_hygiene``,
+        whose age-gating arithmetic genuinely needs a cycle. When neither an
+        explicit ``current_cycle`` nor a configured provider yields one, it
+        raises rather than inventing a default (``0`` would silently make every
+        record look equally fresh).
+
+        Args:
+            current_cycle: The cycle the caller passed, or ``None``.
+            operation: The public method name, for the error message.
+
+        Returns:
+            The resolved cycle as an ``int``.
+
+        Raises:
+            ValueError: When no cycle is available (no explicit argument and no
+                configured provider).
+            CycleProviderError: When a configured provider returns an invalid
+                value.
+
+        """
+        resolved = self._resolve_current_cycle(current_cycle)
+        if resolved is None:
+            msg = (
+                f"{operation} requires a cognitive cycle: pass current_cycle=... "
+                f"or configure a cycle_provider on the store."
+            )
+            raise ValueError(msg)
+        return resolved
+
     # ------------------------------------------------------------------
     # Factory + async context manager
     # ------------------------------------------------------------------
@@ -1019,6 +1171,8 @@ class SqliteEngravaCore:
     async def from_config(
         cls,
         config_path: str | Path,
+        *,
+        cycle_provider: CycleProvider | None = None,
     ) -> Self:
         """Create a fully configured instance from a YAML config file.
 
@@ -1033,6 +1187,12 @@ class SqliteEngravaCore:
 
         Args:
             config_path: Filesystem path to ``engrava.yaml``.
+            cycle_provider: Optional, **runtime-only** opt-in cognitive-cycle
+                source, forwarded verbatim to the constructor. A provider is a
+                live object, so it is **never** read from (or written to) the
+                config file — it is supplied here as a runtime keyword. ``None``
+                (default) preserves today's behaviour. See the constructor's
+                ``cycle_provider`` for the resolution and read-time-only rules.
 
         Returns:
             A configured ``SqliteEngravaCore`` with schema applied.
@@ -1104,6 +1264,7 @@ class SqliteEngravaCore:
                 access_tracking_enabled=access_tracking_enabled,
                 hygiene_policy=config.hygiene_policy,
                 derive_gates=config.derive,
+                cycle_provider=cycle_provider,
             )
             store._owns_connection = True
 
@@ -4075,18 +4236,22 @@ class SqliteEngravaCore:
         given ``top_k`` and ``current_cycle``.
 
         When ``current_cycle`` is ``None`` the recency signal is inactive
-        (see ``search_hybrid``). A store that holds more than
-        ``_RECENCY_NUDGE_THRESHOLD`` thoughts and recalls without a cycle emits
-        a single DEBUG-level breadcrumb on the module logger — once per store
-        instance — pointing out that passing ``current_cycle`` would let recent
-        thoughts rank higher. It is never a warning and never repeats.
+        (see ``search_hybrid``) — **unless** a ``cycle_provider`` is configured
+        on the store, in which case ``search_hybrid`` pulls the cycle from it. A
+        store that holds more than ``_RECENCY_NUDGE_THRESHOLD`` thoughts and
+        recalls without a cycle *and without a provider* emits a single
+        DEBUG-level breadcrumb on the module logger — once per store instance —
+        pointing out that passing ``current_cycle`` would let recent thoughts
+        rank higher. It is never a warning, never repeats, and is suppressed when
+        a provider is configured (recency is already active through it).
 
         Args:
             query: Natural-language text to search for.
             top_k: Maximum number of results to return.
             current_cycle: Current cognitive cycle. When provided, the recency
                 signal is blended into ranking; when ``None``, recency is
-                skipped.
+                skipped — unless a ``cycle_provider`` is configured, which then
+                supplies the cycle.
             filters: Optional :class:`~engrava.domain.models.filters.MetadataFilter`
                 — an ``AND`` of typed field predicates over ``metadata``;
                 delegated to :meth:`search_hybrid`. ``None`` (or an empty
@@ -4128,7 +4293,16 @@ class SqliteEngravaCore:
             backends that contributed.
 
         """
-        if current_cycle is None and not self._recency_nudge_emitted:
+        # The nudge fires only when there is genuinely no cycle source: no
+        # explicit argument AND no configured provider. With a provider set,
+        # recency will be active via the resolution in ``search_hybrid``, so the
+        # "you forgot current_cycle" breadcrumb would mislead. With no provider
+        # (the default), this condition is byte-identical to before.
+        if (
+            current_cycle is None
+            and self._cycle_provider is None
+            and not self._recency_nudge_emitted
+        ):
             count_cursor = await self._db.execute("SELECT COUNT(*) FROM thought")
             count_row = await count_cursor.fetchone()
             total = int(count_row[0]) if count_row is not None else 0
@@ -6417,7 +6591,8 @@ class SqliteEngravaCore:
         Graceful degradation:
             - If FTS5 unavailable or ``query_text`` empty → FTS skipped.
             - If ``query_vector`` is ``None`` and no provider → vector skipped.
-            - If ``current_cycle`` is ``None`` → recency skipped.
+            - If ``current_cycle`` is ``None`` and no ``cycle_provider`` is
+              configured → recency skipped.
             - If ``priority_weight`` is ``0.0`` → priority skipped.
             - If ``graph_weight`` is ``0.0`` → graph skipped.
             - Disabled weights redistributed proportionally to active signals.
@@ -6433,7 +6608,11 @@ class SqliteEngravaCore:
             vector_weight: Optional vector fusion-weight override.
             recency_weight: Optional recency fusion-weight override.
             recency_half_life: Optional recency half-life override.
-            current_cycle: Current cycle number for recency calculation.
+            current_cycle: Current cycle number for recency calculation. When
+                omitted (``None``), it is pulled from a configured
+                ``cycle_provider`` if one is set — an explicit value (including
+                ``0``) always wins, and with neither a value nor a provider
+                recency is skipped.
             fts_top_k: Max candidates from FTS5 before fusion.
             vector_top_k: Max candidates from vector search before fusion.
             priority_weight: Optional priority fusion-weight override.
@@ -6514,6 +6693,13 @@ class SqliteEngravaCore:
         from engrava.domain.models.search import HybridSearchResult  # noqa: PLC0415
 
         _t_start = _time.perf_counter()
+
+        # Resolve the effective cognitive cycle once, up front: an explicit
+        # current_cycle wins (even 0); else pull from a configured cycle
+        # provider; else None (recency stays off — unchanged). Reassigning the
+        # local here means every downstream consumer (_resolve_hybrid_state,
+        # _fallback_hybrid_results, _load_recency_scores) sees the resolved value.
+        current_cycle = self._resolve_current_cycle(current_cycle)
 
         # Compile the effective metadata predicate once per column alias:
         # the arms join ``thought t`` (t.metadata_json); the expansion stage
@@ -7155,7 +7341,7 @@ class SqliteEngravaCore:
     # Memory Hygiene — deterministic forgetting loop
     # ------------------------------------------------------------------
 
-    async def run_hygiene(self, *, current_cycle: int) -> HygieneResult:
+    async def run_hygiene(self, *, current_cycle: int | None = None) -> HygieneResult:
         """Run one Memory Hygiene pass — archive cold/low-value thoughts.
 
         A standalone, deterministic, no-LLM forgetting pass: it scores every
@@ -7205,7 +7391,11 @@ class SqliteEngravaCore:
         Args:
             current_cycle: The current cognitive cycle number, driving the
                 cycle-based recency / staleness keep-signals and the GC restore
-                window.
+                window. Optional: when omitted (``None``), it is pulled from a
+                configured ``cycle_provider`` (an explicit value — including
+                ``0`` — always wins). A disabled / absent policy is a no-op that
+                needs no cycle, so the value is only required once a real pass is
+                about to run.
 
         Returns:
             A :class:`~engrava.infrastructure.sqlite.hygiene.HygieneResult` with
@@ -7217,6 +7407,10 @@ class SqliteEngravaCore:
             RuntimeError: When no hygiene policy is configured on this store
                 (built without ``hygiene_policy`` / ``hygiene_policy`` is
                 ``None``) — there is nothing to run.
+            ValueError: When a pass is due but no cycle is available — neither an
+                explicit ``current_cycle`` nor a configured ``cycle_provider``.
+            CycleProviderError: When a configured provider returns an invalid
+                value (not an ``int``, a ``bool``, or negative).
 
         """
         policy = self._hygiene_policy
@@ -7233,6 +7427,11 @@ class SqliteEngravaCore:
             # for a data-deleting loop. To preview or run, set ``enabled=True``
             # (and ``dry_run=True`` for a non-mutating preview).
             return HygieneResult()
+
+        # A real pass is about to run, so a cycle is now required. Resolved after
+        # the no-op guards above (a disabled/absent policy needs no cycle) and
+        # never invented — ``0`` would make every record look equally fresh.
+        current_cycle = self._require_current_cycle(current_cycle, operation="run_hygiene()")
 
         candidates = await self._hygiene_candidates()
         ctx = DreamingContext(current_cycle=current_cycle, total_thoughts=len(candidates))
@@ -7718,7 +7917,7 @@ class SqliteEngravaCore:
 
         return retired
 
-    async def consolidate(self, *, current_cycle: int) -> ConsolidationResult:
+    async def consolidate(self, *, current_cycle: int | None = None) -> ConsolidationResult:
         """Run one dreaming consolidation cycle on this store.
 
         The invocable entry point for a store built via :meth:`from_config`
@@ -7742,6 +7941,9 @@ class SqliteEngravaCore:
         Args:
             current_cycle: The current cognitive cycle number, driving the
                 cycle-based recency / staleness signals and promotion age gates.
+                Optional: when omitted (``None``), it is pulled from a configured
+                ``cycle_provider`` (an explicit value — including ``0`` — always
+                wins).
 
         Returns:
             The :class:`ConsolidationResult` for the run.
@@ -7750,6 +7952,10 @@ class SqliteEngravaCore:
             RuntimeError: When dreaming is not enabled/wired on this store
                 (built manually, or ``dreaming.enabled`` is false) — there is
                 no extension to run.
+            ValueError: When no cycle is available — neither an explicit
+                ``current_cycle`` nor a configured ``cycle_provider``.
+            CycleProviderError: When a configured provider returns an invalid
+                value (not an ``int``, a ``bool``, or negative).
 
         """
         if self._dreaming_extension is None:
@@ -7758,6 +7964,10 @@ class SqliteEngravaCore:
                 "from_config with extensions.dreaming.enabled = true"
             )
             raise RuntimeError(msg)
+        # Resolve after the wiring guard (nothing to run without an extension) and
+        # never invent a default. The resolved int is passed explicitly to the
+        # inner run + run_hygiene, so the provider is pulled at most once.
+        current_cycle = self._require_current_cycle(current_cycle, operation="consolidate()")
         await self.flush_access_buffer()
         async with self.suppress_access_tracking():
             result = await self._dreaming_extension.run_consolidation(self, current_cycle)

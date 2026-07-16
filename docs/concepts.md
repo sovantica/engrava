@@ -167,8 +167,80 @@ dreaming's age/scheduling gates (`min_age_cycles`, `schedule_every_n_cycles`,
 >
 > **Do this instead:** keep a counter in your application, increment it once per
 > turn, pass it as `current_cycle`, and use it for `created_cycle`/`updated_cycle`
-> when building thoughts. On restart, recover it (e.g. from the maximum
-> `created_cycle` you've stored) so it stays monotonic across process restarts.
+> when building thoughts. On restart, recover it from
+> [`max_cycle()`](#recovering-the-counter-max_cycle) so it stays monotonic across
+> process restarts.
+
+### Injecting the cycle once (the cycle provider)
+
+Threading `current_cycle` through every `search_hybrid` / `recall` /
+`consolidate` / `run_hygiene` call is repetitive when your application already
+owns a cadence. As an **opt-in** convenience you can configure a **cycle
+provider** once — on the constructor or `from_config` — and those read /
+eligibility paths pull the cycle from it whenever you don't pass one explicitly:
+
+```python
+from engrava import SqliteEngravaCore, StaticCycleProvider
+
+# Opt-in: wire a cycle source once (constructor shown; from_config takes the
+# same keyword). The provider is a live runtime object, never part of config.
+store = SqliteEngravaCore(conn, cycle_provider=StaticCycleProvider(0))
+```
+
+Resolution is deliberately simple, and an explicit argument always wins:
+
+1. If you pass `current_cycle` (**including `0`**), that value is used — the
+   check is "was an argument given", never truthiness, so an explicit `0` never
+   silently falls through to the provider.
+2. Otherwise, if a provider is configured, its value is pulled **and validated**
+   — it must be a real, non-negative `int` (a `bool` is rejected). An invalid
+   value raises `CycleProviderError`.
+3. Otherwise the cycle stays `None` — exactly today's behaviour (recency off, no
+   age-gating). **No provider configured = unchanged**: a store built without one
+   behaves byte-for-byte as before.
+
+> **Read-time only.** The provider feeds ranking and eligibility; it **never**
+> stamps `created_cycle` / `updated_cycle` on writes. Write-side cycles stay your
+> explicit choice on each `ThoughtRecord`.
+
+Three reference providers ship: `StaticCycleProvider(value)` (a fixed value);
+`CallableCycleProvider(fn)` (a thin adapter over your own zero-argument callable
+— **its purity is your contract, not the adapter's**: whether it avoids
+wall-clock reads and returns a genuine cognitive cycle depends entirely on your
+`fn`); and `MaxCycleProvider` (below). Whatever a provider returns to be used as
+a cognitive cycle **must not** be wall-clock-derived, nor conflate the three axes
+Engrava keeps distinct (operation count, cognitive cycle, wall-time recency) —
+Engrava validates the *value*, but that containment is **your** obligation.
+
+> **The seam standardises injection; it does not manufacture a cadence.** It
+> gives you one plug point instead of threading `current_cycle` everywhere. A
+> consumer that already advances a cycle can now plug it in once; a consumer with
+> **no** natural cycle still has nothing to supply — the seam enables the wiring,
+> it does not invent a clock.
+
+#### Recovering the counter: `max_cycle()`
+
+`max_cycle()` is a read-only accessor returning the store's cognitive-cycle
+**high-water mark** — the maximum across *all* cycle-bearing records
+(`MAX(thought.updated_cycle)` unioned with `MAX(edge.created_cycle)`), or `0` on
+an empty store. Use it to resume your counter after a restart:
+
+```python
+# Resume your counter after a restart from the store's high-water mark.
+resume_from = await store.max_cycle()  # 0 on an empty store
+```
+
+It is unioned across thoughts *and* edges deliberately: an edge created at a
+higher cycle than any thought would otherwise be missed, letting a resumed
+counter go backwards. The `MaxCycleProvider` reference provider wraps this into a
+provider — `await MaxCycleProvider.create(store)` snapshots the current mark, its
+`current_cycle()` returns that **cached** (possibly stale) snapshot, and
+`await provider.refresh()` re-reads the store when your cadence advances.
+
+> **Chicken-and-egg (disclosed).** On a store where *every* write is stamped
+> cycle `0` (a consumer that never advances the cycle), `max_cycle()` returns
+> `0`. It helps a consumer that *does* advance cycles resume its counter; it
+> cannot recover a cadence that was never expressed in the data.
 
 ## Provenance (where a memory came from)
 

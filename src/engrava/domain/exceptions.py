@@ -377,6 +377,39 @@ class DerivedRecordError(EngravaError):
         super().__init__(f"[source={source_thought_id!r}] {message}")
 
 
+class CycleProviderError(EngravaError):
+    """Raised when a configured cycle provider returns an invalid value.
+
+    A ``runtime_checkable``
+    :class:`~engrava.domain.protocols.cycle_provider.CycleProvider` protocol
+    verifies only that an object *has* a ``current_cycle()`` method — never that
+    the value it returns is a usable cognitive cycle. The store therefore
+    validates the pulled value at the resolution boundary: it must be a real
+    ``int`` (a ``bool`` is rejected even though it subclasses ``int``) and it
+    must be non-negative (matching the ``created_cycle`` / ``updated_cycle``
+    ``ge=0`` invariant). A value failing either check is a provider-contract
+    violation surfaced as this typed error, rather than a bare ``TypeError`` /
+    ``ValueError`` leaking out of downstream recency arithmetic.
+
+    Engrava can only enforce value *validity* here — a provider's *purity*
+    (that its value is not wall-clock-derived and does not conflate the
+    operation-count / cognitive-cycle / wall-time axes) is the configuring
+    consumer's contract, not something the core can check.
+
+    Args:
+        reason: Human-readable description of why the pulled value is invalid.
+
+    Examples:
+        >>> str(CycleProviderError("expected int, got str"))
+        'invalid cycle provider value: expected int, got str'
+
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"invalid cycle provider value: {reason}")
+
+
 class ConnectionQuarantinedError(EngravaError):
     """Raised when the store's connection has been quarantined and is unusable.
 

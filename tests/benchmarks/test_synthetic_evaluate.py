@@ -324,6 +324,11 @@ class TestOffOnPair:
 # cancellation (the connection is quarantined so a later operation cannot run on an
 # indeterminate transaction) — an additive, default-off public-API addition never
 # raised on any normal read/write path.
+# Later extended with the opt-in cycle-provider seam (the CycleProvider capability
+# protocol + StaticCycleProvider / CallableCycleProvider / MaxCycleProvider reference
+# providers + the typed CycleProviderError), an additive, default-off public-API
+# addition — a store that configures no cycle_provider pulls no cycle and is
+# unchanged on every read/write path.
 _PRE_WS_ALL_BASELINE = frozenset(
     {
         "ActionNotFoundError",
@@ -331,6 +336,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "ActionRecord",
         "ActionStatus",
         "ActionType",
+        "CallableCycleProvider",
         "CallbackProvider",
         "CleanupResult",
         "CleanupStrategy",
@@ -340,6 +346,8 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "ConnectionQuarantinedError",
         "ConsolidationResult",
         "CoreThoughtRecord",
+        "CycleProvider",
+        "CycleProviderError",
         "DefaultEngravaHooks",
         "DefaultMindStoreHooks",
         "DeriveContext",
@@ -388,6 +396,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "KnowledgeSource",
         "LatencyHistogram",
         "LifecycleStatus",
+        "MaxCycleProvider",
         "MetadataFilter",
         "MetricsConfig",
         "MindQLCommand",
@@ -421,6 +430,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "SqliteVecSearchBackend",
         "StaleDataError",
         "StalenessSignal",
+        "StaticCycleProvider",
         "StorageFootprint",
         "StructuralSplitProducer",
         "TTLConfig",
