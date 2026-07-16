@@ -60,6 +60,18 @@ during which the fact is considered true:
 > is not filtered out. That is what makes adopting valid time incremental: facts
 > you never annotate keep showing up exactly as before.
 
+> **Bounds may not be inverted.** When you set *both* `valid_from` and
+> `valid_until`, the interval must run forwards — `valid_from` at or before
+> `valid_until`, compared as instants (so offsets are reconciled first). An equal
+> pair (a zero-length, instantaneous fact) is allowed; a strictly inverted pair
+> is rejected on write — construction, the update path, and `invalidate` all
+> refuse it. Because the invariant lives in the domain model, the store also
+> validates on **read**: a row that became inverted out of band (written by an
+> older build before this check existed, or edited directly in the database file)
+> raises a `ValidationError` when it is loaded, rather than returning a corrupt
+> interval. Use an open (`None`) bound for "no known start/end", never an
+> inverted one.
+
 ## The four query predicates
 
 Valid time is queried through four **opt-in** `WHERE` predicates in

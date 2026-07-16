@@ -56,7 +56,10 @@ from engrava.domain.exceptions import (
     StaleDataError,
     ThoughtNotFoundError,
 )
-from engrava.domain.models._temporal import validate_iso8601_nullable
+from engrava.domain.models._temporal import (
+    validate_interval_ordering,
+    validate_iso8601_nullable,
+)
 from engrava.domain.models.action import ActionRecord
 from engrava.domain.models.edge import EdgeRecord
 from engrava.domain.models.embedding import EmbeddingRecord
@@ -4469,10 +4472,20 @@ class SqliteEngravaCore:
         Raises:
             ThoughtNotFoundError: If the thought does not exist.
             StaleDataError: If the row was modified since it was read.
-            ValueError: If ``valid_until`` is not a valid ISO-8601 timestamp.
+            ValueError: If ``valid_until`` is not a valid ISO-8601 timestamp,
+                or is earlier than the thought's existing ``valid_from`` (an
+                inverted validity interval).
 
         """
         normalized = validate_iso8601_nullable(valid_until)
+        existing_row = await self._get_thought_row(thought_id)
+        if existing_row is None:
+            raise ThoughtNotFoundError(thought_id)
+        # Guard the mutation path explicitly: the invalidate write closes an
+        # existing interval, so a caller cannot depend on the model validator
+        # firing only at construction time. Reject a ``valid_until`` that would
+        # invert the stored interval before the row is updated.
+        validate_interval_ordering(existing_row["valid_from"], normalized)
         return await self.update_thought(thought_id, valid_until=normalized)
 
     async def list_thoughts(
@@ -4816,11 +4829,21 @@ class SqliteEngravaCore:
             The updated edge record.
 
         Raises:
-            ValueError: If the edge does not exist, or ``valid_until`` is not
-                a valid ISO-8601 timestamp.
+            ValueError: If the edge does not exist, ``valid_until`` is not a
+                valid ISO-8601 timestamp, or ``valid_until`` is earlier than the
+                edge's existing ``valid_from`` (an inverted validity interval).
 
         """
         normalized = validate_iso8601_nullable(valid_until)
+        existing_row = await self._get_edge_row(edge_id)
+        if existing_row is None:
+            msg = f"Edge not found: {edge_id}"
+            raise ValueError(msg)
+        # Guard the mutation path explicitly: the invalidate write closes an
+        # existing interval, so a caller cannot depend on the model validator
+        # firing only at construction time. Reject a ``valid_until`` that would
+        # invert the stored interval before the row is updated.
+        validate_interval_ordering(existing_row["valid_from"], normalized)
         return await self.update_edge(edge_id, valid_until=normalized)
 
     async def get_edges(

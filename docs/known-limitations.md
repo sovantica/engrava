@@ -29,6 +29,38 @@ dreaming improves retrieval accuracy** on any benchmark — its measured effect 
 our own runs was within noise. Enable it for the cognitive-hygiene mechanics it
 provides, not for an expected accuracy gain. See [Dreaming](dreaming.md).
 
+## Validity intervals cannot be inverted
+
+The bi-temporal `valid_from` / `valid_until` bounds on a `ThoughtRecord` or
+`EdgeRecord` describe a forward interval. When **both** bounds are set, engrava
+**rejects** an inverted interval (`valid_from` strictly after `valid_until`):
+
+- **On write** — construction fails with a `ValidationError`; the store's update
+  path re-validates the whole record, so a change that would invert a stored
+  interval is refused; and `invalidate_thought()` / `invalidate_edge()` reject a
+  `valid_until` earlier than the record's stored `valid_from`.
+- **On read** — the invariant lives in the domain model, and the store
+  reconstructs that model whenever it loads a row (`get_thought()`,
+  `get_edges()`, and every ranked/query read). A row that became inverted **out
+  of band** — for example one written by an older engrava build before this
+  validation existed, or edited directly in the database file — therefore raises
+  a `ValidationError` when it is read back, rather than silently returning a
+  corrupt interval. This is a deliberate fail-loud choice for a data-integrity
+  fault. If you are upgrading a database that may contain such rows, repair them
+  (set the offending bound to `NULL`, or correct the order) before reading.
+
+Bounds are compared as UTC-normalised instants, so differing offsets are
+reconciled before the check. Two cases are **not** inversions and remain
+accepted:
+
+- **Equal bounds** (`valid_from == valid_until`) — a zero-length interval is a
+  legitimate instantaneous fact.
+- **An open bound** (`valid_from` or `valid_until` is `None`) — the interval is
+  open on that side (see [The bi-temporal model](bitemporal.md)).
+
+There is no way to store a fact "valid from June to March"; express an open-ended
+fact with a `None` bound instead.
+
 ## macOS SQLite Extension Loading
 
 macOS ships with a system SQLite that has extension loading disabled by default.

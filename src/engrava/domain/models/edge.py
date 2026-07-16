@@ -5,10 +5,15 @@ Represents a lightweight directional edge in the thought graph.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from typing import Self
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from engrava.domain.enums import EdgeType, KnowledgeSource
-from engrava.domain.models._temporal import validate_iso8601_nullable
+from engrava.domain.models._temporal import (
+    validate_interval_ordering,
+    validate_iso8601_nullable,
+)
 
 
 class EdgeRecord(BaseModel):
@@ -86,3 +91,21 @@ class EdgeRecord(BaseModel):
 
         """
         return validate_iso8601_nullable(v)
+
+    @model_validator(mode="after")
+    def _validate_valid_interval(self) -> Self:
+        """Reject an inverted valid-time interval.
+
+        When both ``valid_from`` and ``valid_until`` are set, the validity
+        interval must not run backwards. The bounds are compared as
+        UTC-normalised instants (not raw strings), so equal instants across
+        differing offsets are accepted (a zero-length interval is a legitimate
+        instantaneous relation) while a strictly inverted pair is rejected. A
+        ``None`` on either bound is an open interval and is always accepted.
+
+        Raises:
+            ValueError: If ``valid_from`` is strictly after ``valid_until``.
+
+        """
+        validate_interval_ordering(self.valid_from, self.valid_until)
+        return self

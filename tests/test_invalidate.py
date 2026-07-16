@@ -3,7 +3,11 @@
 Covers :meth:`SqliteEngravaCore.invalidate_thought` and
 :meth:`SqliteEngravaCore.invalidate_edge`: each closes a record's valid-time
 interval by stamping ``valid_until``, is idempotent, and never cascades or
-deletes.
+deletes. Also pins the interval-ordering guard on the invalidate mutation path:
+the format of ``valid_until`` is checked first, a genuine inversion (a
+``valid_until`` earlier than the stored ``valid_from``) is rejected, and an
+equal instant — including across differing offsets, naive/aware, or an open
+(``NULL``) lower bound — is accepted.
 """
 
 from __future__ import annotations
@@ -47,7 +51,7 @@ async def store() -> AsyncIterator[SqliteEngravaCore]:
     await conn.close()
 
 
-def _mk_thought(thought_id: str) -> ThoughtRecord:
+def _mk_thought(thought_id: str, *, valid_from: str | None = _T_JAN) -> ThoughtRecord:
     return ThoughtRecord(
         thought_id=thought_id,
         thought_type=ThoughtType.OBSERVATION,
@@ -58,7 +62,7 @@ def _mk_thought(thought_id: str) -> ThoughtRecord:
         created_cycle=1,
         updated_cycle=1,
         source="test",
-        valid_from=_T_JAN,
+        valid_from=valid_from,
     )
 
 
@@ -133,11 +137,59 @@ class TestInvalidateThought:
         with pytest.raises(ValueError, match="ISO-8601"):
             await store.invalidate_thought("t1", "not-a-date")
 
+    async def test_backdated_valid_until_rejected(self, store: SqliteEngravaCore) -> None:
+        # AC-4: closing the interval before the stored valid_from is rejected at
+        # the mutation path — the guard runs before the row is updated.
+        await store.create_thought(_mk_thought("t1"))  # valid_from == _T_JAN
+        before_from = "2024-06-01T00:00:00+00:00"  # precedes _T_JAN
+        with pytest.raises(ValueError, match="inverted validity interval"):
+            await store.invalidate_thought("t1", before_from)
+        # The stored row is untouched — the guard rejected before writing.
+        reloaded = await store.get_thought("t1")
+        assert reloaded is not None
+        assert reloaded.valid_until is None
+
+    @pytest.mark.parametrize(
+        "valid_until",
+        [
+            _T_JAN,  # equal, same representation
+            "2025-01-01T02:00:00+02:00",  # equal across a different offset
+            "2025-01-01T00:00:00",  # equal, naive vs stored aware
+        ],
+    )
+    async def test_invalidate_at_valid_from_accepted(
+        self, store: SqliteEngravaCore, valid_until: str
+    ) -> None:
+        # The guard rejects only genuine inversions: a valid_until that equals
+        # the stored valid_from (a zero-length interval) is accepted, however it
+        # is spelled.
+        await store.create_thought(_mk_thought("t1"))  # valid_from == _T_JAN
+        updated = await store.invalidate_thought("t1", valid_until)
+        assert updated.valid_until is not None
+
+    async def test_invalidate_open_lower_bound_accepted(self, store: SqliteEngravaCore) -> None:
+        # A record with an open (NULL) valid_from can always be closed.
+        await store.create_thought(_mk_thought("t1", valid_from=None))
+        updated = await store.invalidate_thought("t1", _T_CLOSE)
+        assert updated.valid_until == _T_CLOSE
+
+    async def test_missing_thought_malformed_ts_raises_iso_error(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # The timestamp format is validated before the existence check, so a
+        # malformed timestamp on a missing id surfaces the ISO-8601 error (not
+        # ThoughtNotFoundError). test_missing_thought_raises covers the
+        # missing-id + valid-timestamp path.
+        with pytest.raises(ValueError, match="ISO-8601"):
+            await store.invalidate_thought("ghost", "not-a-date")
+
 
 class TestInvalidateEdge:
     """``invalidate_edge`` closes an edge's valid-time interval."""
 
-    async def _seed_edge(self, store: SqliteEngravaCore) -> None:
+    async def _seed_edge(
+        self, store: SqliteEngravaCore, *, valid_from: str | None = _T_JAN
+    ) -> None:
         await store.create_thought(_mk_thought("t1"))
         await store.create_thought(_mk_thought("t2"))
         await store.create_edge(
@@ -148,7 +200,7 @@ class TestInvalidateEdge:
                 edge_type=EdgeType.ASSOCIATED,
                 weight=0.5,
                 created_cycle=1,
-                valid_from=_T_JAN,
+                valid_from=valid_from,
             )
         )
 
@@ -194,3 +246,48 @@ class TestInvalidateEdge:
         await self._seed_edge(store)
         with pytest.raises(ValueError, match="ISO-8601"):
             await store.invalidate_edge("e1", "not-a-date")
+
+    async def test_backdated_valid_until_rejected(self, store: SqliteEngravaCore) -> None:
+        # AC-4: closing the interval before the stored valid_from is rejected at
+        # the mutation path — the guard runs before the row is updated.
+        await self._seed_edge(store)  # valid_from == _T_JAN
+        before_from = "2024-06-01T00:00:00+00:00"  # precedes _T_JAN
+        with pytest.raises(ValueError, match="inverted validity interval"):
+            await store.invalidate_edge("e1", before_from)
+        # The stored row is untouched — the guard rejected before writing.
+        edges = await store.get_edges("t1")
+        assert edges[0].valid_until is None
+
+    @pytest.mark.parametrize(
+        "valid_until",
+        [
+            _T_JAN,  # equal, same representation
+            "2025-01-01T02:00:00+02:00",  # equal across a different offset
+            "2025-01-01T00:00:00",  # equal, naive vs stored aware
+        ],
+    )
+    async def test_invalidate_at_valid_from_accepted(
+        self, store: SqliteEngravaCore, valid_until: str
+    ) -> None:
+        # The guard rejects only genuine inversions: a valid_until that equals
+        # the stored valid_from (a zero-length interval) is accepted, however it
+        # is spelled.
+        await self._seed_edge(store)  # valid_from == _T_JAN
+        updated = await store.invalidate_edge("e1", valid_until)
+        assert updated.valid_until is not None
+
+    async def test_invalidate_open_lower_bound_accepted(self, store: SqliteEngravaCore) -> None:
+        # An edge with an open (NULL) valid_from can always be closed.
+        await self._seed_edge(store, valid_from=None)
+        updated = await store.invalidate_edge("e1", _T_CLOSE)
+        assert updated.valid_until == _T_CLOSE
+
+    async def test_missing_edge_malformed_ts_raises_iso_error(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # The timestamp format is validated before the existence check, so a
+        # malformed timestamp on a missing id surfaces the ISO-8601 error (not
+        # "Edge not found"). test_missing_edge_raises covers the missing-id +
+        # valid-timestamp path.
+        with pytest.raises(ValueError, match="ISO-8601"):
+            await store.invalidate_edge("ghost", "not-a-date")

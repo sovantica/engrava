@@ -23,7 +23,10 @@ from engrava.domain.enums import (
     ThoughtVisibility,
 )
 from engrava.domain.exceptions import InvalidTransitionError
-from engrava.domain.models._temporal import validate_iso8601_nullable
+from engrava.domain.models._temporal import (
+    validate_interval_ordering,
+    validate_iso8601_nullable,
+)
 from engrava.domain.models.provenance import ProvenanceContext
 
 #: Allowed value types for ``ThoughtRecord.metadata`` entries.
@@ -179,6 +182,24 @@ class ThoughtRecord(BaseModel):
                 f"created_cycle ({self.created_cycle})"
             )
             raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_valid_interval(self) -> Self:
+        """Reject an inverted valid-time interval.
+
+        When both ``valid_from`` and ``valid_until`` are set, the validity
+        interval must not run backwards. The bounds are compared as
+        UTC-normalised instants (not raw strings), so equal instants across
+        differing offsets are accepted (a zero-length interval is a legitimate
+        instantaneous fact) while a strictly inverted pair is rejected. A
+        ``None`` on either bound is an open interval and is always accepted.
+
+        Raises:
+            ValueError: If ``valid_from`` is strictly after ``valid_until``.
+
+        """
+        validate_interval_ordering(self.valid_from, self.valid_until)
         return self
 
     @field_validator("thought_id")
