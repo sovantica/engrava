@@ -15,6 +15,12 @@ in ``tests/domain/test_derived_records_types.py``:
           adversarial producer that performs a nested public write.
 * AC-10 — fail-open, cancellation propagation, per-family continuation.
 * AC-11 — first-classness (embed/retrieve), conflict-as-reuse, and bounds.
+
+The explicit ``derive_existing()`` backfill trigger — the on-store seam's
+retroactive counterpart — is covered in its own section at the end of this file
+(convergence with the on-store path, idempotency, the recursion guard, fail-open
+isolation, capability-present gating independent of the enabled master switch,
+typed not-found vs clean skip, and a non-LLM structural-split demonstration).
 """
 
 from __future__ import annotations
@@ -41,9 +47,11 @@ from engrava import (
     DerivedRecord,
     DerivedRecordError,
     DeriveGates,
+    DeriveResult,
     EdgeType,
     LifecycleStatus,
     Priority,
+    SourceThoughtNotFoundError,
     SqliteEngravaCore,
     StructuralSplitProducer,
     ThoughtType,
@@ -2017,3 +2025,519 @@ def test_is_unique_violation_false_for_check_named_unique() -> None:
     assert check_exc.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_CHECK
     assert "UNIQUE" in str(check_exc).upper()  # the text-fragility trap
     assert _is_unique_violation(check_exc) is False
+
+
+# ===========================================================================
+# derive_existing() — explicit backfill trigger (the on-store seam's
+# retroactive counterpart). Convergence, idempotency, recursion guard,
+# fail-open isolation, capability-present gating (independent of enabled),
+# typed not-found vs clean skip, and a non-LLM demo.
+# ===========================================================================
+
+
+async def _edge_rows(db: aiosqlite.Connection) -> list[tuple[object, ...]]:
+    """Dump every edge's stable identity columns, ordered for byte comparison."""
+    cursor = await db.execute(
+        "SELECT edge_id, from_thought_id, to_thought_id, edge_type, created_cycle "
+        "FROM edge ORDER BY edge_id",
+    )
+    return [tuple(row) for row in await cursor.fetchall()]
+
+
+async def _derived_identity_dump(
+    conn: aiosqlite.Connection,
+) -> tuple[list[tuple[object, ...]], list[tuple[object, ...]]]:
+    """Dump the deterministic (wall-clock-free) thought + edge fields.
+
+    Used for a cross-store convergence comparison: a derived child's
+    ``created_at`` / ``updated_at`` are wall-clock stamps assigned at persist
+    time, so two independent runs differ there; every *identity-bearing* field
+    (id, content, essence, type, priority, status, cycle, source) plus the whole
+    edge is deterministic and must match byte-for-byte.
+    """
+    tcur = await conn.execute(
+        "SELECT thought_id, content, essence, thought_type, priority, "
+        "lifecycle_status, created_cycle, updated_cycle, source "
+        "FROM thought ORDER BY thought_id",
+    )
+    thoughts = [tuple(row) for row in await tcur.fetchall()]
+    return thoughts, await _edge_rows(conn)
+
+
+async def _fresh_conn() -> aiosqlite.Connection:
+    """A fresh in-memory connection with the row factory + FK pragma set."""
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    await conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+class EchoDeriveProducer(DefaultEngravaHooks):
+    """Derive exactly one child: the source content plus a distinct marker.
+
+    Because the derived content differs from the source content, a *grandchild*
+    (were the child ever re-derived) would have a distinct identity — which lets
+    a test prove that a derived record is never re-derived.
+    """
+
+    def __init__(self) -> None:
+        self.derived_from: list[str] = []
+
+    async def derive_records(
+        self,
+        thought: ThoughtRecord,
+        ctx: DeriveContext,
+    ) -> Sequence[DerivedRecord]:
+        self.derived_from.append(thought.thought_id)
+        return [_child(f"{thought.content} [d]")]
+
+
+class BackfillReentrantProducer(DefaultEngravaHooks):
+    """Adversarial: calls ``derive_existing`` from inside ``derive_records``.
+
+    A contract-violating re-entrant backfill exercised solely to prove the
+    recursion guard holds — a ``derive_existing`` invoked from within an active
+    derivation must be a no-op (it does not re-invoke the producer). It does not
+    endorse the behaviour.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.store: SqliteEngravaCore | None = None
+        self.nested_results: list[DeriveResult] = []
+
+    async def derive_records(
+        self,
+        thought: ThoughtRecord,
+        ctx: DeriveContext,
+    ) -> Sequence[DerivedRecord]:
+        self.calls += 1
+        assert self.store is not None
+        self.nested_results.append(await self.store.derive_existing(thought.thought_id))
+        return [_child("the only child")]
+
+
+# --- AC-4: convergence with the on-store path + idempotency -----------------
+
+
+async def test_backfill_of_on_store_source_is_byte_identical_noop(
+    db: aiosqlite.Connection,
+) -> None:
+    """AC-4 (primary): backfilling an already-derived source is a byte-identical
+    no-op — every child + edge is reused, nothing is created, and a second
+    backfill is identical (idempotent)."""
+    store = _make_store(db, StructuralSplitProducer(), DeriveGates(enabled=True))
+    await store.create_thought(_source(content="Alpha para.\n\nBeta para."))
+    thoughts_before = await _thought_rows(db)
+    edges_before = await _edge_rows(db)
+
+    result = await store.derive_existing("src-1")
+    assert result == DeriveResult(thought_id="src-1", created=0, reused=2, skipped=0)
+    # The children + edges the on-store path produced are reused byte-for-byte —
+    # no new rows, no new edges (reuse writes nothing).
+    assert await _thought_rows(db) == thoughts_before
+    assert await _edge_rows(db) == edges_before
+
+    # A second backfill is the identical no-op.
+    assert await store.derive_existing("src-1") == DeriveResult("src-1", 0, 2, 0)
+    assert await _thought_rows(db) == thoughts_before
+    assert await _edge_rows(db) == edges_before
+
+
+async def test_backfill_children_and_edges_match_on_store_from_scratch() -> None:
+    """AC-4: children + edges created by a from-scratch backfill are byte-
+    identical (deterministic fields) to those an on-store write would produce for
+    the same content — proving convergence, not merely reuse."""
+    content = "Alpha para.\n\nBeta para."
+
+    # Store A: automatic on-store derivation.
+    conn_auto = await _fresh_conn()
+    auto_store = SqliteEngravaCore(
+        conn_auto,
+        hooks=StructuralSplitProducer(),
+        derive_gates=DeriveGates(enabled=True),
+    )
+    await auto_store.ensure_schema()
+    await auto_store.create_thought(_source(content=content))
+    auto = await _derived_identity_dump(conn_auto)
+    await conn_auto.close()
+
+    # Store B: seam disabled at store time, then explicit backfill.
+    conn_back = await _fresh_conn()
+    backfill_store = SqliteEngravaCore(
+        conn_back,
+        hooks=StructuralSplitProducer(),
+        derive_gates=DeriveGates(enabled=False),
+    )
+    await backfill_store.ensure_schema()
+    await backfill_store.create_thought(_source(content=content))
+    assert await _count(conn_back, "SELECT COUNT(*) FROM thought") == 1  # no on-store
+    result = await backfill_store.derive_existing("src-1")
+    assert result == DeriveResult(thought_id="src-1", created=2, reused=0, skipped=0)
+    backfilled = await _derived_identity_dump(conn_back)
+    await conn_back.close()
+
+    assert backfilled == auto
+
+
+async def test_backfill_is_idempotent_across_reruns(db: aiosqlite.Connection) -> None:
+    """AC-4: the first backfill creates every child; a re-run reuses them all and
+    leaves the store unchanged."""
+    store = _make_store(db, StructuralSplitProducer(), DeriveGates(enabled=False))
+    await store.create_thought(_source(content="One.\n\nTwo.\n\nThree."))
+
+    first = await store.derive_existing("src-1")
+    assert first == DeriveResult(thought_id="src-1", created=3, reused=0, skipped=0)
+    thoughts_after_first = await _thought_rows(db)
+    edges_after_first = await _edge_rows(db)
+
+    second = await store.derive_existing("src-1")
+    assert second == DeriveResult(thought_id="src-1", created=0, reused=3, skipped=0)
+    assert await _thought_rows(db) == thoughts_after_first
+    assert await _edge_rows(db) == edges_after_first
+
+
+async def test_backfill_reuses_preexisting_child_in_counts(
+    db: aiosqlite.Connection,
+) -> None:
+    """AC-4: a child colliding with a pre-existing row is reused (not re-created)
+    and reported as ``reused`` in the result counts."""
+    child_content = "Second para."
+    preexisting_id = _derived_thought_id(child_content)
+    seed = SqliteEngravaCore(db)
+    await seed.create_thought(
+        CoreThoughtRecord(
+            thought_id=preexisting_id,
+            thought_type=ThoughtType.NOTE,
+            essence="preexisting",
+            content=child_content,
+            priority=Priority.P1,
+            lifecycle_status=LifecycleStatus.CREATED,
+            created_cycle=0,
+            updated_cycle=0,
+            source="seed",
+        ),
+    )
+    store = _make_store(db, StructuralSplitProducer(), DeriveGates(enabled=False))
+    await store.create_thought(_source(content="First para.\n\nSecond para."))
+
+    result = await store.derive_existing("src-1")
+    # "First para." is newly created; "Second para." reuses the pre-existing row.
+    assert result == DeriveResult(thought_id="src-1", created=1, reused=1, skipped=0)
+
+
+# --- AC-7: capability-present gating, independent of enabled -----------------
+
+
+async def test_backfill_runs_with_seam_disabled(db: aiosqlite.Connection) -> None:
+    """AC-7: backfill runs on capability-present alone — the on-store trigger is
+    off (``enabled=False``) so only the explicit call derives."""
+    store = _make_store(db, StructuralSplitProducer(), DeriveGates(enabled=False))
+    await store.create_thought(_source(content="A.\n\nB."))
+    assert await _count(db, "SELECT COUNT(*) FROM thought") == 1  # enabled=False ⇒ no on-store
+
+    result = await store.derive_existing("src-1")
+    assert result == DeriveResult(thought_id="src-1", created=2, reused=0, skipped=0)
+    assert await _count(db, "SELECT COUNT(*) FROM thought") == 3
+
+
+async def test_backfill_without_producer_is_clean_noop(
+    db: aiosqlite.Connection,
+) -> None:
+    """AC-7: with no producer capability registered, backfill is a clean no-op."""
+    store = _make_store(db, DefaultEngravaHooks(), DeriveGates(enabled=True))
+    await store.create_thought(_source(content="A.\n\nB."))
+    result = await store.derive_existing("src-1")
+    assert result == DeriveResult(thought_id="src-1", created=0, reused=0, skipped=0)
+    assert await _count(db, "SELECT COUNT(*) FROM thought") == 1
+
+
+async def test_backfill_honors_cap_under_raise(db: aiosqlite.Connection) -> None:
+    """AC-7: backfill honours ``max_derived_per_source`` — an over-cap return is
+    rejected before any child write."""
+    producer = ListProducer([_child(f"c{i}") for i in range(5)])
+    store = _make_store(
+        db,
+        producer,
+        DeriveGates(enabled=False, on_error="raise", max_derived_per_source=3),
+    )
+    await store.create_thought(_source())
+    with pytest.raises(DerivedRecordError, match="max_derived_per_source"):
+        await store.derive_existing("src-1")
+    assert await _count(db, "SELECT COUNT(*) FROM thought") == 1
+
+
+async def test_backfill_within_suspended_commit_joins_caller_transaction(
+    db: aiosqlite.Connection,
+) -> None:
+    """Backfill does not early-return inside a ``suspend_auto_commit`` window (its
+    source is already durable); the children join the caller's transaction and
+    become durable when it commits."""
+    store = _make_store(db, StructuralSplitProducer(), DeriveGates(enabled=False))
+    await store.create_thought(_source(content="Alpha.\n\nBeta."))
+    async with store.suspend_auto_commit():
+        result = await store.derive_existing("src-1")
+    assert result == DeriveResult(thought_id="src-1", created=2, reused=0, skipped=0)
+    # After the caller's transaction commits (context exit), children are durable.
+    assert await _count(db, "SELECT COUNT(*) FROM thought") == 3
+
+
+# --- AC-8: not-found (typed error) vs ineligible (clean skip) ----------------
+
+
+async def test_backfill_missing_source_raises_typed_error(
+    db: aiosqlite.Connection,
+) -> None:
+    """AC-8: a missing source id raises the typed error, never a silent no-op."""
+    store = _make_store(db, StructuralSplitProducer(), DeriveGates(enabled=False))
+    with pytest.raises(SourceThoughtNotFoundError):
+        await store.derive_existing("nonexistent-id")
+
+
+async def test_backfill_does_not_re_derive_a_derived_record(
+    db: aiosqlite.Connection,
+) -> None:
+    """AC-8/AC-5: a source that is itself a derived record is a clean skip — the
+    producer is never invoked on it and no grandchild is created."""
+    producer = EchoDeriveProducer()
+    store = _make_store(db, producer, DeriveGates(enabled=True))
+    await store.create_thought(_source(content="X"))
+    child_id = _derived_thought_id("X [d]")
+    assert await store.get_thought(child_id) is not None
+    assert producer.derived_from == ["src-1"]  # derived once, from the source
+
+    result = await store.derive_existing(child_id)
+    assert result == DeriveResult(thought_id=child_id, created=0, reused=0, skipped=0)
+    # The producer was NOT invoked on the derived child (guard-marker skip)...
+    assert producer.derived_from == ["src-1"]
+    # ...so no grandchild ("X [d] [d]") was ever created.
+    assert await store.get_thought(_derived_thought_id("X [d] [d]")) is None
+
+
+# --- AC-5: recursion guard (depth <= 1, nested writes, nested backfill) ------
+
+
+async def test_backfill_recursion_guard_blocks_nested_write(
+    db: aiosqlite.Connection,
+) -> None:
+    """AC-5: a nested public write a producer issues *during backfill* does not
+    re-dispatch — depth stays at most one (no runaway recursion)."""
+    producer = NestedWriteProducer()
+    store = _make_store(db, producer, DeriveGates(enabled=True))
+    producer.store = store
+    await store.create_thought(_source(content="single"))
+    assert producer.calls == 1  # on-store derivation ran once; nested write guarded
+
+    result = await store.derive_existing("src-1")
+    # Exactly one *more* dispatch: the nested create_thought during the backfill
+    # did not re-dispatch (revert the guard ⇒ unbounded recursion ⇒ calls > 2).
+    assert producer.calls == 2
+    assert result == DeriveResult(thought_id="src-1", created=0, reused=1, skipped=0)
+    # The nested write produced no derived children of its own.
+    assert await store.get_edges("nested-2", direction="IN") == []
+
+
+async def test_backfill_nested_derive_existing_is_a_noop(
+    db: aiosqlite.Connection,
+) -> None:
+    """AC-5 (strongest): a ``derive_existing`` invoked from within a derivation is
+    a no-op — it ignores ``enabled``, so *only* the recursion guard stops it."""
+    producer = BackfillReentrantProducer()
+    store = _make_store(db, producer, DeriveGates(enabled=False))
+    producer.store = store
+    await store.create_thought(_source(content="body"))
+    assert producer.calls == 0  # enabled=False ⇒ no on-store derivation
+
+    result = await store.derive_existing("src-1")
+    # derive_records ran exactly once; the re-entrant backfill did NOT re-run it.
+    assert producer.calls == 1
+    assert producer.nested_results == [DeriveResult(thought_id="src-1")]
+    assert result == DeriveResult(thought_id="src-1", created=1, reused=0, skipped=0)
+
+
+# --- AC-6: fail-open, per-child isolation, cancellation ---------------------
+
+
+async def test_backfill_producer_error_raise_keeps_source_durable(
+    db: aiosqlite.Connection,
+) -> None:
+    """AC-6: ``on_error='raise'`` re-raises, but the source stays durable."""
+    producer = RaisingProducer()
+    store = _make_store(db, producer, DeriveGates(enabled=False, on_error="raise"))
+    await store.create_thought(_source())
+    with pytest.raises(RuntimeError, match="producer boom"):
+        await store.derive_existing("src-1")
+    assert await store.get_thought("src-1") is not None
+
+
+async def test_backfill_producer_error_log_swallows(
+    db: aiosqlite.Connection,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AC-6: ``on_error='log'`` swallows the producer failure with ordinary logging."""
+    producer = RaisingProducer()
+    store = _make_store(db, producer, DeriveGates(enabled=False, on_error="log"))
+    await store.create_thought(_source())
+    with caplog.at_level(logging.WARNING, logger=core_module.__name__):
+        result = await store.derive_existing("src-1")
+    assert result == DeriveResult(thought_id="src-1", created=0, reused=0, skipped=0)
+    assert await store.get_thought("src-1") is not None
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+@pytest.mark.parametrize("on_error", ["raise", "log"])
+async def test_backfill_cancellation_propagates(
+    db: aiosqlite.Connection,
+    on_error: str,
+) -> None:
+    """AC-6: a cancelled ``derive_records`` propagates ``CancelledError`` either way,
+    leaving the source durable."""
+    store = _make_store(
+        db,
+        CancellingProducer(),
+        DeriveGates(enabled=False, on_error=on_error),  # type: ignore[arg-type]
+    )
+    await store.create_thought(_source())
+    with pytest.raises(asyncio.CancelledError):
+        await store.derive_existing("src-1")
+    assert await store.get_thought("src-1") is not None
+
+
+async def test_backfill_child_failure_is_isolated_and_journal_valid() -> None:
+    """AC-6: a per-child failure under ``on_error='log'`` is isolated — it is
+    counted as skipped, the other children commit, the source stays durable, and
+    the journal hash-chain remains valid (no orphan / torn transaction)."""
+    collide = "poison content"
+    # Make the source id equal a middle child's content-addressed derived id, so
+    # that child deterministically self-collides (rejected) without touching the
+    # others.
+    colliding_source_id = _derived_thought_id(collide)
+    producer = ListProducer(
+        [_child("first good"), _child(collide), _child("second good")],
+    )
+    conn = await _fresh_conn()
+    store = SqliteEngravaCore(
+        conn,
+        hooks=producer,
+        derive_gates=DeriveGates(enabled=False, on_error="log"),
+        journal_enabled=True,
+    )
+    await store.ensure_schema()
+    await store.create_thought(_source(colliding_source_id, content="Body."))
+
+    result = await store.derive_existing(colliding_source_id)
+    assert result == DeriveResult(
+        thought_id=colliding_source_id,
+        created=2,
+        reused=0,
+        skipped=1,
+    )
+    # Source durable; the two good children committed; journal chain intact.
+    assert await store.get_thought(colliding_source_id) is not None
+    assert await _count(conn, "SELECT COUNT(*) FROM thought") == 3
+    integrity = await store.verify_journal()
+    assert integrity.valid
+    await conn.close()
+
+
+async def test_backfill_raise_in_suspend_window_rolls_back_caller_writes_source_survives() -> None:
+    """AC-6: a raising backfill inside a caller transaction rolls the whole window
+    back — the caller's unrelated write included — while the source stays durable.
+
+    Under a caller-held ``suspend_auto_commit`` window with ``on_error="raise"`` a
+    derived-child failure propagates out of the window, so ``suspend_auto_commit``
+    rolls the entire transaction back. That is the window owner's normal atomicity,
+    not behaviour unique to backfill; ``derive_existing`` is merely the path that
+    runs derivation *inside* such a window (the on-store trigger defers instead).
+    The source thought, committed **before** the window, is unaffected.
+
+    Regression-sensitive by construction: the first produced child is persisted
+    (uncommitted) into the window before the second child collides and aborts, so
+    if the window did NOT roll back on the raise the unrelated write and that
+    first child's row + ``DERIVED_FROM`` edge would survive — assertions (a)/(c)
+    would fail. If the already-committed source were swept into the rollback,
+    assertion (b) would fail.
+    """
+    collide = "poison content"
+    # Make the source id equal a produced child's content-addressed derived id, so
+    # that child deterministically collides with its own source and fails to
+    # persist (identity collision) — surfaced as a raise under on_error="raise".
+    colliding_source_id = _derived_thought_id(collide)
+    producer = ListProducer(
+        [_child("first good"), _child(collide), _child("second good")],
+    )
+    conn = await _fresh_conn()
+    store = SqliteEngravaCore(
+        conn,
+        hooks=producer,
+        derive_gates=DeriveGates(enabled=False, on_error="raise"),
+        journal_enabled=True,
+    )
+    await store.ensure_schema()
+    # The source commits durably BEFORE the window (enabled=False ⇒ no on-store
+    # derivation), so it is not part of the caller transaction opened below.
+    await store.create_thought(_source(colliding_source_id, content="Body."))
+
+    # One caller-held transaction: an unrelated write, then a backfill whose second
+    # child collides and (under raise) aborts — the error leaves the window, which
+    # rolls the whole transaction back.
+    async def _unrelated_write_then_failing_backfill() -> None:
+        async with store.suspend_auto_commit():
+            await store.create_thought(_source("unrelated-src", content="unrelated body"))
+            await store.derive_existing(colliding_source_id)
+
+    with pytest.raises(DerivedRecordError):
+        await _unrelated_write_then_failing_backfill()
+
+    # (a) the caller's unrelated write was rolled back with the failed derivation.
+    assert await store.get_thought("unrelated-src") is None
+    # (b) the source, committed before the window, is unaffected.
+    assert await store.get_thought(colliding_source_id) is not None
+    # (c) no orphan child rows or edges: only the source row survives, and the
+    # first child's row + its DERIVED_FROM edge (persisted but uncommitted in the
+    # window) were rolled back too.
+    assert await _count(conn, "SELECT COUNT(*) FROM thought") == 1
+    assert await _edge_rows(conn) == []
+    # (d) the journal hash-chain remains valid (no torn / half-written entry).
+    integrity = await store.verify_journal()
+    assert integrity.valid
+    await conn.close()
+
+
+# --- AC-10/AC-11: non-LLM demo + first-classness ----------------------------
+
+
+async def test_structural_split_backfill_is_non_llm_demo(
+    db: aiosqlite.Connection,
+) -> None:
+    """AC-10: a deterministic structural-split producer backfilled via
+    ``derive_existing`` — one linked child per paragraph, no LLM."""
+    store = _make_store(db, StructuralSplitProducer(), DeriveGates(enabled=False))
+    await store.create_thought(_source(content="One.\n\nTwo.\n\nThree."))
+    assert await _count(db, "SELECT COUNT(*) FROM thought") == 1
+
+    result = await store.derive_existing("src-1")
+    assert result == DeriveResult(thought_id="src-1", created=3, reused=0, skipped=0)
+    edges = await store.get_edges("src-1", direction="IN")
+    assert len(edges) == 3
+    assert all(e.edge_type == EdgeType.DERIVED_FROM for e in edges)
+
+
+async def test_backfilled_children_are_embedded_and_retrievable(
+    db: aiosqlite.Connection,
+) -> None:
+    """AC-11: backfilled children run the ordinary lifecycle — embedded + linked."""
+    provider = CallbackProvider(_hash_embed, dimension=8, model_name="hash-8")
+    store = _make_store(
+        db,
+        StructuralSplitProducer(),
+        DeriveGates(enabled=False),
+        embedding_provider=provider,
+        auto_embed=True,
+    )
+    await store.create_thought(_source(content="Head para.\n\nTail para."))
+
+    result = await store.derive_existing("src-1")
+    assert result.created == 2
+    for edge in await store.get_edges("src-1", direction="IN"):
+        assert await store.get_embedding(edge.from_thought_id) is not None

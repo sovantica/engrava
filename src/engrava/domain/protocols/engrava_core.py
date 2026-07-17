@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from engrava.domain.models.search import HybridSearchResult
     from engrava.domain.models.thought import MetadataValue, ThoughtRecord
     from engrava.domain.models.ttl import CleanupResult
+    from engrava.domain.protocols.derived_records import DeriveResult
 
 
 @runtime_checkable
@@ -734,6 +735,51 @@ class EngravaCoreProtocol(Protocol):
 
         Returns:
             List of action records.
+
+        """
+        ...
+
+    async def derive_existing(self, thought_id: str) -> DeriveResult:
+        """Run the registered derived-records producer over a stored thought.
+
+        The explicit backfill counterpart of the automatic on-store derived-
+        records trigger: for an already-stored source thought, invoke the
+        configured producer capability and persist every returned child through
+        the **same** core-owned per-child lifecycle the on-store path uses
+        (content-addressed identity, per-child commit, auto-embed, conflict-as-
+        reuse, and the single ``DERIVED_FROM`` provenance edge). It exists so a
+        base built *before* a producer was installed can be enriched
+        retroactively, and because backfilled children share the on-store path's
+        exact identity they **converge** with it (deduped, idempotent).
+
+        Gating: this runs whenever a producer capability is present, honouring
+        ``DeriveGates.on_error`` and ``max_derived_per_source``, but
+        **independently of** ``DeriveGates.enabled`` (the master switch that
+        governs only the automatic on-store trigger) — so an existing base can
+        be backfilled without committing to automatic derivation on every future
+        write. When no producer capability is registered it is a clean no-op.
+
+        Idempotent by construction: because derived-child identity is content-
+        addressed and insertion is conflict-as-reuse, re-running it converges
+        (already-present children are reused, missing ones filled). A source that
+        is itself a derived record is never re-derived (a clean, empty result).
+
+        Stability: additive public method under the ``X.Y.x`` guarantee — it is a
+        write entry point, so it belongs to the writable core, never a read-only
+        view.
+
+        Args:
+            thought_id: The already-stored source thought to derive from.
+
+        Returns:
+            A :class:`~engrava.domain.protocols.derived_records.DeriveResult`
+            tallying children created / reused / skipped for this run.
+
+        Raises:
+            SourceThoughtNotFoundError: If ``thought_id`` does not exist.
+            DerivedRecordError: If the producer's return violates the seam's
+                deterministic contract (over cap, or an identity collision) and
+                ``DeriveGates.on_error="raise"``.
 
         """
         ...

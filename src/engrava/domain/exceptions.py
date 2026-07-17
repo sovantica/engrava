@@ -377,6 +377,32 @@ class DerivedRecordError(EngravaError):
         super().__init__(f"[source={source_thought_id!r}] {message}")
 
 
+class SourceThoughtNotFoundError(EngravaError):
+    """Raised when an explicit backfill targets a source thought that is absent.
+
+    Surfaced by the derived-records backfill entry point when the requested
+    source ``thought_id`` does not exist in the store, so there is nothing to
+    derive from. It is a precondition/contract failure distinct from the clean,
+    empty result the backfill returns for an *ineligible* (already-derived)
+    source — a missing id is an error, an ineligible source is a no-op.
+
+    Args:
+        thought_id: The source ID that was not found.
+
+    Examples:
+        >>> raise SourceThoughtNotFoundError("t-404")
+        Traceback (most recent call last):
+            ...
+        engrava.domain.exceptions.SourceThoughtNotFoundError: \
+source thought not found: 't-404'
+
+    """
+
+    def __init__(self, thought_id: str) -> None:
+        self.thought_id = thought_id
+        super().__init__(f"source thought not found: {thought_id!r}")
+
+
 class CycleProviderError(EngravaError):
     """Raised when a configured cycle provider returns an invalid value.
 

@@ -23,6 +23,7 @@ import sqlite3
 import struct
 import unicodedata
 import uuid as _uuid
+from dataclasses import dataclass
 from importlib import resources
 from itertools import islice
 from pathlib import Path
@@ -56,6 +57,7 @@ from engrava.domain.exceptions import (
     JournalIntegrityError,
     RecencyModeConflictError,
     ReferentialIntegrityError,
+    SourceThoughtNotFoundError,
     StaleDataError,
     ThoughtNotFoundError,
 )
@@ -77,6 +79,7 @@ from engrava.domain.protocols.derived_records import (
     DerivedRecord,
     DerivedRecordProducerProtocol,
     DeriveGates,
+    DeriveResult,
 )
 from engrava.domain.protocols.embedding_provider import RoleAwareEmbeddingProvider
 from engrava.domain.protocols.hooks import DefaultEngravaHooks, EngravaHooksProtocol
@@ -127,6 +130,36 @@ _DERIVATION_ORIGIN: contextvars.ContextVar[str] = contextvars.ContextVar(
     "engrava_derivation_origin",
     default="create_thought",
 )
+
+#: Informational ``DeriveContext.origin`` label for the explicit backfill entry
+#: point (``derive_existing``), distinguishing a retroactive backfill from the
+#: automatic on-store write operations. Purely descriptive — never consulted for
+#: recursion control or gating.
+_ORIGIN_DERIVE_EXISTING = "derive_existing"
+
+
+@dataclass(frozen=True)
+class _DerivationOutcome:
+    """Per-source tally of derived-child persistence outcomes for one dispatch.
+
+    Returned by the shared per-child dispatch loop so the explicit backfill
+    entry point can report counts; the automatic on-store path computes the same
+    tally but discards it (its callers observe derivation only through the store
+    state). Private to this module — the public counterpart is
+    :class:`~engrava.domain.protocols.derived_records.DeriveResult`.
+
+    Attributes:
+        created: Children newly inserted this dispatch.
+        reused: Children that already existed and were reused (conflict-as-reuse).
+        skipped: Children whose persistence failed under ``on_error="log"`` and
+            were left for a later re-run (the source stays durable).
+
+    """
+
+    created: int = 0
+    reused: int = 0
+    skipped: int = 0
+
 
 #: Fixed namespaces for the deterministic identities the derived-records seam
 #: assigns. A derived thought's ``thought_id`` is ``uuid5`` over its content, so
@@ -3729,6 +3762,126 @@ class SqliteEngravaCore:
     # Derived-records extension seam
     # ------------------------------------------------------------------
 
+    async def derive_existing(self, thought_id: str) -> DeriveResult:
+        """Run the registered derived-records producer over a stored thought.
+
+        The explicit backfill counterpart of the automatic on-store derived-
+        records trigger (:meth:`_dispatch_derivation`): for an already-stored
+        source thought it invokes the configured producer capability and persists
+        every returned child through the **same** core-owned per-child lifecycle
+        the on-store path uses (:meth:`_derive_and_persist` →
+        :meth:`_persist_derived_child`). Because backfilled children share the
+        on-store path's exact content-addressed identity, guarded lifecycle, and
+        ``DERIVED_FROM`` edge, a backfill **converges** with the on-store path:
+        its output is byte-identical to what an on-store write would have produced
+        for the same content, so backfilled and auto-derived records dedup against
+        one another. This convergence holds for producers that respect the
+        informational-``origin`` contract: ``DeriveContext.origin`` is **not part
+        of the content-hash identity** and a producer must not derive a child's
+        content or identity from it. ``origin`` already varies across the on-store
+        entry points (``create_thought`` / ``bulk_store`` / ``get_or_create`` /
+        ``upsert_by_hash``) and again here, so a producer that keyed its output off
+        ``origin`` would already diverge between two on-store writes — this is the
+        pre-existing seam contract, not a new limitation of backfill. Re-running it
+        is idempotent — already-present children are reused, missing ones filled.
+
+        Gating (independent of ``DeriveGates.enabled``): this runs whenever a
+        producer capability is present, honouring ``DeriveGates.on_error`` and
+        ``max_derived_per_source`` — but **not** ``DeriveGates.enabled``, which
+        governs only the automatic on-store trigger. So an existing base can be
+        backfilled once without committing to automatic derivation on every future
+        write. With no producer capability registered it is a clean no-op.
+
+        Recursion guard: it consults and sets the same :data:`_IN_DERIVATION`
+        guard as the on-store path, so a producer's own nested public write
+        (including a nested ``derive_existing``) never re-dispatches — depth stays
+        at most one — and a ``derive_existing`` invoked from within a derivation is
+        a no-op. A source that is itself a derived record (it carries an outgoing
+        ``DERIVED_FROM`` edge) is never re-derived.
+
+        Unlike :meth:`_dispatch_derivation` it does **not** early-return inside a
+        caller-held ``suspend_auto_commit`` window: the source is already durable
+        (stored by a prior committed call), so there is no source-durability reason
+        to defer. If a caller wraps it in an open transaction, the children simply
+        join that transaction like any other write and the caller owns their
+        durability. Consequently, inside such a window with
+        ``DeriveGates.on_error="raise"`` a derived-child failure rolls back that
+        **whole** transaction — the caller's unrelated writes included — which is
+        simply ``suspend_auto_commit``'s normal atomicity (the caller who opens the
+        window owns its rollback semantics), not a behaviour unique to backfill;
+        the already-committed **source thought is unaffected**. Outside a suspend
+        window each child commits as its own durable unit (per-child isolation).
+
+        Args:
+            thought_id: The already-stored source thought to derive from.
+
+        Returns:
+            A :class:`~engrava.domain.protocols.derived_records.DeriveResult`
+            tallying children created / reused / skipped for this run (all zero
+            for a clean skip or no-op).
+
+        Raises:
+            SourceThoughtNotFoundError: If ``thought_id`` does not exist.
+            DerivedRecordError: If the producer's return violates the seam's
+                deterministic contract (over cap, or an identity collision) and
+                ``DeriveGates.on_error="raise"``.
+            ConnectionQuarantinedError: When the connection has been quarantined.
+
+        """
+        self._ensure_connection_usable()
+        row = await self._get_thought_row(thought_id)
+        if row is None:
+            # A missing source is a precondition failure (an error), distinct from
+            # the clean empty result returned for an ineligible source below.
+            raise SourceThoughtNotFoundError(thought_id)
+        # Nested no-op: a derive_existing issued from within an active derivation
+        # (e.g. by a contract-violating producer) must not re-dispatch (depth ≤ 1).
+        if _IN_DERIVATION.get():
+            return DeriveResult(thought_id=thought_id)
+        # Capability-present gate — deliberately independent of DeriveGates.enabled
+        # (that master switch governs only the automatic on-store trigger, D4).
+        if not isinstance(self._hooks, DerivedRecordProducerProtocol):
+            return DeriveResult(thought_id=thought_id)
+        producer: DerivedRecordProducerProtocol = self._hooks
+        # A source that is itself a derived record is never re-derived: an outgoing
+        # DERIVED_FROM edge is the structural marker of a derived child.
+        if await self._has_outgoing_derived_edge(thought_id):
+            return DeriveResult(thought_id=thought_id)
+        # Derive from the raw stored row (never on_retrieve-transformed), so the
+        # content — and thus the derived children — match the on-store path, which
+        # derives from the record as written. This also avoids buffering an access.
+        source = self._row_to_thought(row)
+        outcome = await self._derive_and_persist(producer, source, _ORIGIN_DERIVE_EXISTING)
+        return DeriveResult(
+            thought_id=thought_id,
+            created=outcome.created,
+            reused=outcome.reused,
+            skipped=outcome.skipped,
+        )
+
+    async def _has_outgoing_derived_edge(self, thought_id: str) -> bool:
+        """Return whether *thought_id* is itself a derived record.
+
+        A derived child is linked to its source by an outgoing ``DERIVED_FROM``
+        edge (derived → source), so an outgoing edge of that type is the
+        structural marker that a thought was produced by the derived-records seam.
+        The explicit backfill entry point consults this to skip a source that is
+        itself a derived record. The query is index-backed (``idx_edge_type_from``)
+        and short-circuits on the first match.
+
+        Args:
+            thought_id: The candidate source thought id.
+
+        Returns:
+            ``True`` when at least one outgoing ``DERIVED_FROM`` edge exists.
+
+        """
+        cursor = await self._db.execute(
+            "SELECT 1 FROM edge WHERE from_thought_id = ? AND edge_type = ? LIMIT 1",
+            (thought_id, EdgeType.DERIVED_FROM.value),
+        )
+        return await cursor.fetchone() is not None
+
     async def _dispatch_derivation(self, source: ThoughtRecord) -> None:
         """Persist an extension's derived records for a committed source thought.
 
@@ -3770,16 +3923,56 @@ class SqliteEngravaCore:
             return
         if not isinstance(self._hooks, DerivedRecordProducerProtocol):
             return
-        producer: DerivedRecordProducerProtocol = self._hooks
+        # Share the exact per-child dispatch path with the explicit backfill
+        # entry point (:meth:`derive_existing`). The returned tally is only
+        # meaningful to that caller, so the on-store trigger discards it (callers
+        # observe on-store derivation through the store state, not a return).
+        await self._derive_and_persist(self._hooks, source, _DERIVATION_ORIGIN.get())
+
+    async def _derive_and_persist(
+        self,
+        producer: DerivedRecordProducerProtocol,
+        source: ThoughtRecord,
+        origin: str,
+    ) -> _DerivationOutcome:
+        """Build the context, set the recursion guard, and run derivation.
+
+        The single code path shared by the automatic on-store trigger
+        (:meth:`_dispatch_derivation`) and the explicit backfill entry point
+        (:meth:`derive_existing`), so both produce byte-identical children and
+        edges: the source content-hash identity, the guarded per-child lifecycle,
+        and the recursion guard are all computed here in exactly one place. The
+        two callers differ only in their *gating* (the on-store trigger honours
+        ``DeriveGates.enabled``; backfill runs on capability-present alone) and in
+        the informational ``origin`` label — never in how a child is persisted.
+
+        The context's ``cycle_at_derivation`` is the source's own
+        ``updated_cycle`` (the cycle observed on the source thought), so a
+        backfilled child is stamped with exactly the cycle its on-store
+        counterpart would receive — the property that makes backfill converge
+        byte-identically with the on-store path.
+
+        The caller MUST have already confirmed the producer capability and that
+        the source is eligible; this method unconditionally dispatches.
+
+        Args:
+            producer: The derived-record producer capability.
+            source: The durable source thought to derive from.
+            origin: Informational ``DeriveContext.origin`` label for this path.
+
+        Returns:
+            The per-source tally of created / reused / skipped children.
+
+        """
         ctx = DeriveContext(
             source_thought_id=source.thought_id,
             source_content_hash=_compute_content_hash(source.content),
             cycle_at_derivation=source.updated_cycle,
-            origin=_DERIVATION_ORIGIN.get(),
+            origin=origin,
         )
         token = _IN_DERIVATION.set(True)
         try:
-            await self._run_derivation(producer, source, ctx)
+            return await self._run_derivation(producer, source, ctx)
         finally:
             _IN_DERIVATION.reset(token)
 
@@ -3788,7 +3981,7 @@ class SqliteEngravaCore:
         producer: DerivedRecordProducerProtocol,
         source: ThoughtRecord,
         ctx: DeriveContext,
-    ) -> None:
+    ) -> _DerivationOutcome:
         """Invoke the producer and persist its derived records per-child.
 
         Fail-open: the source is already durable, so any failure here never
@@ -3803,14 +3996,23 @@ class SqliteEngravaCore:
             source: The committed source thought.
             ctx: The derivation context.
 
+        Returns:
+            The per-source tally of children created / reused / skipped. A child
+            is *created* when its content-addressed row is newly inserted,
+            *reused* when it collided with an existing row (conflict-as-reuse),
+            and *skipped* when its persistence failed under ``on_error="log"``.
+
         """
         on_error = self._derive_gates.on_error
         records = await self._collect_derived(producer, source, ctx, on_error)
         if records is None:
-            return
+            return _DerivationOutcome()
+        created = 0
+        reused = 0
+        skipped = 0
         for record in records:
             try:
-                await self._persist_derived_child(source, record, ctx)
+                inserted = await self._persist_derived_child(source, record, ctx)
             except asyncio.CancelledError:
                 raise
             except _DerivationRollbackError:
@@ -3829,7 +4031,7 @@ class SqliteEngravaCore:
                     "derived-record rollback failed for source %s; aborting remaining children",
                     ctx.source_thought_id,
                 )
-                return
+                return _DerivationOutcome(created=created, reused=reused, skipped=skipped)
             except Exception:
                 if on_error == "raise":
                     raise
@@ -3838,6 +4040,13 @@ class SqliteEngravaCore:
                     ctx.source_thought_id,
                     exc_info=True,
                 )
+                skipped += 1
+            else:
+                if inserted:
+                    created += 1
+                else:
+                    reused += 1
+        return _DerivationOutcome(created=created, reused=reused, skipped=skipped)
 
     async def _collect_derived(
         self,
@@ -3902,7 +4111,7 @@ class SqliteEngravaCore:
         source: ThoughtRecord,
         record: DerivedRecord,
         ctx: DeriveContext,
-    ) -> None:
+    ) -> bool:
         """Persist a single derived record as an ordinary thought, per-child.
 
         Runs the same lifecycle an ordinary thought gets — insert →
@@ -3942,6 +4151,12 @@ class SqliteEngravaCore:
             record: The producer-owned derived record.
             ctx: The derivation context.
 
+        Returns:
+            ``True`` when the child's row was newly inserted (created), ``False``
+            when an existing row with the same content-addressed identity was
+            reused (conflict-as-reuse). A skipped child never returns — it raises
+            (surfaced per ``on_error`` by the caller).
+
         Raises:
             DerivedRecordError: When the derived identity would collide with the
                 source thought itself, or when a conflict-as-reuse hit lands on a
@@ -3960,7 +4175,7 @@ class SqliteEngravaCore:
         child = self._build_derived_thought(record, child_id, ctx, source)
         reused_foreign = False
         try:
-            await self._insert_derived_row(child)
+            inserted = await self._insert_derived_row(child)
             # Re-read the stored row once: it is both the enrichment target (its
             # own content, never the producer's) and the basis for the provenance
             # identity-collision check below. On a conflict-as-reuse hit it may be
@@ -4016,6 +4231,7 @@ class SqliteEngravaCore:
                 source.thought_id,
                 "derived record identity collides with an unrelated stored thought",
             )
+        return inserted
 
     async def _compensate_child_rollback(self, original: BaseException) -> None:
         """Roll back a failed derived child's uncommitted partial, cancel-safely.
@@ -4134,7 +4350,7 @@ class SqliteEngravaCore:
             updated_at=now_iso,
         )
 
-    async def _insert_derived_row(self, child: ThoughtRecord) -> None:
+    async def _insert_derived_row(self, child: ThoughtRecord) -> bool:
         """Insert a derived child row conflict-safely (conflict-as-reuse).
 
         A child whose deterministic identity already exists (a pre-existing row
@@ -4148,6 +4364,11 @@ class SqliteEngravaCore:
         Args:
             child: The derived thought to persist.
 
+        Returns:
+            ``True`` when a new row was inserted, ``False`` when an existing row
+            with the same content-addressed identity was reused (conflict-as-
+            reuse). The caller uses this to tally created vs reused children.
+
         """
         try:
             await self._db.execute(
@@ -4157,7 +4378,7 @@ class SqliteEngravaCore:
         except aiosqlite.IntegrityError as exc:
             if not _is_unique_violation(exc):
                 raise
-            return
+            return False
         if self._journal is not None:
             await self._journal.append(
                 mutation_type="INSERT_THOUGHT",
@@ -4165,6 +4386,7 @@ class SqliteEngravaCore:
                 delta={"before": None, "after": child.model_dump(mode="json")},
             )
         await self._maybe_commit()
+        return True
 
     async def _insert_derived_edge(
         self,

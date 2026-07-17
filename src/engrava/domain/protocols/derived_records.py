@@ -12,7 +12,8 @@ cycle, lifecycle status, and the single provenance edge).
 Stability
 ---------
 :class:`DerivedRecordProducerProtocol`, :class:`DerivedRecord`,
-:class:`DeriveContext`, and :class:`DeriveGates` are public API and follow the
+:class:`DeriveContext`, :class:`DeriveGates`, and :class:`DeriveResult` are
+public API and follow the
 same ``X.Y.x`` compatibility guarantee as the rest of ``engrava``: no breaking
 change (removed field, renamed field, tightened type, or changed default) lands
 within a patch series. Any breaking change ships in a minor release and is
@@ -115,7 +116,12 @@ class DeriveContext:
         origin: Core-owned, purely informational label naming the write
             operation that triggered derivation (e.g. ``"create_thought"`` or
             ``"bulk_store"``). It is **never** used for recursion control or
-            authorization — the recursion guard is a separate core mechanism.
+            authorization — the recursion guard is a separate core mechanism. It
+            is **not part of the content-hash identity and must not influence a
+            producer's output**: it already varies across the on-store write paths
+            (``create_thought`` / ``bulk_store`` / ``get_or_create`` /
+            ``upsert_by_hash``) and the explicit backfill, so a producer that keys
+            its output off ``origin`` breaks cross-write-path convergence and dedup.
 
     Examples:
         >>> ctx = DeriveContext(
@@ -213,6 +219,43 @@ class DeriveGates:
         if self.max_derived_per_source < 1:
             msg = "DeriveGates.max_derived_per_source must be >= 1"
             raise ValueError(msg)
+
+
+@dataclass(frozen=True)
+class DeriveResult:
+    """Outcome of one explicit derived-records backfill over a source thought.
+
+    Returned by the explicit backfill entry point that runs the registered
+    producer over an already-stored thought. It is a plain tally of what
+    happened to the produced children, carrying no LLM or producer-specific
+    concepts. Because derived-child identity is content-addressed and insertion
+    is conflict-as-reuse, a backfill converges with the on-store path: re-running
+    it over a fully-derived source yields ``created == 0`` (every child already
+    present ⇒ ``reused``), which is what makes backfill idempotent.
+
+    Attributes:
+        thought_id: The source thought the backfill ran over.
+        created: Number of derived children newly inserted by this run.
+        reused: Number of derived children that already existed and were reused
+            (content-addressed conflict-as-reuse), not re-inserted.
+        skipped: Number of derived children skipped because their persistence
+            failed under ``DeriveGates.on_error="log"`` (left for a later
+            re-run to fill — the source and every other child stay durable). It
+            is always ``0`` when the run completes without a per-child failure.
+
+    Examples:
+        >>> result = DeriveResult(thought_id="t-1", created=3)
+        >>> (result.created, result.reused, result.skipped)
+        (3, 0, 0)
+        >>> DeriveResult(thought_id="t-1").created
+        0
+
+    """
+
+    thought_id: str
+    created: int = 0
+    reused: int = 0
+    skipped: int = 0
 
 
 @runtime_checkable

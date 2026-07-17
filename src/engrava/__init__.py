@@ -51,6 +51,7 @@ from engrava.domain.exceptions import (
     JournalIntegrityError,
     ReadOnlyViolationError,
     RecencyModeConflictError,
+    SourceThoughtNotFoundError,
     StaleDataError,
     ThoughtNotFoundError,
 )
@@ -84,6 +85,7 @@ from engrava.domain.protocols.derived_records import (
     DerivedRecord,
     DerivedRecordProducerProtocol,
     DeriveGates,
+    DeriveResult,
 )
 from engrava.domain.protocols.embedding_provider import (
     EmbeddingProviderProtocol,
@@ -146,6 +148,7 @@ __all__ = [
     "DefaultMindStoreHooks",
     "DeriveContext",
     "DeriveGates",
+    "DeriveResult",
     "DerivedRecord",
     "DerivedRecordError",
     "DerivedRecordProducerProtocol",
@@ -221,6 +224,7 @@ __all__ = [
     "SentenceTransformerProvider",
     "ServiceConfig",
     "ServicesConfig",
+    "SourceThoughtNotFoundError",
     "SqliteEngravaCore",
     "SqliteMindStoreCore",
     "SqliteVecSearchBackend",

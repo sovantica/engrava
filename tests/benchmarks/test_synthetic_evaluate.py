@@ -337,6 +337,11 @@ class TestOffOnPair:
 # and InvalidRecencyArgumentError (raised only for a malformed recency_now or a
 # non-positive recency_now_half_life). Both are additive and default-off — never
 # raised on any single-axis (or no-recency) read/write path.
+# Later extended with the explicit derived-records backfill entry point
+# (derive_existing on the writable core, returning DeriveResult, raising
+# SourceThoughtNotFoundError for a missing source) — the explicit counterpart of
+# the on-store derived-records trigger, an additive public-API addition that runs
+# only when a producer capability is registered (a clean no-op otherwise).
 _PRE_WS_ALL_BASELINE = frozenset(
     {
         "ActionNotFoundError",
@@ -360,6 +365,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "DefaultMindStoreHooks",
         "DeriveContext",
         "DeriveGates",
+        "DeriveResult",
         "DerivedRecord",
         "DerivedRecordError",
         "DerivedRecordProducerProtocol",
@@ -435,6 +441,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "SentenceTransformerProvider",
         "ServiceConfig",
         "ServicesConfig",
+        "SourceThoughtNotFoundError",
         "SqliteEngravaCore",
         "SqliteMindStoreCore",
         "SqliteVecSearchBackend",
