@@ -63,7 +63,7 @@ class TestCoreSchemaV9:
         await _fresh_core(db)
         cursor = await db.execute("PRAGMA user_version")
         row = await cursor.fetchone()
-        assert int(row[0]) == 18
+        assert int(row[0]) == 19
 
     async def test_no_manifests_leaves_versions_table_empty(self, db: aiosqlite.Connection) -> None:
         await _fresh_core(db)
@@ -289,7 +289,7 @@ class TestUpgradeFromV8:
 
             cursor = await conn2.execute("PRAGMA user_version")
             row = await cursor.fetchone()
-            assert int(row[0]) == 18
+            assert int(row[0]) == 19
 
             cursor = await conn2.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' "

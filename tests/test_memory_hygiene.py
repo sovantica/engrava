@@ -279,7 +279,7 @@ class TestCore18Migration:
             s = SqliteEngravaCore(conn)
             await s.ensure_schema()
             cursor = await conn.execute("PRAGMA user_version")
-            assert (await cursor.fetchone())[0] == 18
+            assert (await cursor.fetchone())[0] == 19
             cursor = await conn.execute("PRAGMA table_info(thought)")
             cols = {row["name"] for row in await cursor.fetchall()}
             assert "pinned" in cols
@@ -338,7 +338,7 @@ class TestCore18Migration:
             s = SqliteEngravaCore(conn)
             await s.ensure_schema()
             cursor = await conn.execute("PRAGMA user_version")
-            assert (await cursor.fetchone())[0] == 18
+            assert (await cursor.fetchone())[0] == 19
 
             fetched = await s.get_thought("legacy")
             assert fetched is not None

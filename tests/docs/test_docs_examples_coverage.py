@@ -165,6 +165,11 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "docs/api-reference.md",
+        'FieldPredicate("$.subtype", FieldOp.EQ, "supports")',
+        "undefined store; illustrative edge-metadata filter usage",
+    ),
+    (
+        "docs/api-reference.md",
         "class EmbeddingProviderProtocol(Protocol)",
         "Protocol-definition only",
     ),

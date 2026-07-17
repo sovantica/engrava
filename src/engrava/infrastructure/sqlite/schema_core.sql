@@ -1,5 +1,10 @@
 -- engrava: Core thought-graph schema (free-tier boundary — no internal-cognitive columns).
--- Version: core-18 (Memory Hygiene forgetting-loop columns thought.pinned +
+-- Version: core-19 (edge.metadata_json — the generic structured-attribute
+--          carrier mirroring thought.metadata_json; NOT NULL DEFAULT '{}' so
+--          every existing edge reads back an empty mapping, appended last for
+--          column-order parity with the in-place ALTER ... ADD COLUMN; keys
+--          carry no reserved meaning and no secondary index is added;
+--          core-18 added the Memory Hygiene forgetting-loop columns thought.pinned +
 --          thought.archived_at_cycle; both nullable/defaulted so a store that
 --          never enables hygiene reads back unchanged — pinned is the durable
 --          never-forget marker, archived_at_cycle records the cycle hygiene
@@ -15,7 +20,7 @@
 --          core-14 added the hot-path indexes edge.to_thought_id,
 --          embedding.owner_id, thought.updated_cycle, thought.thought_type)
 
-PRAGMA user_version = 18;
+PRAGMA user_version = 19;
 
 CREATE TABLE IF NOT EXISTS thought (
     thought_id        TEXT    PRIMARY KEY,
@@ -84,6 +89,13 @@ CREATE TABLE IF NOT EXISTS edge (
     decay_multiplier  REAL NOT NULL DEFAULT 1.0,
     valid_from        TEXT,
     valid_until       TEXT,
+    -- Generic structured-attribute carrier (core-19), mirroring
+    -- thought.metadata_json. NOT NULL DEFAULT '{}' so every existing edge reads
+    -- back an empty mapping; appended last for column-order parity with the
+    -- in-place ALTER ... ADD COLUMN (which can only append). Keys carry no
+    -- reserved meaning; no secondary index (filtering is a full json_extract
+    -- scan, as with thought metadata).
+    metadata_json     TEXT NOT NULL DEFAULT '{}',
     UNIQUE(from_thought_id, to_thought_id, edge_type),
     FOREIGN KEY (from_thought_id) REFERENCES thought(thought_id) ON DELETE CASCADE,
     FOREIGN KEY (to_thought_id) REFERENCES thought(thought_id) ON DELETE CASCADE

@@ -14,6 +14,7 @@ from engrava.domain.models._temporal import (
     validate_interval_ordering,
     validate_iso8601_nullable,
 )
+from engrava.domain.models.thought import MetadataValue
 
 
 class EdgeRecord(BaseModel):
@@ -36,6 +37,15 @@ class EdgeRecord(BaseModel):
             during which the relation is true in the world (valid time).
             ``None`` means an open upper bound — the relation has no
             known end and is treated as currently valid.
+        metadata: Extensible structured attributes carried on the relation
+            (e.g. ``subtype``, ``sequence``, ``session_id``). Mirrors
+            :attr:`~engrava.domain.models.thought.ThoughtRecord.metadata`
+            exactly: leaf values must be scalars (``str``, ``int``,
+            ``float``, ``bool`` or ``None``); nested
+            ``dict[str, MetadataValue]`` values are accepted for structured
+            namespaces. Lists and other rich containers are rejected at
+            write time. Keys carry no reserved meaning — the field is a
+            generic caller-facing carrier. Defaults to an empty dict.
 
     Examples:
         >>> edge = EdgeRecord(
@@ -61,6 +71,7 @@ class EdgeRecord(BaseModel):
     decay_multiplier: float = Field(default=1.0, ge=0.0)
     valid_from: str | None = None
     valid_until: str | None = None
+    metadata: dict[str, MetadataValue] = Field(default_factory=dict)
 
     @field_validator("edge_id", "from_thought_id", "to_thought_id")
     @classmethod

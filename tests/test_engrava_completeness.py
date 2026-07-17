@@ -529,7 +529,7 @@ class TestMigrationCoreV3ToV4:
         cursor = await conn.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert int(row[0]) == 18
+        assert int(row[0]) == 19
 
         await conn.close()
 

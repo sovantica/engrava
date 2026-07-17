@@ -12,7 +12,12 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from engrava.domain.enums import ActionStatus, VerificationStatus
+    from engrava.domain.enums import (
+        ActionStatus,
+        EdgeType,
+        KnowledgeSource,
+        VerificationStatus,
+    )
     from engrava.domain.models.action import ActionRecord
     from engrava.domain.models.edge import EdgeRecord
     from engrava.domain.models.embedding import EmbeddingRecord
@@ -591,6 +596,33 @@ class EngravaCoreProtocol(Protocol):
 
         Returns:
             List of matching edge records.
+
+        """
+        ...
+
+    async def list_edges(
+        self,
+        *,
+        edge_type: EdgeType | None = None,
+        source: KnowledgeSource | None = None,
+        filters: MetadataFilter | None = None,
+        limit: int = 5000,
+    ) -> list[EdgeRecord]:
+        """List edges matching optional filters.
+
+        Args:
+            edge_type: If given, restrict to this edge type.
+            source: If given, restrict to this knowledge source.
+            filters: Optional typed ``AND`` filter over the edge
+                ``metadata_json`` column (reuses the metadata-filter machinery,
+                EQ / IN + ``$``/``$.key``/``$[0]`` JSONPath only). ``None`` leaves
+                the result unchanged. Edges with malformed ``metadata_json`` never
+                match a non-empty filter. A query refinement, not a security
+                boundary.
+            limit: Maximum number of edges to return.
+
+        Returns:
+            List of matching edge records, ordered by ``created_cycle`` DESC.
 
         """
         ...

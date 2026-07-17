@@ -1417,7 +1417,7 @@ class SqliteEngravaCore:
         Applies the full ``schema_core.sql`` (including FTS5 virtual
         table and sync triggers) only when the database has not already
         been bootstrapped to schema version 3+.  Databases at older
-        versions are upgraded incrementally up to the current version (18).
+        versions are upgraded incrementally up to the current version (19).
 
         After core schema creation or upgrade, probes for the ``thought_fts``
         table and then runs any pending extension schema migrations for each
@@ -1451,7 +1451,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
-            await self._db.execute("PRAGMA user_version = 18")
+            await self._migrate_core_v18_to_v19()
+            await self._db.execute("PRAGMA user_version = 19")
             await self._db.commit()
         elif current_version < 4:  # noqa: PLR2004
             await self._migrate_core_v3_to_v4()
@@ -1469,7 +1470,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
-            await self._db.execute("PRAGMA user_version = 18")
+            await self._migrate_core_v18_to_v19()
+            await self._db.execute("PRAGMA user_version = 19")
             await self._db.commit()
         elif current_version < 5:  # noqa: PLR2004
             await self._migrate_core_v4_to_v5()
@@ -1486,7 +1488,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
-            await self._db.execute("PRAGMA user_version = 18")
+            await self._migrate_core_v18_to_v19()
+            await self._db.execute("PRAGMA user_version = 19")
             await self._db.commit()
         elif current_version < 6:  # noqa: PLR2004
             await self._migrate_core_v5_to_v6()
@@ -1502,7 +1505,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
-            await self._db.execute("PRAGMA user_version = 18")
+            await self._migrate_core_v18_to_v19()
+            await self._db.execute("PRAGMA user_version = 19")
             await self._db.commit()
         elif current_version < 7:  # noqa: PLR2004
             await self._migrate_core_v6_to_v7()
@@ -1517,7 +1521,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
-            await self._db.execute("PRAGMA user_version = 18")
+            await self._migrate_core_v18_to_v19()
+            await self._db.execute("PRAGMA user_version = 19")
             await self._db.commit()
         elif current_version < 8:  # noqa: PLR2004
             await self._migrate_core_v7_to_v8()
@@ -1531,7 +1536,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
-            await self._db.execute("PRAGMA user_version = 18")
+            await self._migrate_core_v18_to_v19()
+            await self._db.execute("PRAGMA user_version = 19")
             await self._db.commit()
         elif current_version < 9:  # noqa: PLR2004
             await self._migrate_core_v8_to_v9()
@@ -1544,7 +1550,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
-            await self._db.execute("PRAGMA user_version = 18")
+            await self._migrate_core_v18_to_v19()
+            await self._db.execute("PRAGMA user_version = 19")
             await self._db.commit()
         elif current_version < 10:  # noqa: PLR2004
             await self._migrate_core_v9_to_v10()
@@ -1556,7 +1563,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
-            await self._db.execute("PRAGMA user_version = 18")
+            await self._migrate_core_v18_to_v19()
+            await self._db.execute("PRAGMA user_version = 19")
             await self._db.commit()
         elif current_version < 11:  # noqa: PLR2004
             await self._migrate_core_v10_to_v11()
@@ -1567,7 +1575,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
-            await self._db.execute("PRAGMA user_version = 18")
+            await self._migrate_core_v18_to_v19()
+            await self._db.execute("PRAGMA user_version = 19")
             await self._db.commit()
         elif current_version < 12:  # noqa: PLR2004
             await self._migrate_core_v11_to_v12()
@@ -1577,7 +1586,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
-            await self._db.execute("PRAGMA user_version = 18")
+            await self._migrate_core_v18_to_v19()
+            await self._db.execute("PRAGMA user_version = 19")
             await self._db.commit()
         elif current_version < 13:  # noqa: PLR2004
             await self._migrate_core_v12_to_v13()
@@ -1586,7 +1596,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
-            await self._db.execute("PRAGMA user_version = 18")
+            await self._migrate_core_v18_to_v19()
+            await self._db.execute("PRAGMA user_version = 19")
             await self._db.commit()
         elif current_version < 14:  # noqa: PLR2004
             await self._migrate_core_v13_to_v14()
@@ -1594,29 +1605,44 @@ class SqliteEngravaCore:
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
-            await self._db.execute("PRAGMA user_version = 18")
+            await self._migrate_core_v18_to_v19()
+            await self._db.execute("PRAGMA user_version = 19")
             await self._db.commit()
         elif current_version < 15:  # noqa: PLR2004
             await self._migrate_core_v14_to_v15()
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
-            await self._db.execute("PRAGMA user_version = 18")
+            await self._migrate_core_v18_to_v19()
+            await self._db.execute("PRAGMA user_version = 19")
             await self._db.commit()
         elif current_version < 16:  # noqa: PLR2004
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
-            await self._db.execute("PRAGMA user_version = 18")
+            await self._migrate_core_v18_to_v19()
+            await self._db.execute("PRAGMA user_version = 19")
             await self._db.commit()
         elif current_version < 17:  # noqa: PLR2004
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
-            await self._db.execute("PRAGMA user_version = 18")
+            await self._migrate_core_v18_to_v19()
+            await self._db.execute("PRAGMA user_version = 19")
             await self._db.commit()
         elif current_version < 18:  # noqa: PLR2004
             await self._migrate_core_v17_to_v18()
-            await self._db.execute("PRAGMA user_version = 18")
+            await self._migrate_core_v18_to_v19()
+            await self._db.execute("PRAGMA user_version = 19")
+            await self._db.commit()
+        elif current_version < 19:  # noqa: PLR2004
+            # A base at exactly 18 matches no lower arm (each tests
+            # ``< N`` for N <= 18). Without this arm every existing v18
+            # database would be stranded: the ``metadata_json`` column
+            # would never be added and the first edge write would raise.
+            # First-match ``elif`` keeps the ladder double-run-safe — a
+            # v17 base hits ``< 18`` only, a v18 base hits ``< 19`` only.
+            await self._migrate_core_v18_to_v19()
+            await self._db.execute("PRAGMA user_version = 19")
             await self._db.commit()
 
         # Ensure referential integrity is enforced for the lifetime of this
@@ -2227,6 +2253,67 @@ class SqliteEngravaCore:
             except OperationalError as exc:  # pragma: no cover - defensive race guard
                 if "duplicate column" not in str(exc).lower():
                     raise
+
+    async def _migrate_core_v18_to_v19(self) -> None:
+        """Add the generic ``metadata_json`` column to the ``edge`` table (core-19).
+
+        Purely additive. Mirrors the thought-side ``metadata_json`` column
+        (core-11): a NOT NULL ``TEXT`` column defaulting to ``'{}'`` so every
+        existing edge reads back an empty metadata mapping with no backfill. The
+        column gives edges the same generic structured-attribute carrier that
+        thoughts already have; keys carry no reserved meaning, and no secondary
+        index is added (parity with thought metadata — filtering is a full
+        ``json_extract`` scan). Appended last, matching the fresh ``edge`` DDL
+        column order (``ALTER ... ADD COLUMN`` can only append).
+
+        The add is guarded against the duplicate-column error exactly as
+        ``_migrate_core_v17_to_v18`` guards its own ``ADD COLUMN``, so a database
+        already carrying the column (a partial or re-run migration) is left
+        unchanged — this makes the "column added but ``user_version`` not yet
+        bumped" state re-entrant.
+
+        The ``ALTER`` is followed by a postcondition assertion that the column
+        is present before the function returns. The ladder arm bumps
+        ``user_version`` only *after* this function returns, so for any database
+        that **carries the** ``edge`` **table** the version can never be trusted
+        while the column is absent: a migrated ``edge`` table at
+        ``user_version = 19`` therefore has ``edge.metadata_json`` by
+        construction, closing the "version bumped without the column" hole an
+        interrupt could otherwise open.
+
+        The one shape the assertion cannot speak to is a partial bootstrap with
+        **no** ``edge`` table at all (a thought-only database): the early return
+        below lets the ladder stamp v19 without touching a table that does not
+        exist — exactly as every earlier edge migration guards its edge work
+        with ``_table_exists`` and still advances the version. This is not a
+        hole, because the ``edge`` table is only ever created from nothing by the
+        base DDL (``schema_core.sql``), which at v19 already carries
+        ``metadata_json``; any ``edge`` table that later comes into existence is
+        therefore self-healing. No database can reach a state with an ``edge``
+        table that lacks ``metadata_json``.
+        """
+        from sqlite3 import OperationalError  # noqa: PLC0415
+
+        # The ``edge`` table may be absent in a partial bootstrap (it is created
+        # lazily / by the fresh DDL), so guard exactly as the earlier
+        # edge-touching migrations (``_migrate_core_v12_to_v13`` /
+        # ``_migrate_core_v13_to_v14``) do: a thought-only database has no edge
+        # column to add, and the fresh DDL already carries the column.
+        if not await self._table_exists("edge"):
+            return
+        if not await self._column_exists("edge", "metadata_json"):
+            try:
+                await self._db.execute(
+                    "ALTER TABLE edge ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
+                )
+            except OperationalError as exc:  # pragma: no cover - defensive race guard
+                if "duplicate column" not in str(exc).lower():
+                    raise
+        # Postcondition: the column must exist before the ladder arm bumps the
+        # version, closing the "version bumped without the column" hole.
+        if not await self._column_exists("edge", "metadata_json"):  # pragma: no cover
+            msg = "core-19 migration failed to add the edge.metadata_json column"
+            raise RuntimeError(msg)
 
     async def _fk_present(self, table: str, column: str) -> bool:
         """Return ``True`` when ``table`` carries an FK on ``column``."""
@@ -4115,8 +4202,9 @@ class SqliteEngravaCore:
             await self._db.execute(
                 "INSERT INTO edge "
                 "(edge_id, from_thought_id, to_thought_id, edge_type, weight, "
-                " created_cycle, source, decay_multiplier, valid_from, valid_until) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " created_cycle, source, decay_multiplier, valid_from, valid_until, "
+                " metadata_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     edge.edge_id,
                     edge.from_thought_id,
@@ -4128,6 +4216,13 @@ class SqliteEngravaCore:
                     edge.decay_multiplier,
                     edge.valid_from,
                     edge.valid_until,
+                    # Derived edges never carry caller metadata, so bind the empty
+                    # ``'{}'`` object literal rather than serializing the in-memory
+                    # record. This provenance-only path therefore cannot smuggle
+                    # unvalidated (e.g. non-finite) metadata into the column — it
+                    # bypasses ``_validate_metadata`` by writing a trivially valid
+                    # empty object, matching the fresh-DDL / ALTER ``DEFAULT '{}'``.
+                    "{}",
                 ),
             )
         except aiosqlite.IntegrityError as exc:
@@ -4922,14 +5017,19 @@ class SqliteEngravaCore:
         Raises:
             ReferentialIntegrityError: When ``from_thought_id`` or
                 ``to_thought_id`` does not match any persisted thought.
+            ValueError: When ``edge.metadata`` violates the shared metadata
+                contract (a non-scalar / list value, a non-finite float, or a
+                serialized size over the 64 KiB hard limit).
 
         """
+        _validate_metadata(edge.metadata)
         try:
             await self._db.execute(
                 "INSERT INTO edge "
                 "(edge_id, from_thought_id, to_thought_id, edge_type, weight, "
-                " created_cycle, source, decay_multiplier, valid_from, valid_until) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " created_cycle, source, decay_multiplier, valid_from, valid_until, "
+                " metadata_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     edge.edge_id,
                     edge.from_thought_id,
@@ -4941,6 +5041,7 @@ class SqliteEngravaCore:
                     edge.decay_multiplier,
                     edge.valid_from,
                     edge.valid_until,
+                    json.dumps(edge.metadata, ensure_ascii=False),
                 ),
             )
         except aiosqlite.IntegrityError as exc:
@@ -4976,7 +5077,10 @@ class SqliteEngravaCore:
             The updated edge record.
 
         Raises:
-            ValueError: If the edge does not exist.
+            ValueError: If the edge does not exist, or if the merged
+                ``metadata`` violates the shared metadata contract (a
+                non-scalar / list value, a non-finite float, or a serialized
+                size over the 64 KiB hard limit).
 
         """
         current_row = await self._get_edge_row(edge_id)
@@ -4986,11 +5090,12 @@ class SqliteEngravaCore:
 
         current = _row_to_edge(current_row)
         updated = type(current).model_validate({**current.model_dump(mode="json"), **changes})
+        _validate_metadata(updated.metadata)
 
         await self._db.execute(
             "UPDATE edge SET from_thought_id = ?, to_thought_id = ?, edge_type = ?, "
             "weight = ?, created_cycle = ?, source = ?, decay_multiplier = ?, "
-            "valid_from = ?, valid_until = ? "
+            "valid_from = ?, valid_until = ?, metadata_json = ? "
             "WHERE edge_id = ?",
             (
                 updated.from_thought_id,
@@ -5002,6 +5107,7 @@ class SqliteEngravaCore:
                 updated.decay_multiplier,
                 updated.valid_from,
                 updated.valid_until,
+                json.dumps(updated.metadata, ensure_ascii=False),
                 edge_id,
             ),
         )
@@ -5127,13 +5233,30 @@ class SqliteEngravaCore:
         *,
         edge_type: EdgeType | None = None,
         source: KnowledgeSource | None = None,
+        filters: MetadataFilter | None = None,
         limit: int = 5000,
     ) -> list[EdgeRecord]:
         """List edges matching optional filters.
 
+        Edge-metadata filtering reuses the same typed
+        :class:`~engrava.domain.models.filters.MetadataFilter` machinery as
+        thought-metadata filtering, pointed at the edge ``metadata_json`` column.
+        It is a **query capability, not a security boundary** — it enforces
+        nothing and is bypassable.
+
         Args:
             edge_type: If given, restrict to this edge type.
             source: If given, restrict to this knowledge source.
+            filters: Optional
+                :class:`~engrava.domain.models.filters.MetadataFilter` — an
+                ``AND`` of typed field predicates over the edge ``metadata_json``
+                column (e.g. ``FieldPredicate("$.subtype", FieldOp.EQ,
+                "supports")``). ``None`` (or an empty filter) leaves the result
+                unchanged. Inherits the shipped semantics verbatim: JSONPath
+                ``$`` / ``$.key`` / ``$[0]`` only, operators EQ and IN only,
+                AND-conjunction, a 250-predicate cap. Edges whose
+                ``metadata_json`` is malformed JSON never match a non-empty
+                filter (the predicate is ``json_valid``-guarded).
             limit: Maximum number of edges to return.
 
         Returns:
@@ -5149,6 +5272,18 @@ class SqliteEngravaCore:
         if source is not None:
             clauses.append("source = ?")
             params.append(str(source))
+
+        # Metadata filtering reuses the generic json_extract predicate
+        # machinery, pointed at the edge ``metadata_json`` column. Edges have no
+        # visibility axis, so ``visibility=None``. A None / empty filter
+        # contributes nothing, leaving the query path unchanged; the whole
+        # predicate is json_valid-guarded, so a malformed metadata row is
+        # non-matching for a non-empty filter.
+        metadata_clause = compile_effective_predicate(filters, None, column="metadata_json")
+        if metadata_clause is not None:
+            fragment, metadata_params = metadata_clause
+            clauses.append(fragment)
+            params.extend(metadata_params)
 
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         sql = f"SELECT * FROM edge{where} ORDER BY created_cycle DESC LIMIT ?"  # noqa: S608
@@ -8486,6 +8621,14 @@ def _row_to_edge(row: aiosqlite.Row) -> EdgeRecord:
     decay_raw = row["decay_multiplier"] if "decay_multiplier" in keys else 1.0
     valid_from_raw = row["valid_from"] if "valid_from" in keys else None
     valid_until_raw = row["valid_until"] if "valid_until" in keys else None
+    # Read + decode metadata mirroring ``_row_to_thought``. The read side is
+    # coupled to the ``update_edge`` write: an un-patched reader would yield
+    # ``metadata={}`` for ``current``, so ``update_edge``'s merge would silently
+    # wipe stored edge metadata on every partial update.
+    metadata_json_raw = row["metadata_json"] if "metadata_json" in keys else "{}"
+    metadata_decoded: dict[str, MetadataValue] = (
+        json.loads(metadata_json_raw) if metadata_json_raw else {}
+    )
     return EdgeRecord(
         edge_id=row["edge_id"],
         from_thought_id=row["from_thought_id"],
@@ -8497,6 +8640,7 @@ def _row_to_edge(row: aiosqlite.Row) -> EdgeRecord:
         decay_multiplier=float(decay_raw) if decay_raw else 1.0,
         valid_from=valid_from_raw,
         valid_until=valid_until_raw,
+        metadata=metadata_decoded,
     )
 
 
@@ -8894,7 +9038,21 @@ def _validate_metadata_value(value: MetadataValue, key_path: str) -> None:
             list/tuple/set/custom container is encountered at any depth.
 
     """
-    if value is None or isinstance(value, (str, int, float, bool)):
+    if value is None or isinstance(value, (str, int, bool)):
+        # None / str / int / bool (bool is an int subclass) are always valid
+        # scalar leaves.
+        return
+    if isinstance(value, float):
+        # A real float must be finite so it round-trips through JSON. NaN and
+        # ±Infinity serialise (``json.dumps`` defaults to ``allow_nan=True``) to
+        # the bare tokens ``NaN`` / ``Infinity`` / ``-Infinity``, which are
+        # invalid JSON: SQLite's ``json_valid()`` then returns 0 and the row
+        # becomes silently unmatchable by every metadata filter. Reject them at
+        # the write boundary — the same finite-only rule the filter value domain
+        # already enforces on the read side.
+        if not math.isfinite(value):
+            msg = f"metadata value at {key_path} must be a finite number, got {value!r}"
+            raise ValueError(msg)
         return
     if isinstance(value, dict):
         for nested_key, nested_value in value.items():

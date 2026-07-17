@@ -111,6 +111,12 @@ e.g. one thought supports, contradicts, or depends on another. Dreaming also
 creates edges automatically (`ASSOCIATED` between consolidated thoughts, and
 `CONSOLIDATED_FROM` from a reflection back to its sources).
 
+Edges carry the same generic `metadata` field as thoughts — a
+`dict[str, MetadataValue]` (default `{}`) for caller-defined structured
+attributes, filterable through `list_edges(filters=...)`. The keys carry no
+reserved meaning; see the [`metadata` field](api-reference.md#metadata-field-edges)
+note in the API reference.
+
 ## Embedding
 
 An **embedding** is the vector representation of a thought that powers semantic

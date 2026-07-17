@@ -18,10 +18,16 @@ from typing import TYPE_CHECKING, NoReturn
 from engrava.domain.exceptions import ReadOnlyViolationError
 
 if TYPE_CHECKING:
-    from engrava.domain.enums import ActionStatus, VerificationStatus
+    from engrava.domain.enums import (
+        ActionStatus,
+        EdgeType,
+        KnowledgeSource,
+        VerificationStatus,
+    )
     from engrava.domain.models.action import ActionRecord
     from engrava.domain.models.edge import EdgeRecord
     from engrava.domain.models.embedding import EmbeddingRecord
+    from engrava.domain.models.filters import MetadataFilter
     from engrava.domain.models.metrics import EngravaMetrics
     from engrava.domain.models.thought import ThoughtRecord
     from engrava.domain.protocols.engrava_core import EngravaCoreProtocol
@@ -146,6 +152,35 @@ class ReadOnlyEngrava:
 
         """
         return await self._inner.get_edges(thought_id, direction=direction)
+
+    async def list_edges(
+        self,
+        *,
+        edge_type: EdgeType | None = None,
+        source: KnowledgeSource | None = None,
+        filters: MetadataFilter | None = None,
+        limit: int = 5000,
+    ) -> list[EdgeRecord]:
+        """List edges matching optional filters.
+
+        Args:
+            edge_type: If given, restrict to this edge type.
+            source: If given, restrict to this knowledge source.
+            filters: Optional typed ``AND`` filter over the edge
+                ``metadata_json`` column (EQ / IN + restricted JSONPath).
+                ``None`` leaves the result unchanged.
+            limit: Maximum number of edges to return.
+
+        Returns:
+            List of matching edge records, ordered by ``created_cycle`` DESC.
+
+        """
+        return await self._inner.list_edges(
+            edge_type=edge_type,
+            source=source,
+            filters=filters,
+            limit=limit,
+        )
 
     async def get_embedding(self, thought_id: str) -> EmbeddingRecord | None:
         """Retrieve the embedding for a thought.

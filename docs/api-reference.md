@@ -188,7 +188,7 @@ not exist.
 |--------|---------|-------------|
 | `await create_edge(edge)` | `EdgeRecord` | Persist an `EdgeRecord`; raises `ReferentialIntegrityError` on a missing endpoint |
 | `await get_edges(thought_id, *, direction='BOTH')` | `list[EdgeRecord]` | Edges for a thought (`direction` is `'IN'`/`'OUT'`/`'BOTH'`, keyword-only) |
-| `await list_edges(*, edge_type=None, source=None, limit=5000)` | `list[EdgeRecord]` | List edges with optional filters |
+| `await list_edges(*, edge_type=None, source=None, filters=None, limit=5000)` | `list[EdgeRecord]` | List edges with optional filters (`filters` is a typed `MetadataFilter` over the edge `metadata`; see the [`metadata` field](#metadata-field-edges) note) |
 | `await update_edge(edge_id, **changes)` | `EdgeRecord` | Update edge fields |
 | `await delete_edge(edge_id)` | `bool` | Hard delete; `True` if a row was removed |
 | `await invalidate_edge(edge_id, valid_until)` | `EdgeRecord` | Close the edge's *valid-time* interval at the given ISO-8601 instant — deterministic, idempotent, and **not a delete** (the row stays on file). Invalidating a thought does **not** cascade to its edges; invalidate them separately. See [Bi-temporal Model](bitemporal.md#invalidate-vs-delete) |
@@ -440,6 +440,43 @@ extension is recommended for filtering queries (`json_extract(metadata_json, '$.
 | `decay_multiplier` | `float` | Decay rate multiplier (default `1.0`) |
 | `valid_from` | `str \| None` | ISO-8601 start of the edge's real-world *valid time* (open lower bound when `None`); see [Bi-temporal Model](bitemporal.md) |
 | `valid_until` | `str \| None` | ISO-8601 end of *valid time*, **exclusive** (open upper bound when `None`); see [Bi-temporal Model](bitemporal.md) |
+| `metadata` | `dict[str, MetadataValue]` | Caller-supplied structured attributes (default `{}`); see the [`metadata` field](#metadata-field-edges) note below |
+
+#### `metadata` field (edges)
+
+Edges carry the **same** generic `metadata` field as thoughts —
+`dict[str, MetadataValue]`, default `{}` — with the identical value domain
+(`str | int | float | bool | None | dict[str, MetadataValue]`; lists and
+non-finite floats such as `NaN` / `Infinity` are rejected) and the same
+~4 KiB warn / ~64 KiB hard-reject size limits. It is validated at the
+`create_edge` / `update_edge` boundaries with a `ValueError`.
+
+Unlike thought metadata, edge metadata keys carry **no reserved meaning and
+no conventional-key table** — the field is a purely generic carrier. Engrava
+assigns no domain semantics to any key, applies no metadata-driven ranking,
+enforces no vocabulary, and makes no compatibility guarantee about key names,
+so do **not** treat any key as "well-known". Engrava's own edge creators
+(dreaming, derived records) write an empty `{}`.
+
+**Filtering.** `list_edges(filters=...)` accepts a typed `MetadataFilter` — an
+`AND` of `FieldPredicate`s over the edge `metadata` — reusing the exact
+machinery that backs thought-metadata filtering: operators `EQ` and `IN` only,
+the restricted `$` / `$.key` / `$[0]` JSONPath grammar, and a 250-predicate
+cap. An edge whose stored metadata is malformed JSON never matches a non-empty
+filter. This is a query refinement, **not** a security boundary.
+
+```python
+from engrava import EdgeType
+from engrava.domain.models.filters import FieldOp, FieldPredicate, MetadataFilter
+
+supports = await store.list_edges(
+    edge_type=EdgeType.ASSOCIATED,
+    filters=MetadataFilter([FieldPredicate("$.subtype", FieldOp.EQ, "supports")]),
+)
+```
+
+**Persistence.** Stored as a `metadata_json TEXT NOT NULL DEFAULT '{}'` column
+on the `edge` table since `user_version = 19`.
 
 ### `EmbeddingRecord`
 
