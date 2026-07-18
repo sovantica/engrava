@@ -342,6 +342,10 @@ class TestOffOnPair:
 # SourceThoughtNotFoundError for a missing source) — the explicit counterpart of
 # the on-store derived-records trigger, an additive public-API addition that runs
 # only when a producer capability is registered (a clean no-op otherwise).
+# Later extended with SplitMode, the enum selecting the StructuralSplitProducer's
+# deterministic, dependency-free segmentation strategy (paragraph / fixed-window) —
+# an additive public-API addition; the default (paragraph) leaves the shipped
+# producer byte-identical, and the producer stays inert unless the seam is enabled.
 _PRE_WS_ALL_BASELINE = frozenset(
     {
         "ActionNotFoundError",
@@ -442,6 +446,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "ServiceConfig",
         "ServicesConfig",
         "SourceThoughtNotFoundError",
+        "SplitMode",
         "SqliteEngravaCore",
         "SqliteMindStoreCore",
         "SqliteVecSearchBackend",

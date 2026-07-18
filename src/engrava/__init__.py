@@ -115,7 +115,7 @@ from engrava.extensions.dreaming_signals import (
     RecencySignal,
     StalenessSignal,
 )
-from engrava.extensions.structural_split import StructuralSplitProducer
+from engrava.extensions.structural_split import SplitMode, StructuralSplitProducer
 from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
 from engrava.infrastructure.read_only_store import ReadOnlyEngrava
 from engrava.infrastructure.service_manager import EngravaManager
@@ -225,6 +225,7 @@ __all__ = [
     "ServiceConfig",
     "ServicesConfig",
     "SourceThoughtNotFoundError",
+    "SplitMode",
     "SqliteEngravaCore",
     "SqliteMindStoreCore",
     "SqliteVecSearchBackend",
