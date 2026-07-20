@@ -6267,14 +6267,19 @@ class SqliteEngravaCore:
             )
             rows = await cursor.fetchall()
         except OperationalError:
-            # A malformed FTS5 expression slipped through normalization (an
-            # expert-syntax token that FTS5 rejects). Surface the failure via
-            # the counter, then recover instead of silently degrading: the bare
-            # (sanitizing) normalization of the *original* query is always a
-            # syntactically valid MATCH, so retry once with it. Only if that
-            # also fails do we fall back to no FTS hits — effectively
-            # unreachable for real input, since the bare path emits only
-            # sanitized OR-terms.
+            # The primary MATCH is invalid FTS5. This branch is REACHABLE by
+            # real input, by design: a *balanced* quoted phrase carrying
+            # adjacent hazardous punctuation (e.g. ``"forum"?``) classifies as
+            # expert, so its primary normalization is a deliberate — but
+            # invalid — expert expression. The counter therefore *does* increment
+            # for real queries; it is a designed, surfaced recovery, not a
+            # "never happens" guard. Surface the failure via the counter, then
+            # recover instead of silently degrading: re-normalize the *original*
+            # query through the bare (sanitizing) path — whose output is always
+            # a syntactically valid MATCH (unsafe characters dropped, wildcards
+            # collapsed to legal prefix markers, and any exposed uppercase
+            # AND/OR/NOT phrase-quoted so FTS5 cannot read it as an operator) —
+            # and retry the MATCH once with it.
             self._fts_match_failure_count += 1
             logger.warning(
                 "FTS MATCH failed for normalized query %r; retrying via "
@@ -6293,9 +6298,14 @@ class SqliteEngravaCore:
                 )
                 rows = await cursor.fetchall()
             except OperationalError:  # pragma: no cover - unreachable for real input
-                # Defense in depth: the sanitizing bare path should always be
-                # valid FTS5, so this branch guards only against an unforeseen
-                # residual. Degrade to no FTS hits rather than propagate.
+                # Effectively unreachable for real input — unlike the primary
+                # failure above, which is a designed, counted recovery. The bare
+                # path emits only sanitized, wildcard-collapsed, operator-quoted
+                # OR-terms, so its MATCH is always valid FTS5 (an 80k-string
+                # star-dense + punctuation/quote/operator fuzz finds no input
+                # that reaches here). This is defense-in-depth against an
+                # unforeseen residual only: degrade to no FTS hits rather than
+                # propagate.
                 logger.warning(
                     "FTS bare-mode fallback also failed for %r; returning no FTS results",
                     fallback_query,
@@ -9167,7 +9177,9 @@ def _normalize_fts_token(token: str, *, expert: bool) -> list[str]:
     if not fragments:
         return []
 
-    terms = [_format_fts_bare_fragment(fragment) for fragment in fragments]
+    terms = [
+        _format_fts_bare_fragment(fragment, in_bare_query=not expert) for fragment in fragments
+    ]
     if expert:
         # Expert mode keeps each original token as one term, re-attaching any
         # parentheses the caller used for grouping.
@@ -9176,15 +9188,49 @@ def _normalize_fts_token(token: str, *, expert: bool) -> list[str]:
     return terms
 
 
-def _format_fts_bare_fragment(fragment: str) -> str:
+def _fragment_exposes_fts_operator(fragment: str) -> bool:
+    """Report whether a bare fragment exposes an uppercase FTS5 boolean operator.
+
+    In a bare, OR-joined query FTS5 reads an uppercase ``AND``/``OR``/``NOT`` as
+    a boolean *operator*, never a term, so emitting one as a bareword yields an
+    invalid ``MATCH`` (``forum OR NOT OR body`` and ``field*NOT`` both raise). A
+    keyword is exposed when it forms a whole ``*``-delimited segment of the
+    fragment: the entire fragment (``NOT``), the segment after a prefix marker
+    (``field*NOT``) or before one (``NOT*field``). A keyword merely glued into a
+    larger token (``NOTbar``) is an ordinary term and is *not* exposed. ``*`` is
+    the only intra-fragment boundary to consider, because a hyphen already
+    forces the fragment to be phrase-quoted upstream.
+
+    Args:
+        fragment: A safe fragment (word characters, ``-`` and ``*`` only) with
+            any trailing prefix marker already stripped by the caller.
+
+    Returns:
+        ``True`` when a ``*``-delimited segment equals an uppercase FTS5 boolean
+        operator, so the fragment must be phrase-quoted to parse as a literal.
+
+    """
+    return any(segment in _FTS_BOOLEAN_OPERATORS for segment in fragment.split("*"))
+
+
+def _format_fts_bare_fragment(fragment: str, *, in_bare_query: bool) -> str:
     """Format a single sanitized fragment as an FTS5 term.
 
-    Preserves a trailing ``*`` prefix marker and quotes hyphenated identifiers
-    so FTS5 does not read the hyphen as a column/operator.
+    Preserves a trailing ``*`` prefix marker and phrase-quotes a fragment that a
+    bare term would otherwise misparse: a hyphenated identifier always (FTS5
+    would read the hyphen as a column/operator), and — only in a bare, OR-joined
+    query (``in_bare_query``) — a fragment that exposes an uppercase
+    ``AND``/``OR``/``NOT`` (see :func:`_fragment_exposes_fts_operator`), which
+    FTS5 would otherwise read as a boolean operator and reject. Phrase-quoting
+    forces literal-term parsing while still matching the same case-folded
+    documents. Expert-mode callers pass ``in_bare_query=False`` so a deliberate
+    operator token is left byte-for-byte as the caller wrote it.
 
     Args:
         fragment: A safe fragment containing only word characters, ``-`` or a
             trailing ``*``.
+        in_bare_query: ``True`` when the fragment belongs to a bare, OR-joined
+            query, so an exposed uppercase boolean operator must be neutralized.
 
     Returns:
         The fragment rewritten as a valid FTS5 term.
@@ -9194,7 +9240,7 @@ def _format_fts_bare_fragment(fragment: str) -> str:
     if fragment.endswith("*"):
         fragment = fragment[:-1]
         suffix = "*"
-    if "-" in fragment:
+    if "-" in fragment or (in_bare_query and _fragment_exposes_fts_operator(fragment)):
         return f'"{fragment}"{suffix}'
     return f"{fragment}{suffix}"
 
