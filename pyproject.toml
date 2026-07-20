@@ -137,3 +137,22 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.coverage.run]
+# Measure coverage of the package only. Without this, a bare ``--cov`` (as the
+# CI gate runs it) instruments the whole repository — including ``tests/`` and
+# ``scripts/`` — which inflates the denominator: those trees sit near 100%, so
+# the aggregate can read comfortably above the 90% gate while ``src/engrava``
+# itself sits below it. Scoping the source here keeps the local and CI ``--cov``
+# invocations measuring exactly the same thing, so there is a single source of
+# truth and the ``--cov-fail-under=90`` floor guards the package, not the repo.
+source = ["src/engrava"]
+
+[tool.coverage.report]
+# No blanket excludes. Coverage's built-in default already omits the narrow,
+# individually-justified ``# pragma: no cover`` defensive lines in the source
+# (see ``infrastructure/sqlite/engrava_core.py``); this section deliberately
+# does not set ``exclude_lines`` so that default stays in force, and adds no
+# broader exclusion. ``show_missing`` surfaces the uncovered lines so a gate
+# failure names the exact spots to test.
+show_missing = true
