@@ -97,6 +97,35 @@ jobs:
           pip install "sentence-transformers>=3.0.0"
           python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
 
+  # End-to-end pip-install upgrade validation: install the last released
+  # engrava from PyPI, populate a database with it, then upgrade in place to the
+  # current working tree and assert data + core CLI commands still work. Unlike
+  # the offline `test` matrix this job MUST reach the network (it pip-installs a
+  # released wheel from PyPI into a throwaway venv), so it is scoped to only the
+  # upgrade suite and sets the opt-in gate the test keeps for local runs.
+  #
+  # ENGRAVA_UPGRADE_FROM_SPEC pins the previous release; bump it on every
+  # release so the job always exercises the real previous-release -> HEAD path
+  # (e.g. 0.5.0 ships schema 18, HEAD ships schema 19, so this run drives the
+  # v18 -> v19 migration through a genuine reinstall).
+  upgrade-matrix:
+    name: Upgrade matrix (last released -> current)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: Run upgrade matrix
+        env:
+          ENGRAVA_RUN_UPGRADE_MATRIX: "1"
+          ENGRAVA_UPGRADE_FROM_SPEC: "engrava==0.5.0"
+          ENGRAVA_UPGRADE_TO_SPEC: "."
+        run: pytest tests/upgrade/test_upgrade_matrix.py -q
+
   test:
     needs: warm-hf-cache
     runs-on: ubuntu-latest
