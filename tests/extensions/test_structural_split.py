@@ -189,7 +189,7 @@ async def test_paragraph_capturing_boundary_preserves_re_split_semantics() -> No
     ``re.split`` keeps captured delimiters as segments, and the shipped producer
     split on ``boundary.split``; this preserves that byte-identically — a captured
     ``|`` stays a segment instead of being dropped (the interim finditer refactor
-    had dropped it, a DEC-021 regression).
+    had dropped it, a delimiter-dropping regression).
     """
     producer = StructuralSplitProducer(boundary=re.compile(r"(\|)"))
     content = "a|b|c"

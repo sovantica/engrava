@@ -240,7 +240,7 @@ def _build_group_a() -> list[FuzzCase]:
     add("(forum body) grouped tokens")
     add("$5 ##tag @handle 12:30 http://example.com/path?q=1")
 
-    # Degenerate wildcard shapes (the class WS-170 AC1 promised to cover). Each
+    # Degenerate wildcard shapes (the class the wildcard-degradation fix must cover). Each
     # is bare and, under the wildcard-collapsing sanitizer, produces a valid
     # primary MATCH (delta 0) even though a raw ``**``/leading-``*`` fragment is
     # an FTS5 syntax error: consecutive trailing stars, token-internal doubled
@@ -503,7 +503,7 @@ class TestSafetyInvariant:
         assert any_case(lambda q: "*" in q)
         assert any_case(lambda q: "-" in q)
 
-        # Wildcard hazards (the WS-170 AC1 gap): consecutive ``**``, a triple-or-
+        # Wildcard hazards (the wildcard-degradation gap): consecutive ``**``, a triple-or-
         # more run, a leading-``*`` token, a standalone ``*`` token, and a ``*``
         # pressed against a quote — each must be witnessed so the invariant
         # genuinely exercises the wildcard-collapsing sanitizer.
@@ -617,7 +617,7 @@ class TestDiscriminatingPower:
         survives as an invalid ``**`` term, so the *primary* MATCH raises AND
         the bare fallback (which re-uses the same sanitizer) raises too: the
         query silently degrades to no hits with a failure delta of 1. That is
-        exactly the WS-170 bug the safety invariant must catch, proving the
+        exactly the wildcard-degradation bug the safety invariant must catch, proving the
         wildcard cases carry real discriminating power rather than passing
         vacuously.
         """
@@ -644,7 +644,7 @@ class TestDiscriminatingPower:
         )
         assert reverted == [], (
             "with the collapse reverted the bare fallback is also invalid, so "
-            "the query silently degrades to no hits — the WS-170 defect"
+            "the query silently degrades to no hits — the wildcard-degradation defect"
         )
 
 
