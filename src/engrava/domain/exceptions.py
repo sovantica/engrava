@@ -133,6 +133,40 @@ class EmbeddingModelMismatchError(EngravaError):
         )
 
 
+class VectorDimensionMismatchError(EngravaError):
+    """Raised when a query vector's length differs from the store's dimension.
+
+    :meth:`SqliteEngravaCore.search_similar` computes cosine similarity between
+    the query vector and every stored embedding, an operation that is only
+    defined when the two share a dimension. A query vector of the wrong length
+    is a structural caller-contract violation — not a benign query that happens
+    to match nothing — so it is rejected loudly with this typed error instead of
+    silently returning an empty result (which would hide the mistake and let a
+    caller believe the corpus simply had no neighbours). The check is dimension
+    only: it fires regardless of the vector's magnitude, so a wrong-length
+    all-zero vector is still a dimension error rather than a degenerate-vector
+    degradation.
+
+    Args:
+        expected: The embedding dimension the store expects (from its configured
+            vector backend, embedding provider, or stored embeddings).
+        actual: The length of the offending query vector.
+
+    Examples:
+        >>> raise VectorDimensionMismatchError(expected=384, actual=383)
+        Traceback (most recent call last):
+            ...
+        engrava.domain.exceptions.VectorDimensionMismatchError: \
+query vector dimension mismatch: store expects 384, got 383
+
+    """
+
+    def __init__(self, *, expected: int, actual: int) -> None:
+        self.expected = expected
+        self.actual = actual
+        super().__init__(f"query vector dimension mismatch: store expects {expected}, got {actual}")
+
+
 class EmbeddingQueryPrefixMismatchError(EngravaError):
     """Raised when the active query prefix diverges from the corpus pairing.
 

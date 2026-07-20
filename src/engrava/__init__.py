@@ -54,6 +54,7 @@ from engrava.domain.exceptions import (
     SourceThoughtNotFoundError,
     StaleDataError,
     ThoughtNotFoundError,
+    VectorDimensionMismatchError,
 )
 from engrava.domain.manifest import ExtensionManifest
 from engrava.domain.models.action import ActionRecord
@@ -240,6 +241,7 @@ __all__ = [
     "ThoughtRecord",
     "ThoughtType",
     "ThoughtVisibility",
+    "VectorDimensionMismatchError",
     "VerificationStatus",
     "VisibilityQueryFilter",
     "discover_manifests",

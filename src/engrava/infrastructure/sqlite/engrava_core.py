@@ -60,6 +60,7 @@ from engrava.domain.exceptions import (
     SourceThoughtNotFoundError,
     StaleDataError,
     ThoughtNotFoundError,
+    VectorDimensionMismatchError,
 )
 from engrava.domain.models._temporal import (
     parse_iso8601_to_utc,
@@ -600,6 +601,45 @@ async def _embed_query(provider: object, text: str) -> list[float]:
     return await provider.embed(text)  # type: ignore[attr-defined,no-any-return]
 
 
+def _query_vector_is_degenerate(query_vector: list[float]) -> bool:
+    """Return whether a query vector has no usable cosine direction.
+
+    Cosine similarity is only defined for a vector with a positive, finite
+    magnitude. Three shapes have none, and every one of them would otherwise
+    make the vector arm *silently* return an empty result (an empty match is
+    indistinguishable from "the corpus had no neighbours"):
+
+    * an **empty** vector (no components at all);
+    * an **all-zero** vector — a zero magnitude has no direction, and the
+      canonical way one arises is auto-embedding empty/stop-word-only text;
+    * a vector carrying a **non-finite** component (``NaN``/``±inf``), which a
+      provider should never emit but which a caller can pass directly and which
+      poisons the whole dot product into ``NaN``.
+
+    These are surfaced through
+    :attr:`SqliteEngravaCore.vector_arm_degradation_count` rather than raised,
+    because — unlike a wrong *dimension* — a degenerate vector is a run-time
+    query-quality condition, not a structural contract violation.
+
+    Args:
+        query_vector: The query embedding to inspect.
+
+    Returns:
+        ``True`` when the vector is empty, all-zero, or non-finite; ``False``
+        for any vector with at least one finite non-zero component.
+
+    """
+    if not query_vector:
+        return True
+    saw_nonzero = False
+    for value in query_vector:
+        if not math.isfinite(value):
+            return True
+        if value != 0.0:
+            saw_nonzero = True
+    return not saw_nonzero
+
+
 #: A token is treated as an FTS5 column filter only when it targets a real
 #: indexed column. ``thought_fts`` indexes exactly ``essence`` and ``content``
 #: (see :meth:`SqliteEngravaCore.ensure_schema`); any other ``word:rest`` token
@@ -908,6 +948,15 @@ class SqliteEngravaCore:
         # query is silently taking the sanitizing fallback path rather than
         # matching the expression as written.
         self._fts_match_failure_count: int = 0
+        # Count of vector-arm searches that degraded to an empty result because
+        # the query vector had no usable cosine direction (empty, all-zero, or
+        # non-finite — see :func:`_query_vector_is_degenerate`). Surfaced
+        # read-only via :attr:`vector_arm_degradation_count` so an operator can
+        # detect that some queries are silently returning nothing because of a
+        # bad query embedding rather than a genuinely empty neighbourhood. A
+        # wrong-*dimension* vector is NOT counted here — it is a structural
+        # contract violation raised as :class:`VectorDimensionMismatchError`.
+        self._vector_arm_degradation_count: int = 0
         self._vector_backend: SqliteVecSearchBackend | None = None
         self._owns_connection: bool = False
         self._embedding_provider: EmbeddingProviderProtocol | None = embedding_provider
@@ -999,6 +1048,33 @@ class SqliteEngravaCore:
 
         """
         return self._fts_match_failure_count
+
+    @property
+    def vector_arm_degradation_count(self) -> int:
+        """Return how many vector-arm searches degraded to an empty result.
+
+        Incremented once each time :meth:`search_similar` is called with a
+        *degenerate* query vector — one with no usable cosine direction: empty,
+        all-zero (the canonical shape produced by auto-embedding empty or
+        stop-word-only text), or carrying a non-finite (``NaN``/``inf``)
+        component. Such a query cannot rank anything, so the arm returns ``[]``;
+        this counter surfaces that silent degradation as an operational health
+        signal, exactly mirroring :attr:`fts_match_failure_count` for the FTS
+        arm. A non-zero, growing value means some queries are producing bad
+        embeddings, not that the corpus is empty.
+
+        A wrong-*dimension* query vector is deliberately **not** counted here: it
+        is a structural caller-contract violation and is raised loudly as
+        :class:`~engrava.domain.exceptions.VectorDimensionMismatchError` rather
+        than degraded.
+
+        Returns:
+            The cumulative degenerate-query-vector count for this store instance
+            (monotonically non-decreasing, reset only by constructing a new
+            store).
+
+        """
+        return self._vector_arm_degradation_count
 
     @property
     def journal(self) -> JournalWriter | None:
@@ -5926,6 +6002,28 @@ class SqliteEngravaCore:
     # Embedding similarity search (brute-force cosine)
     # ------------------------------------------------------------------
 
+    def _declared_embedding_dimension(self) -> int | None:
+        """Return the embedding dimension the store declares, if any.
+
+        The dimension a query vector must match, resolved from the store's
+        configuration without touching the database: the configured vector
+        backend takes precedence (its ``vec0`` table is dimension-typed), then
+        the embedding provider. ``None`` when neither is configured — a store
+        that only ever received raw vectors via ``store_embedding`` has no
+        declared dimension at this level, and the numpy arm validates such a
+        vector against the *stored* embedding dimension instead.
+
+        Returns:
+            The declared embedding dimension, or ``None`` when the store
+            declares none.
+
+        """
+        if self._vector_backend is not None:
+            return self._vector_backend.dimension
+        if self._embedding_provider is not None:
+            return self._embedding_provider.dimension
+        return None
+
     async def search_similar(
         self,
         query_vector: list[float],
@@ -5987,6 +6085,23 @@ class SqliteEngravaCore:
         import time as _time  # noqa: PLC0415
 
         _t_start = _time.perf_counter()
+
+        # --- Query-vector contract guard (backend-agnostic, pre-dispatch) ---
+        # Enforced once here so both the vec0 and the numpy arm share identical
+        # semantics. Order matters: a wrong dimension is checked first, so a
+        # structurally invalid vector is rejected regardless of its magnitude (a
+        # wrong-length all-zero vector is a dimension error, not a degeneracy).
+        # A degenerate vector (empty/all-zero/non-finite) then degrades to an
+        # empty result surfaced via the read-only degradation counter, rather
+        # than silently returning [] as an ordinary "no neighbours" answer.
+        expected_dim = self._declared_embedding_dimension()
+        if expected_dim is not None and len(query_vector) != expected_dim:
+            raise VectorDimensionMismatchError(expected=expected_dim, actual=len(query_vector))
+        if _query_vector_is_degenerate(query_vector):
+            self._vector_arm_degradation_count += 1
+            await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
+            return []
+
         if self._vector_backend is not None and _filter_clause is None:
             # Bounded over-fetch: vec0 applies its k/LIMIT *before* we can drop
             # expired/retired rows (the live-row filter is a post-MATCH join),
@@ -6114,6 +6229,11 @@ class SqliteEngravaCore:
         query_arr = np.asarray(query_vector, dtype=np.float64)
         q_norm = float(np.linalg.norm(query_arr))
         if q_norm == 0.0:
+            # Defense-in-depth: an all-zero (zero-norm) query vector has no
+            # cosine direction. ``search_similar`` already intercepts every
+            # degenerate vector at its boundary and increments the degradation
+            # counter, so this branch is not reached on that path; it guards a
+            # direct/internal call from dividing by a zero norm below.
             return []
 
         owner_ids = [str(row["owner_id"]) for row in rows]
@@ -6129,6 +6249,13 @@ class SqliteEngravaCore:
         # abandoned for the original per-row decode so the exact prior
         # skip/error behaviour is preserved.
         first_dimension = int(rows[0]["dimension"])
+        if len(query_vector) != first_dimension:
+            # Typed rejection instead of an opaque numpy ``matmul`` ValueError.
+            # Reached only when the store declares no dimension at the boundary
+            # (no vector backend and no embedding provider), so ``search_similar``
+            # cannot check the length up front and the mismatch would otherwise
+            # surface as an untyped shape error from the dot product below.
+            raise VectorDimensionMismatchError(expected=first_dimension, actual=len(query_vector))
         expected_bytes = first_dimension * 4
         blobs = [row["vector_blob"] for row in rows]
         uniform = first_dimension > 0 and all(

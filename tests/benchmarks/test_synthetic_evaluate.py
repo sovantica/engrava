@@ -346,6 +346,11 @@ class TestOffOnPair:
 # deterministic, dependency-free segmentation strategy (paragraph / fixed-window) —
 # an additive public-API addition; the default (paragraph) leaves the shipped
 # producer byte-identical, and the producer stays inert unless the seam is enabled.
+# Later extended with VectorDimensionMismatchError, the typed error the vector-arm
+# no-silent-degradation guard raises when a search_similar query vector's length
+# differs from the store's embedding dimension (previously an opaque numpy error or
+# a silent empty result) — an additive public-API addition raised only on a
+# malformed query vector, never on any well-formed vector-search path.
 _PRE_WS_ALL_BASELINE = frozenset(
     {
         "ActionNotFoundError",
@@ -461,6 +466,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "ThoughtRecord",
         "ThoughtType",
         "ThoughtVisibility",
+        "VectorDimensionMismatchError",
         "VerificationStatus",
         "VisibilityQueryFilter",
         "discover_manifests",
