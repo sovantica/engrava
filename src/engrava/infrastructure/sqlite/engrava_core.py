@@ -901,6 +901,13 @@ class SqliteEngravaCore:
         self._quarantine_close_task: asyncio.Task[None] | None = None
         self._fts_available: bool = False
         self._fts_probed: bool = False
+        # Count of primary FTS5 ``MATCH`` executions that raised an
+        # ``OperationalError`` (a malformed MATCH expression) before the
+        # bare-mode fallback retry ran. Surfaced read-only via
+        # :attr:`fts_match_failure_count` so an operator can detect that any
+        # query is silently taking the sanitizing fallback path rather than
+        # matching the expression as written.
+        self._fts_match_failure_count: int = 0
         self._vector_backend: SqliteVecSearchBackend | None = None
         self._owns_connection: bool = False
         self._embedding_provider: EmbeddingProviderProtocol | None = embedding_provider
@@ -972,6 +979,26 @@ class SqliteEngravaCore:
         # never consulted for write-side cycle stamping and is never serialized
         # into config (a live object). ``None`` ⇒ today's behaviour unchanged.
         self._cycle_provider: CycleProvider | None = cycle_provider
+
+    @property
+    def fts_match_failure_count(self) -> int:
+        """Return how many primary FTS5 ``MATCH`` executions have failed.
+
+        Incremented once each time :meth:`search_fts` runs a normalized query
+        whose ``MATCH`` raises an ``OperationalError`` (a malformed FTS5
+        expression), *before* the bare-mode fallback retry. A non-zero, growing
+        value signals that some queries are silently degrading to the
+        sanitizing fallback path instead of matching the expression as written
+        — useful as an operational health signal. The fallback still serves the
+        query, so a non-zero count never means results were lost.
+
+        Returns:
+            The cumulative primary-``MATCH`` failure count for this store
+            instance (monotonically non-decreasing, reset only by
+            constructing a new store).
+
+        """
+        return self._fts_match_failure_count
 
     @property
     def journal(self) -> JournalWriter | None:
@@ -6232,28 +6259,50 @@ class SqliteEngravaCore:
             "ORDER BY score DESC, t.thought_id ASC "
             "LIMIT ?"
         )
+        now_iso = datetime.datetime.now(datetime.UTC).isoformat()
         try:
             cursor = await self._db.execute(
                 sql,
-                (
-                    normalized_query,
-                    datetime.datetime.now(datetime.UTC).isoformat(),
-                    *filter_params,
-                    top_k,
-                ),
+                (normalized_query, now_iso, *filter_params, top_k),
             )
             rows = await cursor.fetchall()
         except OperationalError:
-            # Defense in depth: a residual malformed FTS5 expression must never
-            # propagate to the caller and break an otherwise-serviceable search
-            # (e.g. the vector arm of a hybrid query). Degrade to no FTS hits.
+            # A malformed FTS5 expression slipped through normalization (an
+            # expert-syntax token that FTS5 rejects). Surface the failure via
+            # the counter, then recover instead of silently degrading: the bare
+            # (sanitizing) normalization of the *original* query is always a
+            # syntactically valid MATCH, so retry once with it. Only if that
+            # also fails do we fall back to no FTS hits — effectively
+            # unreachable for real input, since the bare path emits only
+            # sanitized OR-terms.
+            self._fts_match_failure_count += 1
             logger.warning(
-                "FTS MATCH failed for normalized query %r; returning no FTS results",
+                "FTS MATCH failed for normalized query %r; retrying via "
+                "sanitized bare-mode fallback",
                 normalized_query,
                 exc_info=True,
             )
-            await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
-            return []
+            fallback_query = _normalize_fts_query_bare(query)
+            if not fallback_query:
+                await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
+                return []
+            try:
+                cursor = await self._db.execute(
+                    sql,
+                    (fallback_query, now_iso, *filter_params, top_k),
+                )
+                rows = await cursor.fetchall()
+            except OperationalError:  # pragma: no cover - unreachable for real input
+                # Defense in depth: the sanitizing bare path should always be
+                # valid FTS5, so this branch guards only against an unforeseen
+                # residual. Degrade to no FTS hits rather than propagate.
+                logger.warning(
+                    "FTS bare-mode fallback also failed for %r; returning no FTS results",
+                    fallback_query,
+                    exc_info=True,
+                )
+                await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
+                return []
         results = [(row["thought_id"], float(row["score"])) for row in rows]
         await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
         return results
@@ -8869,11 +8918,18 @@ def _row_to_edge(row: aiosqlite.Row) -> EdgeRecord:
 def _query_is_expert_syntax(query: str) -> bool:
     """Return ``True`` when a query should be parsed as expert FTS5 syntax.
 
-    A query is expert syntax when it contains any of:
+    A query is expert syntax when it holds a *deliberate* FTS5 construct:
 
-    * a quoted phrase (any ``"``),
+    * a **balanced** double-quoted phrase (an even number of ``"``) that wraps
+      at least one token,
     * a standalone uppercase boolean operator (``AND``/``OR``/``NOT``), or
     * a whitelisted column filter (``essence:``/``content:``).
+
+    An **odd/unbalanced** number of ``"`` is always bare: it can never form a
+    deliberate phrase and would only yield an invalid MATCH. Incidental
+    scare-quotes in a natural-language sentence (``he said "run"`` embedded in
+    prose, an unterminated ``"quote``) therefore take the bare, sanitizing path
+    rather than being misread as expert phrase syntax.
 
     Expert queries are normalized token-by-token and joined with spaces,
     preserving FTS5's native operators, phrase matching, column filters and
@@ -8890,7 +8946,11 @@ def _query_is_expert_syntax(query: str) -> bool:
         ``True`` for expert syntax, ``False`` for a bare natural-language query.
 
     """
-    if '"' in query:
+    if query.count('"') % 2 == 1:
+        # An unbalanced quote is never a deliberate phrase; take the bare path
+        # so it is sanitized rather than passed through as broken expert syntax.
+        return False
+    if _has_balanced_quoted_phrase(query):
         return True
     for token in query.split():
         if token in _FTS_BOOLEAN_OPERATORS:
@@ -8898,6 +8958,30 @@ def _query_is_expert_syntax(query: str) -> bool:
         if _FTS_FIELD_FILTER_RE.match(token.lstrip("(")):
             return True
     return False
+
+
+def _has_balanced_quoted_phrase(query: str) -> bool:
+    """Return ``True`` when ``query`` holds a balanced quoted phrase with content.
+
+    A balanced quoted phrase is an even, non-zero number of ``"`` where at least
+    one quoted span holds a non-whitespace token (so ``""`` or ``" "`` alone
+    does not qualify). Splitting on ``"`` places quoted spans at the odd indices
+    of the resulting list; the caller guarantees an even quote count, so those
+    indices are exactly the inside-quote spans.
+
+    Args:
+        query: The raw user-facing query string (assumed to have an even ``"``
+            count when a positive result is meaningful).
+
+    Returns:
+        ``True`` when at least one quoted span wraps a non-whitespace token.
+
+    """
+    # ``len(parts) - 1`` == quote count; an even quote count leaves the
+    # inside-quote spans at the odd indices of the split. With no quotes the
+    # range is empty and ``any`` is ``False``.
+    parts = query.split('"')
+    return any(parts[index].strip() for index in range(1, len(parts), 2))
 
 
 def _normalize_fts_query(query: str) -> str:
@@ -8939,6 +9023,33 @@ def _normalize_fts_query(query: str) -> str:
     return joiner.join(terms)
 
 
+def _normalize_fts_query_bare(query: str) -> str:
+    """Normalize ``query`` through the bare (sanitizing) path unconditionally.
+
+    Every token is sanitized into safe FTS5 fragments -- unsafe characters are
+    dropped and wildcards are reduced to valid prefix markers
+    (:func:`_collapse_fts_wildcards`) -- and the fragments are OR-joined. For any
+    input this yields a syntactically valid FTS5 MATCH expression (or the empty
+    string when no indexable term remains). This is the
+    execution-time fallback :meth:`SqliteEngravaCore.search_fts` retries with
+    when the primary — possibly expert — normalization produced an expression
+    that FTS5 rejected, so a stray hazardous character in an expert-looking
+    query degrades to a valid bare match instead of silently returning nothing.
+
+    Args:
+        query: The raw user-facing query string.
+
+    Returns:
+        An always-valid FTS5 MATCH expression, or the empty string when the
+        query holds no indexable term.
+
+    """
+    terms: list[str] = []
+    for token in query.split():
+        terms.extend(_normalize_fts_token(token, expert=False))
+    return " OR ".join(terms)
+
+
 def _strip_fts_boundary_punctuation(raw: str) -> str:
     """Strip unsupported leading and trailing punctuation from a bare token.
 
@@ -8959,13 +9070,49 @@ def _strip_fts_boundary_punctuation(raw: str) -> str:
     return raw
 
 
+def _collapse_fts_wildcards(fragment: str) -> str:
+    """Reduce ``*`` wildcards in a bare fragment to FTS5-valid positions.
+
+    FTS5 accepts ``*`` only as a prefix marker attached to a preceding term
+    character (``foo*``, ``x*y*z``). A leading ``*``, a standalone ``*``, or a
+    run of consecutive ``*`` (``foo**``, ``foo***bar``) is a syntax error. This
+    keeps a ``*`` only when it directly follows a non-``*`` character and
+    collapses each run to a single marker, so the fragment is always a
+    syntactically valid FTS5 term while genuine prefix search (``foo*``) is
+    preserved.
+
+    Args:
+        fragment: A safe fragment containing only word characters, ``-`` and
+            ``*`` (as produced by the unsafe-character split).
+
+    Returns:
+        The fragment with every ``*`` reduced to a valid single prefix marker.
+        May be the empty string when the fragment was nothing but wildcards.
+
+    """
+    collapsed: list[str] = []
+    for char in fragment:
+        if char == "*":
+            # Keep a wildcard only when it attaches to a real term character;
+            # this drops leading wildcards and every wildcard after the first in
+            # a consecutive run.
+            if collapsed and collapsed[-1] != "*":
+                collapsed.append(char)
+        else:
+            collapsed.append(char)
+    return "".join(collapsed)
+
+
 def _sanitize_fts_bare_token(raw: str) -> list[str]:
     """Split an unquoted bare token into safe FTS5 fragments.
 
     Unsafe characters become fragment boundaries rather than being deleted, so
     a contraction or clitic such as ``sister's`` splits into ``["sister", "s"]``
     (which the ``unicode61`` tokenizer also produced at index time) instead of
-    merging into an unindexed ``sisters``.
+    merging into an unindexed ``sisters``. Each fragment's wildcards are then
+    reduced to FTS5-valid positions (see :func:`_collapse_fts_wildcards`) so a
+    consecutive- or leading-``*`` shape such as ``foo**`` can never reach the
+    ``MATCH`` as an invalid term.
 
     Args:
         raw: A single unquoted token, already paren-stripped.
@@ -8977,7 +9124,8 @@ def _sanitize_fts_bare_token(raw: str) -> list[str]:
     """
     stripped = _strip_fts_boundary_punctuation(raw)
     split = _FTS_UNSAFE_CHAR_RE.sub(" ", stripped)
-    return [fragment for fragment in split.split() if fragment]
+    collapsed = (_collapse_fts_wildcards(fragment) for fragment in split.split())
+    return [fragment for fragment in collapsed if fragment]
 
 
 def _normalize_fts_token(token: str, *, expert: bool) -> list[str]:
