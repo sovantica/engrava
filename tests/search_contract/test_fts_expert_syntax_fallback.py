@@ -129,21 +129,17 @@ _REPORTED_QUERY = 'field name between "body" and "forum"? Mark your final answer
 
 
 # ---------------------------------------------------------------------------
-# AC5 — genuine-expert parity golden set
+# Genuine-expert parity
 # ---------------------------------------------------------------------------
-# For each real expert query the classification MUST be expert and the
-# normalized output MUST be byte-identical to release/v0.6.0 (which normalized
-# expert queries token-by-token, joined with spaces, unchanged by this fix).
-# INCLUDES the exact column-filter + phrase queries whose column filter a prior
-# rewrite dropped — the regression this fix must not cause.
-
-_EXPERT_PARITY: dict[str, str] = {
-    'essence:"a b"': 'essence:"a b"',
-    'content:"machine learning"': 'content:"machine learning"',
-    "content:foo AND essence:bar": "content:foo AND essence:bar",
-    "cats AND dogs": "cats AND dogs",
-    '"machine learning" AND relevant': '"machine learning" AND relevant',
-}
+# The genuine-expert parity golden — for each real expert query the
+# classification MUST be expert and the normalized output MUST be byte-identical
+# to the frozen MATCH — is now an externalized, checked-in golden covering the
+# full column-filter x phrase x boolean cross-product (a superset of the five
+# cases that used to live inline here). It lives in
+# ``tests/search_contract/goldens/fts_expert_normalization.json`` and is asserted
+# by ``TestExpertNormalizationGolden`` in ``test_search_goldens.py``, whose
+# discriminating-power tests also prove the rejected column-filter drop breaks
+# it. See ``golden_fixtures.py`` for the query set and regeneration path.
 
 
 # ---------------------------------------------------------------------------
@@ -322,39 +318,9 @@ _FUZZ_CORPUS: tuple[FuzzCase, ...] = tuple(_build_group_a() + _build_group_b())
 
 
 # ---------------------------------------------------------------------------
-# AC5 — genuine-expert parity
+# Genuine-expert parity now lives in ``test_search_goldens.py`` (externalized
+# golden — see the note above where the inline table used to be).
 # ---------------------------------------------------------------------------
-
-
-class TestGenuineExpertParity:
-    """Genuine expert queries keep their classification and normalized output.
-
-    This is the regression the rejected rewrite caused: ``essence:"a b"`` and
-    ``content:"machine learning"`` lost their column filter. The fix touches
-    only classification and execution-time fallback, never the expert
-    normalizer, so these outputs stay byte-identical to release/v0.6.0.
-    """
-
-    @pytest.mark.parametrize(("query", "expected_normalized"), _EXPERT_PARITY.items())
-    def test_expert_normalization_is_byte_identical(
-        self,
-        query: str,
-        expected_normalized: str,
-    ) -> None:
-        """Each genuine expert query classifies expert and normalizes unchanged."""
-        assert _query_is_expert_syntax(query) is True
-        assert _normalize_fts_query(query) == expected_normalized
-
-    async def test_expert_queries_execute_without_raising(
-        self,
-        reported_store: SqliteEngravaCore,
-    ) -> None:
-        """Every genuine expert query drives a valid MATCH (no fallback needed)."""
-        before = reported_store.fts_match_failure_count
-        for query in _EXPERT_PARITY:
-            assert isinstance(await reported_store.search_fts(query), list)
-        # Well-formed expert queries never hit the fallback.
-        assert reported_store.fts_match_failure_count == before
 
 
 # ---------------------------------------------------------------------------

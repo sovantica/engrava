@@ -456,9 +456,13 @@ def gold_questions() -> tuple[GoldQuestion, ...]:
     return _GOLD_QUESTIONS
 
 
-@pytest.fixture
-def embedding_provider() -> CallbackProvider:
-    """Return a deterministic bag-of-words embedding provider.
+def make_embedding_provider() -> CallbackProvider:
+    """Build the deterministic bag-of-words embedding provider.
+
+    Factored out of the ``embedding_provider`` fixture so the golden
+    regeneration path (which runs outside pytest fixture scope) constructs a
+    byte-identical provider — a golden is only trustworthy if it is produced by
+    exactly the wiring the tests read it back against.
 
     Returns:
         A :class:`CallbackProvider` wrapping the network-free hashing embedder.
@@ -468,6 +472,16 @@ def embedding_provider() -> CallbackProvider:
         dimension=_EMBED_DIM,
         model_name="bag-of-words-contract",
     )
+
+
+@pytest.fixture
+def embedding_provider() -> CallbackProvider:
+    """Return a deterministic bag-of-words embedding provider.
+
+    Returns:
+        A :class:`CallbackProvider` wrapping the network-free hashing embedder.
+    """
+    return make_embedding_provider()
 
 
 def _to_thought(turn: CorpusTurn) -> ThoughtRecord:
@@ -495,6 +509,43 @@ def _to_thought(turn: CorpusTurn) -> ThoughtRecord:
     )
 
 
+async def open_populated_store(
+    *,
+    embedding_provider: CallbackProvider | None = None,
+    auto_embed: bool = False,
+) -> tuple[SqliteEngravaCore, aiosqlite.Connection]:
+    """Open an in-memory store populated with the synthetic corpus.
+
+    Single store-construction path shared by the ``fts_store`` / ``hybrid_store``
+    fixtures and the golden regeneration entry point, so a regenerated golden is
+    produced from byte-identical setup to what the tests read it back against
+    (no drift between the fixture and the generator).
+
+    Args:
+        embedding_provider: Optional deterministic provider. ``None`` leaves the
+            vector arm dormant (FTS-only store).
+        auto_embed: When ``True``, every stored thought is embedded on write so
+            the vector arm is live for ``search_hybrid``.
+
+    Returns:
+        The populated store together with its owning connection; the caller is
+        responsible for closing the connection.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    await conn.execute("PRAGMA journal_mode = WAL")
+    await conn.execute("PRAGMA foreign_keys = ON")
+    store = SqliteEngravaCore(
+        conn,
+        embedding_provider=embedding_provider,
+        auto_embed=auto_embed,
+    )
+    await store.ensure_schema()
+    for turn in _CORPUS:
+        await store.create_thought(_to_thought(turn))
+    return store, conn
+
+
 @pytest.fixture
 async def fts_store() -> AsyncIterator[SqliteEngravaCore]:
     """Return a store populated with the corpus, FTS-only (no embeddings).
@@ -502,14 +553,7 @@ async def fts_store() -> AsyncIterator[SqliteEngravaCore]:
     Yields:
         A :class:`SqliteEngravaCore` whose FTS5 index holds every corpus turn.
     """
-    conn = await aiosqlite.connect(":memory:")
-    conn.row_factory = aiosqlite.Row
-    await conn.execute("PRAGMA journal_mode = WAL")
-    await conn.execute("PRAGMA foreign_keys = ON")
-    store = SqliteEngravaCore(conn)
-    await store.ensure_schema()
-    for turn in _CORPUS:
-        await store.create_thought(_to_thought(turn))
+    store, conn = await open_populated_store()
     yield store
     await conn.close()
 
@@ -527,17 +571,9 @@ async def hybrid_store(
         A :class:`SqliteEngravaCore` with ``auto_embed`` enabled so both the
         FTS arm and the vector arm are live for ``search_hybrid``.
     """
-    conn = await aiosqlite.connect(":memory:")
-    conn.row_factory = aiosqlite.Row
-    await conn.execute("PRAGMA journal_mode = WAL")
-    await conn.execute("PRAGMA foreign_keys = ON")
-    store = SqliteEngravaCore(
-        conn,
+    store, conn = await open_populated_store(
         embedding_provider=embedding_provider,
         auto_embed=True,
     )
-    await store.ensure_schema()
-    for turn in _CORPUS:
-        await store.create_thought(_to_thought(turn))
     yield store
     await conn.close()
