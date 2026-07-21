@@ -97,6 +97,18 @@ DEFAULT_TOP_K = 5
 #: blunt mass-forget. Exposed as a CLI knob so calibration runs can tune it.
 DEFAULT_HYGIENE_EVICTION_THRESHOLD = 0.20
 
+#: Uniform applied-action outcome stamped on every ingested haystack turn so the
+#: hygiene run-level access-gate treats the store as one holding genuine usage
+#: evidence. The benchmark measures the *cycle-based* keep-score forgetting
+#: mechanism, but the store's two cold-start guards — the wall-clock
+#: minimum-inactivity-age gate and the usage-signal access-gate — would otherwise
+#: make the forgetting arm an unconditional no-op on a synthetic same-time,
+#: never-queried ingest. ``action_outcome`` is deliberately chosen because it is
+#: *not* one of the hygiene keep-score signals, so opening the access-gate with it
+#: leaves every keep-score (and therefore the archived set) byte-identical to the
+#: pre-guard cycle-driven ranking the benchmark is designed to probe.
+_BENCHMARK_TURN_OUTCOME_SCORE = 1.0
+
 EvalMode = Literal["substring", "cosine", "llm"]
 
 
@@ -212,6 +224,11 @@ def _build_hygiene_policy(
       kept, so promoted / high-value thoughts are never forgotten.
     * **Low threshold** — ``eviction_threshold`` defaults to the conservative
       ``0.20`` bar; only genuinely cold, low-value thoughts fall beneath it.
+    * **Cycle-based coldness** — ``min_inactivity_age_seconds=0`` disables the
+      store's wall-clock minimum-inactivity-age cold-start gate, so the arm
+      measures the cognitive-cycle keep-score mechanism rather than being a no-op
+      on the synthetic same-time ingest (the ingest stamps a usage signal to
+      satisfy the complementary access-gate).
 
     Args:
         enabled: When ``False`` returns ``None`` so the store is built without a
@@ -230,6 +247,12 @@ def _build_hygiene_policy(
         enabled=True,
         eviction_threshold=eviction_threshold,
         auto_gc_enabled=False,
+        # The benchmark's coldness proxy is the cognitive cycle (one per turn),
+        # not wall-clock time. Disable the wall-clock minimum-inactivity-age
+        # cold-start gate so it does not mask the cycle-driven eviction the arm
+        # measures on a synthetic same-time ingest (the run-level access-gate is
+        # satisfied separately by stamping a usage signal on each ingested turn).
+        min_inactivity_age_seconds=0,
     )
 
 
@@ -292,6 +315,11 @@ def _build_thought_from_lme_turn(
         source="longmemeval-benchmark",
         confirmation_count=0,
         confidence=0.9,
+        # Stamp a usage signal so the hygiene access-gate treats these as used
+        # memories rather than a never-queried cold import. ``action_outcome`` is
+        # not a hygiene keep-score signal, so this opens the gate without shifting
+        # any keep-score or the archived set (see ``_BENCHMARK_TURN_OUTCOME_SCORE``).
+        action_outcome_score=_BENCHMARK_TURN_OUTCOME_SCORE,
         metadata={
             "perspective": perspective,
             "source": {

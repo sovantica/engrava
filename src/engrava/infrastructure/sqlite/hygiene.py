@@ -203,6 +203,60 @@ def compute_active_hygiene_weights(
     return weights, sorted(flat_signals)
 
 
+USAGE_HISTORY_SIGNALS: tuple[str, ...] = ("frequency", "confirmation", "action_outcome")
+"""The usage-history keep-signals that gate a hygiene run (the access-gate).
+
+``frequency`` (reads), ``confirmation`` (reinforcements), and ``action_outcome``
+(applied-outcome aggregates) are the only signals grounded in a thought actually
+being *used*. Cycle-based signals (``recency`` / ``staleness``) and ``confidence``
+are deliberately excluded: they are present on any store, so on a bulk import with
+no usage history they would let ingest order alone drive eviction. Membership is
+independent of the configured ``signal_weights`` — the access-gate asks whether the
+pool holds *any* usage evidence, not whether a signal is weighted into the score.
+"""
+
+
+def has_active_usage_signal(
+    candidates: list[ThoughtRecord],
+    *,
+    current_cycle: int,
+    access_tracking_enabled: bool,
+) -> bool:
+    """Report whether any usage-history signal is active across the candidate pool.
+
+    The run-level *access-gate*: a hygiene run may archive nothing unless at least
+    one of the usage-history signals (:data:`USAGE_HISTORY_SIGNALS` —
+    ``frequency`` / ``confirmation`` / ``action_outcome``) has a data source in the
+    pool. Without any usage evidence a "cold" thought cannot be distinguished from
+    one merely ingested early, so cycle-recency alone must not drive eviction. The
+    per-signal activeness test is delegated to the shared
+    :func:`~engrava.extensions.dreaming_signals.default_signal_active` predicate
+    (the same one :func:`compute_active_hygiene_weights` uses) so the gate stays in
+    lock-step with the scorer rather than re-deriving the test.
+
+    Args:
+        candidates: The candidate pool for this run.
+        current_cycle: The run's cycle number, passed through to the shared
+            predicate. The usage signals are not cycle-based, so it does not affect
+            their result — it is threaded only to honour the predicate's signature.
+        access_tracking_enabled: Whether access tracking is on. The ``frequency``
+            signal can only be active when it is.
+
+    Returns:
+        ``True`` when at least one usage-history signal is active this run.
+
+    """
+    return any(
+        default_signal_active(
+            name,
+            candidates,
+            current_cycle=current_cycle,
+            access_tracking_enabled=access_tracking_enabled,
+        )
+        for name in USAGE_HISTORY_SIGNALS
+    )
+
+
 def compute_keep_score(
     thought: ThoughtRecord,
     ctx: DreamingContext,

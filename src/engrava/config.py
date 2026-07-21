@@ -601,6 +601,20 @@ class HygienePolicyConfig:
             (with per-thought eviction reasons) **without mutating anything and
             without journaling** — a safe preview before enabling for real.
             Default ``False``.
+        min_inactivity_age_seconds: Minimum wall-clock inactivity, in seconds,
+            before a thought may be archived. A thought is eligible for hygiene
+            archival only once its time since last contact
+            (``now - COALESCE(last_accessed_at, updated_at, created_at)``)
+            reaches this many seconds; below it the thought is protected,
+            exactly like ``pinned`` / ``protected_priorities``. This is a
+            candidate-eligibility gate on the archive decision, not a scoring
+            change (the keep-score is untouched). It stops a fresh or
+            bulk-imported store — where cycle-recency degenerates into ingest
+            order — from archiving its earliest-ingested rows. Default
+            ``604800`` (7 days), mirroring the wall-clock-seconds convention of
+            ``SearchConfig.recency_now_half_life_seconds``. ``0`` disables the
+            gate (fully backward-compatible with pre-gate behaviour). Must be
+            ``>= 0``.
 
     Examples:
         >>> cfg = HygienePolicyConfig(enabled=True, eviction_threshold=0.15)
@@ -622,6 +636,7 @@ class HygienePolicyConfig:
     auto_gc_enabled: bool = False
     gc_min_archive_age_cycles: int = 10
     dry_run: bool = False
+    min_inactivity_age_seconds: int = 604800
 
     def __post_init__(self) -> None:
         """Validate field invariants on construction.
@@ -638,7 +653,8 @@ class HygienePolicyConfig:
                 wrong type.
             ValueError: When ``eviction_threshold`` is outside ``[0.0, 1.0]``,
                 ``check_every_n_cycles`` or ``max_evictions_per_run`` is ``< 1``,
-                or ``gc_min_archive_age_cycles`` is ``< 0``.
+                or ``gc_min_archive_age_cycles`` / ``min_inactivity_age_seconds``
+                is ``< 0``.
 
         """
         # ``bool`` is an ``int`` subclass; reject it explicitly so ``True`` /
@@ -661,6 +677,9 @@ class HygienePolicyConfig:
             raise ValueError(msg)
         if self.gc_min_archive_age_cycles < 0:
             msg = "HygienePolicyConfig.gc_min_archive_age_cycles must be >= 0"
+            raise ValueError(msg)
+        if self.min_inactivity_age_seconds < 0:
+            msg = "HygienePolicyConfig.min_inactivity_age_seconds must be >= 0"
             raise ValueError(msg)
 
     def _validate_collections(self) -> None:
@@ -1705,6 +1724,24 @@ def _parse_dreaming_nonneg_int(raw: dict[str, Any], key: str, default: int) -> i
     return value
 
 
+def _parse_hygiene_positive_int(raw: dict[str, Any], key: str, default: int) -> int:
+    """Parse a ``>= 1`` integer from the ``hygiene_policy`` mapping."""
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        msg = f"'hygiene_policy.{key}' must be a positive integer"
+        raise ConfigError(msg)
+    return value
+
+
+def _parse_hygiene_nonneg_int(raw: dict[str, Any], key: str, default: int) -> int:
+    """Parse a ``>= 0`` integer from the ``hygiene_policy`` mapping."""
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        msg = f"'hygiene_policy.{key}' must be a non-negative integer"
+        raise ConfigError(msg)
+    return value
+
+
 def _parse_hygiene(raw: Any) -> HygienePolicyConfig | None:  # noqa: ANN401
     """Parse the ``hygiene_policy:`` YAML section (deterministic forgetting).
 
@@ -1748,42 +1785,24 @@ def _parse_hygiene(raw: Any) -> HygienePolicyConfig | None:  # noqa: ANN401
 
     signal_weights = _parse_hygiene_signal_weights(raw.get("signal_weights"))
 
-    check_every_n_cycles = raw.get("check_every_n_cycles", 1)
-    if (
-        isinstance(check_every_n_cycles, bool)
-        or not isinstance(check_every_n_cycles, int)
-        or check_every_n_cycles < 1
-    ):
-        msg = "'hygiene_policy.check_every_n_cycles' must be a positive integer"
-        raise ConfigError(msg)
-
-    max_evictions_per_run = raw.get("max_evictions_per_run", 100)
-    if (
-        isinstance(max_evictions_per_run, bool)
-        or not isinstance(max_evictions_per_run, int)
-        or max_evictions_per_run < 1
-    ):
-        msg = "'hygiene_policy.max_evictions_per_run' must be a positive integer"
-        raise ConfigError(msg)
+    check_every_n_cycles = _parse_hygiene_positive_int(raw, "check_every_n_cycles", 1)
+    max_evictions_per_run = _parse_hygiene_positive_int(raw, "max_evictions_per_run", 100)
 
     auto_gc_enabled = raw.get("auto_gc_enabled", False)
     if not isinstance(auto_gc_enabled, bool):
         msg = "'hygiene_policy.auto_gc_enabled' must be a boolean"
         raise ConfigError(msg)
 
-    gc_min_archive_age_cycles = raw.get("gc_min_archive_age_cycles", 10)
-    if (
-        isinstance(gc_min_archive_age_cycles, bool)
-        or not isinstance(gc_min_archive_age_cycles, int)
-        or gc_min_archive_age_cycles < 0
-    ):
-        msg = "'hygiene_policy.gc_min_archive_age_cycles' must be a non-negative integer"
-        raise ConfigError(msg)
+    gc_min_archive_age_cycles = _parse_hygiene_nonneg_int(raw, "gc_min_archive_age_cycles", 10)
 
     dry_run = raw.get("dry_run", False)
     if not isinstance(dry_run, bool):
         msg = "'hygiene_policy.dry_run' must be a boolean"
         raise ConfigError(msg)
+
+    min_inactivity_age_seconds = _parse_hygiene_nonneg_int(
+        raw, "min_inactivity_age_seconds", 604800
+    )
 
     return HygienePolicyConfig(
         enabled=enabled,
@@ -1795,6 +1814,7 @@ def _parse_hygiene(raw: Any) -> HygienePolicyConfig | None:  # noqa: ANN401
         auto_gc_enabled=auto_gc_enabled,
         gc_min_archive_age_cycles=gc_min_archive_age_cycles,
         dry_run=dry_run,
+        min_inactivity_age_seconds=min_inactivity_age_seconds,
     )
 
 

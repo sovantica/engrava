@@ -92,6 +92,7 @@ from engrava.infrastructure.sqlite.hygiene import (
     HygieneResult,
     compute_active_hygiene_weights,
     compute_keep_score,
+    has_active_usage_signal,
 )
 from engrava.infrastructure.sqlite.journal_writer import JournalWriter
 
@@ -8278,7 +8279,12 @@ class SqliteEngravaCore:
     # Memory Hygiene — deterministic forgetting loop
     # ------------------------------------------------------------------
 
-    async def run_hygiene(self, *, current_cycle: int | None = None) -> HygieneResult:
+    async def run_hygiene(
+        self,
+        *,
+        current_cycle: int | None = None,
+        now: datetime.datetime | None = None,
+    ) -> HygieneResult:
         """Run one Memory Hygiene pass — archive cold/low-value thoughts.
 
         A standalone, deterministic, no-LLM forgetting pass: it scores every
@@ -8306,6 +8312,15 @@ class SqliteEngravaCore:
         * **All-flat fallback.** When no keep-signal is active (e.g. a brand-new
           store with no access history / confirmations / cycle span), the
           keep-score is uninformative, so the pass archives **nothing**.
+        * **Cold-start guards.** Two run-safe additions that only ever *add*
+          protection: a per-thought **minimum-inactivity-age gate**
+          (``min_inactivity_age_seconds`` — a thought must be untouched for at
+          least that many wall-clock seconds before it is archivable) and a
+          run-level **access-gate** (nothing is archived unless a usage-history
+          signal — ``frequency`` / ``confirmation`` / ``action_outcome`` — is
+          active across the pool). Together they stop a fresh or bulk-imported
+          store, where cycle-recency degenerates into ingest order, from
+          archiving its earliest-ingested rows.
         * **Decay clamp.** The ``decay_function`` return is clamped to
           ``[0.0, 1.0]`` and a non-finite value is treated as ``1.0`` (no decay)
           — decay can only lower a score toward archive, never resurrect one, and
@@ -8333,6 +8348,12 @@ class SqliteEngravaCore:
                 ``0`` — always wins). A disabled / absent policy is a no-op that
                 needs no cycle, so the value is only required once a real pass is
                 about to run.
+            now: The wall-clock instant the minimum-inactivity-age gate measures
+                each thought's inactivity against. Computed **once per run** and
+                threaded into both selection and the archive re-check so a run is
+                internally consistent. Optional: defaults to
+                ``datetime.now(UTC)``; inject a fixed timezone-aware instant to
+                pin the age boundary deterministically in tests / benchmarks.
 
         Returns:
             A :class:`~engrava.infrastructure.sqlite.hygiene.HygieneResult` with
@@ -8370,6 +8391,16 @@ class SqliteEngravaCore:
         # never invented — ``0`` would make every record look equally fresh.
         current_cycle = self._require_current_cycle(current_cycle, operation="run_hygiene()")
 
+        # The minimum-inactivity-age gate is measured against a single wall-clock
+        # instant for the whole run (never ``datetime.now`` per thought) so the
+        # archive set is internally consistent and, when ``now`` is injected,
+        # deterministic. An injected ``now`` is normalised to UTC — a naive value
+        # is treated as UTC (the domain's naive-as-UTC convention) and an aware
+        # non-UTC value is converted — so both the Python age subtraction and the
+        # write-time SQL cutoff (a lexicographic compare against UTC-normalised
+        # timestamps) stay correct.
+        now = datetime.datetime.now(datetime.UTC) if now is None else _ensure_utc(now)
+
         candidates = await self._hygiene_candidates()
         ctx = DreamingContext(current_cycle=current_cycle, total_thoughts=len(candidates))
         active_weights, flat_signals = compute_active_hygiene_weights(
@@ -8379,17 +8410,26 @@ class SqliteEngravaCore:
             access_tracking_enabled=self._access_tracking_enabled,
         )
         has_active_signal = any(weight > 0.0 for weight in active_weights.values())
+        # Access-gate (cold-start guard): without any usage-history signal in the
+        # pool, "cold" is indistinguishable from "ingested early", so recency of
+        # cycle must not drive eviction alone — archive nothing this run.
+        has_usage_signal = has_active_usage_signal(
+            candidates,
+            current_cycle=current_cycle,
+            access_tracking_enabled=self._access_tracking_enabled,
+        )
 
         # All-flat fail-safe: an uninformative keep-score must never drive
         # eviction, so archive nothing (but a GC stage may still reap already
         # hygiene-archived thoughts whose restore window has elapsed).
         would_evict: list[EvictionReason] = []
-        if has_active_signal:
+        if has_active_signal and has_usage_signal:
             would_evict = self._select_archive_candidates(
                 candidates,
                 ctx=ctx,
                 active_weights=active_weights,
                 policy=policy,
+                now=now,
                 decay_multipliers=await self._hygiene_decay_multipliers(
                     candidates,
                     current_cycle=current_cycle,
@@ -8407,7 +8447,7 @@ class SqliteEngravaCore:
             )
 
         archived_count = await self._hygiene_archive(
-            would_evict, policy=policy, current_cycle=current_cycle
+            would_evict, policy=policy, current_cycle=current_cycle, now=now
         )
 
         gc_count = 0
@@ -8497,6 +8537,7 @@ class SqliteEngravaCore:
         ctx: DreamingContext,
         active_weights: dict[str, float],
         policy: HygienePolicyConfig,
+        now: datetime.datetime,
         decay_multipliers: dict[str, float],
     ) -> list[EvictionReason]:
         """Score candidates and pick the deterministic, capped archive set.
@@ -8509,15 +8550,17 @@ class SqliteEngravaCore:
         ``max_evictions_per_run`` — a stable set for a given store + config +
         cycle.
 
-        Protected thoughts (``pinned`` or a priority in
-        ``protected_priorities``) are excluded up front and never scored into the
-        archive set.
+        Protected thoughts (``pinned`` or a priority in ``protected_priorities``)
+        and thoughts inside the minimum-inactivity-age window
+        (:func:`_hygiene_inactive_enough`) are excluded up front and never scored
+        into the archive set.
 
         Args:
             candidates: The candidate pool.
             ctx: The scoring context.
             active_weights: The redistributed per-signal weights for this run.
             policy: The active hygiene policy.
+            now: The run's wall-clock instant for the minimum-inactivity-age gate.
             decay_multipliers: Per-thought clamped decay multipliers.
 
         Returns:
@@ -8528,6 +8571,11 @@ class SqliteEngravaCore:
         scored: list[tuple[float, int, str, EvictionReason]] = []
         for thought in candidates:
             if _hygiene_protected(thought, policy):
+                continue
+            if not _hygiene_inactive_enough(thought, policy, now):
+                # Minimum-inactivity-age gate: a thought contacted within the last
+                # ``min_inactivity_age_seconds`` (or with no known last-contact
+                # time) is protected, exactly like a pinned / protected-priority row.
                 continue
             keep_score, per_signal = compute_keep_score(thought, ctx, active_weights)
             decay = decay_multipliers[thought.thought_id]
@@ -8553,6 +8601,7 @@ class SqliteEngravaCore:
         *,
         policy: HygienePolicyConfig,
         current_cycle: int,
+        now: datetime.datetime,
     ) -> int:
         """Archive the selected thoughts (Stage 1 — reversible, journaled).
 
@@ -8578,31 +8627,54 @@ class SqliteEngravaCore:
             to_archive: The eviction reasons chosen by
                 :meth:`_select_archive_candidates`, already ordered and capped.
             policy: The active hygiene policy — used for the write-time protection
-                re-check (a thought pinned / re-prioritised after selection).
+                and minimum-inactivity-age re-checks (a thought pinned /
+                re-prioritised / read after selection).
             current_cycle: The cycle stamped into ``archived_at_cycle``.
+            now: The run's wall-clock instant for the minimum-inactivity-age
+                re-check — the same instant selection used.
 
         Returns:
             The number of thoughts actually archived.
 
         """
+        # Wall-clock cutoff for the atomic write-time inactivity guard: a row is
+        # archivable only if its last contact (COALESCE ladder) is at or before
+        # this instant. Computed once — ``now`` and the policy are fixed for the
+        # run. ``None`` when the gate is disabled (``min_inactivity_age_seconds``
+        # of ``0``), mirroring :func:`_hygiene_inactive_enough`.
+        inactivity_cutoff_iso: str | None = None
+        if policy.min_inactivity_age_seconds > 0:
+            inactivity_cutoff_iso = (
+                now - datetime.timedelta(seconds=policy.min_inactivity_age_seconds)
+            ).isoformat()
+
         archived = 0
         for reason in to_archive:
             before_row = await self._get_thought_row(reason.thought_id)
             if before_row is None:
                 continue
             before = self._row_to_thought(before_row)
-            if _hygiene_protected(before, policy) or before.lifecycle_status not in (
-                LifecycleStatus.ACTIVE,
-                LifecycleStatus.CREATED,
+            if (
+                _hygiene_protected(before, policy)
+                or not _hygiene_inactive_enough(before, policy, now)
+                or before.lifecycle_status
+                not in (
+                    LifecycleStatus.ACTIVE,
+                    LifecycleStatus.CREATED,
+                )
             ):
-                # Early time-of-check guard: a thought pinned, raised to a protected
-                # priority, or already transitioned between selection and here is
-                # skipped. The UPDATE below re-asserts the same predicate atomically.
+                # Time-of-check re-check on the freshly re-fetched row: a thought
+                # pinned, raised to a protected priority, *read* between selection
+                # and here (its ``last_accessed_at`` bumped back inside the
+                # inactivity window), or already transitioned is skipped. The
+                # UPDATE below re-asserts the protection/lifecycle predicate
+                # atomically; the inactivity guard is enforced here on the fresh row.
                 continue
             # Predicate-guarded write: the WHERE re-checks candidate lifecycle +
-            # unprotected at write time, so even a pin / re-prioritise landing
-            # between the check above and this UPDATE cannot archive a now-protected
-            # thought (closes the TOCTOU fully; ``rowcount == 0`` ⇒ raced, skip).
+            # unprotected + inactive-enough at write time, so even a pin /
+            # re-prioritise / read (``last_accessed_at`` bump) landing between the
+            # check above and this UPDATE cannot archive a now-protected thought
+            # (closes the TOCTOU fully; ``rowcount == 0`` ⇒ raced, skip).
             update_params: list[object] = [
                 LifecycleStatus.ARCHIVED.value,
                 current_cycle,
@@ -8615,11 +8687,20 @@ class SqliteEngravaCore:
                 placeholders = ", ".join("?" for _ in policy.protected_priorities)
                 priority_guard = f" AND priority NOT IN ({placeholders})"
                 update_params.extend(policy.protected_priorities)
+            inactivity_guard = ""
+            if inactivity_cutoff_iso is not None:
+                # Same lexicographic ordering of UTC-normalised ISO-8601 the model
+                # relies on for TEXT time comparisons. All-NULL COALESCE is NULL,
+                # so ``NULL <= ?`` is untrue and the row is skipped — the fail-closed
+                # branch, consistent with the Python re-check above.
+                inactivity_guard = " AND COALESCE(last_accessed_at, updated_at, created_at) <= ?"
+                update_params.append(inactivity_cutoff_iso)
             cursor = await self._db.execute(
                 "UPDATE thought SET lifecycle_status = ?, "  # noqa: S608 - interpolation is only ``?`` placeholders
                 "expires_at = NULL, archived_at_cycle = ? "
                 "WHERE thought_id = ? AND lifecycle_status IN (?, ?) AND pinned = 0"
-                + priority_guard,
+                + priority_guard
+                + inactivity_guard,
                 update_params,
             )
             if cursor.rowcount <= 0:
@@ -9633,6 +9714,73 @@ def _hygiene_protected(thought: ThoughtRecord, policy: HygienePolicyConfig) -> b
 
     """
     return thought.pinned or thought.priority.value in policy.protected_priorities
+
+
+def _ensure_utc(moment: datetime.datetime) -> datetime.datetime:
+    """Return ``moment`` as a timezone-aware UTC ``datetime``.
+
+    A naive input is interpreted as UTC (the domain's naive-as-UTC convention,
+    mirroring :func:`~engrava.domain.models._temporal.parse_iso8601_to_utc`); an
+    aware input in any other offset is converted to UTC. Normalising to UTC keeps
+    both aware ``datetime`` arithmetic and lexicographic comparison against the
+    UTC-normalised ISO-8601 timestamp columns correct.
+
+    Args:
+        moment: The instant to normalise (naive or aware).
+
+    Returns:
+        The same instant as a timezone-aware UTC ``datetime``.
+
+    """
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=datetime.UTC)
+    return moment.astimezone(datetime.UTC)
+
+
+def _hygiene_inactive_enough(
+    thought: ThoughtRecord,
+    policy: HygienePolicyConfig,
+    now: datetime.datetime,
+) -> bool:
+    """Report whether a thought has been untouched long enough to be archivable.
+
+    The minimum-inactivity-age gate: a thought is eligible for hygiene archival
+    only once the wall-clock time since its last contact reaches
+    ``policy.min_inactivity_age_seconds``. Last contact is the first present of
+    ``last_accessed_at`` (last read), ``updated_at`` (last write), then
+    ``created_at`` (creation) — the ``COALESCE`` ladder that realises the
+    "time since last read *or* creation" baseline. Below the threshold the
+    thought is protected, exactly like ``pinned`` / ``protected_priorities``;
+    this only ever *adds* protection (it never causes an archival that the
+    keep-score alone would not).
+
+    Fails **closed**: when all three timestamps are ``None`` (a legacy row with
+    no transaction times) the age is indeterminate and the thought is protected.
+    A ``min_inactivity_age_seconds`` of ``0`` disables the gate — every thought
+    passes, restoring the pre-gate behaviour.
+
+    Args:
+        thought: The candidate thought.
+        policy: The active hygiene policy (for ``min_inactivity_age_seconds``).
+        now: The run's wall-clock instant, injected once per run so the age
+            boundary is deterministic. A timezone-aware ``datetime`` (UTC).
+
+    Returns:
+        ``True`` when the thought is inactive for at least
+        ``min_inactivity_age_seconds`` (or the gate is disabled); ``False`` when
+        it was contacted too recently or its last-contact time is indeterminate.
+
+    """
+    if policy.min_inactivity_age_seconds == 0:
+        return True
+    # COALESCE ladder: a valid timestamp is a non-empty ISO-8601 string (empty
+    # strings are rejected by the model validator), so ``or`` selects the first
+    # present bound exactly as SQL COALESCE would.
+    last_contact = thought.last_accessed_at or thought.updated_at or thought.created_at
+    if last_contact is None:
+        return False
+    age = now - parse_iso8601_to_utc(last_contact)
+    return age.total_seconds() >= policy.min_inactivity_age_seconds
 
 
 def _encode_provenance(value: ProvenanceContext | None) -> str | None:

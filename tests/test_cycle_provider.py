@@ -121,6 +121,7 @@ def _thought(
     created_cycle: int = 0,
     updated_cycle: int = 0,
     lifecycle_status: LifecycleStatus = LifecycleStatus.ACTIVE,
+    action_outcome_score: float | None = None,
 ) -> ThoughtRecord:
     return ThoughtRecord(
         thought_id=thought_id,
@@ -132,6 +133,7 @@ def _thought(
         created_cycle=created_cycle,
         updated_cycle=updated_cycle,
         source="test",
+        action_outcome_score=action_outcome_score,
     )
 
 
@@ -552,10 +554,15 @@ class TestRecallResolution:
 
 class TestRunHygieneResolution:
     async def test_provider_supplies_cycle_and_stamps_archive(self) -> None:
-        policy = HygienePolicyConfig(enabled=True, eviction_threshold=1.0, check_every_n_cycles=1)
+        policy = HygienePolicyConfig(
+            enabled=True,
+            eviction_threshold=1.0,
+            check_every_n_cycles=1,
+            min_inactivity_age_seconds=0,  # this test is about cycle resolution, not the age gate
+        )
         s = await _make_store(cycle_provider=StaticCycleProvider(1000), hygiene_policy=policy)
         try:
-            await s.create_thought(_thought("cold", updated_cycle=0))
+            await s.create_thought(_thought("cold", updated_cycle=0, action_outcome_score=0.0))
             result = await s.run_hygiene()  # no explicit cycle → pulled from provider
             assert result.archived_count == 1
             # The provider's cycle (1000) is what hygiene stamped as archived_at_cycle.
@@ -569,11 +576,16 @@ class TestRunHygieneResolution:
             await s._db.close()
 
     async def test_explicit_cycle_wins_over_provider(self) -> None:
-        policy = HygienePolicyConfig(enabled=True, eviction_threshold=1.0, check_every_n_cycles=1)
+        policy = HygienePolicyConfig(
+            enabled=True,
+            eviction_threshold=1.0,
+            check_every_n_cycles=1,
+            min_inactivity_age_seconds=0,  # this test is about cycle resolution, not the age gate
+        )
         spy = _SpyProvider(1000)
         s = await _make_store(cycle_provider=spy, hygiene_policy=policy)
         try:
-            await s.create_thought(_thought("cold", updated_cycle=0))
+            await s.create_thought(_thought("cold", updated_cycle=0, action_outcome_score=0.0))
             await s.run_hygiene(current_cycle=50)
             assert spy.calls == 0  # explicit value wins; provider not pulled
             cursor = await s._db.execute(
@@ -615,12 +627,17 @@ class TestRunHygieneResolution:
 
 class TestConsolidateResolution:
     async def test_provider_supplies_cycle(self) -> None:
-        policy = HygienePolicyConfig(enabled=True, eviction_threshold=1.0, check_every_n_cycles=1)
+        policy = HygienePolicyConfig(
+            enabled=True,
+            eviction_threshold=1.0,
+            check_every_n_cycles=1,
+            min_inactivity_age_seconds=0,  # this test is about cycle resolution, not the age gate
+        )
         s = await _make_store(
             cycle_provider=StaticCycleProvider(1000), hygiene_policy=policy, dreaming=True
         )
         try:
-            await s.create_thought(_thought("cold", updated_cycle=0))
+            await s.create_thought(_thought("cold", updated_cycle=0, action_outcome_score=0.0))
             await s.consolidate()  # no explicit cycle → pulled from provider
             cursor = await s._db.execute(
                 "SELECT lifecycle_status FROM thought WHERE thought_id = 'cold'"
@@ -757,10 +774,15 @@ class TestGoldenDefaultUnchanged:
             await s._db.close()
 
     async def test_golden_run_hygiene(self) -> None:
-        policy = HygienePolicyConfig(enabled=True, eviction_threshold=1.0, check_every_n_cycles=1)
+        policy = HygienePolicyConfig(
+            enabled=True,
+            eviction_threshold=1.0,
+            check_every_n_cycles=1,
+            min_inactivity_age_seconds=0,  # golden path predates the age gate; keep it off here
+        )
         s = await _make_store(hygiene_policy=policy)  # no provider
         try:
-            await s.create_thought(_thought("cold", updated_cycle=0))
+            await s.create_thought(_thought("cold", updated_cycle=0, action_outcome_score=0.0))
             result = await s.run_hygiene(current_cycle=1000)
             assert result.archived_count == 1
             assert result.candidates_evaluated == 1
@@ -776,10 +798,15 @@ class TestGoldenDefaultUnchanged:
             await s._db.close()
 
     async def test_golden_consolidate(self) -> None:
-        policy = HygienePolicyConfig(enabled=True, eviction_threshold=1.0, check_every_n_cycles=1)
+        policy = HygienePolicyConfig(
+            enabled=True,
+            eviction_threshold=1.0,
+            check_every_n_cycles=1,
+            min_inactivity_age_seconds=0,  # golden path predates the age gate; keep it off here
+        )
         s = await _make_store(hygiene_policy=policy, dreaming=True)  # no provider
         try:
-            await s.create_thought(_thought("cold", updated_cycle=0))
+            await s.create_thought(_thought("cold", updated_cycle=0, action_outcome_score=0.0))
             result = await s.consolidate(current_cycle=1000)
             assert result.promoted_count == 0
             cursor = await s._db.execute(
