@@ -1,24 +1,40 @@
 """Uniform cross-arm liveness invariant: no retrieval arm surfaces dead rows.
 
-Two row classes must never reach a caller through *any* retrieval path: a
-thought whose ``expires_at`` has passed (TTL expiry), and a retired REFLECTION
-(a ``REFLECTION`` whose ``lifecycle_status`` is no longer ``ACTIVE`` — an orphan
-archived once its cluster left the active set, which must not over-recall on its
-now-stale centroid). Each arm enforces this independently — the FTS and numpy
-vector arms in their SQL ``WHERE``, the ``vec0`` arm in a post-``MATCH`` filter,
-the query-less fallback in its own ``WHERE`` — so a single shared gate is not
-what keeps them out.
+Three row classes must never reach a caller through *any* default retrieval
+path: a thought whose ``expires_at`` has passed (TTL expiry); a retired
+REFLECTION (a ``REFLECTION`` whose ``lifecycle_status`` is no longer ``ACTIVE``
+— an orphan archived once its cluster left the active set, which must not
+over-recall on its now-stale centroid); and an **archived** regular thought (a
+non-REFLECTION whose ``lifecycle_status`` is ``ARCHIVED`` — forgotten by the
+hygiene loop or TTL-archived, excluded from the default candidate set but
+reversibly, via :meth:`SqliteEngravaCore.restore_thought`). Each arm enforces
+this independently — the FTS and numpy vector arms in their SQL ``WHERE``, the
+``vec0`` arm in a post-``MATCH`` filter, the query-less fallback in its own
+``WHERE`` — so a single shared gate is not what keeps them out.
+
+The archived exclusion, unlike expiry and the retired-REFLECTION floor, is
+reversible per-call: passing ``include_archived=True`` re-admits archived rows
+across every arm without restoring them (the "search my archive" escape hatch).
+The retired-REFLECTION floor is *not* relaxed by that flag — it is an
+independent gate.
 
 :class:`TestCrossArmLiveness` pins the invariant uniformly: a live decoy sharing
 the same vocabulary is returned by every arm (proof the arm executed), while the
-expired thought and the retired REFLECTION are returned by none — not the FTS
-arm, not the vector arm, not hybrid fusion, and not the all-signals-off fallback.
+expired thought, the retired REFLECTION, and the archived thought are returned by
+none — not the FTS arm, not the vector arm, not hybrid fusion, and not the
+all-signals-off fallback — yet the archived row is re-admitted under
+``include_archived=True``.
 
 :class:`TestLivenessDiscriminatingPower` verifies the invariant's power on the
 ``vec0`` arm, whose liveness gate is an isolable seam
 (:meth:`SqliteEngravaCore._filter_expired_results`): reverting it to an identity
 makes the dead rows leak through the vector arm *only*, while the FTS arm — whose
 gate is independent — still excludes them.
+
+:class:`TestArchivedExclusionDiscriminatingPower` proves the archived clause is
+load-bearing per path: forcing an individual arm to skip its archived clause
+(via ``include_archived=True`` on that one path) leaks the archived row through
+that arm alone, while the others still exclude it.
 """
 
 from __future__ import annotations
@@ -57,6 +73,7 @@ _QUERY_TEXT = "alpha beta gamma shared"
 _LIVE_ID = "t-live"
 _EXPIRED_ID = "t-expired"
 _RETIRED_ID = "t-retired"
+_ARCHIVED_ID = "t-archived"
 
 
 def _embed(text: str) -> list[float]:
@@ -120,12 +137,16 @@ def _thought(
 
 @pytest.fixture
 async def liveness_store() -> AsyncIterator[SqliteEngravaCore]:
-    """Return a store holding a live decoy, an expired thought, and a retired REFLECTION.
+    """Return a store holding a live decoy plus three excluded rows.
 
-    All three share the same vocabulary and (via ``auto_embed``) carry an
-    embedding, so both the FTS and the vector arm have a genuine reason to
-    surface each — leaving the liveness gate as the sole thing that keeps the
-    dead rows out.
+    The excluded rows are an expired thought, a retired REFLECTION, and an
+    archived regular OBSERVATION. All four share the same vocabulary and (via
+    ``auto_embed``) carry an embedding, so both the FTS and the vector arm have a
+    genuine reason to surface each — leaving the liveness / archived gate as the
+    sole thing that keeps the excluded rows out. The archived row is created
+    ACTIVE (so it is embedded) and then transitioned to ``ARCHIVED`` through the
+    real ``ACTIVE -> ARCHIVED`` lifecycle edge, mirroring how the hygiene loop
+    forgets a thought.
 
     Yields:
         A :class:`SqliteEngravaCore` with a deterministic vector arm.
@@ -150,6 +171,8 @@ async def liveness_store() -> AsyncIterator[SqliteEngravaCore]:
             lifecycle_status=LifecycleStatus.ARCHIVED,
         )
     )
+    await store.create_thought(_thought(_ARCHIVED_ID))
+    await store.update_thought(_ARCHIVED_ID, lifecycle_status=LifecycleStatus.ARCHIVED)
     yield store
     await conn.close()
 
@@ -219,6 +242,167 @@ class TestCrossArmLiveness:
         assert _LIVE_ID in ids, "fallback must still surface the live row"
         assert _EXPIRED_ID not in ids
         assert _RETIRED_ID not in ids
+        assert _ARCHIVED_ID not in ids
+
+
+class TestArchivedExclusionAcrossArms:
+    """Archived regular thoughts leave every default arm — and return on opt-in.
+
+    A non-REFLECTION thought whose ``lifecycle_status`` is ``ARCHIVED`` shares the
+    suite vocabulary and carries an embedding, so each arm has a genuine reason
+    to surface it; only the archived-exclusion clause keeps it out. Passing
+    ``include_archived=True`` re-admits it on the same arm.
+    """
+
+    async def test_fts_arm_excludes_archived(self, liveness_store: SqliteEngravaCore) -> None:
+        """The FTS arm drops the archived row by default and re-admits it on opt-in."""
+        default_ids = _ids(await liveness_store.search_fts(_QUERY_TEXT, top_k=50))
+        assert _LIVE_ID in default_ids
+        assert _ARCHIVED_ID not in default_ids
+        opt_in_ids = _ids(
+            await liveness_store.search_fts(_QUERY_TEXT, top_k=50, include_archived=True)
+        )
+        assert _ARCHIVED_ID in opt_in_ids
+
+    async def test_vector_arm_excludes_archived(self, liveness_store: SqliteEngravaCore) -> None:
+        """The vector arm drops the archived row by default and re-admits it on opt-in."""
+        query = _embed(_QUERY_TEXT)
+        default_ids = _ids(await liveness_store.search_similar(query, top_k=50))
+        assert _LIVE_ID in default_ids
+        assert _ARCHIVED_ID not in default_ids
+        opt_in_ids = _ids(
+            await liveness_store.search_similar(query, top_k=50, include_archived=True)
+        )
+        assert _ARCHIVED_ID in opt_in_ids
+
+    async def test_hybrid_excludes_archived(self, liveness_store: SqliteEngravaCore) -> None:
+        """Hybrid fusion drops the archived row by default and re-admits it on opt-in."""
+        default_ids = _ids((await liveness_store.search_hybrid(_QUERY_TEXT, top_k=50)).results)
+        assert _LIVE_ID in default_ids
+        assert _ARCHIVED_ID not in default_ids
+        opt_in_ids = _ids(
+            (
+                await liveness_store.search_hybrid(_QUERY_TEXT, top_k=50, include_archived=True)
+            ).results
+        )
+        assert _ARCHIVED_ID in opt_in_ids
+
+    async def test_recall_excludes_archived(self, liveness_store: SqliteEngravaCore) -> None:
+        """``recall`` (the ergonomic hybrid shorthand) honours the archived exclusion."""
+        default_ids = _ids((await liveness_store.recall(_QUERY_TEXT, top_k=50)).results)
+        assert _LIVE_ID in default_ids
+        assert _ARCHIVED_ID not in default_ids
+        opt_in_ids = _ids(
+            (await liveness_store.recall(_QUERY_TEXT, top_k=50, include_archived=True)).results
+        )
+        assert _ARCHIVED_ID in opt_in_ids
+
+    async def test_fallback_excludes_archived(self, liveness_store: SqliteEngravaCore) -> None:
+        """The all-signals-off fallback excludes the archived row and re-admits it on opt-in."""
+        default = await liveness_store.search_hybrid(
+            "", None, top_k=50, recency_weight=0.0, priority_weight=0.0, graph_weight=0.0
+        )
+        assert _LIVE_ID in _ids(default.results)
+        assert _ARCHIVED_ID not in _ids(default.results)
+        opt_in = await liveness_store.search_hybrid(
+            "",
+            None,
+            top_k=50,
+            recency_weight=0.0,
+            priority_weight=0.0,
+            graph_weight=0.0,
+            include_archived=True,
+        )
+        assert _ARCHIVED_ID in _ids(opt_in.results)
+
+    async def test_retired_reflection_floor_survives_include_archived(
+        self,
+        liveness_store: SqliteEngravaCore,
+    ) -> None:
+        """``include_archived=True`` re-admits the archived thought but NOT the retired REFLECTION.
+
+        The retired-REFLECTION freshness floor is an independent gate; the
+        archived escape hatch must not relax it, or a stale synthesis would
+        over-recall on its now-dead centroid.
+        """
+        ids = _ids(
+            (
+                await liveness_store.search_hybrid(_QUERY_TEXT, top_k=50, include_archived=True)
+            ).results
+        )
+        assert _ARCHIVED_ID in ids
+        assert _RETIRED_ID not in ids
+        assert _EXPIRED_ID not in ids
+
+
+class TestArchivedExclusionDiscriminatingPower:
+    """Skipping the archived clause on ONE arm leaks the archived row through that arm only.
+
+    Each arm's archived clause is conditional on ``include_archived``. Forcing an
+    individual arm to run with ``include_archived=True`` (while the caller asked
+    for the default) reproduces "this arm forgot its archived clause": the
+    archived row leaks through that arm, and only that arm.
+    """
+
+    async def test_forcing_fts_arm_leaks_archived_through_fts_only(
+        self,
+        liveness_store: SqliteEngravaCore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Dropping the FTS archived clause leaks the archived row through the FTS arm only."""
+        original = liveness_store.search_fts
+
+        async def _leaky_fts(
+            query: str,
+            top_k: int = 10,
+            *,
+            include_archived: bool = False,
+            _filter_clause: object = None,
+        ) -> list[tuple[str, float]]:
+            return await original(
+                query,
+                top_k=top_k,
+                include_archived=True,
+                _filter_clause=_filter_clause,  # type: ignore[arg-type]
+            )
+
+        monkeypatch.setattr(liveness_store, "search_fts", _leaky_fts)
+
+        leaked_fts = _ids(await liveness_store.search_fts(_QUERY_TEXT, top_k=50))
+        clean_vec = _ids(await liveness_store.search_similar(_embed(_QUERY_TEXT), top_k=50))
+        assert _ARCHIVED_ID in leaked_fts
+        assert _ARCHIVED_ID not in clean_vec
+
+    async def test_forcing_numpy_vector_arm_leaks_archived_through_vector_only(
+        self,
+        liveness_store: SqliteEngravaCore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Dropping the numpy vector arm's archived clause leaks the row through that arm only."""
+        original = liveness_store._search_similar_numpy
+
+        async def _leaky_numpy(
+            query_vector: list[float],
+            top_k: int = 10,
+            threshold: float = 0.0,
+            *,
+            include_archived: bool = False,
+            _filter_clause: object = None,
+        ) -> list[tuple[str, float]]:
+            return await original(
+                query_vector,
+                top_k,
+                threshold,
+                include_archived=True,
+                _filter_clause=_filter_clause,  # type: ignore[arg-type]
+            )
+
+        monkeypatch.setattr(liveness_store, "_search_similar_numpy", _leaky_numpy)
+
+        leaked_vec = _ids(await liveness_store.search_similar(_embed(_QUERY_TEXT), top_k=50))
+        clean_fts = _ids(await liveness_store.search_fts(_QUERY_TEXT, top_k=50))
+        assert _ARCHIVED_ID in leaked_vec
+        assert _ARCHIVED_ID not in clean_fts
 
 
 @sqlite_vec_required
@@ -256,11 +440,14 @@ class TestLivenessDiscriminatingPower:
                 lifecycle_status=LifecycleStatus.ARCHIVED,
             )
         )
-        # All three sit right on the query axis so the KNN returns each; only the
-        # post-MATCH liveness filter then removes the dead ones.
+        await store.create_thought(_thought(_ARCHIVED_ID))
+        await store.update_thought(_ARCHIVED_ID, lifecycle_status=LifecycleStatus.ARCHIVED)
+        # All four sit right on the query axis so the KNN returns each; only the
+        # post-MATCH liveness / archived filter then removes the excluded ones.
         await store.store_embedding(thought_id=_LIVE_ID, vector=[1.0, 0.0], model_name="m2")
         await store.store_embedding(thought_id=_EXPIRED_ID, vector=[0.999, 0.001], model_name="m2")
         await store.store_embedding(thought_id=_RETIRED_ID, vector=[0.998, 0.002], model_name="m2")
+        await store.store_embedding(thought_id=_ARCHIVED_ID, vector=[0.997, 0.003], model_name="m2")
         return store
 
     async def test_reverting_vec0_filter_leaks_through_vector_arm_only(
@@ -268,21 +455,23 @@ class TestLivenessDiscriminatingPower:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Stripping ``_filter_expired_results`` leaks dead rows through the vector arm only."""
+        """Stripping ``_filter_expired_results`` leaks dead + archived rows through vector only."""
         store = await self._build_vec0_store(tmp_path)
         try:
             query = [1.0, 0.0]
 
-            # Baseline: both arms exclude the dead rows.
+            # Baseline: both arms exclude the dead and archived rows.
             vec_ids = _ids(await store.search_similar(query, top_k=10))
             fts_ids = _ids(await store.search_fts(_QUERY_TEXT, top_k=10))
             assert _LIVE_ID in vec_ids
             assert _LIVE_ID in fts_ids
-            assert {_EXPIRED_ID, _RETIRED_ID} & (vec_ids | fts_ids) == set()
+            assert {_EXPIRED_ID, _RETIRED_ID, _ARCHIVED_ID} & (vec_ids | fts_ids) == set()
 
-            # Revert the vec0 liveness gate to a no-op post-filter.
+            # Revert the vec0 liveness + archived gate to a no-op post-filter.
             async def _identity(
                 results: list[tuple[str, float]],
+                *,
+                include_archived: bool = False,
             ) -> list[tuple[str, float]]:
                 return results
 
@@ -291,11 +480,13 @@ class TestLivenessDiscriminatingPower:
             leaked_vec = _ids(await store.search_similar(query, top_k=10))
             still_clean_fts = _ids(await store.search_fts(_QUERY_TEXT, top_k=10))
 
-            # The dead rows now leak through the vector arm...
+            # The dead and archived rows now leak through the vector arm...
             assert _EXPIRED_ID in leaked_vec
             assert _RETIRED_ID in leaked_vec
+            assert _ARCHIVED_ID in leaked_vec
             # ...but the FTS arm's independent gate still excludes them.
             assert _EXPIRED_ID not in still_clean_fts
             assert _RETIRED_ID not in still_clean_fts
+            assert _ARCHIVED_ID not in still_clean_fts
         finally:
             await store.close()

@@ -199,6 +199,7 @@ class EngravaCoreProtocol(Protocol):
         visibility: VisibilityQueryFilter | None = None,
         collapse_key: str | Sequence[str] | None = None,
         collapse_max_per_unit: int | None = None,
+        include_archived: bool = False,
     ) -> HybridSearchResult:
         """Retrieve thoughts relevant to a query with one call.
 
@@ -242,6 +243,10 @@ class EngravaCoreProtocol(Protocol):
                 up to that many highest-ranked members of a unit and backfills
                 the freed slots with deeper distinct units. Only effective with
                 ``collapse_key``; rejected when ``< 1``.
+            include_archived: When ``False`` (default) archived thoughts are
+                excluded from every retrieval path; delegated to
+                ``search_hybrid``. When ``True`` archived rows are re-admitted for
+                this call without restoring them.
 
         Returns:
             A ``HybridSearchResult`` with the ranked matches and the set of
@@ -375,6 +380,8 @@ class EngravaCoreProtocol(Protocol):
         query_vector: list[float],
         top_k: int = 10,
         threshold: float = 0.0,
+        *,
+        include_archived: bool = False,
     ) -> list[tuple[str, float]]:
         """Search for thoughts similar to the query vector.
 
@@ -382,6 +389,9 @@ class EngravaCoreProtocol(Protocol):
             query_vector: Query embedding vector.
             top_k: Maximum number of results.
             threshold: Minimum cosine similarity score.
+            include_archived: When ``False`` (default) archived thoughts
+                (``lifecycle_status = 'ARCHIVED'``) are excluded; when ``True``
+                they are re-admitted for this call without restoring them.
 
         Returns:
             List of (thought_id, similarity_score) tuples, sorted descending.
@@ -393,6 +403,8 @@ class EngravaCoreProtocol(Protocol):
         self,
         query: str,
         top_k: int = 10,
+        *,
+        include_archived: bool = False,
     ) -> list[tuple[str, float]]:
         """Full-text search using SQLite FTS5 with BM25 ranking.
 
@@ -404,6 +416,10 @@ class EngravaCoreProtocol(Protocol):
             query: Search query string.  FTS5 syntax is supported
                 (e.g. ``"projekt AND Alpha"``, ``"REQ-FUNC*"``).
             top_k: Maximum number of results.
+            include_archived: When ``False`` (default) archived thoughts
+                (``lifecycle_status = 'ARCHIVED'``) are excluded from matches;
+                when ``True`` they are re-admitted for this call without
+                restoring them.
 
         Returns:
             List of ``(thought_id, bm25_score)`` tuples sorted by
@@ -433,6 +449,7 @@ class EngravaCoreProtocol(Protocol):
         visibility: VisibilityQueryFilter | None = None,
         collapse_key: str | Sequence[str] | None = None,
         collapse_max_per_unit: int | None = None,
+        include_archived: bool = False,
     ) -> HybridSearchResult:
         """Hybrid search combining FTS5 keyword + vector cosine similarity.
 
@@ -522,6 +539,13 @@ class EngravaCoreProtocol(Protocol):
                 the intra-unit count (never adds a non-candidate row, mutates a
                 score, or drops a distinct unit as a side effect), and is
                 rejected when ``< 1``.
+            include_archived: When ``False`` (default) archived thoughts
+                (``lifecycle_status = 'ARCHIVED'``) are excluded from every
+                candidate path — the FTS and vector arms, the query-less
+                fallback, and the ``CONSOLIDATED_FROM`` graph expansion. When
+                ``True`` archived rows are re-admitted across all of those paths
+                for this call without restoring them. The independent
+                retired-REFLECTION freshness floor is unaffected either way.
 
         Returns:
             ``HybridSearchResult`` with ranked results and the set of

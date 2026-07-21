@@ -649,6 +649,10 @@ class DreamingExtension:
                     struct.unpack(f"{embedding.dimension}f", embedding.vector_blob),
                 )
 
+                # Intentionally at the default archived-exclusion: a forgotten
+                # (archived) thought must not accrue new dreaming edges, so we do
+                # NOT pass include_archived=True here. Only live neighbours are
+                # eligible edge endpoints.
                 neighbours = await store.search_similar(
                     vector,
                     top_k=edge_cfg.top_k + 1,

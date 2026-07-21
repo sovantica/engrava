@@ -55,6 +55,28 @@ class TestParseArgs:
         args = _parse_args(["--dreaming", "--no-dreaming"])
         assert args.dreaming is False
 
+    def test_hygiene_defaults_off_with_conservative_threshold(self) -> None:
+        from engrava.benchmarks.longmemeval.runner import (
+            DEFAULT_HYGIENE_EVICTION_THRESHOLD,
+        )
+
+        args = _parse_args([])
+        assert args.hygiene is False
+        assert args.hygiene_eviction_threshold == pytest.approx(DEFAULT_HYGIENE_EVICTION_THRESHOLD)
+
+    def test_hygiene_flag_flips_default(self) -> None:
+        args = _parse_args(["--hygiene"])
+        assert args.hygiene is True
+
+    def test_no_hygiene_explicitly_restores_default(self) -> None:
+        args = _parse_args(["--hygiene", "--no-hygiene"])
+        assert args.hygiene is False
+
+    def test_hygiene_eviction_threshold_is_parsed(self) -> None:
+        args = _parse_args(["--hygiene", "--hygiene-eviction-threshold", "0.7"])
+        assert args.hygiene is True
+        assert args.hygiene_eviction_threshold == pytest.approx(0.7)
+
     def test_invalid_variant_is_rejected(self) -> None:
         with pytest.raises(SystemExit):
             _parse_args(["--variant", "huge"])

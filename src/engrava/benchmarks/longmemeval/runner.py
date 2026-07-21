@@ -18,6 +18,14 @@ Semantics:
   ``dreaming_enabled=True``; the configuration comes from
   :func:`_build_longmemeval_config` (the binding values are pinned in
   this module; calibration runs may refine them).
+* **Hygiene (forgetting)** — one Memory Hygiene pass after ingestion (and
+  after dreaming, when both are on) when ``hygiene_enabled=True``, so cold
+  thoughts are *archived* before the question is answered. The pass is
+  conservative: GC is OFF (archive-only, reversible), P1/pins protected, and a
+  low ``eviction_threshold`` so only genuinely cold thoughts are forgotten. The
+  per-question ``archived_count`` (and the archived thought ids) are reported so
+  a no-recall-regression study can confirm forgetting actually happened and
+  later check overlap with the answer-bearing thoughts.
 * **Retrieval** — single ``search_hybrid`` query with the natural-
   language question; ``top_k`` defaults to 5 (matches the synthetic
   benchmark).
@@ -50,7 +58,12 @@ from engrava.benchmarks.longmemeval.evaluate import (
     evaluate_llm,
     evaluate_substring,
 )
-from engrava.config import DreamingConfig, DreamingGates, SearchConfig
+from engrava.config import (
+    DreamingConfig,
+    DreamingGates,
+    HygienePolicyConfig,
+    SearchConfig,
+)
 from engrava.domain.enums import LifecycleStatus, Priority, ThoughtType
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.extensions.dreaming import DreamingExtension
@@ -65,6 +78,7 @@ if TYPE_CHECKING:
     )
 
 __all__ = [
+    "DEFAULT_HYGIENE_EVICTION_THRESHOLD",
     "DEFAULT_TOP_K",
     "EvalMode",
     "LongMemEvalResults",
@@ -75,6 +89,13 @@ __all__ = [
 
 
 DEFAULT_TOP_K = 5
+
+#: Conservative default eviction-score cutoff for the benchmark hygiene arm.
+#: Mirrors :attr:`HygienePolicyConfig.eviction_threshold` (``0.20``) — a
+#: deliberately low bar so only clearly cold, low-value thoughts are archived,
+#: keeping the "ON" arm a genuine no-recall-regression probe rather than a
+#: blunt mass-forget. Exposed as a CLI knob so calibration runs can tune it.
+DEFAULT_HYGIENE_EVICTION_THRESHOLD = 0.20
 
 EvalMode = Literal["substring", "cosine", "llm"]
 
@@ -88,6 +109,13 @@ class QuestionResult:
         question_type: Taxonomy label (e.g. ``single-session-recall``).
         eval_mode: Mode used to produce ``outcome``.
         outcome: The :class:`EvaluationOutcome` returned by the mode.
+        archived_count: Number of thoughts the hygiene pass archived for this
+            question (``0`` when hygiene is off). The predict-before-spend
+            signal that forgetting actually happened.
+        archived_thought_ids: The thought ids archived by the hygiene pass for
+            this question, in deterministic order. Empty when hygiene is off.
+            Retained so a study can later check overlap with the answer-bearing
+            thoughts.
 
     """
 
@@ -95,6 +123,8 @@ class QuestionResult:
     question_type: str
     eval_mode: EvalMode
     outcome: EvaluationOutcome
+    archived_count: int = 0
+    archived_thought_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -104,6 +134,8 @@ class LongMemEvalResults:
     Attributes:
         dreaming_enabled: ``True`` when the run executed a
             consolidation cycle per question.
+        hygiene_enabled: ``True`` when the run executed a Memory Hygiene
+            (forgetting) pass per question.
         top_k: Retrieval ``top_k`` used.
         eval_mode: Evaluation mode used.
         total_questions: Number of questions scored.
@@ -111,6 +143,9 @@ class LongMemEvalResults:
             outcomes (``0.0`` for an empty input).
         aggregate_raw_signal: Mean ``raw_signal`` across all per-
             question outcomes.
+        archived_count: Total thoughts archived by the hygiene pass across every
+            question (``0`` when hygiene is off) — the run-level forgetting
+            volume.
         per_type: Aggregate score keyed by ``question_type``.
         question_results: Per-question outcomes in input order; tests
             can use this for deterministic comparisons.
@@ -118,11 +153,13 @@ class LongMemEvalResults:
     """
 
     dreaming_enabled: bool
+    hygiene_enabled: bool
     top_k: int
     eval_mode: EvalMode
     total_questions: int
     aggregate_score: float
     aggregate_raw_signal: float
+    archived_count: int = 0
     per_type: dict[str, float] = field(default_factory=dict)
     question_results: tuple[QuestionResult, ...] = field(default_factory=tuple)
 
@@ -155,6 +192,45 @@ def _build_longmemeval_config() -> tuple[DreamingConfig, SearchConfig]:
     )
     search = SearchConfig(reflection_boost=1.0)
     return dreaming, search
+
+
+def _build_hygiene_policy(
+    *,
+    enabled: bool,
+    eviction_threshold: float,
+) -> HygienePolicyConfig | None:
+    """Return the conservative benchmark hygiene policy, or ``None`` when off.
+
+    The policy is intentionally cautious so the forgetting arm never becomes a
+    blunt mass-delete that would trivially regress recall:
+
+    * **Archive-only** — ``auto_gc_enabled=False``: the pass only flips cold
+      thoughts to ``ARCHIVED`` (reversible, no physical delete), so every
+      forgotten thought remains restorable and inspectable after the run.
+    * **P1 / pins protected** — the :class:`HygienePolicyConfig` defaults
+      (``protected_priorities=("P1",)`` plus the always-on pin invariant) are
+      kept, so promoted / high-value thoughts are never forgotten.
+    * **Low threshold** — ``eviction_threshold`` defaults to the conservative
+      ``0.20`` bar; only genuinely cold, low-value thoughts fall beneath it.
+
+    Args:
+        enabled: When ``False`` returns ``None`` so the store is built without a
+            hygiene policy and the run performs no forgetting (the OFF arm).
+        eviction_threshold: Eviction-score cutoff forwarded to the policy;
+            exposed as a CLI knob for calibration.
+
+    Returns:
+        A conservative :class:`HygienePolicyConfig` when ``enabled``; otherwise
+        ``None``.
+
+    """
+    if not enabled:
+        return None
+    return HygienePolicyConfig(
+        enabled=True,
+        eviction_threshold=eviction_threshold,
+        auto_gc_enabled=False,
+    )
 
 
 def _perspective_for_role(role: str) -> str:
@@ -305,6 +381,30 @@ async def _ingest_question(
     return cycle
 
 
+async def _archived_thought_ids(store: SqliteEngravaCore) -> frozenset[str]:
+    """Return the ids of every ARCHIVED thought currently in the store.
+
+    Used to attribute a hygiene pass's effect: snapshot the archived set before
+    and after :meth:`run_hygiene` and diff, so the reported archived ids reflect
+    exactly what the pass forgot (never a reflection retired by dreaming, nor a
+    TTL/manual archive). The limit is set well above any single LongMemEval
+    haystack (tens to low hundreds of turns) so the snapshot is complete.
+
+    Args:
+        store: The per-question store to inspect.
+
+    Returns:
+        The frozenset of archived thought ids.
+
+    """
+    archived = await store.list_thoughts(
+        lifecycle_status=LifecycleStatus.ARCHIVED.value,
+        include_expired=True,
+        limit=1_000_000,
+    )
+    return frozenset(record.thought_id for record in archived)
+
+
 def _db_uri_for_question(
     question_id: str,
     db_dir: Path | None,
@@ -350,10 +450,17 @@ async def _process_question(
     retrieval_top_k: int,
     binding_dreaming: DreamingConfig,
     binding_search: SearchConfig,
+    hygiene_policy: HygienePolicyConfig | None,
     db_dir: Path | None,
     llm_judge: LLMJudgeClient | None,
 ) -> QuestionResult:
-    """Run the ingest/dream/query/score loop for one question."""
+    """Run the ingest/dream/forget/query/score loop for one question.
+
+    When ``hygiene_policy`` is supplied the store forgets cold thoughts (one
+    :meth:`run_hygiene` pass) after ingestion and after any dreaming cycle, so
+    the archival is reflected in what retrieval can see. The ids archived by that
+    pass are captured (a before/after diff of the ARCHIVED set) and returned.
+    """
     db_uri = _db_uri_for_question(question.question_id, db_dir)
     async with aiosqlite.connect(db_uri) as db:
         db.row_factory = aiosqlite.Row
@@ -362,12 +469,25 @@ async def _process_question(
             embedding_provider=embedding_provider,
             auto_embed=True,
             search_config=binding_search,
+            hygiene_policy=hygiene_policy,
         )
         await store.ensure_schema()
         cycle = await _ingest_question(store, question)
         if dreaming_enabled:
             extension = DreamingExtension(config=binding_dreaming)
             await extension.run_consolidation(store, current_cycle=cycle)
+        archived_ids: tuple[str, ...] = ()
+        if hygiene_policy is not None:
+            # Forget cold thoughts before the question is answered. Diff the
+            # ARCHIVED set around the pass so only ids this pass archived are
+            # attributed (dreaming-retired reflections, if any, are pre-existing
+            # and excluded). The ingest cycle model gives older turns a colder
+            # recency/staleness signal than recent ones, so a conservative
+            # threshold archives a genuine subset rather than all-or-nothing.
+            before = await _archived_thought_ids(store)
+            await store.run_hygiene(current_cycle=cycle)
+            after = await _archived_thought_ids(store)
+            archived_ids = tuple(sorted(after - before))
         hsr = await store.search_hybrid(question.question, top_k=retrieval_top_k)
         contents = await _resolve_contents(store, hsr.results)
         outcome = await _score_question(
@@ -382,6 +502,8 @@ async def _process_question(
         question_type=question.question_type,
         eval_mode=eval_mode,
         outcome=outcome,
+        archived_count=len(archived_ids),
+        archived_thought_ids=archived_ids,
     )
 
 
@@ -392,6 +514,8 @@ async def run_longmemeval(
     embedding_provider: EmbeddingProviderProtocol,
     eval_mode: EvalMode = "substring",
     retrieval_top_k: int = DEFAULT_TOP_K,
+    hygiene_enabled: bool = False,
+    hygiene_eviction_threshold: float = DEFAULT_HYGIENE_EVICTION_THRESHOLD,
     db_path: Path | None = None,
     llm_judge: LLMJudgeClient | None = None,
 ) -> LongMemEvalResults:
@@ -409,6 +533,14 @@ async def run_longmemeval(
             ``cosine``, or ``llm`` (the LLM mode requires
             ``llm_judge``).
         retrieval_top_k: ``top_k`` passed to ``search_hybrid``.
+        hygiene_enabled: When ``True`` run one conservative Memory Hygiene
+            (forgetting) pass per question after ingestion (and after dreaming,
+            when both are on), so cold thoughts are archived before retrieval.
+            The pass is archive-only (no GC) and P1/pin-protected. When
+            ``False`` (default) no forgetting occurs — the baseline arm.
+        hygiene_eviction_threshold: Eviction-score cutoff for the hygiene pass;
+            consulted only when ``hygiene_enabled``. Lower forgets less. Default
+            :data:`DEFAULT_HYGIENE_EVICTION_THRESHOLD`.
         db_path: Optional directory for on-disk SQLite databases. When
             ``None`` (default) every question runs in its own
             ``:memory:`` database. When set, the runner creates one DB
@@ -424,6 +556,10 @@ async def run_longmemeval(
     """
     materialised = tuple(questions)
     binding_dreaming, binding_search = _build_longmemeval_config()
+    hygiene_policy = _build_hygiene_policy(
+        enabled=hygiene_enabled,
+        eviction_threshold=hygiene_eviction_threshold,
+    )
 
     per_question: list[QuestionResult] = [
         await _process_question(
@@ -434,6 +570,7 @@ async def run_longmemeval(
             retrieval_top_k=retrieval_top_k,
             binding_dreaming=binding_dreaming,
             binding_search=binding_search,
+            hygiene_policy=hygiene_policy,
             db_dir=db_path,
             llm_judge=llm_judge,
         )
@@ -443,6 +580,7 @@ async def run_longmemeval(
     return _aggregate(
         records=per_question,
         dreaming_enabled=dreaming_enabled,
+        hygiene_enabled=hygiene_enabled,
         top_k=retrieval_top_k,
         eval_mode=eval_mode,
     )
@@ -455,6 +593,8 @@ def run_longmemeval_sync(
     embedding_provider: EmbeddingProviderProtocol,
     eval_mode: EvalMode = "substring",
     retrieval_top_k: int = DEFAULT_TOP_K,
+    hygiene_enabled: bool = False,
+    hygiene_eviction_threshold: float = DEFAULT_HYGIENE_EVICTION_THRESHOLD,
     db_path: Path | None = None,
     llm_judge: LLMJudgeClient | None = None,
 ) -> LongMemEvalResults:
@@ -471,6 +611,8 @@ def run_longmemeval_sync(
             embedding_provider=embedding_provider,
             eval_mode=eval_mode,
             retrieval_top_k=retrieval_top_k,
+            hygiene_enabled=hygiene_enabled,
+            hygiene_eviction_threshold=hygiene_eviction_threshold,
             db_path=db_path,
             llm_judge=llm_judge,
         ),
@@ -483,16 +625,19 @@ def _aggregate(
     dreaming_enabled: bool,
     top_k: int,
     eval_mode: EvalMode,
+    hygiene_enabled: bool = False,
 ) -> LongMemEvalResults:
     total = len(records)
     if total == 0:
         return LongMemEvalResults(
             dreaming_enabled=dreaming_enabled,
+            hygiene_enabled=hygiene_enabled,
             top_k=top_k,
             eval_mode=eval_mode,
             total_questions=0,
             aggregate_score=0.0,
             aggregate_raw_signal=0.0,
+            archived_count=0,
         )
     aggregate_score = sum(r.outcome.score for r in records) / total
     aggregate_raw = sum(r.outcome.raw_signal for r in records) / total
@@ -502,11 +647,13 @@ def _aggregate(
     per_type_aggregated = {qt: sum(scores) / len(scores) for qt, scores in per_type.items()}
     return LongMemEvalResults(
         dreaming_enabled=dreaming_enabled,
+        hygiene_enabled=hygiene_enabled,
         top_k=top_k,
         eval_mode=eval_mode,
         total_questions=total,
         aggregate_score=aggregate_score,
         aggregate_raw_signal=aggregate_raw,
+        archived_count=sum(r.archived_count for r in records),
         per_type=per_type_aggregated,
         question_results=tuple(records),
     )

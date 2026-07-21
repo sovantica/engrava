@@ -330,6 +330,8 @@ class TestVec0NumpyRankingParity:
         async def _no_filter(
             store: SqliteEngravaCore,
             results: list[tuple[str, float]],
+            *,
+            include_archived: bool = False,
         ) -> list[tuple[str, float]]:
             return results
 

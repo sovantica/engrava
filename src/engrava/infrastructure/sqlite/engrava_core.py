@@ -640,6 +640,40 @@ def _query_vector_is_degenerate(query_vector: list[float]) -> bool:
     return not saw_nonzero
 
 
+def _archived_exclusion_sql(*, column: str, include_archived: bool) -> str:
+    """Return an ``AND``-prefixed clause excluding archived rows, or empty string.
+
+    Archived thoughts (``lifecycle_status = 'ARCHIVED'``) are removed from the
+    default retrieval candidate set — the same eligibility class as expired rows
+    and retired REFLECTIONs — so a forgotten thought stops surfacing without
+    being deleted. The exclusion is reversible: ``restore_thought`` flips the row
+    back to ``ACTIVE`` (eligible again), and an ``include_archived`` query
+    re-admits archived rows for this call without restoring them.
+
+    The clause is deliberately narrow — it drops only ``ARCHIVED`` rows and never
+    touches the independent retired-REFLECTION freshness floor (a retired
+    REFLECTION stays excluded even under ``include_archived=True``, because its
+    ``!= 'ACTIVE'`` guard is a separate ``AND``-ed condition).
+
+    Args:
+        column: The ``lifecycle_status`` column reference to gate — e.g.
+            ``"t.lifecycle_status"`` for a query that aliases ``thought`` as
+            ``t``, or ``"lifecycle_status"`` for an unaliased table.
+        include_archived: When ``True`` the escape hatch is engaged and this
+            returns the empty string (archived rows stay eligible); when
+            ``False`` (the default retrieval behaviour) it returns the exclusion
+            fragment.
+
+    Returns:
+        ``" AND {column} != 'ARCHIVED'"`` when excluding archived rows, otherwise
+        the empty string.
+
+    """
+    if include_archived:
+        return ""
+    return f" AND {column} != '{LifecycleStatus.ARCHIVED.value}'"
+
+
 #: A token is treated as an FTS5 column filter only when it targets a real
 #: indexed column. ``thought_fts`` indexes exactly ``essence`` and ``content``
 #: (see :meth:`SqliteEngravaCore.ensure_schema`); any other ``word:rest`` token
@@ -4663,6 +4697,7 @@ class SqliteEngravaCore:
         visibility: VisibilityQueryFilter | None = None,
         collapse_key: str | Sequence[str] | None = None,
         collapse_max_per_unit: int | None = None,
+        include_archived: bool = False,
     ) -> HybridSearchResult:
         """Retrieve thoughts relevant to a query with one call.
 
@@ -4741,6 +4776,11 @@ class SqliteEngravaCore:
                 the freed slots backfill deeper distinct units. Only takes
                 effect together with ``collapse_key``; a value ``< 1`` is
                 rejected.
+            include_archived: When ``False`` (the default) archived thoughts are
+                excluded from every retrieval path; delegated to
+                :meth:`search_hybrid`. When ``True`` archived rows are re-admitted
+                for this call (the "recall something I forgot" escape hatch)
+                without restoring them.
 
         Returns:
             A ``HybridSearchResult`` with the ranked matches and the set of
@@ -4786,6 +4826,7 @@ class SqliteEngravaCore:
             visibility=visibility,
             collapse_key=collapse_key,
             collapse_max_per_unit=collapse_max_per_unit,
+            include_archived=include_archived,
         )
 
     async def cleanup_expired(
@@ -6030,6 +6071,7 @@ class SqliteEngravaCore:
         top_k: int = 10,
         threshold: float = 0.0,
         *,
+        include_archived: bool = False,
         _filter_clause: tuple[str, list[object]] | None = None,
     ) -> list[tuple[str, float]]:
         """Cosine similarity search — delegates to sqlite-vec if available.
@@ -6060,6 +6102,12 @@ class SqliteEngravaCore:
             query_vector: Query embedding vector.
             top_k: Maximum number of results.
             threshold: Minimum cosine similarity score.
+            include_archived: When ``False`` (the default) archived thoughts
+                (``lifecycle_status = 'ARCHIVED'``) are excluded from the
+                candidate set on both the ``vec0`` and the numpy arm — the same
+                eligibility class as expired rows. When ``True`` archived rows
+                are re-admitted for this call (the "search my archive" escape
+                hatch), without restoring them.
             _filter_clause: Internal. A compiled
                 ``(sql_fragment, params)`` metadata predicate (referencing
                 ``t.metadata_json``). When supplied the exhaustive numpy path
@@ -6122,7 +6170,10 @@ class SqliteEngravaCore:
                 effective_fetch,
                 threshold,
             )
-            filtered = await self._filter_expired_results(results)
+            filtered = await self._filter_expired_results(
+                results,
+                include_archived=include_archived,
+            )
             filtered = _sort_scored_descending(filtered)[:top_k]
             await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
             return filtered
@@ -6130,6 +6181,7 @@ class SqliteEngravaCore:
             query_vector,
             top_k,
             threshold,
+            include_archived=include_archived,
             _filter_clause=_filter_clause,
         )
         await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
@@ -6138,8 +6190,10 @@ class SqliteEngravaCore:
     async def _filter_expired_results(
         self,
         results: list[tuple[str, float]],
+        *,
+        include_archived: bool = False,
     ) -> list[tuple[str, float]]:
-        """Remove expired thoughts and retired REFLECTIONs from results.
+        """Remove expired thoughts, retired REFLECTIONs, and archived rows.
 
         Used as a post-filter for search backends (e.g. sqlite-vec)
         that cannot natively exclude expired rows in their queries. It also
@@ -6147,14 +6201,18 @@ class SqliteEngravaCore:
         orphan archived once its cluster left the active set) must not
         over-recall on its now-stale centroid, so any REFLECTION whose
         ``lifecycle_status`` is not ``ACTIVE`` is dropped. Other thought
-        types are gated on expiry only, exactly as before.
+        types are gated on expiry — and, unless ``include_archived`` is set,
+        on the archived-exclusion rule.
 
         Args:
             results: List of ``(thought_id, similarity_score)`` pairs.
+            include_archived: When ``False`` (the default) archived thoughts are
+                added to the excluded set; when ``True`` they are retained (the
+                retired-REFLECTION and expiry gates still apply).
 
         Returns:
-            Filtered list with expired thoughts and retired REFLECTIONs
-            removed.
+            Filtered list with expired thoughts, retired REFLECTIONs, and — when
+            ``include_archived`` is ``False`` — archived rows removed.
 
         """
         if not results:
@@ -6162,11 +6220,18 @@ class SqliteEngravaCore:
         now = datetime.datetime.now(datetime.UTC).isoformat()
         ids = [r[0] for r in results]
         placeholders = ",".join("?" * len(ids))
+        # Inverted form: this SELECT collects the rows to *exclude*, so the
+        # archived rule is an ``OR`` here (drop where status IS archived), not
+        # the ``!= 'ARCHIVED'`` keep-form used in the arm WHERE clauses.
+        archived_exclusion = (
+            "" if include_archived else f" OR lifecycle_status = '{LifecycleStatus.ARCHIVED.value}'"
+        )
         cursor = await self._db.execute(
             f"SELECT thought_id FROM thought "  # noqa: S608
             f"WHERE thought_id IN ({placeholders}) "
             f"AND ((expires_at IS NOT NULL AND expires_at <= ?) "
-            f"OR (thought_type = 'REFLECTION' AND lifecycle_status != 'ACTIVE'))",
+            f"OR (thought_type = 'REFLECTION' AND lifecycle_status != 'ACTIVE')"
+            f"{archived_exclusion})",
             [*ids, now],
         )
         excluded_ids = {row["thought_id"] for row in await cursor.fetchall()}
@@ -6180,6 +6245,7 @@ class SqliteEngravaCore:
         top_k: int = 10,
         threshold: float = 0.0,
         *,
+        include_archived: bool = False,
         _filter_clause: tuple[str, list[object]] | None = None,
     ) -> list[tuple[str, float]]:
         """Brute-force cosine similarity search (numpy-batched).
@@ -6193,6 +6259,9 @@ class SqliteEngravaCore:
             query_vector: Query embedding vector.
             top_k: Maximum number of results.
             threshold: Minimum cosine similarity score.
+            include_archived: When ``False`` (the default) archived thoughts are
+                excluded from the candidate rows before cosine; when ``True``
+                they remain eligible.
             _filter_clause: Internal. A compiled ``(sql_fragment, params)``
                 metadata predicate (referencing ``t.metadata_json``) injected
                 into the ``WHERE`` so cosine runs only over eligible rows.
@@ -6207,6 +6276,10 @@ class SqliteEngravaCore:
         if _filter_clause is not None:
             filter_fragment, filter_params = _filter_clause
             filter_sql = f"AND {filter_fragment} "
+        archived_sql = _archived_exclusion_sql(
+            column="t.lifecycle_status",
+            include_archived=include_archived,
+        )
 
         cursor = await self._db.execute(
             "SELECT e.owner_id, e.dimension, e.vector_blob "  # noqa: S608
@@ -6218,7 +6291,10 @@ class SqliteEngravaCore:
             # its cluster left the active set) must not over-recall on its
             # now-stale centroid. Only REFLECTIONs are gated on lifecycle
             # here; other thought types keep their existing recall behaviour.
-            "AND NOT (t.thought_type = 'REFLECTION' AND t.lifecycle_status != 'ACTIVE') "
+            "AND NOT (t.thought_type = 'REFLECTION' AND t.lifecycle_status != 'ACTIVE')"
+            # Archived-exclusion: forgotten (archived) thoughts leave the default
+            # candidate set unless the caller opts in via include_archived.
+            f"{archived_sql} "
             f"{filter_sql}",
             (datetime.datetime.now(datetime.UTC).isoformat(), *filter_params),
         )
@@ -6304,6 +6380,7 @@ class SqliteEngravaCore:
         query: str,
         top_k: int = 10,
         *,
+        include_archived: bool = False,
         _filter_clause: tuple[str, list[object]] | None = None,
     ) -> list[tuple[str, float]]:
         """Full-text search via SQLite FTS5 with BM25 ranking.
@@ -6327,6 +6404,10 @@ class SqliteEngravaCore:
                 quoted phrases, uppercase ``AND``/``OR``/``NOT`` and
                 ``essence:``/``content:`` column filters invoke expert syntax.
             top_k: Maximum number of results.
+            include_archived: When ``False`` (the default) archived thoughts
+                (``lifecycle_status = 'ARCHIVED'``) are excluded from matches
+                before the ``LIMIT``; when ``True`` they are re-admitted for this
+                call without restoring them.
             _filter_clause: Internal. A compiled
                 ``(sql_fragment, params)`` metadata predicate (referencing
                 ``t.metadata_json``) injected into the ``WHERE`` *before* the
@@ -6371,6 +6452,10 @@ class SqliteEngravaCore:
             # CASE expression, safe to AND in directly.
             filter_sql = f"AND {filter_fragment} "
 
+        archived_sql = _archived_exclusion_sql(
+            column="t.lifecycle_status",
+            include_archived=include_archived,
+        )
         # bm25() returns negative values; negate so higher = more relevant.
         sql = (
             "SELECT t.thought_id, -bm25(thought_fts) AS score "  # noqa: S608
@@ -6380,7 +6465,10 @@ class SqliteEngravaCore:
             "AND (t.expires_at IS NULL OR t.expires_at > ?) "
             # Freshness floor: retired REFLECTIONs are excluded so a stale
             # synthesis does not out-rank fresh relevant thoughts.
-            "AND NOT (t.thought_type = 'REFLECTION' AND t.lifecycle_status != 'ACTIVE') "
+            "AND NOT (t.thought_type = 'REFLECTION' AND t.lifecycle_status != 'ACTIVE')"
+            # Archived-exclusion: forgotten (archived) thoughts leave the default
+            # candidate set unless the caller opts in via include_archived.
+            f"{archived_sql} "
             f"{filter_sql}"
             # Deterministic total order: BM25 first, then canonical thought_id.
             "ORDER BY score DESC, t.thought_id ASC "
@@ -6912,6 +7000,7 @@ class SqliteEngravaCore:
         max_sources_per_reflection: int,
         reflection_source_ceiling: int,
         expansion_sources: dict[str, str] | None = None,
+        include_archived: bool = False,
         _filter_clause: tuple[str, list[object]] | None = None,
     ) -> int:
         """Expand candidate pool by pulling source OBSERVATIONs from top REFLECTIONs.
@@ -6943,6 +7032,12 @@ class SqliteEngravaCore:
             expansion_sources: Optional output mapping populated with
                 ``source_id -> parent_reflection_id`` for candidates that
                 were newly introduced by graph expansion.
+            include_archived: When ``False`` (the default) archived source
+                OBSERVATIONs are never injected into ``combined`` — forwarded to
+                :meth:`_filter_observation_ids` so an archived observation cannot
+                leak back into the fused set via graph expansion even though the
+                seed REFLECTION is ACTIVE. When ``True`` archived sources are
+                re-admitted, consistent with the arms' escape hatch.
             _filter_clause: Internal. A compiled ``(sql_fragment, params)``
                 metadata predicate forwarded to :meth:`_filter_observation_ids`
                 so expansion-pulled OBSERVATIONs that fall outside the active
@@ -6977,6 +7072,7 @@ class SqliteEngravaCore:
 
         obs_ids = await self._filter_observation_ids(
             [str(r["to_thought_id"]) for r in edge_rows],
+            include_archived=include_archived,
             _filter_clause=_filter_clause,
         )
         if not obs_ids:
@@ -7014,6 +7110,7 @@ class SqliteEngravaCore:
         self,
         candidate_ids: list[str],
         *,
+        include_archived: bool = False,
         _filter_clause: tuple[str, list[object]] | None = None,
     ) -> frozenset[str]:
         """Return the subset of ``candidate_ids`` whose thought_type is OBSERVATION.
@@ -7022,22 +7119,41 @@ class SqliteEngravaCore:
         targets (TASK, REFLECTION, …) from the expansion pool before
         propagating scores.
 
-        When a metadata predicate is active it is re-applied here too: the
-        CONSOLIDATED_FROM expansion pulls brand-new OBSERVATION rows that
-        never passed an arm's ``WHERE``, so without this an out-of-filter
-        OBSERVATION could be injected into the result set. Re-applying the
-        same effective predicate keeps the eligibility invariant on the
-        expansion path.
+        The CONSOLIDATED_FROM expansion pulls brand-new OBSERVATION rows that
+        never passed an arm's ``WHERE``, so the same eligibility gates the arms
+        apply must be re-applied here or an ineligible row would be injected into
+        the result set:
+
+        * **Expiry** — a source OBSERVATION whose ``expires_at`` has passed is
+          dropped, exactly as the FTS and vector arms drop expired rows; the
+          "now" instant is read the same way the arms read it.
+        * **Archived-exclusion** — an ACTIVE REFLECTION may still point (via
+          ``CONSOLIDATED_FROM``) at a source OBSERVATION that has since been
+          archived, so without this gate graph expansion would re-inject a
+          forgotten observation the arms already excluded (unless
+          ``include_archived`` opts it back in).
+        * **Metadata predicate** — the effective ``filters`` / ``visibility``
+          predicate, re-applied so an out-of-filter OBSERVATION is not injected.
+
+        The retired-REFLECTION freshness floor needs no separate clause here: the
+        query already restricts to ``thought_type = 'OBSERVATION'``, so no
+        REFLECTION (retired or otherwise) can pass.
 
         Args:
             candidate_ids: Unfiltered list of target thought IDs.
+            include_archived: When ``False`` (the default) archived source
+                OBSERVATIONs are excluded from the expansion pool; when ``True``
+                they are re-admitted (consistent with the arms' escape hatch).
+                Expiry is always enforced regardless of this flag, matching the
+                arms.
             _filter_clause: Internal. A compiled ``(sql_fragment, params)``
                 metadata predicate (referencing the bare ``metadata_json``
                 column) injected into the ``WHERE``.
 
         Returns:
-            Frozenset containing only IDs of OBSERVATION-type thoughts that
-            also satisfy the active filter. Empty frozenset when
+            Frozenset containing only IDs of OBSERVATION-type thoughts that are
+            unexpired and satisfy the active filter (and the archived-exclusion
+            unless ``include_archived`` is set). Empty frozenset when
             ``candidate_ids`` is empty.
 
         """
@@ -7049,13 +7165,22 @@ class SqliteEngravaCore:
         if _filter_clause is not None:
             filter_fragment, filter_params = _filter_clause
             filter_sql = f" AND {filter_fragment}"
+        archived_sql = _archived_exclusion_sql(
+            column="lifecycle_status",
+            include_archived=include_archived,
+        )
+        now_iso = datetime.datetime.now(datetime.UTC).isoformat()
         placeholders = ", ".join("?" for _ in unique)
         cursor = await self._db.execute(
             f"SELECT thought_id FROM thought"  # noqa: S608
             f" WHERE thought_type = 'OBSERVATION'"
             f" AND thought_id IN ({placeholders})"
+            # Expiry gate: an expired source must not be re-injected via
+            # expansion any more than the arms would surface it.
+            f" AND (expires_at IS NULL OR expires_at > ?)"
+            f"{archived_sql}"
             f"{filter_sql}",
-            [*unique, *filter_params],
+            [*unique, now_iso, *filter_params],
         )
         rows = await cursor.fetchall()
         return frozenset(str(r["thought_id"]) for r in rows)
@@ -7069,6 +7194,7 @@ class SqliteEngravaCore:
         transaction_now: datetime.datetime | None = None,
         transaction_half_life_seconds: float = 0.0,
         filter_clause: tuple[str, list[object]] | None = None,
+        include_archived: bool = False,
     ) -> list[tuple[str, float]]:
         """Fallback results when neither FTS nor vector search is usable.
 
@@ -7086,6 +7212,10 @@ class SqliteEngravaCore:
         enters the result set). The predicate is threaded here directly — not
         through the public ``list_thoughts`` — so raw-SQL fragments stay off the
         public API surface.
+
+        ``include_archived`` mirrors the arms' escape hatch: unless it is set,
+        archived thoughts are excluded from this query-less window too, so the
+        all-signals-off fallback honours the archived-exclusion invariant.
         """
         clauses = ["(expires_at IS NULL OR expires_at > ?)"]
         params: list[object] = [datetime.datetime.now(datetime.UTC).isoformat()]
@@ -7093,6 +7223,8 @@ class SqliteEngravaCore:
             fragment, filter_params = filter_clause
             clauses.append(fragment)
             params.extend(filter_params)
+        if not include_archived:
+            clauses.append(f"lifecycle_status != '{LifecycleStatus.ARCHIVED.value}'")
         where = " AND ".join(clauses)
         params.append(top_k)
         # Pre-order the truncation window by the active recency axis so the
@@ -7256,6 +7388,7 @@ class SqliteEngravaCore:
         visibility: VisibilityQueryFilter | None = None,
         collapse_key: str | Sequence[str] | None = None,
         collapse_max_per_unit: int | None = None,
+        include_archived: bool = False,
     ) -> HybridSearchResult:
         """Hybrid search combining FTS5 + vector + recency + priority + graph signals.
 
@@ -7402,6 +7535,20 @@ class SqliteEngravaCore:
                 still applies unchanged). Key-less rows are unaffected (each is
                 already its own unit). Validated at call time; a value ``< 1``
                 is rejected.
+            include_archived: When ``False`` (the default) archived thoughts
+                (``lifecycle_status = 'ARCHIVED'`` — forgotten by the hygiene
+                loop or TTL-archived) are excluded from **every** candidate path:
+                the FTS arm, the vector arm (``vec0`` post-filter and numpy
+                fallback), the query-less fallback, and the ``CONSOLIDATED_FROM``
+                graph expansion (so an archived source OBSERVATION cannot leak
+                back in via an ACTIVE seed REFLECTION). When ``True`` archived
+                rows are re-admitted across all of those paths for this call (the
+                "search my archive" / "recall something I forgot" escape hatch),
+                without restoring them — use :meth:`restore_thought` to make a
+                thought eligible again permanently. The independent
+                retired-REFLECTION freshness floor is unaffected either way: a
+                retired REFLECTION stays excluded even under
+                ``include_archived=True``.
 
         Returns:
             ``HybridSearchResult`` with ranked results and diagnostics. Tied
@@ -7584,6 +7731,7 @@ class SqliteEngravaCore:
                 transaction_now=transaction_now if recency_active else None,
                 transaction_half_life_seconds=resolved_recency_now_half_life,
                 filter_clause=filter_clause_plain,
+                include_archived=include_archived,
             )
             if priority_active and fallback:
                 backends_used.add("priority")
@@ -7625,6 +7773,7 @@ class SqliteEngravaCore:
                 fts_results = await self.search_fts(
                     query_text,
                     top_k=fts_top_k,
+                    include_archived=include_archived,
                     _filter_clause=filter_clause_t,
                 )
             else:
@@ -7636,6 +7785,7 @@ class SqliteEngravaCore:
                 vec_results = await self.search_similar(
                     effective_vector,
                     top_k=vector_top_k,
+                    include_archived=include_archived,
                     _filter_clause=filter_clause_t,
                 )
                 backends_used.add("vector")
@@ -7734,6 +7884,7 @@ class SqliteEngravaCore:
                     else 50
                 ),
                 expansion_sources=None,
+                include_archived=include_archived,
                 _filter_clause=filter_clause_plain,
             )
             if _added > 0:

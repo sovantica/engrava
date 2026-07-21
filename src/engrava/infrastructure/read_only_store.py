@@ -117,6 +117,8 @@ class ReadOnlyEngrava:
         query_vector: list[float],
         top_k: int = 10,
         threshold: float = 0.0,
+        *,
+        include_archived: bool = False,
     ) -> list[tuple[str, float]]:
         """Search for thoughts similar to the query vector.
 
@@ -124,6 +126,9 @@ class ReadOnlyEngrava:
             query_vector: Query embedding vector.
             top_k: Maximum number of results.
             threshold: Minimum cosine similarity score.
+            include_archived: When ``False`` (default) archived thoughts are
+                excluded; when ``True`` they are re-admitted for this call.
+                Forwarded verbatim to the wrapped store.
 
         Returns:
             List of (thought_id, similarity_score) tuples, sorted descending.
@@ -133,6 +138,7 @@ class ReadOnlyEngrava:
             query_vector,
             top_k=top_k,
             threshold=threshold,
+            include_archived=include_archived,
         )
 
     async def get_edges(
