@@ -1,6 +1,6 @@
 """Whole-ladder schema migration hardening for ``ensure_schema``.
 
-``ensure_schema`` migrates a database up to the head ``user_version`` (19)
+``ensure_schema`` migrates a database up to the head ``user_version`` (20)
 through a hand-written ``elif`` cascade plus a chain of per-version
 ``_migrate_core_v*`` helpers. Existing suites cover single rungs (the
 v13->v14 hot-path indexes and the v18->v19 edge metadata column); this module
@@ -11,17 +11,17 @@ undetected.
 Three properties are asserted:
 
 * **Exhaustive convergence.** For every seed version ``v`` in
-  ``{fresh, 2..18}`` a *real-shape* schema-at-``v`` fixture (the actual tables,
+  ``{fresh, 2..19}`` a *real-shape* schema-at-``v`` fixture (the actual tables,
   columns, indexes and FTS tokenizer that version shipped — reconstructed from
   the migration helpers and cross-checked against the historical
   ``schema_core.sql``) is stamped, pre-migration rows are written, and
-  ``ensure_schema`` must land at v19, be idempotent on a second run, and leave
+  ``ensure_schema`` must land at v20, be idempotent on a second run, and leave
   every pre-existing thought / edge / embedding queryable through the public
   read surface (get / list / FTS / hybrid). A post-migration API write must
   also succeed — the exact failure mode ("a missing column makes the first
   write raise") the ladder hardening guards against.
 
-* **Fresh-vs-migrated parity.** A database bootstrapped fresh at v19 and one
+* **Fresh-vs-migrated parity.** A database bootstrapped fresh at v20 and one
   migrated up from an old version must be structurally equivalent — same
   columns (name, type, nullability, default, PK), same foreign keys, same
   indexes, same triggers, same FTS config. A discriminating revert (a
@@ -62,9 +62,9 @@ from engrava import (
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-_HEAD_VERSION = 19
+_HEAD_VERSION = 20
 
-# The user (non-shadow) tables that exist at head v19, compared column-by-column
+# The user (non-shadow) tables that exist at head v20, compared column-by-column
 # for fresh-vs-migrated parity.
 _CORE_TABLES = (
     "thought",
@@ -109,6 +109,7 @@ _LEGACY_TERM = "beacon"
 #   v17 thought.provenance + its two json-expression indexes
 #   v18 thought.pinned + thought.archived_at_cycle
 #   v19 edge.metadata_json
+#   v20 thought.archived_at
 #
 # The base (v2/v3) tables predate the public git history; v2 differs from v3
 # only in the FTS tokenizer (v2 shipped the pre-hyphen-aware config that
@@ -166,6 +167,8 @@ def _thought_columns(target: int) -> list[str]:
             "pinned            INTEGER NOT NULL DEFAULT 0",
             "archived_at_cycle INTEGER",
         ]
+    if target >= 20:
+        cols.append("archived_at       TEXT")
     return cols
 
 
@@ -307,7 +310,7 @@ def _indexes(target: int) -> list[str]:
 
 
 def _schema_sql_at_version(target: int) -> str:
-    """Assemble the full real-shape schema script for ``target`` (2..18)."""
+    """Assemble the full real-shape schema script for ``target`` (2..19)."""
     parts = [
         "CREATE TABLE thought (\n  " + ",\n  ".join(_thought_columns(target)) + "\n);",
         _edge_table(target) + ";",
@@ -336,7 +339,7 @@ def _schema_sql_at_version(target: int) -> str:
 
 
 async def _bootstrap_core_at_version(db: aiosqlite.Connection, target: int) -> None:
-    """Stamp a real-shape schema-at-``target`` database (2..18)."""
+    """Stamp a real-shape schema-at-``target`` database (2..19)."""
     await db.executescript(_schema_sql_at_version(target))
     await db.commit()
 
@@ -514,7 +517,7 @@ async def fresh_db() -> AsyncIterator[aiosqlite.Connection]:
 
 
 async def _new_migrated_db(target: int, *, seed: bool) -> aiosqlite.Connection:
-    """Return a v19 connection migrated from a real-shape ``target`` base."""
+    """Return a v20 connection migrated from a real-shape ``target`` base."""
     conn = await aiosqlite.connect(":memory:")
     conn.row_factory = aiosqlite.Row
     await _bootstrap_core_at_version(conn, target)
@@ -525,7 +528,7 @@ async def _new_migrated_db(target: int, *, seed: bool) -> aiosqlite.Connection:
 
 
 async def _new_fresh_db() -> aiosqlite.Connection:
-    """Return a v19 connection bootstrapped fresh from ``schema_core.sql``."""
+    """Return a v20 connection bootstrapped fresh from ``schema_core.sql``."""
     conn = await aiosqlite.connect(":memory:")
     conn.row_factory = aiosqlite.Row
     await SqliteEngravaCore(conn).ensure_schema()
@@ -617,7 +620,7 @@ async def _assert_api_roundtrip(store: SqliteEngravaCore) -> None:
 # 1. Exhaustive version-ladder convergence matrix
 # ---------------------------------------------------------------------------
 
-_LADDER_SEEDS: list[int | None] = [None, *range(2, 19)]
+_LADDER_SEEDS: list[int | None] = [None, *range(2, 20)]
 
 
 @pytest.mark.parametrize(
@@ -633,7 +636,7 @@ async def test_version_ladder_converges_and_preserves_data(
 
     ``seed_version is None`` exercises the empty-database fresh bootstrap; every
     other value stamps a real-shape schema-at-``v`` fixture, writes legacy rows,
-    then upgrades. Post-upgrade the ladder must have reached v19, a second
+    then upgrades. Post-upgrade the ladder must have reached v20, a second
     ``ensure_schema`` must be a structural no-op, and the pre-existing rows
     (when seeded) plus a fresh API write must all be queryable.
     """
@@ -668,12 +671,13 @@ async def test_version_ladder_converges_and_preserves_data(
 
 
 async def test_fresh_equals_migrated_from_v2() -> None:
-    """A fresh v19 database is structurally equivalent to one migrated from v2.
+    """A fresh v20 database is structurally equivalent to one migrated from v2.
 
     This walks the entire ladder (v2 rebuilds FTS, v11->v12 recreates the FK
-    tables, v18->v19 adds the edge metadata column) and asserts the end state
-    matches a clean bootstrap column-for-column, FK-for-FK, index-for-index,
-    trigger-for-trigger, and on the FTS config.
+    tables, v18->v19 adds the edge metadata column, v19->v20 adds the
+    thought.archived_at column) and asserts the end state matches a clean
+    bootstrap column-for-column, FK-for-FK, index-for-index, trigger-for-trigger,
+    and on the FTS config.
     """
     fresh = await _new_fresh_db()
     migrated = await _new_migrated_db(2, seed=True)
@@ -687,7 +691,7 @@ async def test_fresh_equals_migrated_from_v2() -> None:
         await migrated.close()
 
 
-@pytest.mark.parametrize("seed_version", list(range(2, 19)))
+@pytest.mark.parametrize("seed_version", list(range(2, 20)))
 async def test_fresh_equals_migrated_every_seed(seed_version: int) -> None:
     """Parity holds for every seed version, not just v2.
 
@@ -706,7 +710,7 @@ async def test_fresh_equals_migrated_every_seed(seed_version: int) -> None:
         await migrated.close()
 
 
-@pytest.mark.parametrize("seed_version", list(range(12, 19)))
+@pytest.mark.parametrize("seed_version", list(range(12, 20)))
 async def test_fresh_equals_migrated_strict_column_order_public_range(seed_version: int) -> None:
     """Full cid-order column parity holds across the public (v12+) range.
 

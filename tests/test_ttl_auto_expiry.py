@@ -271,7 +271,7 @@ class TestSchemaMigration:
         cursor = await db.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 19
+        assert row[0] == 20
 
     async def test_expires_at_column_exists(self, db: aiosqlite.Connection) -> None:
         cursor = await db.execute("PRAGMA table_info(thought)")
@@ -303,7 +303,7 @@ class TestSchemaMigration:
         cursor = await conn.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 19
+        assert row[0] == 20
         await conn.close()
 
 

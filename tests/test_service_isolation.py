@@ -316,7 +316,7 @@ class TestEngravaManager:
             row_a = await cursor_a.fetchone()
             cursor_b = await store_b._db.execute("PRAGMA user_version")
             row_b = await cursor_b.fetchone()
-            assert row_a[0] == row_b[0] == 19
+            assert row_a[0] == row_b[0] == 20
 
     async def test_per_service_fts_independent(self, tmp_path: Path) -> None:
         data_dir = tmp_path / "services"
@@ -483,7 +483,7 @@ class TestSnapshotNewFormat:
         lines = out.read_text(encoding="utf-8").strip().splitlines()
         header = json.loads(lines[0])
         assert header["_type"] == "metadata"
-        assert header["schema_version"] == 19
+        assert header["schema_version"] == 20
         assert header["embedding_model_name"] == "all-MiniLM-L12-v2"
         assert header["embedding_dimension"] == 16
 

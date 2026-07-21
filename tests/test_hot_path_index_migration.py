@@ -39,7 +39,7 @@ _NEW_EDGE_INDEXES = ("idx_edge_to_thought",)
 _NEW_EMBEDDING_INDEXES = ("idx_embedding_owner",)
 _ALL_NEW_INDEXES = _NEW_THOUGHT_INDEXES + _NEW_EDGE_INDEXES + _NEW_EMBEDDING_INDEXES
 
-_HEAD_VERSION = 19
+_HEAD_VERSION = 20
 
 
 # ---------------------------------------------------------------------------

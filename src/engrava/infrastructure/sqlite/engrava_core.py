@@ -1588,7 +1588,7 @@ class SqliteEngravaCore:
         Applies the full ``schema_core.sql`` (including FTS5 virtual
         table and sync triggers) only when the database has not already
         been bootstrapped to schema version 3+.  Databases at older
-        versions are upgraded incrementally up to the current version (19).
+        versions are upgraded incrementally up to the current version (20).
 
         After core schema creation or upgrade, probes for the ``thought_fts``
         table and then runs any pending extension schema migrations for each
@@ -1623,7 +1623,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
             await self._migrate_core_v18_to_v19()
-            await self._db.execute("PRAGMA user_version = 19")
+            await self._migrate_core_v19_to_v20()
+            await self._db.execute("PRAGMA user_version = 20")
             await self._db.commit()
         elif current_version < 4:  # noqa: PLR2004
             await self._migrate_core_v3_to_v4()
@@ -1642,7 +1643,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
             await self._migrate_core_v18_to_v19()
-            await self._db.execute("PRAGMA user_version = 19")
+            await self._migrate_core_v19_to_v20()
+            await self._db.execute("PRAGMA user_version = 20")
             await self._db.commit()
         elif current_version < 5:  # noqa: PLR2004
             await self._migrate_core_v4_to_v5()
@@ -1660,7 +1662,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
             await self._migrate_core_v18_to_v19()
-            await self._db.execute("PRAGMA user_version = 19")
+            await self._migrate_core_v19_to_v20()
+            await self._db.execute("PRAGMA user_version = 20")
             await self._db.commit()
         elif current_version < 6:  # noqa: PLR2004
             await self._migrate_core_v5_to_v6()
@@ -1677,7 +1680,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
             await self._migrate_core_v18_to_v19()
-            await self._db.execute("PRAGMA user_version = 19")
+            await self._migrate_core_v19_to_v20()
+            await self._db.execute("PRAGMA user_version = 20")
             await self._db.commit()
         elif current_version < 7:  # noqa: PLR2004
             await self._migrate_core_v6_to_v7()
@@ -1693,7 +1697,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
             await self._migrate_core_v18_to_v19()
-            await self._db.execute("PRAGMA user_version = 19")
+            await self._migrate_core_v19_to_v20()
+            await self._db.execute("PRAGMA user_version = 20")
             await self._db.commit()
         elif current_version < 8:  # noqa: PLR2004
             await self._migrate_core_v7_to_v8()
@@ -1708,7 +1713,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
             await self._migrate_core_v18_to_v19()
-            await self._db.execute("PRAGMA user_version = 19")
+            await self._migrate_core_v19_to_v20()
+            await self._db.execute("PRAGMA user_version = 20")
             await self._db.commit()
         elif current_version < 9:  # noqa: PLR2004
             await self._migrate_core_v8_to_v9()
@@ -1722,7 +1728,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
             await self._migrate_core_v18_to_v19()
-            await self._db.execute("PRAGMA user_version = 19")
+            await self._migrate_core_v19_to_v20()
+            await self._db.execute("PRAGMA user_version = 20")
             await self._db.commit()
         elif current_version < 10:  # noqa: PLR2004
             await self._migrate_core_v9_to_v10()
@@ -1735,7 +1742,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
             await self._migrate_core_v18_to_v19()
-            await self._db.execute("PRAGMA user_version = 19")
+            await self._migrate_core_v19_to_v20()
+            await self._db.execute("PRAGMA user_version = 20")
             await self._db.commit()
         elif current_version < 11:  # noqa: PLR2004
             await self._migrate_core_v10_to_v11()
@@ -1747,7 +1755,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
             await self._migrate_core_v18_to_v19()
-            await self._db.execute("PRAGMA user_version = 19")
+            await self._migrate_core_v19_to_v20()
+            await self._db.execute("PRAGMA user_version = 20")
             await self._db.commit()
         elif current_version < 12:  # noqa: PLR2004
             await self._migrate_core_v11_to_v12()
@@ -1758,7 +1767,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
             await self._migrate_core_v18_to_v19()
-            await self._db.execute("PRAGMA user_version = 19")
+            await self._migrate_core_v19_to_v20()
+            await self._db.execute("PRAGMA user_version = 20")
             await self._db.commit()
         elif current_version < 13:  # noqa: PLR2004
             await self._migrate_core_v12_to_v13()
@@ -1768,7 +1778,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
             await self._migrate_core_v18_to_v19()
-            await self._db.execute("PRAGMA user_version = 19")
+            await self._migrate_core_v19_to_v20()
+            await self._db.execute("PRAGMA user_version = 20")
             await self._db.commit()
         elif current_version < 14:  # noqa: PLR2004
             await self._migrate_core_v13_to_v14()
@@ -1777,7 +1788,8 @@ class SqliteEngravaCore:
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
             await self._migrate_core_v18_to_v19()
-            await self._db.execute("PRAGMA user_version = 19")
+            await self._migrate_core_v19_to_v20()
+            await self._db.execute("PRAGMA user_version = 20")
             await self._db.commit()
         elif current_version < 15:  # noqa: PLR2004
             await self._migrate_core_v14_to_v15()
@@ -1785,25 +1797,29 @@ class SqliteEngravaCore:
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
             await self._migrate_core_v18_to_v19()
-            await self._db.execute("PRAGMA user_version = 19")
+            await self._migrate_core_v19_to_v20()
+            await self._db.execute("PRAGMA user_version = 20")
             await self._db.commit()
         elif current_version < 16:  # noqa: PLR2004
             await self._migrate_core_v15_to_v16()
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
             await self._migrate_core_v18_to_v19()
-            await self._db.execute("PRAGMA user_version = 19")
+            await self._migrate_core_v19_to_v20()
+            await self._db.execute("PRAGMA user_version = 20")
             await self._db.commit()
         elif current_version < 17:  # noqa: PLR2004
             await self._migrate_core_v16_to_v17()
             await self._migrate_core_v17_to_v18()
             await self._migrate_core_v18_to_v19()
-            await self._db.execute("PRAGMA user_version = 19")
+            await self._migrate_core_v19_to_v20()
+            await self._db.execute("PRAGMA user_version = 20")
             await self._db.commit()
         elif current_version < 18:  # noqa: PLR2004
             await self._migrate_core_v17_to_v18()
             await self._migrate_core_v18_to_v19()
-            await self._db.execute("PRAGMA user_version = 19")
+            await self._migrate_core_v19_to_v20()
+            await self._db.execute("PRAGMA user_version = 20")
             await self._db.commit()
         elif current_version < 19:  # noqa: PLR2004
             # A base at exactly 18 matches no lower arm (each tests
@@ -1813,7 +1829,18 @@ class SqliteEngravaCore:
             # First-match ``elif`` keeps the ladder double-run-safe — a
             # v17 base hits ``< 18`` only, a v18 base hits ``< 19`` only.
             await self._migrate_core_v18_to_v19()
-            await self._db.execute("PRAGMA user_version = 19")
+            await self._migrate_core_v19_to_v20()
+            await self._db.execute("PRAGMA user_version = 20")
+            await self._db.commit()
+        elif current_version < 20:  # noqa: PLR2004
+            # A base at exactly 19 matches no lower arm (each tests ``< N``
+            # for N <= 19). Without this arm every existing v19 database
+            # would be stranded: the ``archived_at`` column would never be
+            # added, so a hygiene archive write could not stamp it. First-match
+            # ``elif`` keeps the ladder double-run-safe — a v18 base hits
+            # ``< 19`` only, a v19 base hits ``< 20`` only.
+            await self._migrate_core_v19_to_v20()
+            await self._db.execute("PRAGMA user_version = 20")
             await self._db.commit()
 
         # Ensure referential integrity is enforced for the lifetime of this
@@ -2486,6 +2513,51 @@ class SqliteEngravaCore:
             msg = "core-19 migration failed to add the edge.metadata_json column"
             raise RuntimeError(msg)
 
+    async def _migrate_core_v19_to_v20(self) -> None:
+        """Add the wall-clock archival-instant column ``thought.archived_at`` (core-20).
+
+        Purely additive. A single nullable ``TEXT`` column holding the
+        UTC-normalised ISO-8601 instant at which the Memory Hygiene loop archived
+        a thought, or ``NULL`` when it was not archived by hygiene (a restore
+        clears it back to ``NULL``, exactly like ``archived_at_cycle``). It backs
+        the wall-clock restore window: the irreversible GC stage may reap a
+        hygiene-archived thought only once **both** the cycle window
+        (``archived_at_cycle``) and this real-time window have elapsed, so a
+        fast-cycling store can no longer permanently delete a just-archived
+        thought before any real-time chance to restore it.
+
+        The add is guarded against the duplicate-column error exactly as
+        ``_migrate_core_v17_to_v18`` guards its own ``ADD COLUMN``, so a database
+        already carrying the column (a partial or re-run migration) is left
+        unchanged. No index is added — the GC stage scans the already-narrow
+        hygiene-archived candidate set and filters ``archived_at`` with a
+        lexicographic ISO-8601 comparison, so no expression index is warranted.
+        A row archived by hygiene **before** this column existed reads back
+        ``archived_at IS NULL``: it has no real-time stamp and is therefore never
+        GC-eligible while the wall-clock window is active — the irreversible stage
+        fails closed rather than delete a row it cannot time.
+
+        The ``thought`` table is always present by this point (it is the first
+        table created by the fresh DDL and by every earlier migration path), so
+        the ``ALTER`` needs no table-existence guard. A postcondition assertion
+        confirms the column is present before the ladder arm bumps
+        ``user_version``, closing the "version bumped without the column" hole an
+        interrupt could otherwise open.
+        """
+        from sqlite3 import OperationalError  # noqa: PLC0415
+
+        if not await self._column_exists("thought", "archived_at"):
+            try:
+                await self._db.execute("ALTER TABLE thought ADD COLUMN archived_at TEXT")
+            except OperationalError as exc:  # pragma: no cover - defensive race guard
+                if "duplicate column" not in str(exc).lower():
+                    raise
+        # Postcondition: the column must exist before the ladder arm bumps the
+        # version, closing the "version bumped without the column" hole.
+        if not await self._column_exists("thought", "archived_at"):  # pragma: no cover
+            msg = "core-20 migration failed to add the thought.archived_at column"
+            raise RuntimeError(msg)
+
     async def _fk_present(self, table: str, column: str) -> bool:
         """Return ``True`` when ``table`` carries an FK on ``column``."""
         cursor = await self._db.execute(f"PRAGMA foreign_key_list({table})")
@@ -3067,6 +3139,7 @@ class SqliteEngravaCore:
         provenance_raw = row["provenance"] if "provenance" in keys else None
         pinned_raw = row["pinned"] if "pinned" in keys else 0
         archived_at_cycle_raw = row["archived_at_cycle"] if "archived_at_cycle" in keys else None
+        archived_at_raw = row["archived_at"] if "archived_at" in keys else None
         return ThoughtRecord(
             thought_id=row["thought_id"],
             thought_type=ThoughtType(row["thought_type"]),
@@ -3103,6 +3176,7 @@ class SqliteEngravaCore:
             archived_at_cycle=(
                 int(archived_at_cycle_raw) if archived_at_cycle_raw is not None else None
             ),
+            archived_at=archived_at_raw,
         )
 
     async def _get_thought_row(self, thought_id: str) -> aiosqlite.Row | None:
@@ -3143,9 +3217,9 @@ class SqliteEngravaCore:
         " consolidated_from, visibility, access_count, action_outcome_score, "
         " last_accessed_at, created_at, updated_at, expires_at, "
         " valid_from, valid_until, "
-        " metadata_json, provenance, pinned, archived_at_cycle) "
+        " metadata_json, provenance, pinned, archived_at_cycle, archived_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-        "?, ?)"
+        "?, ?, ?)"
     )
 
     def _thought_to_core_params(self, thought: ThoughtRecord) -> tuple[object, ...]:
@@ -3200,6 +3274,7 @@ class SqliteEngravaCore:
             _encode_provenance(thought.provenance),
             int(thought.pinned),
             thought.archived_at_cycle,
+            thought.archived_at,
         )
 
     _CORE_UPDATE_SQL = (
@@ -3212,7 +3287,8 @@ class SqliteEngravaCore:
         " access_count = ?, action_outcome_score = ?, last_accessed_at = ?,"
         " created_at = ?, updated_at = ?, expires_at = ?,"
         " valid_from = ?, valid_until = ?,"
-        " metadata_json = ?, provenance = ?, pinned = ?, archived_at_cycle = ? "
+        " metadata_json = ?, provenance = ?, pinned = ?, archived_at_cycle = ?,"
+        " archived_at = ? "
         "WHERE thought_id = ? AND updated_cycle = ?"
     )
 
@@ -3267,6 +3343,7 @@ class SqliteEngravaCore:
             _encode_provenance(updated.provenance),
             int(updated.pinned),
             updated.archived_at_cycle,
+            updated.archived_at,
             thought_id,
             expected_cycle,
         )
@@ -4842,7 +4919,15 @@ class SqliteEngravaCore:
         the store's ``ttl_strategy`` setting.
 
         * **archive**: Sets ``lifecycle_status`` to ``ARCHIVED`` and clears
-          ``expires_at`` so the thought is no longer subject to TTL.
+          ``expires_at`` so the thought is no longer subject to TTL. It also
+          clears the hygiene-archival markers (``archived_at_cycle`` /
+          ``archived_at``) — a TTL archival is *not* a hygiene archival, so the
+          markers (which mean "archived by hygiene at this cycle/instant" and back
+          the GC restore windows) must be ``NULL``. This keeps TTL-archived rows
+          out of hygiene GC and prevents a stale marker from an earlier hygiene
+          episode (left behind by a low-level un-archive) from making a
+          later TTL re-archival GC-eligible on the earlier, already-elapsed
+          restore windows.
         * **delete**: Physically deletes the expired thought rows (cascading
           to edges, embeddings, and actions via ON DELETE CASCADE).
 
@@ -4876,7 +4961,8 @@ class SqliteEngravaCore:
             if strategy is CleanupStrategy.ARCHIVE:
                 before_row = await self._get_thought_row(tid) if self._journal is not None else None
                 await self._db.execute(
-                    "UPDATE thought SET lifecycle_status = ?, expires_at = NULL "
+                    "UPDATE thought SET lifecycle_status = ?, expires_at = NULL, "
+                    "archived_at_cycle = NULL, archived_at = NULL "
                     "WHERE thought_id = ?",
                     (LifecycleStatus.ARCHIVED.value, tid),
                 )
@@ -4885,6 +4971,8 @@ class SqliteEngravaCore:
                     after = before.evolve(
                         lifecycle_status=LifecycleStatus.ARCHIVED.value,
                         expires_at=None,
+                        archived_at_cycle=None,
+                        archived_at=None,
                     )
                     await self._journal.append(
                         mutation_type="UPDATE_THOUGHT",
@@ -5047,17 +5135,22 @@ class SqliteEngravaCore:
         The reversible counterpart to archival — whether the thought was
         archived by the memory-hygiene loop (:meth:`run_hygiene`), TTL cleanup,
         or a manual lifecycle change: an ``ARCHIVED`` thought transitions back to
-        ``ACTIVE`` through the lifecycle state machine and its
-        ``archived_at_cycle`` marker is cleared, so an archive round-trips with
-        no data loss. The move is journaled as an ``UPDATE_THOUGHT`` when
-        journaling is enabled.
+        ``ACTIVE`` through the lifecycle state machine and **both** hygiene
+        archival markers (``archived_at_cycle`` and the wall-clock ``archived_at``)
+        are cleared, so an archive round-trips with no data loss. The move is
+        journaled as an ``UPDATE_THOUGHT`` when journaling is enabled.
 
-        This is the **canonical** un-archive path — the only one that clears
-        ``archived_at_cycle``. The ``ARCHIVED -> ACTIVE`` edge is also reachable
+        This is the **canonical** un-archive path — the only one that clears the
+        archival markers. The ``ARCHIVED -> ACTIVE`` edge is also reachable
         through a raw ``update_thought(lifecycle_status=ACTIVE)``, but that
-        low-level write leaves ``archived_at_cycle`` set. That is harmless — the
-        marker is only consulted while a thought is ``ARCHIVED`` (hygiene GC
-        eligibility) — but it is not a tidy restore, so prefer this method.
+        low-level write leaves ``archived_at_cycle`` / ``archived_at`` set. That
+        is harmless while the thought stays ``ACTIVE`` (the markers are only
+        consulted for ``ARCHIVED`` rows). The hygiene archive path and TTL
+        archival both refresh or clear the markers, so a normal re-archival is
+        safe; only a *raw* ``update_thought(lifecycle_status=ARCHIVED)`` that
+        bypasses both would carry the stale markers into a new archival episode —
+        another reason to prefer this method (and the hygiene / TTL flows) over
+        low-level lifecycle writes.
 
         Args:
             thought_id: UUID of the archived thought to restore.
@@ -5092,6 +5185,7 @@ class SqliteEngravaCore:
         changes: dict[str, object] = {
             "lifecycle_status": LifecycleStatus.ACTIVE,
             "archived_at_cycle": None,
+            "archived_at": None,
         }
         if current_cycle is not None:
             changes["updated_cycle"] = current_cycle
@@ -8293,7 +8387,8 @@ class SqliteEngravaCore:
         by the ``decay_function`` hook, and **archives** — reversibly — the
         thoughts whose eviction-score falls below ``eviction_threshold`` and that
         are not protected. When ``auto_gc_enabled`` it then physically
-        garbage-collects previously-archived thoughts past the restore window.
+        garbage-collects previously hygiene-archived thoughts once **both** the
+        cycle restore window and the wall-clock restore window have elapsed.
 
         This is the store's primary forgetting entry point; it runs immediately
         and **bypasses** ``check_every_n_cycles`` (that cadence gates only the
@@ -8333,12 +8428,26 @@ class SqliteEngravaCore:
           non-NULL ``archived_at_cycle`` (i.e. archived *by hygiene*) are ever
           auto-GC'd — a TTL/manually-archived thought (``archived_at_cycle`` is
           ``None``) is left alone.
+        * **Two restore windows, both required.** GC reaps a hygiene-archived
+          thought only once it is old enough *cognitively* (the cycle window,
+          ``gc_min_archive_age_cycles``) **and** in *real time* (the wall-clock
+          window, ``gc_restore_window_seconds``, measured against ``now``), so a
+          fast-cycling store cannot permanently delete a just-archived thought
+          before a real-time chance to restore it. A hygiene-archived row that
+          predates the ``archived_at`` column (``archived_at`` is ``None``) has
+          no real-time stamp and is never auto-GC'd while the wall-clock window
+          is active — the irreversible stage fails closed. Setting
+          ``gc_restore_window_seconds = 0`` disables the wall-clock window
+          (cycle-only, backward-compatible).
         * **Dry run.** When ``dry_run`` is set nothing is mutated and nothing is
           journaled; the would-evict set is returned for preview.
 
         This is cognitive hygiene, not compliance deletion: GC is best-effort,
-        cycle-based, and opt-in — it offers no deletion guarantee, legal hold,
-        or erasure receipt.
+        window-gated, and opt-in — it offers no deletion guarantee, legal hold,
+        or erasure receipt. **GC is not erasure:** a GC'd thought's content
+        survives in the append-only journal (the ``DELETE_THOUGHT`` entry keeps a
+        full ``before`` snapshot); GC reclaims the live/queryable working set, it
+        does not purge history.
 
         Args:
             current_cycle: The current cognitive cycle number, driving the
@@ -8348,12 +8457,14 @@ class SqliteEngravaCore:
                 ``0`` — always wins). A disabled / absent policy is a no-op that
                 needs no cycle, so the value is only required once a real pass is
                 about to run.
-            now: The wall-clock instant the minimum-inactivity-age gate measures
-                each thought's inactivity against. Computed **once per run** and
-                threaded into both selection and the archive re-check so a run is
-                internally consistent. Optional: defaults to
-                ``datetime.now(UTC)``; inject a fixed timezone-aware instant to
-                pin the age boundary deterministically in tests / benchmarks.
+            now: The wall-clock instant the minimum-inactivity-age gate (archive
+                stage) and the wall-clock restore window (GC stage) both measure
+                against. Computed **once per run** and threaded into selection,
+                the archive re-check (and ``archived_at`` stamp), and the GC
+                eligibility cutoff so a run is internally consistent. Optional:
+                defaults to ``datetime.now(UTC)``; inject a fixed timezone-aware
+                instant to pin both boundaries deterministically in tests /
+                benchmarks.
 
         Returns:
             A :class:`~engrava.infrastructure.sqlite.hygiene.HygieneResult` with
@@ -8452,7 +8563,7 @@ class SqliteEngravaCore:
 
         gc_count = 0
         if policy.auto_gc_enabled:
-            gc_count = await self._hygiene_gc(policy=policy, current_cycle=current_cycle)
+            gc_count = await self._hygiene_gc(policy=policy, current_cycle=current_cycle, now=now)
 
         if archived_count or gc_count:
             await self._maybe_commit()
@@ -8613,8 +8724,17 @@ class SqliteEngravaCore:
         lifecycle state machine only permits ``CREATED -> ACTIVE`` (the ADR's
         candidate set is ACTIVE **and** CREATED), matching how TTL archival flips
         any expired row regardless of its current state. The write also stamps
-        ``archived_at_cycle = current_cycle`` and clears ``expires_at`` so the
-        thought is no longer subject to TTL.
+        ``archived_at_cycle = current_cycle`` and the wall-clock
+        ``archived_at = now`` (the two hygiene-archival markers, cleared together
+        on restore) and clears ``expires_at`` so the thought is no longer subject
+        to TTL. The hygiene loop is the only archival flow that *stamps*
+        ``archived_at`` (and ``archived_at_cycle``): TTL archival
+        (:meth:`cleanup_expired`) actively clears both back to ``NULL``, and a
+        never-hygiene-archived row keeps them ``NULL``, so ``archived_at_cycle IS
+        NOT NULL`` marks exactly a row whose *current* archival was performed by
+        hygiene. Like every model field, both markers are still writable through a
+        raw :meth:`update_thought`; that low-level path does not manage them, so
+        prefer :meth:`restore_thought` / the hygiene and TTL flows.
 
         The mutation is recorded as an ordinary ``UPDATE_THOUGHT`` journal entry
         — **no new mutation type** — with the forgetting rationale nested in the
@@ -8630,8 +8750,11 @@ class SqliteEngravaCore:
                 and minimum-inactivity-age re-checks (a thought pinned /
                 re-prioritised / read after selection).
             current_cycle: The cycle stamped into ``archived_at_cycle``.
-            now: The run's wall-clock instant for the minimum-inactivity-age
-                re-check — the same instant selection used.
+            now: The run's wall-clock instant — used both for the
+                minimum-inactivity-age re-check (the same instant selection used)
+                and as the value stamped into ``archived_at`` (``now.isoformat()``,
+                a UTC-normalised ISO-8601 string) so the GC stage can compare it
+                lexicographically against its cutoff.
 
         Returns:
             The number of thoughts actually archived.
@@ -8647,6 +8770,11 @@ class SqliteEngravaCore:
             inactivity_cutoff_iso = (
                 now - datetime.timedelta(seconds=policy.min_inactivity_age_seconds)
             ).isoformat()
+
+        # The wall-clock archival stamp, written once for the whole run: a
+        # UTC-normalised ISO-8601 string (``now`` is UTC-aware) so the GC stage
+        # can compare ``archived_at`` lexicographically against its cutoff.
+        archived_at_iso = now.isoformat()
 
         archived = 0
         for reason in to_archive:
@@ -8678,6 +8806,7 @@ class SqliteEngravaCore:
             update_params: list[object] = [
                 LifecycleStatus.ARCHIVED.value,
                 current_cycle,
+                archived_at_iso,
                 reason.thought_id,
                 LifecycleStatus.ACTIVE.value,
                 LifecycleStatus.CREATED.value,
@@ -8697,7 +8826,7 @@ class SqliteEngravaCore:
                 update_params.append(inactivity_cutoff_iso)
             cursor = await self._db.execute(
                 "UPDATE thought SET lifecycle_status = ?, "  # noqa: S608 - interpolation is only ``?`` placeholders
-                "expires_at = NULL, archived_at_cycle = ? "
+                "expires_at = NULL, archived_at_cycle = ?, archived_at = ? "
                 "WHERE thought_id = ? AND lifecycle_status IN (?, ?) AND pinned = 0"
                 + priority_guard
                 + inactivity_guard,
@@ -8711,6 +8840,7 @@ class SqliteEngravaCore:
                     lifecycle_status=LifecycleStatus.ARCHIVED.value,
                     expires_at=None,
                     archived_at_cycle=current_cycle,
+                    archived_at=archived_at_iso,
                 )
                 await self._journal.append(
                     mutation_type="UPDATE_THOUGHT",
@@ -8728,33 +8858,43 @@ class SqliteEngravaCore:
         *,
         policy: HygienePolicyConfig,
         current_cycle: int,
+        now: datetime.datetime,
     ) -> int:
-        """Physically delete hygiene-archived thoughts past the restore window.
+        """Physically delete hygiene-archived thoughts past both restore windows.
 
         Stage 2 — runs only when ``auto_gc_enabled``. A thought is GC-eligible
         only when it was archived **by hygiene** (``archived_at_cycle IS NOT
-        NULL``), its restore window has elapsed
-        (``current_cycle - archived_at_cycle >= gc_min_archive_age_cycles``), and
-        it is not protected (``pinned`` or a protected priority). The eligible
-        set is ordered ``archived_at_cycle ASC, thought_id ASC`` (oldest-archived
-        first) and truncated to ``max_evictions_per_run``.
+        NULL``), **both** restore windows have elapsed — the cycle window
+        (``current_cycle - archived_at_cycle >= gc_min_archive_age_cycles``)
+        **and** the wall-clock window
+        (``archived_at <= now - gc_restore_window_seconds``) — and it is not
+        protected (``pinned`` or a protected priority). The eligible set is
+        ordered ``archived_at_cycle ASC, thought_id ASC`` (oldest-archived first)
+        and truncated to ``max_evictions_per_run``.
 
         Deletion order per thought is **orphan-reflection sweep -> cascade delete
         -> vec0 vector purge**: the sweep retires any REFLECTION whose entire
         source cluster would become non-live so no dangling ``CONSOLIDATED_FROM``
         synthesis is left, the cascade drops FK-reachable edges / embeddings /
         actions, and the vec0 vector (outside the FK) is purged explicitly. The
-        delete is recorded as an ordinary ``DELETE_THOUGHT`` journal entry.
+        delete is recorded as an ordinary ``DELETE_THOUGHT`` journal entry with a
+        full ``before`` snapshot — GC reclaims the live working set, it does not
+        erase the content from the append-only journal.
 
         Args:
-            policy: The active hygiene policy (window, cap, protected priorities).
-            current_cycle: The current cycle (drives the window check).
+            policy: The active hygiene policy (windows, cap, protected priorities).
+            current_cycle: The current cycle (drives the cycle-window check).
+            now: The run's wall-clock instant (drives the wall-clock-window
+                cutoff), injected once per run so the eligible set is
+                deterministic.
 
         Returns:
             The number of thoughts physically deleted.
 
         """
-        eligible = await self._hygiene_gc_eligible(policy=policy, current_cycle=current_cycle)
+        eligible = await self._hygiene_gc_eligible(
+            policy=policy, current_cycle=current_cycle, now=now
+        )
         if not eligible:
             return 0
 
@@ -8788,6 +8928,8 @@ class SqliteEngravaCore:
                             "stage": "gc",
                             "archived_at_cycle": thought.archived_at_cycle,
                             "gc_min_archive_age_cycles": policy.gc_min_archive_age_cycles,
+                            "archived_at": thought.archived_at,
+                            "gc_restore_window_seconds": policy.gc_restore_window_seconds,
                         },
                     },
                 )
@@ -8798,20 +8940,46 @@ class SqliteEngravaCore:
         *,
         policy: HygienePolicyConfig,
         current_cycle: int,
+        now: datetime.datetime,
     ) -> list[ThoughtRecord]:
         """Resolve the deterministic, capped GC-eligible set.
 
         Selects ARCHIVED thoughts that hygiene archived (``archived_at_cycle IS
-        NOT NULL``) whose restore window has elapsed, excluding protected
-        thoughts, ordered ``archived_at_cycle ASC, thought_id ASC`` and capped at
-        ``max_evictions_per_run``. The window and ordering are computed in SQL off
-        the explicit ``archived_at_cycle`` column so a thought archived by any
-        other path (its ``archived_at_cycle`` is ``NULL``) is structurally
-        excluded.
+        NOT NULL``) for which **both** restore windows have elapsed, excluding
+        protected thoughts, ordered ``archived_at_cycle ASC, thought_id ASC`` and
+        capped at ``max_evictions_per_run``:
+
+        * **Cycle window** — ``archived_at_cycle <= current_cycle -
+          gc_min_archive_age_cycles`` (computed off the explicit
+          ``archived_at_cycle`` column, so a thought archived by any other path,
+          whose ``archived_at_cycle`` is ``NULL``, is structurally excluded).
+        * **Wall-clock window** — when ``gc_restore_window_seconds > 0``, the row
+          must additionally satisfy ``archived_at IS NOT NULL AND archived_at <=
+          now - gc_restore_window_seconds`` (a lexicographic ISO-8601 compare,
+          valid on the UTC-normalised timestamps this module writes). This
+          predicate **fails closed** for a hygiene-archived row with
+          ``archived_at IS NULL`` (archived before the column existed): its
+          real-time age is unknowable, so the irreversible stage never reaps it.
+          Setting ``gc_restore_window_seconds = 0`` omits this predicate entirely
+          (cycle-only, backward-compatible with the pre-wall-clock behaviour).
+
+        Requiring the **additional** window can only ever *shrink* the eligible
+        **candidate** pool (the monotone-safe property): before the cap, the set
+        of rows passing both windows is a subset of the ``gc_restore_window_seconds
+        = 0`` (cycle-only) candidate set. When ``max_evictions_per_run`` does not
+        bind, the returned set is likewise a subset. Under a **binding** cap the
+        deterministic ``ORDER BY … LIMIT`` top-N may instead reap a *different*
+        genuinely-eligible row (one that a freed young/legacy slot lets surface) —
+        a benign rate-limit reshuffle, never a row that fails either window. The
+        per-candidate safety invariant (nothing is reaped that is not past both
+        windows) always holds; the whole-set subset relation holds when the cap is
+        non-binding, exactly mirroring the archive-stage minimum-inactivity gate.
 
         Args:
             policy: The active hygiene policy.
-            current_cycle: The current cycle.
+            current_cycle: The current cycle (drives the cycle window).
+            now: The run's wall-clock instant (drives the wall-clock window
+                cutoff). A timezone-aware UTC ``datetime``.
 
         Returns:
             The GC-eligible thoughts in delete order.
@@ -8824,6 +8992,19 @@ class SqliteEngravaCore:
         # cap slot and starve younger eligible rows. The Python re-check below
         # stays as defence-in-depth.
         params: list[object] = [LifecycleStatus.ARCHIVED.value, max_archived_cycle]
+        # Wall-clock restore window (in addition to the cycle window). When
+        # disabled (``gc_restore_window_seconds == 0``) the predicate is omitted,
+        # so a hygiene-archived row with ``archived_at IS NULL`` stays cycle-only
+        # eligible (the pre-wall-clock behaviour the operator opted back into);
+        # when active, ``archived_at IS NOT NULL`` makes a NULL-stamped legacy row
+        # fail closed.
+        wall_clock_clause = ""
+        if policy.gc_restore_window_seconds > 0:
+            max_archived_at_iso = (
+                now - datetime.timedelta(seconds=policy.gc_restore_window_seconds)
+            ).isoformat()
+            wall_clock_clause = "  AND archived_at IS NOT NULL AND archived_at <= ? "
+            params.append(max_archived_at_iso)
         priority_clause = ""
         if policy.protected_priorities:
             placeholders = ", ".join("?" for _ in policy.protected_priorities)
@@ -8836,6 +9017,7 @@ class SqliteEngravaCore:
             "  AND archived_at_cycle IS NOT NULL "
             "  AND archived_at_cycle <= ? "
             "  AND pinned = 0 "
+            f"{wall_clock_clause}"
             f"{priority_clause}"
             "ORDER BY archived_at_cycle ASC, thought_id ASC "
             "LIMIT ?",

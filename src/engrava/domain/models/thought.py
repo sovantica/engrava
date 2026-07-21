@@ -121,10 +121,21 @@ class ThoughtRecord(BaseModel):
         archived_at_cycle: The cognitive cycle at which the Memory Hygiene loop
             archived this thought, or ``None`` when it was not archived by
             hygiene.  Only hygiene sets it; a restore (un-archive) clears it back
-            to ``None``.  It backs the garbage-collection restore window
+            to ``None``.  It backs the garbage-collection cycle restore window
             (``current_cycle - archived_at_cycle >= gc_min_archive_age_cycles``),
             so a thought archived by any other path (TTL / manual) keeps
             ``None`` and is never reaped by hygiene GC.  Defaults to ``None``.
+        archived_at: The wall-clock instant (UTC-normalised ISO-8601) at which
+            the Memory Hygiene loop archived this thought, or ``None`` when it was
+            not archived by hygiene.  Only the hygiene archive path sets it,
+            paired with ``archived_at_cycle``; a restore (un-archive) clears both
+            back to ``None``.  It backs the garbage-collection **wall-clock**
+            restore window (``archived_at <= now - gc_restore_window_seconds``),
+            required in addition to the cycle window before the irreversible GC
+            stage may reap the thought, so a fast-cycling store cannot delete a
+            just-archived thought before a real-time chance to restore it.  A
+            thought archived by any other path (TTL / manual) keeps ``None``.
+            Defaults to ``None``.
 
     Examples:
         >>> thought = ThoughtRecord(
@@ -172,6 +183,7 @@ class ThoughtRecord(BaseModel):
     provenance: ProvenanceContext | None = Field(default=None)
     pinned: bool = False
     archived_at_cycle: int | None = Field(default=None, ge=0)
+    archived_at: str | None = None
 
     @model_validator(mode="after")
     def _validate_cycle_ordering(self) -> Self:
@@ -218,6 +230,7 @@ class ThoughtRecord(BaseModel):
         "expires_at",
         "valid_from",
         "valid_until",
+        "archived_at",
     )
     @classmethod
     def _validate_iso8601_nullable(cls, v: str | None) -> str | None:

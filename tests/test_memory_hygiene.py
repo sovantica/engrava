@@ -5,7 +5,8 @@ and, separately opt-in, garbage-collects them after a restore window:
 
 * config: ``HygienePolicyConfig`` defaults, validation, and YAML parsing;
 * the ``core-18`` migration (``pinned`` / ``archived_at_cycle`` columns) and the
-  ThoughtRecord round trip of both fields;
+  ``core-20`` migration (``archived_at`` column) plus the ThoughtRecord round trip
+  of those fields;
 * default-OFF ⇒ no behavioural change (byte-identical write/read paths);
 * keep-score + eviction rule with active-signal redistribution;
 * protection: pinned is never touched, ``P1`` is protected by default,
@@ -14,7 +15,8 @@ and, separately opt-in, garbage-collects them after a restore window:
 * deterministic capped selection (same store + config + cycle ⇒ same set);
 * the all-flat-signals fail-safe (zero evictions);
 * the decay clamp (a hook returning >1 / <0 / NaN / inf never over-evicts);
-* two-stage GC: only hygiene-archived rows reaped, restore window enforced,
+* two-stage GC: only hygiene-archived rows reaped, both restore windows enforced
+  (cycle + wall-clock, BOTH required; legacy NULL fails closed; monotone-safe),
   orphan-reflection sweep before delete, vec0 purge, hash-chain still valid;
 * ``dry_run`` mutates nothing;
 * the journal ``eviction_reason`` with no new mutation type;
@@ -183,6 +185,16 @@ async def _raw_archived_at_cycle(store: SqliteEngravaCore, thought_id: str) -> i
     return int(row["archived_at_cycle"])
 
 
+async def _raw_archived_at(store: SqliteEngravaCore, thought_id: str) -> str | None:
+    cursor = await store._db.execute(
+        "SELECT archived_at FROM thought WHERE thought_id = ?", (thought_id,)
+    )
+    row = await cursor.fetchone()
+    if row is None or row["archived_at"] is None:
+        return None
+    return str(row["archived_at"])
+
+
 # ---------------------------------------------------------------------------
 # HygienePolicyConfig — defaults + validation
 # ---------------------------------------------------------------------------
@@ -201,6 +213,7 @@ class TestHygienePolicyConfigDefaults:
         assert cfg.gc_min_archive_age_cycles == 10
         assert cfg.dry_run is False
         assert cfg.min_inactivity_age_seconds == 604800  # 7 days
+        assert cfg.gc_restore_window_seconds == 2592000  # 30 days
 
     def test_default_signal_weights(self) -> None:
         """The keep-weight vector matches the ratified defaults and sums to 1.0."""
@@ -252,6 +265,15 @@ class TestHygienePolicyConfigValidation:
         """``0`` is the explicit gate-disabled value and must construct cleanly."""
         assert HygienePolicyConfig(min_inactivity_age_seconds=0).min_inactivity_age_seconds == 0
 
+    def test_gc_restore_window_negative_raises(self) -> None:
+        with pytest.raises(ValueError, match="gc_restore_window_seconds"):
+            HygienePolicyConfig(gc_restore_window_seconds=-1)
+
+    def test_gc_restore_window_zero_allowed(self) -> None:
+        """``0`` is the explicit wall-clock-window-disabled value (cycle-only)."""
+        cfg = HygienePolicyConfig(gc_restore_window_seconds=0)
+        assert cfg.gc_restore_window_seconds == 0
+
     def test_protected_priorities_non_string_raises(self) -> None:
         with pytest.raises(TypeError, match="protected_priorities"):
             HygienePolicyConfig(protected_priorities=(1,))  # type: ignore[arg-type]
@@ -283,6 +305,7 @@ class TestHygieneYamlParsing:
                 "gc_min_archive_age_cycles": 20,
                 "dry_run": True,
                 "min_inactivity_age_seconds": 3600,
+                "gc_restore_window_seconds": 86400,
             }
         )
         assert cfg is not None
@@ -296,6 +319,7 @@ class TestHygieneYamlParsing:
         assert cfg.gc_min_archive_age_cycles == 20
         assert cfg.dry_run is True
         assert cfg.min_inactivity_age_seconds == 3600
+        assert cfg.gc_restore_window_seconds == 86400
 
     def test_min_inactivity_age_defaults_when_absent(self) -> None:
         """An omitted ``min_inactivity_age_seconds`` falls back to the 7-day default."""
@@ -317,6 +341,26 @@ class TestHygieneYamlParsing:
         assert cfg is not None
         assert cfg.min_inactivity_age_seconds == 42
 
+    def test_gc_restore_window_defaults_when_absent(self) -> None:
+        """An omitted ``gc_restore_window_seconds`` falls back to the 30-day default."""
+        cfg = _parse_hygiene({"enabled": True})
+        assert cfg is not None
+        assert cfg.gc_restore_window_seconds == 2592000
+
+    def test_gc_restore_window_loader_parity_and_round_trip(self) -> None:
+        """The loader mirrors direct construction: same rejection, same round-trip."""
+        # Loader parity: the YAML path rejects the same out-of-range value that
+        # direct construction does (both name the field), and a bool is not a
+        # valid integer (``True`` must not impersonate ``1``).
+        with pytest.raises(ConfigError, match="gc_restore_window_seconds"):
+            _parse_hygiene({"gc_restore_window_seconds": -1})
+        with pytest.raises(ConfigError, match="gc_restore_window_seconds"):
+            _parse_hygiene({"gc_restore_window_seconds": True})
+        # Round-trip: an accepted value survives the YAML → dataclass parse.
+        cfg = _parse_hygiene({"gc_restore_window_seconds": 0})
+        assert cfg is not None
+        assert cfg.gc_restore_window_seconds == 0
+
     def test_non_mapping_raises(self) -> None:
         with pytest.raises(ConfigError, match="hygiene_policy"):
             _parse_hygiene([1, 2, 3])
@@ -333,6 +377,9 @@ class TestHygieneYamlParsing:
             ({"min_inactivity_age_seconds": -1}, "min_inactivity_age_seconds"),
             ({"min_inactivity_age_seconds": True}, "min_inactivity_age_seconds"),
             ({"min_inactivity_age_seconds": 1.5}, "min_inactivity_age_seconds"),
+            ({"gc_restore_window_seconds": -1}, "gc_restore_window_seconds"),
+            ({"gc_restore_window_seconds": True}, "gc_restore_window_seconds"),
+            ({"gc_restore_window_seconds": 1.5}, "gc_restore_window_seconds"),
             ({"auto_gc_enabled": "no"}, "auto_gc_enabled"),
             ({"dry_run": 1}, "dry_run"),
             ({"protected_priorities": "P1"}, "protected_priorities"),
@@ -359,11 +406,12 @@ class TestCore18Migration:
             s = SqliteEngravaCore(conn)
             await s.ensure_schema()
             cursor = await conn.execute("PRAGMA user_version")
-            assert (await cursor.fetchone())[0] == 19
+            assert (await cursor.fetchone())[0] == 20
             cursor = await conn.execute("PRAGMA table_info(thought)")
             cols = {row["name"] for row in await cursor.fetchall()}
             assert "pinned" in cols
             assert "archived_at_cycle" in cols
+            assert "archived_at" in cols
         finally:
             await conn.close()
 
@@ -418,12 +466,13 @@ class TestCore18Migration:
             s = SqliteEngravaCore(conn)
             await s.ensure_schema()
             cursor = await conn.execute("PRAGMA user_version")
-            assert (await cursor.fetchone())[0] == 19
+            assert (await cursor.fetchone())[0] == 20
 
             fetched = await s.get_thought("legacy")
             assert fetched is not None
             assert fetched.pinned is False
             assert fetched.archived_at_cycle is None
+            assert fetched.archived_at is None
         finally:
             await conn.close()
 
@@ -456,6 +505,129 @@ class TestCore18Migration:
         assert refetched is not None
         assert refetched.archived_at_cycle == 7
         assert updated.archived_at_cycle == 7
+
+
+# ---------------------------------------------------------------------------
+# core-20 migration + ThoughtRecord round trip (thought.archived_at)
+# ---------------------------------------------------------------------------
+
+
+class TestArchivedAtColumnMigration:
+    """The core-20 ``thought.archived_at`` column: migration + model round trip."""
+
+    async def test_fresh_schema_has_archived_at_and_head_version(self) -> None:
+        """A fresh bootstrap lands at head v20 with the ``archived_at`` column."""
+        conn = await aiosqlite.connect(":memory:")
+        conn.row_factory = aiosqlite.Row
+        try:
+            s = SqliteEngravaCore(conn)
+            await s.ensure_schema()
+            cursor = await conn.execute("PRAGMA user_version")
+            assert (await cursor.fetchone())[0] == 20
+            cursor = await conn.execute("PRAGMA table_info(thought)")
+            cols = {row["name"] for row in await cursor.fetchall()}
+            assert "archived_at" in cols
+        finally:
+            await conn.close()
+
+    async def test_v19_db_migrates_and_existing_rows_default(self) -> None:
+        """A v19 DB (pre-column) upgrades cleanly; existing rows read ``archived_at`` NULL."""
+        conn = await aiosqlite.connect(":memory:")
+        conn.row_factory = aiosqlite.Row
+        try:
+            # Bootstrap a fresh head DB, then reshape ``thought`` back to its v19
+            # form (``archived_at_cycle`` present, ``archived_at`` absent) with a
+            # pre-column row, and stamp the version back to 19.
+            boot = SqliteEngravaCore(conn)
+            await boot.ensure_schema()
+            await conn.execute("DROP TABLE thought")
+            await conn.executescript(
+                """
+                CREATE TABLE thought (
+                    thought_id        TEXT    PRIMARY KEY,
+                    thought_type      TEXT    NOT NULL,
+                    essence           TEXT    NOT NULL,
+                    content           TEXT    NOT NULL,
+                    content_hash      TEXT,
+                    priority          TEXT    NOT NULL,
+                    lifecycle_status  TEXT    NOT NULL DEFAULT 'CREATED',
+                    created_cycle     INTEGER NOT NULL DEFAULT 0,
+                    updated_cycle     INTEGER NOT NULL DEFAULT 0,
+                    source            TEXT    NOT NULL DEFAULT 'human',
+                    confidence        REAL,
+                    embedding_ref     TEXT,
+                    source_type       TEXT    NOT NULL DEFAULT 'EXPERIENCE',
+                    confirmation_count INTEGER NOT NULL DEFAULT 0,
+                    consolidated_from TEXT,
+                    visibility        TEXT    NOT NULL DEFAULT 'selective',
+                    access_count      INTEGER NOT NULL DEFAULT 0,
+                    last_accessed_at  TEXT,
+                    created_at        TEXT,
+                    updated_at        TEXT,
+                    expires_at        TEXT,
+                    metadata_json     TEXT    NOT NULL DEFAULT '{}',
+                    valid_from        TEXT,
+                    valid_until       TEXT,
+                    action_outcome_score REAL,
+                    provenance        TEXT,
+                    pinned            INTEGER NOT NULL DEFAULT 0,
+                    archived_at_cycle INTEGER
+                );
+                INSERT INTO thought (thought_id, thought_type, essence, content, priority,
+                                     lifecycle_status, updated_cycle)
+                VALUES ('legacy', 'OBSERVATION', 'e', 'c', 'P2', 'ACTIVE', 0);
+                PRAGMA user_version = 19;
+                """
+            )
+            await conn.commit()
+            info = await conn.execute("PRAGMA table_info(thought)")
+            existing_cols = {row["name"] for row in await info.fetchall()}
+            assert "archived_at" not in existing_cols
+
+            s = SqliteEngravaCore(conn)
+            await s.ensure_schema()
+            cursor = await conn.execute("PRAGMA user_version")
+            assert (await cursor.fetchone())[0] == 20
+
+            fetched = await s.get_thought("legacy")
+            assert fetched is not None
+            assert fetched.archived_at is None
+        finally:
+            await conn.close()
+
+    async def test_migrate_helper_idempotent(self) -> None:
+        """Running the v19->v20 migration repeatedly adds the column exactly once."""
+        conn = await aiosqlite.connect(":memory:")
+        conn.row_factory = aiosqlite.Row
+        try:
+            s = SqliteEngravaCore(conn)
+            await s.ensure_schema()
+            for _ in range(3):
+                await s._migrate_core_v19_to_v20()
+            cursor = await conn.execute("PRAGMA table_info(thought)")
+            names = [row["name"] for row in await cursor.fetchall()]
+            assert names.count("archived_at") == 1
+        finally:
+            await conn.close()
+
+    async def test_thought_round_trips_archived_at(self, store: SqliteEngravaCore) -> None:
+        """An ``archived_at`` value survives a write/read round trip, UTC-normalised."""
+        await store.create_thought(_thought("t1"))
+        fetched = await store.get_thought("t1")
+        assert fetched is not None
+        assert fetched.archived_at is None
+
+        await store.update_thought("t1", archived_at="2026-01-01T12:00:00+00:00")
+        refetched = await store.get_thought("t1")
+        assert refetched is not None
+        assert refetched.archived_at == "2026-01-01T12:00:00+00:00"
+
+        # An offset timestamp is normalised to UTC on the way in (so the GC
+        # lexicographic compare stays correct).
+        await store.update_thought("t1", archived_at="2026-01-01T14:00:00+02:00")
+        renorm = await store.get_thought("t1")
+        assert renorm is not None
+        assert renorm.archived_at == "2026-01-01T12:00:00+00:00"
 
 
 # ---------------------------------------------------------------------------
@@ -1053,11 +1225,16 @@ class TestGarbageCollection:
             await s._db.close()
 
     async def test_gc_respects_restore_window(self) -> None:
-        """A just-archived thought is not GC'd until the window elapses."""
+        """A just-archived thought is not GC'd until the cycle window elapses.
+
+        The wall-clock window is disabled (``gc_restore_window_seconds=0``) so
+        this exercises the cycle window in isolation.
+        """
         policy = _forgetful_policy(
             eviction_threshold=1.0,
             auto_gc_enabled=True,
             gc_min_archive_age_cycles=10,
+            gc_restore_window_seconds=0,
         )
         s = await _make_store(policy)
         try:
@@ -1080,6 +1257,7 @@ class TestGarbageCollection:
             eviction_threshold=0.0,  # archive nothing new
             auto_gc_enabled=True,
             gc_min_archive_age_cycles=0,
+            gc_restore_window_seconds=0,
         )
         s = await _make_store(policy)
         try:
@@ -1101,6 +1279,7 @@ class TestGarbageCollection:
             eviction_threshold=0.0,  # archive nothing new
             auto_gc_enabled=True,
             gc_min_archive_age_cycles=1,
+            gc_restore_window_seconds=0,
             # One slot: a pinned, older-archived row must not consume it and
             # starve the younger eligible row (protection is excluded in SQL).
             max_evictions_per_run=1,
@@ -1132,6 +1311,7 @@ class TestGarbageCollection:
             eviction_threshold=0.0,
             auto_gc_enabled=True,
             gc_min_archive_age_cycles=0,
+            gc_restore_window_seconds=0,
         )
         s = await _make_store(policy)
         try:
@@ -1155,6 +1335,7 @@ class TestGarbageCollection:
             eviction_threshold=0.0,  # archive nothing new via score
             auto_gc_enabled=True,
             gc_min_archive_age_cycles=0,
+            gc_restore_window_seconds=0,
         )
         s = await _make_store(policy)
         try:
@@ -1206,6 +1387,7 @@ class TestGarbageCollection:
             eviction_threshold=0.0,
             auto_gc_enabled=True,
             gc_min_archive_age_cycles=0,
+            gc_restore_window_seconds=0,
         )
         s = SqliteEngravaCore(conn, hygiene_policy=policy)
         s._owns_connection = True
@@ -1244,6 +1426,7 @@ class TestGarbageCollection:
             eviction_threshold=1.0,
             auto_gc_enabled=True,
             gc_min_archive_age_cycles=10,
+            gc_restore_window_seconds=0,
         )
         s = await _make_store(policy, journal_enabled=True)
         try:
@@ -1341,6 +1524,7 @@ class TestJournalEvictionReason:
             eviction_threshold=1.0,
             auto_gc_enabled=True,
             gc_min_archive_age_cycles=0,
+            gc_restore_window_seconds=0,
         )
         s = await _make_store(policy, journal_enabled=True)
         try:
@@ -1368,6 +1552,7 @@ class TestJournalEvictionReason:
             eviction_threshold=1.0,
             auto_gc_enabled=True,
             gc_min_archive_age_cycles=0,
+            gc_restore_window_seconds=0,
         )
         s = await _make_store(policy, journal_enabled=True)
         try:
@@ -2061,5 +2246,464 @@ class TestAccessGate:
             # Usage/confidence signals with no data are still reported as flat.
             assert "frequency" in result.flat_signals
             assert "confirmation" in result.flat_signals
+        finally:
+            await s._db.close()
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 GC — wall-clock restore window (required in addition to the cycle window)
+# ---------------------------------------------------------------------------
+
+
+_MONTH_SECONDS = 2592000  # 30 days — the default wall-clock restore window.
+
+
+async def _archive_row_raw(
+    store: SqliteEngravaCore,
+    thought_id: str,
+    *,
+    archived_at_cycle: int | None,
+    archived_at: str | None,
+    pinned: bool = False,
+    priority: Priority = Priority.P3,
+    thought_type: ThoughtType = ThoughtType.OBSERVATION,
+) -> None:
+    """Insert an ARCHIVED thought and stamp both hygiene markers directly.
+
+    Stamping via raw SQL lets a test set the cycle window
+    (``archived_at_cycle``) and the wall-clock window (``archived_at``)
+    independently, so the two-window conjunction can be exercised in isolation.
+    ``archived_at=None`` reproduces a hygiene-archived row that predates the
+    ``archived_at`` column (the legacy fail-closed case).
+    """
+    await store.create_thought(
+        _thought(
+            thought_id,
+            lifecycle_status=LifecycleStatus.ARCHIVED,
+            pinned=pinned,
+            priority=priority,
+            thought_type=thought_type,
+        )
+    )
+    await store._db.execute(
+        "UPDATE thought SET archived_at_cycle = ?, archived_at = ? WHERE thought_id = ?",
+        (archived_at_cycle, archived_at, thought_id),
+    )
+
+
+class TestGarbageCollectionWallClockWindow:
+    """The wall-clock restore window: GC requires BOTH windows before permanent delete."""
+
+    async def test_wall_clock_window_protects_then_zero_reveals_footgun(self) -> None:
+        """A recently-archived row survives the elapsed cycle window; disabling the
+        wall-clock window (``gc_restore_window_seconds=0``) GC's it — the
+        discriminating revert that reproduces the pre-window footgun.
+        """
+        policy = _forgetful_policy(
+            eviction_threshold=1.0,
+            auto_gc_enabled=True,
+            gc_min_archive_age_cycles=10,
+            gc_restore_window_seconds=_MONTH_SECONDS,
+        )
+        s = await _make_store(policy)
+        try:
+            await s.create_thought(_thought("cold", updated_cycle=0, action_outcome_score=0.0))
+            r1 = await s.run_hygiene(current_cycle=5, now=_NOW)  # archives, stamps archived_at
+            assert r1.archived_count == 1
+            assert await _raw_archived_at(s, "cold") == _NOW.isoformat()
+
+            # Cycle window elapsed (100 - 5 >= 10) but only one hour of wall clock
+            # has passed (< 30 days) -> protected by the wall-clock window.
+            r2 = await s.run_hygiene(current_cycle=100, now=_NOW + datetime.timedelta(hours=1))
+            assert r2.gc_count == 0
+            assert await s.get_thought("cold") is not None
+
+            # Disable the wall-clock window -> cycle-only -> the row is now GC'd
+            # (the pre-window behaviour the wall-clock window guards against).
+            s._hygiene_policy = _forgetful_policy(
+                eviction_threshold=1.0,
+                auto_gc_enabled=True,
+                gc_min_archive_age_cycles=10,
+                gc_restore_window_seconds=0,
+            )
+            r3 = await s.run_hygiene(current_cycle=100, now=_NOW + datetime.timedelta(hours=1))
+            assert r3.gc_count == 1
+            assert await s.get_thought("cold") is None
+        finally:
+            await s._db.close()
+
+    async def test_both_windows_required(self) -> None:
+        """Only a row past BOTH windows is GC'd; each window alone protects."""
+        policy = HygienePolicyConfig(
+            enabled=True,
+            eviction_threshold=0.0,  # archive nothing new; GC the pre-stamped rows
+            auto_gc_enabled=True,
+            gc_min_archive_age_cycles=10,
+            gc_restore_window_seconds=_MONTH_SECONDS,
+        )
+        s = await _make_store(policy)
+        try:
+            recent = _iso_before(_NOW, 60)  # 1 minute ago -> wall-clock NOT elapsed
+            old = _iso_before(_NOW, _MONTH_SECONDS * 2)  # wall-clock elapsed
+            # cycle elapsed at current_cycle=100: archived_at_cycle=5 (100-5>=10);
+            # cycle NOT elapsed: archived_at_cycle=95 (100-95 < 10).
+            await _archive_row_raw(s, "cycle_only", archived_at_cycle=5, archived_at=recent)
+            await _archive_row_raw(s, "wallclock_only", archived_at_cycle=95, archived_at=old)
+            await _archive_row_raw(s, "both", archived_at_cycle=5, archived_at=old)
+
+            result = await s.run_hygiene(current_cycle=100, now=_NOW)
+
+            assert result.gc_count == 1
+            assert await s.get_thought("cycle_only") is not None  # wall-clock protects
+            assert await s.get_thought("wallclock_only") is not None  # cycle protects
+            assert await s.get_thought("both") is None  # both elapsed -> reaped
+        finally:
+            await s._db.close()
+
+    async def test_boundary_via_injected_now(self) -> None:
+        """The wall-clock boundary is exact and inclusive (``<=``), under an injected ``now``.
+
+        A row archived exactly at ``now - gc_restore_window_seconds`` is eligible
+        (the ``<=`` cutoff is inclusive — changing it to ``<`` would protect the
+        ``exact`` row and fail this test); one second later is protected, one
+        second earlier is eligible.
+        """
+        policy = HygienePolicyConfig(
+            enabled=True,
+            eviction_threshold=0.0,
+            auto_gc_enabled=True,
+            gc_min_archive_age_cycles=10,
+            gc_restore_window_seconds=_MONTH_SECONDS,
+        )
+        s = await _make_store(policy)
+        try:
+            # All rows are past the cycle window (archived_at_cycle=0, cycle=1000),
+            # so only the wall-clock boundary decides.
+            await _archive_row_raw(
+                s, "over", archived_at_cycle=0, archived_at=_iso_before(_NOW, _MONTH_SECONDS + 1)
+            )
+            await _archive_row_raw(
+                s, "exact", archived_at_cycle=0, archived_at=_iso_before(_NOW, _MONTH_SECONDS)
+            )
+            await _archive_row_raw(
+                s, "under", archived_at_cycle=0, archived_at=_iso_before(_NOW, _MONTH_SECONDS - 1)
+            )
+            result = await s.run_hygiene(current_cycle=1000, now=_NOW)
+            assert result.gc_count == 2
+            assert await s.get_thought("over") is None  # just over the window -> reaped
+            assert await s.get_thought("exact") is None  # exactly at the cutoff -> reaped (<=)
+            assert await s.get_thought("under") is not None  # just under -> protected
+        finally:
+            await s._db.close()
+
+    async def test_legacy_null_archived_at_never_gc(self) -> None:
+        """A hygiene-archived row with ``archived_at`` NULL (pre-column) fails closed.
+
+        Even with the cycle window and ``gc_restore_window_seconds`` both
+        satisfied it is never GC-eligible, while a stamped-old sibling in the same
+        run *is* reaped — proving the NULL exclusion is the reason, not a
+        misconfigured window.
+        """
+        policy = HygienePolicyConfig(
+            enabled=True,
+            eviction_threshold=0.0,
+            auto_gc_enabled=True,
+            gc_min_archive_age_cycles=0,
+            gc_restore_window_seconds=1,  # active window; even 1s makes stamped rows eligible
+        )
+        s = await _make_store(policy)
+        try:
+            await _archive_row_raw(s, "legacy", archived_at_cycle=0, archived_at=None)
+            await _archive_row_raw(
+                s, "stamped", archived_at_cycle=0, archived_at=_iso_before(_NOW, 3600)
+            )
+            result = await s.run_hygiene(current_cycle=1000, now=_NOW)
+            assert result.gc_count == 1
+            assert await s.get_thought("legacy") is not None  # fail closed: never reaped
+            assert await s.get_thought("stamped") is None  # window satisfied -> reaped
+        finally:
+            await s._db.close()
+
+    async def test_restore_clears_archived_at_and_rearchive_restamps(self) -> None:
+        """archive stamps ``archived_at``; restore clears it; re-archival restamps fresh.
+
+        A restored row transitions back to ACTIVE with both hygiene markers NULL,
+        so it leaves the GC candidate set entirely (GC only touches ARCHIVED rows
+        with a non-NULL ``archived_at_cycle``) — it is structurally never GC'd
+        until it is re-archived, which stamps a fresh ``archived_at``.
+        """
+        policy = _forgetful_policy(
+            eviction_threshold=1.0,
+            auto_gc_enabled=True,
+            gc_min_archive_age_cycles=0,
+            gc_restore_window_seconds=_MONTH_SECONDS,
+        )
+        s = await _make_store(policy)
+        try:
+            await s.create_thought(_thought("cold", updated_cycle=0, action_outcome_score=0.0))
+            await s.run_hygiene(current_cycle=5, now=_NOW)
+            assert await _raw_archived_at(s, "cold") == _NOW.isoformat()
+
+            restored = await s.restore_thought("cold")
+            assert restored.archived_at is None
+            assert await _raw_archived_at(s, "cold") is None
+            assert await _raw_archived_at_cycle(s, "cold") is None
+            assert await _raw_lifecycle(s, "cold") == "ACTIVE"
+
+            # Re-archival on a later pass stamps a fresh, later ``archived_at``
+            # (not the stale original), so the wall-clock window restarts.
+            later = _NOW + datetime.timedelta(days=1)
+            await s.run_hygiene(current_cycle=1001, now=later)
+            assert await _raw_lifecycle(s, "cold") == "ARCHIVED"
+            assert await _raw_archived_at(s, "cold") == later.isoformat()
+        finally:
+            await s._db.close()
+
+    async def test_ttl_manual_archived_never_gc_with_window_active(self) -> None:
+        """A TTL/manually-archived row (both markers NULL) is never GC'd (window active)."""
+        policy = HygienePolicyConfig(
+            enabled=True,
+            eviction_threshold=0.0,
+            auto_gc_enabled=True,
+            gc_min_archive_age_cycles=0,
+            gc_restore_window_seconds=_MONTH_SECONDS,
+        )
+        s = await _make_store(policy)
+        try:
+            await s.create_thought(_thought("manual", updated_cycle=0))
+            await s.update_thought("manual", lifecycle_status=LifecycleStatus.ARCHIVED)
+            assert await _raw_archived_at_cycle(s, "manual") is None
+            assert await _raw_archived_at(s, "manual") is None
+
+            far_future = _NOW + datetime.timedelta(days=999)
+            result = await s.run_hygiene(current_cycle=1000, now=far_future)
+            assert result.gc_count == 0
+            assert await s.get_thought("manual") is not None
+        finally:
+            await s._db.close()
+
+    async def test_archived_at_stamped_only_on_hygiene_path(self) -> None:
+        """Only the hygiene archive path stamps ``archived_at``; TTL/manual leaves NULL."""
+        policy = _forgetful_policy(eviction_threshold=1.0)
+        s = await _make_store(policy)
+        try:
+            await s.create_thought(_thought("hygiene", updated_cycle=0, action_outcome_score=0.0))
+            await s.create_thought(_thought("manual", updated_cycle=0, action_outcome_score=0.0))
+            # Manually archive one row before the pass; hygiene archives the other.
+            await s.update_thought("manual", lifecycle_status=LifecycleStatus.ARCHIVED)
+
+            await s.run_hygiene(current_cycle=42, now=_NOW)
+
+            assert await _raw_archived_at(s, "hygiene") == _NOW.isoformat()
+            assert await _raw_archived_at(s, "manual") is None
+        finally:
+            await s._db.close()
+
+    async def test_delete_scope_preserved_with_journal(self) -> None:
+        """A GC under the wall-clock window keeps the full delete scope + journal.
+
+        Orphan-reflection sweep runs first, the FK cascade drops the edge, and a
+        ``DELETE_THOUGHT`` journal entry with a full ``before`` snapshot is
+        appended — the GC-is-not-erasure property (content survives in history).
+        """
+        policy = HygienePolicyConfig(
+            enabled=True,
+            eviction_threshold=0.0,  # archive nothing new via score
+            auto_gc_enabled=True,
+            gc_min_archive_age_cycles=0,
+            gc_restore_window_seconds=_MONTH_SECONDS,
+        )
+        s = await _make_store(policy, journal_enabled=True)
+        try:
+            # A source OBSERVATION hygiene-archived past BOTH windows (GC target).
+            await _archive_row_raw(
+                s, "src", archived_at_cycle=0, archived_at=_iso_before(_NOW, _MONTH_SECONDS * 2)
+            )
+            # A REFLECTION consolidated only from that (now non-live) source.
+            await s.create_thought(
+                _thought("refl", thought_type=ThoughtType.REFLECTION, updated_cycle=0)
+            )
+            await s.create_edge(
+                EdgeRecord(
+                    edge_id="e1",
+                    from_thought_id="refl",
+                    to_thought_id="src",
+                    edge_type=EdgeType.CONSOLIDATED_FROM,
+                    weight=0.5,
+                    created_cycle=0,
+                    source=KnowledgeSource.EXPERIENCE,
+                )
+            )
+            result = await s.run_hygiene(current_cycle=1000, now=_NOW)
+
+            assert result.gc_count == 1
+            assert await s.get_thought("src") is None
+            # Orphan sweep ran before the delete -> the REFLECTION is retired ...
+            assert await _raw_lifecycle(s, "refl") == "ARCHIVED"
+            # ... and the FK cascade dropped the dangling edge.
+            cursor = await s._db.execute("SELECT COUNT(*) AS n FROM edge")
+            assert (await cursor.fetchone())["n"] == 0
+
+            # GC != erasure: the DELETE_THOUGHT entry keeps a full ``before`` snapshot.
+            entries = await s.journal.get_entries()
+            gc_entries = [
+                e
+                for e in entries
+                if e.mutation_type == "DELETE_THOUGHT"
+                and isinstance(e.delta, dict)
+                and e.delta.get("before") is not None
+                and e.delta["before"].get("thought_id") == "src"
+            ]
+            assert len(gc_entries) == 1
+            assert gc_entries[0].delta["before"]["content"] == "content of src"
+            assert (await s.verify_journal()).valid is True
+        finally:
+            await s._db.close()
+
+    async def test_monotone_gc_set_is_subset_of_cycle_only_set_when_cap_not_binding(self) -> None:
+        """With a non-binding cap the wall-clock GC set is a subset of the cycle-only set.
+
+        Requiring an additional window can only ever *shrink* the eligible pool, so
+        with a non-binding ``max_evictions_per_run`` (the default 100 here, 4 rows)
+        the window-active store reaps a strict subset, omitting the recently-archived
+        row and the legacy NULL-stamped row. (Under a *binding* cap a freed slot may
+        be filled by another genuinely-eligible aged row — see
+        ``test_binding_cap_reaps_only_rows_past_both_windows``.) Compared on two
+        identical stores (GC deletes, so a single store cannot show both outcomes).
+        """
+        seeds = {
+            "old1": _iso_before(_NOW, _MONTH_SECONDS * 2),  # both windows
+            "old2": _iso_before(_NOW, _MONTH_SECONDS + 100),  # both windows
+            "recent": _iso_before(_NOW, 60),  # cycle only (wall-clock too new)
+            "legacy": None,  # cycle only (no wall-clock stamp -> fail closed when active)
+        }
+
+        async def _run(window_seconds: int) -> set[str]:
+            policy = HygienePolicyConfig(
+                enabled=True,
+                eviction_threshold=0.0,
+                auto_gc_enabled=True,
+                gc_min_archive_age_cycles=10,
+                gc_restore_window_seconds=window_seconds,
+            )
+            s = await _make_store(policy)
+            try:
+                for tid, archived_at in seeds.items():
+                    await _archive_row_raw(s, tid, archived_at_cycle=0, archived_at=archived_at)
+                await s.run_hygiene(current_cycle=1000, now=_NOW)
+                return {tid for tid in seeds if await s.get_thought(tid) is None}
+            finally:
+                await s._db.close()
+
+        cycle_only = await _run(0)
+        wall_clock = await _run(_MONTH_SECONDS)
+
+        assert wall_clock <= cycle_only  # monotone-safe: the window only removes rows
+        assert wall_clock == {"old1", "old2"}
+        # The discriminating direction: the extra window omits exactly the young
+        # and the unstampable-legacy rows the cycle-only path would have reaped.
+        assert cycle_only == {"old1", "old2", "recent", "legacy"}
+
+    async def test_binding_cap_reaps_only_rows_past_both_windows(self) -> None:
+        """Under a binding cap the window may reap a *different* row, never an unsafe one.
+
+        The wall-clock predicate filters candidates *before* the ``ORDER BY … LIMIT``
+        cap, so protecting a high-ordered young row can free the single slot for a
+        genuinely-eligible aged row that the cycle-only path (which spent the slot on
+        the young row) did not reach. The gated set is then **not** a subset of the
+        cycle-only set — yet every reaped row is past BOTH windows, and the young
+        row is never reaped under the window. This mirrors the archive-stage
+        binding-cap reshuffle and pins the per-candidate safety invariant.
+        """
+        # Both rows share ``archived_at_cycle`` so the delete order is the
+        # ``thought_id ASC`` tiebreak: ``a_recent`` sorts before ``b_aged``.
+        recent = _iso_before(_NOW, 60)  # wall-clock NOT elapsed
+        aged = _iso_before(_NOW, _MONTH_SECONDS * 2)  # wall-clock elapsed
+
+        async def _run(window_seconds: int) -> set[str]:
+            policy = HygienePolicyConfig(
+                enabled=True,
+                eviction_threshold=0.0,
+                auto_gc_enabled=True,
+                gc_min_archive_age_cycles=0,
+                gc_restore_window_seconds=window_seconds,
+                max_evictions_per_run=1,  # binding: two cycle-eligible rows, one slot
+            )
+            s = await _make_store(policy)
+            try:
+                await _archive_row_raw(s, "a_recent", archived_at_cycle=0, archived_at=recent)
+                await _archive_row_raw(s, "b_aged", archived_at_cycle=0, archived_at=aged)
+                await s.run_hygiene(current_cycle=1000, now=_NOW)
+                return {tid for tid in ("a_recent", "b_aged") if await s.get_thought(tid) is None}
+            finally:
+                await s._db.close()
+
+        cycle_only = await _run(0)
+        wall_clock = await _run(_MONTH_SECONDS)
+
+        # Cycle-only spends the one slot on the tiebreak-first row ...
+        assert cycle_only == {"a_recent"}
+        # ... while the window filters that young row out and reaps the aged one:
+        # not a subset (disjoint), but a safe reshuffle.
+        assert wall_clock == {"b_aged"}
+        assert not wall_clock <= cycle_only
+        # Per-candidate safety: the young (wall-clock-failing) row is never reaped
+        # under the window, and the reaped row is genuinely past both windows.
+        assert "a_recent" not in wall_clock
+
+    async def test_ttl_re_archival_clears_stale_hygiene_markers_end_to_end(self) -> None:
+        """End-to-end reproduction of the stale-marker GC-bypass the fix closes.
+
+        Literally walks the reachable sequence rather than hand-assigning markers:
+        hygiene archives a cold row (stamping both markers) -> a low-level
+        ``update_thought(lifecycle_status=ACTIVE)`` un-archives it and *leaves* the
+        markers -> the row later expires and TTL re-archives it. Because a TTL
+        archival is not a hygiene archival it clears both markers, so
+        ``archived_at_cycle`` is NULL and the irreversible GC stage cannot reap the
+        freshly re-archived row on the earlier, already-elapsed restore windows.
+        Without the fix the stale markers would make GC delete it immediately.
+        """
+        policy = _forgetful_policy(
+            eviction_threshold=1.0,
+            auto_gc_enabled=True,
+            gc_min_archive_age_cycles=10,
+            gc_restore_window_seconds=_MONTH_SECONDS,
+        )
+        s = await _make_store(policy)
+        try:
+            # A genuinely cold + aged row with a usage signal so hygiene archives it.
+            await s.create_thought(
+                _thought(
+                    "t",
+                    updated_cycle=0,
+                    created_at=_LONG_AGO,
+                    updated_at=_LONG_AGO,
+                    action_outcome_score=0.0,
+                )
+            )
+
+            # 1) Hygiene archives it, stamping both markers.
+            r1 = await s.run_hygiene(current_cycle=500, now=_NOW)
+            assert r1.archived_count == 1
+            assert await _raw_archived_at_cycle(s, "t") == 500
+            assert await _raw_archived_at(s, "t") == _NOW.isoformat()
+
+            # 2) A raw low-level un-archive leaves the (now stale) markers behind.
+            await s.update_thought("t", lifecycle_status=LifecycleStatus.ACTIVE)
+            assert await _raw_lifecycle(s, "t") == "ACTIVE"
+            assert await _raw_archived_at_cycle(s, "t") == 500
+            assert await _raw_archived_at(s, "t") == _NOW.isoformat()
+
+            # 3) The row later expires and TTL re-archives it -> markers cleared.
+            await s.update_thought("t", expires_at=_iso_before(_NOW, 60))
+            await s.cleanup_expired(now=_NOW.isoformat())
+            assert await _raw_lifecycle(s, "t") == "ARCHIVED"
+            assert await _raw_archived_at_cycle(s, "t") is None
+            assert await _raw_archived_at(s, "t") is None
+
+            # 4) GC far past both stale windows does NOT reap it (no hygiene marker).
+            r2 = await s.run_hygiene(current_cycle=5000, now=_NOW + datetime.timedelta(days=90))
+            assert r2.gc_count == 0
+            assert await s.get_thought("t") is not None
         finally:
             await s._db.close()

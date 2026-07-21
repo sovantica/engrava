@@ -615,6 +615,21 @@ class HygienePolicyConfig:
             ``SearchConfig.recency_now_half_life_seconds``. ``0`` disables the
             gate (fully backward-compatible with pre-gate behaviour). Must be
             ``>= 0``.
+        gc_restore_window_seconds: The wall-clock restore window, in seconds,
+            before the irreversible GC stage may delete a hygiene-archived
+            thought — required **in addition to** ``gc_min_archive_age_cycles``.
+            A thought is GC-eligible only once it has been hygiene-archived for at
+            least this many seconds of real time
+            (``archived_at <= now - gc_restore_window_seconds``), so a bulk /
+            fast-cycling store cannot permanently delete a just-archived thought
+            before any real-time chance to ``restore_thought`` it. Measured off
+            the explicit ``archived_at`` column; a hygiene-archived row that
+            predates that column (``archived_at`` is ``None``) is never GC-eligible
+            while this window is active (fail closed). Default ``2592000``
+            (30 days), the wall-clock-seconds convention of
+            ``min_inactivity_age_seconds`` above. ``0`` disables the wall-clock
+            window (cycle-only, fully backward-compatible with pre-window
+            behaviour). Must be ``>= 0``.
 
     Examples:
         >>> cfg = HygienePolicyConfig(enabled=True, eviction_threshold=0.15)
@@ -637,6 +652,7 @@ class HygienePolicyConfig:
     gc_min_archive_age_cycles: int = 10
     dry_run: bool = False
     min_inactivity_age_seconds: int = 604800
+    gc_restore_window_seconds: int = 2592000
 
     def __post_init__(self) -> None:
         """Validate field invariants on construction.
@@ -654,7 +670,7 @@ class HygienePolicyConfig:
             ValueError: When ``eviction_threshold`` is outside ``[0.0, 1.0]``,
                 ``check_every_n_cycles`` or ``max_evictions_per_run`` is ``< 1``,
                 or ``gc_min_archive_age_cycles`` / ``min_inactivity_age_seconds``
-                is ``< 0``.
+                / ``gc_restore_window_seconds`` is ``< 0``.
 
         """
         # ``bool`` is an ``int`` subclass; reject it explicitly so ``True`` /
@@ -680,6 +696,9 @@ class HygienePolicyConfig:
             raise ValueError(msg)
         if self.min_inactivity_age_seconds < 0:
             msg = "HygienePolicyConfig.min_inactivity_age_seconds must be >= 0"
+            raise ValueError(msg)
+        if self.gc_restore_window_seconds < 0:
+            msg = "HygienePolicyConfig.gc_restore_window_seconds must be >= 0"
             raise ValueError(msg)
 
     def _validate_collections(self) -> None:
@@ -1804,6 +1823,8 @@ def _parse_hygiene(raw: Any) -> HygienePolicyConfig | None:  # noqa: ANN401
         raw, "min_inactivity_age_seconds", 604800
     )
 
+    gc_restore_window_seconds = _parse_hygiene_nonneg_int(raw, "gc_restore_window_seconds", 2592000)
+
     return HygienePolicyConfig(
         enabled=enabled,
         eviction_threshold=float(eviction_threshold),
@@ -1815,6 +1836,7 @@ def _parse_hygiene(raw: Any) -> HygienePolicyConfig | None:  # noqa: ANN401
         gc_min_archive_age_cycles=gc_min_archive_age_cycles,
         dry_run=dry_run,
         min_inactivity_age_seconds=min_inactivity_age_seconds,
+        gc_restore_window_seconds=gc_restore_window_seconds,
     )
 
 

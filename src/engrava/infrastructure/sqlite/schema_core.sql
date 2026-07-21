@@ -1,5 +1,12 @@
 -- engrava: Core thought-graph schema (free-tier boundary — no internal-cognitive columns).
--- Version: core-19 (edge.metadata_json — the generic structured-attribute
+-- Version: core-20 (thought.archived_at — the wall-clock instant the Memory
+--          Hygiene loop archived a thought; nullable TEXT (UTC-normalised
+--          ISO-8601), stamped only by the hygiene archive path and cleared on
+--          restore, appended last for column-order parity with the in-place
+--          ALTER ... ADD COLUMN; it backs the wall-clock restore window that
+--          must elapse IN ADDITION to the cycle window before the irreversible
+--          GC stage may reap a thought;
+--          core-19 added edge.metadata_json — the generic structured-attribute
 --          carrier mirroring thought.metadata_json; NOT NULL DEFAULT '{}' so
 --          every existing edge reads back an empty mapping, appended last for
 --          column-order parity with the in-place ALTER ... ADD COLUMN; keys
@@ -8,7 +15,7 @@
 --          thought.archived_at_cycle; both nullable/defaulted so a store that
 --          never enables hygiene reads back unchanged — pinned is the durable
 --          never-forget marker, archived_at_cycle records the cycle hygiene
---          archived a thought and backs the GC restore window;
+--          archived a thought and backs the cycle restore window;
 --          core-17 added the opt-in thought.provenance capture column + the two
 --          JSON expression indexes idx_thought_prov_session /
 --          idx_thought_prov_actor on its identity fields; provenance is captured
@@ -20,7 +27,7 @@
 --          core-14 added the hot-path indexes edge.to_thought_id,
 --          embedding.owner_id, thought.updated_cycle, thought.thought_type)
 
-PRAGMA user_version = 19;
+PRAGMA user_version = 20;
 
 CREATE TABLE IF NOT EXISTS thought (
     thought_id        TEXT    PRIMARY KEY,
@@ -71,11 +78,23 @@ CREATE TABLE IF NOT EXISTS thought (
     -- hygiene loop (default 0 = not pinned). ``archived_at_cycle`` records the
     -- cycle at which the hygiene loop archived a thought (NULL when it was not
     -- archived by hygiene — a restore clears it back to NULL); it backs the
-    -- GC restore window, so a thought archived by any other path (TTL / manual)
+    -- cycle restore window, so a thought archived by any other path (TTL / manual)
     -- keeps NULL and is never reaped by hygiene GC. A store that never enables
     -- hygiene leaves both at their defaults and reads back unchanged.
     pinned            INTEGER NOT NULL DEFAULT 0,
-    archived_at_cycle INTEGER
+    archived_at_cycle INTEGER,
+    -- Wall-clock archival instant (core-20). The UTC-normalised ISO-8601 time
+    -- the hygiene loop archived a thought, or NULL when it was not archived by
+    -- hygiene (a restore clears it back to NULL, exactly like archived_at_cycle).
+    -- Appended last for the same column-order parity as the columns above. It
+    -- backs the wall-clock restore window: the irreversible GC stage may reap a
+    -- hygiene-archived thought only once BOTH the cycle window and this real-time
+    -- window have elapsed, so a fast-cycling store cannot delete a just-archived
+    -- thought before a real-time chance to restore it. A hygiene-archived row
+    -- with archived_at NULL (archived before this column existed) has no
+    -- real-time stamp and is therefore never GC-eligible while the wall-clock
+    -- window is active — the irreversible stage fails closed.
+    archived_at       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS edge (

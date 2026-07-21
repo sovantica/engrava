@@ -63,7 +63,7 @@ from engrava.mindql.executor import MindQLExecutor
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-_HEAD_VERSION = 19
+_HEAD_VERSION = 20
 
 
 # ---------------------------------------------------------------------------

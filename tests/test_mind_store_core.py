@@ -582,7 +582,7 @@ class TestFTS5Schema:
         cursor = await db.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert int(row[0]) == 19
+        assert int(row[0]) == 20
 
     async def test_search_fts_lazy_probes_index(self, db: aiosqlite.Connection) -> None:
         """search_fts should work without an explicit _probe_fts call."""
