@@ -38,6 +38,36 @@ thought / edge / embedding / action.
 full list): `--clear` to wipe the target first, `--skip-embeddings` / `--re-embed`
 to control embedding handling, and `--service` for multi-service targets.
 
+### Trust boundary
+
+`restore` is designed for **snapshots you produced yourself** with `engrava
+snapshot` — your own trusted backups. That is the supported input boundary.
+
+Restore does not blindly trust the file. Every line must be a JSON object, and
+each record targeting a known table (thought, edge, embedding, action) is
+validated against a fixed, code-owned schema: its columns must be a known subset
+of that table's columns, the required columns must be present and non-null, and
+each value must match its column's type (an imported embedding vector must be
+valid base64 — the base64 check applies only when embeddings are actually
+imported, not under `--skip-embeddings` or `--re-embed`, which never read the
+stored vectors). A record whose type is not one of those tables is skipped, so a newer snapshot restored
+into an older build ignores record types it does not understand rather than
+failing. The whole restore runs as **one transaction**: if any record is
+malformed or carries a bad value, the transaction is rolled back and **no rows
+are written** — not even a `--clear` that ran first, and not the records that
+validated before the bad one. Column names never come from the file; the SQL
+uses a fixed, built-in column set, so a hand-edited or corrupted key cannot
+alter the statements that run.
+
+What restore does **not** do is vouch for the *content* of a snapshot from
+someone else. The thought text, metadata, and other values are restored
+verbatim, so a snapshot obtained from an untrusted third party is untrusted data
+in your database — treat it with the same caution as any external import.
+Restore a snapshot you trust the origin of; if you must ingest an external one,
+review it first. Restore also assumes the file is **not being modified while it
+runs**; point it at a completed backup, not a snapshot that is still being
+written.
+
 ## Physical file backup (WAL-safe)
 
 Engrava runs in **WAL mode**, where recently-written data lives in the `-wal`

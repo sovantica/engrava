@@ -30,20 +30,45 @@ from typing import TYPE_CHECKING, Any
 import click
 
 from engrava.cli.config import EngravaCLIConfig
+from engrava.cli.snapshot_records import (
+    CoreTable,
+    MetadataRecord,
+    TableRecord,
+    parse_snapshot_record,
+)
 from engrava.config import ServicesConfig
 from engrava.domain.protocols.hooks import MindQLExtension
 from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator, Mapping, Sequence
+
     import aiosqlite
+
+    from engrava.domain.protocols.embedding_provider import EmbeddingProviderProtocol
 
 logger = logging.getLogger(__name__)
 
-# Core tables in dependency order (thought first, dependents after).
-_CORE_TABLES: tuple[str, ...] = ("thought", "edge", "embedding", "action")
+# Re-embedding thought IDs are flushed in batches of this size so restore memory
+# stays bounded by the batch rather than by the total number of thoughts.
+_REEMBED_BATCH_SIZE = 128
+
+# Core tables in dependency order (thought first, dependents after). Typed as
+# CoreTable so every table identifier that reaches SQL comes from the enum.
+_CORE_TABLES: tuple[CoreTable, ...] = (
+    CoreTable.THOUGHT,
+    CoreTable.EDGE,
+    CoreTable.EMBEDDING,
+    CoreTable.ACTION,
+)
 
 # Reverse order for safe deletion (dependents first).
-_CORE_TABLES_DELETE_ORDER: tuple[str, ...] = ("action", "embedding", "edge", "thought")
+_CORE_TABLES_DELETE_ORDER: tuple[CoreTable, ...] = (
+    CoreTable.ACTION,
+    CoreTable.EMBEDDING,
+    CoreTable.EDGE,
+    CoreTable.THOUGHT,
+)
 
 # ------------------------------------------------------------------
 # Helpers
@@ -86,7 +111,7 @@ def _run(coro: Any) -> Any:  # noqa: ANN401
 
 
 def _format_rows(
-    rows: list[dict[str, Any]],
+    rows: Sequence[Mapping[str, object]],
     fmt: str,
     *,
     columns: list[str] | None = None,
@@ -452,10 +477,10 @@ async def _export_db_to_jsonl(conn: Any, out: Path) -> int:  # noqa: ANN401
         total += 1
 
         _select_all_sql = {
-            "thought": "SELECT * FROM thought",
-            "edge": "SELECT * FROM edge",
-            "embedding": "SELECT * FROM embedding",
-            "action": "SELECT * FROM action",
+            CoreTable.THOUGHT: "SELECT * FROM thought",
+            CoreTable.EDGE: "SELECT * FROM edge",
+            CoreTable.EMBEDDING: "SELECT * FROM embedding",
+            CoreTable.ACTION: "SELECT * FROM action",
         }
         for table in _CORE_TABLES:
             cursor = await conn.execute(_select_all_sql[table])
@@ -470,7 +495,7 @@ async def _export_db_to_jsonl(conn: Any, out: Path) -> int:  # noqa: ANN401
                         val = base64.b64encode(val).decode("ascii")
                     record[key] = val
                 line = json.dumps(
-                    {"_type": table, "data": record},
+                    {"_type": table.value, "data": record},
                     default=str,
                     ensure_ascii=False,
                 )
@@ -557,84 +582,62 @@ def snapshot(ctx: click.Context, output_path: str | None, service_name: str | No
 # restore (import from JSONL snapshot)
 # ------------------------------------------------------------------
 
-# Valid _type values for data records (excludes "metadata" header).
-_VALID_IMPORT_TYPES = frozenset(_CORE_TABLES)
 
-# Backward compat: old snapshots used {"table": "...", "data": {...}}.
-_LEGACY_FORMAT = "table"
+def _iter_snapshot_lines(input_path: Path) -> Iterator[tuple[int, str]]:
+    """Stream a snapshot file, yielding non-empty ``(line_number, line)`` pairs.
 
-
-def _parse_snapshot_line(raw_line: str) -> tuple[str, dict[str, Any]]:
-    """Parse a single JSONL line into (record_type, data).
-
-    Supports both new ``{_type, data}`` and legacy ``{table, data}``
-    formats.
+    Streaming keeps restore memory bounded by a single line rather than the
+    whole snapshot. Lines are stripped and blank lines are skipped; line numbers
+    are 1-based and count every physical line for accurate error context.
 
     Args:
-        raw_line: Stripped JSON line.
+        input_path: Path to the JSONL snapshot file.
 
-    Returns:
-        Tuple of (record type, data dict).  For metadata records the
-        data dict is the full record.
+    Yields:
+        ``(line_number, stripped_line)`` for each non-empty line.
 
     """
-    record: dict[str, Any] = json.loads(raw_line)
-    record_type: str = record.get("_type") or record.get(_LEGACY_FORMAT, "")
-    if record_type == "metadata":
-        return record_type, record
-    data: dict[str, Any] = record.get("data", {})
-    return record_type, data
+    with input_path.open(encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            stripped = raw_line.strip()
+            if stripped:
+                yield line_number, stripped
 
 
-async def _check_model_mismatch(
-    lines: list[str],
-    embedding_provider: Any,  # noqa: ANN401
-    *,
-    re_embed: bool,
-    skip_embeddings: bool,
+def _assert_embedding_model_match(
+    record: MetadataRecord,
+    embedding_provider: EmbeddingProviderProtocol,
 ) -> None:
-    """Validate embedding model compatibility before import.
+    """Reject a snapshot whose embedding model differs from the target's.
 
     Args:
-        lines: Raw JSONL lines from the snapshot.
-        embedding_provider: Target embedding provider (or None).
-        re_embed: Whether re-embedding is requested.
-        skip_embeddings: Whether embeddings are skipped.
+        record: The snapshot metadata header.
+        embedding_provider: The target embedding provider.
 
     Raises:
-        click.ClickException: On model mismatch without override flags.
+        click.ClickException: On model mismatch without an override flag.
 
     """
-    if embedding_provider is None or re_embed or skip_embeddings:
-        return
-
-    for raw_line in lines:
-        stripped = raw_line.strip()
-        if not stripped:
-            continue
-        record_type, data = _parse_snapshot_line(stripped)
-        if record_type == "metadata":
-            source_model = data.get("embedding_model_name")
-            if source_model is not None and source_model != embedding_provider.model_name:
-                msg = (
-                    f"Embedding model mismatch: snapshot has '{source_model}', "
-                    f"target has '{embedding_provider.model_name}'. "
-                    f"Use --re-embed to re-generate or --skip-embeddings to skip."
-                )
-                raise click.ClickException(msg)
-            break
+    source_model = record.embedding_model_name
+    if source_model is not None and source_model != embedding_provider.model_name:
+        msg = (
+            f"Embedding model mismatch: snapshot has '{source_model}', "
+            f"target has '{embedding_provider.model_name}'. "
+            f"Use --re-embed to re-generate or --skip-embeddings to skip."
+        )
+        raise click.ClickException(msg)
 
 
 async def _reembed_thoughts(
-    conn: Any,  # noqa: ANN401
+    conn: aiosqlite.Connection,
     thought_ids: list[str],
-    embedding_provider: Any,  # noqa: ANN401
+    embedding_provider: EmbeddingProviderProtocol,
 ) -> int:
-    """Re-embed imported thoughts via the target provider.
+    """Re-embed a batch of imported thoughts via the target provider.
 
     Args:
         conn: Open aiosqlite connection.
-        thought_ids: IDs of thoughts to re-embed.
+        thought_ids: IDs of thoughts to re-embed (a single bounded batch).
         embedding_provider: Async embedding provider.
 
     Returns:
@@ -681,46 +684,124 @@ async def _reembed_thoughts(
 
 
 async def _insert_record(
-    conn: Any,  # noqa: ANN401
-    record_type: str,
-    data: dict[str, Any],
+    conn: aiosqlite.Connection,
+    record: TableRecord,
 ) -> None:
-    """Insert a single record into the database.
+    """Insert one validated snapshot record via fixed, allow-listed SQL.
+
+    The statement's column identifiers come only from the record's
+    :class:`~engrava.cli.snapshot_records.TableSpec`; no identifier is derived
+    from snapshot data, and every value travels as a bound parameter.
 
     Args:
         conn: Open aiosqlite connection.
-        record_type: Table name (thought/edge/embedding/action).
-        data: Column name-value mapping.
+        record: A validated core-table record.
 
     """
-    # Re-encode base64 blobs for embedding table.
-    if record_type == "embedding" and "vector_blob" in data:
-        import base64  # noqa: PLC0415
+    sql, values = record.to_insert()
+    await conn.execute(sql, values)
 
-        raw = data["vector_blob"]
-        if isinstance(raw, str):
-            data["vector_blob"] = base64.b64decode(raw)
 
-    cols = list(data.keys())
-    placeholders = ", ".join("?" for _ in cols)
-    col_names = ", ".join(cols)
-    values = list(data.values())
-    await conn.execute(
-        f"INSERT OR REPLACE INTO {record_type} ({col_names}) VALUES ({placeholders})",  # noqa: S608
-        values,
-    )
+def _reembed_id(
+    record: TableRecord,
+    *,
+    re_embed: bool,
+    embedding_provider: EmbeddingProviderProtocol | None,
+) -> str | None:
+    """Return the thought ID to re-embed for a record, or ``None``.
+
+    Args:
+        record: A validated core-table record about to be inserted.
+        re_embed: Whether re-embedding is requested.
+        embedding_provider: Target embedding provider (or ``None``).
+
+    Returns:
+        The thought's ID when re-embedding applies to it, otherwise ``None``.
+
+    """
+    if not (re_embed and embedding_provider is not None and record.spec.table is CoreTable.THOUGHT):
+        return None
+    tid = record.data["thought_id"]  # required + non-null, validated at parse
+    return tid if isinstance(tid, str) else None
+
+
+async def _stream_insert(
+    conn: aiosqlite.Connection,
+    input_path: Path,
+    *,
+    skip_embeddings: bool,
+    re_embed: bool,
+    embedding_provider: EmbeddingProviderProtocol | None,
+) -> int:
+    """Stream a snapshot once, validating and inserting each record in order.
+
+    Each record is fully validated -- structure and values -- immediately before
+    it is inserted, so a bad record raises before its own write. Re-embedding IDs
+    are flushed in bounded batches; peak memory is one line plus one batch.
+
+    Args:
+        conn: Open aiosqlite connection (inside the caller's transaction).
+        input_path: Path to the JSONL snapshot file.
+        skip_embeddings: Skip embedding records during import.
+        re_embed: Re-embed thoughts via the embedding provider after insert.
+        embedding_provider: ``EmbeddingProviderProtocol`` for re-embedding.
+
+    Returns:
+        Total number of records written (inserts plus re-embeddings).
+
+    Raises:
+        click.ClickException: On a malformed record, an invalid value, or an
+            embedding-model mismatch without an override flag.
+
+    """
+    check_model = embedding_provider is not None and not re_embed and not skip_embeddings
+    total = 0
+    reembed_batch: list[str] = []
+    for line_number, line in _iter_snapshot_lines(input_path):
+        record = parse_snapshot_record(line, line_number=line_number)
+        if isinstance(record, MetadataRecord):
+            if check_model and embedding_provider is not None:
+                _assert_embedding_model_match(record, embedding_provider)
+            continue
+        if not isinstance(record, TableRecord):
+            continue
+        if record.spec.table is CoreTable.EMBEDDING and (skip_embeddings or re_embed):
+            continue
+
+        await _insert_record(conn, record)
+        total += 1
+
+        tid = _reembed_id(record, re_embed=re_embed, embedding_provider=embedding_provider)
+        if tid is not None and embedding_provider is not None:
+            reembed_batch.append(tid)
+            if len(reembed_batch) >= _REEMBED_BATCH_SIZE:
+                total += await _reembed_thoughts(conn, reembed_batch, embedding_provider)
+                reembed_batch.clear()
+
+    if reembed_batch and embedding_provider is not None:
+        total += await _reembed_thoughts(conn, reembed_batch, embedding_provider)
+    return total
 
 
 async def _import_records_to_db(
-    conn: Any,  # noqa: ANN401
+    conn: aiosqlite.Connection,
     input_path: Path,
     *,
     clear: bool = False,
     skip_embeddings: bool = False,
     re_embed: bool = False,
-    embedding_provider: Any = None,  # noqa: ANN401
+    embedding_provider: EmbeddingProviderProtocol | None = None,
 ) -> int:
-    """Import JSONL records into a database connection.
+    """Import JSONL records into a database connection atomically.
+
+    The whole restore runs in a **single transaction over a single streaming
+    pass**: each record is fully validated -- structure and values, including
+    base64 decoding of an embedding blob -- immediately before it is inserted,
+    and any failure (a malformed record, an embedding-model mismatch, or a bad
+    value) rolls the transaction back so nothing is ever committed from an
+    invalid snapshot. "Reject before any write" therefore holds as "nothing
+    persists", including the optional ``clear``. The file is read exactly once
+    and peak memory is one line plus one re-embed batch.
 
     Args:
         conn: Open aiosqlite connection with schema applied.
@@ -734,48 +815,34 @@ async def _import_records_to_db(
         Total number of records imported.
 
     Raises:
-        click.ClickException: On embedding model mismatch without flags.
+        click.ClickException: On a malformed snapshot record, an invalid value,
+            or an embedding-model mismatch without an override flag. The
+            transaction is rolled back before the error propagates.
 
     """
-    if clear:
-        for table in _CORE_TABLES_DELETE_ORDER:
-            await conn.execute(f"DELETE FROM {table}")  # noqa: S608
-
-    raw_text = input_path.read_text(encoding="utf-8")  # noqa: ASYNC240
-    raw_lines = raw_text.splitlines()
-
-    await _check_model_mismatch(
-        raw_lines, embedding_provider, re_embed=re_embed, skip_embeddings=skip_embeddings
-    )
-
     total = 0
-    thought_ids_for_reembed: list[str] = []
-
-    for raw_line in raw_lines:
-        stripped = raw_line.strip()
-        if not stripped:
-            continue
-
-        record_type, data = _parse_snapshot_line(stripped)
-
-        if record_type == "metadata" or record_type not in _VALID_IMPORT_TYPES:
-            continue
-        if record_type == "embedding" and (skip_embeddings or re_embed):
-            continue
-
-        if record_type == "thought" and re_embed:
-            tid = data.get("thought_id")
-            if tid:
-                thought_ids_for_reembed.append(tid)
-
-        await _insert_record(conn, record_type, data)
-        total += 1
-
-    # Re-embed pass.
-    if re_embed and embedding_provider is not None and thought_ids_for_reembed:
-        total += await _reembed_thoughts(conn, thought_ids_for_reembed, embedding_provider)
-
-    await conn.commit()
+    committed = False
+    # Open the transaction explicitly so atomicity holds regardless of the
+    # connection's isolation configuration (it does not depend on the driver's
+    # implicit-transaction default).
+    await conn.execute("BEGIN")
+    try:
+        if clear:
+            for table in _CORE_TABLES_DELETE_ORDER:
+                await conn.execute(f"DELETE FROM {table.value}")  # noqa: S608
+        total = await _stream_insert(
+            conn,
+            input_path,
+            skip_embeddings=skip_embeddings,
+            re_embed=re_embed,
+            embedding_provider=embedding_provider,
+        )
+        await conn.commit()
+        committed = True
+    finally:
+        if not committed:
+            # Any validation or insert failure discards the whole restore.
+            await conn.rollback()
     return total
 
 
