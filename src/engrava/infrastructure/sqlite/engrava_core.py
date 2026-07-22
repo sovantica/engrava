@@ -1036,10 +1036,16 @@ class SqliteEngravaCore:
         self._access_tracking_enabled: bool = access_tracking_enabled
         self._access_buffer: _AccessBuffer = _AccessBuffer()
         # Suppresses access buffering for reads issued *by* consolidation
-        # itself (its candidate scans / reflection-member resolution). Those
-        # are internal machinery, not caller retrievals, so they must not feed
-        # the frequency signal. Set only inside ``suppress_access_tracking``.
-        self._suppress_access_tracking: bool = False
+        # itself (its candidate scans / reflection-member resolution) and by a
+        # read-only view. Those are not caller retrievals, so they must not feed
+        # the frequency signal. Task-local (a ``ContextVar``, not a plain bool)
+        # so overlapping suppressed reads on this store cannot clobber each
+        # other's flag: each async task carries its own value and nesting is
+        # token-scoped. Set only inside ``suppress_access_tracking``.
+        self._suppress_access_tracking: contextvars.ContextVar[bool] = contextvars.ContextVar(
+            "engrava_suppress_access_tracking",
+            default=False,
+        )
         # The dreaming extension, wired by ``from_config`` when dreaming is
         # enabled so ``consolidate()`` can run a cycle without the caller
         # constructing it. ``None`` for a manually-built store or dreaming-off.
@@ -2906,22 +2912,26 @@ class SqliteEngravaCore:
         """Context manager that suppresses access buffering for reads inside it.
 
         Reads that a component issues as internal machinery — dreaming's own
-        candidate scans and reflection-member resolution — are not caller
-        retrievals and must not feed the ``frequency`` signal. Wrapping those
-        reads in this block keeps them out of the access buffer. No effect when
-        access tracking is disabled; restores the prior state on exit even on
-        error.
+        candidate scans and reflection-member resolution — or reads routed
+        through a read-only view are not caller retrievals and must not feed the
+        ``frequency`` signal. Wrapping those reads in this block keeps them out
+        of the access buffer. No effect when access tracking is disabled.
+
+        The suppression flag is a task-local ``ContextVar`` and this block scopes
+        it with a reset token, so the guarantee holds under **overlapping**
+        suppressed reads: two concurrent async tasks each carry their own value
+        (neither task's exit clears the other's), and nested suppression on one
+        task restores exactly the enclosing state on exit — even on error.
 
         Yields:
             None — access buffering is suppressed for the duration of the block.
 
         """
-        previous = self._suppress_access_tracking
-        self._suppress_access_tracking = True
+        token = self._suppress_access_tracking.set(True)
         try:
             yield
         finally:
-            self._suppress_access_tracking = previous
+            self._suppress_access_tracking.reset(token)
 
     @contextlib.asynccontextmanager
     async def suspend_auto_commit(self) -> AsyncIterator[None]:
@@ -8316,7 +8326,11 @@ class SqliteEngravaCore:
                 lists are handled by the buffer (coalesced / ignored).
 
         """
-        if not self._access_tracking_enabled or self._suppress_access_tracking or not thought_ids:
+        if (
+            not self._access_tracking_enabled
+            or self._suppress_access_tracking.get()
+            or not thought_ids
+        ):
             return
         now = datetime.datetime.now(datetime.UTC).isoformat()
         for thought_id in thought_ids:

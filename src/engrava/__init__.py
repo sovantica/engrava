@@ -93,6 +93,7 @@ from engrava.domain.protocols.embedding_provider import (
     RoleAwareEmbeddingProvider,
 )
 from engrava.domain.protocols.engrava_core import EngravaCoreProtocol
+from engrava.domain.protocols.engrava_read import EngravaReadProtocol
 from engrava.domain.protocols.hooks import (
     DefaultEngravaHooks,
     EngravaHooksProtocol,
@@ -173,6 +174,7 @@ __all__ = [
     "EngravaHooksProtocol",
     "EngravaManager",
     "EngravaMetrics",
+    "EngravaReadProtocol",
     "EvictionReason",
     "ExtensionManifest",
     "ExtensionMigrationError",

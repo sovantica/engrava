@@ -351,6 +351,11 @@ class TestOffOnPair:
 # differs from the store's embedding dimension (previously an opaque numpy error or
 # a silent empty result) — an additive public-API addition raised only on a
 # malformed query vector, never on any well-formed vector-search path.
+# Later extended with EngravaReadProtocol, the runtime-checkable read (non-mutating)
+# half of EngravaCoreProtocol — extracted so the write-blocking ReadOnlyEngrava view
+# declares and is type-checked against exactly the capabilities it forwards. An
+# additive, non-breaking public-API addition: EngravaCoreProtocol now inherits from it
+# and every full store satisfies it by construction, so no existing consumer changes.
 _PRE_WS_ALL_BASELINE = frozenset(
     {
         "ActionNotFoundError",
@@ -398,6 +403,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "EngravaHooksProtocol",
         "EngravaManager",
         "EngravaMetrics",
+        "EngravaReadProtocol",
         "EvictionReason",
         "ExtensionManifest",
         "ExtensionMigrationError",
