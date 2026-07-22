@@ -99,8 +99,9 @@ class TestDreamingGates:
     def test_threshold_rejects_bool(self, field_name: str, bool_value: bool) -> None:
         # ``bool`` is a subclass of ``int`` in Python; the contract is "float in
         # [0.0, 1.0]", so ``True``/``False`` must be rejected explicitly rather
-        # than silently coerced to ``1.0``/``0.0`` and disable a gate.
-        with pytest.raises(TypeError, match=field_name):
+        # than silently coerced to ``1.0``/``0.0`` and disable a gate. Both
+        # construction paths raise the same ``ConfigError`` for this.
+        with pytest.raises(ConfigError, match=field_name):
             DreamingGates(**{field_name: bool_value})  # type: ignore[arg-type]
 
 

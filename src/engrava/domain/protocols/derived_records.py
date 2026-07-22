@@ -26,6 +26,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
+from engrava.config_validation import ConfigError, require_bool, require_positive_int
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -191,34 +193,24 @@ class DeriveGates:
         """Validate field invariants on construction.
 
         Enforces the same contract the YAML loader
-        (:func:`~engrava.config._parse_derive`) applies, so a direct
-        ``DeriveGates(...)`` call rejects the same malformed values a config file
-        would — ``enabled`` must be a strict ``bool`` and, in particular, a
-        ``bool`` cannot masquerade as an ``int`` for the cap (``bool`` is an
+        (:func:`~engrava.config._parse_derive`) applies, through the shared strict
+        decoders, so a direct ``DeriveGates(...)`` call and a malformed config file
+        are rejected identically (same :class:`~engrava.config_validation.ConfigError`,
+        a ``ValueError`` subclass). In particular ``enabled`` must be a strict
+        ``bool`` and a ``bool`` cannot masquerade as an ``int`` cap (``bool`` is an
         ``int`` subclass).
 
         Raises:
-            TypeError: When ``enabled`` is not a ``bool``, or
-                ``max_derived_per_source`` is a ``bool`` or not an ``int``.
-            ValueError: When ``on_error`` is not ``"raise"``/``"log"`` or
-                ``max_derived_per_source`` is ``< 1``.
+            ConfigError: When ``enabled`` is not a ``bool``, ``on_error`` is not
+                ``"raise"``/``"log"``, or ``max_derived_per_source`` is a ``bool``,
+                not an ``int``, or ``< 1``.
 
         """
-        if not isinstance(self.enabled, bool):
-            msg = "DeriveGates.enabled must be a bool"
-            raise TypeError(msg)
+        require_bool(self.enabled, "DeriveGates.enabled")
         if self.on_error not in ("raise", "log"):
             msg = "DeriveGates.on_error must be 'raise' or 'log'"
-            raise ValueError(msg)
-        if isinstance(self.max_derived_per_source, bool) or not isinstance(
-            self.max_derived_per_source,
-            int,
-        ):
-            msg = "DeriveGates.max_derived_per_source must be an int"
-            raise TypeError(msg)
-        if self.max_derived_per_source < 1:
-            msg = "DeriveGates.max_derived_per_source must be >= 1"
-            raise ValueError(msg)
+            raise ConfigError(msg)
+        require_positive_int(self.max_derived_per_source, "DeriveGates.max_derived_per_source")
 
 
 @dataclass(frozen=True)

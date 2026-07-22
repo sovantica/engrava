@@ -242,7 +242,7 @@ class TestHygienePolicyConfigValidation:
 
     def test_threshold_bool_rejected(self) -> None:
         """``True`` must not impersonate ``1.0`` for the threshold."""
-        with pytest.raises(TypeError, match="eviction_threshold"):
+        with pytest.raises(ConfigError, match="eviction_threshold"):
             HygienePolicyConfig(eviction_threshold=True)  # type: ignore[arg-type]
 
     def test_check_every_below_one_raises(self) -> None:
@@ -275,11 +275,11 @@ class TestHygienePolicyConfigValidation:
         assert cfg.gc_restore_window_seconds == 0
 
     def test_protected_priorities_non_string_raises(self) -> None:
-        with pytest.raises(TypeError, match="protected_priorities"):
+        with pytest.raises(ConfigError, match="protected_priorities"):
             HygienePolicyConfig(protected_priorities=(1,))  # type: ignore[arg-type]
 
     def test_signal_weight_non_numeric_raises(self) -> None:
-        with pytest.raises(TypeError, match="signal_weights"):
+        with pytest.raises(ConfigError, match="signal_weights"):
             HygienePolicyConfig(signal_weights={"recency": "high"})  # type: ignore[dict-item]
 
     def test_empty_protected_priorities_allowed(self) -> None:

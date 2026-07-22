@@ -13,6 +13,7 @@ import dataclasses
 
 import pytest
 
+from engrava.config_validation import ConfigError
 from engrava.domain.enums import Priority, ThoughtType
 from engrava.domain.protocols import derived_records
 from engrava.domain.protocols.derived_records import (
@@ -155,20 +156,20 @@ def test_derive_gates_rejects_non_positive_cap(bad_cap: int) -> None:
 
 def test_derive_gates_rejects_bool_cap() -> None:
     """A ``bool`` cannot masquerade as an ``int`` cap (bool is an int subclass)."""
-    with pytest.raises(TypeError, match="max_derived_per_source"):
+    with pytest.raises(ConfigError, match="max_derived_per_source"):
         DeriveGates(max_derived_per_source=True)
 
 
 def test_derive_gates_rejects_non_int_cap() -> None:
     """A non-int cap is rejected, matching the YAML loader's integer contract."""
-    with pytest.raises(TypeError, match="max_derived_per_source"):
+    with pytest.raises(ConfigError, match="max_derived_per_source"):
         DeriveGates(max_derived_per_source=1.5)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("bad_enabled", [1, 0, "yes"])
 def test_derive_gates_rejects_non_bool_enabled(bad_enabled: object) -> None:
     """``enabled`` must be a strict ``bool`` (matching the YAML loader)."""
-    with pytest.raises(TypeError, match="enabled"):
+    with pytest.raises(ConfigError, match="enabled"):
         DeriveGates(enabled=bad_enabled)  # type: ignore[arg-type]
 
 

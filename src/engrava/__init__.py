@@ -1,7 +1,6 @@
 """engrava — standalone thought-graph persistence engine."""
 
 from engrava.config import (
-    ConfigError,
     DreamingConfig,
     DreamingGates,
     EmbeddingConfig,
@@ -18,6 +17,7 @@ from engrava.config import (
     resolve_hooks,
     resolve_manifests,
 )
+from engrava.config_validation import ConfigError
 from engrava.cycle_providers import (
     CallableCycleProvider,
     MaxCycleProvider,

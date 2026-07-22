@@ -25,6 +25,36 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
 
+from engrava.config_validation import (
+    ConfigError,
+)
+from engrava.config_validation import (
+    is_finite as _is_finite,
+)
+from engrava.config_validation import (
+    require_bool as _require_bool,
+)
+from engrava.config_validation import (
+    require_finite_number as _require_finite_number,
+)
+from engrava.config_validation import (
+    require_mapping as _require_mapping,
+)
+from engrava.config_validation import (
+    require_nonneg_float as _require_nonneg_float,
+)
+from engrava.config_validation import (
+    require_nonneg_int as _require_nonneg_int,
+)
+from engrava.config_validation import (
+    require_positive_int as _require_positive_int,
+)
+from engrava.config_validation import (
+    require_str_collection as _require_str_collection,
+)
+from engrava.config_validation import (
+    require_unit_float as _require_unit_float,
+)
 from engrava.domain.protocols.derived_records import DeriveGates
 from engrava.domain.protocols.hooks import DefaultEngravaHooks
 
@@ -206,22 +236,40 @@ class DreamingGates:
     cluster_quality_require_meaningful_keyphrases: bool = True
 
     def __post_init__(self) -> None:
-        """Validate field invariants on construction.
+        """Validate every field invariant on construction.
 
-        The YAML loader (:func:`_parse_gates`) performs the same range
-        check before reaching this dataclass — the duplication is
-        intentional so a direct ``DreamingGates(...)`` call from
-        Python code raises the same ``ValueError`` that a malformed
-        YAML would, instead of silently accepting an out-of-range
-        threshold that would later disable a gate (e.g. persona ratio
-        ``> 1.0`` is unreachable so the gate never fires).
+        Enforces the same public invariants the YAML loader (:func:`_parse_gates`)
+        applies, through the shared strict decoders, so a direct
+        ``DreamingGates(...)`` call and a malformed YAML are rejected identically
+        (same :class:`ConfigError`), instead of silently accepting an out-of-range
+        threshold that would later disable a gate (e.g. a persona ratio ``> 1.0``
+        is unreachable so the gate never fires).
 
         Raises:
-            ValueError: When ``cluster_similarity_threshold`` or any
-                ``cluster_quality_*_threshold`` falls outside
-                ``[0.0, 1.0]``.
+            ConfigError: When any integer, float, boolean, literal, or collection
+                field falls outside its documented domain — including a ``bool`` in
+                a numeric field, which is rejected explicitly.
 
         """
+        _require_nonneg_int(self.min_confirmations, "DreamingGates.min_confirmations")
+        _require_nonneg_int(self.min_age_cycles, "DreamingGates.min_age_cycles")
+        _require_positive_int(self.max_promoted_per_run, "DreamingGates.max_promoted_per_run")
+        _require_bool(self.allow_zero_confirmation, "DreamingGates.allow_zero_confirmation")
+        _require_positive_int(self.min_cluster_size, "DreamingGates.min_cluster_size")
+        _require_bool(self.enable_reflections, "DreamingGates.enable_reflections")
+        _require_bool(self.cold_start_clustering, "DreamingGates.cold_start_clustering")
+        _require_bool(
+            self.cluster_quality_gating_enabled,
+            "DreamingGates.cluster_quality_gating_enabled",
+        )
+        _require_bool(
+            self.cluster_quality_require_meaningful_keyphrases,
+            "DreamingGates.cluster_quality_require_meaningful_keyphrases",
+        )
+        _require_nonneg_int(
+            self.clustering_min_new_candidates,
+            "DreamingGates.clustering_min_new_candidates",
+        )
         for field_name in (
             "cluster_similarity_threshold",
             "cluster_quality_persona_threshold",
@@ -229,16 +277,48 @@ class DreamingGates:
             "cluster_quality_external_homogeneity_threshold",
             "cluster_quality_ne_consistency_threshold",
         ):
-            value = getattr(self, field_name)
-            # ``bool`` is a subclass of ``int`` in Python; reject it explicitly so
-            # ``True``/``False`` cannot impersonate ``1.0``/``0.0`` and silently
-            # disable a gate.
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                msg = f"DreamingGates.{field_name} must be a float in [0.0, 1.0]; got {value!r}"
-                raise TypeError(msg)
-            if not 0.0 <= value <= 1.0:
-                msg = f"DreamingGates.{field_name} must be a float in [0.0, 1.0]; got {value!r}"
-                raise ValueError(msg)
+            _require_unit_float(getattr(self, field_name), f"DreamingGates.{field_name}")
+        if self.cluster_algorithm not in ("lpa", "agglomerative"):
+            msg = "DreamingGates.cluster_algorithm must be 'lpa' or 'agglomerative'"
+            raise ConfigError(msg)
+        self._validate_max_cluster_size()
+        self._validate_cluster_allowed_types()
+
+    def _validate_max_cluster_size(self) -> None:
+        """Validate ``max_cluster_size`` is ``None`` or an integer ``>= 2``.
+
+        Split out of :meth:`__post_init__` to keep its branch count within the
+        linter budget.
+
+        Raises:
+            ConfigError: When the value is a ``bool`` or a non-``None`` value that
+                is not an integer ``>= 2``.
+
+        """
+        value = self.max_cluster_size
+        min_bound = 2
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < min_bound
+        ):
+            msg = "DreamingGates.max_cluster_size must be None or an integer >= 2"
+            raise ConfigError(msg)
+
+    def _validate_cluster_allowed_types(self) -> None:
+        """Validate ``cluster_allowed_types`` is a non-empty collection of strings.
+
+        A bare ``str`` iterates character-by-character, so the shared decoder
+        rejects it before the non-empty check — matching the YAML loader, which
+        requires a list/tuple of thought-type strings.
+
+        Raises:
+            ConfigError: When the value is a bare string, is not a
+                list/tuple/set/frozenset, holds a non-string entry, or is empty.
+
+        """
+        _require_str_collection(self.cluster_allowed_types, "DreamingGates.cluster_allowed_types")
+        if not self.cluster_allowed_types:
+            msg = "DreamingGates.cluster_allowed_types must list at least one thought type"
+            raise ConfigError(msg)
 
 
 @dataclass(frozen=True)
@@ -266,6 +346,24 @@ class EdgeCreationConfig:
     top_k: int = 1
     min_similarity: float = 0.7
     edge_weight_factor: float = 0.5
+
+    def __post_init__(self) -> None:
+        """Validate field invariants on construction.
+
+        Enforces the same invariants as the YAML loader
+        (:func:`_parse_edge_creation`) through the shared strict decoders, so a
+        direct ``EdgeCreationConfig(...)`` call and a malformed YAML are rejected
+        identically (same :class:`ConfigError`).
+
+        Raises:
+            ConfigError: When a field falls outside its documented domain
+                (including a ``bool`` in a numeric field).
+
+        """
+        _require_bool(self.enabled, "EdgeCreationConfig.enabled")
+        _require_positive_int(self.top_k, "EdgeCreationConfig.top_k")
+        _require_unit_float(self.min_similarity, "EdgeCreationConfig.min_similarity")
+        _require_nonneg_float(self.edge_weight_factor, "EdgeCreationConfig.edge_weight_factor")
 
 
 @dataclass(frozen=True)
@@ -471,49 +569,145 @@ class DreamingConfig:
     boilerplate_min_keyphrases_per_refl: int = 1
     access_tracking_enabled: bool = True
 
-    def __post_init__(self) -> None:  # noqa: C901 -- each branch validates a distinct field; splitting would obscure validation locality
-        """Validate field values on construction.
+    def __post_init__(self) -> None:
+        """Validate every field invariant on construction.
+
+        Enforces the same public invariants the YAML loader (:func:`_parse_dreaming`)
+        applies, through the shared strict decoders, so a direct
+        ``DreamingConfig(...)`` call and a malformed YAML are rejected identically
+        (same :class:`ConfigError`). Split into cohesive helpers to keep each
+        method's branch count within the linter budget.
 
         Raises:
-            ValueError: If ``max_p1_fraction`` is outside ``[0.0, 1.0]``,
-                ``promote_targets`` is not a recognised literal,
-                ``reflection_default_priority`` is not a recognised literal,
-                ``self_filter_mode`` is not ``any``/``self_only``/``external_only``,
-                ``min_source_confidence`` is not ``high``/``medium``/``low``,
-                or ``eligible_perspectives`` contains a value outside the
-                ``percept``/``utterance``/``thought`` enum.
+            ConfigError: When any scalar, signal-weight, literal, or content-type
+                field falls outside its documented domain (including a ``bool`` in
+                a numeric field, which is rejected explicitly).
 
         """
-        # Signal weights are relative priorities, not a probability
-        # distribution: the scoring path renormalises over the signals active
-        # for each run (see DreamingExtension._compute_active_weights), so the
-        # configured map need not sum to exactly 1.0 — the six shipped defaults
-        # deliberately sum to 1.15. The warning therefore flags only a sum far
-        # enough from the ~1.0 scale that a typo (a near-zero or an inflated
-        # map) is the likely cause, not a legitimately weighted set.
-        weight_sum = sum(self.signals.values())
+        self._validate_scalars()
+        self._validate_signals()
+        self._validate_literals()
+        self._validate_content_type_sets()
+        self._validate_nested()
+
+    def _validate_nested(self) -> None:
+        """Validate the nested ``gates`` / ``edges`` config objects.
+
+        The YAML loader always supplies validated :class:`DreamingGates` /
+        :class:`EdgeCreationConfig` objects; direct construction must reject an
+        ill-typed nested config the same way rather than accept it silently.
+
+        Raises:
+            ConfigError: When ``gates`` is not a :class:`DreamingGates` or ``edges``
+                is not an :class:`EdgeCreationConfig`.
+
+        """
+        if not isinstance(self.gates, DreamingGates):
+            msg = "DreamingConfig.gates must be a DreamingGates"
+            raise ConfigError(msg)
+        if not isinstance(self.edges, EdgeCreationConfig):
+            msg = "DreamingConfig.edges must be an EdgeCreationConfig"
+            raise ConfigError(msg)
+
+    def _validate_scalars(self) -> None:
+        """Validate the numeric and boolean scalar fields.
+
+        Raises:
+            ConfigError: When a scalar field falls outside its documented domain.
+
+        """
+        _require_bool(self.enabled, "DreamingConfig.enabled")
+        _require_positive_int(
+            self.schedule_every_n_cycles, "DreamingConfig.schedule_every_n_cycles"
+        )
+        _require_unit_float(self.promote_threshold, "DreamingConfig.promote_threshold")
+        _require_positive_int(self.candidates_limit, "DreamingConfig.candidates_limit")
+        _require_positive_int(self.top_keyphrases_count, "DreamingConfig.top_keyphrases_count")
+        _require_positive_int(
+            self.top_member_excerpts_count,
+            "DreamingConfig.top_member_excerpts_count",
+        )
+        _require_positive_int(
+            self.member_excerpt_max_chars,
+            "DreamingConfig.member_excerpt_max_chars",
+        )
+        _require_unit_float(self.max_p1_fraction, "DreamingConfig.max_p1_fraction")
+        _require_unit_float(self.boilerplate_threshold, "DreamingConfig.boilerplate_threshold")
+        _require_positive_int(
+            self.boilerplate_min_corpus_size,
+            "DreamingConfig.boilerplate_min_corpus_size",
+        )
+        _require_nonneg_int(
+            self.boilerplate_min_keyphrases_per_refl,
+            "DreamingConfig.boilerplate_min_keyphrases_per_refl",
+        )
+        _require_bool(self.access_tracking_enabled, "DreamingConfig.access_tracking_enabled")
+
+    def _validate_signals(self) -> None:
+        """Validate ``signals`` keys/weights and warn on an implausible weight sum.
+
+        Signal weights are relative priorities, not a probability distribution:
+        the scoring path renormalises over the signals active for each run (see
+        ``DreamingExtension._compute_active_weights``), so the configured map need
+        not sum to exactly 1.0 — the six shipped defaults deliberately sum to 1.15.
+        The warning therefore flags only a sum far enough from the ~1.0 scale that a
+        typo (a near-zero or an inflated map) is the likely cause.
+
+        Raises:
+            ConfigError: When ``signals`` is not a mapping, a signal name is not a
+                string, or a weight is not a real number (a ``bool`` is rejected
+                explicitly).
+
+        """
+        signals = _require_mapping(self.signals, "DreamingConfig.signals")
+        for name, weight in signals.items():
+            if not isinstance(name, str):
+                msg = f"DreamingConfig.signals keys must be strings, got {type(name).__name__}"
+                raise ConfigError(msg)
+            _require_finite_number(weight, f"DreamingConfig.signals[{name!r}]")
+        # Each weight is finite, but their sum can still overflow to +/-inf (e.g.
+        # two ~1e308 weights). A non-finite total would silently zero every
+        # normalised weight in the scorer, so reject it here rather than degrade.
+        weight_sum = sum(signals.values())
+        if not _is_finite(weight_sum):
+            msg = "DreamingConfig.signals weights must sum to a finite value"
+            raise ConfigError(msg)
         if not 0.5 <= weight_sum <= 1.5:  # noqa: PLR2004
             logger.warning(
                 "Dreaming signal weights sum to %.3f (expected roughly 1.0); "
                 "scoring may behave unexpectedly",
                 weight_sum,
             )
-        if not 0.0 <= self.max_p1_fraction <= 1.0:
-            msg = "DreamingConfig.max_p1_fraction must be in [0.0, 1.0]"
-            raise ValueError(msg)
+
+    def _validate_literals(self) -> None:
+        """Validate the closed-enum (``Literal``) fields.
+
+        Raises:
+            ConfigError: When a literal field carries an unrecognised value, or
+                ``eligible_perspectives`` contains a value outside the
+                ``percept``/``utterance``/``thought`` enum.
+
+        """
+        if self.clustering_backend not in ("python", "numpy"):
+            msg = "DreamingConfig.clustering_backend must be 'python' or 'numpy'"
+            raise ConfigError(msg)
         if self.promote_targets not in ("OBS_ONLY", "REFL_ONLY", "ALL"):
             msg = "DreamingConfig.promote_targets must be 'OBS_ONLY', 'REFL_ONLY', or 'ALL'"
-            raise ValueError(msg)
+            raise ConfigError(msg)
         if self.reflection_default_priority not in ("P1", "P2", "P3"):
             msg = "DreamingConfig.reflection_default_priority must be 'P1', 'P2', or 'P3'"
-            raise ValueError(msg)
+            raise ConfigError(msg)
         if self.self_filter_mode not in ("any", "self_only", "external_only"):
             msg = "DreamingConfig.self_filter_mode must be 'any', 'self_only', or 'external_only'"
-            raise ValueError(msg)
+            raise ConfigError(msg)
         if self.min_source_confidence not in ("high", "medium", "low"):
             msg = "DreamingConfig.min_source_confidence must be 'high', 'medium', or 'low'"
-            raise ValueError(msg)
+            raise ConfigError(msg)
         if self.eligible_perspectives is not None:
+            _require_str_collection(
+                self.eligible_perspectives,
+                "DreamingConfig.eligible_perspectives",
+            )
             allowed_perspectives = {"percept", "utterance", "thought"}
             invalid = set(self.eligible_perspectives) - allowed_perspectives
             if invalid:
@@ -522,16 +716,29 @@ class DreamingConfig:
                     f"value(s) {sorted(invalid)!r}; allowed: "
                     f"'percept', 'utterance', 'thought'"
                 )
-                raise ValueError(msg)
-        if not 0.0 <= self.boilerplate_threshold <= 1.0:
-            msg = "DreamingConfig.boilerplate_threshold must be in [0.0, 1.0]"
-            raise ValueError(msg)
-        if self.boilerplate_min_corpus_size < 1:
-            msg = "DreamingConfig.boilerplate_min_corpus_size must be >= 1"
-            raise ValueError(msg)
-        if self.boilerplate_min_keyphrases_per_refl < 0:
-            msg = "DreamingConfig.boilerplate_min_keyphrases_per_refl must be >= 0"
-            raise ValueError(msg)
+                raise ConfigError(msg)
+
+    def _validate_content_type_sets(self) -> None:
+        """Validate the content-type filter sets are collections of strings.
+
+        A bare ``str`` iterates character-by-character, so the shared decoder
+        rejects it — matching the YAML loader, which requires a list of strings.
+
+        Raises:
+            ConfigError: When ``excluded_content_types`` or a non-``None``
+                ``eligible_content_types`` is a bare string or holds a non-string
+                entry.
+
+        """
+        _require_str_collection(
+            self.excluded_content_types,
+            "DreamingConfig.excluded_content_types",
+        )
+        if self.eligible_content_types is not None:
+            _require_str_collection(
+                self.eligible_content_types,
+                "DreamingConfig.eligible_content_types",
+            )
 
 
 @dataclass(frozen=True)
@@ -655,51 +862,42 @@ class HygienePolicyConfig:
     gc_restore_window_seconds: int = 2592000
 
     def __post_init__(self) -> None:
-        """Validate field invariants on construction.
+        """Validate every field invariant on construction.
 
-        The YAML loader (:func:`_parse_hygiene`) performs the same checks
-        before reaching this dataclass — the duplication is intentional so a
-        direct ``HygienePolicyConfig(...)`` call from Python raises the same
-        errors a malformed YAML would, instead of silently accepting an
+        Enforces the same public invariants the YAML loader (:func:`_parse_hygiene`)
+        applies, through the shared strict decoders, so a direct
+        ``HygienePolicyConfig(...)`` call and a malformed YAML are rejected
+        identically (same :class:`ConfigError`), instead of silently accepting an
         out-of-range value that would later mis-drive eviction.
 
         Raises:
-            TypeError: When ``eviction_threshold`` is not a real number, or a
-                ``protected_priorities`` / ``signal_weights`` entry has the
-                wrong type.
-            ValueError: When ``eviction_threshold`` is outside ``[0.0, 1.0]``,
-                ``check_every_n_cycles`` or ``max_evictions_per_run`` is ``< 1``,
-                or ``gc_min_archive_age_cycles`` / ``min_inactivity_age_seconds``
-                / ``gc_restore_window_seconds`` is ``< 0``.
+            ConfigError: When any boolean, threshold, integer, or collection field
+                falls outside its documented domain — including a ``bool`` in a
+                numeric field, which is rejected explicitly.
 
         """
-        # ``bool`` is an ``int`` subclass; reject it explicitly so ``True`` /
-        # ``False`` cannot impersonate ``1.0`` / ``0.0`` for the threshold.
-        if isinstance(self.eviction_threshold, bool) or not isinstance(
-            self.eviction_threshold,
-            (int, float),
-        ):
-            msg = "HygienePolicyConfig.eviction_threshold must be a float in [0.0, 1.0]"
-            raise TypeError(msg)
-        if not 0.0 <= self.eviction_threshold <= 1.0:
-            msg = "HygienePolicyConfig.eviction_threshold must be a float in [0.0, 1.0]"
-            raise ValueError(msg)
+        _require_bool(self.enabled, "HygienePolicyConfig.enabled")
+        _require_unit_float(self.eviction_threshold, "HygienePolicyConfig.eviction_threshold")
         self._validate_collections()
-        if self.check_every_n_cycles < 1:
-            msg = "HygienePolicyConfig.check_every_n_cycles must be >= 1"
-            raise ValueError(msg)
-        if self.max_evictions_per_run < 1:
-            msg = "HygienePolicyConfig.max_evictions_per_run must be >= 1"
-            raise ValueError(msg)
-        if self.gc_min_archive_age_cycles < 0:
-            msg = "HygienePolicyConfig.gc_min_archive_age_cycles must be >= 0"
-            raise ValueError(msg)
-        if self.min_inactivity_age_seconds < 0:
-            msg = "HygienePolicyConfig.min_inactivity_age_seconds must be >= 0"
-            raise ValueError(msg)
-        if self.gc_restore_window_seconds < 0:
-            msg = "HygienePolicyConfig.gc_restore_window_seconds must be >= 0"
-            raise ValueError(msg)
+        _require_positive_int(self.check_every_n_cycles, "HygienePolicyConfig.check_every_n_cycles")
+        _require_positive_int(
+            self.max_evictions_per_run,
+            "HygienePolicyConfig.max_evictions_per_run",
+        )
+        _require_bool(self.auto_gc_enabled, "HygienePolicyConfig.auto_gc_enabled")
+        _require_nonneg_int(
+            self.gc_min_archive_age_cycles,
+            "HygienePolicyConfig.gc_min_archive_age_cycles",
+        )
+        _require_bool(self.dry_run, "HygienePolicyConfig.dry_run")
+        _require_nonneg_int(
+            self.min_inactivity_age_seconds,
+            "HygienePolicyConfig.min_inactivity_age_seconds",
+        )
+        _require_nonneg_int(
+            self.gc_restore_window_seconds,
+            "HygienePolicyConfig.gc_restore_window_seconds",
+        )
 
     def _validate_collections(self) -> None:
         """Validate the ``protected_priorities`` and ``signal_weights`` entries.
@@ -709,21 +907,42 @@ class HygienePolicyConfig:
         direct-construction guards the YAML loader also applies.
 
         Raises:
-            TypeError: When a ``protected_priorities`` entry is not a string, or
-                a ``signal_weights`` key is not a string / value is not numeric.
+            ConfigError: When ``protected_priorities`` is a bare string / holds a
+                non-string entry, or ``signal_weights`` is not a mapping / a key is
+                not a string / a value is not numeric (a ``bool`` weight is rejected
+                explicitly).
 
         """
-        for priority in self.protected_priorities:
-            if not isinstance(priority, str):
-                msg = "HygienePolicyConfig.protected_priorities entries must be strings"
-                raise TypeError(msg)
-        for name, weight in self.signal_weights.items():
+        _require_str_collection(
+            self.protected_priorities,
+            "HygienePolicyConfig.protected_priorities",
+        )
+        signal_weights = _require_mapping(
+            self.signal_weights,
+            "HygienePolicyConfig.signal_weights",
+        )
+        for name, weight in signal_weights.items():
             if not isinstance(name, str):
                 msg = "HygienePolicyConfig.signal_weights keys must be strings"
-                raise TypeError(msg)
-            if isinstance(weight, bool) or not isinstance(weight, (int, float)):
-                msg = f"HygienePolicyConfig.signal_weights[{name!r}] must be numeric"
-                raise TypeError(msg)
+                raise ConfigError(msg)
+            _require_finite_number(weight, f"HygienePolicyConfig.signal_weights[{name!r}]")
+        # Each weight is finite, but their sum can still overflow to +/-inf; a
+        # non-finite total would silently zero every normalised keep-score weight,
+        # so reject it here rather than degrade the hygiene pass.
+        if not _is_finite(sum(signal_weights.values())):
+            msg = "HygienePolicyConfig.signal_weights must sum to a finite value"
+            raise ConfigError(msg)
+
+
+_VALID_PROVIDERS = frozenset(
+    {
+        "sentence-transformer",
+        "openai-compatible",
+        "ollama",
+        "huggingface",
+    }
+)
+"""Valid built-in embedding provider identifiers."""
 
 
 @dataclass(frozen=True)
@@ -780,6 +999,45 @@ class EmbeddingConfig:
     api_key: str | None = None
     query_prefix: str | None = None
     document_prefix: str | None = None
+
+    def __post_init__(self) -> None:
+        """Validate field invariants on construction.
+
+        Enforces the same invariants as the YAML loader
+        (:func:`_parse_embeddings`) through the shared strict decoders, so a direct
+        ``EmbeddingConfig(...)`` call and a malformed YAML are rejected identically
+        (same :class:`ConfigError`). Environment-variable resolution for ``api_key``
+        (``${VAR}`` syntax) remains a YAML-loader concern; direct construction takes
+        the value verbatim.
+
+        Raises:
+            ConfigError: When ``provider`` is not a recognised identifier, a string
+                field is not a string, ``batch_size`` is not a positive integer, or a
+                boolean field is not a ``bool``.
+
+        """
+        # Check the type before the membership test: an unhashable ``provider``
+        # (e.g. a list) would raise ``TypeError`` from ``in`` on a frozenset, so the
+        # ``isinstance`` short-circuit keeps the failure a ``ConfigError``.
+        if self.provider is not None and (
+            not isinstance(self.provider, str) or self.provider not in _VALID_PROVIDERS
+        ):
+            msg = (
+                f"EmbeddingConfig.provider must be one of {sorted(_VALID_PROVIDERS)} "
+                f"or None, got {self.provider!r}"
+            )
+            raise ConfigError(msg)
+        for field_name in ("model", "base_url", "api_key", "query_prefix", "document_prefix"):
+            value = getattr(self, field_name)
+            if value is not None and not isinstance(value, str):
+                msg = f"EmbeddingConfig.{field_name} must be a string or None"
+                raise ConfigError(msg)
+        if not isinstance(self.device, str):
+            msg = "EmbeddingConfig.device must be a string"
+            raise ConfigError(msg)
+        _require_bool(self.auto_embed, "EmbeddingConfig.auto_embed")
+        _require_bool(self.require_embedding, "EmbeddingConfig.require_embedding")
+        _require_positive_int(self.batch_size, "EmbeddingConfig.batch_size")
 
 
 @dataclass(frozen=True)
@@ -897,6 +1155,79 @@ class SearchConfig:
     collapse_pool_factor: int = 4
     vec0_overfetch_factor: int = 4
 
+    def __post_init__(self) -> None:
+        """Validate field invariants on construction.
+
+        Enforces the same invariants as the YAML loader (:func:`_parse_search`)
+        through the shared strict decoders, so a direct ``SearchConfig(...)`` call
+        and a malformed YAML are rejected identically (same :class:`ConfigError`),
+        including a ``bool`` in any numeric field.
+
+        Raises:
+            ConfigError: When any weight/boost/decay is not a non-negative number,
+                any count/window is not a positive integer, or
+                ``graph_expansion_enabled`` is not a ``bool``.
+
+        """
+        self._validate_weights()
+        self._validate_counts()
+        _require_bool(self.graph_expansion_enabled, "SearchConfig.graph_expansion_enabled")
+
+    def _validate_weights(self) -> None:
+        """Validate the non-negative float weight/boost/decay fields.
+
+        Raises:
+            ConfigError: When a field is not a non-negative number.
+
+        """
+        _require_nonneg_float(self.default_fts_weight, "SearchConfig.default_fts_weight")
+        _require_nonneg_float(self.default_vector_weight, "SearchConfig.default_vector_weight")
+        _require_nonneg_float(self.default_recency_weight, "SearchConfig.default_recency_weight")
+        _require_nonneg_float(self.default_priority_weight, "SearchConfig.default_priority_weight")
+        _require_nonneg_float(self.default_graph_weight, "SearchConfig.default_graph_weight")
+        _require_nonneg_float(self.priority_boost_p1, "SearchConfig.priority_boost_p1")
+        _require_nonneg_float(self.priority_boost_p2, "SearchConfig.priority_boost_p2")
+        _require_nonneg_float(self.priority_boost_p3, "SearchConfig.priority_boost_p3")
+        _require_nonneg_float(self.priority_boost_p4, "SearchConfig.priority_boost_p4")
+        _require_nonneg_float(self.graph_edge_decay, "SearchConfig.graph_edge_decay")
+        _require_nonneg_float(self.reflection_boost, "SearchConfig.reflection_boost")
+        _require_nonneg_float(
+            self.graph_expansion_propagation_factor,
+            "SearchConfig.graph_expansion_propagation_factor",
+        )
+        # ``reflection_topk_cap`` is a fraction of the top-K window in [0.0, 1.0]
+        # (1.0 disables the cap); a value > 1.0 is meaningless, so it takes the
+        # unit-interval decoder rather than the plain non-negative one.
+        _require_unit_float(self.reflection_topk_cap, "SearchConfig.reflection_topk_cap")
+
+    def _validate_counts(self) -> None:
+        """Validate the positive-integer count/window fields.
+
+        Raises:
+            ConfigError: When a field is not a positive integer.
+
+        """
+        _require_positive_int(self.recency_half_life, "SearchConfig.recency_half_life")
+        _require_positive_int(
+            self.recency_now_half_life_seconds,
+            "SearchConfig.recency_now_half_life_seconds",
+        )
+        _require_positive_int(
+            self.max_neighbors_per_candidate,
+            "SearchConfig.max_neighbors_per_candidate",
+        )
+        _require_positive_int(self.graph_expansion_top_n, "SearchConfig.graph_expansion_top_n")
+        _require_positive_int(
+            self.graph_expansion_max_sources_per_reflection,
+            "SearchConfig.graph_expansion_max_sources_per_reflection",
+        )
+        _require_positive_int(
+            self.graph_expansion_reflection_source_ceiling,
+            "SearchConfig.graph_expansion_reflection_source_ceiling",
+        )
+        _require_positive_int(self.collapse_pool_factor, "SearchConfig.collapse_pool_factor")
+        _require_positive_int(self.vec0_overfetch_factor, "SearchConfig.vec0_overfetch_factor")
+
 
 @dataclass(frozen=True)
 class ServiceConfig:
@@ -913,6 +1244,22 @@ class ServiceConfig:
     """
 
     embeddings: EmbeddingConfig | None = None
+
+    def __post_init__(self) -> None:
+        """Validate the ``embeddings`` override on construction.
+
+        Enforces the same invariant the YAML loader (:func:`_parse_service_config`)
+        applies, so a direct ``ServiceConfig(...)`` and a malformed YAML reject an
+        ill-typed override identically (same :class:`ConfigError`).
+
+        Raises:
+            ConfigError: When ``embeddings`` is neither ``None`` nor an
+                :class:`EmbeddingConfig`.
+
+        """
+        if self.embeddings is not None and not isinstance(self.embeddings, EmbeddingConfig):
+            msg = "ServiceConfig.embeddings must be an EmbeddingConfig or None"
+            raise ConfigError(msg)
 
 
 @dataclass(frozen=True)
@@ -937,6 +1284,38 @@ class ServicesConfig:
     data_dir: Path
     default_service: str = "main"
     configs: dict[str, ServiceConfig] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Validate the data directory, default service, and per-service configs.
+
+        Enforces the same invariants the YAML loader (:func:`_parse_services`)
+        applies, so a direct ``ServicesConfig(...)`` and a malformed YAML reject the
+        same values identically (same :class:`ConfigError`). ``default_service`` is
+        type-checked before the name-pattern match so a non-string cannot reach the
+        regex (which would raise ``TypeError``).
+
+        Raises:
+            ConfigError: When ``data_dir`` is not a :class:`~pathlib.Path`,
+                ``default_service`` is not a well-formed service name, ``configs`` is
+                not a mapping, or a config key/value is ill-formed.
+
+        """
+        if not isinstance(self.data_dir, Path):
+            msg = "ServicesConfig.data_dir must be a Path"
+            raise ConfigError(msg)
+        if not isinstance(self.default_service, str):
+            msg = "ServicesConfig.default_service must be a string"
+            raise ConfigError(msg)
+        _validate_service_name(self.default_service)
+        configs = _require_mapping(self.configs, "ServicesConfig.configs")
+        for name, service in configs.items():
+            if not isinstance(name, str):
+                msg = "ServicesConfig.configs keys must be strings"
+                raise ConfigError(msg)
+            _validate_service_name(name)
+            if not isinstance(service, ServiceConfig):
+                msg = f"ServicesConfig.configs[{name!r}] must be a ServiceConfig"
+                raise ConfigError(msg)
 
 
 @dataclass(frozen=True)
@@ -969,6 +1348,20 @@ class JournalConfig:
     enabled: bool = False
     verify_on_open: bool = False
 
+    def __post_init__(self) -> None:
+        """Validate field invariants on construction.
+
+        Enforces the same invariants as the YAML loader (:func:`_parse_journal`),
+        so a direct ``JournalConfig(...)`` and a malformed YAML reject a non-boolean
+        identically (same :class:`ConfigError`).
+
+        Raises:
+            ConfigError: When ``enabled`` or ``verify_on_open`` is not a ``bool``.
+
+        """
+        _require_bool(self.enabled, "JournalConfig.enabled")
+        _require_bool(self.verify_on_open, "JournalConfig.verify_on_open")
+
 
 @dataclass(frozen=True)
 class TTLConfig:
@@ -991,6 +1384,27 @@ class TTLConfig:
     check_every_n_operations: int = 0
     default_ttl_seconds: int | None = None
 
+    def __post_init__(self) -> None:
+        """Validate field invariants on construction.
+
+        Enforces the same invariants as the YAML loader (:func:`_parse_ttl`), so a
+        direct ``TTLConfig(...)`` and a malformed YAML reject the same values
+        identically (same :class:`ConfigError`), including a ``bool`` in an integer
+        field.
+
+        Raises:
+            ConfigError: When ``strategy`` is not ``'archive'``/``'delete'``,
+                ``check_every_n_operations`` is not a non-negative integer, or
+                ``default_ttl_seconds`` is neither ``None`` nor a positive integer.
+
+        """
+        if self.strategy not in ("archive", "delete"):
+            msg = f"TTLConfig.strategy must be 'archive' or 'delete', got {self.strategy!r}"
+            raise ConfigError(msg)
+        _require_nonneg_int(self.check_every_n_operations, "TTLConfig.check_every_n_operations")
+        if self.default_ttl_seconds is not None:
+            _require_positive_int(self.default_ttl_seconds, "TTLConfig.default_ttl_seconds")
+
 
 @dataclass(frozen=True)
 class MetricsConfig:
@@ -1005,6 +1419,22 @@ class MetricsConfig:
 
     window_size: int = 1000
     enabled: bool = True
+
+    def __post_init__(self) -> None:
+        """Validate field invariants on construction.
+
+        Enforces the same invariants as the YAML loader (:func:`_parse_metrics`),
+        so a direct ``MetricsConfig(...)`` and a malformed YAML reject the same
+        values identically (same :class:`ConfigError`), including a ``bool`` in the
+        integer ``window_size``.
+
+        Raises:
+            ConfigError: When ``window_size`` is not a positive integer or
+                ``enabled`` is not a ``bool``.
+
+        """
+        _require_positive_int(self.window_size, "MetricsConfig.window_size")
+        _require_bool(self.enabled, "MetricsConfig.enabled")
 
 
 @dataclass(frozen=True)
@@ -1040,6 +1470,19 @@ class IngestConfig:
     """
 
     deduplication_enabled: bool = True
+
+    def __post_init__(self) -> None:
+        """Validate field invariants on construction.
+
+        Enforces the same invariant as the YAML loader (:func:`_parse_ingest`), so a
+        direct ``IngestConfig(...)`` and a malformed YAML reject a non-boolean
+        identically (same :class:`ConfigError`).
+
+        Raises:
+            ConfigError: When ``deduplication_enabled`` is not a ``bool``.
+
+        """
+        _require_bool(self.deduplication_enabled, "IngestConfig.deduplication_enabled")
 
 
 @dataclass(frozen=True)
@@ -1104,23 +1547,86 @@ class EngravaConfig:
     extension_manifest_paths: list[str] = field(default_factory=list)
     extension_discover: bool = False
 
+    def __post_init__(self) -> None:
+        """Validate the top-level invariants on construction.
+
+        Enforces the same invariants the YAML loader (:func:`_parse_config`) applies
+        to the flattened ``database`` / ``extensions.vector`` scalars, the manifest
+        paths, and the nested config types, so a direct ``EngravaConfig(...)`` and a
+        malformed YAML reject the same values identically (same :class:`ConfigError`).
+
+        Raises:
+            ConfigError: When ``database_path`` is not a :class:`~pathlib.Path`,
+                ``wal_mode`` / ``extension_discover`` is not a ``bool``,
+                ``vector_backend`` is not a recognised backend,
+                ``embedding_dimension`` is not a positive integer, ``hooks_class`` is
+                neither a string nor ``None``, ``extension_manifest_paths`` is not a
+                list of well-formed dotted paths, or a nested config has the wrong
+                type.
+
+        """
+        if not isinstance(self.database_path, Path):
+            msg = "EngravaConfig.database_path must be a Path"
+            raise ConfigError(msg)
+        _require_bool(self.wal_mode, "EngravaConfig.wal_mode")
+        if self.vector_backend not in ("numpy", "sqlite-vec"):
+            msg = (
+                "EngravaConfig.vector_backend must be 'numpy' or 'sqlite-vec', "
+                f"got {self.vector_backend!r}"
+            )
+            raise ConfigError(msg)
+        _require_positive_int(self.embedding_dimension, "EngravaConfig.embedding_dimension")
+        _require_bool(self.extension_discover, "EngravaConfig.extension_discover")
+        if self.hooks_class is not None and not isinstance(self.hooks_class, str):
+            msg = "EngravaConfig.hooks_class must be a string or None"
+            raise ConfigError(msg)
+        _require_str_collection(
+            self.extension_manifest_paths,
+            "EngravaConfig.extension_manifest_paths",
+        )
+        _validate_manifest_paths(self.extension_manifest_paths)
+        self._validate_nested_types()
+
+    def _validate_nested_types(self) -> None:
+        """Validate every nested config object has its declared type.
+
+        Split out of :meth:`__post_init__` to keep its branch count within the
+        linter budget. The YAML loader always produces the right types; direct
+        construction must reject an ill-typed nested config the same way.
+
+        Raises:
+            ConfigError: When an optional nested config is neither ``None`` nor its
+                type, or a required nested config is not its type.
+
+        """
+        optional: tuple[tuple[str, type], ...] = (
+            ("dreaming", DreamingConfig),
+            ("hygiene_policy", HygienePolicyConfig),
+            ("embeddings", EmbeddingConfig),
+            ("services", ServicesConfig),
+        )
+        for name, cls in optional:
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, cls):
+                msg = f"EngravaConfig.{name} must be a {cls.__name__} or None"
+                raise ConfigError(msg)
+        required: tuple[tuple[str, type], ...] = (
+            ("search", SearchConfig),
+            ("journal", JournalConfig),
+            ("ttl", TTLConfig),
+            ("metrics", MetricsConfig),
+            ("ingest", IngestConfig),
+            ("derive", DeriveGates),
+        )
+        for name, cls in required:
+            if not isinstance(getattr(self, name), cls):
+                msg = f"EngravaConfig.{name} must be a {cls.__name__}"
+                raise ConfigError(msg)
+
 
 # ------------------------------------------------------------------
 # YAML loader
 # ------------------------------------------------------------------
-
-
-class ConfigError(Exception):
-    """Raised when engrava configuration is invalid.
-
-    Attributes:
-        message: Human-readable error description.
-
-    """
-
-    def __init__(self, message: str) -> None:
-        self.message = message
-        super().__init__(message)
 
 
 def load_config(path: str | Path) -> EngravaConfig:
@@ -1173,38 +1679,39 @@ def _parse_config(raw: dict[str, Any]) -> EngravaConfig:
         ConfigError: On missing or invalid fields.
 
     """
-    db_section = raw.get("database", {})
-    if not isinstance(db_section, dict):
-        msg = "'database' must be a mapping"
-        raise ConfigError(msg)
+    db_section = _require_mapping(raw.get("database", {}), "database")
 
     db_path = db_section.get("path")
     if not db_path:
         msg = "'database.path' is required"
         raise ConfigError(msg)
-
-    wal_mode = db_section.get("wal_mode", True)
-    if not isinstance(wal_mode, bool):
-        msg = "'database.wal_mode' must be a boolean"
+    # Type-check before ``Path(...)`` so a non-string (e.g. a list) is rejected as
+    # a ConfigError rather than leaking a raw TypeError from the Path constructor.
+    if not isinstance(db_path, str):
+        msg = "'database.path' must be a string"
         raise ConfigError(msg)
+
+    wal_mode = _require_bool(db_section.get("wal_mode", True), "database.wal_mode")
 
     # Extensions section
-    ext_section = raw.get("extensions", {})
-    if not isinstance(ext_section, dict):
-        msg = "'extensions' must be a mapping"
-        raise ConfigError(msg)
+    ext_section = _require_mapping(raw.get("extensions", {}), "extensions")
 
-    vector_cfg = ext_section.get("vector", {})
     vector_backend = "numpy"
     embedding_dimension = 384
-    if isinstance(vector_cfg, dict):
+    raw_vector = ext_section.get("vector")
+    # An explicit ``vector: null`` (and an absent section) means "unset" and keeps
+    # the defaults — the conventional YAML reading of null, consistent with every
+    # other optional section (``dreaming``, ``search``, ``hooks`` below, ...). A
+    # non-null, non-mapping ``vector`` is malformed and must fail loudly rather than
+    # silently retaining the defaults.
+    if raw_vector is not None:
+        vector_cfg = _require_mapping(raw_vector, "extensions.vector")
         vector_backend = vector_cfg.get("backend", "numpy")
-        raw_dim = vector_cfg.get("dimension", 384)
-        if not isinstance(raw_dim, int) or raw_dim < 1:
-            msg = f"'extensions.vector.dimension' must be a positive integer, got {raw_dim!r}"
-            raise ConfigError(msg)
-        embedding_dimension = raw_dim
-    if vector_backend not in {"numpy", "sqlite-vec"}:
+        embedding_dimension = _require_positive_int(
+            vector_cfg.get("dimension", 384),
+            "extensions.vector.dimension",
+        )
+    if vector_backend not in ("numpy", "sqlite-vec"):
         msg = f"'extensions.vector.backend' must be 'numpy' or 'sqlite-vec', got {vector_backend!r}"
         raise ConfigError(msg)
 
@@ -1220,9 +1727,13 @@ def _parse_config(raw: dict[str, Any]) -> EngravaConfig:
     search_cfg = _parse_search(raw.get("search"))
 
     # Hooks section
-    hooks_section = raw.get("hooks", {})
+    raw_hooks = raw.get("hooks")
     hooks_class: str | None = None
-    if isinstance(hooks_section, dict):
+    # ``hooks: null`` (and an absent section) means "unset" → the no-hooks default,
+    # matching the ``vector`` null handling above; a non-null, non-mapping ``hooks``
+    # is malformed and must fail loudly rather than silently retaining the default.
+    if raw_hooks is not None:
+        hooks_section = _require_mapping(raw_hooks, "hooks")
         hooks_class = hooks_section.get("class")
 
     # Services section
@@ -1276,20 +1787,10 @@ def _parse_metrics(raw: Any) -> MetricsConfig:  # noqa: ANN401
     """Parse the ``metrics:`` YAML section."""
     if raw is None:
         return MetricsConfig()
-    if not isinstance(raw, dict):
-        msg = "'metrics' must be a mapping"
-        raise ConfigError(msg)
+    raw = _require_mapping(raw, "metrics")
 
-    window_size = raw.get("window_size", 1000)
-    if not isinstance(window_size, int) or window_size < 1:
-        msg = "'metrics.window_size' must be a positive integer"
-        raise ConfigError(msg)
-
-    enabled = raw.get("enabled", True)
-    if not isinstance(enabled, bool):
-        msg = "'metrics.enabled' must be a boolean"
-        raise ConfigError(msg)
-
+    window_size = _require_positive_int(raw.get("window_size", 1000), "metrics.window_size")
+    enabled = _require_bool(raw.get("enabled", True), "metrics.enabled")
     return MetricsConfig(window_size=window_size, enabled=enabled)
 
 
@@ -1302,15 +1803,12 @@ def _parse_ingest(raw: Any) -> IngestConfig:  # noqa: ANN401
     """Parse the ``ingest:`` YAML section (content-hash deduplication)."""
     if raw is None:
         return IngestConfig()
-    if not isinstance(raw, dict):
-        msg = "'ingest' must be a mapping"
-        raise ConfigError(msg)
+    raw = _require_mapping(raw, "ingest")
 
-    deduplication_enabled = raw.get("deduplication_enabled", True)
-    if not isinstance(deduplication_enabled, bool):
-        msg = "'ingest.deduplication_enabled' must be a boolean"
-        raise ConfigError(msg)
-
+    deduplication_enabled = _require_bool(
+        raw.get("deduplication_enabled", True),
+        "ingest.deduplication_enabled",
+    )
     return IngestConfig(deduplication_enabled=deduplication_enabled)
 
 
@@ -1335,24 +1833,19 @@ def _parse_derive(raw: Any) -> DeriveGates:  # noqa: ANN401
     """
     if raw is None:
         return DeriveGates()
-    if not isinstance(raw, dict):
-        msg = "'derive' must be a mapping"
-        raise ConfigError(msg)
+    raw = _require_mapping(raw, "derive")
 
-    enabled = raw.get("enabled", False)
-    if not isinstance(enabled, bool):
-        msg = "'derive.enabled' must be a boolean"
-        raise ConfigError(msg)
+    enabled = _require_bool(raw.get("enabled", False), "derive.enabled")
 
     on_error = raw.get("on_error", "log")
     if on_error not in ("raise", "log"):
         msg = "'derive.on_error' must be 'raise' or 'log'"
         raise ConfigError(msg)
 
-    max_derived = raw.get("max_derived_per_source", 32)
-    if isinstance(max_derived, bool) or not isinstance(max_derived, int) or max_derived < 1:
-        msg = "'derive.max_derived_per_source' must be a positive integer"
-        raise ConfigError(msg)
+    max_derived = _require_positive_int(
+        raw.get("max_derived_per_source", 32),
+        "derive.max_derived_per_source",
+    )
 
     return DeriveGates(
         enabled=enabled,
@@ -1403,9 +1896,7 @@ def _parse_service_config(name: str, raw: Any) -> ServiceConfig:  # noqa: ANN401
     """
     if raw is None:
         return ServiceConfig()
-    if not isinstance(raw, dict):
-        msg = f"'services.configs.{name}' must be a mapping"
-        raise ConfigError(msg)
+    raw = _require_mapping(raw, f"services.configs.{name}")
 
     embeddings_cfg = _parse_embeddings(raw.get("embeddings"))
     return ServiceConfig(embeddings=embeddings_cfg)
@@ -1426,9 +1917,7 @@ def _parse_services(raw: Any) -> ServicesConfig | None:  # noqa: ANN401
     """
     if raw is None:
         return None
-    if not isinstance(raw, dict):
-        msg = "'services' must be a mapping"
-        raise ConfigError(msg)
+    raw = _require_mapping(raw, "services")
 
     data_dir = raw.get("data_dir")
     if not data_dir:
@@ -1444,10 +1933,7 @@ def _parse_services(raw: Any) -> ServicesConfig | None:  # noqa: ANN401
         raise ConfigError(msg)
     _validate_service_name(default_service)
 
-    configs_raw = raw.get("configs", {})
-    if not isinstance(configs_raw, dict):
-        msg = "'services.configs' must be a mapping"
-        raise ConfigError(msg)
+    configs_raw = _require_mapping(raw.get("configs", {}), "services.configs")
 
     configs: dict[str, ServiceConfig] = {}
     for svc_name, svc_raw in configs_raw.items():
@@ -1464,7 +1950,7 @@ def _parse_services(raw: Any) -> ServicesConfig | None:  # noqa: ANN401
     )
 
 
-def _parse_dreaming(raw: Any) -> DreamingConfig | None:  # noqa: ANN401, C901, PLR0912, PLR0915
+def _parse_dreaming(raw: Any) -> DreamingConfig | None:  # noqa: ANN401, C901, PLR0915
     """Parse the ``extensions.dreaming`` section.
 
     Args:
@@ -1479,24 +1965,19 @@ def _parse_dreaming(raw: Any) -> DreamingConfig | None:  # noqa: ANN401, C901, P
     """
     if raw is None:
         return None
-    if not isinstance(raw, dict):
-        msg = "'extensions.dreaming' must be a mapping"
-        raise ConfigError(msg)
+    raw = _require_mapping(raw, "extensions.dreaming")
 
-    enabled = raw.get("enabled", False)
-    if not isinstance(enabled, bool):
-        msg = "'extensions.dreaming.enabled' must be a boolean"
-        raise ConfigError(msg)
+    enabled = _require_bool(raw.get("enabled", False), "extensions.dreaming.enabled")
 
-    schedule = raw.get("schedule_every_n_cycles", 100)
-    if not isinstance(schedule, int) or schedule < 1:
-        msg = "'extensions.dreaming.schedule_every_n_cycles' must be a positive integer"
-        raise ConfigError(msg)
+    schedule = _require_positive_int(
+        raw.get("schedule_every_n_cycles", 100),
+        "extensions.dreaming.schedule_every_n_cycles",
+    )
 
-    threshold = raw.get("promote_threshold", 0.7)
-    if not isinstance(threshold, (int, float)) or not 0.0 <= threshold <= 1.0:
-        msg = "'extensions.dreaming.promote_threshold' must be a float in [0.0, 1.0]"
-        raise ConfigError(msg)
+    threshold = _require_unit_float(
+        raw.get("promote_threshold", 0.7),
+        "extensions.dreaming.promote_threshold",
+    )
 
     signals = raw.get("signals")
     if signals is not None:
@@ -1507,9 +1988,7 @@ def _parse_dreaming(raw: Any) -> DreamingConfig | None:  # noqa: ANN401, C901, P
             if not isinstance(name, str):
                 msg = f"Signal name must be a string, got {type(name).__name__}"
                 raise ConfigError(msg)
-            if not isinstance(weight, (int, float)):
-                msg = f"Signal weight for {name!r} must be numeric"
-                raise ConfigError(msg)
+            _require_finite_number(weight, f"extensions.dreaming.signals[{name!r}]")
 
     gates_raw = raw.get("gates")
     gates = _parse_gates(gates_raw) if gates_raw is not None else DreamingGates()
@@ -1517,10 +1996,10 @@ def _parse_dreaming(raw: Any) -> DreamingConfig | None:  # noqa: ANN401, C901, P
     edges_raw = raw.get("edges")
     edges = _parse_edge_creation(edges_raw) if edges_raw is not None else EdgeCreationConfig()
 
-    candidates_limit = raw.get("candidates_limit", 200)
-    if not isinstance(candidates_limit, int) or candidates_limit < 1:
-        msg = "'extensions.dreaming.candidates_limit' must be a positive integer"
-        raise ConfigError(msg)
+    candidates_limit = _require_positive_int(
+        raw.get("candidates_limit", 200),
+        "extensions.dreaming.candidates_limit",
+    )
 
     clustering_backend_raw = raw.get("clustering_backend", "numpy")
     if clustering_backend_raw not in ("python", "numpy"):
@@ -1528,25 +2007,25 @@ def _parse_dreaming(raw: Any) -> DreamingConfig | None:  # noqa: ANN401, C901, P
         raise ConfigError(msg)
     clustering_backend: Literal["python", "numpy"] = clustering_backend_raw
 
-    top_keyphrases_count = raw.get("top_keyphrases_count", 3)
-    if not isinstance(top_keyphrases_count, int) or top_keyphrases_count < 1:
-        msg = "'extensions.dreaming.top_keyphrases_count' must be a positive integer"
-        raise ConfigError(msg)
+    top_keyphrases_count = _require_positive_int(
+        raw.get("top_keyphrases_count", 3),
+        "extensions.dreaming.top_keyphrases_count",
+    )
 
-    top_member_excerpts_count = raw.get("top_member_excerpts_count", 5)
-    if not isinstance(top_member_excerpts_count, int) or top_member_excerpts_count < 1:
-        msg = "'extensions.dreaming.top_member_excerpts_count' must be a positive integer"
-        raise ConfigError(msg)
+    top_member_excerpts_count = _require_positive_int(
+        raw.get("top_member_excerpts_count", 5),
+        "extensions.dreaming.top_member_excerpts_count",
+    )
 
-    member_excerpt_max_chars = raw.get("member_excerpt_max_chars", 150)
-    if not isinstance(member_excerpt_max_chars, int) or member_excerpt_max_chars < 1:
-        msg = "'extensions.dreaming.member_excerpt_max_chars' must be a positive integer"
-        raise ConfigError(msg)
+    member_excerpt_max_chars = _require_positive_int(
+        raw.get("member_excerpt_max_chars", 150),
+        "extensions.dreaming.member_excerpt_max_chars",
+    )
 
-    max_p1_fraction = raw.get("max_p1_fraction", 0.05)
-    if not isinstance(max_p1_fraction, (int, float)) or not 0.0 <= max_p1_fraction <= 1.0:
-        msg = "'extensions.dreaming.max_p1_fraction' must be a float in [0.0, 1.0]"
-        raise ConfigError(msg)
+    max_p1_fraction = _require_unit_float(
+        raw.get("max_p1_fraction", 0.05),
+        "extensions.dreaming.max_p1_fraction",
+    )
 
     promote_targets_raw = raw.get("promote_targets", "OBS_ONLY")
     if promote_targets_raw not in ("OBS_ONLY", "REFL_ONLY", "ALL"):
@@ -1584,23 +2063,28 @@ def _parse_dreaming(raw: Any) -> DreamingConfig | None:  # noqa: ANN401, C901, P
         "eligible_content_types",
         default=None,
     )
-    boilerplate_threshold = _parse_dreaming_unit_float(raw, "boilerplate_threshold", 0.30)
-    boilerplate_min_corpus_size = _parse_dreaming_positive_int(
-        raw, "boilerplate_min_corpus_size", 5
+    boilerplate_threshold = _require_unit_float(
+        raw.get("boilerplate_threshold", 0.30),
+        "extensions.dreaming.boilerplate_threshold",
     )
-    boilerplate_min_keyphrases_per_refl = _parse_dreaming_nonneg_int(
-        raw, "boilerplate_min_keyphrases_per_refl", 1
+    boilerplate_min_corpus_size = _require_positive_int(
+        raw.get("boilerplate_min_corpus_size", 5),
+        "extensions.dreaming.boilerplate_min_corpus_size",
+    )
+    boilerplate_min_keyphrases_per_refl = _require_nonneg_int(
+        raw.get("boilerplate_min_keyphrases_per_refl", 1),
+        "extensions.dreaming.boilerplate_min_keyphrases_per_refl",
     )
 
-    access_tracking_enabled = raw.get("access_tracking_enabled", True)
-    if not isinstance(access_tracking_enabled, bool):
-        msg = "'extensions.dreaming.access_tracking_enabled' must be a boolean"
-        raise ConfigError(msg)
+    access_tracking_enabled = _require_bool(
+        raw.get("access_tracking_enabled", True),
+        "extensions.dreaming.access_tracking_enabled",
+    )
 
     return DreamingConfig(
         enabled=enabled,
         schedule_every_n_cycles=schedule,
-        promote_threshold=float(threshold),
+        promote_threshold=threshold,
         signals=merged_signals,
         gates=gates,
         candidates_limit=candidates_limit,
@@ -1609,7 +2093,7 @@ def _parse_dreaming(raw: Any) -> DreamingConfig | None:  # noqa: ANN401, C901, P
         top_keyphrases_count=top_keyphrases_count,
         top_member_excerpts_count=top_member_excerpts_count,
         member_excerpt_max_chars=member_excerpt_max_chars,
-        max_p1_fraction=float(max_p1_fraction),
+        max_p1_fraction=max_p1_fraction,
         promote_targets=promote_targets,
         reflection_default_priority=reflection_default_priority,
         eligible_perspectives=eligible_perspectives,
@@ -1645,7 +2129,10 @@ def _parse_eligible_perspectives(
     if not isinstance(raw, (list, tuple, set, frozenset)):
         msg = "'extensions.dreaming.eligible_perspectives' must be a list of strings"
         raise ConfigError(msg)
-    allowed = {"percept", "utterance", "thought"}
+    # A tuple (not a set) so membership uses equality rather than hashing: an
+    # unhashable entry (e.g. a nested list) is then rejected with a ConfigError
+    # instead of leaking a raw TypeError from the ``in`` test.
+    allowed = ("percept", "utterance", "thought")
     values: set[Literal["percept", "utterance", "thought"]] = set()
     for entry in raw:
         if entry not in allowed:
@@ -1716,51 +2203,6 @@ def _parse_content_type_set(
     return frozenset(values)
 
 
-def _parse_dreaming_unit_float(raw: dict[str, Any], key: str, default: float) -> float:
-    """Parse a ``[0.0, 1.0]`` float from the ``dreaming`` mapping."""
-    value = raw.get(key, default)
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 <= value <= 1.0:
-        msg = f"'extensions.dreaming.{key}' must be a float in [0.0, 1.0]"
-        raise ConfigError(msg)
-    return float(value)
-
-
-def _parse_dreaming_positive_int(raw: dict[str, Any], key: str, default: int) -> int:
-    """Parse a ``>= 1`` integer from the ``dreaming`` mapping."""
-    value = raw.get(key, default)
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        msg = f"'extensions.dreaming.{key}' must be a positive integer"
-        raise ConfigError(msg)
-    return value
-
-
-def _parse_dreaming_nonneg_int(raw: dict[str, Any], key: str, default: int) -> int:
-    """Parse a ``>= 0`` integer from the ``dreaming`` mapping."""
-    value = raw.get(key, default)
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        msg = f"'extensions.dreaming.{key}' must be a non-negative integer"
-        raise ConfigError(msg)
-    return value
-
-
-def _parse_hygiene_positive_int(raw: dict[str, Any], key: str, default: int) -> int:
-    """Parse a ``>= 1`` integer from the ``hygiene_policy`` mapping."""
-    value = raw.get(key, default)
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        msg = f"'hygiene_policy.{key}' must be a positive integer"
-        raise ConfigError(msg)
-    return value
-
-
-def _parse_hygiene_nonneg_int(raw: dict[str, Any], key: str, default: int) -> int:
-    """Parse a ``>= 0`` integer from the ``hygiene_policy`` mapping."""
-    value = raw.get(key, default)
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        msg = f"'hygiene_policy.{key}' must be a non-negative integer"
-        raise ConfigError(msg)
-    return value
-
-
 def _parse_hygiene(raw: Any) -> HygienePolicyConfig | None:  # noqa: ANN401
     """Parse the ``hygiene_policy:`` YAML section (deterministic forgetting).
 
@@ -1782,52 +2224,53 @@ def _parse_hygiene(raw: Any) -> HygienePolicyConfig | None:  # noqa: ANN401
     """
     if raw is None:
         return None
-    if not isinstance(raw, dict):
-        msg = "'hygiene_policy' must be a mapping"
-        raise ConfigError(msg)
+    raw = _require_mapping(raw, "hygiene_policy")
 
-    enabled = raw.get("enabled", False)
-    if not isinstance(enabled, bool):
-        msg = "'hygiene_policy.enabled' must be a boolean"
-        raise ConfigError(msg)
+    enabled = _require_bool(raw.get("enabled", False), "hygiene_policy.enabled")
 
-    eviction_threshold = raw.get("eviction_threshold", 0.20)
-    if (
-        isinstance(eviction_threshold, bool)
-        or not isinstance(eviction_threshold, (int, float))
-        or not 0.0 <= eviction_threshold <= 1.0
-    ):
-        msg = "'hygiene_policy.eviction_threshold' must be a float in [0.0, 1.0]"
-        raise ConfigError(msg)
+    eviction_threshold = _require_unit_float(
+        raw.get("eviction_threshold", 0.20),
+        "hygiene_policy.eviction_threshold",
+    )
 
     protected_priorities = _parse_protected_priorities(raw.get("protected_priorities"))
 
     signal_weights = _parse_hygiene_signal_weights(raw.get("signal_weights"))
 
-    check_every_n_cycles = _parse_hygiene_positive_int(raw, "check_every_n_cycles", 1)
-    max_evictions_per_run = _parse_hygiene_positive_int(raw, "max_evictions_per_run", 100)
-
-    auto_gc_enabled = raw.get("auto_gc_enabled", False)
-    if not isinstance(auto_gc_enabled, bool):
-        msg = "'hygiene_policy.auto_gc_enabled' must be a boolean"
-        raise ConfigError(msg)
-
-    gc_min_archive_age_cycles = _parse_hygiene_nonneg_int(raw, "gc_min_archive_age_cycles", 10)
-
-    dry_run = raw.get("dry_run", False)
-    if not isinstance(dry_run, bool):
-        msg = "'hygiene_policy.dry_run' must be a boolean"
-        raise ConfigError(msg)
-
-    min_inactivity_age_seconds = _parse_hygiene_nonneg_int(
-        raw, "min_inactivity_age_seconds", 604800
+    check_every_n_cycles = _require_positive_int(
+        raw.get("check_every_n_cycles", 1),
+        "hygiene_policy.check_every_n_cycles",
+    )
+    max_evictions_per_run = _require_positive_int(
+        raw.get("max_evictions_per_run", 100),
+        "hygiene_policy.max_evictions_per_run",
     )
 
-    gc_restore_window_seconds = _parse_hygiene_nonneg_int(raw, "gc_restore_window_seconds", 2592000)
+    auto_gc_enabled = _require_bool(
+        raw.get("auto_gc_enabled", False),
+        "hygiene_policy.auto_gc_enabled",
+    )
+
+    gc_min_archive_age_cycles = _require_nonneg_int(
+        raw.get("gc_min_archive_age_cycles", 10),
+        "hygiene_policy.gc_min_archive_age_cycles",
+    )
+
+    dry_run = _require_bool(raw.get("dry_run", False), "hygiene_policy.dry_run")
+
+    min_inactivity_age_seconds = _require_nonneg_int(
+        raw.get("min_inactivity_age_seconds", 604800),
+        "hygiene_policy.min_inactivity_age_seconds",
+    )
+
+    gc_restore_window_seconds = _require_nonneg_int(
+        raw.get("gc_restore_window_seconds", 2592000),
+        "hygiene_policy.gc_restore_window_seconds",
+    )
 
     return HygienePolicyConfig(
         enabled=enabled,
-        eviction_threshold=float(eviction_threshold),
+        eviction_threshold=eviction_threshold,
         protected_priorities=protected_priorities,
         signal_weights=signal_weights,
         check_every_n_cycles=check_every_n_cycles,
@@ -1895,10 +2338,10 @@ def _parse_hygiene_signal_weights(raw: object) -> dict[str, float]:
         if not isinstance(name, str):
             msg = f"Signal name must be a string, got {type(name).__name__}"
             raise ConfigError(msg)
-        if isinstance(weight, bool) or not isinstance(weight, (int, float)):
-            msg = f"'hygiene_policy.signal_weights[{name!r}]' must be numeric"
-            raise ConfigError(msg)
-        merged[name] = float(weight)
+        merged[name] = _require_finite_number(
+            weight,
+            f"hygiene_policy.signal_weights[{name!r}]",
+        )
     return merged
 
 
@@ -1915,39 +2358,25 @@ def _parse_edge_creation(raw: object) -> EdgeCreationConfig:
         ConfigError: On invalid field types or values.
 
     """
-    if not isinstance(raw, dict):
-        msg = "'extensions.dreaming.edges' must be a mapping"
-        raise ConfigError(msg)
+    raw = _require_mapping(raw, "extensions.dreaming.edges")
 
-    enabled = raw.get("enabled", True)
-    if not isinstance(enabled, bool):
-        msg = "'edges.enabled' must be a boolean"
-        raise ConfigError(msg)
-
-    top_k = raw.get("top_k", 1)
-    if not isinstance(top_k, int) or top_k < 1:
-        msg = "'edges.top_k' must be a positive integer"
-        raise ConfigError(msg)
-
-    min_sim = raw.get("min_similarity", 0.7)
-    if not isinstance(min_sim, (int, float)) or not 0.0 <= min_sim <= 1.0:
-        msg = "'edges.min_similarity' must be a float in [0.0, 1.0]"
-        raise ConfigError(msg)
-
-    weight_factor = raw.get("edge_weight_factor", 0.5)
-    if not isinstance(weight_factor, (int, float)) or weight_factor < 0.0:
-        msg = "'edges.edge_weight_factor' must be a non-negative number"
-        raise ConfigError(msg)
+    enabled = _require_bool(raw.get("enabled", True), "edges.enabled")
+    top_k = _require_positive_int(raw.get("top_k", 1), "edges.top_k")
+    min_sim = _require_unit_float(raw.get("min_similarity", 0.7), "edges.min_similarity")
+    weight_factor = _require_nonneg_float(
+        raw.get("edge_weight_factor", 0.5),
+        "edges.edge_weight_factor",
+    )
 
     return EdgeCreationConfig(
         enabled=enabled,
         top_k=top_k,
-        min_similarity=float(min_sim),
-        edge_weight_factor=float(weight_factor),
+        min_similarity=min_sim,
+        edge_weight_factor=weight_factor,
     )
 
 
-def _parse_gates(raw: Any) -> DreamingGates:  # noqa: ANN401, C901, PLR0912, PLR0915
+def _parse_gates(raw: Any) -> DreamingGates:  # noqa: ANN401
     """Parse the ``extensions.dreaming.gates`` section.
 
     Args:
@@ -1960,87 +2389,74 @@ def _parse_gates(raw: Any) -> DreamingGates:  # noqa: ANN401, C901, PLR0912, PLR
         ConfigError: On invalid field types.
 
     """
-    if not isinstance(raw, dict):
-        msg = "'extensions.dreaming.gates' must be a mapping"
-        raise ConfigError(msg)
+    raw = _require_mapping(raw, "extensions.dreaming.gates")
 
-    min_conf = raw.get("min_confirmations", 2)
-    if not isinstance(min_conf, int) or min_conf < 0:
-        msg = "'gates.min_confirmations' must be a non-negative integer"
-        raise ConfigError(msg)
-
-    min_age = raw.get("min_age_cycles", 1)
-    if not isinstance(min_age, int) or min_age < 0:
-        msg = "'gates.min_age_cycles' must be a non-negative integer"
-        raise ConfigError(msg)
-
-    max_promoted = raw.get("max_promoted_per_run", 20)
-    if not isinstance(max_promoted, int) or max_promoted < 1:
-        msg = "'gates.max_promoted_per_run' must be a positive integer"
-        raise ConfigError(msg)
-
-    allow_zero = raw.get("allow_zero_confirmation", True)
-    if not isinstance(allow_zero, bool):
-        msg = "'gates.allow_zero_confirmation' must be a boolean"
-        raise ConfigError(msg)
-
-    min_cluster_size = raw.get("min_cluster_size", 3)
-    if not isinstance(min_cluster_size, int) or min_cluster_size < 1:
-        msg = "'gates.min_cluster_size' must be a positive integer"
-        raise ConfigError(msg)
-
-    cluster_threshold = raw.get("cluster_similarity_threshold", 0.7)
-    if not isinstance(cluster_threshold, (int, float)) or not 0.0 <= cluster_threshold <= 1.0:
-        msg = "'gates.cluster_similarity_threshold' must be a float in [0.0, 1.0]"
-        raise ConfigError(msg)
+    min_conf = _require_nonneg_int(raw.get("min_confirmations", 2), "gates.min_confirmations")
+    min_age = _require_nonneg_int(raw.get("min_age_cycles", 1), "gates.min_age_cycles")
+    max_promoted = _require_positive_int(
+        raw.get("max_promoted_per_run", 20),
+        "gates.max_promoted_per_run",
+    )
+    allow_zero = _require_bool(
+        raw.get("allow_zero_confirmation", True), "gates.allow_zero_confirmation"
+    )
+    min_cluster_size = _require_positive_int(
+        raw.get("min_cluster_size", 3), "gates.min_cluster_size"
+    )
+    cluster_threshold = _require_unit_float(
+        raw.get("cluster_similarity_threshold", 0.7),
+        "gates.cluster_similarity_threshold",
+    )
 
     cluster_algorithm = raw.get("cluster_algorithm", "lpa")
     if cluster_algorithm not in ("lpa", "agglomerative"):
         msg = "'gates.cluster_algorithm' must be 'lpa' or 'agglomerative'"
         raise ConfigError(msg)
 
-    enable_reflections = raw.get("enable_reflections", True)
-    if not isinstance(enable_reflections, bool):
-        msg = "'gates.enable_reflections' must be a boolean"
-        raise ConfigError(msg)
-
-    cold_start_clustering = raw.get("cold_start_clustering", False)
-    if not isinstance(cold_start_clustering, bool):
-        msg = "'gates.cold_start_clustering' must be a boolean"
-        raise ConfigError(msg)
+    enable_reflections = _require_bool(
+        raw.get("enable_reflections", True), "gates.enable_reflections"
+    )
+    cold_start_clustering = _require_bool(
+        raw.get("cold_start_clustering", False),
+        "gates.cold_start_clustering",
+    )
 
     _min_cluster_size_bound = 2
     max_cluster_size = raw.get("max_cluster_size", 200)
     if max_cluster_size is not None and (
-        not isinstance(max_cluster_size, int) or max_cluster_size < _min_cluster_size_bound
+        isinstance(max_cluster_size, bool)
+        or not isinstance(max_cluster_size, int)
+        or max_cluster_size < _min_cluster_size_bound
     ):
         msg = "'gates.max_cluster_size' must be None or an integer >= 2"
         raise ConfigError(msg)
 
-    cluster_quality_gating_enabled = raw.get("cluster_quality_gating_enabled", True)
-    if not isinstance(cluster_quality_gating_enabled, bool):
-        msg = "'gates.cluster_quality_gating_enabled' must be a boolean"
-        raise ConfigError(msg)
-
-    cluster_quality_persona_threshold = _parse_unit_float(
-        raw, "cluster_quality_persona_threshold", 0.75
-    )
-    cluster_quality_cohesion_threshold = _parse_unit_float(
-        raw, "cluster_quality_cohesion_threshold", 0.40
-    )
-    cluster_quality_external_homogeneity_threshold = _parse_unit_float(
-        raw, "cluster_quality_external_homogeneity_threshold", 0.95
-    )
-    cluster_quality_ne_consistency_threshold = _parse_unit_float(
-        raw, "cluster_quality_ne_consistency_threshold", 0.60
+    cluster_quality_gating_enabled = _require_bool(
+        raw.get("cluster_quality_gating_enabled", True),
+        "gates.cluster_quality_gating_enabled",
     )
 
-    cluster_quality_require_meaningful_keyphrases = raw.get(
-        "cluster_quality_require_meaningful_keyphrases", True
+    cluster_quality_persona_threshold = _require_unit_float(
+        raw.get("cluster_quality_persona_threshold", 0.75),
+        "gates.cluster_quality_persona_threshold",
     )
-    if not isinstance(cluster_quality_require_meaningful_keyphrases, bool):
-        msg = "'gates.cluster_quality_require_meaningful_keyphrases' must be a boolean"
-        raise ConfigError(msg)
+    cluster_quality_cohesion_threshold = _require_unit_float(
+        raw.get("cluster_quality_cohesion_threshold", 0.40),
+        "gates.cluster_quality_cohesion_threshold",
+    )
+    cluster_quality_external_homogeneity_threshold = _require_unit_float(
+        raw.get("cluster_quality_external_homogeneity_threshold", 0.95),
+        "gates.cluster_quality_external_homogeneity_threshold",
+    )
+    cluster_quality_ne_consistency_threshold = _require_unit_float(
+        raw.get("cluster_quality_ne_consistency_threshold", 0.60),
+        "gates.cluster_quality_ne_consistency_threshold",
+    )
+
+    cluster_quality_require_meaningful_keyphrases = _require_bool(
+        raw.get("cluster_quality_require_meaningful_keyphrases", True),
+        "gates.cluster_quality_require_meaningful_keyphrases",
+    )
 
     cluster_allowed_types_raw = raw.get("cluster_allowed_types", ("OBSERVATION",))
     if not isinstance(cluster_allowed_types_raw, (list, tuple)):
@@ -2057,14 +2473,10 @@ def _parse_gates(raw: Any) -> DreamingGates:  # noqa: ANN401, C901, PLR0912, PLR
         raise ConfigError(msg)
     cluster_allowed_types = tuple(cluster_allowed_types_list)
 
-    clustering_min_new_candidates = raw.get("clustering_min_new_candidates", 50)
-    if (
-        isinstance(clustering_min_new_candidates, bool)
-        or not isinstance(clustering_min_new_candidates, int)
-        or clustering_min_new_candidates < 0
-    ):
-        msg = "'gates.clustering_min_new_candidates' must be a non-negative integer"
-        raise ConfigError(msg)
+    clustering_min_new_candidates = _require_nonneg_int(
+        raw.get("clustering_min_new_candidates", 50),
+        "gates.clustering_min_new_candidates",
+    )
 
     return DreamingGates(
         min_confirmations=min_conf,
@@ -2092,80 +2504,9 @@ def _parse_gates(raw: Any) -> DreamingGates:  # noqa: ANN401, C901, PLR0912, PLR
     )
 
 
-def _parse_unit_float(raw: dict[str, Any], key: str, default: float) -> float:
-    """Parse a ``[0.0, 1.0]`` threshold from the ``gates`` mapping.
-
-    Args:
-        raw: Raw ``gates`` mapping from YAML.
-        key: Field name to read.
-        default: Default value when the key is absent.
-
-    Returns:
-        Validated float value in ``[0.0, 1.0]``.
-
-    Raises:
-        ConfigError: When the value is not a number in ``[0.0, 1.0]``.
-
-    """
-    value = raw.get(key, default)
-    # ``bool`` is a subclass of ``int``; reject it explicitly so YAML ``true``
-    # / ``false`` cannot impersonate ``1.0`` / ``0.0`` and silently disable a
-    # gate.
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 <= value <= 1.0:
-        msg = f"'gates.{key}' must be a float in [0.0, 1.0]"
-        raise ConfigError(msg)
-    return float(value)
-
-
 # ------------------------------------------------------------------
 # Search config parser
 # ------------------------------------------------------------------
-
-
-def _parse_nonneg_float(raw: dict[str, Any], key: str, default: float, section: str) -> float:
-    """Extract and validate a non-negative float from a raw YAML dict.
-
-    Args:
-        raw: Parsed YAML mapping.
-        key: Key to look up.
-        default: Default when key is absent.
-        section: Config section name for error messages.
-
-    Returns:
-        Validated float value.
-
-    Raises:
-        ConfigError: If the value is not numeric or is negative.
-
-    """
-    val = raw.get(key, default)
-    if not isinstance(val, (int, float)) or val < 0.0:
-        msg = f"'{section}.{key}' must be a non-negative number"
-        raise ConfigError(msg)
-    return float(val)
-
-
-def _parse_positive_int(raw: dict[str, Any], key: str, default: int, section: str) -> int:
-    """Extract and validate a positive integer from a raw YAML dict.
-
-    Args:
-        raw: Parsed YAML mapping.
-        key: Key to look up.
-        default: Default when key is absent.
-        section: Config section name for error messages.
-
-    Returns:
-        Validated integer value (``>= 1``).
-
-    Raises:
-        ConfigError: If the value is not an integer or is less than 1.
-
-    """
-    val = raw.get(key, default)
-    if not isinstance(val, int) or isinstance(val, bool) or val < 1:
-        msg = f"'{section}.{key}' must be a positive integer"
-        raise ConfigError(msg)
-    return val
 
 
 def _parse_search(raw: Any) -> SearchConfig:  # noqa: ANN401
@@ -2183,64 +2524,85 @@ def _parse_search(raw: Any) -> SearchConfig:  # noqa: ANN401
     """
     if raw is None:
         return SearchConfig()
-    if not isinstance(raw, dict):
-        msg = "'search' must be a mapping"
-        raise ConfigError(msg)
+    raw = _require_mapping(raw, "search")
 
-    fts_w = _parse_nonneg_float(raw, "default_fts_weight", 0.3, "search")
-    vec_w = _parse_nonneg_float(raw, "default_vector_weight", 0.55, "search")
-    rec_w = _parse_nonneg_float(raw, "default_recency_weight", 0.1, "search")
-    pri_w = _parse_nonneg_float(raw, "default_priority_weight", 0.05, "search")
-
-    half_life = raw.get("recency_half_life", 50)
-    if not isinstance(half_life, int) or half_life < 1:
-        msg = "'search.recency_half_life' must be a positive integer"
-        raise ConfigError(msg)
-
-    recency_now_half_life_seconds = _parse_positive_int(
-        raw, "recency_now_half_life_seconds", 604800, "search"
+    fts_w = _require_nonneg_float(raw.get("default_fts_weight", 0.3), "search.default_fts_weight")
+    vec_w = _require_nonneg_float(
+        raw.get("default_vector_weight", 0.55),
+        "search.default_vector_weight",
+    )
+    rec_w = _require_nonneg_float(
+        raw.get("default_recency_weight", 0.1),
+        "search.default_recency_weight",
+    )
+    pri_w = _require_nonneg_float(
+        raw.get("default_priority_weight", 0.05),
+        "search.default_priority_weight",
     )
 
-    boost_p1 = _parse_nonneg_float(raw, "priority_boost_p1", 1.0, "search")
-    boost_p2 = _parse_nonneg_float(raw, "priority_boost_p2", 0.6, "search")
-    boost_p3 = _parse_nonneg_float(raw, "priority_boost_p3", 0.3, "search")
-    boost_p4 = _parse_nonneg_float(raw, "priority_boost_p4", 0.0, "search")
+    half_life = _require_positive_int(raw.get("recency_half_life", 50), "search.recency_half_life")
 
-    graph_w = _parse_nonneg_float(raw, "default_graph_weight", 0.0, "search")
-    graph_decay = _parse_nonneg_float(raw, "graph_edge_decay", 0.5, "search")
-    max_neighbors = raw.get("max_neighbors_per_candidate", 5)
-    if not isinstance(max_neighbors, int) or max_neighbors < 1:
-        msg = "'search.max_neighbors_per_candidate' must be a positive integer"
-        raise ConfigError(msg)
+    recency_now_half_life_seconds = _require_positive_int(
+        raw.get("recency_now_half_life_seconds", 604800),
+        "search.recency_now_half_life_seconds",
+    )
 
-    reflection_boost = _parse_nonneg_float(raw, "reflection_boost", 1.0, "search")
+    boost_p1 = _require_nonneg_float(raw.get("priority_boost_p1", 1.0), "search.priority_boost_p1")
+    boost_p2 = _require_nonneg_float(raw.get("priority_boost_p2", 0.6), "search.priority_boost_p2")
+    boost_p3 = _require_nonneg_float(raw.get("priority_boost_p3", 0.3), "search.priority_boost_p3")
+    boost_p4 = _require_nonneg_float(raw.get("priority_boost_p4", 0.0), "search.priority_boost_p4")
 
-    reflection_topk_cap = _parse_nonneg_float(raw, "reflection_topk_cap", 0.3, "search")
+    graph_w = _require_nonneg_float(
+        raw.get("default_graph_weight", 0.0), "search.default_graph_weight"
+    )
+    graph_decay = _require_nonneg_float(raw.get("graph_edge_decay", 0.5), "search.graph_edge_decay")
+    max_neighbors = _require_positive_int(
+        raw.get("max_neighbors_per_candidate", 5),
+        "search.max_neighbors_per_candidate",
+    )
 
-    expansion_enabled = raw.get("graph_expansion_enabled", True)
-    if not isinstance(expansion_enabled, bool):
-        msg = "'search.graph_expansion_enabled' must be a boolean"
-        raise ConfigError(msg)
+    reflection_boost = _require_nonneg_float(
+        raw.get("reflection_boost", 1.0), "search.reflection_boost"
+    )
 
-    expansion_top_n = raw.get("graph_expansion_top_n", 5)
-    if not isinstance(expansion_top_n, int) or expansion_top_n < 1:
-        msg = "'search.graph_expansion_top_n' must be a positive integer"
-        raise ConfigError(msg)
+    reflection_topk_cap = _require_unit_float(
+        raw.get("reflection_topk_cap", 0.3),
+        "search.reflection_topk_cap",
+    )
 
-    expansion_factor = _parse_nonneg_float(raw, "graph_expansion_propagation_factor", 0.7, "search")
+    expansion_enabled = _require_bool(
+        raw.get("graph_expansion_enabled", True),
+        "search.graph_expansion_enabled",
+    )
 
-    expansion_max_sources = raw.get("graph_expansion_max_sources_per_reflection", 20)
-    if not isinstance(expansion_max_sources, int) or expansion_max_sources < 1:
-        msg = "'search.graph_expansion_max_sources_per_reflection' must be a positive integer"
-        raise ConfigError(msg)
+    expansion_top_n = _require_positive_int(
+        raw.get("graph_expansion_top_n", 5),
+        "search.graph_expansion_top_n",
+    )
 
-    expansion_ceiling = raw.get("graph_expansion_reflection_source_ceiling", 50)
-    if not isinstance(expansion_ceiling, int) or expansion_ceiling < 1:
-        msg = "'search.graph_expansion_reflection_source_ceiling' must be a positive integer"
-        raise ConfigError(msg)
+    expansion_factor = _require_nonneg_float(
+        raw.get("graph_expansion_propagation_factor", 0.7),
+        "search.graph_expansion_propagation_factor",
+    )
 
-    collapse_pool_factor = _parse_positive_int(raw, "collapse_pool_factor", 4, "search")
-    vec0_overfetch_factor = _parse_positive_int(raw, "vec0_overfetch_factor", 4, "search")
+    expansion_max_sources = _require_positive_int(
+        raw.get("graph_expansion_max_sources_per_reflection", 20),
+        "search.graph_expansion_max_sources_per_reflection",
+    )
+
+    expansion_ceiling = _require_positive_int(
+        raw.get("graph_expansion_reflection_source_ceiling", 50),
+        "search.graph_expansion_reflection_source_ceiling",
+    )
+
+    collapse_pool_factor = _require_positive_int(
+        raw.get("collapse_pool_factor", 4),
+        "search.collapse_pool_factor",
+    )
+    vec0_overfetch_factor = _require_positive_int(
+        raw.get("vec0_overfetch_factor", 4),
+        "search.vec0_overfetch_factor",
+    )
 
     return SearchConfig(
         default_fts_weight=fts_w,
@@ -2272,16 +2634,6 @@ def _parse_search(raw: Any) -> SearchConfig:  # noqa: ANN401
 # Embeddings config parser
 # ------------------------------------------------------------------
 
-_VALID_PROVIDERS = frozenset(
-    {
-        "sentence-transformer",
-        "openai-compatible",
-        "ollama",
-        "huggingface",
-    }
-)
-"""Valid built-in embedding provider identifiers."""
-
 
 def _resolve_env_var(value: str) -> str:
     """Resolve ``${ENV_VAR}`` patterns in a string.
@@ -2310,7 +2662,7 @@ def _resolve_env_var(value: str) -> str:
     return value
 
 
-def _parse_embeddings(raw: Any) -> EmbeddingConfig | None:  # noqa: ANN401, C901, PLR0912
+def _parse_embeddings(raw: Any) -> EmbeddingConfig | None:  # noqa: ANN401, C901
     """Parse the ``embeddings:`` YAML section.
 
     Args:
@@ -2325,12 +2677,12 @@ def _parse_embeddings(raw: Any) -> EmbeddingConfig | None:  # noqa: ANN401, C901
     """
     if raw is None:
         return None
-    if not isinstance(raw, dict):
-        msg = "'embeddings' must be a mapping"
-        raise ConfigError(msg)
+    raw = _require_mapping(raw, "embeddings")
 
     provider = raw.get("provider")
-    if provider is not None and provider not in _VALID_PROVIDERS:
+    # Check the type before the frozenset membership test: an unhashable provider
+    # (e.g. a list) would leak a raw TypeError from ``in`` without the guard.
+    if provider is not None and (not isinstance(provider, str) or provider not in _VALID_PROVIDERS):
         msg = (
             f"'embeddings.provider' must be one of {sorted(_VALID_PROVIDERS)} "
             f"or null, got {provider!r}"
@@ -2357,10 +2709,7 @@ def _parse_embeddings(raw: Any) -> EmbeddingConfig | None:  # noqa: ANN401, C901
         msg = "'embeddings.device' must be a string"
         raise ConfigError(msg)
 
-    batch_size = raw.get("batch_size", 32)
-    if not isinstance(batch_size, int) or batch_size < 1:
-        msg = "'embeddings.batch_size' must be a positive integer"
-        raise ConfigError(msg)
+    batch_size = _require_positive_int(raw.get("batch_size", 32), "embeddings.batch_size")
 
     base_url = raw.get("base_url")
     if base_url is not None and not isinstance(base_url, str):
@@ -2501,20 +2850,10 @@ def _parse_journal(raw: Any) -> JournalConfig:  # noqa: ANN401
     """
     if raw is None:
         return JournalConfig()
-    if not isinstance(raw, dict):
-        msg = "'journal' must be a mapping"
-        raise ConfigError(msg)
+    raw = _require_mapping(raw, "journal")
 
-    enabled = raw.get("enabled", False)
-    if not isinstance(enabled, bool):
-        msg = "'journal.enabled' must be a boolean"
-        raise ConfigError(msg)
-
-    verify_on_open = raw.get("verify_on_open", False)
-    if not isinstance(verify_on_open, bool):
-        msg = "'journal.verify_on_open' must be a boolean"
-        raise ConfigError(msg)
-
+    enabled = _require_bool(raw.get("enabled", False), "journal.enabled")
+    verify_on_open = _require_bool(raw.get("verify_on_open", False), "journal.verify_on_open")
     return JournalConfig(enabled=enabled, verify_on_open=verify_on_open)
 
 
@@ -2538,24 +2877,23 @@ def _parse_ttl(raw: Any) -> TTLConfig:  # noqa: ANN401
     """
     if raw is None:
         return TTLConfig()
-    if not isinstance(raw, dict):
-        msg = "'ttl' must be a mapping"
-        raise ConfigError(msg)
+    raw = _require_mapping(raw, "ttl")
 
     strategy = raw.get("strategy", "archive")
-    if strategy not in {"archive", "delete"}:
+    # Type-check before the membership test so a non-string (e.g. a list) is
+    # rejected as a ConfigError rather than leaking a TypeError.
+    if not isinstance(strategy, str) or strategy not in ("archive", "delete"):
         msg = f"'ttl.strategy' must be 'archive' or 'delete', got {strategy!r}"
         raise ConfigError(msg)
 
-    check_every = raw.get("check_every_n_operations", 0)
-    if not isinstance(check_every, int) or check_every < 0:
-        msg = "'ttl.check_every_n_operations' must be a non-negative integer"
-        raise ConfigError(msg)
+    check_every = _require_nonneg_int(
+        raw.get("check_every_n_operations", 0),
+        "ttl.check_every_n_operations",
+    )
 
     default_ttl = raw.get("default_ttl_seconds")
-    if default_ttl is not None and (not isinstance(default_ttl, int) or default_ttl < 1):
-        msg = "'ttl.default_ttl_seconds' must be a positive integer or null"
-        raise ConfigError(msg)
+    if default_ttl is not None:
+        default_ttl = _require_positive_int(default_ttl, "ttl.default_ttl_seconds")
 
     return TTLConfig(
         strategy=strategy,
