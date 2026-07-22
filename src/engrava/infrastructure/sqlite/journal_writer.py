@@ -17,6 +17,7 @@ import json
 import uuid as _uuid
 from sqlite3 import IntegrityError
 from typing import TYPE_CHECKING, ClassVar
+from weakref import WeakKeyDictionary
 
 from engrava.domain.models.journal import JournalEntry, JournalIntegrityResult
 
@@ -54,7 +55,18 @@ class JournalWriter:
 
     """
 
-    _connection_locks: ClassVar[dict[int, asyncio.Lock]] = {}
+    # Process-global registry that serialises appends across every writer
+    # sharing one connection (aiosqlite exposes no row-level locking, so two
+    # writers on the same connection must contend on the same lock or they race
+    # the gapless-sequence read/insert). Keyed **by the connection object** via a
+    # weak-key map so each entry is reclaimed automatically when its connection is
+    # garbage-collected: the registry cannot grow without bound as long-lived
+    # processes open and drop transient connections, and — because keys are object
+    # identity, not ``id(connection)`` — a fresh connection can never inherit a
+    # dead connection's stale lock through address reuse.
+    _connection_locks: ClassVar[WeakKeyDictionary[aiosqlite.Connection, asyncio.Lock]] = (
+        WeakKeyDictionary()
+    )
 
     def __init__(
         self,
@@ -64,7 +76,7 @@ class JournalWriter:
     ) -> None:
         self._db = db
         self._revocation = revocation
-        self._lock = self._connection_locks.setdefault(id(db), asyncio.Lock())
+        self._lock = self._connection_locks.setdefault(db, asyncio.Lock())
 
     def _check_revoked(self) -> None:
         """Fail hard if the shared connection has been revoked (quarantined).
