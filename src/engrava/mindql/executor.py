@@ -9,7 +9,7 @@ from __future__ import annotations
 import contextvars
 import datetime
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, TypeAlias
 
 from engrava.mindql.parser import (
     BoolExpr,
@@ -159,20 +159,36 @@ def _guard_select_sql(sql: str) -> str:
     return without_trailing
 
 
+# A single MindQL result row: an ordered ``{column: value}`` mapping.
+#
+# Cell values are heterogeneous across command types, so ``object`` (the sound,
+# checked top type) is the honest upper bound rather than a scalar-only union:
+#   * FIND / SELECT rows carry SQLite storage-class scalars
+#     (``str | int | float | bytes | None``);
+#   * COUNT carries a single ``int``;
+#   * EXPLAIN carries the compiled SQL ``str`` plus its bound-parameter ``list``;
+#   * extension commands may place any object their handler returns -- the
+#     ``MindQLExtension.handler`` contract is already ``list[dict[str, object]]``.
+# ``object`` forces consumers to narrow a cell before use, whereas ``Any`` would
+# silently disable that check.
+MindQLRow: TypeAlias = dict[str, object]
+
+
 @dataclass(frozen=True)
 class MindQLResult:
     """Result of a MindQL query execution.
 
     Attributes:
         columns: Column names in result order.
-        rows: List of row dicts.
+        rows: Result rows, each an ordered ``{column: value}`` mapping
+            (:data:`MindQLRow`).
         count: For COUNT queries, the count value.
         command: The command that was executed.
 
     """
 
     columns: list[str] = field(default_factory=list)
-    rows: list[dict[str, Any]] = field(default_factory=list)
+    rows: list[MindQLRow] = field(default_factory=list)
     count: int | None = None
     command: str = ""
 
