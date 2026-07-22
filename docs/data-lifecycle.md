@@ -19,23 +19,27 @@ Every thought carries a `LifecycleStatus`. There are four states:
 | `CREATED` | Just created, not yet promoted into active use. |
 | `ACTIVE` | In normal use — the default working state, included in queries. |
 | `DONE` | Completed (e.g. a finished task) but retained. |
-| `ARCHIVED` | Soft-retired and retained until garbage-collected. **Not a global results filter** — see the note below. |
+| `ARCHIVED` | Soft-retired and retained until garbage-collected. **Excluded from default ranked retrieval** (reversible via `restore_thought` / `include_archived`) — see the note below. |
 
 You set the status on the `ThoughtRecord` you create, and update it over the
 thought's life. Archiving is the soft-retire step: an `ARCHIVED` thought still
 exists (and its content is still stored) until you garbage-collect it.
 
-> **`ARCHIVED` does not hide a thought from search or queries.** Marking a
-> regular thought `ARCHIVED` is a *retention* state, not a visibility filter: an
-> archived `OBSERVATION` still appears in `search_hybrid` / `search_fts` and is
-> still counted by `count_thoughts()` / `list_thoughts()`. Only two kinds of rows
-> are auto-excluded: **expired** thoughts (dropped by the TTL expiry checks
-> described below, unless you pass `include_expired=True`), and **retired
-> REFLECTIONs** — a `REFLECTION` whose `lifecycle_status` is no longer `ACTIVE` is
-> filtered out of search by a *freshness floor* so a stale cluster centroid can't
-> resurface. This REFLECTION gate is type-specific; it does **not** apply to
-> ordinary thoughts. To keep archived regular thoughts out of your own results,
-> either filter on `lifecycle_status` yourself or remove them with `engrava gc`.
+> **`ARCHIVED` is excluded from default retrieval, but still stored and counted.**
+> Marking a thought `ARCHIVED` is a *retention* state — the row and its content
+> stay in the database — but an archived thought is **dropped from default ranked
+> retrieval**: `search_hybrid` / `recall` / `search_fts` / `search_similar` no
+> longer return it unless you pass `include_archived=True` (and `restore_thought`
+> re-activates it). This retrieval exclusion is the retrieval side of
+> [Forgetting](memory-hygiene.md) — an **opt-in, off-by-default** hygiene loop —
+> but the exclusion itself applies to **any** archived row (including one archived
+> by the TTL `archive` strategy or manually), whether or not that loop is enabled.
+> It is **still counted** by `count_thoughts()` /
+> `list_thoughts()` (those are not ranked retrieval) — filter on `lifecycle_status`
+> yourself to exclude it there. **Expired** thoughts are likewise excluded from
+> retrieval (unless `include_expired=True`), and a retired `REFLECTION` (one whose
+> `lifecycle_status` is no longer `ACTIVE`) stays out of search by a type-specific
+> *freshness floor* even under `include_archived=True`.
 
 ## Time-to-live (TTL) and expiry
 
@@ -138,6 +142,12 @@ archive-then-gc) the thought rows → purge the matching `journal_entry` rows if
 journaling is on → roll the deletion through your backup retention. Don't treat
 "the thought no longer appears in search" as "the data is gone."
 
+> **Memory-hygiene GC is a hard delete, not erasure.** The opt-in
+> [Forgetting](memory-hygiene.md) garbage-collection stage removes archived rows
+> exactly like the deletes above: it reclaims the live/queryable working set, but
+> when journaling is on the content survives in the `DELETE_THOUGHT` journal entry.
+> Treat it as cognitive cleanup, not guaranteed erasure.
+
 ## Reclaiming disk space
 
 Deleting rows — whether via `ttl.strategy: delete`, `engrava gc`, or a hard
@@ -165,6 +175,8 @@ live row count — this is normal SQLite behaviour, not a leak.
 ## See also
 
 - [Configuration → ttl](configuration.md#ttl) — the strategy and default-TTL knobs
+- [Forgetting (Memory Hygiene)](memory-hygiene.md) — the opt-in deterministic
+  archive-then-GC loop and its restore windows
 - [Audit Trail](audit-trail.md) — what the journal records (and its delta residue)
 - [CLI](cli.md#gc) — the full `engrava gc` option reference
 - [Known Limitations](known-limitations.md) — storage and concurrency constraints

@@ -60,6 +60,23 @@ Another name for what dreaming does in a single pass — evaluating candidates a
 producing promotions, edges, and reflections via `run_consolidation()`. See
 [Dreaming](dreaming.md).
 
+### Forgetting
+
+The **subtractive** counterpart to [dreaming](#dreaming) — the two halves of
+memory maintenance. An **opt-in, reversible**, no-LLM loop (mechanism:
+[Memory Hygiene](#memory-hygiene)) that lets cold, low-signal thoughts fade by
+**archiving** them, and — as a *separately* opted-in step — garbage-collects
+archived rows after cycle + wall-clock restore windows. OFF by default. See
+[Forgetting (Memory Hygiene)](memory-hygiene.md).
+
+### Memory Hygiene
+
+The **mechanism** name for [Forgetting](#forgetting): the deterministic
+`run_hygiene()` loop configured under `hygiene_policy`. "Forgetting" is the public
+concept, "Memory Hygiene" is the mechanism, and `hygiene` is the API name — the
+same concept-over-mechanism layering as Dreaming over `consolidate()`. See
+[Forgetting (Memory Hygiene)](memory-hygiene.md).
+
 ### Promotion
 
 The act, during consolidation, of marking an important thought by setting its
@@ -119,8 +136,9 @@ hybrid-search signals, so higher-priority thoughts surface more readily; dreamin
 
 The small state machine a thought moves through: `CREATED → ACTIVE → DONE →
 ARCHIVED` (`LifecycleStatus`, with transitions enforced). `ARCHIVED` is a
-soft-retired state and a thought there remains (and stays searchable) until
-garbage-collected — it is a retention marker, not an automatic results filter. See
+soft-retired state — the row and its content remain until garbage-collected, but
+an archived thought is **excluded from default ranked retrieval** (reversible via
+`restore_thought` / `include_archived`). See
 [Core Concepts → Lifecycle](concepts.md#lifecycle) and
 [Data Lifecycle](data-lifecycle.md).
 

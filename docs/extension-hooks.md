@@ -26,8 +26,8 @@ see [extensions.md](extensions.md).
 
 ### 1.2 Available hooks
 
-Only `on_store` and `on_retrieve` are invoked by the public engrava package
-today. The remaining three are part of the protocol contract but are
+`on_store`, `on_retrieve`, and `decay_function` are invoked by the public engrava
+package today. The remaining two are part of the protocol contract but are
 **reserved** — core engrava does not call them (they exist for downstream
 consumers and future use). Implement them if you want protocol conformance,
 but do not expect core to invoke them.
@@ -36,8 +36,8 @@ but do not expect core to invoke them.
 |--------|------|---------|----------------|
 | `on_store` | After a thought is persisted | `ThoughtRecord` (enriched or unchanged) | **active** |
 | `on_retrieve` | After a thought is loaded from storage | `ThoughtRecord` (enriched or unchanged) | **active** |
+| `decay_function(thought, elapsed_cycles)` | Per-thought decay factor, multiplied into the hygiene eviction-score | `float` in `[0.0, 1.0]` | **active** — its only call-site is [Forgetting / Memory Hygiene](memory-hygiene.md); it is never consulted in search, ranking, or promotion |
 | `score_function(thought, context)` | Custom relevance score | `float` | reserved — not called by core |
-| `decay_function(thought, elapsed_cycles)` | Per-thought decay factor | `float` in `[0.0, 1.0]` | reserved — not called by core |
 | `mindql_extension_registry()` | Register custom MindQL verbs | `dict[str, MindQLExtension]` | reserved — core wires MindQL verbs via `ExtensionManifest.mindql_extensions`, not this hook |
 
 ---
@@ -171,6 +171,76 @@ class SentenceSplitter(DefaultEngravaHooks):
 `DeriveGates` are public API under the `X.Y.x` stability guarantee (no breaking
 change within a patch series; breaking changes ship in a minor after a
 deprecation window).
+
+### 1A.5 Split modes (`StructuralSplitProducer`)
+
+`StructuralSplitProducer` ships two deterministic, dependency-free split modes,
+selected with `split_mode` (a `SplitMode` value):
+
+| Mode | What it does |
+|---|---|
+| `SplitMode.PARAGRAPH` (default) | Splits on a blank-line (paragraph) boundary — the byte-identical original behaviour. |
+| `SplitMode.FIXED_WINDOW` | Tiles the content into fixed-size windows, bounding chunk size for embedding robustness on long content with no dependence on natural boundaries. |
+
+For `FIXED_WINDOW`, three keyword-only knobs shape the windows:
+
+- `window_size` (default `1000`, must be `>= 1`) — the window length, in
+  `window_unit` units;
+- `window_unit` (`"char"` (default) or `"word"`) — whether `window_size` /
+  `window_overlap` count characters or whitespace-delimited words;
+- `window_overlap` (default `0`, must satisfy `0 <= window_overlap < window_size`)
+  — how many units consecutive windows share.
+
+Windows advance by `window_size - window_overlap` and fully cover the content (the
+final window may be shorter). Every derived child records its `split_mode`,
+`segment_index`, and source `char_start` / `char_end` in its `metadata`.
+
+```python
+from engrava import SplitMode, StructuralSplitProducer
+
+# 200-word windows with a 20-word overlap.
+producer = StructuralSplitProducer(
+    split_mode=SplitMode.FIXED_WINDOW,
+    window_size=200,
+    window_unit="word",
+    window_overlap=20,
+)
+```
+
+Only `SplitMode.PARAGRAPH` and `SplitMode.FIXED_WINDOW` exist — a model-tokenizer
+window is deliberately excluded, since it would couple the producer to an
+embedding model.
+
+### 1A.6 Backfilling an existing store (`derive_existing`)
+
+`derive_records` fires automatically on a durable create. To run a producer over
+thoughts that are **already stored** (for example after adding a producer to an
+existing store), call `derive_existing`:
+
+```python
+result = await store.derive_existing(thought_id)
+print(result.created, result.reused, result.skipped)
+```
+
+- Returns a `DeriveResult` tallying children `created` / `reused` / `skipped`.
+  Because derived-child identity is content-addressed, re-running is
+  **idempotent** — already-present children are `reused`, not duplicated (a
+  fully-derived source yields `created == 0`).
+- Gated on a producer capability being present, honouring `DeriveGates.on_error`
+  and `max_derived_per_source` — but **independent of `DeriveGates.enabled`**
+  (that master switch governs only the automatic on-store trigger), so you can
+  backfill once without committing to automatic derivation on every future write.
+  With no producer registered it is a clean no-op.
+- Raises `SourceThoughtNotFoundError` when `thought_id` does not exist (a
+  precondition failure, distinct from the clean empty result returned for an
+  ineligible — already-derived — source). Raises `DerivedRecordError` if the
+  producer's return violates the seam's deterministic contract (over cap, or an
+  identity collision) under `on_error="raise"`.
+- A source that is itself a derived record (it carries an outgoing `DERIVED_FROM`
+  edge) is never re-derived.
+
+`SplitMode`, `DeriveResult`, and `SourceThoughtNotFoundError` are public API under
+the same `X.Y.x` stability guarantee.
 
 ---
 

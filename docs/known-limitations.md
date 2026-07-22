@@ -146,6 +146,45 @@ return incorrect results.
 The `restore --re-embed` flag validates model consistency and raises
 `EmbeddingModelMismatchError` on mismatch.
 
+## Query-vector dimension mismatch
+
+Distinct from the DB-wide **Embedding Dimension Consistency** above (which is
+about the *stored corpus* all sharing one dimension): this is about a single
+**query** vector whose length does not match the store's embedding dimension.
+
+`search_similar()` (and the vector arm of `search_hybrid()`) computes cosine
+similarity between the query vector and stored embeddings, which is only defined
+when both share a dimension. A wrong-length query vector is a caller-contract
+violation, so it is **raised loudly** as
+`VectorDimensionMismatchError` (carrying `expected` and `actual`) rather than
+silently returning an empty result. The check is dimension-only and runs before
+the degeneracy check, so a wrong-length all-zero vector is a dimension error, not
+a [degenerate-vector degradation](observability.md#observability-signals).
+
+> **Behaviour change — catch the typed error.** The wrong-dimension case now
+> raises `VectorDimensionMismatchError` (a subclass of `EngravaError`, **not** of
+> `ValueError`). Any caller that previously caught a plain `ValueError` around a
+> vector search must catch `VectorDimensionMismatchError` (or `EngravaError`)
+> instead.
+
+## Archived thoughts and default retrieval
+
+Archived thoughts (`lifecycle_status = ARCHIVED`) are **excluded from default
+retrieval** on every ranked read — `search_hybrid()`, `recall()`, `search_fts()`,
+and `search_similar()`. This is the retrieval side of
+[Forgetting](memory-hygiene.md) — an **opt-in, off-by-default** hygiene loop — but
+the exclusion applies to **any** archived row, whether or not that loop is enabled:
+a forgotten (archived) thought stops surfacing without being deleted.
+
+- **Behaviour change:** previously an `ARCHIVED` thought still appeared in search.
+  It no longer does. This also affects the TTL `archive` strategy — a TTL-expired,
+  archived thought now drops out of default search too.
+- **Reversible:** `restore_thought()` re-activates a row, and `include_archived=True`
+  re-admits archived rows for a single call without restoring them.
+- **Not applied to counts/listing:** `count_thoughts()` and `list_thoughts()` still
+  include archived rows (they are not ranked retrieval) — filter on
+  `lifecycle_status` yourself if you need them excluded there.
+
 ## Maximum Database Size
 
 SQLite supports databases up to 281 TB (theoretical). In practice, engrava

@@ -26,6 +26,11 @@ relates to the other memory options you might be choosing between.
   OpenAI-compatible endpoint, Ollama, HuggingFace, or your own callback — or run
   with FTS-only and no embeddings at all. See the
   [Embeddings guide](guides/embeddings.md).
+- **You want memory that maintains itself.** Engrava models both halves of memory
+  maintenance: [Dreaming](dreaming.md) (consolidation) keeps and strengthens what
+  matters, and [Forgetting](memory-hygiene.md) (opt-in, reversible memory hygiene)
+  lets cold, low-signal memories fade rather than being kept indefinitely. Both are
+  deterministic and use no LLM.
 - **Small-to-medium corpora.** The default backend brute-forces vector search in
   Python and works well up to roughly 100k embeddings; beyond that, switch to
   the `sqlite-vec` backend. See

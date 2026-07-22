@@ -48,7 +48,7 @@ a single writer coexist. SQLite is **single-writer**, so heavy concurrent writes
 from **multiple processes** are out of scope. For multi-tenant isolation, give
 each tenant its own database file via `EngravaManager` (each has its own lock).
 See [Known Limitations → Concurrent Write Safety](known-limitations.md#concurrent-write-safety)
-and the [migration guide's scoping section](guides/migrating-from-other-memory.md#filtering-scoping-and-multi-tenancy).
+and the [migration guide's scoping section](guides/migrating-from-other-memory.md#filtering-scoping--multi-tenancy).
 
 ## How do I scope search to one user or session?
 
@@ -57,7 +57,7 @@ The `search_*` methods are **unscoped by default** — they take no `user_id` /
 of three patterns: over-fetch + post-filter, one store per tenant via
 `EngravaManager`, or a raw-SQL pre-filter on `metadata_json` with `json_extract`.
 The tradeoffs are laid out in the
-[scoping section](guides/migrating-from-other-memory.md#filtering-scoping-and-multi-tenancy).
+[scoping section](guides/migrating-from-other-memory.md#filtering-scoping--multi-tenancy).
 
 ## When should I enable dreaming?
 

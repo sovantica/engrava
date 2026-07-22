@@ -58,6 +58,34 @@ engrava --db mydata.db --format json info
   contributes one latency sample.
 - This snapshot API tracks only aggregate counts and search latency — not individual events.
 
+## Observability signals
+
+Beyond the aggregate snapshot above, the store exposes two **read-only, monotonic
+counters** as plain properties — `store.fts_match_failure_count` and
+`store.vector_arm_degradation_count` (no `await`, no SQL; they are **not** part of
+the `metrics()` snapshot). Each starts at `0`, only ever increases over the life of
+a store instance, and resets only when you construct a new store. They surface
+silent, self-healing search-arm degradations so an operator can detect a
+systematic problem; reading them never changes behaviour.
+
+| Counter | Increments when… | What it means |
+|---|---|---|
+| `fts_match_failure_count` | a normalized FTS5 `MATCH` raises **before** the sanitizing retry runs | some queries are taking the bare-mode fallback path instead of matching as written. The fallback runs a sanitized query that is a valid MATCH and returns its matches. |
+| `vector_arm_degradation_count` | a **degenerate** query vector (empty, all-zero, or non-finite) makes the vector arm return nothing | some queries are producing bad embeddings, not that the corpus is empty. A **wrong-dimension** query vector is **not** counted here — it raises `VectorDimensionMismatchError` instead (see [Known Limitations](known-limitations.md#query-vector-dimension-mismatch)). |
+
+A steadily-growing `fts_match_failure_count` points at a query-construction issue
+in the caller (queries that keep tripping FTS5 syntax); a growing
+`vector_arm_degradation_count` points at an embedding provider returning empty or
+degenerate vectors. Neither is fatal — both are self-healing — but a rising trend
+is worth an alert.
+
+**FTS query robustness.** The normalizer is built so ordinary text and **valid
+expert syntax** (quoted phrases, `*` prefixes, uppercase `AND`/`OR`/`NOT`,
+`essence:` / `content:` column filters) keep their BM25 ranking and never trip the
+fallback — only a genuinely malformed expression does, and even then the query is
+retried once through the always-valid bare normalization. See
+[Search → Keyword query syntax](search.md#keyword-query-syntax-fts).
+
 ## Production monitoring
 
 `store.metrics()` is a **pull** snapshot — there is no built-in exporter. To
@@ -171,7 +199,9 @@ logging.getLogger("engrava").setLevel(logging.WARNING)  # quiet, production defa
 The snapshot is deliberately small. It does **not** include:
 
 - **write / mutation counters** or **error counters** — track those at your
-  application layer (Engrava raises typed exceptions you can count there);
+  application layer (Engrava raises typed exceptions you can count there). The two
+  search-arm health counters live as separate store properties, not in the
+  snapshot — see [Observability signals](#observability-signals);
 - **dreaming metrics** — `run_consolidation()` returns a `ConsolidationResult`
   (promoted / edges / reflections counts) per run; consume that directly;
 - **journal size or per-event audit metrics** — the audit history lives in the

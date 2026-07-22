@@ -115,7 +115,7 @@ async with EngravaManager.from_config(config.services) as mgr:
 
 Because each service is a separate file, writes to `tenant_a` never contend with
 writes to `tenant_b`, and each can be backed up or deleted independently. See the
-[scoping section](guides/migrating-from-other-memory.md#filtering-scoping-and-multi-tenancy)
+[scoping section](guides/migrating-from-other-memory.md#filtering-scoping--multi-tenancy)
 for when to choose per-service isolation over in-store filtering.
 
 ## Summary

@@ -25,7 +25,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from engrava import DreamingGates, SearchConfig, TTLConfig
+from engrava import DreamingGates, HygienePolicyConfig, SearchConfig, TTLConfig
 from tests.docs._md_blocks import REPO_ROOT
 
 
@@ -69,6 +69,18 @@ DOCUMENTED_DEFAULTS: tuple[DocumentedDefault, ...] = (
         field="min_age_cycles",
         doc_files=("docs/troubleshooting.md",),
         label="DreamingGates.min_age_cycles",
+    ),
+    DocumentedDefault(
+        config_factory=HygienePolicyConfig,
+        field="min_inactivity_age_seconds",
+        doc_files=("docs/configuration.md",),
+        label="HygienePolicyConfig.min_inactivity_age_seconds",
+    ),
+    DocumentedDefault(
+        config_factory=HygienePolicyConfig,
+        field="gc_restore_window_seconds",
+        doc_files=("docs/configuration.md",),
+        label="HygienePolicyConfig.gc_restore_window_seconds",
     ),
 )
 

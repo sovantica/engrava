@@ -91,12 +91,16 @@ CREATED → ACTIVE → DONE → ARCHIVED
 
 `LifecycleStatus` transitions are enforced (`evolve()` rejects illegal jumps).
 Most thoughts you create will start `ACTIVE`. `ARCHIVED` is a **soft-retired**
-retention state and a marker for garbage collection — an archived regular thought
-is **not** automatically hidden from `search_hybrid` / `list_thoughts` /
-`count_thoughts`; it stays searchable until you remove it with `engrava gc`. The
-only rows search auto-excludes are **expired** thoughts and **retired
-REFLECTIONs**. See [Data Lifecycle](data-lifecycle.md) for the full
-retention and garbage-collection behavior.
+retention state and a marker for garbage collection — the row and its content stay
+in the database, but an archived thought is **excluded from default ranked
+retrieval** (`search_hybrid` / `recall` / `search_fts` / `search_similar`) — the
+retrieval side of [Forgetting](memory-hygiene.md), an **opt-in, off-by-default**
+loop. The exclusion applies to any archived row whether or not that loop is
+enabled. It is still returned by `list_thoughts` / `count_thoughts` (those are not
+ranked retrieval), and the exclusion is reversible (`restore_thought` /
+`include_archived=True`). See
+[Data Lifecycle](data-lifecycle.md) for the full retention and garbage-collection
+behavior.
 
 ## Edge
 
@@ -368,6 +372,8 @@ observation = ThoughtRecord(
 
 - [Quick Start](quickstart.md) — create, link, and search in five minutes.
 - [Dreaming](dreaming.md) — how consolidation turns observations into reflections.
+- [Forgetting (Memory Hygiene)](memory-hygiene.md) — the subtractive counterpart to
+  Dreaming: the opt-in, reversible loop that lets cold memories fade.
 - [Hybrid Search](search.md) — how the signals (including recency/cycle and priority) fuse into a ranking.
 - [The Bi-temporal Model](bitemporal.md) — the optional second time axis (valid time) and how it differs from the cycle.
 - [API Reference](api-reference.md) — the exact fields, enums, and methods.

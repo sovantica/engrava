@@ -249,7 +249,7 @@ exists = await store.thought_exists_by_source(
 |--------|---------|-------------|
 | `await store_embedding(thought_id, vector, *, model_name="all-MiniLM-L12-v2", embedding_id=None)` | `EmbeddingRecord` | Store an embedding vector (dimension derived from `len(vector)`) |
 | `await get_embedding(thought_id)` | `EmbeddingRecord \| None` | Retrieve embedding |
-| `await search_similar(query_vector, top_k=10, threshold=0.0)` | `list[tuple[str, float]]` | Cosine similarity search → `(thought_id, score)` |
+| `await search_similar(query_vector, top_k=10, threshold=0.0, *, include_archived=False)` | `list[tuple[str, float]]` | Cosine similarity search → `(thought_id, score)`. Raises `VectorDimensionMismatchError` on a wrong-length query vector; a degenerate vector degrades to `[]` (see [Known Limitations](known-limitations.md#query-vector-dimension-mismatch)). |
 
 #### Full-Text & Hybrid Search
 
@@ -268,6 +268,12 @@ returns a single `HybridSearchResult` container.
 `vector_weight`, `recency_weight`, `recency_half_life`, `current_cycle`,
 `fts_top_k`, `vector_top_k`, `priority_weight`, `graph_weight`,
 `graph_edge_decay`, `include_reflections` (default `True`), `reflection_boost`.
+
+> **Archived thoughts are excluded by default.** All four ranked reads — `recall`,
+> `search_fts`, `search_hybrid`, `search_similar` — drop `ARCHIVED` thoughts from
+> the default candidate set (the mechanism behind [Forgetting](memory-hygiene.md)).
+> Pass `include_archived=True` to re-admit them for one call, or `restore_thought`
+> to re-activate a row. See [Search](search.md#archived-thoughts-are-excluded-by-default).
 
 ##### Scoped & de-fragmented retrieval (keyword-only)
 
@@ -305,9 +311,16 @@ result = await store.recall(
 |--------|---------|-------------|
 | `await metrics()` | `EngravaMetrics` | Snapshot of thought/edge counts, storage, and search-latency percentiles (see [Observability](observability.md)) |
 | `await cleanup_expired(now=None, *, exclude_id=None)` | `CleanupResult` | Archive or delete thoughts past their `expires_at` |
+| `await run_hygiene(*, current_cycle=None, now=None)` | `HygieneResult` | Run one [Forgetting / Memory Hygiene](memory-hygiene.md) pass: archive cold thoughts (reversibly) and, when `auto_gc_enabled`, GC ones past both restore windows. No-op when no `hygiene_policy` is enabled. See [Memory Hygiene](memory-hygiene.md). |
+| `await derive_existing(thought_id)` | `DeriveResult` | Backfill: run the registered derived-records producer over an already-stored source thought (idempotent). Raises `SourceThoughtNotFoundError` if the id is absent. See [Extension hooks §1A.6](extension-hooks.md#1a6-backfilling-an-existing-store-derive_existing). |
 | `await verify_embedding_model()` | `None` | Raise `EmbeddingModelMismatchError` if the stored model lock disagrees with the configured provider |
 | `async with store.suspend_auto_commit():` | context manager | Defer per-call commits so a block of writes commits once (rolls back on error) — use for bulk ingest |
 | `await close()` | `None` | Close the owned connection (only when the store opened it via `from_config`) |
+
+**Read-only health counters** (plain properties, not `await`, not in the metrics
+snapshot): `store.fts_match_failure_count` and `store.vector_arm_degradation_count`
+are monotonic `int` counters that surface silent, self-healing search-arm
+degradations. See [Observability signals](observability.md#observability-signals).
 
 ```python
 # Bulk ingest: one transaction instead of one commit per write.
@@ -567,6 +580,18 @@ for thought_id, score in result.results:
     ...
 ```
 
+### Forgetting (Memory Hygiene) types
+
+Configured under `hygiene_policy` and returned by
+[`run_hygiene`](#metrics--maintenance) — see [Memory Hygiene](memory-hygiene.md)
+and [Configuration → `hygiene_policy`](configuration.md#hygiene_policy).
+
+| Type | Kind | Key fields |
+|------|------|------------|
+| `HygienePolicyConfig` | config | `enabled`, `eviction_threshold`, `protected_priorities`, `signal_weights`, `auto_gc_enabled`, `gc_min_archive_age_cycles`, `gc_restore_window_seconds`, `min_inactivity_age_seconds`, `max_evictions_per_run`, `dry_run` |
+| `HygieneResult` | result | `archived_count`, `gc_count`, `candidates_evaluated`, `dry_run`, `would_evict`, `flat_signals` |
+| `EvictionReason` | audit record | `thought_id`, `keep_score`, `eviction_score`, `decay_multiplier`, `threshold`, `signals`, `mechanism` (always `"hygiene"`) |
+
 ## Metadata Helpers
 
 Three exported helpers build the structured `metadata` dict that pins a
@@ -607,6 +632,7 @@ All enums are `StrEnum` — JSON-serializable and stored as strings.
 | `ThoughtVisibility` | member names `PRIVATE`, `SELECTIVE`, `PUBLIC` — **stored values are lowercase** (`"private"`, `"selective"`, `"public"`) |
 | `KnowledgeSource` | `EXPERIENCE`, `SEEDED_LLM`, `DISTILLED_LLM`, `DREAMING` |
 | `VerificationStatus` | `PENDING`, `CONFIRMED`, `PARTIAL`, `FAILED`, `UNVERIFIABLE` |
+| `SplitMode` | `PARAGRAPH`, `FIXED_WINDOW` — the `StructuralSplitProducer` split strategy (see [Extension hooks §1A.5](extension-hooks.md#1a5-split-modes-structuralsplitproducer)) |
 
 ## Exceptions
 
@@ -626,6 +652,8 @@ All enums are `StrEnum` — JSON-serializable and stored as strings.
 | `EmbeddingQueryPrefixMismatchError` | `EngravaError` | Active query prefix diverges from the corpus pairing, silently degrading ranking |
 | `JournalIntegrityError` | `EngravaError` | On-open journal check (`journal.verify_on_open`) found a broken hash chain; carries first-broken diagnostics |
 | `DerivedRecordError` | `EngravaError` | The derived-records seam rejected a producer result (over-cap return, or a derived identity colliding with its source); carries the failing `source_thought_id` |
+| `SourceThoughtNotFoundError` | `EngravaError` | `derive_existing` targeted a source `thought_id` that does not exist; carries the failing `thought_id` |
+| `VectorDimensionMismatchError` | `EngravaError` | A vector-search query vector's length differs from the store's embedding dimension; carries `expected` / `actual`. **Not** a `ValueError` — catch this typed error (or `EngravaError`). |
 
 > `create_edge` raises `ReferentialIntegrityError` when an endpoint thought
 > does not exist. This exception is **not** re-exported from the top-level
@@ -660,9 +688,13 @@ Companion generic types (all public, `X.Y.x`-stable): `DerivedRecord`
 (producer-owned non-empty `content` / `thought_type` / `priority` / `metadata` /
 `attach_provenance_edge`; core derives the `essence` and owns identity),
 `DeriveContext` (source id, content hash, cycle, informational `origin`; no
-store handle), and `DeriveGates`
-(`enabled`, `on_error`, `max_derived_per_source`). Configure via the `derive:`
-YAML section or the `derive_gates=` constructor argument.
+store handle), `DeriveGates`
+(`enabled`, `on_error`, `max_derived_per_source`), and `DeriveResult` (the
+`created` / `reused` / `skipped` tally returned by
+[`derive_existing`](#metrics--maintenance)). Configure via the `derive:`
+YAML section or the `derive_gates=` constructor argument. The shipped reference
+producer is `StructuralSplitProducer` (see
+[Extension hooks §1A.5](extension-hooks.md#1a5-split-modes-structuralsplitproducer)).
 
 ### `EmbeddingProviderProtocol`
 

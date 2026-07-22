@@ -304,7 +304,9 @@ signal-derived keep-score.
 | `check_every_n_cycles` | `int` | `1` | Cadence for the convenience pass from `consolidate()` only — an explicit `run_hygiene` bypasses it. |
 | `max_evictions_per_run` | `int` | `100` | Caps **each** stage per run (≤ N archived and ≤ N GC'd). |
 | `auto_gc_enabled` | `bool` | `false` | Whether Stage 2 (physical delete) runs. Enabling hygiene never implicitly enables deletion. |
-| `gc_min_archive_age_cycles` | `int` | `10` | Restore window: a hygiene-archived thought is GC-eligible only after this many cycles. |
+| `gc_min_archive_age_cycles` | `int` | `10` | Cycle restore window: a hygiene-archived thought is GC-eligible only after this many cycles. `0` makes this window always pass (disabled), symmetric with `gc_restore_window_seconds: 0`. |
+| `gc_restore_window_seconds` | `int` | `2592000` | Wall-clock restore window (seconds), required **in addition to** the cycle window, before GC may delete a hygiene-archived thought. Default `2592000` (30 days). `0` disables the wall-clock window (cycle-only). |
+| `min_inactivity_age_seconds` | `int` | `604800` | Minimum wall-clock inactivity (seconds) before a thought is archivable — a cold-start guard measured from last contact. Default `604800` (7 days). `0` disables the gate. |
 | `dry_run` | `bool` | `false` | Preview mode — compute the would-archive set (returned with reasons) without mutating or journaling. |
 
 Default `signal_weights`: `recency 0.30`, `frequency 0.25`, `confirmation 0.20`,
@@ -324,9 +326,11 @@ hygiene_policy:
     staleness: 0.10
   check_every_n_cycles: 1
   max_evictions_per_run: 100
-  auto_gc_enabled: false         # Stage 2 physical delete is separately opt-in
-  gc_min_archive_age_cycles: 10  # restore window before a GC is eligible
-  dry_run: false                 # set true to preview without mutating
+  auto_gc_enabled: false             # Stage 2 physical delete is separately opt-in
+  gc_min_archive_age_cycles: 10      # cycle restore window before a GC is eligible
+  gc_restore_window_seconds: 2592000 # AND a 30-day wall-clock window; 0 disables it
+  min_inactivity_age_seconds: 604800 # cold-start guard: 7 days untouched; 0 disables
+  dry_run: false                     # set true to preview without mutating
 ```
 
 > Garbage collection here is cognitive hygiene, not compliance deletion — it is

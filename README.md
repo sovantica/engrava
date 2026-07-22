@@ -178,6 +178,17 @@ since 0.3.0.
 → See [`docs/benchmarks.md`](https://github.com/sovantica/engrava/blob/main/docs/benchmarks.md) for reproducible
 evidence (synthetic benchmark suite runnable in ~5 minutes).
 
+### Forgetting / Memory Hygiene
+
+The subtractive half of memory maintenance, paired with Dreaming: an **opt-in,
+reversible**, no-LLM loop that **archives** cold, low-signal thoughts — and, as a
+*separately* opted-in step, garbage-collects them only after both a cycle and a
+wall-clock restore window. OFF by default; once enabled, archived thoughts drop out
+of default retrieval and can be restored (`restore_thought` / `include_archived`).
+
+→ See [`docs/memory-hygiene.md`](https://github.com/sovantica/engrava/blob/main/docs/memory-hygiene.md) for the
+loop, protection, restore windows, and the honest deletion posture.
+
 ### Tamper-Evident Thought/Edge Journal
 
 Opt-in hash-chain **journal** that records thought and edge mutations (plus

@@ -194,6 +194,17 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
         "class-definition-only producer; the shipped StructuralSplitProducer is behaviour-tested",
     ),
     (
+        "docs/extension-hooks.md",
+        'window_unit="word",',
+        "StructuralSplitProducer FIXED_WINDOW constructor fragment; segmentation "
+        "asserted in the structural-split tests",
+    ),
+    (
+        "docs/extension-hooks.md",
+        "store.derive_existing(thought_id)",
+        "fragment assuming a store; derive_existing asserted in the derived-records backfill tests",
+    ),
+    (
         "docs/audit-trail.md",
         "journaling is active",
         "requires an on-disk engrava.yaml; illustrative from_config wiring",

@@ -26,6 +26,43 @@ its weight is **redistributed proportionally** across active signals.
 - `graph_weight` is `0.0` → graph skipped, zero overhead.
 - All signals disabled → fallback to `list_thoughts(LIMIT top_k)`.
 
+The vector arm distinguishes two bad-query-vector cases:
+
+- A **degenerate** `query_vector` (empty, all-zero, or non-finite) → the vector
+  arm returns nothing and the read-only `vector_arm_degradation_count` counter is
+  incremented (a bad query embedding, not an empty corpus). It does **not** raise.
+- A **wrong-dimension** `query_vector` (its length differs from the store's
+  embedding dimension) is a caller-contract violation and **raises**
+  `VectorDimensionMismatchError` — it is not silently degraded. See
+  [Observability signals](observability.md#observability-signals) and
+  [Known Limitations](known-limitations.md#query-vector-dimension-mismatch).
+
+## Archived thoughts are excluded by default
+
+Every ranked read — `search_hybrid()`, `recall()`, `search_fts()`, and
+`search_similar()` — drops **archived** thoughts (`lifecycle_status = ARCHIVED`)
+from its default candidate set, the same eligibility class as expired rows and
+retired reflections. This is the retrieval side of
+[Forgetting](memory-hygiene.md) — an **opt-in, off-by-default** hygiene loop — but
+the exclusion applies to any archived row, whether or not that loop is enabled: an
+archived (forgotten) thought stops surfacing without being deleted.
+
+The exclusion is **reversible**:
+
+- `store.restore_thought(thought_id)` flips the row back to `ACTIVE`, so it is
+  eligible again; and
+- passing `include_archived=True` to any of the four methods re-admits archived
+  rows for that one call, without restoring them.
+
+> **Behaviour change.** Marking a thought `ARCHIVED` — including via the TTL
+> `archive` strategy — now removes it from default retrieval; previously an
+> archived thought still surfaced in search. It is still counted by
+> `count_thoughts()` / `list_thoughts()` (those are not ranked retrieval); to
+> exclude it there, filter on `lifecycle_status` yourself. The retired-reflection
+> freshness floor is independent — a retired `REFLECTION` stays excluded even under
+> `include_archived=True`. See [Data lifecycle](data-lifecycle.md#lifecycle-states)
+> and [Known Limitations](known-limitations.md#archived-thoughts-and-default-retrieval).
+
 ## Two recency axes
 
 Recency ranks along **two separately-typed axes**, and a query picks **exactly
@@ -110,9 +147,14 @@ rather than breaking the query: a contraction like `sister's` becomes `sister OR
 s`, so it still matches a stored `sister's dog`. Pasting a URL or a timestamp is
 safe too — only the real `essence:` / `content:` column filters are honoured, so
 `http://example.com` and `12:30` are treated as ordinary search terms (they do
-**not** become spurious `http:` / `12:` column filters). A genuinely malformed
-full-text expression is logged and degraded to zero FTS hits, so the rest of a
-hybrid search still returns results.
+**not** become spurious `http:` / `12:` column filters). When a normalized
+full-text expression is a genuinely malformed FTS5 query, engrava logs a warning,
+increments the read-only `fts_match_failure_count` counter, and **retries once**
+through the bare normalization (unsafe characters dropped, wildcards collapsed to
+legal prefixes, any exposed `AND`/`OR`/`NOT` phrase-quoted so FTS5 cannot read it
+as an operator), which is always a valid MATCH; the FTS arm returns that query's
+matches (an empty set when the sanitized query matches nothing). See
+[Observability signals](observability.md#observability-signals).
 
 ## Graph-Aware Ranking
 
