@@ -197,11 +197,12 @@ mine = await store.list_thoughts(
 
 `create_edge` takes a single `EdgeRecord` object and returns the persisted
 record. It raises `ReferentialIntegrityError` when an endpoint thought does
-not exist.
+not exist and `DuplicateEdgeError` when the same directed, typed relationship
+already exists.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `await create_edge(edge)` | `EdgeRecord` | Persist an `EdgeRecord`; raises `ReferentialIntegrityError` on a missing endpoint |
+| `await create_edge(edge)` | `EdgeRecord` | Persist an `EdgeRecord`; raises `ReferentialIntegrityError` on a missing endpoint or `DuplicateEdgeError` for an existing `(from, to, type)` relationship |
 | `await get_edges(thought_id, *, direction='BOTH')` | `list[EdgeRecord]` | Edges for a thought (`direction` is `'IN'`/`'OUT'`/`'BOTH'`, keyword-only) |
 | `await list_edges(*, edge_type=None, source=None, filters=None, limit=5000)` | `list[EdgeRecord]` | List edges with optional filters (`filters` is a typed `MetadataFilter` over the edge `metadata`; see the [`metadata` field](#metadata-field-edges) note) |
 | `await update_edge(edge_id, **changes)` | `EdgeRecord` | Update edge fields |
@@ -211,10 +212,10 @@ not exist.
 The database permits at most one edge for each
 `(from_thought_id, to_thought_id, edge_type)` tuple, independently of
 `edge_id`; attempting to insert the same directed, typed relationship twice
-is rejected by the database uniqueness constraint. No typed Engrava domain
-exception is currently guaranteed for that duplicate case; treat it as a
-backend integrity failure. Reversing the endpoints or using a different edge
-type produces a distinct edge. A **hard** thought delete cascades to edges where
+raises `DuplicateEdgeError`. Reversing the endpoints or using a different edge
+type produces a distinct edge. A duplicate caller-supplied `edge_id` for a
+different relationship remains a separate integrity failure. A **hard** thought
+delete cascades to edges where
 the thought is either endpoint; `invalidate_thought()` does not remove or
 invalidate any edge.
 
@@ -287,7 +288,7 @@ returns a single `HybridSearchResult` container.
 | `await recall(query, *, top_k=10, current_cycle=None, recency_now=None, recency_now_half_life=None, filters=None, visibility=None, collapse_key=None, collapse_max_per_unit=None, include_archived=False)` | `HybridSearchResult` | Ergonomic shorthand over `search_hybrid` for the common retrieval case; supports either recency axis, scoped retrieval, collapse, and archived-row opt-in |
 | `await search_fts(query, top_k=10, *, include_archived=False)` | `list[tuple[str, float]]` | FTS5/BM25 text search → `(thought_id, bm25_score)`; malformed expert expressions retry once through safe bare normalization |
 | `await search_hybrid(query_text, query_vector=None, *, top_k=10, ...)` | `HybridSearchResult` | Combined FTS + vector + recency + priority + graph |
-| `await search_reflections_only(query_text, query_vector=None, *, top_k=10, current_cycle=None)` | `HybridSearchResult` | Search restricted to active REFLECTION thoughts, ranked by vector similarity and optional cycle recency. Unlike the four general ranked methods, this specialized path does not currently apply the `expires_at` cutoff; run TTL cleanup before relying on it for expiry-sensitive reads. |
+| `await search_reflections_only(query_text, query_vector=None, *, top_k=10, current_cycle=None)` | `HybridSearchResult` | Search restricted to active, unexpired REFLECTION thoughts, ranked by vector similarity and optional cycle recency. Expiry is evaluated against one UTC instant captured for the call; `expires_at <= now` is excluded. |
 
 The complete `search_hybrid` signature is:
 
@@ -419,14 +420,15 @@ await ro.create_thought(...)           # Raises ReadOnlyViolationError
 
 Multi-service database isolation. Each service owns a separate
 `<data_dir>/<service_name>.db` file, with its own schema, connection, embedding
-configuration, and journal. Service names accepted by `get_store()` and
-`delete_service()` must match `^[a-z][a-z0-9_-]{0,62}$`: start with a lowercase
+configuration, and journal. Service names accepted by `get_store()`,
+`service_exists()`, and `delete_service()` must match
+`^[a-z][a-z0-9_-]{0,62}$`: start with a lowercase
 letter, then use lowercase letters, digits, `_`, or `-`, up to 63 characters.
 
 | Method | Description |
 |--------|-------------|
 | `await get_store(service_name)` | Lazily create/open and initialize a service store on first access. The manager caches the store, so later calls for the same name return the same live instance until `close_all()` or deletion. |
-| `service_exists(service_name)` | Check whether the computed `.db` file exists without opening or creating it. This probe does not run service-name validation; pass a name conforming to the manager's service-name contract. |
+| `service_exists(service_name)` | Validate the service name, then check whether its `.db` file exists without opening or creating it. Raises `ConfigError` for an invalid name. |
 | `await list_services()` | Scan `data_dir` for `.db` files and return their stems in sorted order; returns `[]` when the directory does not exist. |
 | `await delete_service(service_name)` | Close and evict a cached store, then delete its `.db`, `.db-wal`, and `.db-shm` files. Raises `FileNotFoundError` when the main database file does not exist. This permanently deletes that service's data. |
 | `await close_all()` | Close all cached connections and clear the cache; idempotent. Database files remain on disk, and a later `get_store()` opens a fresh store instance. Async context-manager exit calls this method. |
@@ -762,6 +764,7 @@ store-replacement guidance, see [Error handling and recovery](error-handling.md)
 | `ThoughtNotFoundError` | `EngravaError` | Thought ID not found |
 | `StaleDataError` | `EngravaError` | Concurrent modification detected |
 | `InvalidTransitionError` | `EngravaError` | Invalid lifecycle state transition |
+| `DuplicateEdgeError` | `EngravaError` | The directed `(from_thought_id, to_thought_id, edge_type)` relationship already exists |
 | `ReadOnlyViolationError` | `EngravaError` | Write attempt on read-only store |
 | `EmbeddingModelMismatchError` | `EngravaError` | Embedding model mismatch on restore |
 | `EmbeddingGenerationError` | `EngravaError` | Auto-embed failed under `require_embedding=True` (the thought is committed but unembedded); carries the failing `thought_id` |
@@ -781,9 +784,9 @@ store-replacement guidance, see [Error handling and recovery](error-handling.md)
 | `ConfigError` | `ValueError` | YAML or direct config construction violates a documented configuration invariant |
 
 > `create_edge` raises `ReferentialIntegrityError` when an endpoint thought
-> does not exist. This exception is **not** re-exported from the top-level
-> `engrava` package — catch it via
-> `from engrava.domain.exceptions import ReferentialIntegrityError`.
+> does not exist and `DuplicateEdgeError` when the relationship already exists.
+> These exceptions are **not** re-exported from the top-level `engrava` package;
+> import them from `engrava.domain.exceptions`.
 
 ## Protocols
 
@@ -971,7 +974,7 @@ selecting a provider or vector backend.
 
 | Export | Purpose |
 |---|---|
-| `DreamingExtension` | Periodic consolidation implementation; returns `ConsolidationResult` |
+| `DreamingExtension` | Consolidation implementation. `run_consolidation()` runs immediately; `is_due()` / `run_if_due()` apply the configured cycle cadence without starting a background scheduler. |
 | `DreamingContext` | Per-run context supplied to dreaming signals |
 | `DreamingSignalProtocol` | Contract implemented by promotion-scoring signals |
 | `ActionOutcomeSignal`, `ConfidenceSignal`, `ConfirmationSignal` | Outcome, confidence, and confirmation scoring signals |

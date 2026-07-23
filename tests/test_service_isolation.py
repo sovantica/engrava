@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 
@@ -39,6 +40,43 @@ from engrava.config import (
     load_config,
 )
 from engrava.infrastructure.service_manager import EngravaManager
+
+
+class _RestoreEmbeddingProvider:
+    """Deterministic provider used by CLI restore configuration tests."""
+
+    dimension = 3
+
+    def __init__(
+        self,
+        model_name: str,
+        *,
+        query_prefix: str = "",
+        document_prefix: str = "",
+    ) -> None:
+        self.model_name = model_name
+        self.query_prefix = query_prefix
+        self.document_prefix = document_prefix
+
+    async def embed(self, text: str) -> list[float]:
+        del text
+        return [1.0, 0.0, 0.0]
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        return [[1.0, 0.0, 0.0] for _text in texts]
+
+    async def embed_query(self, text: str) -> list[float]:
+        return await self.embed(self.query_prefix + text)
+
+    async def embed_document(self, text: str) -> list[float]:
+        return await self.embed(self.document_prefix + text)
+
+    async def embed_query_batch(self, texts: list[str]) -> list[list[float]]:
+        return await self.embed_batch([self.query_prefix + text for text in texts])
+
+    async def embed_document_batch(self, texts: list[str]) -> list[list[float]]:
+        return await self.embed_batch([self.document_prefix + text for text in texts])
+
 
 # ------------------------------------------------------------------
 # Value objects: ServiceConfig, ServicesConfig
@@ -758,6 +796,235 @@ class TestEngravaConfigServices:
 class TestReEmbedRequiresProvider:
     """Fix 1: --re-embed must fail when no embedding provider is configured."""
 
+    def test_re_embed_uses_top_level_provider_for_single_db(
+        self,
+        ms11_runner: CliRunner,
+        ms11_populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        snap = tmp_path / "direct-source.jsonl"
+        ms11_runner.invoke(
+            cli,
+            ["--db", str(ms11_populated_db), "snapshot", "-o", str(snap)],
+        )
+        target_db = tmp_path / "direct-target.db"
+        config_path = tmp_path / "direct.yaml"
+        config_path.write_text(
+            f"database:\n  path: {target_db}\n"
+            "embeddings:\n"
+            "  provider: ollama\n"
+            "  model: direct-model\n"
+            '  query_prefix: "query: "\n'
+            '  document_prefix: "passage: "\n',
+            encoding="utf-8",
+        )
+
+        async def _seed_stale_metadata() -> None:
+            conn = await aiosqlite.connect(str(target_db))
+            store = SqliteEngravaCore(conn)
+            await store.ensure_schema()
+            await conn.executemany(
+                "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
+                [
+                    ("embedding_model_name", "stale-model"),
+                    ("embedding_dimension", "999"),
+                    ("embedding_document_prefix_fingerprint", "stale-document-prefix"),
+                    ("embedding_query_prefix", "stale-query-prefix"),
+                ],
+            )
+            await conn.execute(
+                "CREATE TABLE embedding_vec(rowid INTEGER PRIMARY KEY, embedding BLOB)"
+            )
+            await conn.execute(
+                "INSERT INTO embedding_vec(rowid, embedding) VALUES (1, X'00000000')"
+            )
+            await conn.commit()
+            await conn.close()
+
+        asyncio.run(_seed_stale_metadata())
+        resolved_providers: list[str | None] = []
+
+        def _resolve(config: EmbeddingConfig | None) -> _RestoreEmbeddingProvider | None:
+            resolved_providers.append(config.provider if config else None)
+            if config is None or config.provider is None:
+                return None
+            return _RestoreEmbeddingProvider(
+                config.model or config.provider,
+                query_prefix=config.query_prefix or "",
+                document_prefix=config.document_prefix or "",
+            )
+
+        monkeypatch.setattr("engrava.cli.main.resolve_embedding_provider", _resolve)
+
+        async def _load_existing_vec_index(_conn: aiosqlite.Connection) -> bool:
+            return True
+
+        monkeypatch.setattr(
+            "engrava.extensions.vector_sqlite_vec.load_sqlite_vec",
+            _load_existing_vec_index,
+        )
+
+        result = ms11_runner.invoke(
+            cli,
+            [
+                "--db",
+                str(target_db),
+                "--config",
+                str(config_path),
+                "restore",
+                "-i",
+                str(snap),
+                "--re-embed",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert resolved_providers == ["ollama"]
+
+        async def _read_corpus_identity() -> tuple[dict[str, str], set[str], bool]:
+            conn = await aiosqlite.connect(str(target_db))
+            metadata_cursor = await conn.execute(
+                "SELECT key, value FROM _metadata WHERE key LIKE 'embedding_%'"
+            )
+            metadata = {str(key): str(value) for key, value in await metadata_cursor.fetchall()}
+            owner_cursor = await conn.execute("SELECT DISTINCT owner_type FROM embedding")
+            owner_types = {str(row[0]) for row in await owner_cursor.fetchall()}
+            vec_cursor = await conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'embedding_vec'"
+            )
+            vec_index_exists = await vec_cursor.fetchone() is not None
+            await conn.close()
+            return metadata, owner_types, vec_index_exists
+
+        metadata, owner_types, vec_index_exists = asyncio.run(_read_corpus_identity())
+        expected_fingerprint = hashlib.sha256(b"passage: ").hexdigest()
+        assert metadata == {
+            "embedding_model_name": "direct-model",
+            "embedding_dimension": "3",
+            "embedding_document_prefix_fingerprint": expected_fingerprint,
+            "embedding_query_prefix": "query: ",
+        }
+        assert owner_types == {"THOUGHT"}
+        assert not vec_index_exists
+
+    @pytest.mark.parametrize(
+        ("service_override", "expected_provider"),
+        [
+            (False, "ollama"),
+            (True, "huggingface"),
+        ],
+    )
+    def test_re_embed_service_provider_precedence(
+        self,
+        ms11_runner: CliRunner,
+        ms11_populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        service_override: bool,
+        expected_provider: str,
+    ) -> None:
+        snap = tmp_path / f"service-source-{expected_provider}.jsonl"
+        ms11_runner.invoke(
+            cli,
+            ["--db", str(ms11_populated_db), "snapshot", "-o", str(snap)],
+        )
+        data_dir = tmp_path / f"services-{expected_provider}"
+        target_db = data_dir / "target.db"
+        override_yaml = (
+            "  configs:\n"
+            "    target:\n"
+            "      embeddings:\n"
+            "        provider: huggingface\n"
+            "        model: service-model\n"
+            if service_override
+            else ""
+        )
+        config_path = tmp_path / f"service-{expected_provider}.yaml"
+        config_path.write_text(
+            f"database:\n  path: {target_db}\n"
+            "embeddings:\n  provider: ollama\n  model: fallback-model\n"
+            f"services:\n  data_dir: {data_dir}\n  default_service: target\n"
+            f"{override_yaml}",
+            encoding="utf-8",
+        )
+        resolved_providers: list[str | None] = []
+
+        def _resolve(config: EmbeddingConfig | None) -> _RestoreEmbeddingProvider | None:
+            resolved_providers.append(config.provider if config else None)
+            if config is None or config.provider is None:
+                return None
+            return _RestoreEmbeddingProvider(config.model or config.provider)
+
+        monkeypatch.setattr(
+            "engrava.infrastructure.service_manager.resolve_embedding_provider",
+            _resolve,
+        )
+
+        result = ms11_runner.invoke(
+            cli,
+            [
+                "--db",
+                str(target_db),
+                "--config",
+                str(config_path),
+                "restore",
+                "-i",
+                str(snap),
+                "--re-embed",
+                "--service",
+                "target",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert resolved_providers == [expected_provider]
+
+    def test_re_embed_rejects_existing_embeddings_without_clear(
+        self,
+        ms11_runner: CliRunner,
+        ms11_populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        snap = tmp_path / "nonempty-source.jsonl"
+        ms11_runner.invoke(
+            cli,
+            ["--db", str(ms11_populated_db), "snapshot", "-o", str(snap)],
+        )
+        config_path = tmp_path / "nonempty.yaml"
+        config_path.write_text(
+            f"database:\n  path: {ms11_populated_db}\n"
+            "embeddings:\n  provider: ollama\n  model: replacement-model\n",
+            encoding="utf-8",
+        )
+
+        def _resolve(config: EmbeddingConfig | None) -> _RestoreEmbeddingProvider | None:
+            if config is None or config.provider is None:
+                return None
+            return _RestoreEmbeddingProvider(config.model or config.provider)
+
+        monkeypatch.setattr("engrava.cli.main.resolve_embedding_provider", _resolve)
+
+        result = ms11_runner.invoke(
+            cli,
+            [
+                "--db",
+                str(ms11_populated_db),
+                "--config",
+                str(config_path),
+                "restore",
+                "-i",
+                str(snap),
+                "--re-embed",
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "empty embedding target or --clear" in result.output
+
     def test_re_embed_no_provider_single_db(
         self,
         ms11_runner: CliRunner,
@@ -1053,3 +1320,13 @@ class TestServiceExistsMethod:
         async with EngravaManager(data_dir=data_dir) as mgr:
             await mgr.get_store("real")
             assert mgr.service_exists("real")
+
+    @pytest.mark.parametrize("service_name", ["../escape", "UPPER", "", "two words"])
+    def test_service_exists_rejects_invalid_name(
+        self,
+        tmp_path: Path,
+        service_name: str,
+    ) -> None:
+        mgr = EngravaManager(data_dir=tmp_path / "svc")
+        with pytest.raises(ConfigError, match="Invalid service name"):
+            mgr.service_exists(service_name)

@@ -150,7 +150,13 @@ class EngravaManager:
         Returns:
             ``True`` if ``<data_dir>/<service_name>.db`` exists.
 
+        Raises:
+            ConfigError: If the service name is invalid.
+
         """
+        from engrava.config import _validate_service_name  # noqa: PLC0415
+
+        _validate_service_name(service_name)
         return self._service_db_path(service_name).exists()
 
     async def list_services(self) -> list[str]:

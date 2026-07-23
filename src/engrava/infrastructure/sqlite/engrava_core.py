@@ -50,6 +50,7 @@ from engrava.domain.exceptions import (
     CoreMigrationError,
     CycleProviderError,
     DerivedRecordError,
+    DuplicateEdgeError,
     EmbeddingGenerationError,
     EmbeddingModelMismatchError,
     EmbeddingQueryPrefixMismatchError,
@@ -5552,6 +5553,8 @@ class SqliteEngravaCore:
             The persisted edge record.
 
         Raises:
+            DuplicateEdgeError: When the same directed endpoints and edge type
+                already identify a persisted relationship.
             ReferentialIntegrityError: When ``from_thought_id`` or
                 ``to_thought_id`` does not match any persisted thought.
             ValueError: When ``edge.metadata`` violates the shared metadata
@@ -5582,9 +5585,22 @@ class SqliteEngravaCore:
                 ),
             )
         except aiosqlite.IntegrityError as exc:
-            if "FOREIGN KEY" not in str(exc).upper():
-                # Surface UNIQUE / NOT NULL violations unchanged — only
-                # FK violations get the domain wrapper.
+            error_text = str(exc).upper()
+            duplicate_cursor = await self._db.execute(
+                "SELECT 1 FROM edge "
+                "WHERE from_thought_id = ? AND to_thought_id = ? AND edge_type = ? "
+                "LIMIT 1",
+                (edge.from_thought_id, edge.to_thought_id, edge.edge_type.value),
+            )
+            if await duplicate_cursor.fetchone() is not None:
+                raise DuplicateEdgeError(
+                    edge.from_thought_id,
+                    edge.to_thought_id,
+                    edge.edge_type.value,
+                ) from exc
+            if "FOREIGN KEY" not in error_text:
+                # Preserve unrelated integrity failures, such as a duplicate
+                # caller-supplied edge_id, for their own future domain contract.
                 raise
             column, referenced = await self._identify_orphan_endpoint(edge)
             raise ReferentialIntegrityError(
@@ -8238,7 +8254,11 @@ class SqliteEngravaCore:
         ``default_recency_weight``.
 
         When no query vector is available and no embedding provider is
-        configured, all REFLECTION thoughts are returned unranked.
+        configured, all eligible REFLECTION thoughts are returned unranked.
+
+        REFLECTIONs whose ``expires_at`` is at or before the single UTC instant
+        captured for this call are excluded, matching the general ranked
+        retrieval paths.
 
         Args:
             query_text: Text used for auto-embedding when no
@@ -8259,6 +8279,9 @@ class SqliteEngravaCore:
         from engrava.domain.models.search import HybridSearchResult  # noqa: PLC0415
 
         _t_start = _time.perf_counter()
+        # Pin the expiry boundary before the optional provider await so a slow
+        # embedding call cannot change eligibility during this search.
+        now_iso = datetime.datetime.now(datetime.UTC).isoformat()
 
         # Resolve effective query vector (auto-embed if provider available)
         effective_vector = query_vector
@@ -8266,12 +8289,17 @@ class SqliteEngravaCore:
             await self._ensure_query_prefix_pairs()
             effective_vector = await _embed_query(self._embedding_provider, query_text)
 
-        # Fetch all REFLECTION thought IDs directly — complete, no pagination
-        # gap. Retired REFLECTIONs (lifecycle != ACTIVE) are excluded by the
-        # same freshness floor the similarity/hybrid paths apply.
+        # Fetch all eligible REFLECTION thought IDs directly — complete, no
+        # pagination gap. Capture the wall-clock boundary once so every row is
+        # evaluated against the same instant. Retired REFLECTIONs and expired
+        # rows are excluded by the same freshness floors the general ranked
+        # paths apply.
         cursor = await self._db.execute(
             "SELECT thought_id FROM thought "
-            "WHERE thought_type = 'REFLECTION' AND lifecycle_status = 'ACTIVE'"
+            "WHERE thought_type = 'REFLECTION' AND lifecycle_status = 'ACTIVE' "
+            "AND (expires_at IS NULL OR expires_at > ?) "
+            "ORDER BY thought_id ASC",
+            (now_iso,),
         )
         rows = await cursor.fetchall()
         reflection_ids = [str(r["thought_id"]) for r in rows]
@@ -8339,7 +8367,7 @@ class SqliteEngravaCore:
                     for rid, sim in scores
                 ]
 
-        scores.sort(key=lambda x: x[1], reverse=True)
+        scores = _sort_scored_descending(scores)
         await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
         final_scores = scores[:top_k]
         self._buffer_accesses([rid for rid, _ in final_scores])

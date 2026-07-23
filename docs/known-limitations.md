@@ -157,10 +157,11 @@ return incorrect results.
 Engrava validates the stored model identity and raises
 `EmbeddingModelMismatchError` rather than mixing incompatible vectors. A
 deliberate CLI re-embed is available while restoring a snapshot into a
-configured service, where Engrava can resolve the target provider. The
-single-database `--db` restore path has no provider and therefore cannot use
-`--re-embed`; use service mode, `--skip-embeddings`, or preserve the source
-vectors. See [CLI restore](cli.md#restore).
+configured direct database or service. Pass `--config`: direct mode uses the
+top-level `embeddings` provider, while service mode prefers its per-service
+override and otherwise uses the top-level provider. Without a configured
+provider, use `--skip-embeddings` or preserve the source vectors. See
+[CLI restore](cli.md#restore).
 
 ## Query-vector dimension mismatch
 
@@ -200,15 +201,6 @@ a forgotten (archived) thought stops surfacing without being deleted.
 - **Not applied to counts/listing:** `count_thoughts()` and `list_thoughts()` still
   include archived rows (they are not ranked retrieval) — filter on
   `lifecycle_status` yourself if you need them excluded there.
-
-### Reflection-only expiry exception
-
-The specialized `search_reflections_only()` path enforces the `ACTIVE`
-reflection freshness floor but does not currently compare `expires_at` with the
-current time. The general ranked paths listed above do enforce expiry. When an
-application assigns TTLs to REFLECTION records and needs an expiry-sensitive
-reflection-only read, run `cleanup_expired()` first or use a general ranked
-search until this specialized-path limitation is removed.
 
 ## Maximum Database Size
 

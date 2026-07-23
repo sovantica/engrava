@@ -23,6 +23,7 @@ class EngravaCLIConfig:
         output_format: Output format for query results.
         verbose: Enable verbose logging.
         config_path: Optional path to ``engrava.yaml`` for services config.
+        extensions_enabled: Whether installed CLI and MindQL entry points may load.
 
     """
 
@@ -30,6 +31,7 @@ class EngravaCLIConfig:
     output_format: Literal["json", "table", "csv"] = "table"
     verbose: bool = False
     config_path: Path | None = None
+    extensions_enabled: bool = True
 
     @classmethod
     def resolve(
@@ -39,6 +41,7 @@ class EngravaCLIConfig:
         output_format: str = "table",
         verbose: bool = False,
         config_path: str | None = None,
+        disable_extensions: bool = False,
     ) -> EngravaCLIConfig:
         """Resolve config from explicit args, then env, then defaults.
 
@@ -52,6 +55,7 @@ class EngravaCLIConfig:
             output_format: Output format (json/table/csv).
             verbose: Enable verbose output.
             config_path: Explicit path to engrava.yaml.
+            disable_extensions: Prevent installed CLI and MindQL entry-point loading.
 
         Returns:
             Resolved CLI configuration.
@@ -65,4 +69,5 @@ class EngravaCLIConfig:
             output_format=fmt,  # type: ignore[arg-type]
             verbose=verbose,
             config_path=Path(resolved_config) if resolved_config else None,
+            extensions_enabled=not disable_extensions,
         )

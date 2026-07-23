@@ -64,13 +64,11 @@ async with await SqliteEngravaCore.from_config("engrava.yaml") as store:
     thought = await store.get_thought("abc")
 ```
 
-> **Unknown keys are ignored.** The YAML loader validates recognised values but
-> does not reject or warn about unrecognised keys at the top level or inside
-> sections. A misspelling such as `promtoe_threshold` is therefore ignored and
-> leaves `promote_threshold` at its default. Review configuration diffs
-> carefully and inspect the returned `EngravaConfig` when deploying a changed
-> file. Missing required recognised fields, such as `database.path`, still fail
-> with `ConfigError`.
+> **Unknown keys fail fast.** The YAML loader raises `ConfigError` for
+> unrecognised keys at the top level and inside every statically shaped section,
+> so a misspelling such as `promtoe_threshold` cannot silently retain a default.
+> Dynamic mapping keys remain supported where the contract permits them, such
+> as service names and custom Dreaming signal names.
 
 ### Full Factory Method
 
@@ -228,14 +226,15 @@ vector dimension lives under `extensions.vector.dimension`, not here.
 
 Memory consolidation configuration. Setting `enabled: true` wires
 `store.consolidate()` when the store is created with `from_config()`; it does
-not start a background task. `schedule_every_n_cycles` is configuration data
-for caller-side scheduling and is not currently enforced by
-`run_consolidation()` or `store.consolidate()`.
+not start a background task. `DreamingExtension.is_due()` and `run_if_due()`
+apply `schedule_every_n_cycles` for callers that drive a cycle loop.
+`run_consolidation()` and `store.consolidate()` remain explicit, unconditional
+operations.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | `bool` | `false` | Enable dreaming consolidation |
-| `schedule_every_n_cycles` | `int` | `100` | Positive caller-visible cadence hint. Engrava stores it but does not schedule or suppress consolidation calls. |
+| `schedule_every_n_cycles` | `int` | `100` | Positive cadence consumed by `DreamingExtension.is_due()` / `run_if_due()`; Engrava does not start a background scheduler. |
 | `promote_threshold` | `float` | `0.7` | Promotion requires a redistributed weighted score strictly greater than this value. |
 | `signals` | `map[str, float]` | see below | Relative promotion-signal weights. A partial YAML map merges onto the defaults. Flat signals are removed and active weights are renormalised per run. |
 | `candidates_limit` | `int` | `200` | Limit for the ACTIVE promotion pool and each agglomerative type query. The LPA path reads the existing dream-edge graph rather than applying this as a graph-edge cap. |

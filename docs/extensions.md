@@ -306,22 +306,26 @@ manifests:
     - "my_plugin.manifest:MANIFEST"
 ```
 
-### CLI discovery is automatic
+### CLI discovery and its disable control
 
 The `engrava` CLI has two additional discovery paths that are independent of
 the library opt-in above:
 
-- every CLI startup scans the `engrava.cli` entry-point group and loads values
-  that provide Click commands, before the requested subcommand is parsed;
+- root CLI help and resolution of an otherwise unknown command scan the
+  `engrava.cli` entry-point group and load values that provide Click commands;
+  built-in commands resolve without that scan;
 - the built-in `engrava query` command also scans `engrava.extensions`, loads
   manifests, and registers their `mindql_extensions` for that query.
 
 These CLI scans do not pass discovered manifests to a store and therefore do
 not apply their schema migrations. They do import and execute installed Python
-entry-point code. There is currently no CLI flag, environment variable, or YAML
-setting that disables either scan. Run the CLI in an environment containing
-only trusted packages; use the Python API with explicit manifests when you need
-an allow-listed extension set. See [Security and Trust Boundaries](security.md).
+entry-point code. The global `--no-extensions` option prevents both scans,
+including during root help, built-in commands, and `query`. Set
+`ENGRAVA_DISABLE_EXTENSIONS=1` for the equivalent process-level control. This
+does not disable explicit manifest paths or library-side discovery configured on
+an application-created store. Run the CLI in an environment containing only
+trusted packages; use the Python API with explicit manifests when you need an
+allow-listed extension set. See [Security and Trust Boundaries](security.md).
 
 ### Version tracking
 

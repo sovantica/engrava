@@ -317,8 +317,9 @@ the table. This family includes E5, BGE, GTE, and Ollama's `nomic-embed-text`.
 `SentenceTransformerProvider`, `OllamaProvider`, and `HuggingFaceProvider` accept
 an optional, keyword-only `query_prefix` / `document_prefix` for exactly this.
 The document prefix is applied on every document-embed path (ingest auto-embed
-and configured-service `restore --re-embed`); the query prefix on every
-query-embed path (`search_hybrid`, `recall`, and reflection search).
+and configured `restore --re-embed`, in direct or service mode); the query
+prefix on every query-embed path (`search_hybrid`, `recall`, and reflection
+search).
 
 ```python
 provider = SentenceTransformerProvider(
@@ -353,10 +354,15 @@ A few rules make this safe to adopt incrementally:
   is part of the corpus identity: change it and every stored vector would change.
   Turning it on (or changing it) on a store that already holds vectors raises
   `EmbeddingModelMismatchError` — Engrava never silently re-embeds. Re-embed on
-  purpose by restoring a snapshot with `--re-embed` into a service whose
-  provider is defined in `engrava.yaml` (which applies the configured document
-  prefix), or start a fresh store. The single-database `--db` restore path does
-  not resolve an embedding provider.
+  purpose by restoring a snapshot with `--re-embed` and `--config` (which applies
+  the top-level provider in direct mode, or a per-service override before the
+  top-level fallback), or start a fresh store. Restore replaces the model,
+  dimension, document-prefix fingerprint, and query-prefix pairing in the same
+  transaction as the new vectors. Use a fresh target or `--clear` when the
+  target already contains embeddings. If the database has a persisted
+  sqlite-vec index, restore drops it transactionally and the next configured
+  open rebuilds it from `embedding`; keep the `engrava[vec]` extra installed for
+  that reset.
 - **Changing `query_prefix` alone does *not* re-embed anything** — it does not touch
   stored vectors. But the corpus records the query prefix it was built to pair with,
   so querying with a *divergent* query prefix raises `EmbeddingQueryPrefixMismatchError`
@@ -371,8 +377,8 @@ A few rules make this safe to adopt incrementally:
 
 - **Keep one model per store.** The query and corpus vectors must come from the
   same model; switching models on an existing store requires a deliberate
-  migration. The CLI can re-embed while restoring a snapshot into a configured
-  service; see [CLI restore](../cli.md#restore).
+  migration. The CLI can re-embed while restoring a snapshot with a configured
+  top-level or per-service provider; see [CLI restore](../cli.md#restore).
 - **Dimension follows the model.** Local/HF providers infer it from the model;
   `CallbackProvider` requires you to declare `dimension` to match what your
   callback returns. For the `sqlite-vec` vector backend, set

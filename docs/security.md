@@ -140,15 +140,17 @@ Discovery boundaries differ between the library and CLI:
 - `SqliteEngravaCore` does not scan entry points by itself. Library discovery
   happens only when the caller invokes `discover_manifests()` or configuration
   sets `manifests.discover: true`.
-- the `engrava` executable automatically scans `engrava.cli` on every startup,
-  before dispatching any subcommand;
+- root `engrava --help` and resolution of an otherwise unknown CLI command scan
+  `engrava.cli`; built-in commands resolve without that scan;
 - `engrava query` additionally scans `engrava.extensions` to register MindQL
   commands from discovered manifests.
 
 The CLI scans load Python entry-point objects even though they do not apply the
-manifests' schema migrations. There is currently no CLI switch, environment
-variable, or YAML option to disable these automatic scans. Installing an
-extension package into an environment where `engrava` is invoked therefore
+manifests' schema migrations. Use global `--no-extensions`, or set
+`ENGRAVA_DISABLE_EXTENSIONS=1`, to prevent loading from **both** `engrava.cli`
+and `engrava.extensions`, including for help, built-ins, and `query`. This
+control does not override explicit manifest configuration used by library code.
+Installing an extension package into an environment where discovery is enabled
 grants that package code execution in the CLI process. Use a dedicated virtual
 environment containing only reviewed packages, or use the Python API with an
 explicit manifest allow-list when this trust is unacceptable.
@@ -245,8 +247,8 @@ and enabled only with controls appropriate to the environment.
 - [ ] Enforce authentication and authorization outside Engrava core.
 - [ ] Use a separate database per tenant or security domain where isolation is
       required.
-- [ ] Install only reviewed hooks and extensions; remember that library
-      manifest discovery is opt-in but CLI entry-point discovery is automatic.
+- [ ] Install only reviewed hooks and extensions; disable CLI entry-point loading
+      with `--no-extensions` or `ENGRAVA_DISABLE_EXTENSIONS=1` when it is not needed.
 - [ ] Back up before migrations and use a WAL-safe backup method.
 - [ ] Treat restored content as trusted only when its source is trusted.
 - [ ] Enable and verify the journal only with its keyless, partial-coverage

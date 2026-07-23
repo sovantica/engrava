@@ -1629,6 +1629,27 @@ class EngravaConfig:
 # ------------------------------------------------------------------
 
 
+def _reject_unknown_keys(raw: dict[str, Any], allowed: set[str], path: str) -> None:
+    """Reject unrecognised keys in a statically shaped YAML mapping.
+
+    Dynamic mappings such as service names and custom signal registries are
+    validated by their dedicated parsers and do not use this helper.
+
+    Args:
+        raw: Parsed mapping to inspect.
+        allowed: Keys owned by the mapping's public configuration contract.
+        path: Human-readable dotted path used in the error message.
+
+    Raises:
+        ConfigError: If one or more keys are not recognised.
+
+    """
+    unknown = sorted((key for key in raw if key not in allowed), key=repr)
+    if unknown:
+        rendered = ", ".join(repr(key) for key in unknown)
+        raise ConfigError(f"Unknown configuration key(s) at {path}: {rendered}")
+
+
 def load_config(path: str | Path) -> EngravaConfig:
     """Load and validate an ``engrava.yaml`` configuration file.
 
@@ -1679,7 +1700,28 @@ def _parse_config(raw: dict[str, Any]) -> EngravaConfig:
         ConfigError: On missing or invalid fields.
 
     """
+    _reject_unknown_keys(
+        raw,
+        {
+            "database",
+            "derive",
+            "embeddings",
+            "extensions",
+            "hooks",
+            "hygiene_policy",
+            "ingest",
+            "journal",
+            "manifests",
+            "metrics",
+            "search",
+            "services",
+            "ttl",
+        },
+        "<root>",
+    )
+
     db_section = _require_mapping(raw.get("database", {}), "database")
+    _reject_unknown_keys(db_section, {"path", "wal_mode"}, "database")
 
     db_path = db_section.get("path")
     if not db_path:
@@ -1695,6 +1737,7 @@ def _parse_config(raw: dict[str, Any]) -> EngravaConfig:
 
     # Extensions section
     ext_section = _require_mapping(raw.get("extensions", {}), "extensions")
+    _reject_unknown_keys(ext_section, {"dreaming", "vector"}, "extensions")
 
     vector_backend = "numpy"
     embedding_dimension = 384
@@ -1706,6 +1749,7 @@ def _parse_config(raw: dict[str, Any]) -> EngravaConfig:
     # silently retaining the defaults.
     if raw_vector is not None:
         vector_cfg = _require_mapping(raw_vector, "extensions.vector")
+        _reject_unknown_keys(vector_cfg, {"backend", "dimension"}, "extensions.vector")
         vector_backend = vector_cfg.get("backend", "numpy")
         embedding_dimension = _require_positive_int(
             vector_cfg.get("dimension", 384),
@@ -1734,6 +1778,7 @@ def _parse_config(raw: dict[str, Any]) -> EngravaConfig:
     # is malformed and must fail loudly rather than silently retaining the default.
     if raw_hooks is not None:
         hooks_section = _require_mapping(raw_hooks, "hooks")
+        _reject_unknown_keys(hooks_section, {"class"}, "hooks")
         hooks_class = hooks_section.get("class")
 
     # Services section
@@ -1788,6 +1833,7 @@ def _parse_metrics(raw: Any) -> MetricsConfig:  # noqa: ANN401
     if raw is None:
         return MetricsConfig()
     raw = _require_mapping(raw, "metrics")
+    _reject_unknown_keys(raw, {"enabled", "window_size"}, "metrics")
 
     window_size = _require_positive_int(raw.get("window_size", 1000), "metrics.window_size")
     enabled = _require_bool(raw.get("enabled", True), "metrics.enabled")
@@ -1804,6 +1850,7 @@ def _parse_ingest(raw: Any) -> IngestConfig:  # noqa: ANN401
     if raw is None:
         return IngestConfig()
     raw = _require_mapping(raw, "ingest")
+    _reject_unknown_keys(raw, {"deduplication_enabled"}, "ingest")
 
     deduplication_enabled = _require_bool(
         raw.get("deduplication_enabled", True),
@@ -1834,6 +1881,7 @@ def _parse_derive(raw: Any) -> DeriveGates:  # noqa: ANN401
     if raw is None:
         return DeriveGates()
     raw = _require_mapping(raw, "derive")
+    _reject_unknown_keys(raw, {"enabled", "max_derived_per_source", "on_error"}, "derive")
 
     enabled = _require_bool(raw.get("enabled", False), "derive.enabled")
 
@@ -1897,6 +1945,7 @@ def _parse_service_config(name: str, raw: Any) -> ServiceConfig:  # noqa: ANN401
     if raw is None:
         return ServiceConfig()
     raw = _require_mapping(raw, f"services.configs.{name}")
+    _reject_unknown_keys(raw, {"embeddings"}, f"services.configs.{name}")
 
     embeddings_cfg = _parse_embeddings(raw.get("embeddings"))
     return ServiceConfig(embeddings=embeddings_cfg)
@@ -1918,6 +1967,7 @@ def _parse_services(raw: Any) -> ServicesConfig | None:  # noqa: ANN401
     if raw is None:
         return None
     raw = _require_mapping(raw, "services")
+    _reject_unknown_keys(raw, {"configs", "data_dir", "default_service"}, "services")
 
     data_dir = raw.get("data_dir")
     if not data_dir:
@@ -1966,6 +2016,35 @@ def _parse_dreaming(raw: Any) -> DreamingConfig | None:  # noqa: ANN401, C901, P
     if raw is None:
         return None
     raw = _require_mapping(raw, "extensions.dreaming")
+    _reject_unknown_keys(
+        raw,
+        {
+            "access_tracking_enabled",
+            "boilerplate_min_corpus_size",
+            "boilerplate_min_keyphrases_per_refl",
+            "boilerplate_threshold",
+            "candidates_limit",
+            "clustering_backend",
+            "edges",
+            "eligible_content_types",
+            "eligible_perspectives",
+            "enabled",
+            "excluded_content_types",
+            "gates",
+            "max_p1_fraction",
+            "member_excerpt_max_chars",
+            "min_source_confidence",
+            "promote_targets",
+            "promote_threshold",
+            "reflection_default_priority",
+            "schedule_every_n_cycles",
+            "self_filter_mode",
+            "signals",
+            "top_keyphrases_count",
+            "top_member_excerpts_count",
+        },
+        "extensions.dreaming",
+    )
 
     enabled = _require_bool(raw.get("enabled", False), "extensions.dreaming.enabled")
 
@@ -2225,6 +2304,23 @@ def _parse_hygiene(raw: Any) -> HygienePolicyConfig | None:  # noqa: ANN401
     if raw is None:
         return None
     raw = _require_mapping(raw, "hygiene_policy")
+    _reject_unknown_keys(
+        raw,
+        {
+            "auto_gc_enabled",
+            "check_every_n_cycles",
+            "dry_run",
+            "enabled",
+            "eviction_threshold",
+            "gc_min_archive_age_cycles",
+            "gc_restore_window_seconds",
+            "max_evictions_per_run",
+            "min_inactivity_age_seconds",
+            "protected_priorities",
+            "signal_weights",
+        },
+        "hygiene_policy",
+    )
 
     enabled = _require_bool(raw.get("enabled", False), "hygiene_policy.enabled")
 
@@ -2359,6 +2455,11 @@ def _parse_edge_creation(raw: object) -> EdgeCreationConfig:
 
     """
     raw = _require_mapping(raw, "extensions.dreaming.edges")
+    _reject_unknown_keys(
+        raw,
+        {"edge_weight_factor", "enabled", "min_similarity", "top_k"},
+        "extensions.dreaming.edges",
+    )
 
     enabled = _require_bool(raw.get("enabled", True), "edges.enabled")
     top_k = _require_positive_int(raw.get("top_k", 1), "edges.top_k")
@@ -2390,6 +2491,30 @@ def _parse_gates(raw: Any) -> DreamingGates:  # noqa: ANN401
 
     """
     raw = _require_mapping(raw, "extensions.dreaming.gates")
+    _reject_unknown_keys(
+        raw,
+        {
+            "allow_zero_confirmation",
+            "cluster_algorithm",
+            "cluster_allowed_types",
+            "cluster_quality_cohesion_threshold",
+            "cluster_quality_external_homogeneity_threshold",
+            "cluster_quality_gating_enabled",
+            "cluster_quality_ne_consistency_threshold",
+            "cluster_quality_persona_threshold",
+            "cluster_quality_require_meaningful_keyphrases",
+            "cluster_similarity_threshold",
+            "clustering_min_new_candidates",
+            "cold_start_clustering",
+            "enable_reflections",
+            "max_cluster_size",
+            "max_promoted_per_run",
+            "min_age_cycles",
+            "min_cluster_size",
+            "min_confirmations",
+        },
+        "extensions.dreaming.gates",
+    )
 
     min_conf = _require_nonneg_int(raw.get("min_confirmations", 2), "gates.min_confirmations")
     min_age = _require_nonneg_int(raw.get("min_age_cycles", 1), "gates.min_age_cycles")
@@ -2525,6 +2650,34 @@ def _parse_search(raw: Any) -> SearchConfig:  # noqa: ANN401
     if raw is None:
         return SearchConfig()
     raw = _require_mapping(raw, "search")
+    _reject_unknown_keys(
+        raw,
+        {
+            "collapse_pool_factor",
+            "default_fts_weight",
+            "default_graph_weight",
+            "default_priority_weight",
+            "default_recency_weight",
+            "default_vector_weight",
+            "graph_edge_decay",
+            "graph_expansion_enabled",
+            "graph_expansion_max_sources_per_reflection",
+            "graph_expansion_propagation_factor",
+            "graph_expansion_reflection_source_ceiling",
+            "graph_expansion_top_n",
+            "max_neighbors_per_candidate",
+            "priority_boost_p1",
+            "priority_boost_p2",
+            "priority_boost_p3",
+            "priority_boost_p4",
+            "recency_half_life",
+            "recency_now_half_life_seconds",
+            "reflection_boost",
+            "reflection_topk_cap",
+            "vec0_overfetch_factor",
+        },
+        "search",
+    )
 
     fts_w = _require_nonneg_float(raw.get("default_fts_weight", 0.3), "search.default_fts_weight")
     vec_w = _require_nonneg_float(
@@ -2678,6 +2831,22 @@ def _parse_embeddings(raw: Any) -> EmbeddingConfig | None:  # noqa: ANN401, C901
     if raw is None:
         return None
     raw = _require_mapping(raw, "embeddings")
+    _reject_unknown_keys(
+        raw,
+        {
+            "api_key",
+            "auto_embed",
+            "base_url",
+            "batch_size",
+            "device",
+            "document_prefix",
+            "model",
+            "provider",
+            "query_prefix",
+            "require_embedding",
+        },
+        "embeddings",
+    )
 
     provider = raw.get("provider")
     # Check the type before the frozenset membership test: an unhashable provider
@@ -2851,6 +3020,7 @@ def _parse_journal(raw: Any) -> JournalConfig:  # noqa: ANN401
     if raw is None:
         return JournalConfig()
     raw = _require_mapping(raw, "journal")
+    _reject_unknown_keys(raw, {"enabled", "verify_on_open"}, "journal")
 
     enabled = _require_bool(raw.get("enabled", False), "journal.enabled")
     verify_on_open = _require_bool(raw.get("verify_on_open", False), "journal.verify_on_open")
@@ -2878,6 +3048,11 @@ def _parse_ttl(raw: Any) -> TTLConfig:  # noqa: ANN401
     if raw is None:
         return TTLConfig()
     raw = _require_mapping(raw, "ttl")
+    _reject_unknown_keys(
+        raw,
+        {"check_every_n_operations", "default_ttl_seconds", "strategy"},
+        "ttl",
+    )
 
     strategy = raw.get("strategy", "archive")
     # Type-check before the membership test so a non-string (e.g. a list) is
@@ -3004,6 +3179,8 @@ def _parse_manifests(raw: Any) -> tuple[list[str], bool]:  # noqa: ANN401
             "with optional 'discover' and 'paths' keys"
         )
         raise ConfigError(msg)
+
+    _reject_unknown_keys(raw, {"discover", "paths"}, "manifests")
 
     discover = raw.get("discover", False)
     if not isinstance(discover, bool):

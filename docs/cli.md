@@ -17,12 +17,15 @@ These apply to every command and go **before** the command name:
 | `--db` | path | `./engrava.db` | Path to the SQLite database. Falls back to the `ENGRAVA_DB` env var, then the default. |
 | `--config` | path | — | Path to `engrava.yaml`. Falls back to the `ENGRAVA_CONFIG` env var. |
 | `--format` | `table` \| `json` \| `csv` | `table` | Output format for commands that print records. |
-| `--verbose` | flag | off | Compatibility flag. It is accepted and stored in CLI configuration, but currently does not change logging or command output. |
+| `--verbose` | flag | off | Emit DEBUG logs from Engrava modules to stderr for this invocation. Command data on stdout keeps its selected format. |
+| `--no-extensions` | flag | off | Prevent loading both `engrava.cli` and `engrava.extensions` entry points. `ENGRAVA_DISABLE_EXTENSIONS=1` provides the same control. |
 | `--help` | flag | — | Show help and exit (works on the root and on every command). |
 
 **Environment variables.** `ENGRAVA_DB` and `ENGRAVA_CONFIG` are CLI fallbacks for
 `--db` and `--config` respectively; the explicit flag always wins
 (`--db` > `ENGRAVA_DB` > `./engrava.db`).
+`ENGRAVA_DISABLE_EXTENSIONS=1` activates `--no-extensions` before command
+resolution, including for root help and built-in commands.
 
 ```bash
 export ENGRAVA_DB=/data/engrava.db
@@ -45,11 +48,10 @@ engrava --db other.db info         # flag overrides the env var
 
 ## Extension discovery
 
-The executable automatically discovers installed CLI extensions. Before Click
-parses and dispatches the requested subcommand, every `engrava` invocation scans
-the `engrava.cli` entry-point group and loads objects that provide Click
-commands. This happens even when you invoke a built-in command such as `info` or
-`--help`.
+The executable discovers installed CLI extensions lazily. Built-in commands are
+resolved without scanning `engrava.cli`. Root help scans that entry-point group
+so installed commands appear in the command list, and an otherwise unknown
+command triggers the scan so an installed extension command can resolve.
 
 The built-in `query` command performs a second scan of
 `engrava.extensions`. It loads each discovered manifest and registers its
@@ -57,14 +59,25 @@ The built-in `query` command performs a second scan of
 schema migrations.
 
 Both scans import and may execute code from installed packages. Failed entry
-points are skipped with a warning log. There is currently no global option,
-environment variable, or YAML setting to disable CLI discovery. Use the CLI in
-an environment containing only trusted packages; see
+points are skipped with a warning log. Put `--no-extensions` before the command,
+or set `ENGRAVA_DISABLE_EXTENSIONS=1`, to prevent **both** entry-point groups from
+being scanned or loaded:
+
+```bash
+engrava --no-extensions --help
+ENGRAVA_DISABLE_EXTENSIONS=1 engrava --db memory.db info
+engrava --no-extensions --db memory.db query "SELECT thought_id FROM thought LIMIT 5"
+```
+
+This control is specific to automatic CLI entry-point loading. It does not
+disable explicit manifest paths or library-side `manifests.discover` settings
+used by an application-created store. Continue to install only trusted packages;
+see
 [Security and Trust Boundaries](security.md#extensions-hooks-and-migrations).
 
-`--verbose` does not make these warnings or other logs more verbose in the
-current release. The flag is retained for CLI compatibility but has no output or
-logging effect.
+`--verbose` enables DEBUG logging for the `engrava` logger hierarchy for the
+duration of the command. Logs go to stderr, leaving JSON/CSV/table command data
+on stdout.
 
 ## Service resolution
 
@@ -188,8 +201,14 @@ Restores a database from a JSONL snapshot produced by `snapshot`.
 | `-i`, `--input` | path | **required** | JSONL snapshot file to restore. |
 | `--clear` | flag | off | Clear existing data before restoring. |
 | `--skip-embeddings` | flag | off | Import without embedding records. |
-| `--re-embed` | flag | off | Re-embed all thoughts via a configured target service's provider, ignoring source embeddings. Requires config-backed service mode. |
+| `--re-embed` | flag | off | Re-embed all thoughts via the target provider, ignoring source embeddings. Requires `--config` with top-level or per-service embeddings. |
 | `--service` | name | see below | The service to restore into. |
+
+For any `restore --clear`, an existing sqlite-vec table is dropped in the same
+transaction as the canonical rows. The next sqlite-vec-enabled open recreates
+and backfills it. Because SQLite must load the virtual-table module before it can
+remove that table safely, install `engrava[vec]` before clearing a database that
+already contains a persisted sqlite-vec index.
 
 `--service` resolves exactly as for [`snapshot`](#service-resolution): an explicit
 `--service NAME` targets that service even without a services config (its database
@@ -205,25 +224,27 @@ fails with:
 Error: --re-embed and --skip-embeddings are mutually exclusive.
 ```
 
-Use `--re-embed` when a **configured service** uses a different embedding model
-than the snapshot. Load an `engrava.yaml` whose `services` configuration
-resolves the target service and sets
-`services.configs.<name>.embeddings.provider`. The CLI does not forward the
-top-level `embeddings` section as a service default. The restore opens that
-service through `EngravaManager`, discards snapshot embedding rows, and
-generates replacement vectors with the target provider.
+Use `--re-embed` when the target should use a different embedding model than the
+snapshot. In single-database mode, the provider comes from the top-level
+`embeddings` section of the file passed with `--config`. In service mode,
+`services.configs.<name>.embeddings` takes precedence; when no override exists,
+the same top-level `embeddings` section is the fallback. Restore discards source
+embedding rows, generates replacement vectors with the resolved provider, and
+atomically replaces the stored model, dimension, document-prefix fingerprint,
+and query-prefix pairing. A target that already contains embeddings requires
+`--clear`; without it, restore refuses to relabel vectors that are not part of
+the snapshot. The sqlite-vec reset described above prevents stale index rows
+from surviving that replacement.
 
-The single-database `--db` branch constructs a bare store without an embedding
-provider. Consequently, `engrava --db fresh.db restore ... --re-embed` is not a
-supported re-embed path and fails before restoring snapshot records, even if a config
-path is also present but does not resolve restore into service mode. An explicit
-`--service` without a configured provider fails for the same reason. Use
-`--skip-embeddings` to import text without vectors, or restore normally to retain
-the snapshot vectors.
+If neither level declares a provider, restore fails before importing records and
+names the missing configuration. An explicit `--service` without a config-backed
+provider fails for the same reason. Use `--skip-embeddings` to import text
+without vectors, or restore normally to retain the snapshot vectors.
 
 ```bash
 engrava --db fresh.db restore -i backup.jsonl
 engrava --db fresh.db restore -i backup.jsonl --clear --skip-embeddings
+engrava --db fresh.db --config engrava.yaml restore -i backup.jsonl --clear --re-embed
 engrava --config engrava.yaml restore -i backup.jsonl --service main --clear --re-embed
 ```
 

@@ -122,10 +122,12 @@ extension. It raises `RuntimeError` if dreaming is not enabled/wired on the
 store (built manually, or `dreaming.enabled` is `false`) — there is no
 extension to run.
 
-`schedule_every_n_cycles` is a validated configuration value, not an internal
-scheduler. Engrava does not start a background task and neither
-`store.consolidate()` nor `run_consolidation()` skips a call based on that
-field. Your application must decide when the configured cadence is due.
+`schedule_every_n_cycles` does not start a background scheduler. Applications
+with a cycle loop can call `DreamingExtension.run_if_due(store, current_cycle)`;
+it runs only on positive cycle multiples while Dreaming is enabled and returns
+`None` otherwise. `is_due(current_cycle)` exposes the same decision without a
+write. Explicit `store.consolidate()` and `run_consolidation()` calls remain
+unconditional.
 
 ## Gates
 
@@ -359,7 +361,7 @@ recommended production profile:
 extensions:
   dreaming:
     enabled: false
-    schedule_every_n_cycles: 100   # caller-side hint; not an internal scheduler
+    schedule_every_n_cycles: 100   # used by is_due() / run_if_due()
     promote_threshold: 0.7
     candidates_limit: 200
     signals:
@@ -423,10 +425,10 @@ require a matching `custom_signals` implementation when constructing
 `DreamingExtension`; the YAML-only `from_config()` path has no custom-signal
 registry and rejects unknown names when it constructs the extension.
 
-As described in the [configuration loading warning](configuration.md#loading-configuration),
-unknown keys are ignored. A misspelled Dreaming key can silently leave the
-documented default active. See [Configuration](configuration.md#dreaming) for
-field-by-field types and validation ranges.
+As described in [Configuration](configuration.md#loading-configuration), unknown
+keys in the Dreaming, gates, and edge mappings raise `ConfigError`. See
+[Configuration](configuration.md#dreaming) for field-by-field types and
+validation ranges.
 
 ## Reflections (meta-consolidation)
 

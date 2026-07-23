@@ -195,18 +195,27 @@ incompatible with new ones, so it refuses rather than silently mixing
 dimensions (which would corrupt similarity results).
 
 **Fix.** Use the same embedding model the database was created with, or restore
-a trusted snapshot into a configured service and deliberately re-embed the
-corpus under that service's provider:
+a trusted snapshot with a configured provider and deliberately re-embed the
+corpus. Direct mode uses top-level `embeddings`:
+
+```bash
+engrava --db restored.db --config engrava.yaml restore \
+  -i backup.jsonl --clear --re-embed
+```
+
+Service mode prefers `services.configs.<name>.embeddings` and falls back to the
+top-level provider:
 
 ```bash
 engrava --config engrava.yaml restore \
   --service main -i backup.jsonl --clear --re-embed
 ```
 
-`--re-embed` requires service mode because that path resolves the target
-embedding provider from `engrava.yaml`. The single-database `--db` restore path
-does not construct a provider; use a configured service, import with
-`--skip-embeddings`, or keep the source embeddings unchanged.
+`--re-embed` requires `--config` with a provider at one of those levels. If no
+provider is configured, import with `--skip-embeddings` or keep the source
+embeddings unchanged. If the target already contains embeddings, restore also
+requires `--clear`; this prevents old vectors from surviving under the new
+model/dimension/prefix identity.
 
 See [Known Limitations → Embedding Dimension Consistency](known-limitations.md#embedding-dimension-consistency).
 

@@ -14,6 +14,7 @@ Engrava does not make every write idempotent.
 |---|---|---|---|
 | `ConfigError`, validation `ValueError`, invalid filter/recency/cycle, dimension or prefix mismatch | Rejected at a validation boundary in the usual path | Correct the configuration or arguments | No |
 | `ThoughtNotFoundError`, `ActionNotFoundError`, `SourceThoughtNotFoundError`, `ReferentialIntegrityError` | Required data is absent | Refresh identifiers or create the missing parent deliberately | No |
+| `DuplicateEdgeError` | The requested directed, typed relationship already exists | Treat the write as idempotent success or choose a different direction/type | No |
 | `InvalidTransitionError`, `ReadOnlyViolationError` | Requested operation is not allowed in the current state/view | Change the requested transition or use a writable capability | No |
 | `StaleDataError` | Another writer won the optimistic-concurrency race | Re-read, recompute the intended change, then issue a new update | No, not without re-reading |
 | Remote embedding timeout, network error, `408`, `409`, `425`, `429`, or selected `5xx` | Depends on the operation; a single thought/update may already be committed | Let the provider exhaust its bounded retry policy, then reconcile by thought ID | Not the whole write blindly |
@@ -44,6 +45,9 @@ These failures require a changed request, not backoff:
 - `ThoughtNotFoundError`, `ActionNotFoundError`,
   `SourceThoughtNotFoundError`, and `ReferentialIntegrityError` identify a
   missing target or parent.
+- `DuplicateEdgeError` identifies an existing `(from, to, type)` relationship;
+  callers can safely use it as the idempotent-create signal without parsing
+  SQLite error text.
 - `InvalidTransitionError` rejects an illegal lifecycle/action transition, and
   `ReadOnlyViolationError` rejects a write through `ReadOnlyEngrava`.
 - `StaleDataError` is recoverable only through a new read-modify-write cycle. Do

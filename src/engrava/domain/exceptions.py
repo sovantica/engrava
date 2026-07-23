@@ -267,6 +267,31 @@ does not reference an existing thought
         )
 
 
+class DuplicateEdgeError(EngravaError):
+    """Raised when a directed, typed edge relationship already exists.
+
+    Edge identity is constrained by ``(from_thought_id, to_thought_id,
+    edge_type)`` independently of the caller-supplied ``edge_id``. This typed
+    boundary lets callers handle idempotent graph writes without depending on
+    SQLite error text.
+
+    Args:
+        from_thought_id: Source endpoint of the duplicate relationship.
+        to_thought_id: Target endpoint of the duplicate relationship.
+        edge_type: Edge type value participating in the uniqueness key.
+
+    """
+
+    def __init__(self, from_thought_id: str, to_thought_id: str, edge_type: str) -> None:
+        self.from_thought_id = from_thought_id
+        self.to_thought_id = to_thought_id
+        self.edge_type = edge_type
+        super().__init__(
+            "edge relationship already exists: "
+            f"{from_thought_id!r} -[{edge_type}]-> {to_thought_id!r}",
+        )
+
+
 class InvalidFilterError(EngravaError):
     """Raised when a metadata/visibility filter is invalid at construction.
 

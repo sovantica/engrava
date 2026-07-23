@@ -4,7 +4,8 @@ A standalone module for promoting short-term thoughts to long-term
 memory based on configurable scoring signals and gate thresholds.
 
 **Not** built into core CRUD — the consumer decides when to invoke
-``run_consolidation()`` (after N cycles, in a cron job, manually).
+``run_consolidation()`` directly or calls ``run_if_due()`` from its cycle loop
+to honor ``schedule_every_n_cycles``.
 
 Default signals operate **exclusively** on ``CoreThoughtRecord`` fields.
 Custom signals can be provided via ``DreamingSignalProtocol`` to score
@@ -19,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from engrava.config import DreamingConfig
+from engrava.domain.exceptions import DuplicateEdgeError
 from engrava.extensions.dreaming_signals import (
     DEFAULT_SIGNALS,
     DreamingContext,
@@ -163,6 +165,57 @@ class DreamingExtension:
 
         """
         return self._config
+
+    def is_due(self, current_cycle: int) -> bool:
+        """Return whether configured cycle cadence permits consolidation.
+
+        The helper does not own a background scheduler. Consumers call it from
+        their own cycle loop, or use :meth:`run_if_due`. Cycle ``0`` is treated
+        as initialization rather than the first scheduled run.
+
+        Args:
+            current_cycle: Non-negative cognitive cycle number.
+
+        Returns:
+            ``True`` when Dreaming is enabled and the cycle is a positive
+            multiple of ``schedule_every_n_cycles``.
+
+        Raises:
+            ValueError: If ``current_cycle`` is negative or not an integer.
+
+        """
+        if isinstance(current_cycle, bool) or not isinstance(current_cycle, int):
+            raise ValueError("current_cycle must be an integer")
+        if current_cycle < 0:
+            raise ValueError("current_cycle must be >= 0")
+        return (
+            self._config.enabled
+            and current_cycle > 0
+            and current_cycle % self._config.schedule_every_n_cycles == 0
+        )
+
+    async def run_if_due(
+        self,
+        store: SqliteEngravaCore,
+        current_cycle: int,
+    ) -> ConsolidationResult | None:
+        """Run consolidation only when the configured cadence is due.
+
+        This is the schedule-aware convenience path. Explicit callers that
+        intentionally need an immediate pass can continue to call
+        :meth:`run_consolidation`, which remains unconditional.
+
+        Args:
+            store: Store to consolidate when the cadence is due.
+            current_cycle: Current cognitive cycle number.
+
+        Returns:
+            A consolidation result when a pass ran, otherwise ``None``.
+
+        """
+        if not self.is_due(current_cycle):
+            return None
+        return await self.run_consolidation(store, current_cycle)
 
     def _build_signal_map(
         self,
@@ -685,7 +738,7 @@ class DreamingExtension:
                     try:
                         await store.create_edge(edge)
                         created += 1
-                    except sqlite3.IntegrityError:
+                    except (sqlite3.IntegrityError, DuplicateEdgeError):
                         logger.debug(
                             "Edge %s→%s already exists, skipping",
                             thought_id,
@@ -1506,7 +1559,7 @@ class DreamingExtension:
                     )
                     try:
                         await store.create_edge(edge)
-                    except sqlite3.IntegrityError:
+                    except (sqlite3.IntegrityError, DuplicateEdgeError):
                         logger.debug(
                             "CONSOLIDATED_FROM edge %s→%s already exists",
                             reflection_id,

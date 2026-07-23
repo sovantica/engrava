@@ -6,6 +6,7 @@ Tests all subcommands against an in-memory (temp file) SQLite database.
 from __future__ import annotations
 
 import json
+import logging
 from typing import TYPE_CHECKING
 
 import pytest
@@ -81,6 +82,105 @@ def populated_db(db_path: Path) -> Path:
 
     asyncio.run(_setup())
     return db_path
+
+
+class TestGlobalControls:
+    """Tests for extension isolation and verbose logging controls."""
+
+    def test_no_extensions_skips_cli_discovery_for_help(
+        self,
+        runner: CliRunner,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def _unexpected_discovery() -> list[object]:
+            raise AssertionError("CLI extension discovery must stay disabled")
+
+        monkeypatch.setattr(
+            "engrava.cli.main._discover_extension_commands",
+            _unexpected_discovery,
+        )
+
+        result = runner.invoke(cli, ["--no-extensions", "--help"])
+
+        assert result.exit_code == 0
+        assert "--no-extensions" in result.output
+
+    def test_disable_extensions_environment_variable_skips_cli_discovery(
+        self,
+        runner: CliRunner,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def _unexpected_discovery() -> list[object]:
+            raise AssertionError("CLI extension discovery must stay disabled")
+
+        monkeypatch.setattr(
+            "engrava.cli.main._discover_extension_commands",
+            _unexpected_discovery,
+        )
+
+        result = runner.invoke(
+            cli,
+            ["--help"],
+            env={"ENGRAVA_DISABLE_EXTENSIONS": "1"},
+        )
+
+        assert result.exit_code == 0
+
+    def test_no_extensions_skips_mindql_discovery(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def _unexpected_discovery() -> dict[str, object]:
+            raise AssertionError("MindQL extension discovery must stay disabled")
+
+        monkeypatch.setattr(
+            "engrava.cli.main._load_mindql_extensions",
+            _unexpected_discovery,
+        )
+
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(populated_db),
+                "--no-extensions",
+                "query",
+                "SELECT thought_id FROM thought LIMIT 1",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert "thought-000" in result.output
+
+    def test_verbose_emits_debug_logging(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+    ) -> None:
+        records: list[logging.LogRecord] = []
+
+        class _CaptureHandler(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        capture_handler = _CaptureHandler()
+        package_logger = logging.getLogger("engrava")
+        package_logger.addHandler(capture_handler)
+        try:
+            result = runner.invoke(
+                cli,
+                ["--db", str(populated_db), "--verbose", "info"],
+            )
+        finally:
+            package_logger.removeHandler(capture_handler)
+
+        assert result.exit_code == 0
+        assert any(
+            record.levelno == logging.DEBUG and record.getMessage() == "Verbose logging enabled"
+            for record in records
+        )
 
 
 class TestInfo:

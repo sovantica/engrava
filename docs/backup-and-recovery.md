@@ -37,6 +37,9 @@ thought / edge / embedding / action.
 `restore` options worth knowing (see the [CLI reference](cli.md#restore) for the
 full list): `--clear` to wipe the target first, `--skip-embeddings` / `--re-embed`
 to control embedding handling, and `--service` for multi-service targets.
+When `--clear` encounters a persisted sqlite-vec index, restore drops the derived
+table transactionally and the next configured open rebuilds it. Keep
+`engrava[vec]` installed for that virtual-table reset.
 
 ### Embedding handling during restore
 
@@ -45,11 +48,28 @@ A normal restore imports the embedding rows carried by the snapshot.
 without vectors.
 
 `--re-embed` also discards the snapshot vectors, then generates new vectors for
-every imported thought. That path is supported only for a configuration-backed
-service whose provider is declared under
-`services.configs.<name>.embeddings`. For example:
+every imported thought. The provider must come from the configuration passed via
+`--config`. A top-level provider supports single-database restore and acts as the
+fallback for configured services:
 
 ```yaml
+database:
+  path: ./fresh.db
+embeddings:
+  provider: sentence-transformer
+  model: sentence-transformers/all-MiniLM-L6-v2
+```
+
+```bash
+engrava --db fresh.db --config engrava.yaml restore -i backup.jsonl --clear --re-embed
+```
+
+A service can inherit that top-level provider or override it:
+
+```yaml
+embeddings:
+  provider: ollama
+  model: nomic-embed-text
 services:
   data_dir: ./data
   default_service: main
@@ -64,20 +84,14 @@ services:
 engrava --config engrava.yaml restore -i backup.jsonl --service main --clear --re-embed
 ```
 
-The top-level `embeddings` section is not forwarded as a default by the restore
-CLI's service manager. The single-database `--db` restore branch also creates a
-bare store with no provider, so this command is **not** a supported re-embed
-procedure:
-
-```bash
-# Fails: the single-database restore branch has no embedding provider.
-engrava --db fresh.db restore -i backup.jsonl --re-embed
-```
-
-For a single database, either retain the snapshot embeddings, use
-`--skip-embeddings`, or define the target as a configured service before
-requesting re-embedding. `--skip-embeddings` and `--re-embed` are mutually
-exclusive.
+`services.configs.<name>.embeddings` has precedence over the top-level fallback.
+Without either provider, `--re-embed` fails before importing records. Retain the
+snapshot embeddings or use `--skip-embeddings` when no provider is available.
+The re-embed and its model/dimension/prefix identity update commit atomically.
+Use a fresh target or `--clear`: a target with existing embeddings is rejected
+without `--clear` so surviving vectors cannot be mislabeled as the new corpus.
+The general `--clear` sqlite-vec reset described above also protects this path.
+`--skip-embeddings` and `--re-embed` are mutually exclusive.
 
 ### Trust boundary
 
@@ -163,8 +177,8 @@ multi-file copy when writers are stopped or behind a consistent snapshot.
 
 - **From a snapshot:** `engrava --db <target> restore -i backup.jsonl`. Restore
   into a **fresh** database (optionally `--clear` an existing one). Remember the
-  journal is not restored. Use configured service mode, not the single `--db`
-  branch, when the restore must run `--re-embed`.
+  journal is not restored. For `--re-embed`, pass `--config` with a top-level
+  provider or a per-service provider override.
 - **From a physical backup:** stop the process, put the backed-up file in place,
   and start again. A backup made with the Online Backup API, `VACUUM INTO`, or a
   checkpoint-then-copy is a single self-contained `.db`. If instead you captured a

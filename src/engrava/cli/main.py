@@ -21,6 +21,7 @@ import asyncio
 import datetime
 import json
 import logging
+import os
 import sys
 from dataclasses import asdict
 from importlib.metadata import entry_points
@@ -36,7 +37,12 @@ from engrava.cli.snapshot_records import (
     TableRecord,
     parse_snapshot_record,
 )
-from engrava.config import ServicesConfig
+from engrava.config import (
+    ConfigError,
+    EmbeddingConfig,
+    ServicesConfig,
+    resolve_embedding_provider,
+)
 from engrava.domain.protocols.hooks import MindQLExtension
 from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
 
@@ -52,6 +58,9 @@ logger = logging.getLogger(__name__)
 # Re-embedding thought IDs are flushed in batches of this size so restore memory
 # stays bounded by the batch rather than by the total number of thoughts.
 _REEMBED_BATCH_SIZE = 128
+
+_DISABLE_EXTENSIONS_META_KEY = "engrava_disable_extensions"
+_FALSE_ENV_FLAG_VALUES = frozenset({"", "0", "false", "no", "off"})
 
 # Core tables in dependency order (thought first, dependents after). Typed as
 # CoreTable so every table identifier that reaches SQL comes from the enum.
@@ -218,12 +227,117 @@ def _discover_extension_commands() -> list[click.Command]:
     return commands
 
 
+class _ExtensionAwareGroup(click.Group):
+    """Click group that discovers extension commands only when needed.
+
+    Built-in commands resolve without importing third-party entry points. Global
+    help discovers extensions so they remain visible by default, while the
+    ``--no-extensions`` control suppresses discovery and hides commands loaded by
+    an earlier in-process invocation.
+    """
+
+    _extension_commands_loaded = False
+    _extension_command_names: frozenset[str] = frozenset()
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        """Capture the disable control before eager options such as help run."""
+        env_value = os.environ.get("ENGRAVA_DISABLE_EXTENSIONS")
+        disabled_by_env = (
+            env_value is not None
+            and env_value.strip().lower() not in _FALSE_ENV_FLAG_VALUES
+        )
+        ctx.meta[_DISABLE_EXTENSIONS_META_KEY] = "--no-extensions" in args or disabled_by_env
+        return super().parse_args(ctx, args)
+
+    @staticmethod
+    def _extensions_disabled(ctx: click.Context) -> bool:
+        """Return whether extension loading is disabled for this invocation."""
+        return bool(
+            ctx.meta.get(_DISABLE_EXTENSIONS_META_KEY, False)
+            or ctx.params.get("disable_extensions", False)
+        )
+
+    def _register_extension_commands(self) -> None:
+        """Discover and register installed extension commands once."""
+        if self._extension_commands_loaded:
+            return
+
+        self._extension_commands_loaded = True
+        loaded_names: set[str] = set()
+        for command in _discover_extension_commands():
+            command_name = command.name
+            if command_name is None:
+                logger.warning("Ignoring unnamed CLI extension command")
+                continue
+            if command_name in self.commands:
+                logger.warning(
+                    "Ignoring CLI extension command %r because the name is already registered",
+                    command_name,
+                )
+                continue
+            self.add_command(command)
+            loaded_names.add(command_name)
+        self._extension_command_names = frozenset(loaded_names)
+
+    def list_commands(self, ctx: click.Context) -> list[str]:
+        """List built-ins and, unless disabled, discovered extension commands."""
+        disabled = self._extensions_disabled(ctx)
+        if not disabled:
+            self._register_extension_commands()
+
+        command_names = super().list_commands(ctx)
+        if not disabled:
+            return command_names
+        return [name for name in command_names if name not in self._extension_command_names]
+
+    def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
+        """Resolve built-ins first and load entry points only for unknown commands."""
+        disabled = self._extensions_disabled(ctx)
+        command = super().get_command(ctx, cmd_name)
+        if command is not None and (
+            not disabled or cmd_name not in self._extension_command_names
+        ):
+            return command
+        if disabled:
+            return None
+
+        self._register_extension_commands()
+        return super().get_command(ctx, cmd_name)
+
+
+def _configure_verbose_logging(ctx: click.Context) -> None:
+    """Emit DEBUG logs from Engrava for the lifetime of one CLI invocation.
+
+    Args:
+        ctx: Root Click context used to restore logger state on close.
+
+    """
+    package_logger = logging.getLogger("engrava")
+    previous_level = package_logger.level
+    previous_propagate = package_logger.propagate
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+
+    package_logger.addHandler(handler)
+    package_logger.setLevel(logging.DEBUG)
+    package_logger.propagate = False
+
+    def _restore_logging() -> None:
+        package_logger.removeHandler(handler)
+        handler.close()
+        package_logger.setLevel(previous_level)
+        package_logger.propagate = previous_propagate
+
+    ctx.call_on_close(_restore_logging)
+
+
 # ------------------------------------------------------------------
 # CLI group
 # ------------------------------------------------------------------
 
 
-@click.group()
+@click.group(cls=_ExtensionAwareGroup)
 @click.option("--db", "db_path", default=None, help="Path to SQLite database.")
 @click.option(
     "--format",
@@ -233,6 +347,13 @@ def _discover_extension_commands() -> list[click.Command]:
     help="Output format.",
 )
 @click.option("--verbose", is_flag=True, help="Enable verbose output.")
+@click.option(
+    "--no-extensions",
+    "disable_extensions",
+    is_flag=True,
+    envvar="ENGRAVA_DISABLE_EXTENSIONS",
+    help="Disable installed CLI and MindQL extension entry points.",
+)
 @click.option(
     "--config",
     "config_path",
@@ -246,6 +367,7 @@ def cli(
     output_format: str,
     *,
     verbose: bool,
+    disable_extensions: bool,
     config_path: str | None,
 ) -> None:
     """Engrava — standalone thought-graph CLI.
@@ -259,17 +381,25 @@ def cli(
         output_format=output_format,
         verbose=verbose,
         config_path=config_path,
+        disable_extensions=disable_extensions,
     )
     ctx.obj["config"] = cfg
 
+    if cfg.verbose:
+        _configure_verbose_logging(ctx)
+        logger.debug("Verbose logging enabled")
+
     # Pre-load services config for --service default resolution.
     services_cfg = None
+    default_embeddings = None
     if cfg.config_path and cfg.config_path.exists():
         from engrava.config import load_config  # noqa: PLC0415
 
         ms_config = load_config(cfg.config_path)
         services_cfg = ms_config.services
+        default_embeddings = ms_config.embeddings
     ctx.obj["services_config"] = services_cfg
+    ctx.obj["default_embeddings"] = default_embeddings
 
 
 # ------------------------------------------------------------------
@@ -401,7 +531,7 @@ def query(ctx: click.Context, mql: str) -> None:
             from engrava.mindql.parser import MindQLParseError, parse  # noqa: PLC0415
 
             # Gather extension commands from loaded extensions
-            extensions = _load_mindql_extensions()
+            extensions = _load_mindql_extensions() if cfg.extensions_enabled else {}
             known_names = set(extensions.keys())
 
             try:
@@ -662,6 +792,12 @@ async def _reembed_thoughts(
             continue
         text = f"{row[0]}\n{row[1]}"
         vector = await _embed_document(embedding_provider, text)
+        if len(vector) != embedding_provider.dimension:
+            msg = (
+                f"Embedding provider {embedding_provider.model_name!r} returned "
+                f"{len(vector)} dimensions; expected {embedding_provider.dimension}."
+            )
+            raise click.ClickException(msg)
         blob = struct.pack(f"<{len(vector)}f", *vector)
         now = datetime.datetime.now(tz=datetime.UTC).isoformat()
         await conn.execute(
@@ -671,7 +807,7 @@ async def _reembed_thoughts(
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 str(_uuid.uuid4()),
-                "thought",
+                "THOUGHT",
                 tid,
                 embedding_provider.model_name,
                 embedding_provider.dimension,
@@ -681,6 +817,116 @@ async def _reembed_thoughts(
         )
         count += 1
     return count
+
+
+async def _replace_embedding_model_metadata(
+    conn: aiosqlite.Connection,
+    embedding_provider: EmbeddingProviderProtocol | None,
+) -> None:
+    """Replace the corpus identity after a successful transactional re-embed.
+
+    Args:
+        conn: Restore connection with an active transaction.
+        embedding_provider: Provider that generated every imported vector, or
+            ``None`` when the restored corpus has no vectors and must remain
+            unlocked.
+
+    """
+    from engrava.infrastructure.sqlite.engrava_core import (  # noqa: PLC0415
+        _METADATA_DOCUMENT_PREFIX_FINGERPRINT,
+        _METADATA_QUERY_PREFIX,
+        _document_prefix_fingerprint,
+        _role_prefixes,
+    )
+
+    await conn.execute(
+        "DELETE FROM _metadata WHERE key IN (?, ?, ?, ?)",
+        (
+            "embedding_model_name",
+            "embedding_dimension",
+            _METADATA_DOCUMENT_PREFIX_FINGERPRINT,
+            _METADATA_QUERY_PREFIX,
+        ),
+    )
+    if embedding_provider is None:
+        return
+
+    query_prefix, document_prefix = _role_prefixes(embedding_provider)
+    document_fingerprint = _document_prefix_fingerprint(document_prefix)
+    metadata = [
+        ("embedding_model_name", embedding_provider.model_name),
+        ("embedding_dimension", str(embedding_provider.dimension)),
+    ]
+    if document_fingerprint is not None:
+        metadata.append((_METADATA_DOCUMENT_PREFIX_FINGERPRINT, document_fingerprint))
+    if query_prefix:
+        metadata.append((_METADATA_QUERY_PREFIX, query_prefix))
+    await conn.executemany(
+        "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
+        metadata,
+    )
+
+
+async def _assert_reembed_target_is_safe(
+    conn: aiosqlite.Connection,
+    *,
+    clear: bool,
+) -> None:
+    """Reject relabelling embeddings that are not part of this restore.
+
+    Args:
+        conn: Restore connection with an active transaction.
+        clear: Whether restore will clear all existing core records first.
+
+    Raises:
+        click.ClickException: If existing embeddings would survive the restore.
+
+    """
+    if clear:
+        return
+    cursor = await conn.execute("SELECT COUNT(*) FROM embedding")
+    row = await cursor.fetchone()
+    existing_count = int(row[0]) if row is not None else 0
+    if existing_count:
+        msg = (
+            "--re-embed requires an empty embedding target or --clear; "
+            f"the target already contains {existing_count} embedding record(s)."
+        )
+        raise click.ClickException(msg)
+
+
+async def _reset_sqlite_vec_index_for_restore(conn: aiosqlite.Connection) -> None:
+    """Drop a persisted vec0 index before replacing its canonical vectors.
+
+    The ``embedding`` table is the source of truth. A vec0 table may retain old
+    rows across ``--clear`` and SQLite may then reuse their rowids, making a
+    missing-row-only startup sync mistake stale vectors for current ones.
+    Dropping the derived table inside the restore transaction lets the next
+    sqlite-vec-enabled open recreate it at the new dimension and backfill it.
+
+    Args:
+        conn: Restore connection with an active transaction.
+
+    Raises:
+        click.ClickException: If a persisted vec0 table exists but the
+            sqlite-vec module cannot be loaded to remove it safely.
+
+    """
+    cursor = await conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embedding_vec'"
+    )
+    if await cursor.fetchone() is None:
+        return
+
+    from engrava.extensions.vector_sqlite_vec import load_sqlite_vec  # noqa: PLC0415
+
+    if not await load_sqlite_vec(conn):
+        msg = (
+            "Restore found an existing sqlite-vec index but could not load "
+            "sqlite-vec to rebuild it safely. Install 'engrava[vec]' and retry."
+        )
+        raise click.ClickException(msg)
+    await conn.execute("DROP TABLE embedding_vec")
 
 
 async def _insert_record(
@@ -756,6 +1002,7 @@ async def _stream_insert(
     """
     check_model = embedding_provider is not None and not re_embed and not skip_embeddings
     total = 0
+    reembedded = 0
     reembed_batch: list[str] = []
     for line_number, line in _iter_snapshot_lines(input_path):
         record = parse_snapshot_record(line, line_number=line_number)
@@ -775,11 +1022,20 @@ async def _stream_insert(
         if tid is not None and embedding_provider is not None:
             reembed_batch.append(tid)
             if len(reembed_batch) >= _REEMBED_BATCH_SIZE:
-                total += await _reembed_thoughts(conn, reembed_batch, embedding_provider)
+                batch_count = await _reembed_thoughts(conn, reembed_batch, embedding_provider)
+                total += batch_count
+                reembedded += batch_count
                 reembed_batch.clear()
 
     if reembed_batch and embedding_provider is not None:
-        total += await _reembed_thoughts(conn, reembed_batch, embedding_provider)
+        batch_count = await _reembed_thoughts(conn, reembed_batch, embedding_provider)
+        total += batch_count
+        reembedded += batch_count
+    if re_embed and embedding_provider is not None:
+        await _replace_embedding_model_metadata(
+            conn,
+            embedding_provider if reembedded else None,
+        )
     return total
 
 
@@ -827,6 +1083,10 @@ async def _import_records_to_db(
     # implicit-transaction default).
     await conn.execute("BEGIN")
     try:
+        if re_embed:
+            await _assert_reembed_target_is_safe(conn, clear=clear)
+        if clear or re_embed:
+            await _reset_sqlite_vec_index_for_restore(conn)
         if clear:
             for table in _CORE_TABLES_DELETE_ORDER:
                 await conn.execute(f"DELETE FROM {table.value}")  # noqa: S608
@@ -882,6 +1142,7 @@ def restore(
     """
     cfg: EngravaCLIConfig = ctx.obj["config"]
     services_cfg: ServicesConfig | None = ctx.obj.get("services_config")
+    default_embeddings: EmbeddingConfig | None = ctx.obj.get("default_embeddings")
 
     if re_embed and skip_embeddings:
         click.echo("Error: --re-embed and --skip-embeddings are mutually exclusive.", err=True)
@@ -907,10 +1168,18 @@ def restore(
             data_dir = services_cfg.data_dir if services_cfg else cfg.db_path.parent
             manager = EngravaManager(
                 data_dir=data_dir,
+                default_embeddings=default_embeddings if re_embed else None,
                 services_config=services_cfg,
             )
             try:
-                store = await manager.get_store(effective_service)
+                try:
+                    store = await manager.get_store(effective_service)
+                except ConfigError as exc:
+                    msg = (
+                        f"Cannot initialize service {effective_service!r} from the configured "
+                        f"embedding provider: {exc}"
+                    )
+                    raise click.ClickException(msg) from exc
                 if re_embed:
                     emb_provider = store._embedding_provider  # noqa: SLF001
                     if emb_provider is None:
@@ -935,6 +1204,20 @@ def restore(
             finally:
                 await manager.close_all()
         else:
+            if re_embed:
+                try:
+                    emb_provider = resolve_embedding_provider(default_embeddings)
+                except ConfigError as exc:
+                    msg = f"Cannot initialize the configured embedding provider: {exc}"
+                    raise click.ClickException(msg) from exc
+                if emb_provider is None:
+                    msg = (
+                        "--re-embed requires an embedding provider, but none is configured. "
+                        "Set top-level 'embeddings.provider' in engrava.yaml and pass "
+                        "--config, or use --skip-embeddings instead."
+                    )
+                    raise click.ClickException(msg)
+
             conn = await _aiosqlite.connect(str(cfg.db_path))
             conn.row_factory = _aiosqlite.Row
             await conn.execute("PRAGMA journal_mode = WAL")
@@ -942,17 +1225,6 @@ def restore(
 
             store = SqliteEngravaCore(conn)
             await store.ensure_schema()
-
-            if re_embed:
-                emb_provider = store._embedding_provider  # noqa: SLF001
-                if emb_provider is None:
-                    await conn.close()
-                    msg = (
-                        "--re-embed requires an embedding provider, but none is "
-                        "configured. Set 'embeddings.provider' in engrava.yaml "
-                        "or use --skip-embeddings instead."
-                    )
-                    raise click.ClickException(msg)
 
             try:
                 total = await _import_records_to_db(
@@ -1189,11 +1461,10 @@ def export_cmd(ctx: click.Context, output_path: str | None, status_filter: str |
 def main() -> None:
     """CLI entry point for ``engrava`` command.
 
-    Discovers and registers extension CLI commands before invoking
-    the main CLI group.
+    Extension CLI commands are discovered lazily by the root group after global
+    options have been parsed, so ``--no-extensions`` can prevent all entry-point
+    loading.
     """
-    for cmd in _discover_extension_commands():
-        cli.add_command(cmd)
     cli()
 
 

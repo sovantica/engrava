@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -168,6 +169,48 @@ class TestDreamingExtension:
         )
         with pytest.raises(ValueError, match=r"Unknown dreaming signal.*unknown_signal"):
             DreamingExtension(config=cfg)
+
+    @pytest.mark.parametrize(
+        ("enabled", "cycle", "expected"),
+        [
+            (False, 100, False),
+            (True, 0, False),
+            (True, 99, False),
+            (True, 100, True),
+            (True, 200, True),
+        ],
+    )
+    def test_is_due_honors_enabled_and_cycle_cadence(
+        self,
+        enabled: bool,
+        cycle: int,
+        expected: bool,
+    ) -> None:
+        ext = DreamingExtension(
+            config=DreamingConfig(enabled=enabled, schedule_every_n_cycles=100)
+        )
+        assert ext.is_due(cycle) is expected
+
+    @pytest.mark.parametrize("cycle", [-1, 1.5, True])
+    def test_is_due_rejects_invalid_cycle(self, cycle: object) -> None:
+        ext = DreamingExtension(config=DreamingConfig(enabled=True))
+        with pytest.raises(ValueError, match="current_cycle"):
+            ext.is_due(cycle)  # type: ignore[arg-type]
+
+    async def test_run_if_due_skips_or_delegates(self) -> None:
+        ext = DreamingExtension(
+            config=DreamingConfig(enabled=True, schedule_every_n_cycles=10)
+        )
+        expected = ConsolidationResult(candidates_evaluated=0, promoted_count=0)
+        run = AsyncMock(return_value=expected)
+        ext.run_consolidation = run  # type: ignore[method-assign]
+        store = object()
+
+        assert await ext.run_if_due(store, 9) is None  # type: ignore[arg-type]
+        run.assert_not_awaited()
+
+        assert await ext.run_if_due(store, 10) is expected  # type: ignore[arg-type]
+        run.assert_awaited_once_with(store, 10)
 
     def test_custom_signal_overrides_default(self) -> None:
         class ConstantSignal:

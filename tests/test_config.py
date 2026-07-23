@@ -194,6 +194,65 @@ class TestIngestParser:
 # ------------------------------------------------------------------
 
 
+class TestUnknownKeys:
+    @pytest.mark.parametrize(
+        ("yaml_suffix", "path", "key"),
+        [
+            ("unexpected: true\n", "<root>", "unexpected"),
+            ("database:\n  path: ./test.db\n  wal_mod: true\n", "database", "wal_mod"),
+            (
+                "extensions:\n  dreaming:\n    promote_treshold: 0.8\n",
+                "extensions.dreaming",
+                "promote_treshold",
+            ),
+            (
+                "extensions:\n  dreaming:\n    gates:\n      min_confrmations: 2\n",
+                "extensions.dreaming.gates",
+                "min_confrmations",
+            ),
+        ],
+    )
+    def test_unknown_static_key_rejected(
+        self,
+        tmp_path: Path,
+        yaml_suffix: str,
+        path: str,
+        key: str,
+    ) -> None:
+        cfg_file = tmp_path / "engrava.yaml"
+        base = "database:\n  path: ./test.db\n"
+        if yaml_suffix.startswith("database:"):
+            base = ""
+        cfg_file.write_text(base + yaml_suffix, encoding="utf-8")
+
+        with pytest.raises(ConfigError, match=rf"{path}.*{key}"):
+            load_config(cfg_file)
+
+    def test_dynamic_service_and_signal_names_remain_supported(self, tmp_path: Path) -> None:
+        cfg_file = tmp_path / "engrava.yaml"
+        cfg_file.write_text(
+            """database:
+  path: ./test.db
+services:
+  data_dir: ./services
+  configs:
+    custom-service:
+      embeddings: null
+extensions:
+  dreaming:
+    signals:
+      caller_signal: 0.4
+""",
+            encoding="utf-8",
+        )
+
+        config = load_config(cfg_file)
+        assert config.services is not None
+        assert "custom-service" in config.services.configs
+        assert config.dreaming is not None
+        assert config.dreaming.signals["caller_signal"] == 0.4
+
+
 class TestLoadConfig:
     def test_minimal_config(self, tmp_path: Path) -> None:
         cfg_file = tmp_path / "engrava.yaml"

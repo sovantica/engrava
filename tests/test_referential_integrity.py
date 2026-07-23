@@ -41,7 +41,7 @@ from engrava.domain.enums import (
     ThoughtType,
     VerificationStatus,
 )
-from engrava.domain.exceptions import ReferentialIntegrityError
+from engrava.domain.exceptions import DuplicateEdgeError, ReferentialIntegrityError
 from engrava.domain.models.action import ActionRecord
 from engrava.domain.models.edge import EdgeRecord
 from engrava.domain.models.thought import ThoughtRecord
@@ -197,18 +197,29 @@ class TestCreateEdgeRejectsOrphans:
         assert row is not None
         assert row[0] == 1
 
-    async def test_unique_violation_propagates_unchanged(
+    async def test_duplicate_relationship_raises_domain_error(
         self,
         store: SqliteEngravaCore,
     ) -> None:
-        """The wrapper only catches FK failures; UNIQUE violations stay raw."""
         await store.create_thought(_make_thought("t1"))
         await store.create_thought(_make_thought("t2"))
         await store.create_edge(_make_edge("e1", "t1", "t2"))
-        with pytest.raises(aiosqlite.IntegrityError) as excinfo:
-            # Same (from, to, type) tuple triggers UNIQUE; not FK.
+        with pytest.raises(DuplicateEdgeError) as excinfo:
             await store.create_edge(_make_edge("e2", "t1", "t2"))
-        assert "UNIQUE" in str(excinfo.value).upper()
+        assert excinfo.value.from_thought_id == "t1"
+        assert excinfo.value.to_thought_id == "t2"
+        assert excinfo.value.edge_type == "ASSOCIATED"
+
+    async def test_duplicate_edge_id_remains_a_distinct_integrity_failure(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        await store.create_thought(_make_thought("t1"))
+        await store.create_thought(_make_thought("t2"))
+        await store.create_thought(_make_thought("t3"))
+        await store.create_edge(_make_edge("e1", "t1", "t2"))
+        with pytest.raises(aiosqlite.IntegrityError):
+            await store.create_edge(_make_edge("e1", "t1", "t3"))
 
 
 class TestCascadeOnDelete:

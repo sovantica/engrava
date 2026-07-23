@@ -622,6 +622,9 @@ for thought_id, score in result.results:
 ```
 
 Key difference from `search_hybrid(include_reflections=True)`:
-`search_reflections_only()` fetches **all** REFLECTIONs directly from
+`search_reflections_only()` fetches **all eligible** REFLECTIONs directly from
 the store (no pagination gap) and scores them purely by cosine similarity
 to the query.  It does not compete against regular thoughts for result slots.
+Only active, unexpired REFLECTIONs are eligible. Expiry is compared against one
+UTC instant captured for the call, and a row with `expires_at <= now` is
+excluded. Equal scores are ordered by `thought_id` for deterministic results.
