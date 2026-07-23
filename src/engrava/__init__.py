@@ -23,6 +23,17 @@ from engrava.cycle_providers import (
     MaxCycleProvider,
     StaticCycleProvider,
 )
+from engrava.domain.dreaming import (
+    ActionOutcomeSignal,
+    ConfidenceSignal,
+    ConfirmationSignal,
+    ConsolidationResult,
+    DreamingContext,
+    DreamingSignalProtocol,
+    FrequencySignal,
+    RecencySignal,
+    StalenessSignal,
+)
 from engrava.domain.enums import (
     ActionStatus,
     ActionType,
@@ -106,17 +117,7 @@ from engrava.embeddings.ollama import OllamaProvider
 from engrava.embeddings.openai_compatible import OpenAICompatibleProvider
 from engrava.embeddings.sentence_transformer import SentenceTransformerProvider
 from engrava.extensions.discovery import discover_manifests
-from engrava.extensions.dreaming import ConsolidationResult, DreamingExtension
-from engrava.extensions.dreaming_signals import (
-    ActionOutcomeSignal,
-    ConfidenceSignal,
-    ConfirmationSignal,
-    DreamingContext,
-    DreamingSignalProtocol,
-    FrequencySignal,
-    RecencySignal,
-    StalenessSignal,
-)
+from engrava.extensions.dreaming import DreamingExtension
 from engrava.extensions.structural_split import SplitMode, StructuralSplitProducer
 from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
 from engrava.infrastructure.read_only_store import ReadOnlyEngrava

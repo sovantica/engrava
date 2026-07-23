@@ -33,6 +33,12 @@ import aiosqlite
 import numpy as np
 import numpy.typing as npt
 
+from engrava.domain.dreaming import (
+    CENTROID_MODEL_NAME,
+    ConsolidationResult,
+    DreamingContext,
+    compute_centroid,
+)
 from engrava.domain.enums import (
     ActionStatus,
     ActionType,
@@ -86,8 +92,6 @@ from engrava.domain.protocols.derived_records import (
 )
 from engrava.domain.protocols.embedding_provider import RoleAwareEmbeddingProvider
 from engrava.domain.protocols.hooks import DefaultEngravaHooks, EngravaHooksProtocol
-from engrava.extensions.dreaming_signals import DreamingContext
-from engrava.infrastructure.sqlite.centroid import CENTROID_MODEL_NAME, compute_centroid
 from engrava.infrastructure.sqlite.connection_revocation import ConnectionRevocationToken
 from engrava.infrastructure.sqlite.hygiene import (
     EvictionReason,
@@ -107,9 +111,9 @@ if TYPE_CHECKING:
     from engrava.domain.models.metrics import EngravaMetrics, LatencyHistogram
     from engrava.domain.models.search import HybridSearchResult
     from engrava.domain.protocols.cycle_provider import CycleProvider
+    from engrava.domain.protocols.dreaming import DreamingConsolidatorProtocol
     from engrava.domain.protocols.embedding_provider import EmbeddingProviderProtocol
     from engrava.domain.protocols.hooks import MindQLExtension
-    from engrava.extensions.dreaming import ConsolidationResult, DreamingExtension
     from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
     from engrava.mindql.executor import MindQLResult
     from engrava.mindql.parser import MindQLQuery
@@ -1054,10 +1058,11 @@ class SqliteEngravaCore:
             "engrava_suppress_access_tracking",
             default=False,
         )
-        # The dreaming extension, wired by ``from_config`` when dreaming is
-        # enabled so ``consolidate()`` can run a cycle without the caller
-        # constructing it. ``None`` for a manually-built store or dreaming-off.
-        self._dreaming_extension: DreamingExtension | None = None
+        # The backend-independent dreaming consolidator, supplied by the
+        # composition root when enabled. ``None`` for a manually built store or
+        # dreaming-off configuration. The legacy private attribute name is kept
+        # to avoid disrupting existing diagnostic integrations.
+        self._dreaming_extension: DreamingConsolidatorProtocol | None = None
         # Memory Hygiene (deterministic forgetting) policy. ``None`` (default)
         # or ``enabled=False`` ⇒ the forgetting loop never runs and no existing
         # read/write path changes. ``run_hygiene`` and the ``consolidate()``
@@ -1466,16 +1471,16 @@ class SqliteEngravaCore:
             )
             store._owns_connection = True
 
-            # Wire the dreaming extension when enabled so a YAML-only user can
-            # run a consolidation cycle via ``store.consolidate(...)`` without
-            # constructing ``DreamingExtension`` by hand. Off by default ⇒ no
-            # extension is built and dreaming never runs.
+            # The composition root owns concrete optional implementations; the
+            # SQLite facade retains only the inward consolidator contract. Keep
+            # construction after the store, matching the established error and
+            # cleanup ordering, and avoid importing Dreaming when it is disabled.
             if config.dreaming is not None and config.dreaming.enabled:
-                from engrava.extensions.dreaming import (  # noqa: PLC0415
-                    DreamingExtension,
+                from engrava._composition import (  # noqa: PLC0415
+                    compose_dreaming_consolidator,
                 )
 
-                store._dreaming_extension = DreamingExtension(config=config.dreaming)
+                store._dreaming_extension = compose_dreaming_consolidator(config.dreaming)
 
             await store.ensure_schema()
 
@@ -5456,8 +5461,8 @@ class SqliteEngravaCore:
         """Count thoughts matching the given filters.
 
         A lightweight alternative to ``list_thoughts`` when only the
-        total count is needed (e.g. for the early-stop clustering
-        guard in ``DreamingExtension``).
+        total count is needed (e.g. for a consolidator's early-stop clustering
+        guard).
 
         Args:
             lifecycle_status: Filter by lifecycle status.
@@ -9230,7 +9235,7 @@ class SqliteEngravaCore:
 
         The invocable entry point for a store built via :meth:`from_config`
         with ``dreaming.enabled`` — it lets a YAML-only caller run consolidation
-        without constructing a ``DreamingExtension`` by hand. It first flushes
+        without constructing a consolidator by hand. It first flushes
         any pending access-buffer events (so the ``frequency`` signal sees the
         latest access counts this cycle), then runs the wired extension's
         consolidation with access tracking suppressed for the extension's own
