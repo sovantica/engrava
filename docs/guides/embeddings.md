@@ -316,9 +316,9 @@ the table. This family includes E5, BGE, GTE, and Ollama's `nomic-embed-text`.
 
 `SentenceTransformerProvider`, `OllamaProvider`, and `HuggingFaceProvider` accept
 an optional, keyword-only `query_prefix` / `document_prefix` for exactly this.
-The document prefix is applied on every document-embed path (ingest auto-embed and
-the `engrava restore --re-embed` path); the query prefix on every query-embed path
-(`search_hybrid`, `recall`, and reflection search).
+The document prefix is applied on every document-embed path (ingest auto-embed
+and configured-service `restore --re-embed`); the query prefix on every
+query-embed path (`search_hybrid`, `recall`, and reflection search).
 
 ```python
 provider = SentenceTransformerProvider(
@@ -353,8 +353,10 @@ A few rules make this safe to adopt incrementally:
   is part of the corpus identity: change it and every stored vector would change.
   Turning it on (or changing it) on a store that already holds vectors raises
   `EmbeddingModelMismatchError` — Engrava never silently re-embeds. Re-embed on
-  purpose with `engrava restore --re-embed` (which now applies the configured
-  document prefix), or start a fresh store.
+  purpose by restoring a snapshot with `--re-embed` into a service whose
+  provider is defined in `engrava.yaml` (which applies the configured document
+  prefix), or start a fresh store. The single-database `--db` restore path does
+  not resolve an embedding provider.
 - **Changing `query_prefix` alone does *not* re-embed anything** — it does not touch
   stored vectors. But the corpus records the query prefix it was built to pair with,
   so querying with a *divergent* query prefix raises `EmbeddingQueryPrefixMismatchError`
@@ -368,8 +370,9 @@ A few rules make this safe to adopt incrementally:
 ## Choosing a model and dimension
 
 - **Keep one model per store.** The query and corpus vectors must come from the
-  same model; switching models on an existing store requires re-embedding (see
-  `engrava restore --re-embed`).
+  same model; switching models on an existing store requires a deliberate
+  migration. The CLI can re-embed while restoring a snapshot into a configured
+  service; see [CLI restore](../cli.md#restore).
 - **Dimension follows the model.** Local/HF providers infer it from the model;
   `CallbackProvider` requires you to declare `dimension` to match what your
   callback returns. For the `sqlite-vec` vector backend, set

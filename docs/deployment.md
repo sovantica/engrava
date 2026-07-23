@@ -129,5 +129,7 @@ Wire whichever applies into your framework's shutdown hook (e.g. FastAPI
 
 - [Concurrency](concurrency.md) — the single-writer model, busy timeout, isolation
 - [Backup & Recovery](backup-and-recovery.md) — WAL-safe backup and restore
+- [Security](security.md) — file, network, extension, and tenant trust boundaries
+- [Error handling and recovery](error-handling.md) — retry, repair, or replace
 - [Configuration](configuration.md) — the YAML the deployment loads
 - [Known Limitations](known-limitations.md) — filesystem and locking constraints

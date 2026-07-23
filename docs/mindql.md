@@ -278,6 +278,21 @@ except MindQLParseError as exc:
 
 ### Execution
 
+When you already have a `SqliteEngravaCore`, use its `execute_mindql()`
+convenience method. It executes a **parsed** query on the store's own connection
+and accepts the same optional extension-command mapping as the lower-level
+executor:
+
+```python
+from engrava import parse
+
+result = await store.execute_mindql(
+    parse("FIND thoughts WHERE thought_type = 'OBSERVATION' LIMIT 10")
+)
+for row in result.rows:
+    print(row["essence"])
+```
+
 `MindQLExecutor` runs against an open `aiosqlite.Connection`, and `execute()`
 takes a **parsed** `MindQLQuery` — parse the string first. `MindQLResult`
 exposes `columns`, `rows`, `count`, and `command`.

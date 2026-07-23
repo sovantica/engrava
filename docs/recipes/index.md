@@ -57,28 +57,35 @@ async def context_for(store, query, cycle, top_k=5):
 
 ## Filter retrieval by session (or user)
 
-The ranked search methods take **no** metadata/scope filter, so "only this
-session's memories" is done by over-fetching and post-filtering on metadata in
-Python:
+Use the ranked methods' native typed metadata filters. They constrain candidate
+eligibility inside each ranking arm before its candidate limit, so unrelated
+rows cannot consume the pool and starve the requested `top_k`:
 
 ```python
+from engrava import FieldOp, FieldPredicate, MetadataFilter
+
 async def search_in_session(store, query, session_id, cycle, want=5):
-    # over-fetch, then keep only this session's hits, preserving rank order
-    result = await store.search_hybrid(query, top_k=want * 5, current_cycle=cycle)
+    result = await store.search_hybrid(
+        query,
+        top_k=want,
+        current_cycle=cycle,
+        filters=MetadataFilter(
+            [FieldPredicate("$.session_id", FieldOp.EQ, session_id)]
+        ),
+    )
     scoped = []
     for thought_id, _score in result.results:
         record = await store.get_thought(thought_id)
-        if record is not None and record.metadata.get("session_id") == session_id:
+        if record is not None:
             scoped.append(record)
-        if len(scoped) >= want:
-            break
     return scoped
 ```
 
 > For *hard* isolation between users/tenants (separate databases rather than a
 > shared one with a metadata tag), use [`EngravaManager`](../api-reference.md) —
 > one `<name>.db` per service. That trades cross-tenant search for strong
-> isolation; the metadata approach keeps one searchable store.
+> isolation; the metadata approach keeps one searchable store. `filters=` is a
+> query refinement, not access control: a caller can omit or forge it.
 
 ## Set a TTL on transient memories
 
@@ -152,16 +159,27 @@ and whether it worked — is part of memory:
 import uuid
 from engrava import ActionRecord, ActionType, ActionStatus, VerificationStatus
 
-await store.create_action(
+action = await store.create_action(
     ActionRecord(
         action_id=str(uuid.uuid4()),
         source_thought_id=prompting_thought_id,
         action_type=ActionType.TOOL_CALL,     # or MESSAGE / CLI_OUTPUT / STATE_UPDATE
         intent="search the web for flight prices",
-        status=ActionStatus.CONFIRMED,        # PLANNED → EXECUTING → CONFIRMED / FAILED / BLOCKED
-        verification_status=VerificationStatus.CONFIRMED,
+        status=ActionStatus.PLANNED,
+        verification_status=VerificationStatus.PENDING,
     )
 )
+
+# Execution follows PLANNED -> EXECUTING -> CONFIRMED or FAILED.
+await store.update_action(action.action_id, status=ActionStatus.EXECUTING)
+await store.update_action(
+    action.action_id,
+    status=ActionStatus.CONFIRMED,
+    verification_status=VerificationStatus.CONFIRMED,
+)
+
+# BLOCKED is a planning detour only: PLANNED -> BLOCKED -> PLANNED.
+# It is not reachable from EXECUTING and does not lead directly to a terminal state.
 
 # read an entity's actions back:
 actions = await store.get_actions(prompting_thought_id)

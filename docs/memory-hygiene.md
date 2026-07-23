@@ -1,6 +1,8 @@
 # Forgetting
 
-> **Mechanism: Memory Hygiene** — a deterministic, no-LLM memory-hygiene loop.
+> **Mechanism: Memory Hygiene** — a no-LLM memory-hygiene loop that is
+> deterministic for a fixed store, configuration, cycle, and `now` when any
+> configured custom hooks are deterministic too.
 
 **Forgetting** is how an Engrava store lets cold, low-signal memories fade. It is
 **opt-in** (off by default) and **reversible**: the default action **archives** a
@@ -21,7 +23,9 @@ Forgetting is the **subtractive** half of a memory-maintenance cycle whose
 
 Together they mirror how biological memory maintains itself — reinforcing some
 traces while letting others fade — so Forgetting can reduce the active working set
-over time. Both are deterministic and involve no LLM.
+over time. Both involve no LLM; Forgetting is deterministic when its cycle and
+wall-clock reference are held fixed and any configured custom hooks are
+deterministic too.
 
 The whole capability is **OFF by default**: the hygiene *loop* does nothing until
 you enable it — a store that never configures `hygiene_policy` never scores,
@@ -51,10 +55,11 @@ with `store.run_hygiene(current_cycle=N)` (or let it run at the end of a
   │            decay multiplier -> an eviction-score              │
   │ 1. archive thoughts below the eviction threshold (and not     │
   │    (Stage 1) protected) flip to ARCHIVED — reversible, no data │
-  │            loss; their archived_at_cycle is stamped           │
+  │            loss; cycle and wall-clock archive stamps are set  │
   │ 2. gc      only when auto_gc_enabled: hygiene-archived         │
   │    (Stage 2) thoughts past the restore window are physically   │
-  │            deleted (cascading edges/embeddings/vectors)       │
+  │            deleted (cascading edges/embeddings/actions, then  │
+  │            purging the vector index)                           │
   └─┬──────────────────────────────────────────────────────────┘
     │
     ▼
@@ -93,9 +98,10 @@ archive(thought) ⇐ eviction_score < eviction_threshold  AND  not protected(tho
 The default `decay_function` returns `1.0` (no decay), so out of the box the
 eviction-score *is* the keep-score. A custom hook can shape a decay curve; its
 return is clamped into `[0.0, 1.0]`, and a non-finite value is treated as `1.0`.
-Decay can therefore only ever *lower* a score toward archival — a misbehaving
-hook can never cause a thought to be archived that the keep-score alone would
-have kept.
+Decay can therefore only ever *lower* a score toward archival; it cannot raise a
+low keep-score back above the threshold. Because a custom hook can deliberately
+make an otherwise high-scoring thought archivable, treat it as part of the
+retention policy and preview its effect with `dry_run` before enabling mutations.
 
 The Memory Hygiene loop is the **only** place `decay_function` is consulted; it
 is not part of search, ranking, or promotion.
@@ -138,12 +144,15 @@ eligible. Pinning is the invariant.
 Stage 1 (archive) is the **default action** and is fully reversible:
 
 - A below-threshold, unprotected thought flips to `ARCHIVED` and its
-  `archived_at_cycle` is set to the current cycle. Its `expires_at` is cleared so
-  it is no longer subject to [TTL](data-lifecycle.md).
+  `archived_at_cycle` is set to the current cycle while `archived_at` receives
+  the run's wall-clock instant. Its `expires_at` is cleared so it is no longer
+  subject to [TTL](data-lifecycle.md). This dedicated path accepts eligible
+  `ACTIVE` and `CREATED` rows; it does not require an ordinary lifecycle journey
+  through `DONE`.
 - **Restore** un-archives a thought: `store.restore_thought(thought_id)` transitions
   it back to `ACTIVE` (the `ARCHIVED → ACTIVE` lifecycle edge) and clears
-  `archived_at_cycle` to `None`. No data was lost. Restoring a thought that is not
-  archived raises `InvalidTransitionError`.
+  both `archived_at_cycle` and `archived_at`. No data was lost. Restoring a
+  thought that is not archived raises `InvalidTransitionError`.
 
 Stage 2 (garbage collection) runs **only** when `auto_gc_enabled` is set (it is
 **`false` by default**) — enabling hygiene never implicitly enables deletion:
@@ -191,8 +200,11 @@ Stage 2 (garbage collection) runs **only** when `auto_gc_enabled` is set (it is
 
 - **Bounded.** `max_evictions_per_run` (default `100`) caps **each stage**
   independently — at most that many archived, and at most that many GC'd, per run.
-- **Deterministic.** The same store + config + cycle always selects the same set.
-  When more candidates qualify than the cap allows, the archive stage keeps the
+- **Deterministic for fixed inputs.** The same store + config + cycle + injected
+  `now` selects the same set when any configured custom hooks are deterministic
+  too. If `now` is omitted, `run_hygiene` reads UTC wall time once, so
+  eligibility can change as the inactivity and restore windows advance. When
+  more candidates qualify than the cap allows, the archive stage keeps the
   lowest-scoring, then oldest, then lowest-id thoughts; the GC stage keeps the
   oldest-archived, then lowest-id thoughts.
 - **Fail-safe on a blank slate.** When *no* signal is active (a brand-new store
@@ -233,8 +245,11 @@ archival the keep-score alone would not.
   a thought was ever used, "cold" cannot be told apart from "merely ingested
   early", so cycle-recency must not drive eviction on its own. In practice this
   means Forgetting only has an effect once the store carries genuine usage data:
-  enable [access tracking](dreaming.md#access-tracking-the-frequency-substrate)
-  (on by default when dreaming is enabled) or record confirmations.
+  enable [access tracking](concepts.md#access-tracking-and-usage-telemetry) (on by
+  default when dreaming is enabled) or record confirmations. Implicit accesses
+  are buffered; `consolidate()` flushes them before scoring, while a direct
+  `run_hygiene()` does not. Call `flush_access_buffer()` first when a standalone
+  hygiene pass must include the newest pending reads.
 
 Together with the [all-flat fail-safe](#bounded-deterministic-previewable) above,
 these make the first hygiene runs on a new store a safe no-op rather than a guess.
@@ -264,11 +279,17 @@ chain still verifies with `verify_journal()` after an archive and a GC. A
 
 ## Running it
 
-**Directly** — runs immediately, ignoring the cadence:
+**Directly** — runs immediately, ignoring the cadence. Pass a timezone-aware
+`now` when a replay or benchmark needs fixed wall-clock boundaries:
 
 ```python
+from datetime import UTC, datetime
+
 async with await SqliteEngravaCore.from_config("engrava.yaml") as store:
-    result = await store.run_hygiene(current_cycle=1000)
+    result = await store.run_hygiene(
+        current_cycle=1000,
+        now=datetime(2026, 7, 23, tzinfo=UTC),
+    )
 ```
 
 **As a convenience at the end of a dreaming cycle** — when both `dreaming` and

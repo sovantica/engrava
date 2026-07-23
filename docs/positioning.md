@@ -29,8 +29,10 @@ relates to the other memory options you might be choosing between.
 - **You want memory that maintains itself.** Engrava models both halves of memory
   maintenance: [Dreaming](dreaming.md) (consolidation) keeps and strengthens what
   matters, and [Forgetting](memory-hygiene.md) (opt-in, reversible memory hygiene)
-  lets cold, low-signal memories fade rather than being kept indefinitely. Both are
-  deterministic and use no LLM.
+  lets cold, low-signal memories fade rather than being kept indefinitely. The
+  built-in mechanisms use no LLM; reproducibility requires fixed inputs and
+  deterministic custom hooks/signals, and Forgetting additionally requires a
+  fixed wall-clock `now`.
 - **Small-to-medium corpora.** The default backend brute-forces vector search in
   Python and works well up to roughly 100k embeddings; beyond that, switch to
   the `sqlite-vec` backend. See
@@ -61,12 +63,16 @@ relates to the other memory options you might be choosing between.
 
 These are deliberate boundaries, not missing features:
 
-- **No LLM-side intelligence.** Engrava never calls a language model. It does no
-  fact extraction, no summarisation, no entity resolution, no automatic
-  "memory writing" from raw text. Those belong in your agent (or a downstream
-  extension), above the storage layer. The one consolidation feature that *does*
-  synthesise — [dreaming](dreaming.md) — is purely structural (clustering +
-  centroids + keyword counts), with **no LLM involved**.
+- **No LLM-side intelligence.** Engrava core and built-in Dreaming do not call a
+  language model. They do no fact extraction, no summarisation, no entity
+  resolution, no semantic
+  contradiction detection, no truth arbitration, and no automatic "memory
+  writing" from raw text. Those belong in your agent (or a downstream
+  extension), above the storage layer. The one consolidation feature that
+  *does* synthesise — [dreaming](dreaming.md) — is purely structural
+  (clustering + centroids + keyword counts), with **no LLM involved**. See
+  [Evidence and conflicts](evidence-and-conflicts.md) for the explicit graph
+  pattern available in core.
 - **Retrieval is unscoped by default.** Queries rank across the whole store unless
   you scope them: `search_hybrid`/`recall` accept optional `filters=`/`visibility=`
   (a query filter, not access control); `search_similar`/`search_fts` take no filter

@@ -70,8 +70,8 @@ erroring when its prerequisite is missing. Work through this checklist:
 |---|---|
 | No `embedding_provider` is configured | the **vector** signal is skipped — only FTS/priority run. A purely semantic query with no shared keywords may find nothing. |
 | You pass `query_text` but no provider and no `query_vector` | same as above — there is no vector to compare against. |
-| `current_cycle` is `None` | the **recency** signal is skipped (it cannot compute an age). |
-| `recency_weight` is `0.0` | recency is disabled even if `current_cycle` is set. |
+| No explicit `current_cycle` or `recency_now`, and no configured `cycle_provider` | the **recency** signal is skipped because no recency reference is available. |
+| `recency_weight` is `0.0` | recency is disabled even when a cycle or transaction-time reference is available. |
 | The query shares no FTS tokens with any thought | FTS legitimately returns nothing — this is a real miss, not a bug. Note a *bare* query is `OR`-matched (any shared word hits), so this is rarer than it looks; if you instead get **too many** hits, you may want strict matching — see below. |
 | You used lowercase `and` / `or` between words | These are **not** FTS5 operators — they are matched as ordinary words (and `OR`-joined like any bare query). Booleans must be **uppercase** (`AND`, `OR`, `NOT`). |
 
@@ -84,8 +84,9 @@ print(sorted(result.backends_used))  # e.g. ['fts5', 'priority', 'recency']
 
 If `'vector'` is missing and you expected semantic matching, configure an
 embedding provider (see the [Embeddings guide](guides/embeddings.md)). If
-`'recency'` is missing, pass a non-`None` `current_cycle` **and** a
-`recency_weight > 0`.
+`'recency'` is missing, use a positive `recency_weight` and provide exactly one
+recency mode: pass `current_cycle`, configure a `cycle_provider`, or pass
+`recency_now` for transaction-time recency.
 
 ## Keyword search returns too many results (I wanted all words to match)
 
@@ -193,12 +194,19 @@ different model name or a different dimension, the stored vectors are
 incompatible with new ones, so it refuses rather than silently mixing
 dimensions (which would corrupt similarity results).
 
-**Fix.** Use the same embedding model the database was created with, or
-re-embed the corpus under the new model. The CLI does this safely:
+**Fix.** Use the same embedding model the database was created with, or restore
+a trusted snapshot into a configured service and deliberately re-embed the
+corpus under that service's provider:
 
 ```bash
-engrava restore --re-embed   # validates model consistency, re-embeds
+engrava --config engrava.yaml restore \
+  --service main -i backup.jsonl --clear --re-embed
 ```
+
+`--re-embed` requires service mode because that path resolves the target
+embedding provider from `engrava.yaml`. The single-database `--db` restore path
+does not construct a provider; use a configured service, import with
+`--skip-embeddings`, or keep the source embeddings unchanged.
 
 See [Known Limitations → Embedding Dimension Consistency](known-limitations.md#embedding-dimension-consistency).
 
@@ -243,6 +251,8 @@ base), `ConfigError`, `EmbeddingModelMismatchError`, `ExtensionMigrationError`,
 
 ## Still stuck?
 
+- Use [Error handling and recovery](error-handling.md) to decide whether to
+  retry, repair the input, or replace the store.
 - Re-read the relevant guide: [Core Concepts](concepts.md),
   [Search](search.md), [Embeddings](guides/embeddings.md), [Dreaming](dreaming.md).
 - Check the [FAQ](faq.md) for "is this supposed to work this way?" questions.

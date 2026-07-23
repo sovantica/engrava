@@ -25,6 +25,29 @@ You set the status on the `ThoughtRecord` you create, and update it over the
 thought's life. Archiving is the soft-retire step: an `ARCHIVED` thought still
 exists (and its content is still stored) until you garbage-collect it.
 
+The ordinary lifecycle state machine is:
+
+```text
+CREATED -> ACTIVE -> DONE -> ARCHIVED
+              \--------------> ARCHIVED
+ARCHIVED --restore_thought()--> ACTIVE
+```
+
+The direct `ACTIVE -> ARCHIVED` transition is valid; a thought does not have to
+pass through `DONE` before being manually archived. `restore_thought()` is the
+canonical reverse path: it returns an archived thought to `ACTIVE` and clears
+the hygiene archive stamps. Two maintenance mechanisms have dedicated archival
+paths outside the ordinary `evolve()` sequence:
+
+- TTL cleanup with the `archive` strategy archives any expired row, clears its
+  `expires_at`, and clears the hygiene-specific archive stamps.
+- Memory Hygiene may archive an eligible `ACTIVE` or `CREATED` row, clears its
+  `expires_at`, and stamps `archived_at_cycle` plus `archived_at` for its restore
+  windows.
+
+Both remain reversible through `restore_thought()` until a hard-delete or
+garbage-collection stage removes the row.
+
 > **`ARCHIVED` is excluded from default retrieval, but still stored and counted.**
 > Marking a thought `ARCHIVED` is a *retention* state — the row and its content
 > stay in the database — but an archived thought is **dropped from default ranked
@@ -37,13 +60,15 @@ exists (and its content is still stored) until you garbage-collect it.
 > It is **still counted** by `count_thoughts()` /
 > `list_thoughts()` (those are not ranked retrieval) — filter on `lifecycle_status`
 > yourself to exclude it there. **Expired** thoughts are likewise excluded from
-> retrieval (unless `include_expired=True`), and a retired `REFLECTION` (one whose
-> `lifecycle_status` is no longer `ACTIVE`) stays out of search by a type-specific
-> *freshness floor* even under `include_archived=True`.
+> the four ranked retrieval methods listed above; those methods do not offer an
+> `include_expired` escape hatch. `include_expired=True` applies only to
+> `list_thoughts()` and `count_thoughts()`. A retired `REFLECTION` (one whose
+> `lifecycle_status` is no longer `ACTIVE`) stays out of search by a
+> type-specific *freshness floor* even under `include_archived=True`.
 
 ## Time-to-live (TTL) and expiry
 
-A thought can carry an expiry time. Two ways to set it:
+A thought can carry an expiry time. Three ways to set it:
 
 - **Per-thought, absolute:** set `ThoughtRecord.expires_at` to a timestamp.
 - **Per-thought, relative at create time:** pass `expires_after_seconds=` to
@@ -51,6 +76,11 @@ A thought can carry an expiry time. Two ways to set it:
 - **A default for the whole store:** `ttl.default_ttl_seconds` in config applies a
   default TTL to new thoughts that don't set their own (see
   [Configuration → ttl](configuration.md#ttl)).
+
+When more than one is available at creation, precedence is explicit and
+deterministic: the `expires_after_seconds` argument wins, then the record's own
+`expires_at`, then the configured store default. The default is used only when
+neither per-call nor per-record expiry was supplied.
 
 Expiry is **not** automatic on a timer. Expired thoughts remain until a cleanup
 pass runs (see [running cleanup](#running-cleanup) below). By default, expired
@@ -61,6 +91,11 @@ pass `include_expired=True` to include them:
 live = await store.count_thoughts()  # excludes expired
 everything = await store.count_thoughts(include_expired=True)
 ```
+
+Ranked retrieval (`search_hybrid`, `recall`, `search_fts`, and
+`search_similar`) always excludes rows whose `expires_at` has passed, even
+before cleanup has archived or deleted them. `include_expired` belongs only to
+the list/count APIs; it is not a ranked-search parameter.
 
 ## Archive vs. delete
 
@@ -175,8 +210,8 @@ live row count — this is normal SQLite behaviour, not a leak.
 ## See also
 
 - [Configuration → ttl](configuration.md#ttl) — the strategy and default-TTL knobs
-- [Forgetting (Memory Hygiene)](memory-hygiene.md) — the opt-in deterministic
-  archive-then-GC loop and its restore windows
+- [Forgetting (Memory Hygiene)](memory-hygiene.md) — the opt-in, rule-based
+  archive-then-GC loop, its reproducibility conditions, and its restore windows
 - [Audit Trail](audit-trail.md) — what the journal records (and its delta residue)
 - [CLI](cli.md#gc) — the full `engrava gc` option reference
 - [Known Limitations](known-limitations.md) — storage and concurrency constraints

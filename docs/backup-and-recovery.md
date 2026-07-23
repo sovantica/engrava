@@ -38,6 +38,47 @@ thought / edge / embedding / action.
 full list): `--clear` to wipe the target first, `--skip-embeddings` / `--re-embed`
 to control embedding handling, and `--service` for multi-service targets.
 
+### Embedding handling during restore
+
+A normal restore imports the embedding rows carried by the snapshot.
+`--skip-embeddings` discards those rows and restores text/graph/action data
+without vectors.
+
+`--re-embed` also discards the snapshot vectors, then generates new vectors for
+every imported thought. That path is supported only for a configuration-backed
+service whose provider is declared under
+`services.configs.<name>.embeddings`. For example:
+
+```yaml
+services:
+  data_dir: ./data
+  default_service: main
+  configs:
+    main:
+      embeddings:
+        provider: sentence-transformer
+        model: sentence-transformers/all-MiniLM-L6-v2
+```
+
+```bash
+engrava --config engrava.yaml restore -i backup.jsonl --service main --clear --re-embed
+```
+
+The top-level `embeddings` section is not forwarded as a default by the restore
+CLI's service manager. The single-database `--db` restore branch also creates a
+bare store with no provider, so this command is **not** a supported re-embed
+procedure:
+
+```bash
+# Fails: the single-database restore branch has no embedding provider.
+engrava --db fresh.db restore -i backup.jsonl --re-embed
+```
+
+For a single database, either retain the snapshot embeddings, use
+`--skip-embeddings`, or define the target as a configured service before
+requesting re-embedding. `--skip-embeddings` and `--re-embed` are mutually
+exclusive.
+
 ### Trust boundary
 
 `restore` is designed for **snapshots you produced yourself** with `engrava
@@ -122,7 +163,8 @@ multi-file copy when writers are stopped or behind a consistent snapshot.
 
 - **From a snapshot:** `engrava --db <target> restore -i backup.jsonl`. Restore
   into a **fresh** database (optionally `--clear` an existing one). Remember the
-  journal is not restored.
+  journal is not restored. Use configured service mode, not the single `--db`
+  branch, when the restore must run `--re-embed`.
 - **From a physical backup:** stop the process, put the backed-up file in place,
   and start again. A backup made with the Online Backup API, `VACUUM INTO`, or a
   checkpoint-then-copy is a single self-contained `.db`. If instead you captured a

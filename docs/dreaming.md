@@ -104,13 +104,15 @@ print(f"Promoted {result.promoted_count} thoughts")
 
 If you enable dreaming in `engrava.yaml`
 (`extensions.dreaming.enabled: true`) and build the store with
-`EngravaStore.from_config(...)`, you do **not** need to construct a
+`SqliteEngravaCore.from_config(...)`, you do **not** need to construct a
 `DreamingExtension` by hand — call `consolidate()` on the store directly:
 
 ```python
-# store built via EngravaStore.from_config(config_with_dreaming_enabled)
-result = await store.consolidate(current_cycle=1)
-print(f"Promoted {result.promoted_count} thoughts")
+from engrava import SqliteEngravaCore
+
+async with await SqliteEngravaCore.from_config("engrava.yaml") as store:
+    result = await store.consolidate(current_cycle=1)
+    print(f"Promoted {result.promoted_count} thoughts")
 ```
 
 `store.consolidate(current_cycle=...)` first flushes any pending
@@ -119,6 +121,11 @@ signal sees the latest access counts this cycle), then runs the configured
 extension. It raises `RuntimeError` if dreaming is not enabled/wired on the
 store (built manually, or `dreaming.enabled` is `false`) — there is no
 extension to run.
+
+`schedule_every_n_cycles` is a validated configuration value, not an internal
+scheduler. Engrava does not start a background task and neither
+`store.consolidate()` nor `run_consolidation()` skips a call based on that
+field. Your application must decide when the configured cadence is due.
 
 ## Gates
 
@@ -144,6 +151,38 @@ Set to `False` only when your application explicitly tracks
 confirmations and you want to require at least `min_confirmations`
 experience-based validations before a thought is eligible for
 promotion.
+
+## Eligibility filters and corpus caps
+
+After the age/confirmation gates, promotion and REFLECTION members also pass
+metadata-aware eligibility filters. They read caller-provided metadata and are
+not identity or authorization controls.
+
+| Field | Default | Effect |
+|---|---|---|
+| `eligible_perspectives` | `null` | Optional allow-list for `metadata.perspective`: `percept`, `utterance`, `thought`. |
+| `self_filter_mode` | `any` | `self_only` / `external_only` use strict boolean `metadata.source.is_self`. |
+| `min_source_confidence` | `low` | Minimum `metadata.source.confidence` in `low < medium < high` order. |
+| `excluded_content_types` | `["code"]` | Reject matching declared `metadata.content_type` values. |
+| `eligible_content_types` | `null` | Optional allow-list for declared content types. |
+
+Missing perspective, `is_self`, or content-type annotations remain eligible for
+backward compatibility. Once a non-empty `metadata` mapping exists, missing or
+malformed source confidence is treated as `low`, so a higher configured
+threshold rejects it. A record with absent or empty metadata bypasses every
+metadata-driven filter, including the confidence threshold.
+
+The remaining caps operate at different stages:
+
+- `candidates_limit` (default `200`) bounds the ACTIVE promotion query and each
+  type query used by agglomerative clustering;
+- `max_promoted_per_run` (default `20`) limits writes in one promotion phase;
+- `max_p1_fraction` (default `0.05`) limits the corpus-wide P1 population;
+- `min_cluster_size` / `max_cluster_size` (defaults `3` / `200`) reject clusters
+  that are too small or too broad after eligibility filtering;
+- `clustering_min_new_candidates` (default `50`) skips repeat clustering when
+  the eligible ACTIVE population has not grown enough. It does not skip signal
+  scoring, promotion, or edge creation.
 
 ## Signals
 
@@ -310,10 +349,84 @@ The graph signal is **opt-in** in v0.3.0 (`default_graph_weight=0.0`).
 When the weight is `0.0`, no graph queries are made and there is zero
 performance impact.
 
-## Configuration reference
+## Complete YAML surface
 
-See [configuration.md](configuration.md) for the full YAML reference
-of `DreamingGates`, `EdgeCreationConfig`, and `SearchConfig` fields.
+This example names every YAML-configurable `DreamingConfig`, `DreamingGates`,
+and `EdgeCreationConfig` field with its default. It is a reference, not a
+recommended production profile:
+
+```yaml
+extensions:
+  dreaming:
+    enabled: false
+    schedule_every_n_cycles: 100   # caller-side hint; not an internal scheduler
+    promote_threshold: 0.7
+    candidates_limit: 200
+    signals:
+      recency: 0.25
+      staleness: 0.20
+      confirmation: 0.20
+      confidence: 0.15
+      frequency: 0.20
+      action_outcome: 0.15
+
+    clustering_backend: numpy      # numpy or python
+    top_keyphrases_count: 3
+    top_member_excerpts_count: 5
+    member_excerpt_max_chars: 150
+    max_p1_fraction: 0.05
+    promote_targets: OBS_ONLY      # OBS_ONLY, REFL_ONLY, or ALL
+    reflection_default_priority: P2
+
+    eligible_perspectives: null    # optional list: percept, utterance, thought
+    self_filter_mode: any          # any, self_only, external_only
+    min_source_confidence: low     # low, medium, high
+    excluded_content_types: [code]
+    eligible_content_types: null
+
+    boilerplate_threshold: 0.30
+    boilerplate_min_corpus_size: 5
+    boilerplate_min_keyphrases_per_refl: 1
+    access_tracking_enabled: true
+
+    gates:
+      min_confirmations: 2
+      min_age_cycles: 1
+      max_promoted_per_run: 20
+      allow_zero_confirmation: true
+
+      min_cluster_size: 3
+      cluster_similarity_threshold: 0.7
+      cluster_algorithm: lpa       # lpa or agglomerative
+      enable_reflections: true
+      cold_start_clustering: false
+      cluster_allowed_types: [OBSERVATION]
+      clustering_min_new_candidates: 50
+      max_cluster_size: 200        # null disables the upper bound
+
+      cluster_quality_gating_enabled: true
+      cluster_quality_persona_threshold: 0.75
+      cluster_quality_cohesion_threshold: 0.40
+      cluster_quality_external_homogeneity_threshold: 0.95
+      cluster_quality_ne_consistency_threshold: 0.60
+      cluster_quality_require_meaningful_keyphrases: true
+
+    edges:
+      enabled: true
+      top_k: 1
+      min_similarity: 0.7
+      edge_weight_factor: 0.5
+```
+
+A partial `signals` mapping merges onto the six defaults. Unknown signal names
+require a matching `custom_signals` implementation when constructing
+`DreamingExtension`; the YAML-only `from_config()` path has no custom-signal
+registry and rejects unknown names when it constructs the extension.
+
+As described in the [configuration loading warning](configuration.md#loading-configuration),
+unknown keys are ignored. A misspelled Dreaming key can silently leave the
+documented default active. See [Configuration](configuration.md#dreaming) for
+field-by-field types and validation ranges.
 
 ## Reflections (meta-consolidation)
 
@@ -330,16 +443,30 @@ higher-order abstraction over a cluster of related thoughts:
 |-------|-------|
 | `thought_type` | `REFLECTION` |
 | `embedding` | Centroid of member embeddings (mean, L2-normalised) |
-| `content` | JSON: `{"member_ids": [...], "keywords": [...], "cluster_hash": "..."}` |
-| `priority` | Maximum priority of any cluster member |
+| `content` | Structural JSON schema v2 (fields below) |
+| `priority` | `reflection_default_priority` (`P2` by default) |
 | `source` | `"dreaming:<cluster_hash>"` (hex-16) |
 | `source_type` | `KnowledgeSource.DREAMING` |
 | Edges | `CONSOLIDATED_FROM` → every cluster member |
 
-**No LLM is involved** — content is purely structural (keyword frequency
-counts from member text, centroid from member vectors). LLM-generated
-prose summaries belong in downstream extension hooks, not in the
-core graph layer.
+The v2 content payload preserves the legacy `member_ids`, `keywords`, and
+`cluster_hash` fields and adds:
+
+| Content field | Meaning |
+|---|---|
+| `type` / `version` | `"reflection"` / `2` schema discriminator |
+| `member_count` | Number of eligible source members |
+| `cluster_algorithm` | Algorithm used for the cluster |
+| `created_at` | ISO-8601 payload build time |
+| `top_keyphrases` | Bounded TF-IDF phrase/score objects after cross-cluster boilerplate filtering |
+| `member_excerpts` | Bounded excerpts from priority/recency-ordered members |
+| `temporal_span` | Member creation-time bounds and span |
+| `named_entities` | Sorted unique structurally extracted entities |
+
+**No LLM is involved**. Content, essence, centroid, metadata enrichments, and
+valid-time extent are derived structurally from member records and vectors; the
+payload's `created_at` records the current UTC build time. LLM-generated prose
+summaries belong in downstream extensions, not in the core graph layer.
 
 > **Navigating the lineage.** The `CONSOLIDATED_FROM` edges are queryable
 > through dedicated store helpers — `consolidated_member_ids(reflection_id)`,
@@ -360,11 +487,18 @@ Two algorithms are available via `DreamingGates.cluster_algorithm`:
 - Works when the graph is dense enough to form communities.
 
 **`"agglomerative"` — cosine-similarity single-linkage**
-- Operates over **all active ACTIVE thoughts**, independent of graph edges.
+- Operates over bounded ACTIVE candidates whose thought types are listed in
+  `cluster_allowed_types` (default: `OBSERVATION`), independent of graph edges.
 - Intended for sparse-graph / first-run scenarios where LPA finds no clusters.
 - Nodes whose cosine similarity ≥ `cluster_similarity_threshold` are merged
   via Union-Find.
 - Use when you want clustering before dreams have built up a graph.
+
+`clustering_backend` selects the similarity implementation for the
+agglomerative path. `numpy` (default) uses vectorised float32 matrix operations
+and chunks large candidate sets to bound peak matrix memory. `python` uses the
+legacy pure-Python O(n²) loop and is intended only as a debugging escape hatch.
+It does not change the LPA implementation.
 
 **Cold-start fallback (`cold_start_clustering`, default `false`)**
 
@@ -409,16 +543,52 @@ extensions:
       enable_reflections: true        # set to false to skip phase 3 entirely
       cold_start_clustering: false    # opt-in: LPA falls back to agglomerative
                                       #   clustering when the edge graph is empty
+      cluster_allowed_types: [OBSERVATION]
+      clustering_min_new_candidates: 50
+      max_cluster_size: 200
 ```
+
+### Cluster-quality gates
+
+After clustering, metadata eligibility is applied again to the resolved
+members. The cluster must still contain at least `min_cluster_size` eligible
+members and must not exceed `max_cluster_size`.
+
+With `cluster_quality_gating_enabled: true` (default), a cluster is rejected on
+the first failed content-quality check:
+
+- duplicate member content;
+- persona-only share at or above `cluster_quality_persona_threshold` (`0.75`);
+- contradictions flagged by the lightweight English token-pair heuristic;
+- mean pairwise cosine below `cluster_quality_cohesion_threshold` (`0.40`);
+- external-source fraction below
+  `cluster_quality_external_homogeneity_threshold` (`0.95`);
+- named-entity overlap below `cluster_quality_ne_consistency_threshold`
+  (`0.60`); or
+- no meaningful post-boilerplate keyphrase when
+  `cluster_quality_require_meaningful_keyphrases` is true.
+
+Disabling the master switch bypasses these content-quality checks, but not
+cluster size, metadata eligibility, embedding availability, or idempotence.
+The cross-cluster boilerplate filter is controlled separately by
+`boilerplate_threshold`, `boilerplate_min_corpus_size`, and
+`boilerplate_min_keyphrases_per_refl`.
 
 ### `ConsolidationResult` fields
 
-```python
-result = await ext.run_consolidation(store, current_cycle=42)
-print(result.promoted_count)  # thoughts promoted to P1
-print(result.edges_created)  # ASSOCIATED edges created
-print(result.reflections_created)  # new REFLECTION thoughts created
-```
+| Field | Meaning |
+|---|---|
+| `candidates_evaluated` | Number of ACTIVE candidates in the bounded promotion pool |
+| `promoted_count` / `promoted_ids` | Promotions written and their thought IDs |
+| `skipped_gate_count` | Candidates rejected by age/confirmation gates |
+| `scores` | Computed score for every promotion candidate |
+| `edges_created` | New dream-created ASSOCIATED edges |
+| `reflections_created` | New REFLECTION thoughts |
+| `promotion_capped` | Whether the corpus-wide P1 fraction prevented a promotion |
+| `p1_fraction_after` | P1 share after the run |
+| `orphans_retired` | ACTIVE REFLECTIONs archived because all sources left the active set |
+| `active_signal_weights` | Effective weights after flat-signal redistribution |
+| `flat_signals` | Configured signal names that carried no ranking information this run |
 
 ### Querying reflections
 

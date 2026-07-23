@@ -1,11 +1,13 @@
 # Extensions
 
-engrava provides a hook-based extension system that lets you plug into
-the thought lifecycle without modifying core code.
+engrava provides lifecycle hooks, derived-record producers, embedding providers,
+MindQL commands, and package manifests for extending the store without modifying
+core code. This page covers the package-level patterns; the complete hook and
+derived-record contracts are in [Extension hooks](extension-hooks.md).
 
 ## EngravaHooksProtocol
 
-All extensions implement the `EngravaHooksProtocol`:
+Lifecycle-hook implementations satisfy `EngravaHooksProtocol`:
 
 ```python
 from engrava import (
@@ -33,7 +35,7 @@ class MyHooks(EngravaHooksProtocol):
     async def decay_function(
         self, thought: ThoughtRecord, elapsed_cycles: int
     ) -> float:
-        """Decay multiplier (reserved — not currently called by core)."""
+        """Decay multiplier used by an enabled Memory Hygiene pass."""
         return 1.0
 
     def mindql_extension_registry(self) -> dict[str, MindQLExtension]:
@@ -41,10 +43,14 @@ class MyHooks(EngravaHooksProtocol):
         return {}
 ```
 
-> In the public engrava package only `on_store` and `on_retrieve` are invoked.
-> The other three protocol methods are reserved (see
-> [Extension hooks](extension-hooks.md) §1.2). Subclass `DefaultEngravaHooks`
-> if you only want to override one or two methods.
+> Core invokes `on_store`, `on_retrieve`, and `decay_function`.
+> `decay_function` is called once per candidate when an enabled `run_hygiene()`
+> pass reaches archive scoring; its return is clamped to `[0.0, 1.0]`, and a
+> non-finite value fails safe to `1.0`. It is not a search or promotion hook. Only
+> `score_function` and `mindql_extension_registry()` are reserved and not called
+> by core; MindQL verbs are wired through `ExtensionManifest`. See
+> [Available extension hooks](extension-hooks.md). Subclass
+> `DefaultEngravaHooks` if you only want to override selected methods.
 
 ## Using Hooks
 
@@ -59,7 +65,8 @@ async with aiosqlite.connect("my.db") as conn:
     conn.row_factory = aiosqlite.Row
     store = SqliteEngravaCore(conn, hooks=hooks)
     await store.ensure_schema()
-    # on_store / on_retrieve are now called automatically during CRUD operations
+    # on_store / on_retrieve now run during CRUD; decay_function runs only when
+    # this store executes an enabled Memory Hygiene pass.
 ```
 
 ## Default Hooks
@@ -262,7 +269,8 @@ async with aiosqlite.connect("my.db") as db:
     # migrations/001_initial.sql and 002_add_tags.sql are now applied
 ```
 
-Or use the opt-in discovery helper to load all installed extensions:
+Or use the opt-in discovery helper to load all installed extensions into a
+library-created store:
 
 ```python
 from engrava import SqliteEngravaCore
@@ -272,9 +280,11 @@ store = SqliteEngravaCore(db, manifests=discover_manifests())
 await store.ensure_schema()
 ```
 
-> **Note:** Discovery is **never** automatic — always opt in explicitly.
-> Schema migrations have side-effects (ALTER TABLE, CREATE TABLE) and
-> should only run when the caller is aware of them.
+> **Library boundary:** `SqliteEngravaCore` does not scan entry points by
+> itself. Library callers opt in by calling `discover_manifests()` or by setting
+> `manifests.discover: true` in a configuration loaded by `from_config()`.
+> Discovered manifests are then passed to the store, so their schema migrations
+> run during `ensure_schema()`.
 
 ### YAML configuration
 
@@ -296,25 +306,73 @@ manifests:
     - "my_plugin.manifest:MANIFEST"
 ```
 
+### CLI discovery is automatic
+
+The `engrava` CLI has two additional discovery paths that are independent of
+the library opt-in above:
+
+- every CLI startup scans the `engrava.cli` entry-point group and loads values
+  that provide Click commands, before the requested subcommand is parsed;
+- the built-in `engrava query` command also scans `engrava.extensions`, loads
+  manifests, and registers their `mindql_extensions` for that query.
+
+These CLI scans do not pass discovered manifests to a store and therefore do
+not apply their schema migrations. They do import and execute installed Python
+entry-point code. There is currently no CLI flag, environment variable, or YAML
+setting that disables either scan. Run the CLI in an environment containing
+only trusted packages; use the Python API with explicit manifests when you need
+an allow-listed extension set. See [Security and Trust Boundaries](security.md).
+
 ### Version tracking
 
-The runner tracks per-extension migration state in the
-`extension_schema_versions` table (added in core schema v9).  Each row
-records the extension name, the count of applied migrations, the timestamp,
-the last applied filename, and the extension version at apply time.
+The runner uses two bookkeeping tables:
+
+- `extension_schema_migrations` is append-only history keyed by extension name
+  and one-based migration index. Each row records the filename, a SHA-256
+  content checksum, timestamp, and extension version at apply time.
+- `extension_schema_versions` is a one-row summary containing the latest
+  applied count, filename, timestamp, and extension version.
+
+Migration identity is the unique basename in lexicographic order. After a file
+has been applied, its position, basename, and SQL content are immutable: add a
+new later migration instead of editing, renaming, reordering, or inserting a
+file before history. Duplicate basenames are rejected even when their paths
+differ.
 
 Runner behavior at startup:
 
 | State | Action |
 |---|---|
-| No row (fresh install) | Apply all migration files |
-| Row with `version < len(files)` | Apply only pending files |
-| Row with `version == len(files)` | No-op |
-| Row with `version > len(files)` | Raise `ExtensionMigrationError` (downgrade detected) |
+| No history or summary (fresh install) | Prepare and apply all migration files |
+| History is a valid prefix of the current files | Re-verify every applied filename/checksum, then apply only the pending suffix |
+| History covers every current file | No-op after drift verification |
+| Recorded count exceeds the current file count | Raise `ExtensionMigrationError` (downgrade detected) |
+| History is non-contiguous or disagrees with the summary | Raise `ExtensionMigrationError` (bookkeeping corruption) |
+| Applied filename, order, or checksum changed | Raise `ExtensionMigrationError` before pending SQL runs |
 
-On SQL failure the version counter is **not** advanced.
-`ExtensionMigrationError` is raised with the extension name and failing
-filename so the caller can surface a clear error message.
+Databases created by older Engrava versions may have only the summary row. On
+the first run with checksum history, the runner adopts the first recorded
+number of current files as the baseline and stores their current checksums.
+Because no older checksum exists, this cannot detect edits made before adoption;
+drift detection for those files is prospective from that point onward.
+
+Every pending file is read, split into complete semicolon-terminated SQLite
+statements, checksummed, and checked for forbidden transaction-control commands
+before the first pending migration runs. The runner owns transaction state;
+`BEGIN`, `COMMIT`, `END`, `ROLLBACK`, `SAVEPOINT`, and `RELEASE` statements are
+rejected.
+
+Each migration file runs in its own savepoint together with its history append
+and summary update. A failure rolls back that file's SQL and bookkeeping, then
+raises `ExtensionMigrationError` with the extension and filename. Successfully
+completed earlier files have already been committed and remain applied; the
+pending set is not one all-or-nothing transaction. Re-running resumes from the
+first unapplied file after the problem is corrected by adding/fixing a migration
+that has not yet been recorded.
+
+Use a WAL-safe backup before applying migrations. Checksums protect migration
+history from accidental drift; they do not authenticate an extension publisher
+or make untrusted SQL safe.
 
 ## Subclassing SqliteEngravaCore
 

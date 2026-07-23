@@ -129,7 +129,8 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 | 0.2.2 | 0.3.0 | Yes | Minor upgrade with extension migration tracking and upgrade CI coverage |
 | 0.3.0 | 0.3.1 | Yes | Patch-level upgrade; no schema change (`user_version` unchanged) — safe to roll across workers |
 | 0.3.x | 0.4.0 | Yes | **Schema-changing** minor upgrade — adds the valid-time columns (additive, zero data loss). Back up first and follow the [rolling-upgrades](#rolling-upgrades-multiple-workers) note |
-| 0.4.x | 0.5.0 | Yes | Library upgrade is drop-in. **Breaking for MCP-server users only:** the `engrava[mcp]` extra and the in-engrava `engrava-mcp` command are removed — the server moved to the standalone [`engrava-mcp`](https://github.com/sovantica/engrava-mcp) package (see the 0.4 → 0.5 note) |
+| 0.4.x | 0.5.0 | Yes | **Schema-changing** minor upgrade (`user_version` 14 → 18), although the library API is drop-in. **Breaking for MCP-server users only:** the `engrava[mcp]` extra and the in-engrava `engrava-mcp` command are removed — the server moved to the standalone [`engrava-mcp`](https://github.com/sovantica/engrava-mcp) package (see the 0.4 → 0.5 note) |
+| 0.5.0 | 0.6.0 | Yes | **Schema-changing** minor upgrade (`user_version` 18 → 20), with two additive columns. Default retrieval now excludes archived thoughts, and wrong-dimension query vectors raise a typed error. Back up, quiesce shared-store workers, migrate once, and review the [0.5 → 0.6 notes](#05---06) |
 
 For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 `0.x.*` line do not change the schema and are low-risk; **minor** upgrades
@@ -138,18 +139,82 @@ For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 
 ## Version Notes
 
+### 0.5 -> 0.6
+
+Version 0.6 is a **schema-changing minor upgrade**. Do not roll it across old and
+new workers sharing one database file. Back up the database, stop the 0.5
+workers, let one 0.6 process run `ensure_schema()` (or `engrava migrate`) to
+completion, and then start the 0.6 workers. The migration is automatic and
+forward-only.
+
+The core schema advances from `user_version = 18` to `user_version = 20` in two
+additive steps:
+
+| Step | Change | Existing-row behavior |
+|---|---|---|
+| 18 → 19 | Adds `edge.metadata_json` | Existing edges read back `metadata == {}`. |
+| 19 → 20 | Adds nullable `thought.archived_at` | An older hygiene-archived row has no wall-clock timestamp and fails closed: it is not auto-GC-eligible while the wall-clock restore window is active. |
+
+Neither step drops a table or rewrites user content. The columns are added
+automatically with a neutral default or `NULL`. A physical pre-upgrade backup is
+still required because downgrades and reverse migrations are unsupported.
+
+Review these behavior changes before deployment:
+
+- **Archived thoughts leave default retrieval.** `search_similar`, `search_fts`,
+  `search_hybrid`, and `recall` now exclude `LifecycleStatus.ARCHIVED` rows by
+  default. Pass `include_archived=True` for an archive-search call, or use
+  `restore_thought(...)` to return a thought to `ACTIVE`. `list_thoughts` and
+  `count_thoughts` retain their lifecycle-neutral behavior unless you filter
+  them explicitly.
+- **Query-vector dimensions fail loudly.** `search_similar` and the vector arm
+  reject a vector whose length does not match the store dimension with
+  `VectorDimensionMismatchError` (an `EngravaError` subclass). Code that caught
+  the previous incidental `ValueError`, or relied on a wrong-dimension all-zero
+  vector returning `[]`, must catch the typed error instead. Empty, all-zero, or
+  non-finite vectors remain a graceful empty result and increment
+  `vector_arm_degradation_count`.
+- **Malformed FTS syntax gets one safe retry.** A failed expert `MATCH`
+  expression is retried through bare-query normalization before the FTS arm is
+  dropped; every failed first attempt increments `fts_match_failure_count`.
+- **Recency has two explicit modes.** Existing `current_cycle` behavior remains,
+  with an optional runtime `cycle_provider`. Callers without a cognitive cadence
+  can select transaction-time recency with `recency_now`; supplying both explicit
+  references raises `RecencyModeConflictError` rather than combining clocks.
+- **Configuration validation is uniform.** Invalid values in supported config
+  sections are rejected consistently whether the store is built from YAML or
+  through the corresponding typed construction path. Fix invalid legacy values
+  rather than relying on a path that previously skipped validation.
+- **Enabled hygiene gains conservative wall-clock guards.** Memory Hygiene is
+  still off by default. For a store that already enabled it in 0.5, omitted new
+  fields resolve to a seven-day minimum inactivity age and a 30-day wall-clock
+  restore window; archival also requires an active usage-history signal. Pass a
+  fixed `now` when replaying a selection, and review the new defaults before the
+  first 0.6 hygiene run. Existing hygiene archives without `archived_at` fail
+  closed and are not auto-GC'd while the wall-clock window is active.
+
+The new edge-metadata, derived-record, cycle-provider, and transaction-time
+recency surfaces are additive. Existing stores do not enable automatic
+derivation or a cycle provider merely by being migrated.
+
 ### 0.4 -> 0.5
 
 The library upgrade is drop-in: `pip install --upgrade engrava` and your normal
 startup. The schema migration runs automatically on first open as usual.
 
-**Schema change (additive, zero data loss).** 0.5 steps the core schema forward
-one step, `user_version = 14 → 15`, adding a single composite index
-`edge(edge_type, to_thought_id)` so edge-type-scoped inbound edge lookups seek
-on both columns instead of filtering `edge_type` as a residual. It touches no
-row, column, or query result — purely a query-plan improvement — and runs inside
-a transaction on the first `ensure_schema()`. Nothing to do beyond your normal
-startup.
+**Schema change (additive, zero data loss).** 0.5 steps the core schema from
+`user_version = 14` to `user_version = 18` in four migrations:
+
+| Step | Change | Existing-row behavior |
+|---|---|---|
+| 14 → 15 | Adds the composite `edge(edge_type, to_thought_id)` lookup index | Query-plan improvement only; no row changes. |
+| 15 → 16 | Adds nullable `thought.action_outcome_score` and `idx_action_source_thought` | Existing thoughts have no action-outcome aggregate until linked terminal actions produce one. |
+| 16 → 17 | Adds nullable `thought.provenance` plus session/actor JSON expression indexes | Existing thoughts have no captured provenance. |
+| 17 → 18 | Adds `thought.pinned` and nullable `thought.archived_at_cycle` | Existing thoughts read as `pinned=False`; no row is treated as hygiene-archived. |
+
+All four steps run automatically inside the migration transaction on first
+`ensure_schema()`. They add columns or indexes without dropping or rewriting
+user content.
 
 **Breaking change for MCP-server users.** The Model Context Protocol server moved
 out of `engrava` into its own package, **`engrava-mcp`**. Removed from `engrava`

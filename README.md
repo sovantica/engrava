@@ -120,8 +120,9 @@ Link thoughts with typed, weighted edges. Edge types include `ASSOCIATED`,
 
 ### Embedding Search
 
-Store embeddings alongside thoughts and perform brute-force cosine similarity
-search. Pluggable embedding providers:
+Store embeddings alongside thoughts and search them with the built-in NumPy
+cosine backend or the optional `sqlite-vec` backend (`pip install
+'engrava[vec]'`). Pluggable embedding providers:
 
 | Provider | Extra | Backend |
 |----------|-------|---------|
@@ -134,7 +135,9 @@ search. Pluggable embedding providers:
 ### Full-Text Search (FTS5)
 
 SQLite FTS5 virtual table with BM25 ranking. Hybrid search combines vector
-similarity, text relevance, and recency scoring.
+similarity, text relevance, recency, priority, and graph connectivity. Signals
+that cannot run for a query are skipped and the remaining weights are
+redistributed.
 
 ### MindQL Query Language
 
@@ -146,26 +149,35 @@ COUNT thoughts WHERE lifecycle_status = 'ACTIVE'
 SELECT thought_id, essence FROM thought WHERE thought_type = 'BELIEF'
 ```
 
-Extensible with custom commands via the hook system.
+Extensible with custom commands through `MindQLExecutor` or an
+`ExtensionManifest`; the lifecycle hook registry is reserved and is not
+consulted by the core executor.
 
 ### Extension System
 
-Plug into the thought lifecycle via `EngravaHooksProtocol`:
+Plug into the thought lifecycle via `EngravaHooksProtocol`. Subclass
+`DefaultEngravaHooks` when you only need selected active methods:
 
 ```python
-from engrava import EngravaHooksProtocol, ThoughtRecord, ScoringContext
+from engrava import DefaultEngravaHooks, ThoughtRecord
 
-class MyHooks(EngravaHooksProtocol):
+class MyHooks(DefaultEngravaHooks):
     async def on_store(self, thought: ThoughtRecord) -> ThoughtRecord:
-        # Transform thoughts before persistence
+        # Observe or enrich the object returned after persistence.
         return thought
 
-    async def score_function(
-        self, thought: ThoughtRecord, context: ScoringContext
+    async def decay_function(
+        self, thought: ThoughtRecord, elapsed_cycles: int
     ) -> float:
-        # Custom relevance scoring
-        return thought.confidence or 0.5
+        # Supply a decay multiplier to an enabled Memory Hygiene pass.
+        return 1.0
 ```
+
+Core currently invokes `on_store`, `on_retrieve`, and `decay_function`.
+`on_store` runs after the source thought is durable; changing its return value
+does not rewrite the persisted row. `score_function` and
+`mindql_extension_registry()` remain reserved protocol methods and are not
+called by core.
 
 ### Dreaming / Memory Consolidation
 
@@ -207,6 +219,8 @@ guarantee).
 Run multiple independent databases under one `EngravaManager`:
 
 ```python
+from pathlib import Path
+
 from engrava import EngravaManager
 
 async with EngravaManager(data_dir=Path("./data")) as mgr:
@@ -237,7 +251,7 @@ mode.
 
 ```bash
 engrava --db mydata.db info          # Database stats
-engrava --db mydata.db query "FIND type=OBSERVATION LIMIT 5"
+engrava --db mydata.db query "FIND thoughts WHERE thought_type = 'OBSERVATION' LIMIT 5"
 engrava --db mydata.db snapshot -o backup.jsonl
 engrava --db mydata.db restore -i backup.jsonl
 engrava --db mydata.db gc            # Garbage-collect archived thoughts
@@ -261,6 +275,7 @@ See the [CLI reference](https://github.com/sovantica/engrava/blob/main/docs/cli.
 
 ## Documentation
 
+- [Documentation Index](https://github.com/sovantica/engrava/blob/main/docs/index.md) — choose a path by task: learn, build, operate, extend, or migrate
 - [Core Concepts](https://github.com/sovantica/engrava/blob/main/docs/concepts.md) — the mental model (thought, edge, reflection, cycle, …) — start here
 - [The Bi-temporal Model](https://github.com/sovantica/engrava/blob/main/docs/bitemporal.md) — the optional valid-time axis: query a fact as of any instant, `invalidate` without deleting
 - [Positioning](https://github.com/sovantica/engrava/blob/main/docs/positioning.md) — when Engrava is (and isn't) the right tool, and how it compares
@@ -276,6 +291,10 @@ See the [CLI reference](https://github.com/sovantica/engrava/blob/main/docs/cli.
 - [Extensions](https://github.com/sovantica/engrava/blob/main/docs/extensions.md) — Writing custom extensions and hooks
 - [Observability](https://github.com/sovantica/engrava/blob/main/docs/observability.md) — Metrics snapshot API
 - [Audit Trail](https://github.com/sovantica/engrava/blob/main/docs/audit-trail.md) — Tamper-evident hash-chain journal (enabling, querying, verifying, security model)
+- [Evidence and Conflicts](https://github.com/sovantica/engrava/blob/main/docs/evidence-and-conflicts.md) — model claims, provenance, contested facts, and caller-owned clarification
+- [Security](https://github.com/sovantica/engrava/blob/main/docs/security.md) — trust boundaries, data egress, tenant isolation, encryption posture, and journal limits
+- [Error Handling and Recovery](https://github.com/sovantica/engrava/blob/main/docs/error-handling.md) — decide when to retry, repair input, or replace a store
+- [Benchmarks](https://github.com/sovantica/engrava/blob/main/docs/benchmarks.md) — release gates, versioned observed values, and LongMemEval
 - [API Reference](https://github.com/sovantica/engrava/blob/main/docs/api-reference.md) — Full protocol and class reference
 - [CLI Reference](https://github.com/sovantica/engrava/blob/main/docs/cli.md) — every `engrava` command and option
 - [Glossary](https://github.com/sovantica/engrava/blob/main/docs/glossary.md) — quick definitions of every Engrava term

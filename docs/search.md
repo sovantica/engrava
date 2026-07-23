@@ -13,15 +13,17 @@ into a single ranked result list.
 | 4 | **Priority** | `default_priority_weight` | `0.05` | Boost multiplier per priority level (P1–P4) |
 | 5 | **Graph** | `default_graph_weight` | `0.00` | 1-hop-weighted neighbour boost (opt-in) |
 
-Default weights sum to `1.0`.  When a signal is unavailable (e.g. no
-`current_cycle` → recency skipped, no embeddings → vector skipped),
+Default weights sum to `1.0`. When a signal is unavailable (e.g. neither
+recency reference nor a cycle provider can resolve recency, or no embeddings
+can resolve the vector arm),
 its weight is **redistributed proportionally** across active signals.
 
 ## Graceful Degradation
 
 - FTS5 unavailable or empty query → FTS skipped.
 - `query_vector` is `None` and no embedding provider → vector skipped.
-- Neither recency reference present (no `current_cycle` and no `recency_now`) → recency skipped.
+- No explicit `current_cycle`, no configured cycle provider, and no
+  `recency_now` → recency skipped.
 - `priority_weight` is `0.0` → priority skipped.
 - `graph_weight` is `0.0` → graph skipped, zero overhead.
 - All signals disabled → fallback to `list_thoughts(LIMIT top_k)`.
@@ -36,6 +38,28 @@ The vector arm distinguishes two bad-query-vector cases:
   `VectorDimensionMismatchError` — it is not silently degraded. See
   [Observability signals](observability.md#observability-signals) and
   [Known Limitations](known-limitations.md#query-vector-dimension-mismatch).
+
+Both health counters are read-only, monotonically increasing properties on one
+store instance and reset when a new store is constructed:
+
+```python
+print(store.fts_match_failure_count)
+print(store.vector_arm_degradation_count)
+```
+
+`fts_match_failure_count` increments before the one safe fallback retry whenever
+the primary normalized FTS5 `MATCH` expression fails. The fallback may still
+return valid matches; a non-zero count therefore means recovery occurred, not
+that the FTS arm was necessarily lost. `vector_arm_degradation_count` increments
+only for degenerate vectors. A dimension mismatch is not counted because it is
+raised as a typed contract error.
+
+> **v0.6.0 compatibility note.** A wrong-dimension query vector is rejected with
+> `VectorDimensionMismatchError` instead of being confused with an empty
+> neighbourhood or leaking a backend-specific shape error. Callers that accept
+> externally supplied vectors should catch this error (or `EngravaError`) and
+> correct the embedding/model configuration; retrying the same vector cannot
+> produce a valid result.
 
 ## Archived thoughts are excluded by default
 
@@ -66,7 +90,8 @@ The exclusion is **reversible**:
 ## Two recency axes
 
 Recency ranks along **two separately-typed axes**, and a query picks **exactly
-one** — the default (passing neither reference) leaves recency off, unchanged:
+one**. Passing neither explicit reference uses a configured cycle provider when
+present; without one, recency remains off:
 
 | Axis | Reference | Ages a row by | Half-life unit | For |
 |---|---|---|---|---|
@@ -215,6 +240,48 @@ uses a single batch SQL query bounded by
 
 When the graph signal contributes to at least one candidate,
 `"graph"` appears in `HybridSearchResult.backends_used`.
+
+## Reflection-source candidate expansion
+
+Graph expansion is separate from the weighted graph ranking signal above. It
+is a bounded candidate-generation step over dreaming lineage, not a sixth
+fusion signal:
+
+1. After the available fusion signals have scored the current pool, engrava
+   selects up to `graph_expansion_top_n` top-ranked `REFLECTION` candidates.
+2. It follows each reflection's outgoing `CONSOLIDATED_FROM` edges, ordered by
+   edge weight, and admits only source thoughts of type `OBSERVATION`.
+3. Each admitted source receives
+   `parent_score × graph_expansion_propagation_factor × edge.weight`; when the
+   source is already present, the higher of its existing and propagated score
+   wins.
+
+Unlike graph-aware ranking, expansion **can add new candidates** and is not
+controlled by `graph_weight`. It is enabled by default even though the weighted
+graph signal defaults to `0.0`. Expansion re-applies expiry, archive, metadata,
+and visibility eligibility, so it cannot bring back a source excluded by the
+active query (unless `include_archived=True` explicitly re-admits archived
+rows). Non-observation targets are ignored. Expansion runs before the final
+reflection filter, so eligible source observations may still be admitted when
+`include_reflections=False`; only the reflection rows are removed.
+
+The store-level controls are:
+
+```yaml
+search:
+  graph_expansion_enabled: true
+  graph_expansion_top_n: 5
+  graph_expansion_propagation_factor: 0.7
+  graph_expansion_max_sources_per_reflection: 20
+  graph_expansion_reflection_source_ceiling: 50
+```
+
+The per-reflection source cap keeps traversal bounded. A reflection with more
+than `graph_expansion_reflection_source_ceiling` lineage sources is skipped
+entirely, preventing a very large cluster from flooding the candidate pool.
+These settings belong to `SearchConfig`; `search_hybrid()` has no per-query
+expansion override. When expansion adds or improves at least one candidate,
+`"graph_expansion"` appears in `HybridSearchResult.backends_used`.
 
 ## Per-Query Overrides
 
@@ -447,10 +514,11 @@ async def assemble_unit(query: str, thought_id: str) -> str:
   surface you call to read a result's text. `search_hybrid()`'s result stays
   `(thought_id, score)` tuples.
 - **The metadata predicate lives on the ranked search surface**
-  (`search_hybrid`/`recall`/`search_similar` `filters=`), not on `list_thoughts`
-  (whose filters cover the built-in columns + provenance, not arbitrary metadata),
-  so gathering a unit's chunks is a filtered search with a generous `top_k`; the
-  ranking is irrelevant because you re-order by your own ordinal.
+  (`search_hybrid`/`recall` `filters=`), not on the public `search_similar` or
+  `search_fts` methods or on `list_thoughts` (whose filters cover the built-in
+  columns + provenance, not arbitrary metadata), so gathering a unit's chunks
+  is a filtered hybrid search with a generous `top_k`; the ranking is
+  irrelevant because you re-order by your own ordinal.
 - **Precondition (yours to guarantee).** Contiguous order is only as good as the
   metadata you wrote: without a stable, orderable ordinal on each chunk, siblings
   can be *fetched* but not meaningfully *ordered* — engrava has no chunk-sequence

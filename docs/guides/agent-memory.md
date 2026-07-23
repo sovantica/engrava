@@ -225,8 +225,9 @@ knobs.
 ## Persistence across restarts
 
 - **Embeddings persist.** They are stored in the database; you do **not**
-  re-embed on a normal restart. (You only need `engrava restore --re-embed`
-  when you deliberately change the embedding model.)
+  re-embed on a normal restart. Re-embedding is a deliberate migration when
+  you change the embedding model; the CLI supports it while restoring a
+  snapshot into a configured service (see [CLI restore](../cli.md#restore)).
 - **The cycle counter does not persist** — Engrava doesn't store it. Recover it
   on startup so it keeps increasing. `list_thoughts` returns rows ordered by
   `updated_cycle` descending, so the most recent thought carries the highest

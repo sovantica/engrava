@@ -85,12 +85,18 @@ readily. Set it to reflect how important a memory is to keep at hand.
 
 A thought moves through a small state machine:
 
-```
-CREATED → ACTIVE → DONE → ARCHIVED
+```text
+CREATED -> ACTIVE -> DONE -> ARCHIVED
+              \--------------> ARCHIVED
+ARCHIVED --restore_thought()--> ACTIVE
 ```
 
 `LifecycleStatus` transitions are enforced (`evolve()` rejects illegal jumps).
-Most thoughts you create will start `ACTIVE`. `ARCHIVED` is a **soft-retired**
+Most thoughts you create will start `ACTIVE`; `ACTIVE -> ARCHIVED` is a valid
+direct transition and does not require an intermediate `DONE`. The canonical
+reverse transition is `restore_thought()`, which restores `ARCHIVED -> ACTIVE`
+and clears hygiene archive stamps. TTL cleanup and Memory Hygiene also have
+dedicated archival paths for their eligibility rules. `ARCHIVED` is a **soft-retired**
 retention state and a marker for garbage collection — the row and its content stay
 in the database, but an archived thought is **excluded from default ranked
 retrieval** (`search_hybrid` / `recall` / `search_fts` / `search_similar`) — the
@@ -120,6 +126,16 @@ Edges carry the same generic `metadata` field as thoughts — a
 attributes, filterable through `list_edges(filters=...)`. The keys carry no
 reserved meaning; see the [`metadata` field](api-reference.md#metadata-field-edges)
 note in the API reference.
+
+Engrava validates edge shape and referential integrity but does not infer the
+relationship or reason over it. The database permits at most one edge for each
+`(from_thought_id, to_thought_id, edge_type)` triple, independent of `edge_id`;
+creating a duplicate triple raises a database integrity error. Deleting either
+endpoint thought cascades to the edge row. That cascade is part of the thought
+deletion and, when journaling is enabled, does not emit a separate `DELETE_EDGE`
+journal entry. For a recommended direction convention for claims, evidence, and
+`CONTESTED_BY`, see
+[Evidence and conflicts](evidence-and-conflicts.md).
 
 ## Embedding
 
@@ -164,9 +180,11 @@ dreaming's age/scheduling gates (`min_age_cycles`, `schedule_every_n_cycles`,
 > **The trap to avoid.** Because Engrava does not advance the cycle for you,
 > there are two distinct failure modes — and neither raises an error:
 >
-> - **Omitting it entirely** (`current_cycle=None`, the default in
->   `search_hybrid`) makes the recency signal **inactive** — it is dropped from
->   the ranking and its weight is redistributed to the other signals.
+> - **Providing no recency reference** makes the recency signal **inactive** —
+>   it is dropped from the ranking and its weight is redistributed to the other
+>   signals. This means no explicit `current_cycle`, no explicit `recency_now`,
+>   and no configured `cycle_provider`; omitting only `current_cycle` does not
+>   disable recency when either of the other references is available.
 > - **Passing a constant** (e.g. always `current_cycle=0`, and never advancing
 >   `created_cycle`/`updated_cycle`) keeps recency active but **useless**: a
 >   thought's age is `current_cycle - updated_cycle`, so with everything frozen
@@ -175,11 +193,12 @@ dreaming's age/scheduling gates (`min_age_cycles`, `schedule_every_n_cycles`,
 >   (`min_age_cycles`) never opens — `created_cycle`/`current_cycle` never grow,
 >   so no thought ever ages enough to be promoted.
 >
-> **Do this instead:** keep a counter in your application, increment it once per
-> turn, pass it as `current_cycle`, and use it for `created_cycle`/`updated_cycle`
-> when building thoughts. On restart, recover it from
-> [`max_cycle()`](#recovering-the-counter-max_cycle) so it stays monotonic across
-> process restarts.
+> **Do this instead:** for a cycle-aware application, keep a counter, increment
+> it once per turn, pass it as `current_cycle`, and use it for
+> `created_cycle`/`updated_cycle` when building thoughts. On restart, recover it
+> from [`max_cycle()`](#recovering-the-counter-max_cycle) so it stays monotonic.
+> If your application has no meaningful cognitive cadence, use the separately
+> typed transaction-time reference `recency_now` described below.
 
 ### The other recency axis: transaction time (`recency_now`)
 
@@ -338,6 +357,54 @@ Dreaming's `ConfidenceSignal` reads the first and `ConfirmationSignal` reads the
 second, so they tune consolidation in different ways. (Relatedly,
 `DreamingGates.allow_zero_confirmation` exists so single-write batch ingest —
 where `confirmation_count` never grows — can still be consolidated.)
+
+## Access tracking and usage telemetry
+
+Access tracking supplies the `frequency` signal used by Dreaming and Memory
+Hygiene. A store built with `from_config(...)` enables it only when dreaming is
+enabled and `extensions.dreaming.access_tracking_enabled` is `true` (the setting
+defaults to `true` inside an enabled dreaming configuration). A directly
+constructed `SqliteEngravaCore` leaves it off unless
+`access_tracking_enabled=True` is passed.
+
+When enabled, these caller-facing paths implicitly record accesses:
+
+- a successful `get_thought()` records the returned thought once;
+- `search_hybrid()` records each final result, including its query-less fallback;
+- `recall()` delegates to `search_hybrid()` and has the same behavior; and
+- `search_reflections_only()` records each returned reflection.
+
+The lower-level `search_fts()` and `search_similar()` methods do not record an
+implicit access when called directly. Neither do list/count and auxiliary reads
+such as `list_thoughts()`, `count_thoughts()`, `get_edges()`, `list_edges()`,
+`get_embedding()`, `get_actions()`, `metrics()`, or `max_cycle()`. Calls compose:
+for example, a `search_hybrid()` result followed by `get_thought()` records two
+access events for that thought. `record_access()` is the explicit immediate
+write when the caller wants to mark an access outside the implicit paths.
+
+Implicit events are best-effort telemetry, not durable read receipts. Repeated
+events for one thought are coalesced in a bounded in-process buffer (up to
+10,000 distinct ids; oldest-inserted ids are evicted first at the cap). The
+buffer is flushed in one batched update:
+
+- explicitly by `flush_access_buffer()`;
+- at the start of `consolidate()`, before Dreaming scores frequency; and
+- on `close()`, best-effort, so a flush failure does not prevent closing.
+
+`flush_access_buffer()` returns the number of distinct buffered ids drained,
+not the total access-count delta or a guarantee that every id still matched a
+live row.
+
+An explicit `run_hygiene()` does not flush first; call
+`flush_access_buffer()` beforehand when that pass must include the newest
+pending reads. A crash before a flush, buffer eviction, or deletion before the
+batched update can undercount. Both buffered updates and `record_access()` are
+deliberately absent from the hash-chain journal.
+
+Every read delegated through `ReadOnlyEngrava` runs with implicit tracking
+suppressed, and its explicit `record_access()` method is blocked like every
+other write. During `store.consolidate()`, internal Dreaming reads are suppressed
+as well, so maintenance does not inflate its own frequency signal.
 
 ## Putting it together
 

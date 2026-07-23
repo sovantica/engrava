@@ -71,10 +71,12 @@ archived rows after cycle + wall-clock restore windows. OFF by default. See
 
 ### Memory Hygiene
 
-The **mechanism** name for [Forgetting](#forgetting): the deterministic
-`run_hygiene()` loop configured under `hygiene_policy`. "Forgetting" is the public
-concept, "Memory Hygiene" is the mechanism, and `hygiene` is the API name — the
-same concept-over-mechanism layering as Dreaming over `consolidate()`. See
+The **mechanism** name for [Forgetting](#forgetting): the `run_hygiene()` loop
+configured under `hygiene_policy`, deterministic for a fixed store,
+configuration, cycle, and `now` when any configured custom hooks are
+deterministic too. "Forgetting" is the public concept, "Memory Hygiene" is the
+mechanism, and `hygiene` is the API name — the same
+concept-over-mechanism layering as Dreaming over `consolidate()`. See
 [Forgetting (Memory Hygiene)](memory-hygiene.md).
 
 ### Promotion
@@ -89,15 +91,18 @@ promoted depends on the [gates](#gate) and the `promote_threshold`. See
 A **logical clock** — a monotonically increasing integer tick that *you own and
 advance* (typically one cycle per agent turn). It is not wall-clock time and not
 a stored row; Engrava never increments it for you. It drives the recency signal
-and dreaming's age gates. Leaving it at `None` makes recency inactive; freezing it
-at a constant makes recency useless and stalls dreaming. See
+and dreaming's age gates. With no explicit recency reference and no configured
+cycle provider, recency is inactive; an explicit `recency_now` instead selects
+transaction-time recency. Freezing a cognitive cycle at a constant makes that
+axis useless and stalls dreaming. See
 [Core Concepts → Cycle](concepts.md#cycle-the-agent-clock).
 
 ### Valid time
 
-The second of Engrava's two time axes: **when a fact is true in the world**, as
+One of Engrava's three time axes: **when a fact is true in the world**, as
 opposed to **transaction time** (when Engrava recorded it — `created_at` /
-`updated_at`). Valid time is carried by two optional, nullable ISO-8601 fields,
+`updated_at`) and the consumer-owned cognitive [cycle](#cycle). Valid time is
+carried by two optional, nullable ISO-8601 fields,
 `valid_from` and `valid_until`, on both `ThoughtRecord` and `EdgeRecord`. They
 describe a half-open interval (`valid_until` is exclusive); a `None` bound means
 *open* (±∞), so an un-annotated record is "valid for all time". Queried through
@@ -144,11 +149,22 @@ an archived thought is **excluded from default ranked retrieval** (reversible vi
 
 ### Provenance
 
-Where a memory came from, recorded in two fields: `source` (a free-form string id
-you choose, e.g. `"onboarding-flow"`) and `source_type` (the `KnowledgeSource`
-enum: `EXPERIENCE`, `SEEDED_LLM`, `DISTILLED_LLM`, `DREAMING`). Dreaming can
-filter on provenance, so set it honestly. See
-[Core Concepts → Provenance](concepts.md#provenance-where-a-memory-came-from).
+Where a memory came from. `source` is a free-form identifier and `source_type`
+is the `KnowledgeSource` enum. The optional, typed `ProvenanceContext` records
+caller-supplied write-time context such as session, actor, retrieval query, and
+retrieved thought ids. These values are untrusted lineage hints, not identity,
+authorization, or proof that a claim is true. Semantic evidence and the
+hash-chain mutation journal are separate provenance layers. See
+[Core Concepts → Provenance](concepts.md#provenance-where-a-memory-came-from) and
+[Evidence and conflicts](evidence-and-conflicts.md#three-kinds-of-provenance).
+
+### Conflict
+
+A caller-detected tension between claims. Engrava lets incompatible thoughts
+coexist and provides the directional `CONTESTED_BY` edge label, valid-time
+bounds, metadata, and provenance needed to represent the tension. It does not
+resolve entities, infer a contradiction, choose the true claim, or create a
+clarification task. See [Evidence and conflicts](evidence-and-conflicts.md).
 
 ### Confirmation
 
@@ -196,3 +212,4 @@ thought. It is what the agent *produces*. See
 - [Core Concepts](concepts.md) — the same ideas as a guided mental model
 - [Search](search.md) — the signal model in depth
 - [Dreaming](dreaming.md) — consolidation, gates, promotion, reflections
+- [Evidence and conflicts](evidence-and-conflicts.md) — claims, lineage, and contested facts

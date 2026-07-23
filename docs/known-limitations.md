@@ -1,6 +1,7 @@
 # Known Limitations
 
 This document covers platform-specific notes, constraints, and known issues.
+For the consolidated threat and trust-boundary model, see [Security](security.md).
 
 ## Search is unscoped by default (multi-tenant caveat)
 
@@ -13,21 +14,27 @@ Two supported ways to isolate:
 
 - **A file per tenant** (the strongest boundary) — one store per tenant, managed
   via `EngravaManager`. Isolation is then the file boundary itself.
-- **Scoped retrieval within one file** — pass `filters=` / `visibility=` to the
-  ranked search methods to constrain results to a metadata scope (e.g. an owner
-  or session key). See [Search](search.md#scoped-retrieval).
+- **Scoped retrieval within one file** — pass `filters=` / `visibility=` to
+  `search_hybrid()` or `recall()` to constrain results to a metadata scope
+  (e.g. an owner or session key). The public `search_similar()` and
+  `search_fts()` methods do not accept those metadata filters. See
+  [Search](search.md#scoped-retrieval).
 
 Choose file-per-tenant when tenants must never share a file; use scoped filters
 for soft, in-file partitioning.
 
 ## Dreaming / consolidation: mechanism, not a proven retrieval lift
 
-The `DreamingExtension` performs deterministic, no-LLM consolidation
-(promotion → priority boost, association edges, reflections). Those are real
+The built-in `DreamingExtension` performs no-LLM consolidation (promotion →
+priority boost, association edges, reflections). With a fixed store,
+configuration, cycle, embedding inputs, and deterministic custom signals, its
+result is reproducible. Those are real
 **mechanical** ranking effects, but Engrava makes **no claim that enabling
-dreaming improves retrieval accuracy** on any benchmark — its measured effect on
-our own runs was within noise. Enable it for the cognitive-hygiene mechanics it
-provides, not for an expected accuracy gain. See [Dreaming](dreaming.md).
+dreaming improves retrieval accuracy. The v0.5/v0.6-candidate frozen synthetic
+snapshot measured aggregate recall@5 at `0.80` with Dreaming off and `0.70` with
+it on, even though the separate curated release gates passed. Enable it for the
+cognitive-hygiene mechanics it provides, not for an expected accuracy gain. See
+[Dreaming](dreaming.md) and the current [benchmark evidence](benchmarks.md).
 
 ## Validity intervals cannot be inverted
 
@@ -99,7 +106,11 @@ reaches 1.0, the pin will be relaxed.
 
 Without the `vec` extra, engrava falls back to brute-force cosine similarity
 search in Python. This works well for databases up to ~100k embeddings. For
-larger collections, install `engrava[vec]`.
+larger collections, run `pip install 'engrava[vec]'` to use the compact compiled `vec0`
+backend, but note that the pinned sqlite-vec 0.1.x line still performs an
+**exhaustive linear KNN scan**. It reduces the constant factor and memory
+overhead; it is not an approximate or sub-linear index. Measure your own p95
+latency and see [Performance](performance.md#the-brute-force-ceiling-and-how-to-pass-it).
 
 ## FTS5 Availability
 
@@ -143,8 +154,13 @@ All embeddings for a given database must use the same dimensionality. Mixing
 dimensions (e.g., 384 and 768) is not supported and will cause search to
 return incorrect results.
 
-The `restore --re-embed` flag validates model consistency and raises
-`EmbeddingModelMismatchError` on mismatch.
+Engrava validates the stored model identity and raises
+`EmbeddingModelMismatchError` rather than mixing incompatible vectors. A
+deliberate CLI re-embed is available while restoring a snapshot into a
+configured service, where Engrava can resolve the target provider. The
+single-database `--db` restore path has no provider and therefore cannot use
+`--re-embed`; use service mode, `--skip-embeddings`, or preserve the source
+vectors. See [CLI restore](cli.md#restore).
 
 ## Query-vector dimension mismatch
 
@@ -184,6 +200,15 @@ a forgotten (archived) thought stops surfacing without being deleted.
 - **Not applied to counts/listing:** `count_thoughts()` and `list_thoughts()` still
   include archived rows (they are not ranked retrieval) — filter on
   `lifecycle_status` yourself if you need them excluded there.
+
+### Reflection-only expiry exception
+
+The specialized `search_reflections_only()` path enforces the `ACTIVE`
+reflection freshness floor but does not currently compare `expires_at` with the
+current time. The general ranked paths listed above do enforce expiry. When an
+application assigns TTLs to REFLECTION records and needs an expiry-sensitive
+reflection-only read, run `cleanup_expired()` first or use a general ranked
+search until this specialized-path limitation is removed.
 
 ## Maximum Database Size
 

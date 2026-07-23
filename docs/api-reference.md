@@ -35,6 +35,17 @@ async with await SqliteEngravaCore.from_config("engrava.yaml") as store:
 | `embedding_provider` | `EmbeddingProviderProtocol \| None` | `None` | Provider used when `auto_embed=True` |
 | `auto_embed` | `bool` | `False` | Auto-embed thoughts on create/update |
 | `require_embedding` | `bool` | `False` | When `True`, an auto-embed provider failure raises `EmbeddingGenerationError` instead of only logging a `WARNING` and re-raising the provider error. The thought is committed before embedding either way, so this governs how loudly a missing embedding is reported, not whether the row persists. No effect unless `auto_embed=True`. |
+| `search_config` | `SearchConfig \| None` | `None` | Default hybrid-search weights, recency half-lives, graph expansion, reflection handling, and bounded candidate-pool settings |
+| `journal_enabled` | `bool` | `False` | Record mutations in the hash-chain journal |
+| `ttl_strategy` | `str` | `"archive"` | Expiry action: `"archive"` or `"delete"` |
+| `ttl_check_every_n` | `int` | `0` | Automatic expiry-cleanup cadence in store operations; `0` disables automatic cleanup |
+| `ttl_default_seconds` | `int \| None` | `None` | Default relative TTL for new thoughts |
+| `metrics_config` | `MetricsConfig \| None` | `None` | Metrics enablement and latency-window settings |
+| `manifests` | `Sequence[ExtensionManifest]` | `()` | Extension manifests whose schema migrations are applied by `ensure_schema()` |
+| `access_tracking_enabled` | `bool` | `False` | Buffer retrieval access events for the dreaming frequency signal |
+| `hygiene_policy` | `HygienePolicyConfig \| None` | `None` | Memory Hygiene policy; `None` means `run_hygiene()` is unavailable |
+| `derive_gates` | `DeriveGates \| None` | `None` | Automatic derived-record production gates; defaults to disabled gates |
+| `cycle_provider` | `CycleProvider \| None` | `None` | Runtime-only cognitive-cycle source used when a supported call omits `current_cycle` and no explicit `recency_now` selects transaction-time recency; explicit cycle values, including `0`, win |
 
 > The `SqliteEngravaCore(db_path=...)` form does **not** exist — pass a
 > connection, or use `await SqliteEngravaCore.from_config(path)`.
@@ -43,13 +54,14 @@ async with await SqliteEngravaCore.from_config("engrava.yaml") as store:
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `await SqliteEngravaCore.from_config(config_path)` | `SqliteEngravaCore` | Build from a YAML config; opens + owns the connection and applies the schema. Use as an async context manager. |
+| `await SqliteEngravaCore.from_config(config_path, *, cycle_provider=None)` | `SqliteEngravaCore` | Build from a YAML config; opens + owns the connection and applies the schema. `cycle_provider` is a runtime object and is never read from YAML. Use the result as an async context manager. |
 
 #### Schema
 
 | Method | Description |
 |--------|-------------|
 | `await ensure_schema()` | Create tables if missing, run migrations |
+| `await verify_journal()` | Verify the complete persisted hash chain and return `JournalIntegrityResult` |
 | `await close()` | Close the database connection |
 
 #### Thought CRUD
@@ -60,16 +72,17 @@ keyword arguments and does **not** return a UUID string.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
+| `await remember(text, *, metadata=None, deduplicate=False)` | `ThoughtRecord` | Store a bare string as an `ACTIVE` P3 `NOTE` at cycle `0`; its first 200 characters become `essence`. Use an explicit `ThoughtRecord` when the caller owns cognitive cycles or needs other fields. |
 | `await create_thought(thought, *, expires_after_seconds=None, deduplicate=False)` | `ThoughtRecord` | Persist a `ThoughtRecord`; returns the stored record. Raises `ValueError` if the ID already exists. |
 | `await get_or_create(thought, *, expires_after_seconds=None)` | `tuple[ThoughtRecord, bool]` | Content-hash convenience over dedup: returns `(existing, False)` on a hash hit (confirmation bumped, like `deduplicate=True`) or `(new, True)` on a miss. The `bool` tells you whether it created, removing the check-then-create round trip. Does not alter a matched row's fields. |
 | `await upsert_by_hash(thought, *, expires_after_seconds=None)` | `ThoughtRecord` | Update-on-match upsert: on a hash hit, overwrites the stored row's mutable fields (`essence`, `priority`, `metadata`, `visibility`, `lifecycle_status`, `source`, `confidence`, `source_type`, `thought_type`) from `thought` and returns it (**no** confirmation bump — distinct from `deduplicate=True`, which returns the stored record unchanged); on a miss, inserts. `content` is never rewritten (it is the hash key). |
 | `await bulk_store(thoughts, *, deduplicate=False)` | `list[ThoughtRecord]` | Transactional batch insert: the whole list commits **once** and is all-or-nothing (any row error rolls the batch back). Order preserved. Under `auto_embed`, all thoughts are embedded in one batch provider call. `deduplicate` applies per row. |
 | `await get_thought(thought_id)` | `ThoughtRecord \| None` | Retrieve by ID; `None` if not found |
 | `await update_thought(thought_id, **changes)` | `ThoughtRecord` | Optimistic-concurrency update; raises `ThoughtNotFoundError` / `StaleDataError` |
-| `await restore_thought(thought_id, *, current_cycle=None)` | `ThoughtRecord` | Un-archive: transition an `ARCHIVED` thought back to `ACTIVE`, clearing its `archived_at_cycle` marker so an archive round-trips with no data loss. The reversible counterpart to the memory-hygiene / TTL / manual archive paths, journaled as an `UPDATE_THOUGHT`. Raises `ThoughtNotFoundError` if missing, `InvalidTransitionError` if the thought is not currently `ARCHIVED`, `StaleDataError` on a concurrent write. This is the **canonical** un-archive path (the only one that clears `archived_at_cycle`); a raw `update_thought(lifecycle_status=...)` back to `ACTIVE` leaves the marker set. |
+| `await restore_thought(thought_id, *, current_cycle=None)` | `ThoughtRecord` | Un-archive: transition an `ARCHIVED` thought back to `ACTIVE`, clearing both hygiene markers (`archived_at_cycle` and `archived_at`) so an archive round-trips with no data loss. The reversible counterpart to the memory-hygiene / TTL / manual archive paths, journaled as an `UPDATE_THOUGHT`. Raises `ThoughtNotFoundError` if missing, `InvalidTransitionError` if the thought is not currently `ARCHIVED`, `StaleDataError` on a concurrent write. This is the **canonical** un-archive path; a raw `update_thought(lifecycle_status=...)` back to `ACTIVE` does not manage those markers. |
 | `await list_thoughts(...)` | `list[ThoughtRecord]` | List with filters (keyword-only) |
 | `await count_thoughts(...)` | `int` | Count with filters (keyword-only) |
-| `await delete_thought(thought_id)` | `bool` | Hard delete; `True` if a row was removed |
+| `await delete_thought(thought_id)` | `bool` | Hard delete; `True` if a row was removed. Deleting a thought also deletes every edge for which it is either endpoint, its embedding, and its linked actions. This is a physical cascade, unlike valid-time invalidation. |
 | `await invalidate_thought(thought_id, valid_until)` | `ThoughtRecord` | Close the thought's *valid-time* interval at the given ISO-8601 instant — deterministic, idempotent, non-cascading, and **not a delete** (the row stays on file and remains retrievable for instants before `valid_until`). Raises `ThoughtNotFoundError` if missing. See [Bi-temporal Model](bitemporal.md#invalidate-vs-delete) |
 | `await record_access(thought_id)` | `None` | Mark a thought as accessed — bumps `access_count` and sets `last_accessed_at`; raises `ThoughtNotFoundError` if missing. Drives the access-frequency dreaming signal. |
 
@@ -115,11 +128,13 @@ assert restored.lifecycle_status is LifecycleStatus.ACTIVE
 | `lifecycle_status` | `str \| None` | Filter by status |
 | `priority` | `str \| None` | Filter by priority |
 | `include_expired` | `bool` | Include expired thoughts (default `False`) |
+| `min_cycle` | `int \| None` | Minimum `updated_cycle`, inclusive (`list_thoughts` only) |
+| `max_cycle` | `int \| None` | Maximum `updated_cycle`, inclusive (`list_thoughts` only) |
 | `limit` | `int` | Max results (`list_thoughts` only; default `50`) |
 | `offset` | `int` | Results to skip (`list_thoughts` only; default `0`) |
 
-> `list_thoughts` also supports `min_cycle`, `max_cycle`, `visibility`,
-> `exclude_visibility`, and `provenance_filter` (see
+> `list_thoughts` also supports `visibility`, `exclude_visibility`, and
+> `provenance_filter` (see
 > [Provenance capture](#provenance-capture)).
 
 ##### Provenance capture
@@ -193,6 +208,16 @@ not exist.
 | `await delete_edge(edge_id)` | `bool` | Hard delete; `True` if a row was removed |
 | `await invalidate_edge(edge_id, valid_until)` | `EdgeRecord` | Close the edge's *valid-time* interval at the given ISO-8601 instant — deterministic, idempotent, and **not a delete** (the row stays on file). Invalidating a thought does **not** cascade to its edges; invalidate them separately. See [Bi-temporal Model](bitemporal.md#invalidate-vs-delete) |
 
+The database permits at most one edge for each
+`(from_thought_id, to_thought_id, edge_type)` tuple, independently of
+`edge_id`; attempting to insert the same directed, typed relationship twice
+is rejected by the database uniqueness constraint. No typed Engrava domain
+exception is currently guaranteed for that duplicate case; treat it as a
+backend integrity failure. Reversing the endpoints or using a different edge
+type produces a distinct edge. A **hard** thought delete cascades to edges where
+the thought is either endpoint; `invalidate_thought()` does not remove or
+invalidate any edge.
+
 ```python
 import uuid
 from engrava import EdgeRecord, EdgeType
@@ -259,21 +284,52 @@ returns a single `HybridSearchResult` container.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `await recall(query, *, top_k=10, current_cycle=None, filters=None, visibility=None, collapse_key=None, collapse_max_per_unit=None)` | `HybridSearchResult` | Ergonomic shorthand over `search_hybrid` for the common retrieval case: passes the query text straight through and delegates the scoped-retrieval keywords below |
-| `await search_fts(query, top_k=10)` | `list[tuple[str, float]]` | FTS5/BM25 text search → `(thought_id, bm25_score)` |
+| `await recall(query, *, top_k=10, current_cycle=None, recency_now=None, recency_now_half_life=None, filters=None, visibility=None, collapse_key=None, collapse_max_per_unit=None, include_archived=False)` | `HybridSearchResult` | Ergonomic shorthand over `search_hybrid` for the common retrieval case; supports either recency axis, scoped retrieval, collapse, and archived-row opt-in |
+| `await search_fts(query, top_k=10, *, include_archived=False)` | `list[tuple[str, float]]` | FTS5/BM25 text search → `(thought_id, bm25_score)`; malformed expert expressions retry once through safe bare normalization |
 | `await search_hybrid(query_text, query_vector=None, *, top_k=10, ...)` | `HybridSearchResult` | Combined FTS + vector + recency + priority + graph |
-| `await search_reflections_only(query_text, *, top_k=10, ...)` | `HybridSearchResult` | Hybrid search restricted to REFLECTION thoughts |
+| `await search_reflections_only(query_text, query_vector=None, *, top_k=10, current_cycle=None)` | `HybridSearchResult` | Search restricted to active REFLECTION thoughts, ranked by vector similarity and optional cycle recency. Unlike the four general ranked methods, this specialized path does not currently apply the `expires_at` cutoff; run TTL cleanup before relying on it for expiry-sensitive reads. |
 
-`search_hybrid` keyword-only weight/limit overrides: `fts_weight`,
-`vector_weight`, `recency_weight`, `recency_half_life`, `current_cycle`,
-`fts_top_k`, `vector_top_k`, `priority_weight`, `graph_weight`,
-`graph_edge_decay`, `include_reflections` (default `True`), `reflection_boost`.
+The complete `search_hybrid` signature is:
 
-> **Archived thoughts are excluded by default.** All four ranked reads — `recall`,
-> `search_fts`, `search_hybrid`, `search_similar` — drop `ARCHIVED` thoughts from
-> the default candidate set (the mechanism behind [Forgetting](memory-hygiene.md)).
-> Pass `include_archived=True` to re-admit them for one call, or `restore_thought`
-> to re-activate a row. See [Search](search.md#archived-thoughts-are-excluded-by-default).
+```python
+async def search_hybrid(
+    query_text: str,
+    query_vector: list[float] | None = None,
+    *,
+    top_k: int = 10,
+    fts_weight: float | None = None,
+    vector_weight: float | None = None,
+    recency_weight: float | None = None,
+    recency_half_life: int | None = None,
+    current_cycle: int | None = None,
+    recency_now: str | None = None,
+    recency_now_half_life: int | None = None,
+    fts_top_k: int = 50,
+    vector_top_k: int = 50,
+    priority_weight: float | None = None,
+    graph_weight: float | None = None,
+    graph_edge_decay: float | None = None,
+    include_reflections: bool = True,
+    reflection_boost: float | None = None,
+    filters: MetadataFilter | None = None,
+    visibility: VisibilityQueryFilter | None = None,
+    collapse_key: str | Sequence[str] | None = None,
+    collapse_max_per_unit: int | None = None,
+    include_archived: bool = False,
+) -> HybridSearchResult: ...
+```
+
+`current_cycle` and `recency_now` are mutually exclusive when both are supplied
+explicitly. `recency_now_half_life` is measured in seconds and is only valid
+with `recency_now`; `recency_half_life` is measured in cognitive cycles.
+
+> **Archived thoughts are excluded by default.** `recall`, `search_fts`,
+> `search_hybrid`, and `search_similar` drop `ARCHIVED` thoughts from the default
+> candidate set (the mechanism behind [Forgetting](memory-hygiene.md)). Pass
+> `include_archived=True` to re-admit them for one call, or `restore_thought` to
+> re-activate a row. `search_reflections_only` remains restricted to active
+> reflections and has no archive opt-in. See
+> [Search](search.md#archived-thoughts-are-excluded-by-default).
 
 ##### Scoped & de-fragmented retrieval (keyword-only)
 
@@ -310,10 +366,15 @@ result = await store.recall(
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `await metrics()` | `EngravaMetrics` | Snapshot of thought/edge counts, storage, and search-latency percentiles (see [Observability](observability.md)) |
+| `await max_cycle()` | `int` | Cognitive-cycle high-water mark across `thought.updated_cycle` and `edge.created_cycle`; returns `0` for an empty store |
 | `await cleanup_expired(now=None, *, exclude_id=None)` | `CleanupResult` | Archive or delete thoughts past their `expires_at` |
-| `await run_hygiene(*, current_cycle=None, now=None)` | `HygieneResult` | Run one [Forgetting / Memory Hygiene](memory-hygiene.md) pass: archive cold thoughts (reversibly) and, when `auto_gc_enabled`, GC ones past both restore windows. No-op when no `hygiene_policy` is enabled. See [Memory Hygiene](memory-hygiene.md). |
-| `await derive_existing(thought_id)` | `DeriveResult` | Backfill: run the registered derived-records producer over an already-stored source thought (idempotent). Raises `SourceThoughtNotFoundError` if the id is absent. See [Extension hooks §1A.6](extension-hooks.md#1a6-backfilling-an-existing-store-derive_existing). |
+| `await run_hygiene(*, current_cycle=None, now=None)` | `HygieneResult` | Run one [Forgetting / Memory Hygiene](memory-hygiene.md) pass: archive cold thoughts (reversibly) and, when `auto_gc_enabled`, GC ones past both restore windows. Raises `RuntimeError` if no policy was supplied; returns an empty result when the supplied policy is disabled. |
+| `await derive_existing(thought_id)` | `DeriveResult` | Backfill: run the registered derived-records producer over an already-stored source thought (idempotent). Raises `SourceThoughtNotFoundError` if the id is absent. See [Backfilling existing thoughts](extension-hooks.md). |
+| `await flush_access_buffer()` | `int` | Persist buffered retrieval-access deltas in one batch; returns the number of thoughts updated |
+| `await retire_orphan_reflections()` | `int` | Archive active REFLECTIONs whose entire `CONSOLIDATED_FROM` source set is no longer active |
+| `await consolidate(*, current_cycle=None)` | `ConsolidationResult` | Run the dreaming extension wired by `from_config`; raises `RuntimeError` when dreaming is not enabled and uses `cycle_provider` when no explicit cycle is supplied |
 | `await verify_embedding_model()` | `None` | Raise `EmbeddingModelMismatchError` if the stored model lock disagrees with the configured provider |
+| `async with store.suppress_access_tracking():` | context manager | Suppress implicit retrieval-access buffering inside the current async task; nestable and concurrency-safe, with no effect when access tracking is disabled. Used by internal maintenance and read-only views so their reads do not inflate the frequency signal. |
 | `async with store.suspend_auto_commit():` | context manager | Defer per-call commits so a block of writes commits once (rolls back on error) — use for bulk ingest |
 | `await close()` | `None` | Close the owned connection (only when the store opened it via `from_config`) |
 
@@ -335,7 +396,16 @@ async with store.suspend_auto_commit():
 A composition wrapper that delegates reads to the wrapped store and raises
 `ReadOnlyViolationError` on any write. Use it to hand a retrieval-only view of
 shared memory to a component that should never mutate it — e.g. a sub-agent or
-worker whose job is only to look things up.
+worker whose job is only to look things up. Delegated reads suppress access
+tracking, so they do not stage deferred access-count mutations.
+
+The guarantee is **behavioural, not structural**. `ReadOnlyEngrava` implements
+the narrower `EngravaReadProtocol`, but also exposes signature-compatible write
+methods whose only behaviour is to raise. Because `EngravaCoreProtocol` is a
+runtime-checkable structural protocol, those blockers mean
+`isinstance(ro, EngravaCoreProtocol)` is also `True`. Use
+`EngravaReadProtocol` to type a read capability; do not use the structural core
+check as evidence that a value is writable.
 
 ```python
 from engrava import ReadOnlyEngrava
@@ -347,21 +417,48 @@ await ro.create_thought(...)           # Raises ReadOnlyViolationError
 
 ### `EngravaManager`
 
-Multi-service database isolation.
+Multi-service database isolation. Each service owns a separate
+`<data_dir>/<service_name>.db` file, with its own schema, connection, embedding
+configuration, and journal. Service names accepted by `get_store()` and
+`delete_service()` must match `^[a-z][a-z0-9_-]{0,62}$`: start with a lowercase
+letter, then use lowercase letters, digits, `_`, or `-`, up to 63 characters.
+
+| Method | Description |
+|--------|-------------|
+| `await get_store(service_name)` | Lazily create/open and initialize a service store on first access. The manager caches the store, so later calls for the same name return the same live instance until `close_all()` or deletion. |
+| `service_exists(service_name)` | Check whether the computed `.db` file exists without opening or creating it. This probe does not run service-name validation; pass a name conforming to the manager's service-name contract. |
+| `await list_services()` | Scan `data_dir` for `.db` files and return their stems in sorted order; returns `[]` when the directory does not exist. |
+| `await delete_service(service_name)` | Close and evict a cached store, then delete its `.db`, `.db-wal`, and `.db-shm` files. Raises `FileNotFoundError` when the main database file does not exist. This permanently deletes that service's data. |
+| `await close_all()` | Close all cached connections and clear the cache; idempotent. Database files remain on disk, and a later `get_store()` opens a fresh store instance. Async context-manager exit calls this method. |
 
 ```python
+from pathlib import Path
+
 from engrava import EngravaManager
 
 async with EngravaManager(data_dir=Path("./data")) as mgr:
     store = await mgr.get_store("my-service")
-    await mgr.list_services()   # -> ["my-service"]
-    await mgr.delete_service("old-service")
+    assert mgr.service_exists("my-service")
+    print(await mgr.list_services())  # ["my-service"]
+
+# The context manager has closed its cached connections, but the database
+# remains. Delete is a separate, destructive operation:
+async with EngravaManager(data_dir=Path("./data")) as mgr:
+    await mgr.delete_service("my-service")
 ```
 
 ## Domain Models
 
-All models are **frozen** Pydantic objects. Use `model_copy(update={...})` to
-create modified copies.
+All models are **frozen** Pydantic objects. For `ThoughtRecord`, use
+`thought.evolve(...)` when changing lifecycle or temporal fields: it validates
+lifecycle transitions, preserves `created_at` immutability, refreshes
+`updated_at` unless supplied explicitly, and revalidates the complete record.
+Likewise, `ActionRecord.evolve(...)` validates action-status transitions.
+
+Pydantic's `model_copy(update={...})` does **not** validate its update payload.
+Reserve it for trusted, already-validated changes to fields on which no domain
+invariant depends (or use `model_copy()` without `update` for an unchanged
+copy). Do not use it for `ThoughtRecord` lifecycle or timestamp changes.
 
 ### `ThoughtRecord`
 
@@ -391,6 +488,10 @@ create modified copies.
 | `valid_from` | `str \| None` | ISO-8601 start of the fact's real-world *valid time* (open lower bound when `None`); see [Bi-temporal Model](bitemporal.md) |
 | `valid_until` | `str \| None` | ISO-8601 end of *valid time*, **exclusive** (open upper bound when `None`); see [Bi-temporal Model](bitemporal.md) |
 | `metadata` | `dict[str, MetadataValue]` | Caller-supplied structured attributes (default `{}`) |
+| `provenance` | `ProvenanceContext \| None` | Optional bounded write-time provenance; an untrusted query hint, never identity or authorization |
+| `pinned` | `bool` | Hard keep-intent for Memory Hygiene; pinned thoughts are never auto-archived or auto-GC'd (default `False`) |
+| `archived_at_cycle` | `int \| None` | Cognitive cycle stamped only by hygiene archival and cleared by `restore_thought`; gates cycle-based GC eligibility |
+| `archived_at` | `str \| None` | UTC ISO-8601 instant stamped only by hygiene archival and cleared by `restore_thought`; gates wall-clock GC eligibility |
 
 #### `metadata` field
 
@@ -535,7 +636,22 @@ change raises `InvalidTransitionError`).
 When a linked action reaches a terminal state (`CONFIRMED` / `FAILED`), the
 source thought's `action_outcome_score` — the mean outcome value over its
 terminal actions, `None` when it has none — is recomputed. That score is also
-read by the optional `action_outcome` dreaming signal.
+read by the optional `action_outcome` dreaming signal and by Memory Hygiene's
+usage-history gate and scoring path.
+
+The per-action value is exact and depends on both terminal execution status and
+verification:
+
+| Action status | Verification status | Outcome value |
+|---------------|---------------------|---------------|
+| `FAILED` | Any | `0.0` |
+| `CONFIRMED` | `CONFIRMED` | `1.0` |
+| `CONFIRMED` | `FAILED` | `0.0` |
+| `CONFIRMED` | `PENDING`, `PARTIAL`, or `UNVERIFIABLE` | `0.5` |
+| `PLANNED`, `EXECUTING`, or `BLOCKED` | Any | Excluded (outcome undecided) |
+
+`action_outcome_score` is the arithmetic mean of those values across terminal
+actions only. It remains `None` when a thought has no terminal action.
 
 ```python
 import uuid
@@ -565,13 +681,14 @@ actions = await store.get_actions(prompting_thought_id)
 
 ### `HybridSearchResult`
 
-A frozen container of ranked results plus backend diagnostics. It has exactly
-two fields — it is **not** a per-result object with score breakdowns.
+A frozen container of ranked results plus backend diagnostics. It is **not** a
+per-result object with score breakdowns.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `results` | `list[tuple[str, float]]` | Ranked `(thought_id, combined_score)`, highest first |
-| `backends_used` | `frozenset[str]` | Which signals contributed (e.g. `"fts5"`, `"vector"`, `"graph_expansion"`) |
+| `backends_used` | `frozenset[str]` | Backends/signals available or applicable to the query (e.g. `"fts5"`, `"vector"`, `"graph_expansion"`); a backend may appear even when it returned no rows |
+| `reflections_evicted` | `int` | Number of REFLECTION rows removed from the final top-K window by `reflection_topk_cap` and backfilled with non-reflections (default `0`) |
 
 ```python
 result = await store.search_hybrid("query text", top_k=5)
@@ -625,16 +742,19 @@ All enums are `StrEnum` — JSON-serializable and stored as strings.
 |------|--------|
 | `ThoughtType` | `TASK`, `OBSERVATION`, `BELIEF`, `REFLECTION`, `OUTPUT_DRAFT`, `NOTE` |
 | `Priority` | `P1`, `P2`, `P3`, `P4` (P1 highest) |
-| `LifecycleStatus` | `CREATED`, `ACTIVE`, `DONE`, `ARCHIVED` (state machine `CREATED → ACTIVE → DONE → ARCHIVED`) |
+| `LifecycleStatus` | `CREATED`, `ACTIVE`, `DONE`, `ARCHIVED` (forward state machine `CREATED → ACTIVE → DONE → ARCHIVED`, plus reversible `ARCHIVED → ACTIVE`) |
 | `EdgeType` | `ASSOCIATED`, `DEPENDS_ON`, `DERIVED_FROM`, `MESSAGE_OF`, `BRIDGE`, `CONSOLIDATED_FROM`, `CONTESTED_BY` |
 | `ActionType` | `CLI_OUTPUT`, `TOOL_CALL`, `MESSAGE`, `STATE_UPDATE` |
 | `ActionStatus` | `PLANNED`, `EXECUTING`, `CONFIRMED`, `FAILED`, `BLOCKED` |
 | `ThoughtVisibility` | member names `PRIVATE`, `SELECTIVE`, `PUBLIC` — **stored values are lowercase** (`"private"`, `"selective"`, `"public"`) |
 | `KnowledgeSource` | `EXPERIENCE`, `SEEDED_LLM`, `DISTILLED_LLM`, `DREAMING` |
 | `VerificationStatus` | `PENDING`, `CONFIRMED`, `PARTIAL`, `FAILED`, `UNVERIFIABLE` |
-| `SplitMode` | `PARAGRAPH`, `FIXED_WINDOW` — the `StructuralSplitProducer` split strategy (see [Extension hooks §1A.5](extension-hooks.md#1a5-split-modes-structuralsplitproducer)) |
+| `SplitMode` | `PARAGRAPH`, `FIXED_WINDOW` — the `StructuralSplitProducer` split strategy (see [Structural split modes](extension-hooks.md#1a5-split-modes-structuralsplitproducer)) |
 
 ## Exceptions
+
+The table below defines the public types. For operational retry, repair, and
+store-replacement guidance, see [Error handling and recovery](error-handling.md).
 
 | Exception | Base | Description |
 |-----------|------|-------------|
@@ -654,6 +774,11 @@ All enums are `StrEnum` — JSON-serializable and stored as strings.
 | `DerivedRecordError` | `EngravaError` | The derived-records seam rejected a producer result (over-cap return, or a derived identity colliding with its source); carries the failing `source_thought_id` |
 | `SourceThoughtNotFoundError` | `EngravaError` | `derive_existing` targeted a source `thought_id` that does not exist; carries the failing `thought_id` |
 | `VectorDimensionMismatchError` | `EngravaError` | A vector-search query vector's length differs from the store's embedding dimension; carries `expected` / `actual`. **Not** a `ValueError` — catch this typed error (or `EngravaError`). |
+| `CycleProviderError` | `EngravaError` | A configured cycle provider returned a boolean, non-integer, or negative value |
+| `RecencyModeConflictError` | `EngravaError` | A query explicitly supplied both `current_cycle` and `recency_now` |
+| `InvalidRecencyArgumentError` | `EngravaError` | `recency_now` is malformed or `recency_now_half_life` is not positive |
+| `ConnectionQuarantinedError` | `EngravaError` | A failed derived-record compensation left the connection potentially indeterminate; the store instance is terminal and must be replaced |
+| `ConfigError` | `ValueError` | YAML or direct config construction violates a documented configuration invariant |
 
 > `create_edge` raises `ReferentialIntegrityError` when an endpoint thought
 > does not exist. This exception is **not** re-exported from the top-level
@@ -662,9 +787,38 @@ All enums are `StrEnum` — JSON-serializable and stored as strings.
 
 ## Protocols
 
+### `EngravaReadProtocol`
+
+The non-mutating capability shared by the writable store and
+`ReadOnlyEngrava`: thought/edge/action/embedding reads, FTS/vector/hybrid
+retrieval, `recall`, metrics, and `max_cycle`. Read-only retrieval suppresses
+the concrete SQLite store's optional access-frequency instrumentation.
+`ReadOnlyEngrava` declares and type-checks against this read-side protocol. Its
+compatibility write methods are blocked and raise `ReadOnlyViolationError`.
+
 ### `EngravaCoreProtocol`
 
-The abstract interface for any engrava implementation.
+The writable abstract interface for an engrava implementation. It extends
+`EngravaReadProtocol`, the separately exported read capability implemented by
+both `SqliteEngravaCore` and `ReadOnlyEngrava`. Because runtime structural
+checks inspect member names and `ReadOnlyEngrava` exposes rejecting write
+methods, the wrapper also satisfies `isinstance(ro, EngravaCoreProtocol)`.
+That result describes structural compatibility, not permission to write; use
+the narrower read protocol for capability boundaries.
+
+### `CycleProvider`
+
+A runtime-checkable, synchronous pull protocol with one method:
+`current_cycle() -> int`. It supplies a cognitive cycle only when a supported
+call omits an explicit one and no explicit `recency_now` selects transaction-time
+recency. It never advances a cycle, never stamps writes, and is never loaded from
+YAML. The store validates each pulled value as a real, non-negative `int`.
+
+| Implementation | Construction | Behavior |
+|---|---|---|
+| `StaticCycleProvider` | `StaticCycleProvider(value)` | Always returns one fixed value |
+| `CallableCycleProvider` | `CallableCycleProvider(fn)` | Calls a zero-argument consumer function on every pull; purity is the consumer's responsibility |
+| `MaxCycleProvider` | `await MaxCycleProvider.create(store)` | Caches `await store.max_cycle()`; `current_cycle()` may be stale until `await refresh()` |
 
 ### `EngravaHooksProtocol`
 
@@ -694,7 +848,7 @@ store handle), `DeriveGates`
 [`derive_existing`](#metrics--maintenance)). Configure via the `derive:`
 YAML section or the `derive_gates=` constructor argument. The shipped reference
 producer is `StructuralSplitProducer` (see
-[Extension hooks §1A.5](extension-hooks.md#1a5-split-modes-structuralsplitproducer)).
+[Structural split modes](extension-hooks.md)).
 
 ### `EmbeddingProviderProtocol`
 
@@ -769,3 +923,96 @@ print(query.limit)       # 5
 
 See [MindQL](mindql.md) for the full grammar, operators, and per-table
 filterable columns.
+
+## Additional top-level exports
+
+The sections above cover the primary store, records, protocols, and query
+surface in depth. The remaining names exported directly from `engrava` are
+listed here so the top-level package has a complete index; follow the linked
+specialist guide for operational detail.
+
+### Configuration objects and resolvers
+
+| Export | Purpose |
+|---|---|
+| `EngravaConfig` | Root typed configuration returned by `load_config` |
+| `SearchConfig` | Hybrid-search weights, half-lives, graph/reflection controls, and candidate-pool bounds |
+| `DreamingConfig`, `DreamingGates` | Consolidation settings and eligibility gates |
+| `EmbeddingConfig` | Embedding provider and model settings |
+| `HygienePolicyConfig` | Forgetting / Memory Hygiene policy |
+| `JournalConfig` | Journal enablement and verify-on-open settings |
+| `MetricsConfig` | Metrics enablement and rolling latency-window size |
+| `TTLConfig` | Expiry strategy, cadence, and default TTL |
+| `ServiceConfig`, `ServicesConfig` | Per-service and multi-service manager configuration |
+| `load_config(path)` | Parse and validate YAML into `EngravaConfig` |
+| `resolve_embedding_provider(config)` | Construct the provider selected by an `EmbeddingConfig` |
+| `resolve_hooks(hooks_class)` | Import and construct a dotted-path hooks class, or return default hooks for `None` |
+| `resolve_manifests(manifest_paths, *, discover=False)` | Load explicit manifest paths and optionally append entry-point discovery results |
+
+See [Configuration](configuration.md) for the fields, defaults, validation, and
+YAML examples.
+
+### Embedding and vector implementations
+
+| Export | Purpose |
+|---|---|
+| `CallbackProvider` | Adapt caller-supplied embedding callbacks to `EmbeddingProviderProtocol` |
+| `SentenceTransformerProvider` | Local sentence-transformers provider |
+| `HuggingFaceProvider` | Hugging Face inference/provider adapter |
+| `OllamaProvider` | Ollama embedding provider |
+| `OpenAICompatibleProvider` | Provider for OpenAI-compatible embedding endpoints |
+| `RoleAwareEmbeddingProvider` | Optional protocol for distinct query/document embedding paths |
+| `SqliteVecSearchBackend` | sqlite-vec `vec0` backend used by configured stores |
+
+See [Embeddings](guides/embeddings.md) and [Performance](performance.md) before
+selecting a provider or vector backend.
+
+### Dreaming and scoring types
+
+| Export | Purpose |
+|---|---|
+| `DreamingExtension` | Periodic consolidation implementation; returns `ConsolidationResult` |
+| `DreamingContext` | Per-run context supplied to dreaming signals |
+| `DreamingSignalProtocol` | Contract implemented by promotion-scoring signals |
+| `ActionOutcomeSignal`, `ConfidenceSignal`, `ConfirmationSignal` | Outcome, confidence, and confirmation scoring signals |
+| `FrequencySignal`, `RecencySignal`, `StalenessSignal` | Access-frequency, cycle-recency, and staleness scoring signals |
+| `ScoringContext` | Context type accepted by the reserved hook-level `score_function` |
+
+See [Dreaming](dreaming.md) for activation, gates, signal semantics, and the
+no-retrieval-accuracy-claim boundary.
+
+### Journal, cleanup, and metrics value objects
+
+| Export | Purpose |
+|---|---|
+| `JournalEntry` | One persisted hash-chain journal entry |
+| `JournalWriter` | Low-level journal writer bound to an open connection; ordinary callers use `store.journal` / `verify_journal()` |
+| `MutationType` | Journal mutation-kind enum |
+| `CleanupStrategy` | TTL cleanup enum: `ARCHIVE` or `DELETE` |
+| `ThoughtCounts`, `EdgeCounts` | Count components nested in `EngravaMetrics` |
+| `StorageFootprint` | Database, WAL, vector-index, and total byte counts |
+| `LatencyHistogram` | Rolling search-latency count and percentile summary |
+
+### Discovery and parsing helpers
+
+| Export | Purpose |
+|---|---|
+| `discover_manifests()` | Discover opt-in extension manifests from package entry points |
+| `MindQLParseError` | Raised when `parse()` rejects invalid MindQL syntax |
+
+### Deprecated compatibility aliases
+
+`CoreThoughtRecord` is a compatibility alias of `ThoughtRecord`. The legacy
+MindStore-era names below resolve lazily to their Engrava equivalents and emit a
+`DeprecationWarning`; new code should not use them.
+
+| Deprecated export | Use instead |
+|---|---|
+| `SqliteMindStoreCore` | `SqliteEngravaCore` |
+| `MindStoreManager` | `EngravaManager` |
+| `MindStoreConfig` | `EngravaConfig` |
+| `MindStoreError` | `EngravaError` |
+| `MindStoreCoreProtocol` | `EngravaCoreProtocol` |
+| `MindStoreHooksProtocol` | `EngravaHooksProtocol` |
+| `DefaultMindStoreHooks` | `DefaultEngravaHooks` |
+| `ReadOnlyMindStore` | `ReadOnlyEngrava` |

@@ -100,6 +100,16 @@ captured according to the configured TTL strategy:
 (The separate `engrava gc` CLI command, which physically purges already-archived
 rows, operates at the storage layer and is not journaled.)
 
+Deleting a thought also removes its incident edges, embeddings, and actions
+through database cascades (and purges its vector-index row). When deletion goes
+through a journaled store path, the only entry for that operation is
+`DELETE_THOUGHT`: cascade-removed edges do not receive `DELETE_EDGE` entries,
+and cascade-removed embeddings, actions, and vector-index rows receive no
+separate journal entry. Embedding/vector mutations and action creation/deletion
+are outside journal coverage generally; only action status and verification
+transitions are covered. Call `delete_edge()` explicitly when an individually
+journaled edge deletion is required.
+
 ## The `JournalEntry` schema
 
 Each entry is an immutable `JournalEntry`:
@@ -177,6 +187,21 @@ else:
 | `error_message` | `str \| None` | Description of the first error, or `None` |
 
 An empty journal verifies as `valid=True` with `entries_checked=0`.
+
+**What this check proves.** Verification proves that every journal row still on
+disk has self-consistent hashed content and links to the preceding row that was
+walked. It detects an in-row journal mutation, a changed parent link, or a
+mid-chain deletion/reordering when the affected hashes have not been
+recomputed. It does **not** provide either of these separate guarantees:
+
+- **Chain length / tail completeness.** Removing a self-consistent suffix leaves
+  a valid prefix, so `verify_journal()` cannot know that newer entries once
+  existed. Detect this with an externally retained high-water mark and tail
+  anchor, such as the expected `(sequence_number, entry_hash)` at a checkpoint.
+- **Live-table reconciliation.** The verifier reads `journal_entry`; it does not
+  compare the current thought, edge, embedding, or action tables with the latest
+  journal deltas. A direct edit to a live thought or edge row is outside this
+  check unless the edit also changes a journal row or breaks the SQLite file.
 
 **Verification is independent of the current `journal.enabled` state.** Entries
 are recorded only while journaling is on, but once written they stay in the
@@ -271,18 +296,23 @@ external anchor.
 
 **What it protects against (in scope):**
 
-- **Accidental corruption** — bit-rot, a truncated file, a half-written row: the
-  recomputed hash or the parent linkage will not match, and verification fails.
-- **Naive tampering** — someone who edits, deletes, or reorders a journal row
-  (or an audited record) *without* recomputing the rest of the chain: the break
-  is detected at the first inconsistent entry.
+- **Accidental corruption inside the retained journal rows** — changed hashed
+  content or parent linkage makes verification fail.
+- **Naive journal tampering** — someone who edits, deletes from the middle, or
+  reorders a journal row *without* recomputing the affected chain: the break is
+  detected at the first inconsistent entry.
 
 **What it does NOT protect against (out of scope):**
 
+- **Self-consistent tail removal.** The retained prefix still verifies. An
+  external high-water mark or tail anchor is required to prove expected length.
+- **Direct edits to live records.** Verification does not replay the journal or
+  reconcile thought/edge/action state against it.
 - **A chain-aware actor with write access to the database file.** Because the
   chain is keyless and self-contained, anyone who can write to the `.db` can
   edit an entry **and** recompute every subsequent hash, producing a fully
-  self-consistent chain that passes `verify_integrity()` with `valid=True`. The
+  self-consistent chain that passes `store.verify_journal()` (or the enabled
+  writer's `store.journal.verify_integrity()`) with `valid=True`. The
   journal is **not** forgery-proof against an adversary (including the agent
   process itself) who controls the file.
 
@@ -292,11 +322,13 @@ layer and add at least one of:
 - **Restrict write access** — store the `.db` on a volume only the trusted
   writer process can modify (OS file permissions / ownership).
 - **Anchor the chain externally** — periodically export the latest
-  `entry_hash` (the chain tail) to an append-only / WORM store, a signed log, or
-  another system out of the writer's control. A later `verify_integrity()` plus
-  a match against the externally-anchored tail hash detects a full-file rewrite.
-- **Verify on a schedule** — run `verify_integrity()` from a separate monitored
-  process so a detected mismatch raises an alert.
+  `(sequence_number, entry_hash)` to an append-only / WORM store, a signed log,
+  or another system out of the writer's control. A later integrity walk plus a
+  match against that checkpoint adds the length/tail expectation the in-file
+  walk does not possess.
+- **Verify on a schedule** — run `store.verify_journal()` from a separate
+  monitored process so a detected mismatch raises an alert. This store-level
+  entry point also works when journaling is currently disabled.
 
 State this boundary plainly to stakeholders: Engrava's journal gives you
 **integrity detection for accidental damage and unsophisticated edits**, not

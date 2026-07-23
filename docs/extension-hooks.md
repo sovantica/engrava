@@ -36,7 +36,7 @@ but do not expect core to invoke them.
 |--------|------|---------|----------------|
 | `on_store` | After a thought is persisted | `ThoughtRecord` (enriched or unchanged) | **active** |
 | `on_retrieve` | After a thought is loaded from storage | `ThoughtRecord` (enriched or unchanged) | **active** |
-| `decay_function(thought, elapsed_cycles)` | Per-thought decay factor, multiplied into the hygiene eviction-score | `float` in `[0.0, 1.0]` | **active** — its only call-site is [Forgetting / Memory Hygiene](memory-hygiene.md); it is never consulted in search, ranking, or promotion |
+| `decay_function(thought, elapsed_cycles)` | Per-candidate decay factor, multiplied into the hygiene eviction-score | `float` in `[0.0, 1.0]` | **active** — called for each candidate when an enabled `run_hygiene()` pass reaches archive scoring; it is never consulted in search, ranking, or promotion |
 | `score_function(thought, context)` | Custom relevance score | `float` | reserved — not called by core |
 | `mindql_extension_registry()` | Register custom MindQL verbs | `dict[str, MindQLExtension]` | reserved — core wires MindQL verbs via `ExtensionManifest.mindql_extensions`, not this hook |
 
@@ -182,18 +182,27 @@ selected with `split_mode` (a `SplitMode` value):
 | `SplitMode.PARAGRAPH` (default) | Splits on a blank-line (paragraph) boundary — the byte-identical original behaviour. |
 | `SplitMode.FIXED_WINDOW` | Tiles the content into fixed-size windows, bounding chunk size for embedding robustness on long content with no dependence on natural boundaries. |
 
-For `FIXED_WINDOW`, three keyword-only knobs shape the windows:
+The complete constructor surface is:
 
-- `window_size` (default `1000`, must be `>= 1`) — the window length, in
-  `window_unit` units;
-- `window_unit` (`"char"` (default) or `"word"`) — whether `window_size` /
-  `window_overlap` count characters or whitespace-delimited words;
-- `window_overlap` (default `0`, must satisfy `0 <= window_overlap < window_size`)
-  — how many units consecutive windows share.
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `thought_type` | `ThoughtType` | `OBSERVATION` | Classification assigned to every derived child |
+| `priority` | `Priority` | `P3` | Priority assigned to every derived child |
+| `split_mode` | `SplitMode` | `PARAGRAPH` | Paragraph or fixed-window segmentation |
+| `window_size` | `int` | `1000` | Fixed-window length in `window_unit`; must be `>= 1` |
+| `window_unit` | `"char" \| "word"` | `"char"` | Count windows and overlap in characters or whitespace-delimited words |
+| `window_overlap` | `int` | `0` | Units shared by consecutive windows; must satisfy `0 <= overlap < window_size` |
+| `min_chars` | `int` | `0` | Minimum stripped source length required before splitting; must be `>= 0` |
+| `boundary` | `re.Pattern[str]` | blank-line pattern | Custom paragraph boundary; ignored in fixed-window mode |
+| `attach_edges` | `bool` | `True` | Attach one `DERIVED_FROM` edge from each child to the source |
 
 Windows advance by `window_size - window_overlap` and fully cover the content (the
 final window may be shorter). Every derived child records its `split_mode`,
 `segment_index`, and source `char_start` / `char_end` in its `metadata`.
+Regardless of mode, fewer than two resulting segments produces no children; a
+single segment is not a structural split. `min_chars` is checked before
+segmentation, while `attach_edges=False` changes provenance attachment only and
+does not change child content or identity.
 
 ```python
 from engrava import SplitMode, StructuralSplitProducer
@@ -219,8 +228,15 @@ existing store), call `derive_existing`:
 
 ```python
 result = await store.derive_existing(thought_id)
-print(result.created, result.reused, result.skipped)
+print(result.thought_id, result.created, result.reused, result.skipped)
 ```
+
+| `DeriveResult` field | Meaning |
+|---|---|
+| `thought_id` | Source thought the backfill targeted |
+| `created` | Children inserted by this run |
+| `reused` | Content-addressed children that already existed |
+| `skipped` | Child failures suppressed under `on_error="log"` |
 
 - Returns a `DeriveResult` tallying children `created` / `reused` / `skipped`.
   Because derived-child identity is content-addressed, re-running is
