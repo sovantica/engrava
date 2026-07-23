@@ -1,10 +1,10 @@
 """Whole-ladder schema migration hardening for ``ensure_schema``.
 
 ``ensure_schema`` migrates a database up to the head ``user_version`` (20)
-through a hand-written ``elif`` cascade plus a chain of per-version
+through an ordered migration registry plus a loop over a chain of per-version
 ``_migrate_core_v*`` helpers. Existing suites cover single rungs (the
 v13->v14 hot-path indexes and the v18->v19 edge metadata column); this module
-generalises that to the **entire** ladder so an off-by-one arm (a wrong start
+generalises that to the **entire** ladder so an off-by-one step (a wrong start
 version or a skipped step) can no longer strand one specific source version
 undetected.
 
@@ -58,6 +58,7 @@ from engrava import (
     ThoughtRecord,
     ThoughtType,
 )
+from engrava.domain.exceptions import CoreMigrationError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -774,3 +775,206 @@ async def test_parity_check_detects_default_drift(
         migrated_shape.columns["edge"]["metadata_json"]
         != fresh_shape.columns["edge"]["metadata_json"]
     )
+
+
+# ---------------------------------------------------------------------------
+# 3. Registry-driven dispatch: ordering, postcondition gating, retryability
+# ---------------------------------------------------------------------------
+
+
+async def test_migration_registry_is_contiguous_and_ordered(
+    fresh_db: aiosqlite.Connection,
+) -> None:
+    """The registry is the single source of upgrade order: contiguous 3..20.
+
+    Every entry's target version is strictly greater than the previous one and
+    the sequence is gap-free from the first post-bootstrap step (``v2 -> v3``)
+    to head (``v19 -> v20``), so the loop applies exactly the right tail for any
+    starting version and a future migration is one appended entry.
+    """
+    store = SqliteEngravaCore(fresh_db)
+    targets = [target for target, _ in store._core_migration_steps()]
+
+    assert targets == list(range(3, _HEAD_VERSION + 1))
+    assert targets == sorted(targets)
+    assert len(targets) == len(set(targets))
+
+
+async def test_loop_runs_only_pending_steps(
+    fresh_db: aiosqlite.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A step whose target is at or below the current version is never run.
+
+    A database stamped at v19 must upgrade by running only ``v19 -> v20``. If
+    the loop re-ran an already-applied step it would call the patched
+    ``v18 -> v19`` helper below and raise; reaching head proves the loop skips
+    every step whose target does not exceed the current version.
+    """
+
+    async def _must_not_run(self: SqliteEngravaCore) -> None:
+        message = "already-applied step re-run"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(SqliteEngravaCore, "_migrate_core_v18_to_v19", _must_not_run)
+
+    await _bootstrap_core_at_version(fresh_db, 19)
+    await _seed_legacy_rows(fresh_db)
+    store = SqliteEngravaCore(fresh_db)
+
+    await store.ensure_schema()
+
+    assert await _user_version(fresh_db) == _HEAD_VERSION
+
+
+async def test_double_run_after_head_is_a_noop(
+    fresh_db: aiosqlite.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-running ``ensure_schema`` at head runs no migration step at all.
+
+    Once the database is at head, a second ``ensure_schema`` must leave the
+    version untouched and dispatch no step — patching every registered helper
+    to raise proves the loop body is never entered on the second pass.
+    """
+    store = SqliteEngravaCore(fresh_db)
+    await store.ensure_schema()
+    assert await _user_version(fresh_db) == _HEAD_VERSION
+
+    async def _must_not_run(self: SqliteEngravaCore) -> None:
+        message = "no step may run at head"
+        raise AssertionError(message)
+
+    for _target, step in store._core_migration_steps():
+        monkeypatch.setattr(SqliteEngravaCore, step.__name__, _must_not_run)
+
+    await store.ensure_schema()
+    assert await _user_version(fresh_db) == _HEAD_VERSION
+
+
+async def test_unexpected_index_ddl_failure_leaves_version_retryable() -> None:
+    """An isolated index-creation failure propagates and never marks the DB current.
+
+    The ``v7 -> v8`` step creates ``idx_edge_type_from``. Seeding a conflicting
+    object of that name makes the ``CREATE INDEX`` raise a real SQLite error
+    that is **not** the absent-``edge``-table case the step tolerates. The error
+    must propagate (not be swallowed), the version must stay at 7 (the failed
+    step never bumps it), and once the conflict is removed a re-run must
+    complete the upgrade to head with the pre-existing rows intact — proving the
+    failure left the database retryable rather than falsely current.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    try:
+        await _bootstrap_core_at_version(conn, 7)
+        await _seed_legacy_rows(conn)
+        # A non-index object occupying the index name the migration will create.
+        await conn.execute("CREATE TABLE idx_edge_type_from (placeholder TEXT)")
+        await conn.commit()
+
+        store = SqliteEngravaCore(conn)
+        with pytest.raises(aiosqlite.OperationalError, match="idx_edge_type_from"):
+            await store.ensure_schema()
+
+        # The failed step must not have advanced the version past its input.
+        assert await _user_version(conn) == 7
+
+        # Remove the conflict and retry: the upgrade resumes and completes.
+        await conn.execute("DROP TABLE idx_edge_type_from")
+        await conn.commit()
+        await store.ensure_schema()
+
+        assert await _user_version(conn) == _HEAD_VERSION
+        await _assert_legacy_rows_survive(store)
+        await _assert_api_roundtrip(store)
+    finally:
+        await conn.close()
+
+
+async def test_failed_step_stops_at_last_successful_version(
+    fresh_db: aiosqlite.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-ladder failure bumps only through the last fully-applied step.
+
+    Seeded at v18, the loop applies ``v18 -> v19`` (bumping to 19) and then
+    fails on a patched ``v19 -> v20``. The version must be exactly 19 — the last
+    step that fully applied — never 20. Restoring the helper and re-running must
+    resume from 19 and reach head, so the interrupted upgrade was retryable.
+    """
+    await _bootstrap_core_at_version(fresh_db, 18)
+    await _seed_legacy_rows(fresh_db)
+    store = SqliteEngravaCore(fresh_db)
+
+    async def _boom(self: SqliteEngravaCore) -> None:
+        message = "injected v19->v20 failure"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(SqliteEngravaCore, "_migrate_core_v19_to_v20", _boom)
+    with pytest.raises(RuntimeError, match="injected"):
+        await store.ensure_schema()
+    assert await _user_version(fresh_db) == 19
+
+    monkeypatch.undo()
+    await store.ensure_schema()
+    assert await _user_version(fresh_db) == _HEAD_VERSION
+    await _assert_legacy_rows_survive(store)
+    await _assert_api_roundtrip(store)
+
+
+@pytest.mark.parametrize("stamped_version", [0, 1])
+async def test_below_floor_versions_bootstrap_fresh(
+    fresh_db: aiosqlite.Connection,
+    stamped_version: int,
+) -> None:
+    """Any ``user_version`` below the bootstrap floor loads the full head schema.
+
+    An empty database at version 0 (the default) and one explicitly stamped at
+    version 1 both sit below the migration-ladder floor, so ``ensure_schema``
+    must run ``schema_core.sql`` directly and land at head with a fully writable
+    schema — never entering the incremental loop.
+    """
+    await fresh_db.execute(f"PRAGMA user_version = {stamped_version}")
+    await fresh_db.commit()
+
+    store = SqliteEngravaCore(fresh_db)
+    await store.ensure_schema()
+
+    assert await _user_version(fresh_db) == _HEAD_VERSION
+    await _assert_api_roundtrip(store)
+
+
+async def test_postcondition_failure_raises_and_leaves_version_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A step whose postcondition does not hold raises and never bumps the version.
+
+    Forcing ``_index_exists`` to report the ``v7 -> v8`` index absent even after
+    its ``CREATE INDEX`` runs simulates the exact "version advanced without the
+    required index" hole the postcondition closes: the step must raise
+    :class:`CoreMigrationError`, the version must stay at 7, and once the probe
+    behaves again a re-run must reach head — proving the postcondition gates the
+    bump and leaves the database retryable.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    try:
+        await _bootstrap_core_at_version(conn, 7)
+        await _seed_legacy_rows(conn)
+        store = SqliteEngravaCore(conn)
+
+        async def _index_never_present(self: SqliteEngravaCore, index: str) -> bool:
+            return False
+
+        monkeypatch.setattr(SqliteEngravaCore, "_index_exists", _index_never_present)
+        with pytest.raises(CoreMigrationError, match="idx_edge_type_from"):
+            await store.ensure_schema()
+        assert await _user_version(conn) == 7
+
+        monkeypatch.undo()
+        await store.ensure_schema()
+        assert await _user_version(conn) == _HEAD_VERSION
+        await _assert_legacy_rows_survive(store)
+        await _assert_api_roundtrip(store)
+    finally:
+        await conn.close()

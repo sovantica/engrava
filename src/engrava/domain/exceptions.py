@@ -383,6 +383,35 @@ class ExtensionMigrationError(EngravaError):
         super().__init__(f"{prefix} {message}")
 
 
+class CoreMigrationError(EngravaError):
+    """Raised when a core schema migration step fails its postcondition.
+
+    A migration step that returns without leaving its target schema structure
+    (a column, table, index, or foreign key) in place would otherwise let the
+    upgrade loop stamp a higher ``user_version`` over a schema that does not
+    actually carry the migrated structure — a permanently "false-current"
+    database that skips the migration on every future open. Raising here leaves
+    the version at the last fully-applied step, so the next open retries the
+    remaining steps.
+
+    Args:
+        target_version: The core schema version the failed step targets.
+        message: Human-readable description of the unmet postcondition.
+
+    Examples:
+        >>> raise CoreMigrationError(8, "idx_edge_type_from missing after create")
+        Traceback (most recent call last):
+            ...
+        engrava.domain.exceptions.CoreMigrationError: \
+[core schema v8] idx_edge_type_from missing after create
+
+    """
+
+    def __init__(self, target_version: int, message: str) -> None:
+        self.target_version = target_version
+        super().__init__(f"[core schema v{target_version}] {message}")
+
+
 class DerivedRecordError(EngravaError):
     """Raised when the derived-records extension seam rejects a producer result.
 

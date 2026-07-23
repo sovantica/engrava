@@ -47,6 +47,7 @@ from engrava.domain.enums import (
 from engrava.domain.exceptions import (
     ActionNotFoundError,
     ConnectionQuarantinedError,
+    CoreMigrationError,
     CycleProviderError,
     DerivedRecordError,
     EmbeddingGenerationError,
@@ -97,7 +98,7 @@ from engrava.infrastructure.sqlite.hygiene import (
 from engrava.infrastructure.sqlite.journal_writer import JournalWriter
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 
     from engrava.config import HygienePolicyConfig, MetricsConfig, SearchConfig
     from engrava.domain.manifest import ExtensionManifest
@@ -138,6 +139,12 @@ _DERIVATION_ORIGIN: contextvars.ContextVar[str] = contextvars.ContextVar(
 #: automatic on-store write operations. Purely descriptive — never consulted for
 #: recursion control or gating.
 _ORIGIN_DERIVE_EXISTING = "derive_existing"
+
+#: Databases below this ``user_version`` predate the incremental migration
+#: ladder and are bootstrapped from the full ``schema_core.sql`` (which stamps
+#: the head version itself) rather than stepped. A database at or above it is
+#: upgraded through the ordered core-migration registry.
+_CORE_SCHEMA_BOOTSTRAP_FLOOR = 2
 
 
 @dataclass(frozen=True)
@@ -1588,13 +1595,14 @@ class SqliteEngravaCore:
     # Schema bootstrap (standalone usage)
     # ------------------------------------------------------------------
 
-    async def ensure_schema(self) -> None:  # noqa: C901, PLR0912, PLR0915
+    async def ensure_schema(self) -> None:
         """Create core tables if they don't already exist.
 
-        Applies the full ``schema_core.sql`` (including FTS5 virtual
-        table and sync triggers) only when the database has not already
-        been bootstrapped to schema version 3+.  Databases at older
-        versions are upgraded incrementally up to the current version (20).
+        Applies the full ``schema_core.sql`` (including the FTS5 virtual table
+        and sync triggers) only when the database predates the migration-ladder
+        floor. A database at or above the floor is upgraded incrementally
+        through the ordered core-migration registry (see
+        :meth:`_core_migration_steps`) up to the head version (20).
 
         After core schema creation or upgrade, probes for the ``thought_fts``
         table and then runs any pending extension schema migrations for each
@@ -1604,250 +1612,18 @@ class SqliteEngravaCore:
         row = await cursor.fetchone()
         current_version = int(row[0]) if row else 0
 
-        if current_version < 2:  # noqa: PLR2004
+        if current_version < _CORE_SCHEMA_BOOTSTRAP_FLOOR:
+            # Fresh bootstrap: ``schema_core.sql`` already carries the head DDL
+            # and stamps ``user_version`` itself, so no incremental step runs
+            # for a brand-new database.
             schema_sql = (
                 resources.files("engrava.infrastructure.sqlite")
                 .joinpath("schema_core.sql")
                 .read_text(encoding="utf-8")
             )
             await self._db.executescript(schema_sql)
-        elif current_version < 3:  # noqa: PLR2004
-            await self._rebuild_fts_index()
-            await self._migrate_core_v3_to_v4()
-            await self._migrate_core_v4_to_v5()
-            await self._migrate_core_v5_to_v6()
-            await self._migrate_core_v6_to_v7()
-            await self._migrate_core_v7_to_v8()
-            await self._migrate_core_v8_to_v9()
-            await self._migrate_core_v9_to_v10()
-            await self._migrate_core_v10_to_v11()
-            await self._migrate_core_v11_to_v12()
-            await self._migrate_core_v12_to_v13()
-            await self._migrate_core_v13_to_v14()
-            await self._migrate_core_v14_to_v15()
-            await self._migrate_core_v15_to_v16()
-            await self._migrate_core_v16_to_v17()
-            await self._migrate_core_v17_to_v18()
-            await self._migrate_core_v18_to_v19()
-            await self._migrate_core_v19_to_v20()
-            await self._db.execute("PRAGMA user_version = 20")
-            await self._db.commit()
-        elif current_version < 4:  # noqa: PLR2004
-            await self._migrate_core_v3_to_v4()
-            await self._migrate_core_v4_to_v5()
-            await self._migrate_core_v5_to_v6()
-            await self._migrate_core_v6_to_v7()
-            await self._migrate_core_v7_to_v8()
-            await self._migrate_core_v8_to_v9()
-            await self._migrate_core_v9_to_v10()
-            await self._migrate_core_v10_to_v11()
-            await self._migrate_core_v11_to_v12()
-            await self._migrate_core_v12_to_v13()
-            await self._migrate_core_v13_to_v14()
-            await self._migrate_core_v14_to_v15()
-            await self._migrate_core_v15_to_v16()
-            await self._migrate_core_v16_to_v17()
-            await self._migrate_core_v17_to_v18()
-            await self._migrate_core_v18_to_v19()
-            await self._migrate_core_v19_to_v20()
-            await self._db.execute("PRAGMA user_version = 20")
-            await self._db.commit()
-        elif current_version < 5:  # noqa: PLR2004
-            await self._migrate_core_v4_to_v5()
-            await self._migrate_core_v5_to_v6()
-            await self._migrate_core_v6_to_v7()
-            await self._migrate_core_v7_to_v8()
-            await self._migrate_core_v8_to_v9()
-            await self._migrate_core_v9_to_v10()
-            await self._migrate_core_v10_to_v11()
-            await self._migrate_core_v11_to_v12()
-            await self._migrate_core_v12_to_v13()
-            await self._migrate_core_v13_to_v14()
-            await self._migrate_core_v14_to_v15()
-            await self._migrate_core_v15_to_v16()
-            await self._migrate_core_v16_to_v17()
-            await self._migrate_core_v17_to_v18()
-            await self._migrate_core_v18_to_v19()
-            await self._migrate_core_v19_to_v20()
-            await self._db.execute("PRAGMA user_version = 20")
-            await self._db.commit()
-        elif current_version < 6:  # noqa: PLR2004
-            await self._migrate_core_v5_to_v6()
-            await self._migrate_core_v6_to_v7()
-            await self._migrate_core_v7_to_v8()
-            await self._migrate_core_v8_to_v9()
-            await self._migrate_core_v9_to_v10()
-            await self._migrate_core_v10_to_v11()
-            await self._migrate_core_v11_to_v12()
-            await self._migrate_core_v12_to_v13()
-            await self._migrate_core_v13_to_v14()
-            await self._migrate_core_v14_to_v15()
-            await self._migrate_core_v15_to_v16()
-            await self._migrate_core_v16_to_v17()
-            await self._migrate_core_v17_to_v18()
-            await self._migrate_core_v18_to_v19()
-            await self._migrate_core_v19_to_v20()
-            await self._db.execute("PRAGMA user_version = 20")
-            await self._db.commit()
-        elif current_version < 7:  # noqa: PLR2004
-            await self._migrate_core_v6_to_v7()
-            await self._migrate_core_v7_to_v8()
-            await self._migrate_core_v8_to_v9()
-            await self._migrate_core_v9_to_v10()
-            await self._migrate_core_v10_to_v11()
-            await self._migrate_core_v11_to_v12()
-            await self._migrate_core_v12_to_v13()
-            await self._migrate_core_v13_to_v14()
-            await self._migrate_core_v14_to_v15()
-            await self._migrate_core_v15_to_v16()
-            await self._migrate_core_v16_to_v17()
-            await self._migrate_core_v17_to_v18()
-            await self._migrate_core_v18_to_v19()
-            await self._migrate_core_v19_to_v20()
-            await self._db.execute("PRAGMA user_version = 20")
-            await self._db.commit()
-        elif current_version < 8:  # noqa: PLR2004
-            await self._migrate_core_v7_to_v8()
-            await self._migrate_core_v8_to_v9()
-            await self._migrate_core_v9_to_v10()
-            await self._migrate_core_v10_to_v11()
-            await self._migrate_core_v11_to_v12()
-            await self._migrate_core_v12_to_v13()
-            await self._migrate_core_v13_to_v14()
-            await self._migrate_core_v14_to_v15()
-            await self._migrate_core_v15_to_v16()
-            await self._migrate_core_v16_to_v17()
-            await self._migrate_core_v17_to_v18()
-            await self._migrate_core_v18_to_v19()
-            await self._migrate_core_v19_to_v20()
-            await self._db.execute("PRAGMA user_version = 20")
-            await self._db.commit()
-        elif current_version < 9:  # noqa: PLR2004
-            await self._migrate_core_v8_to_v9()
-            await self._migrate_core_v9_to_v10()
-            await self._migrate_core_v10_to_v11()
-            await self._migrate_core_v11_to_v12()
-            await self._migrate_core_v12_to_v13()
-            await self._migrate_core_v13_to_v14()
-            await self._migrate_core_v14_to_v15()
-            await self._migrate_core_v15_to_v16()
-            await self._migrate_core_v16_to_v17()
-            await self._migrate_core_v17_to_v18()
-            await self._migrate_core_v18_to_v19()
-            await self._migrate_core_v19_to_v20()
-            await self._db.execute("PRAGMA user_version = 20")
-            await self._db.commit()
-        elif current_version < 10:  # noqa: PLR2004
-            await self._migrate_core_v9_to_v10()
-            await self._migrate_core_v10_to_v11()
-            await self._migrate_core_v11_to_v12()
-            await self._migrate_core_v12_to_v13()
-            await self._migrate_core_v13_to_v14()
-            await self._migrate_core_v14_to_v15()
-            await self._migrate_core_v15_to_v16()
-            await self._migrate_core_v16_to_v17()
-            await self._migrate_core_v17_to_v18()
-            await self._migrate_core_v18_to_v19()
-            await self._migrate_core_v19_to_v20()
-            await self._db.execute("PRAGMA user_version = 20")
-            await self._db.commit()
-        elif current_version < 11:  # noqa: PLR2004
-            await self._migrate_core_v10_to_v11()
-            await self._migrate_core_v11_to_v12()
-            await self._migrate_core_v12_to_v13()
-            await self._migrate_core_v13_to_v14()
-            await self._migrate_core_v14_to_v15()
-            await self._migrate_core_v15_to_v16()
-            await self._migrate_core_v16_to_v17()
-            await self._migrate_core_v17_to_v18()
-            await self._migrate_core_v18_to_v19()
-            await self._migrate_core_v19_to_v20()
-            await self._db.execute("PRAGMA user_version = 20")
-            await self._db.commit()
-        elif current_version < 12:  # noqa: PLR2004
-            await self._migrate_core_v11_to_v12()
-            await self._migrate_core_v12_to_v13()
-            await self._migrate_core_v13_to_v14()
-            await self._migrate_core_v14_to_v15()
-            await self._migrate_core_v15_to_v16()
-            await self._migrate_core_v16_to_v17()
-            await self._migrate_core_v17_to_v18()
-            await self._migrate_core_v18_to_v19()
-            await self._migrate_core_v19_to_v20()
-            await self._db.execute("PRAGMA user_version = 20")
-            await self._db.commit()
-        elif current_version < 13:  # noqa: PLR2004
-            await self._migrate_core_v12_to_v13()
-            await self._migrate_core_v13_to_v14()
-            await self._migrate_core_v14_to_v15()
-            await self._migrate_core_v15_to_v16()
-            await self._migrate_core_v16_to_v17()
-            await self._migrate_core_v17_to_v18()
-            await self._migrate_core_v18_to_v19()
-            await self._migrate_core_v19_to_v20()
-            await self._db.execute("PRAGMA user_version = 20")
-            await self._db.commit()
-        elif current_version < 14:  # noqa: PLR2004
-            await self._migrate_core_v13_to_v14()
-            await self._migrate_core_v14_to_v15()
-            await self._migrate_core_v15_to_v16()
-            await self._migrate_core_v16_to_v17()
-            await self._migrate_core_v17_to_v18()
-            await self._migrate_core_v18_to_v19()
-            await self._migrate_core_v19_to_v20()
-            await self._db.execute("PRAGMA user_version = 20")
-            await self._db.commit()
-        elif current_version < 15:  # noqa: PLR2004
-            await self._migrate_core_v14_to_v15()
-            await self._migrate_core_v15_to_v16()
-            await self._migrate_core_v16_to_v17()
-            await self._migrate_core_v17_to_v18()
-            await self._migrate_core_v18_to_v19()
-            await self._migrate_core_v19_to_v20()
-            await self._db.execute("PRAGMA user_version = 20")
-            await self._db.commit()
-        elif current_version < 16:  # noqa: PLR2004
-            await self._migrate_core_v15_to_v16()
-            await self._migrate_core_v16_to_v17()
-            await self._migrate_core_v17_to_v18()
-            await self._migrate_core_v18_to_v19()
-            await self._migrate_core_v19_to_v20()
-            await self._db.execute("PRAGMA user_version = 20")
-            await self._db.commit()
-        elif current_version < 17:  # noqa: PLR2004
-            await self._migrate_core_v16_to_v17()
-            await self._migrate_core_v17_to_v18()
-            await self._migrate_core_v18_to_v19()
-            await self._migrate_core_v19_to_v20()
-            await self._db.execute("PRAGMA user_version = 20")
-            await self._db.commit()
-        elif current_version < 18:  # noqa: PLR2004
-            await self._migrate_core_v17_to_v18()
-            await self._migrate_core_v18_to_v19()
-            await self._migrate_core_v19_to_v20()
-            await self._db.execute("PRAGMA user_version = 20")
-            await self._db.commit()
-        elif current_version < 19:  # noqa: PLR2004
-            # A base at exactly 18 matches no lower arm (each tests
-            # ``< N`` for N <= 18). Without this arm every existing v18
-            # database would be stranded: the ``metadata_json`` column
-            # would never be added and the first edge write would raise.
-            # First-match ``elif`` keeps the ladder double-run-safe — a
-            # v17 base hits ``< 18`` only, a v18 base hits ``< 19`` only.
-            await self._migrate_core_v18_to_v19()
-            await self._migrate_core_v19_to_v20()
-            await self._db.execute("PRAGMA user_version = 20")
-            await self._db.commit()
-        elif current_version < 20:  # noqa: PLR2004
-            # A base at exactly 19 matches no lower arm (each tests ``< N``
-            # for N <= 19). Without this arm every existing v19 database
-            # would be stranded: the ``archived_at`` column would never be
-            # added, so a hygiene archive write could not stamp it. First-match
-            # ``elif`` keeps the ladder double-run-safe — a v18 base hits
-            # ``< 19`` only, a v19 base hits ``< 20`` only.
-            await self._migrate_core_v19_to_v20()
-            await self._db.execute("PRAGMA user_version = 20")
-            await self._db.commit()
+        else:
+            await self._run_pending_core_migrations(current_version)
 
         # Ensure referential integrity is enforced for the lifetime of this
         # connection. SQLite ships with foreign_keys=OFF by default, so any
@@ -1867,6 +1643,76 @@ class SqliteEngravaCore:
             runner = ExtensionMigrationRunner()
             for _manifest in self._manifests:
                 await runner.apply_pending(_manifest, self._db)
+
+    def _core_migration_steps(
+        self,
+    ) -> tuple[tuple[int, Callable[[], Awaitable[None]]], ...]:
+        """Return the ordered core-schema migration registry.
+
+        This is the **single source of truth** for the core upgrade order:
+        each entry maps the ``user_version`` a step reaches to the coroutine
+        that applies it. :meth:`_run_pending_core_migrations` walks it from the
+        database's current version, so adding a future migration is one new
+        entry here plus its ``_migrate_core_*`` method — never an edit to every
+        historical path.
+
+        The registry is rebuilt per call from bound method references so a
+        monkeypatched migration (used by the schema-drift regression test)
+        resolves to the patched attribute.
+
+        Returns:
+            Entries ordered by ascending target version, contiguous from the
+            first post-bootstrap step (``v2 -> v3`` rebuilds the FTS index) up
+            to the head version (``v19 -> v20``).
+
+        """
+        return (
+            (3, self._rebuild_fts_index),
+            (4, self._migrate_core_v3_to_v4),
+            (5, self._migrate_core_v4_to_v5),
+            (6, self._migrate_core_v5_to_v6),
+            (7, self._migrate_core_v6_to_v7),
+            (8, self._migrate_core_v7_to_v8),
+            (9, self._migrate_core_v8_to_v9),
+            (10, self._migrate_core_v9_to_v10),
+            (11, self._migrate_core_v10_to_v11),
+            (12, self._migrate_core_v11_to_v12),
+            (13, self._migrate_core_v12_to_v13),
+            (14, self._migrate_core_v13_to_v14),
+            (15, self._migrate_core_v14_to_v15),
+            (16, self._migrate_core_v15_to_v16),
+            (17, self._migrate_core_v16_to_v17),
+            (18, self._migrate_core_v17_to_v18),
+            (19, self._migrate_core_v18_to_v19),
+            (20, self._migrate_core_v19_to_v20),
+        )
+
+    async def _run_pending_core_migrations(self, current_version: int) -> None:
+        """Apply every pending core migration in registry order.
+
+        Walks the ordered registry from :meth:`_core_migration_steps` and runs
+        only the steps whose target version exceeds ``current_version``. Each
+        step is idempotent and **verifies its own postcondition**, raising
+        :class:`CoreMigrationError` (or the underlying SQLite error) before it
+        returns if the migrated structure is absent. The ``user_version`` is
+        stamped and committed only *after* the step returns successfully, so a
+        failed or interrupted migration leaves the version at the last
+        fully-applied step and the next ``ensure_schema`` retries the remaining
+        tail — a failure can never mark the database current over a
+        partially-migrated schema.
+
+        Args:
+            current_version: The database's current ``user_version``. It is at
+                or above the bootstrap floor; the fresh-bootstrap path is
+                handled by :meth:`ensure_schema` before this method is called.
+
+        """
+        for target_version, migrate in self._core_migration_steps():
+            if target_version <= current_version:
+                continue
+            await migrate()
+            await self._db.execute(f"PRAGMA user_version = {target_version}")
+            await self._db.commit()
 
     async def _probe_fts(self) -> None:
         """Detect whether the ``thought_fts`` FTS5 table exists.
@@ -1926,6 +1772,16 @@ class SqliteEngravaCore:
             "INSERT OR IGNORE INTO thought_fts(rowid, essence, content) "
             "SELECT rowid, essence, content FROM thought"
         )
+        # Postcondition: the rebuilt FTS table AND its three sync triggers must
+        # all exist before the loop bumps the version, so a v3 database always
+        # carries a fully wired, queryable index (not a table without triggers).
+        await self._require_table(3, "thought_fts")
+        for trigger in (
+            "thought_fts_insert",
+            "thought_fts_delete",
+            "thought_fts_update",
+        ):
+            await self._require_trigger(3, trigger)
 
     async def _migrate_core_v3_to_v4(self) -> None:
         """Add access tracking and datetime timestamp columns (core-4).
@@ -1934,17 +1790,14 @@ class SqliteEngravaCore:
         Backfills ``created_at`` and ``updated_at`` with the current UTC
         time for existing rows that lack timestamps.
         """
-        from sqlite3 import OperationalError  # noqa: PLC0415
-
-        alter_statements = [
-            "ALTER TABLE thought ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE thought ADD COLUMN last_accessed_at TEXT",
-            "ALTER TABLE thought ADD COLUMN created_at TEXT",
-            "ALTER TABLE thought ADD COLUMN updated_at TEXT",
-        ]
-        for stmt in alter_statements:
-            with contextlib.suppress(OperationalError):
-                await self._db.execute(stmt)
+        new_columns = (
+            ("access_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_accessed_at", "TEXT"),
+            ("created_at", "TEXT"),
+            ("updated_at", "TEXT"),
+        )
+        for column, column_type in new_columns:
+            await self._add_column_if_absent("thought", column, column_type)
 
         now = datetime.datetime.now(datetime.UTC).isoformat()
         await self._db.execute(
@@ -1955,6 +1808,12 @@ class SqliteEngravaCore:
             "UPDATE thought SET updated_at = ? WHERE updated_at IS NULL",
             (now,),
         )
+        # Postcondition: all four columns must exist before the loop bumps the
+        # version. ``access_count`` / ``last_accessed_at`` are not read by the
+        # backfill above, so a silently-swallowed ``ALTER`` would otherwise be
+        # recorded as migrated.
+        for column in ("access_count", "last_accessed_at", "created_at", "updated_at"):
+            await self._require_column(4, "thought", column)
 
     async def _migrate_core_v4_to_v5(self) -> None:
         """Add the ``_metadata`` key/value table (core-5).
@@ -1964,6 +1823,7 @@ class SqliteEngravaCore:
         await self._db.execute(
             "CREATE TABLE IF NOT EXISTS _metadata (key TEXT PRIMARY KEY, value TEXT)"
         )
+        await self._require_table(5, "_metadata")
 
     async def _migrate_core_v5_to_v6(self) -> None:
         """Add the ``journal_entry`` table and indexes (core-6).
@@ -1993,18 +1853,24 @@ class SqliteEngravaCore:
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_journal_seq ON journal_entry(sequence_number)"
         )
+        await self._require_table(6, "journal_entry")
+        for index_name in ("idx_journal_target", "idx_journal_type", "idx_journal_seq"):
+            await self._require_index(6, index_name)
 
     async def _migrate_core_v6_to_v7(self) -> None:
         """Add ``expires_at`` column and partial index (core-7).
 
-        Idempotent — silently skips when the column already exists.
+        Idempotent — the ``ADD COLUMN`` is guarded so a database already
+        carrying the column is left unchanged, and any non-duplicate DDL error
+        propagates rather than being swallowed.
         """
-        with contextlib.suppress(Exception):  # Column may already exist.
-            await self._db.execute("ALTER TABLE thought ADD COLUMN expires_at TEXT")
+        await self._add_column_if_absent("thought", "expires_at", "TEXT")
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_thought_expires "
             "ON thought(expires_at) WHERE expires_at IS NOT NULL"
         )
+        await self._require_column(7, "thought", "expires_at")
+        await self._require_index(7, "idx_thought_expires")
 
     async def _migrate_core_v7_to_v8(self) -> None:
         """Add composite edge index for candidate expansion queries (core-8).
@@ -2020,14 +1886,24 @@ class SqliteEngravaCore:
         The same index also accelerates the existing ``_load_graph_signal``
         COUNT query backing the giant-cluster guard.
 
-        Idempotent — uses ``CREATE INDEX IF NOT EXISTS``.  Silently skips
-        when the ``edge`` table does not yet exist (partial-schema test
-        environments or future migrations that reorder DDL).
+        Idempotent — uses ``CREATE INDEX IF NOT EXISTS``. The ``edge`` table may
+        be absent in a partial bootstrap (it is created lazily / by the fresh
+        DDL), so the create is guarded by ``_table_exists`` exactly as the later
+        edge-touching migrations guard theirs — a thought-only database has no
+        edge index to build, and the fresh DDL already carries it. Any *other*
+        DDL failure propagates rather than being swallowed, so an isolated
+        index-creation error can no longer be recorded as a completed migration.
+        A postcondition assertion confirms the index is present (when the
+        ``edge`` table exists) before the loop bumps the version.
         """
-        with contextlib.suppress(Exception):
+        if await self._table_exists("edge"):
             await self._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_edge_type_from ON edge(edge_type, from_thought_id)"
             )
+            # Postcondition: the index must exist before the loop bumps the
+            # version, so a v8 database that carries the ``edge`` table is never
+            # marked current without the candidate-expansion index.
+            await self._require_index(8, "idx_edge_type_from")
 
     async def _migrate_core_v8_to_v9(self) -> None:
         """Add extension_schema_versions table (core-9).
@@ -2048,6 +1924,7 @@ class SqliteEngravaCore:
             )
             """
         )
+        await self._require_table(9, "extension_schema_versions")
 
     async def _migrate_core_v9_to_v10(self) -> None:
         """Add ``content_hash`` column + index to ``thought`` table (core-10).
@@ -2066,17 +1943,12 @@ class SqliteEngravaCore:
         calls compute the hash at insert time regardless of the
         ``deduplicate`` flag.
         """
-        try:
-            await self._db.execute("ALTER TABLE thought ADD COLUMN content_hash TEXT")
-        except aiosqlite.OperationalError as exc:
-            # SQLite emits "duplicate column name: content_hash" when the
-            # column already exists; that is the idempotent re-run signal.
-            if "duplicate column" not in str(exc).lower():
-                raise
-
+        await self._add_column_if_absent("thought", "content_hash", "TEXT")
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_thought_content_hash ON thought(content_hash)"
         )
+        await self._require_column(10, "thought", "content_hash")
+        await self._require_index(10, "idx_thought_content_hash")
 
     async def _migrate_core_v10_to_v11(self) -> None:
         """Add ``metadata_json`` column to ``thought`` table (core-11).
@@ -2086,21 +1958,13 @@ class SqliteEngravaCore:
         content_type, session_id, ...).  Existing rows get the
         empty-dict default — no data migration required.
 
-        Idempotent: ``ALTER TABLE ADD COLUMN`` is wrapped in
-        duplicate-column tolerance (matches ``_migrate_core_v9_to_v10``
-        precedent), so re-running the migration after a partial crash
-        converges on the fully-applied state.
+        Idempotent: the guarded ``ADD COLUMN`` tolerates only a duplicate
+        column (matches ``_migrate_core_v9_to_v10`` precedent), so re-running
+        the migration after a partial crash converges on the fully-applied
+        state.
         """
-        try:
-            await self._db.execute(
-                "ALTER TABLE thought ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
-            )
-        except aiosqlite.OperationalError as exc:
-            # SQLite emits "duplicate column name: metadata_json" when
-            # the column already exists; that is the idempotent re-run
-            # signal.
-            if "duplicate column" not in str(exc).lower():
-                raise
+        await self._add_column_if_absent("thought", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
+        await self._require_column(11, "thought", "metadata_json")
 
     async def _migrate_core_v11_to_v12(self) -> None:
         """Add referential integrity (FK + ON DELETE CASCADE) to child tables.
@@ -2113,15 +1977,15 @@ class SqliteEngravaCore:
         declared on it.
 
         ``PRAGMA foreign_keys=OFF`` is a documented no-op while a
-        transaction is open. The dispatch chain in ``ensure_schema``
-        may arrive here with prior migration writes still in an open
-        implicit transaction; this helper therefore commits any pending
+        transaction is open. This helper therefore commits any pending
         work *before* toggling the pragma, runs the recreate steps,
         commits the recreations, and only then re-enables enforcement.
-        Without this, the ladder path (older schema → … → v12) leaves
-        FK enforcement on during the swap and the recreated tables
-        fail their first ``INSERT … SELECT *`` if any unpurged orphan
-        remains.
+        The leading commit is defensive: the migration loop commits after
+        every step, but a caller that reaches this migration with an open
+        implicit transaction (from an earlier write on the same connection)
+        would otherwise leave FK enforcement on during the swap, and the
+        recreated tables would fail their first ``INSERT … SELECT *`` if any
+        unpurged orphan remained.
 
         Pre-existing orphan rows in any of the three child tables are
         purged before the constraint is enabled. Orphans are already
@@ -2145,37 +2009,79 @@ class SqliteEngravaCore:
         edge_exists = await self._table_exists("edge")
         embedding_exists = await self._table_exists("embedding")
         action_exists = await self._table_exists("action")
-        edge_done = edge_exists and await self._fk_present("edge", "from_thought_id")
+        edge_done = (
+            edge_exists
+            and await self._fk_present("edge", "from_thought_id")
+            and await self._fk_present("edge", "to_thought_id")
+        )
         embedding_done = embedding_exists and await self._fk_present("embedding", "owner_id")
         action_done = action_exists and await self._fk_present("action", "source_thought_id")
         # Tables absent from a partial bootstrap (only `thought` present) are
         # treated as "nothing to migrate" — fresh installs receive the FK
         # directly from ``schema_core.sql``.
-        if (
+        migration_needed = not (
             (edge_done or not edge_exists)
             and (embedding_done or not embedding_exists)
             and (action_done or not action_exists)
-        ):
-            return
+        )
 
-        # Close any implicit transaction opened by prior migration steps
-        # so PRAGMA foreign_keys=OFF actually takes effect (the pragma
-        # is silently ignored while a transaction is open).
-        await self._db.commit()
-        await self._db.execute("PRAGMA foreign_keys=OFF")
-        try:
-            await self._purge_orphan_children()
-            if edge_exists and not edge_done:
-                await self._recreate_edge_with_fk()
-            if embedding_exists and not embedding_done:
-                await self._recreate_embedding_with_fk()
-            if action_exists and not action_done:
-                await self._recreate_action_with_fk()
-            # Commit the recreate steps before re-enabling FK so the
-            # ON pragma also lands outside a transaction.
+        if migration_needed:
+            # Close any implicit transaction opened by prior migration steps
+            # so PRAGMA foreign_keys=OFF actually takes effect (the pragma
+            # is silently ignored while a transaction is open).
             await self._db.commit()
-        finally:
-            await self._db.execute("PRAGMA foreign_keys=ON")
+            await self._db.execute("PRAGMA foreign_keys=OFF")
+            try:
+                await self._purge_orphan_children()
+                if edge_exists and not edge_done:
+                    await self._recreate_edge_with_fk()
+                if embedding_exists and not embedding_done:
+                    await self._recreate_embedding_with_fk()
+                if action_exists and not action_done:
+                    await self._recreate_action_with_fk()
+                # Commit the recreate steps before re-enabling FK so the
+                # ON pragma also lands outside a transaction.
+                await self._db.commit()
+            except BaseException:  # noqa: BLE001 - rollback must also cover cancellation
+                # Keep the failed step retryable on this same connection. In
+                # particular, never leave a committed ``*_new`` table or a
+                # half-completed table swap for the next attempt to inherit.
+                await self._db.rollback()
+                raise
+            finally:
+                await self._db.execute("PRAGMA foreign_keys=ON")
+
+        # The edge recreation drops its indexes. Ensure the required v8 index
+        # also when the FK was already present, so a partial legacy schema is
+        # repaired rather than failing the same postcondition on every retry.
+        if edge_exists:
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_edge_type_from "
+                "ON edge(edge_type, from_thought_id)"
+            )
+
+        # Postcondition: every child table that exists now carries its FK, and
+        # the edge recreate re-created ``idx_edge_type_from`` (dropped with the
+        # old table), so the loop never marks a v12 database current without
+        # referential integrity or the candidate-expansion index.
+        for table, column in (
+            ("edge", "from_thought_id"),
+            ("edge", "to_thought_id"),
+            ("embedding", "owner_id"),
+            ("action", "source_thought_id"),
+        ):
+            if await self._table_exists(table):
+                await self._require_fk(12, table, column)
+        if await self._table_exists("edge"):
+            await self._require_index(12, "idx_edge_type_from")
+
+        # Retry model: the per-step registry resumes a failed upgrade at the
+        # failed step (an improvement over the old bump-once-at-the-end ladder,
+        # which re-ran the whole tail). The table swaps are atomic within the
+        # recreate transaction and explicitly rolled back on failure; a
+        # persisted partial legacy state is still convergent because tables
+        # already carrying the exact FK are skipped and the required edge index
+        # is recreated independently above.
 
     async def _migrate_core_v12_to_v13(self) -> None:
         """Add nullable valid-time columns + indexes to thought and edge (core-13).
@@ -2200,11 +2106,10 @@ class SqliteEngravaCore:
           cycle number would invent information, so edges keep both
           valid-time fields ``NULL`` (an open lower bound).
 
-        Idempotent: each ``ALTER TABLE ... ADD COLUMN`` is wrapped in
-        ``contextlib.suppress(Exception)`` so a re-run after the column
-        already exists is a no-op, and every index uses
-        ``CREATE INDEX IF NOT EXISTS``. Re-running the migration leaves
-        the schema unchanged.
+        Idempotent: each ``ALTER TABLE ... ADD COLUMN`` is guarded so a re-run
+        after the column already exists is a no-op and any non-duplicate DDL
+        error propagates, and every index uses ``CREATE INDEX IF NOT EXISTS``.
+        Re-running the migration leaves the schema unchanged.
         """
         # Only touch tables that exist. A partial bootstrap may carry just
         # ``thought`` (the ``edge`` table is created lazily); operating on an
@@ -2217,8 +2122,7 @@ class SqliteEngravaCore:
 
         for table in tables:
             for column in ("valid_from", "valid_until"):
-                with contextlib.suppress(Exception):  # Column may already exist.
-                    await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+                await self._add_column_if_absent(table, column, "TEXT")
 
         # Asymmetric backfill — thought only, sourced from transaction time.
         # Rows with NULL created_at (legacy, pre-timestamp) keep NULL
@@ -2243,6 +2147,14 @@ class SqliteEngravaCore:
                 f"CREATE INDEX IF NOT EXISTS idx_{table}_valid_range "
                 f"ON {table}(valid_from, valid_until)"
             )
+        # Postcondition: every touched table (``thought`` always, ``edge`` when
+        # present) must carry both valid-time columns and their three indexes
+        # before the loop bumps the version.
+        for table in tables:
+            for column in ("valid_from", "valid_until"):
+                await self._require_column(13, table, column)
+            for suffix in ("valid_from", "valid_until", "valid_range"):
+                await self._require_index(13, f"idx_{table}_{suffix}")
 
     async def _migrate_core_v13_to_v14(self) -> None:
         """Add hot-path indexes for the core read queries (core-14).
@@ -2297,6 +2209,17 @@ class SqliteEngravaCore:
             await self._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_embedding_owner ON embedding(owner_id)"
             )
+        # Postcondition: every hot-path index whose guarded target is present
+        # must exist before the loop bumps the version.
+        expected_indexes = (
+            (await self._column_exists("thought", "updated_cycle"), "idx_thought_updated_cycle"),
+            (await self._column_exists("thought", "thought_type"), "idx_thought_type"),
+            (await self._table_exists("edge"), "idx_edge_to_thought"),
+            (await self._table_exists("embedding"), "idx_embedding_owner"),
+        )
+        for guarded_present, index_name in expected_indexes:
+            if guarded_present:
+                await self._require_index(14, index_name)
 
     async def _migrate_core_v14_to_v15(self) -> None:
         """Add the ``(edge_type, to_thought_id)`` composite edge index (core-15).
@@ -2321,6 +2244,7 @@ class SqliteEngravaCore:
             await self._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_edge_type_to ON edge(edge_type, to_thought_id)"
             )
+            await self._require_index(15, "idx_edge_type_to")
 
     async def _migrate_core_v15_to_v16(self) -> None:
         """Add the action-outcome aggregate column and its seek index (core-16).
@@ -2350,18 +2274,13 @@ class SqliteEngravaCore:
         ``_table_exists`` exactly as ``_migrate_core_v14_to_v15`` guards its
         ``edge`` index.
         """
-        from sqlite3 import OperationalError  # noqa: PLC0415
-
-        if not await self._column_exists("thought", "action_outcome_score"):
-            try:
-                await self._db.execute("ALTER TABLE thought ADD COLUMN action_outcome_score REAL")
-            except OperationalError as exc:  # pragma: no cover - defensive race guard
-                if "duplicate column" not in str(exc).lower():
-                    raise
+        await self._add_column_if_absent("thought", "action_outcome_score", "REAL")
         if await self._table_exists("action"):
             await self._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_action_source_thought ON action(source_thought_id)"
             )
+            await self._require_index(16, "idx_action_source_thought")
+        await self._require_column(16, "thought", "action_outcome_score")
 
     async def _migrate_core_v16_to_v17(self) -> None:
         """Add the opt-in provenance column and its identity indexes (core-17).
@@ -2371,9 +2290,9 @@ class SqliteEngravaCore:
         * ``thought.provenance`` (nullable ``TEXT``) — a JSON document holding
           the opt-in :class:`~engrava.domain.models.provenance.ProvenanceContext`
           sub-model, or ``NULL`` when a thought carries no provenance. Added via
-          ``ALTER TABLE ... ADD COLUMN``; an ``OperationalError`` naming a
-          duplicate column is swallowed so a database already carrying the
-          column (a partial or re-run migration) is left unchanged.
+          the guarded ``ADD COLUMN`` helper, which tolerates only a duplicate
+          column so a database already carrying it (a partial or re-run
+          migration) is left unchanged.
         * ``idx_thought_prov_session`` / ``idx_thought_prov_actor`` — JSON
           expression indexes on the two identity fields
           (``json_extract(provenance, '$.session_id')`` and ``'$.actor_id'``).
@@ -2398,14 +2317,7 @@ class SqliteEngravaCore:
         indexes need no table-existence guard — the column guard above ensures
         the indexed expression resolves.
         """
-        from sqlite3 import OperationalError  # noqa: PLC0415
-
-        if not await self._column_exists("thought", "provenance"):
-            try:
-                await self._db.execute("ALTER TABLE thought ADD COLUMN provenance TEXT")
-            except OperationalError as exc:  # pragma: no cover - defensive race guard
-                if "duplicate column" not in str(exc).lower():
-                    raise
+        await self._add_column_if_absent("thought", "provenance", "TEXT")
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_thought_prov_session "
             "ON thought(json_extract(provenance, '$.session_id'))"
@@ -2414,6 +2326,9 @@ class SqliteEngravaCore:
             "CREATE INDEX IF NOT EXISTS idx_thought_prov_actor "
             "ON thought(json_extract(provenance, '$.actor_id'))"
         )
+        await self._require_column(17, "thought", "provenance")
+        for index_name in ("idx_thought_prov_session", "idx_thought_prov_actor"):
+            await self._require_index(17, index_name)
 
     async def _migrate_core_v17_to_v18(self) -> None:
         """Add the Memory Hygiene forgetting-loop columns (core-18).
@@ -2441,22 +2356,12 @@ class SqliteEngravaCore:
         on any existing path, so this is "no behavioural change while disabled",
         not literally byte-identical bytes on disk.
         """
-        from sqlite3 import OperationalError  # noqa: PLC0415
-
-        if not await self._column_exists("thought", "pinned"):
-            try:
-                await self._db.execute(
-                    "ALTER TABLE thought ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"
-                )
-            except OperationalError as exc:  # pragma: no cover - defensive race guard
-                if "duplicate column" not in str(exc).lower():
-                    raise
-        if not await self._column_exists("thought", "archived_at_cycle"):
-            try:
-                await self._db.execute("ALTER TABLE thought ADD COLUMN archived_at_cycle INTEGER")
-            except OperationalError as exc:  # pragma: no cover - defensive race guard
-                if "duplicate column" not in str(exc).lower():
-                    raise
+        await self._add_column_if_absent("thought", "pinned", "INTEGER NOT NULL DEFAULT 0")
+        await self._add_column_if_absent("thought", "archived_at_cycle", "INTEGER")
+        # Postcondition: both hygiene columns must exist before the loop bumps
+        # the version.
+        for column in ("pinned", "archived_at_cycle"):
+            await self._require_column(18, "thought", column)
 
     async def _migrate_core_v18_to_v19(self) -> None:
         """Add the generic ``metadata_json`` column to the ``edge`` table (core-19).
@@ -2477,7 +2382,7 @@ class SqliteEngravaCore:
         bumped" state re-entrant.
 
         The ``ALTER`` is followed by a postcondition assertion that the column
-        is present before the function returns. The ladder arm bumps
+        is present before the function returns. The migration loop bumps
         ``user_version`` only *after* this function returns, so for any database
         that **carries the** ``edge`` **table** the version can never be trusted
         while the column is absent: a migrated ``edge`` table at
@@ -2487,7 +2392,7 @@ class SqliteEngravaCore:
 
         The one shape the assertion cannot speak to is a partial bootstrap with
         **no** ``edge`` table at all (a thought-only database): the early return
-        below lets the ladder stamp v19 without touching a table that does not
+        below lets the loop stamp v19 without touching a table that does not
         exist — exactly as every earlier edge migration guards its edge work
         with ``_table_exists`` and still advances the version. This is not a
         hole, because the ``edge`` table is only ever created from nothing by the
@@ -2496,8 +2401,6 @@ class SqliteEngravaCore:
         therefore self-healing. No database can reach a state with an ``edge``
         table that lacks ``metadata_json``.
         """
-        from sqlite3 import OperationalError  # noqa: PLC0415
-
         # The ``edge`` table may be absent in a partial bootstrap (it is created
         # lazily / by the fresh DDL), so guard exactly as the earlier
         # edge-touching migrations (``_migrate_core_v12_to_v13`` /
@@ -2505,19 +2408,10 @@ class SqliteEngravaCore:
         # column to add, and the fresh DDL already carries the column.
         if not await self._table_exists("edge"):
             return
-        if not await self._column_exists("edge", "metadata_json"):
-            try:
-                await self._db.execute(
-                    "ALTER TABLE edge ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
-                )
-            except OperationalError as exc:  # pragma: no cover - defensive race guard
-                if "duplicate column" not in str(exc).lower():
-                    raise
-        # Postcondition: the column must exist before the ladder arm bumps the
+        await self._add_column_if_absent("edge", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
+        # Postcondition: the column must exist before the loop bumps the
         # version, closing the "version bumped without the column" hole.
-        if not await self._column_exists("edge", "metadata_json"):  # pragma: no cover
-            msg = "core-19 migration failed to add the edge.metadata_json column"
-            raise RuntimeError(msg)
+        await self._require_column(19, "edge", "metadata_json")
 
     async def _migrate_core_v19_to_v20(self) -> None:
         """Add the wall-clock archival-instant column ``thought.archived_at`` (core-20).
@@ -2546,29 +2440,55 @@ class SqliteEngravaCore:
         The ``thought`` table is always present by this point (it is the first
         table created by the fresh DDL and by every earlier migration path), so
         the ``ALTER`` needs no table-existence guard. A postcondition assertion
-        confirms the column is present before the ladder arm bumps
+        confirms the column is present before the migration loop bumps
         ``user_version``, closing the "version bumped without the column" hole an
         interrupt could otherwise open.
         """
-        from sqlite3 import OperationalError  # noqa: PLC0415
-
-        if not await self._column_exists("thought", "archived_at"):
-            try:
-                await self._db.execute("ALTER TABLE thought ADD COLUMN archived_at TEXT")
-            except OperationalError as exc:  # pragma: no cover - defensive race guard
-                if "duplicate column" not in str(exc).lower():
-                    raise
-        # Postcondition: the column must exist before the ladder arm bumps the
+        await self._add_column_if_absent("thought", "archived_at", "TEXT")
+        # Postcondition: the column must exist before the loop bumps the
         # version, closing the "version bumped without the column" hole.
-        if not await self._column_exists("thought", "archived_at"):  # pragma: no cover
-            msg = "core-20 migration failed to add the thought.archived_at column"
-            raise RuntimeError(msg)
+        await self._require_column(20, "thought", "archived_at")
 
     async def _fk_present(self, table: str, column: str) -> bool:
-        """Return ``True`` when ``table`` carries an FK on ``column``."""
+        """Return whether ``column`` has the required thought-cascade foreign key.
+
+        Args:
+            table: Child table to inspect.
+            column: Child column that must reference ``thought.thought_id``.
+
+        Returns:
+            ``True`` only for the core contract's exact reference and
+            ``ON DELETE CASCADE`` action.
+
+        """
         cursor = await self._db.execute(f"PRAGMA foreign_key_list({table})")
         rows = await cursor.fetchall()
-        return any(row["from"] == column for row in rows)
+        return any(
+            row["from"] == column
+            and row["table"] == "thought"
+            and row["to"] == "thought_id"
+            and str(row["on_delete"]).upper() == "CASCADE"
+            for row in rows
+        )
+
+    async def _require_fk(self, target_version: int, table: str, column: str) -> None:
+        """Raise :class:`CoreMigrationError` when a required FK is absent.
+
+        Args:
+            target_version: The core schema version the calling step targets.
+            table: Child table expected to carry the foreign key.
+            column: Child column expected to reference ``thought.thought_id``
+                with ``ON DELETE CASCADE``.
+
+        Raises:
+            CoreMigrationError: If the exact foreign-key contract is absent.
+
+        """
+        if not await self._fk_present(table, column):
+            raise CoreMigrationError(
+                target_version,
+                f"{table}.{column} missing thought FK with ON DELETE CASCADE",
+            )
 
     async def _table_exists(self, table: str) -> bool:
         """Return ``True`` when ``table`` is registered in ``sqlite_master``."""
@@ -2577,6 +2497,82 @@ class SqliteEngravaCore:
             (table,),
         )
         return await cursor.fetchone() is not None
+
+    async def _index_exists(self, index: str) -> bool:
+        """Return ``True`` when ``index`` is registered in ``sqlite_master``.
+
+        Presence (registration by name) is the right granularity for a
+        migration postcondition: the migrations own these index names and
+        create each from a fixed ``CREATE INDEX`` statement, so a registered
+        name means our DDL took effect. The exact index *definition* (columns,
+        predicate, expression) is pinned separately by the fresh-vs-migrated
+        schema-parity test suite, which compares normalised index DDL.
+
+        Args:
+            index: The index name to look for.
+
+        Returns:
+            ``True`` if an ``index``-typed entry with that name exists.
+
+        """
+        cursor = await self._db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index,),
+        )
+        return await cursor.fetchone() is not None
+
+    async def _require_index(self, target_version: int, index: str) -> None:
+        """Raise :class:`CoreMigrationError` when ``index`` is not registered.
+
+        A postcondition helper (see :meth:`_require_table` for the shared
+        existence-based-gate contract these ``_require_*`` helpers implement)
+        confirming a step's index was created before the migration loop stamps
+        the version.
+
+        Args:
+            target_version: The core schema version the calling step targets.
+            index: The index name that must be present.
+
+        Raises:
+            CoreMigrationError: If no index with that name is registered.
+
+        """
+        if not await self._index_exists(index):
+            raise CoreMigrationError(target_version, f"{index} missing after create")
+
+    async def _trigger_exists(self, trigger: str) -> bool:
+        """Return ``True`` when ``trigger`` is registered in ``sqlite_master``.
+
+        Args:
+            trigger: The trigger name to look for.
+
+        Returns:
+            ``True`` if a ``trigger``-typed entry with that name exists.
+
+        """
+        cursor = await self._db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            (trigger,),
+        )
+        return await cursor.fetchone() is not None
+
+    async def _require_trigger(self, target_version: int, trigger: str) -> None:
+        """Raise :class:`CoreMigrationError` when ``trigger`` is not registered.
+
+        A postcondition helper (see :meth:`_require_table` for the shared
+        existence-based-gate contract) confirming a step's trigger was created
+        before the migration loop stamps the version.
+
+        Args:
+            target_version: The core schema version the calling step targets.
+            trigger: The trigger name that must be present.
+
+        Raises:
+            CoreMigrationError: If no trigger with that name is registered.
+
+        """
+        if not await self._trigger_exists(trigger):
+            raise CoreMigrationError(target_version, f"{trigger} missing after create")
 
     async def _column_exists(self, table: str, column: str) -> bool:
         """Return ``True`` when ``table`` has a column named ``column``.
@@ -2592,6 +2588,76 @@ class SqliteEngravaCore:
         cursor = await self._db.execute(f"PRAGMA table_info({table})")
         rows = await cursor.fetchall()
         return any(row["name"] == column for row in rows)
+
+    async def _require_table(self, target_version: int, table: str) -> None:
+        """Raise :class:`CoreMigrationError` when ``table`` is not registered.
+
+        Shared contract of the ``_require_*`` postcondition helpers
+        (:meth:`_require_column`, :meth:`_require_index`, :meth:`_require_trigger`
+        and this one): the runtime gate is **existence-based**. It detects a
+        *failed or absent* migration — its object was not created — and raises so
+        the migration loop leaves ``user_version`` retryable rather than stamping
+        it over a partial schema. It deliberately does **not** re-verify object
+        *definitions* (FTS tokenizer or index/trigger bodies): those are pinned
+        by the fresh-vs-migrated schema-parity test suite in dev/CI. Foreign keys
+        are the exception: :meth:`_require_fk` verifies the referenced table,
+        referenced column, and delete action because all three are available via
+        ``PRAGMA foreign_key_list``. A name collision with a pre-existing object
+        of the wrong definition is a corruption/tampering case that the parity
+        suite catches, outside this gate's scope (the migrations own these names
+        and create each from a fixed statement).
+
+        Args:
+            target_version: The core schema version the calling step targets.
+            table: The table name that must be present.
+
+        Raises:
+            CoreMigrationError: If no table with that name is registered.
+
+        """
+        if not await self._table_exists(table):
+            raise CoreMigrationError(target_version, f"{table} table missing after create")
+
+    async def _require_column(self, target_version: int, table: str, column: str) -> None:
+        """Raise :class:`CoreMigrationError` when ``table.column`` is absent.
+
+        A postcondition helper (see :meth:`_require_table` for the shared
+        existence-based-gate contract) confirming a step's column was added
+        before the migration loop stamps the version.
+
+        Args:
+            target_version: The core schema version the calling step targets.
+            table: The table expected to carry the column.
+            column: The column name that must be present.
+
+        Raises:
+            CoreMigrationError: If the column is not present on the table.
+
+        """
+        if not await self._column_exists(table, column):
+            raise CoreMigrationError(target_version, f"{table}.{column} missing after migration")
+
+    async def _add_column_if_absent(self, table: str, column: str, column_type: str) -> None:
+        """Idempotently add ``column`` to ``table`` when it is not already present.
+
+        Guards on current presence and tolerates only the duplicate-column error
+        (the idempotent re-run signal); any other DDL failure propagates so a
+        genuine failure is never silently recorded as a completed migration.
+
+        Args:
+            table: The table to alter. Must already exist.
+            column: The column name to add.
+            column_type: The SQLite column type and constraints, e.g. ``"TEXT"``
+                or ``"INTEGER NOT NULL DEFAULT 0"``.
+
+        """
+        if await self._column_exists(table, column):
+            return
+        try:
+            await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+        except aiosqlite.OperationalError as exc:  # pragma: no cover - defensive race guard
+            if "duplicate column" not in str(exc).lower():
+                raise
 
     async def _purge_orphan_children(self) -> None:
         """Delete orphan rows whose parent thought no longer exists.
