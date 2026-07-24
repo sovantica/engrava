@@ -26,8 +26,13 @@
 --          edge(edge_type, to_thought_id) for edge-type-scoped inbound lookups;
 --          core-14 added the hot-path indexes edge.to_thought_id,
 --          embedding.owner_id, thought.updated_cycle, thought.thought_type)
-
-PRAGMA user_version = 20;
+--
+-- ``user_version`` is stamped at the very END of this script (after every DDL
+-- statement below), never here at the top. Stamping last means a bootstrap that
+-- fails part-way leaves ``user_version = 0`` (unstamped): the next
+-- ``ensure_schema()`` re-runs this idempotent (``IF NOT EXISTS``) script and
+-- only reaches the stamp once the full head schema is present — the same
+-- postcondition-before-stamp invariant the incremental migration ladder upholds.
 
 CREATE TABLE IF NOT EXISTS thought (
     thought_id        TEXT    PRIMARY KEY,
@@ -351,3 +356,9 @@ CREATE INDEX IF NOT EXISTS idx_thought_prov_session
     ON thought(json_extract(provenance, '$.session_id'));
 CREATE INDEX IF NOT EXISTS idx_thought_prov_actor
     ON thought(json_extract(provenance, '$.actor_id'));
+
+-- Stamp the schema version LAST: only a fully-applied head schema is marked
+-- current. A DDL failure above leaves ``user_version = 0`` so the next
+-- ``ensure_schema()`` re-runs this idempotent bootstrap rather than skipping
+-- every migration against an incomplete schema (postcondition-before-stamp).
+PRAGMA user_version = 20;

@@ -301,6 +301,37 @@ def _is_unique_violation(exc: aiosqlite.IntegrityError) -> bool:
     return "UNIQUE" in str(exc).upper()  # pragma: no cover
 
 
+#: The extended result code for a ``FOREIGN KEY`` constraint violation (787).
+#: Classified structurally via :attr:`sqlite3.Error.sqlite_errorcode` so a
+#: user-defined trigger that merely mentions "foreign key" in its ``RAISE(ABORT,
+#: ...)`` message (a ``SQLITE_CONSTRAINT_TRIGGER``, 1811) is never misread as a
+#: real referential-integrity failure.
+_FOREIGN_KEY_CONSTRAINT_ERRORCODE: int = getattr(sqlite3, "SQLITE_CONSTRAINT_FOREIGNKEY", 787)
+
+
+def _is_foreign_key_violation(exc: aiosqlite.IntegrityError) -> bool:
+    """Return ``True`` when *exc* is a genuine ``FOREIGN KEY`` constraint failure.
+
+    Uses SQLite's extended result code (Python 3.11+) rather than a message
+    substring, so a differently-sourced abort whose text happens to contain
+    "foreign key" (e.g. a trigger ``RAISE(ABORT, ...)``) is not misclassified.
+    A text match is used only as a fallback if the extended code is unavailable.
+
+    Args:
+        exc: The raised SQLite integrity error.
+
+    Returns:
+        ``True`` for a FOREIGN KEY violation, ``False`` otherwise.
+
+    """
+    errorcode = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(errorcode, int):
+        return errorcode == _FOREIGN_KEY_CONSTRAINT_ERRORCODE
+    # Fallback only when the extended result code is unavailable. Unreachable on
+    # the supported floor (Python >= 3.11 always exposes ``sqlite_errorcode``).
+    return "FOREIGN KEY" in str(exc).upper()  # pragma: no cover
+
+
 class _DerivationRollbackError(Exception):
     """Internal: a per-child rollback itself failed during derivation.
 
@@ -2043,7 +2074,9 @@ class SqliteEngravaCore:
                 # Commit the recreate steps before re-enabling FK so the
                 # ON pragma also lands outside a transaction.
                 await self._db.commit()
-            except BaseException:  # noqa: BLE001 - rollback must also cover cancellation
+            # ``except BaseException`` (not ``Exception``) so a cancellation
+            # during recreate also rolls back before it propagates.
+            except BaseException:
                 # Keep the failed step retryable on this same connection. In
                 # particular, never leave a committed ``*_new`` table or a
                 # half-completed table swap for the next attempt to inherit.
@@ -2057,23 +2090,28 @@ class SqliteEngravaCore:
         # repaired rather than failing the same postcondition on every retry.
         if edge_exists:
             await self._db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_edge_type_from "
-                "ON edge(edge_type, from_thought_id)"
+                "CREATE INDEX IF NOT EXISTS idx_edge_type_from ON edge(edge_type, from_thought_id)"
             )
 
-        # Postcondition: every child table that exists now carries its FK, and
-        # the edge recreate re-created ``idx_edge_type_from`` (dropped with the
-        # old table), so the loop never marks a v12 database current without
-        # referential integrity or the candidate-expansion index.
-        for table, column in (
-            ("edge", "from_thought_id"),
-            ("edge", "to_thought_id"),
-            ("embedding", "owner_id"),
-            ("action", "source_thought_id"),
+        # Postcondition: every child table that EXISTED AT ENTRY must still
+        # exist and now carry its FK, and the edge recreate re-created
+        # ``idx_edge_type_from`` (dropped with the old table). Keying off the
+        # entry-time ``*_exists`` flags — not a fresh existence probe — means a
+        # table present at entry but vanished mid-migration fails ``_require_table``
+        # here rather than being silently skipped and stamped v12 without
+        # referential integrity. A table absent at entry (partial bootstrap with
+        # only ``thought``) has nothing to migrate and is not required.
+        for existed_at_entry, table, column in (
+            (edge_exists, "edge", "from_thought_id"),
+            (edge_exists, "edge", "to_thought_id"),
+            (embedding_exists, "embedding", "owner_id"),
+            (action_exists, "action", "source_thought_id"),
         ):
-            if await self._table_exists(table):
-                await self._require_fk(12, table, column)
-        if await self._table_exists("edge"):
+            if not existed_at_entry:
+                continue
+            await self._require_table(12, table)
+            await self._require_fk(12, table, column)
+        if edge_exists:
             await self._require_index(12, "idx_edge_type_from")
 
         # Retry model: the per-step registry resumes a failed upgrade at the
@@ -2656,8 +2694,16 @@ class SqliteEngravaCore:
             return
         try:
             await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
-        except aiosqlite.OperationalError as exc:  # pragma: no cover - defensive race guard
-            if "duplicate column" not in str(exc).lower():
+        except aiosqlite.OperationalError as exc:
+            # Tolerate ONLY the exact "duplicate column name: <column>" signal for
+            # THIS column (a concurrent add after the presence guard passed). The
+            # SQLite message ends with the column name, so an exact (whole-message)
+            # match avoids a prefix collision — a duplicate-column error for a
+            # different column (e.g. ``<column>_extra``) is NOT a substring match
+            # and propagates, so a genuine DDL failure is never silently recorded
+            # as a completed migration.
+            expected = f"duplicate column name: {column}".lower()
+            if str(exc).strip().lower() != expected:
                 raise
 
     async def _purge_orphan_children(self) -> None:
@@ -5585,29 +5631,38 @@ class SqliteEngravaCore:
                 ),
             )
         except aiosqlite.IntegrityError as exc:
-            error_text = str(exc).upper()
-            duplicate_cursor = await self._db.execute(
-                "SELECT 1 FROM edge "
-                "WHERE from_thought_id = ? AND to_thought_id = ? AND edge_type = ? "
-                "LIMIT 1",
-                (edge.from_thought_id, edge.to_thought_id, edge.edge_type.value),
-            )
-            if await duplicate_cursor.fetchone() is not None:
-                raise DuplicateEdgeError(
-                    edge.from_thought_id,
-                    edge.to_thought_id,
-                    edge.edge_type.value,
+            # Classify structurally by the extended result code BEFORE any
+            # existence probe: a FOREIGN KEY failure maps to the domain wrapper,
+            # and only a UNIQUE / PRIMARY KEY failure is a candidate duplicate.
+            # A CHECK / NOT NULL / trigger abort (even one whose message mentions
+            # "foreign key") is neither and propagates unchanged.
+            if _is_foreign_key_violation(exc):
+                column, referenced = await self._identify_orphan_endpoint(edge)
+                raise ReferentialIntegrityError(
+                    entity_type="edge",
+                    column=column,
+                    referenced_id=referenced,
                 ) from exc
-            if "FOREIGN KEY" not in error_text:
-                # Preserve unrelated integrity failures, such as a duplicate
-                # caller-supplied edge_id, for their own future domain contract.
-                raise
-            column, referenced = await self._identify_orphan_endpoint(edge)
-            raise ReferentialIntegrityError(
-                entity_type="edge",
-                column=column,
-                referenced_id=referenced,
-            ) from exc
+            if _is_unique_violation(exc):
+                # Confirm the collision is the directed-endpoint + type identity
+                # (the conflict-as-reuse case) rather than another UNIQUE
+                # constraint, such as a caller-supplied duplicate ``edge_id``,
+                # which keeps its own contract and propagates.
+                duplicate_cursor = await self._db.execute(
+                    "SELECT 1 FROM edge "
+                    "WHERE from_thought_id = ? AND to_thought_id = ? AND edge_type = ? "
+                    "LIMIT 1",
+                    (edge.from_thought_id, edge.to_thought_id, edge.edge_type.value),
+                )
+                if await duplicate_cursor.fetchone() is not None:
+                    raise DuplicateEdgeError(
+                        edge.from_thought_id,
+                        edge.to_thought_id,
+                        edge.edge_type.value,
+                    ) from exc
+            # Preserve every other integrity failure (a non-duplicate UNIQUE, a
+            # CHECK, NOT NULL, or trigger abort) for its own contract.
+            raise
 
         if self._journal is not None:
             await self._journal.append(
@@ -8273,7 +8328,6 @@ class SqliteEngravaCore:
 
         """
         import math  # noqa: PLC0415
-        import struct  # noqa: PLC0415
         import time as _time  # noqa: PLC0415
 
         from engrava.domain.models.search import HybridSearchResult  # noqa: PLC0415
@@ -8334,20 +8388,9 @@ class SqliteEngravaCore:
         # per-row ``emb is None`` branch did.
         embeddings_by_id = await self._batch_fetch_embedding_blobs(reflection_ids)
 
-        scores: list[tuple[str, float]] = []
-        for rid in reflection_ids:
-            emb = embeddings_by_id.get(rid)
-            if emb is None:
-                scores.append((rid, 0.0))
-                continue
-            _dimension, _blob = emb
-            vec = list(struct.unpack(f"{_dimension}f", _blob))
-            v_norm = math.sqrt(sum(x * x for x in vec))
-            if v_norm == 0.0:
-                scores.append((rid, 0.0))
-                continue
-            dot = sum(a * b for a, b in zip(effective_vector, vec, strict=False))
-            scores.append((rid, dot / (q_norm * v_norm)))
+        scores = self._cosine_score_reflections(
+            reflection_ids, effective_vector, q_norm, embeddings_by_id
+        )
 
         # Optional recency blend when current_cycle is provided
         if current_cycle is not None:
@@ -8375,6 +8418,45 @@ class SqliteEngravaCore:
             results=final_scores,
             backends_used=frozenset(backends_used_set),
         )
+
+    @staticmethod
+    def _cosine_score_reflections(
+        reflection_ids: list[str],
+        query_vector: list[float],
+        query_norm: float,
+        embeddings_by_id: dict[str, tuple[int, bytes]],
+    ) -> list[tuple[str, float]]:
+        """Score each reflection id by cosine similarity to the query vector.
+
+        A reflection with no stored embedding, or a zero-norm embedding, scores
+        ``0.0`` — matching the per-row behaviour of the general ranked
+        retrieval paths.
+
+        Args:
+            reflection_ids: REFLECTION thought ids to score, in output order.
+            query_vector: The effective (auto-embedded or supplied) query vector.
+            query_norm: Precomputed L2 norm of ``query_vector`` (non-zero).
+            embeddings_by_id: Batch-fetched ``(dimension, blob)`` per id.
+
+        Returns:
+            ``(reflection_id, cosine_score)`` pairs in ``reflection_ids`` order.
+
+        """
+        scores: list[tuple[str, float]] = []
+        for rid in reflection_ids:
+            emb = embeddings_by_id.get(rid)
+            if emb is None:
+                scores.append((rid, 0.0))
+                continue
+            dimension, blob = emb
+            vec = list(struct.unpack(f"{dimension}f", blob))
+            v_norm = math.sqrt(sum(x * x for x in vec))
+            if v_norm == 0.0:
+                scores.append((rid, 0.0))
+                continue
+            dot = sum(a * b for a, b in zip(query_vector, vec, strict=False))
+            scores.append((rid, dot / (query_norm * v_norm)))
+        return scores
 
     # ------------------------------------------------------------------
     # Access tracking
