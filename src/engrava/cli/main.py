@@ -657,15 +657,18 @@ def snapshot(ctx: click.Context, output_path: str | None, service_name: str | No
     if effective_service is None and services_cfg is not None:
         effective_service = services_cfg.default_service
 
+    # Validate any resolved service name — an explicit --service (including an
+    # empty string, which is falsy) or a config default — up front so a malformed
+    # value is a clean ClickException rather than a silent fall-through to the
+    # single-database path or a later traceback.
+    if effective_service is not None:
+        _require_valid_cli_service_name(effective_service)
+
     async def _snapshot() -> None:
         if effective_service:
             from engrava.infrastructure.service_manager import (  # noqa: PLC0415
                 EngravaManager,
             )
-
-            # Validate the name first so ``../escape`` is a clean CLI error
-            # rather than a traceback from the service-name check below.
-            _require_valid_cli_service_name(effective_service)
 
             data_dir = services_cfg.data_dir if services_cfg else cfg.db_path.parent
             manager = EngravaManager(
@@ -1152,10 +1155,8 @@ async def _restore_service_snapshot(
     """
     from engrava.infrastructure.service_manager import EngravaManager  # noqa: PLC0415
 
-    # Validate the name first so ``../escape`` is a clean CLI error rather than
-    # a traceback — and distinct from the provider failure handled below.
-    _require_valid_cli_service_name(effective_service)
-
+    # The service name was validated up front by the command (see restore()), so
+    # ``effective_service`` is a well-formed, non-empty name here.
     data_dir = services_cfg.data_dir if services_cfg else cfg.db_path.parent
     manager = EngravaManager(
         data_dir=data_dir,
@@ -1298,6 +1299,13 @@ def restore(
     effective_service = service_name
     if effective_service is None and services_cfg is not None:
         effective_service = services_cfg.default_service
+
+    # Validate any resolved service name — an explicit --service (including an
+    # empty string, which is falsy) or a config default — up front so a malformed
+    # value is a clean ClickException rather than a silent fall-through to the
+    # single-database path or a mislabelled embedding-provider error.
+    if effective_service is not None:
+        _require_valid_cli_service_name(effective_service)
 
     async def _restore() -> None:
         if effective_service:

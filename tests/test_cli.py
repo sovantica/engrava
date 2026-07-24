@@ -329,6 +329,27 @@ class TestSnapshot:
         # It was handled as a ClickException (clean exit), not an uncaught error.
         assert isinstance(result.exception, SystemExit)
 
+    @pytest.mark.parametrize("bad_service", ["", "   "])
+    def test_snapshot_empty_service_name_is_clean_error(
+        self,
+        runner: CliRunner,
+        db_path: Path,
+        bad_service: str,
+    ) -> None:
+        """An explicit empty/whitespace --service is validated, not routed away.
+
+        Such a value is falsy, so it must be rejected on `is not None` rather
+        than a truthiness check that would fall through to the single-database
+        path.
+        """
+        result = runner.invoke(
+            cli,
+            ["--db", str(db_path), "snapshot", "--service", bad_service],
+        )
+        assert result.exit_code != 0
+        assert "Invalid --service value" in result.output
+        assert isinstance(result.exception, SystemExit)
+
 
 class TestRestore:
     """Tests for ``engrava restore``."""
@@ -384,6 +405,30 @@ class TestRestore:
         result = runner.invoke(
             cli,
             ["--db", str(db_path), "restore", "-i", str(snap), "--service", "../escape"],
+        )
+        assert result.exit_code != 0
+        assert "Invalid --service value" in result.output
+        assert "embedding provider" not in result.output
+        assert isinstance(result.exception, SystemExit)
+
+    @pytest.mark.parametrize("bad_service", ["", "   "])
+    def test_restore_empty_service_name_is_clean_error(
+        self,
+        runner: CliRunner,
+        db_path: Path,
+        tmp_path: Path,
+        bad_service: str,
+    ) -> None:
+        """An explicit empty/whitespace --service on restore is rejected cleanly.
+
+        Such a value is falsy; validating on `is not None` gives it the same
+        clean ClickException as any other malformed name instead of silently
+        falling through to the single-database path.
+        """
+        snap = tmp_path / "missing.jsonl"
+        result = runner.invoke(
+            cli,
+            ["--db", str(db_path), "restore", "-i", str(snap), "--service", bad_service],
         )
         assert result.exit_code != 0
         assert "Invalid --service value" in result.output
