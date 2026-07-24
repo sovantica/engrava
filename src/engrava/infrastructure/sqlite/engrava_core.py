@@ -282,7 +282,6 @@ def _is_unique_violation(exc: aiosqlite.IntegrityError) -> bool:
     Python 3.11+) — a UNIQUE (2067) or PRIMARY KEY (1555) code — instead of
     matching the message text, which is locale/driver-fragile and could
     misclassify (e.g. a ``CHECK`` constraint whose name contains ``"unique"``).
-    A text match is used only as a fallback if the extended code is unavailable.
 
     Args:
         exc: The raised SQLite integrity error.
@@ -294,11 +293,13 @@ def _is_unique_violation(exc: aiosqlite.IntegrityError) -> bool:
 
     """
     errorcode = getattr(exc, "sqlite_errorcode", None)
-    if isinstance(errorcode, int):
-        return errorcode in _UNIQUE_CONSTRAINT_ERRORCODES
-    # Fallback only when the extended result code is unavailable. Unreachable on
-    # the supported floor (Python >= 3.11 always exposes ``sqlite_errorcode``).
-    return "UNIQUE" in str(exc).upper()  # pragma: no cover
+    if not isinstance(errorcode, int):
+        # Unreachable on the supported floor (Python >= 3.11 always exposes
+        # ``sqlite_errorcode``). Fail safe rather than guessing from fragile
+        # message text: "not a recognised unique violation" lets the caller
+        # propagate the original error instead of misclassifying it.
+        return False  # pragma: no cover
+    return errorcode in _UNIQUE_CONSTRAINT_ERRORCODES
 
 
 #: The extended result code for a ``FOREIGN KEY`` constraint violation (787).
@@ -315,7 +316,6 @@ def _is_foreign_key_violation(exc: aiosqlite.IntegrityError) -> bool:
     Uses SQLite's extended result code (Python 3.11+) rather than a message
     substring, so a differently-sourced abort whose text happens to contain
     "foreign key" (e.g. a trigger ``RAISE(ABORT, ...)``) is not misclassified.
-    A text match is used only as a fallback if the extended code is unavailable.
 
     Args:
         exc: The raised SQLite integrity error.
@@ -325,11 +325,13 @@ def _is_foreign_key_violation(exc: aiosqlite.IntegrityError) -> bool:
 
     """
     errorcode = getattr(exc, "sqlite_errorcode", None)
-    if isinstance(errorcode, int):
-        return errorcode == _FOREIGN_KEY_CONSTRAINT_ERRORCODE
-    # Fallback only when the extended result code is unavailable. Unreachable on
-    # the supported floor (Python >= 3.11 always exposes ``sqlite_errorcode``).
-    return "FOREIGN KEY" in str(exc).upper()  # pragma: no cover
+    if not isinstance(errorcode, int):
+        # Unreachable on the supported floor (Python >= 3.11 always exposes
+        # ``sqlite_errorcode``). Fail safe rather than guessing from fragile
+        # message text: "not a recognised FK violation" lets the caller
+        # propagate the original error instead of misclassifying it.
+        return False  # pragma: no cover
+    return errorcode == _FOREIGN_KEY_CONSTRAINT_ERRORCODE
 
 
 class _DerivationRollbackError(Exception):
@@ -1998,6 +2000,67 @@ class SqliteEngravaCore:
         await self._add_column_if_absent("thought", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
         await self._require_column(11, "thought", "metadata_json")
 
+    async def _recreate_child_tables_with_fk_atomically(
+        self,
+        *,
+        edge_needs: bool,
+        embedding_needs: bool,
+        action_needs: bool,
+    ) -> None:
+        """Recreate the child tables that still lack their FK, atomically.
+
+        All three recreations run inside ONE explicit SAVEPOINT so the whole
+        swap is atomic. Under sqlite3 legacy isolation (aiosqlite's default) the
+        driver does not implicitly begin a transaction for DDL, so a bare
+        ``rollback()`` may NOT undo a mid-recreate ``DROP`` — the child table
+        would be permanently gone and a later ``ensure_schema`` retry (which
+        recomputes ``*_exists`` as ``False``) could then stamp v12 over the
+        missing table. An explicit savepoint enrols every statement, so
+        ``ROLLBACK TO`` provably undoes the DROP and preserves the original
+        table for a clean retry.
+
+        Foreign-key enforcement is disabled for the swap and restored in the
+        outer ``finally`` — which brackets the savepoint itself — so FK
+        enforcement is re-enabled even if establishing the savepoint fails.
+
+        Args:
+            edge_needs: Whether ``edge`` must be recreated with its FK.
+            embedding_needs: Whether ``embedding`` must be recreated with its FK.
+            action_needs: Whether ``action`` must be recreated with its FK.
+
+        """
+        # Close any implicit transaction opened by prior migration steps so
+        # PRAGMA foreign_keys=OFF takes effect (it is ignored inside a txn).
+        await self._db.commit()
+        await self._db.execute("PRAGMA foreign_keys=OFF")
+        try:
+            await self._db.execute("SAVEPOINT recreate_fk")
+            try:
+                await self._purge_orphan_children()
+                if edge_needs:
+                    await self._recreate_edge_with_fk()
+                if embedding_needs:
+                    await self._recreate_embedding_with_fk()
+                if action_needs:
+                    await self._recreate_action_with_fk()
+            # ``except BaseException`` (not ``Exception``) so a cancellation
+            # during recreate also rolls the swap back before it propagates.
+            except BaseException:
+                # Undo every statement back to the savepoint so a half-completed
+                # swap never leaves a dropped table (or a leftover ``*_new``
+                # table) for the next attempt to inherit, then release it.
+                await self._db.execute("ROLLBACK TO recreate_fk")
+                await self._db.execute("RELEASE recreate_fk")
+                raise
+            else:
+                # Success: release the savepoint (commits the swap) and land the
+                # commit outside any transaction so re-enabling FK below — a
+                # no-op inside a transaction — actually takes effect.
+                await self._db.execute("RELEASE recreate_fk")
+                await self._db.commit()
+        finally:
+            await self._db.execute("PRAGMA foreign_keys=ON")
+
     async def _migrate_core_v11_to_v12(self) -> None:
         """Add referential integrity (FK + ON DELETE CASCADE) to child tables.
 
@@ -2058,32 +2121,11 @@ class SqliteEngravaCore:
         )
 
         if migration_needed:
-            # Close any implicit transaction opened by prior migration steps
-            # so PRAGMA foreign_keys=OFF actually takes effect (the pragma
-            # is silently ignored while a transaction is open).
-            await self._db.commit()
-            await self._db.execute("PRAGMA foreign_keys=OFF")
-            try:
-                await self._purge_orphan_children()
-                if edge_exists and not edge_done:
-                    await self._recreate_edge_with_fk()
-                if embedding_exists and not embedding_done:
-                    await self._recreate_embedding_with_fk()
-                if action_exists and not action_done:
-                    await self._recreate_action_with_fk()
-                # Commit the recreate steps before re-enabling FK so the
-                # ON pragma also lands outside a transaction.
-                await self._db.commit()
-            # ``except BaseException`` (not ``Exception``) so a cancellation
-            # during recreate also rolls back before it propagates.
-            except BaseException:
-                # Keep the failed step retryable on this same connection. In
-                # particular, never leave a committed ``*_new`` table or a
-                # half-completed table swap for the next attempt to inherit.
-                await self._db.rollback()
-                raise
-            finally:
-                await self._db.execute("PRAGMA foreign_keys=ON")
+            await self._recreate_child_tables_with_fk_atomically(
+                edge_needs=edge_exists and not edge_done,
+                embedding_needs=embedding_exists and not embedding_done,
+                action_needs=action_exists and not action_done,
+            )
 
         # The edge recreation drops its indexes. Ensure the required v8 index
         # also when the FK was already present, so a partial legacy schema is
@@ -2117,10 +2159,10 @@ class SqliteEngravaCore:
         # Retry model: the per-step registry resumes a failed upgrade at the
         # failed step (an improvement over the old bump-once-at-the-end ladder,
         # which re-ran the whole tail). The table swaps are atomic within the
-        # recreate transaction and explicitly rolled back on failure; a
-        # persisted partial legacy state is still convergent because tables
-        # already carrying the exact FK are skipped and the required edge index
-        # is recreated independently above.
+        # SAVEPOINT above and rolled back to it on failure, so a mid-recreate
+        # drop never persists; a legacy state that already carries the exact FK
+        # is skipped and the required edge index is recreated independently, so
+        # a resumed upgrade is convergent.
 
     async def _migrate_core_v12_to_v13(self) -> None:
         """Add nullable valid-time columns + indexes to thought and edge (core-13).

@@ -897,6 +897,94 @@ class TestV11ToV12PostconditionCatchesVanishedTable:
             assert version_row is not None
             assert version_row[0] < 12
 
+    async def test_mid_recreate_failure_rolls_back_and_retry_completes(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A mid-recreate failure rolls the DROP back; a clean retry reaches v20.
+
+        Under sqlite3 legacy isolation (aiosqlite's default) DDL is not enrolled
+        in an implicit transaction, so without the SAVEPOINT a failure after the
+        recreate's ``DROP`` could leave the child table permanently gone and a
+        later attempt (``*_exists`` recomputed False) could stamp v12 over the
+        missing table. The savepoint rolls the swap back so the original table
+        survives with its row, foreign-key enforcement is restored, and a second
+        ``ensure_schema`` (fault removed) converges on a complete v20 schema with
+        every foreign key — never a v12 stamp over a missing table.
+        """
+        db_path = tmp_path / "midfail-v11.sqlite"
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await TestMigrationV11ToV12._bootstrap_v11_schema(db)
+            await db.execute(
+                "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+                "VALUES ('t1', 'OBSERVATION', 'a', 'a', 'P3')",
+            )
+            await db.execute(
+                "INSERT INTO embedding (embedding_id, owner_type, owner_id, model_name, "
+                " dimension, vector_blob, created_at) "
+                "VALUES ('emb1', 'THOUGHT', 't1', 'm', 3, ?, '2026-01-01T00:00:00+00:00')",
+                (b"\x00\x01\x02",),
+            )
+            await db.commit()
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            core = SqliteEngravaCore(db=db, embedding_provider=None, auto_embed=False)
+
+            async def _drop_then_fail() -> None:
+                # Mimic a recreate that drops the old table and then fails before
+                # completing the swap (e.g. crash before RENAME).
+                await db.execute("DROP TABLE embedding")
+                msg = "injected mid-recreate failure"
+                raise RuntimeError(msg)
+
+            # First attempt: the recreate fails mid-swap.
+            with (
+                patch.object(core, "_recreate_embedding_with_fk", _drop_then_fail),
+                pytest.raises(RuntimeError, match="injected mid-recreate"),
+            ):
+                await core.ensure_schema()
+
+            # The savepoint rolled the DROP back: embedding survives with its row,
+            # and the version was not advanced to 12.
+            present = await (
+                await db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embedding'"
+                )
+            ).fetchone()
+            assert present is not None, "savepoint should have rolled back the DROP"
+            count_row = await (await db.execute("SELECT COUNT(*) FROM embedding")).fetchone()
+            assert count_row is not None
+            assert count_row[0] == 1, "the original embedding row must survive the rollback"
+            version_row = await (await db.execute("PRAGMA user_version")).fetchone()
+            assert version_row is not None
+            assert version_row[0] < 12
+            # Foreign-key enforcement was restored after the failed attempt (the
+            # outer finally re-enables it even though the swap failed).
+            fk_row = await (await db.execute("PRAGMA foreign_keys")).fetchone()
+            assert fk_row is not None
+            assert fk_row[0] == 1
+
+            # Second attempt with the fault removed converges on a complete v20.
+            await core.ensure_schema()
+            version_row = await (await db.execute("PRAGMA user_version")).fetchone()
+            assert version_row is not None
+            assert version_row[0] == 20
+            for table, column in (
+                ("edge", "from_thought_id"),
+                ("edge", "to_thought_id"),
+                ("embedding", "owner_id"),
+                ("action", "source_thought_id"),
+            ):
+                fks = list(
+                    await (await db.execute(f"PRAGMA foreign_key_list({table})")).fetchall(),
+                )
+                assert any(row["from"] == column for row in fks), f"{table}.{column} FK missing"
+            violations = list(
+                await (await db.execute("PRAGMA foreign_key_check")).fetchall(),
+            )
+            assert violations == [], f"unexpected FK violations: {violations}"
+
 
 class TestAddColumnIfAbsentExactMatch:
     """``_add_column_if_absent`` tolerates only the exact duplicate-column race."""
