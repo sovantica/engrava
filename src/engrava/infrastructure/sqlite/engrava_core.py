@@ -2019,9 +2019,21 @@ class SqliteEngravaCore:
         ``ROLLBACK TO`` provably undoes the DROP and preserves the original
         table for a clean retry.
 
-        Foreign-key enforcement is disabled for the swap and restored in the
-        outer ``finally`` — which brackets the savepoint itself — so FK
-        enforcement is re-enabled even if establishing the savepoint fails.
+        Foreign-key enforcement is per-connection, and ``PRAGMA foreign_keys``
+        is silently ignored inside an open transaction, so a leaked "off" state
+        would make the rest of the session accept orphans and skip
+        ``ON DELETE CASCADE`` without ever raising. Both the disable and the
+        savepoint therefore live inside the outer ``try`` whose ``finally``
+        closes any still-open transaction and re-enables enforcement, covering
+        every failure of a transaction-control statement.
+
+        This is a strong best effort, not an absolute postcondition: if the
+        cleanup ``rollback()`` itself fails while leaving a transaction active,
+        the following pragma is ignored, and the restore is itself an ``await``
+        that a further cancellation could interrupt. Callers that swallow a
+        migration failure and keep using the connection should re-assert
+        ``PRAGMA foreign_keys=ON`` (``ensure_schema`` does so on its success
+        path) or discard the connection.
 
         Args:
             edge_needs: Whether ``edge`` must be recreated with its FK.
@@ -2032,8 +2044,11 @@ class SqliteEngravaCore:
         # Close any implicit transaction opened by prior migration steps so
         # PRAGMA foreign_keys=OFF takes effect (it is ignored inside a txn).
         await self._db.commit()
-        await self._db.execute("PRAGMA foreign_keys=OFF")
         try:
+            # Inside the try: a failure (or cancellation) delivered on this await
+            # may still leave the pragma applied on the connection, so the
+            # ``finally`` below must already cover it.
+            await self._db.execute("PRAGMA foreign_keys=OFF")
             await self._db.execute("SAVEPOINT recreate_fk")
             try:
                 await self._purge_orphan_children()
@@ -2049,6 +2064,12 @@ class SqliteEngravaCore:
                 # Undo every statement back to the savepoint so a half-completed
                 # swap never leaves a dropped table (or a leftover ``*_new``
                 # table) for the next attempt to inherit, then release it.
+                #
+                # If one of these control statements itself fails, it propagates
+                # and the outer ``finally`` discards the whole transaction — the
+                # safe outcome, and deliberately NOT a further ``RELEASE``:
+                # releasing the OUTERMOST savepoint COMMITS, so a release after a
+                # failed ``ROLLBACK TO`` would durably commit the half-swap.
                 await self._db.execute("ROLLBACK TO recreate_fk")
                 await self._db.execute("RELEASE recreate_fk")
                 raise
@@ -2059,7 +2080,19 @@ class SqliteEngravaCore:
                 await self._db.execute("RELEASE recreate_fk")
                 await self._db.commit()
         finally:
-            await self._db.execute("PRAGMA foreign_keys=ON")
+            try:
+                # ``PRAGMA foreign_keys`` is ignored inside a transaction, so
+                # close any that is still open first. Issued UNCONDITIONALLY:
+                # ``in_transaction`` is read straight off the connection and can
+                # be stale relative to a statement still queued in aiosqlite's
+                # worker, so gating on it could skip a rollback that is in fact
+                # needed. On the committed success path this is a no-op.
+                await self._db.rollback()
+            finally:
+                # Nested so the restore is still attempted even if the rollback
+                # above fails — the pragma is per-connection, and leaving it OFF
+                # would silently disable FK enforcement for the whole session.
+                await self._db.execute("PRAGMA foreign_keys=ON")
 
     async def _migrate_core_v11_to_v12(self) -> None:
         """Add referential integrity (FK + ON DELETE CASCADE) to child tables.

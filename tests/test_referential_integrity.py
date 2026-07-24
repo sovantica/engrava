@@ -985,6 +985,128 @@ class TestV11ToV12PostconditionCatchesVanishedTable:
             )
             assert violations == [], f"unexpected FK violations: {violations}"
 
+    @pytest.mark.parametrize(
+        ("failing_statement", "fail_body"),
+        [
+            ("PRAGMA foreign_keys=OFF", False),
+            ("SAVEPOINT", False),
+            (None, True),
+            ("ROLLBACK TO", True),
+            ("RELEASE", True),
+            # RELEASE also runs on the success path, where it commits the swap.
+            ("RELEASE", False),
+        ],
+        ids=[
+            "off-pragma",
+            "savepoint",
+            "body",
+            "rollback-to",
+            "release-after-body-failure",
+            "release-on-success-path",
+        ],
+    )
+    async def test_control_statement_failure_never_leaks_fk_or_savepoint(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        failing_statement: str | None,
+        fail_body: bool,
+    ) -> None:
+        """No failure path leaves FK off, a transaction open, or a ``*_new`` table.
+
+        ``PRAGMA foreign_keys`` is per-connection and is silently ignored inside
+        an open transaction, so a leaked "off" state (or a stuck savepoint that
+        keeps a transaction open) would make the rest of the session accept
+        orphans and skip ``ON DELETE CASCADE`` with no error at all. This injects
+        a failure at every transaction-control point of the swap — disabling FK,
+        establishing the savepoint, the recreate body itself, ``ROLLBACK TO`` and
+        ``RELEASE`` — and asserts the connection is always left safe.
+        """
+        db_path = tmp_path / f"leak-{failing_statement or 'body'}-{fail_body}.sqlite"
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await TestMigrationV11ToV12._bootstrap_v11_schema(db)
+            await db.execute(
+                "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+                "VALUES ('t1', 'OBSERVATION', 'a', 'a', 'P3')",
+            )
+            await db.execute(
+                "INSERT INTO embedding (embedding_id, owner_type, owner_id, model_name, "
+                " dimension, vector_blob, created_at) "
+                "VALUES ('emb1', 'THOUGHT', 't1', 'm', 3, ?, '2026-01-01T00:00:00+00:00')",
+                (b"\x00\x01\x02",),
+            )
+            await db.commit()
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            core = SqliteEngravaCore(db=db, embedding_provider=None, auto_embed=False)
+
+            if fail_body:
+
+                async def _fail_body() -> None:
+                    # A recreate that drops the old table and then fails, i.e. the
+                    # worst case the savepoint has to undo.
+                    await db.execute("DROP TABLE embedding")
+                    msg = "injected body failure"
+                    raise RuntimeError(msg)
+
+                monkeypatch.setattr(core, "_recreate_embedding_with_fk", _fail_body)
+
+            if failing_statement is not None:
+                real_execute = db.execute
+
+                async def _execute(sql: str, *args: object, **kwargs: object) -> object:
+                    if failing_statement in sql:
+                        msg = f"injected failure at {failing_statement}"
+                        raise RuntimeError(msg)
+                    return await real_execute(sql, *args, **kwargs)
+
+                monkeypatch.setattr(db, "execute", _execute)
+
+            with pytest.raises(RuntimeError, match="injected"):
+                await core.ensure_schema()
+
+            # Restore the real driver before inspecting the connection state.
+            monkeypatch.undo()
+
+            # (a) Foreign-key enforcement is back on for the rest of the session.
+            fk_row = await (await db.execute("PRAGMA foreign_keys")).fetchone()
+            assert fk_row is not None
+            assert fk_row[0] == 1, "foreign-key enforcement leaked OFF"
+
+            # (b) No transaction (or savepoint) is left open.
+            assert not db.in_transaction, "a transaction/savepoint was left open"
+
+            # (c) No half-swap scratch table survives.
+            leftovers = [
+                str(row[0])
+                for row in await (
+                    await db.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'table' AND name LIKE '%\\_new' ESCAPE '\\'"
+                    )
+                ).fetchall()
+            ]
+            assert leftovers == [], f"leftover swap tables: {leftovers}"
+
+            # (d) The ORIGINAL pre-migration child table and its row survived —
+            # the swap is either fully applied or fully undone. The legacy v11
+            # table declares no foreign key, so an absent FK proves this is the
+            # rolled-back original rather than a half-swap that got committed.
+            present = await (
+                await db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embedding'"
+                )
+            ).fetchone()
+            assert present is not None, "the original embedding table was lost"
+            count_row = await (await db.execute("SELECT COUNT(*) FROM embedding")).fetchone()
+            assert count_row is not None
+            assert count_row[0] == 1, "the original embedding row was lost"
+            recreated_fks = list(
+                await (await db.execute("PRAGMA foreign_key_list(embedding)")).fetchall(),
+            )
+            assert recreated_fks == [], "a half-swapped embedding table was committed"
+
 
 class TestAddColumnIfAbsentExactMatch:
     """``_add_column_if_absent`` tolerates only the exact duplicate-column race."""
