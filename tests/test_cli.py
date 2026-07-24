@@ -93,7 +93,8 @@ class TestGlobalControls:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         def _unexpected_discovery() -> list[object]:
-            raise AssertionError("CLI extension discovery must stay disabled")
+            msg = "CLI extension discovery must stay disabled"
+            raise AssertionError(msg)
 
         monkeypatch.setattr(
             "engrava.cli.main._discover_extension_commands",
@@ -111,7 +112,8 @@ class TestGlobalControls:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         def _unexpected_discovery() -> list[object]:
-            raise AssertionError("CLI extension discovery must stay disabled")
+            msg = "CLI extension discovery must stay disabled"
+            raise AssertionError(msg)
 
         monkeypatch.setattr(
             "engrava.cli.main._discover_extension_commands",
@@ -133,7 +135,8 @@ class TestGlobalControls:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         def _unexpected_discovery() -> dict[str, object]:
-            raise AssertionError("MindQL extension discovery must stay disabled")
+            msg = "MindQL extension discovery must stay disabled"
+            raise AssertionError(msg)
 
         monkeypatch.setattr(
             "engrava.cli.main._load_mindql_extensions",
@@ -311,6 +314,21 @@ class TestSnapshot:
         default_out = populated_db.with_suffix(".snapshot.jsonl")
         assert default_out.exists()
 
+    def test_snapshot_invalid_service_name_is_clean_error(
+        self,
+        runner: CliRunner,
+        db_path: Path,
+    ) -> None:
+        """An invalid --service value is a clean CLI error, never a traceback."""
+        result = runner.invoke(
+            cli,
+            ["--db", str(db_path), "snapshot", "--service", "../escape"],
+        )
+        assert result.exit_code != 0
+        assert "Invalid --service value" in result.output
+        # It was handled as a ClickException (clean exit), not an uncaught error.
+        assert isinstance(result.exception, SystemExit)
+
 
 class TestRestore:
     """Tests for ``engrava restore``."""
@@ -349,6 +367,28 @@ class TestRestore:
             ["--db", str(populated_db), "restore", "-i", str(snap), "--clear"],
         )
         assert result.exit_code == 0
+
+    def test_restore_invalid_service_name_is_distinct_clean_error(
+        self,
+        runner: CliRunner,
+        db_path: Path,
+        tmp_path: Path,
+    ) -> None:
+        """An invalid --service value is a clean, distinct error on restore.
+
+        It must not be mislabelled as an embedding-provider initialisation
+        failure, and must not print a traceback. Validation happens before any
+        snapshot file is read, so the input path need not exist.
+        """
+        snap = tmp_path / "missing.jsonl"
+        result = runner.invoke(
+            cli,
+            ["--db", str(db_path), "restore", "-i", str(snap), "--service", "../escape"],
+        )
+        assert result.exit_code != 0
+        assert "Invalid --service value" in result.output
+        assert "embedding provider" not in result.output
+        assert isinstance(result.exception, SystemExit)
 
 
 class TestGc:
