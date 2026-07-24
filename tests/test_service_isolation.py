@@ -891,8 +891,7 @@ class TestReEmbedRequiresProvider:
             owner_cursor = await conn.execute("SELECT DISTINCT owner_type FROM embedding")
             owner_types = {str(row[0]) for row in await owner_cursor.fetchall()}
             vec_cursor = await conn.execute(
-                "SELECT 1 FROM sqlite_master "
-                "WHERE type = 'table' AND name = 'embedding_vec'"
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embedding_vec'"
             )
             vec_index_exists = await vec_cursor.fetchone() is not None
             await conn.close()
