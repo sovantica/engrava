@@ -2016,24 +2016,36 @@ class SqliteEngravaCore:
         would be permanently gone and a later ``ensure_schema`` retry (which
         recomputes ``*_exists`` as ``False``) could then stamp v12 over the
         missing table. An explicit savepoint enrols every statement, so
-        ``ROLLBACK TO`` provably undoes the DROP and preserves the original
-        table for a clean retry.
+        ``ROLLBACK TO`` undoes the DROP.
+
+        The contract on failure is **all-or-nothing, not "always the original"**:
+        the swap is either fully rolled back (the original table survives, ready
+        for a clean retry) or fully applied — never half-applied. Both outcomes
+        are self-consistent. If ``RELEASE recreate_fk`` reaches SQLite but
+        cancellation lands before this coroutine resumes, the reconstruction is
+        already committed and the later cleanup ``rollback()`` is a no-op; that
+        state is the migration's intended end state anyway, so a retry sees the
+        foreign keys present and converges on v12.
 
         Foreign-key enforcement is per-connection, and ``PRAGMA foreign_keys``
         is silently ignored inside an open transaction, so a leaked "off" state
         would make the rest of the session accept orphans and skip
         ``ON DELETE CASCADE`` without ever raising. Both the disable and the
         savepoint therefore live inside the outer ``try`` whose ``finally``
-        closes any still-open transaction and re-enables enforcement, covering
-        every failure of a transaction-control statement.
+        closes any still-open transaction and re-enables enforcement. That
+        covers every transaction-control statement except the leading
+        ``commit()``, which precedes the ``try`` and runs while enforcement is
+        still on.
 
         This is a strong best effort, not an absolute postcondition: if the
         cleanup ``rollback()`` itself fails while leaving a transaction active,
         the following pragma is ignored, and the restore is itself an ``await``
-        that a further cancellation could interrupt. Callers that swallow a
-        migration failure and keep using the connection should re-assert
-        ``PRAGMA foreign_keys=ON`` (``ensure_schema`` does so on its success
-        path) or discard the connection.
+        that a further cancellation could interrupt. A caller that swallows a
+        migration failure and keeps using the connection cannot assume
+        enforcement is back on — re-asserting ``PRAGMA foreign_keys=ON`` is not
+        sufficient either, since it is ignored while a transaction is still
+        open. The only reliable boundary after an uncertain cleanup is to
+        discard (close) the connection.
 
         Args:
             edge_needs: Whether ``edge`` must be recreated with its FK.

@@ -480,6 +480,12 @@ class TestMigrationV11ToV12:
                 ).fetchone()
                 assert row is not None
                 assert row[0] == expected, f"{table} row count mismatch"
+            # The success path also leaves the connection safe: the swap disables
+            # foreign keys and opens a savepoint, so pin that both are restored.
+            fk_row = await (await db.execute("PRAGMA foreign_keys")).fetchone()
+            assert fk_row is not None
+            assert fk_row[0] == 1, "foreign-key enforcement left OFF after a successful migration"
+            assert not db.in_transaction, "a transaction was left open after a successful migration"
 
     async def test_orphan_seeded_v11_purges_orphans_only(
         self,
