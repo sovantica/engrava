@@ -429,12 +429,16 @@ class TestConfigActivation:
             "extensions:\n"
             "  dreaming:\n"
             "    enabled: true\n"
-            "    enable_reflections: false\n",
+            "    gates:\n"
+            "      enable_reflections: false\n",
             encoding="utf-8",
         )
         store = await SqliteEngravaCore.from_config(cfg_file)
         try:
             assert store._dreaming_extension is not None
+            # The documented gates key flows through the YAML path (it is not
+            # silently dropped): reflections are disabled as configured.
+            assert store._dreaming_extension.config.gates.enable_reflections is False
             assert store._access_tracking_enabled is True
             for i in range(4):
                 await store.create_thought(_obs(f"obs-{i}"))

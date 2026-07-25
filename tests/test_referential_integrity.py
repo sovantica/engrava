@@ -24,6 +24,7 @@ from __future__ import annotations
 import datetime
 import uuid
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import aiosqlite
 import pytest
@@ -41,7 +42,11 @@ from engrava.domain.enums import (
     ThoughtType,
     VerificationStatus,
 )
-from engrava.domain.exceptions import DuplicateEdgeError, ReferentialIntegrityError
+from engrava.domain.exceptions import (
+    CoreMigrationError,
+    DuplicateEdgeError,
+    ReferentialIntegrityError,
+)
 from engrava.domain.models.action import ActionRecord
 from engrava.domain.models.edge import EdgeRecord
 from engrava.domain.models.thought import ThoughtRecord
@@ -220,6 +225,34 @@ class TestCreateEdgeRejectsOrphans:
         await store.create_edge(_make_edge("e1", "t1", "t2"))
         with pytest.raises(aiosqlite.IntegrityError):
             await store.create_edge(_make_edge("e1", "t1", "t3"))
+
+    async def test_trigger_abort_mentioning_foreign_key_is_not_misclassified(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """A trigger RAISE(ABORT, '...foreign key...') stays a raw IntegrityError.
+
+        Classification is by ``sqlite_errorcode`` (SQLITE_CONSTRAINT_TRIGGER),
+        not the message text, so a trigger abort whose message merely mentions
+        "foreign key" is neither wrapped as ``ReferentialIntegrityError`` nor
+        mistaken for a duplicate — it propagates unchanged, and no row persists.
+        """
+        await store.create_thought(_make_thought("t1"))
+        await store.create_thought(_make_thought("t2"))
+        # Both endpoints resolve, so no genuine FK violation occurs; the trigger
+        # aborts the insert with a message that would fool substring matching.
+        await store._db.execute(
+            "CREATE TRIGGER edge_guard BEFORE INSERT ON edge "
+            "BEGIN SELECT RAISE(ABORT, 'blocked by policy trigger: foreign key rule'); END"
+        )
+        with pytest.raises(aiosqlite.IntegrityError) as excinfo:
+            await store.create_edge(_make_edge("e1", "t1", "t2"))
+        assert not isinstance(excinfo.value, (ReferentialIntegrityError, DuplicateEdgeError))
+        assert getattr(excinfo.value, "sqlite_errorname", "") == "SQLITE_CONSTRAINT_TRIGGER"
+        cursor = await store._db.execute("SELECT COUNT(*) FROM edge")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 0
 
 
 class TestCascadeOnDelete:
@@ -447,6 +480,12 @@ class TestMigrationV11ToV12:
                 ).fetchone()
                 assert row is not None
                 assert row[0] == expected, f"{table} row count mismatch"
+            # The success path also leaves the connection safe: the swap disables
+            # foreign keys and opens a savepoint, so pin that both are restored.
+            fk_row = await (await db.execute("PRAGMA foreign_keys")).fetchone()
+            assert fk_row is not None
+            assert fk_row[0] == 1, "foreign-key enforcement left OFF after a successful migration"
+            assert not db.in_transaction, "a transaction was left open after a successful migration"
 
     async def test_orphan_seeded_v11_purges_orphans_only(
         self,
@@ -740,3 +779,419 @@ class TestMigrationV11ToV12:
                 await (await db.execute("PRAGMA foreign_key_check")).fetchall(),
             )
             assert violations == [], f"unexpected FK violations: {violations}"
+
+
+class TestBootstrapAtomicity:
+    """Fresh bootstrap stamps ``user_version`` only after the full schema applies."""
+
+    async def test_bootstrap_failure_leaves_version_unstamped_and_retryable(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A mid-bootstrap DDL failure leaves version 0; a retry reaches v20.
+
+        The version stamp is the last statement of ``schema_core.sql``, so a DDL
+        failure before it leaves ``user_version = 0`` (never a partial 20). The
+        next ``ensure_schema`` then re-runs the idempotent bootstrap rather than
+        skipping every migration against an incomplete schema.
+        """
+        db_path = tmp_path / "bootstrap.sqlite"
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            core = SqliteEngravaCore(db=db, embedding_provider=None, auto_embed=False)
+
+            real_executescript = db.executescript
+
+            async def _failing_executescript(script: str) -> object:
+                # Run only the FIRST table (``thought``) then fail — a genuine
+                # mid-bootstrap DDL error that leaves a *partial* schema well
+                # before the final ``PRAGMA user_version`` stamp.
+                head, sep, _tail = script.partition("CREATE TABLE IF NOT EXISTS edge")
+                assert sep, "bootstrap script must create the edge table"
+                await real_executescript(head)
+                msg = "injected bootstrap DDL failure"
+                raise aiosqlite.OperationalError(msg)
+
+            with (
+                patch.object(db, "executescript", _failing_executescript),
+                pytest.raises(aiosqlite.OperationalError, match="injected bootstrap"),
+            ):
+                await core.ensure_schema()
+
+            # The failed bootstrap left a PARTIAL schema (thought only, no edge)
+            # and did NOT durably stamp the version.
+            version_row = await (await db.execute("PRAGMA user_version")).fetchone()
+            assert version_row is not None
+            assert version_row[0] == 0
+            present = {
+                str(row[0])
+                for row in await (
+                    await db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+                ).fetchall()
+            }
+            assert "thought" in present
+            assert "edge" not in present, "partial bootstrap should not have reached the edge table"
+
+            # A retry with the real bootstrap converges on a complete head schema.
+            await core.ensure_schema()
+            version_row = await (await db.execute("PRAGMA user_version")).fetchone()
+            assert version_row is not None
+            assert version_row[0] == 20
+            for table in ("thought", "edge", "embedding", "action", "_metadata", "thought_fts"):
+                row = await (
+                    await db.execute(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE name = ?",
+                        (table,),
+                    )
+                ).fetchone()
+                assert row is not None
+                assert row[0] == 1, f"{table} missing after retry"
+            # The recovered schema is usable end to end.
+            await core.create_thought(_make_thought("t-after-retry"))
+            assert await core.get_thought("t-after-retry") is not None
+
+
+class TestV11ToV12PostconditionCatchesVanishedTable:
+    """The v11 -> v12 postcondition keys off entry-time existence flags.
+
+    A standalone class (not a subclass of ``TestMigrationV11ToV12``) so pytest
+    does not re-collect and re-run the whole v11 migration suite; the legacy
+    schema builder is reused via a direct static-method call.
+    """
+
+    async def test_child_table_vanished_mid_migration_is_caught(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A child table present at entry but dropped mid-recreate is caught.
+
+        Keying the postcondition off the entry-time ``*_exists`` flags (not a
+        fresh existence probe) means a vanished child table fails
+        ``_require_table`` rather than being silently skipped and stamped v12
+        without its foreign key. ``embedding`` is used because — unlike ``edge``
+        — it has no post-recreate index step that would surface the drop first,
+        so the failure is caught precisely by the FK postcondition under test.
+        """
+        db_path = tmp_path / "vanished-v11.sqlite"
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await TestMigrationV11ToV12._bootstrap_v11_schema(db)
+            await db.execute(
+                "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+                "VALUES ('t1', 'OBSERVATION', 'a', 'a', 'P3')",
+            )
+            await db.commit()
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            core = SqliteEngravaCore(db=db, embedding_provider=None, auto_embed=False)
+
+            async def _drop_embedding_without_recreate() -> None:
+                await db.execute("DROP TABLE embedding")
+
+            monkeypatch.setattr(
+                core,
+                "_recreate_embedding_with_fk",
+                _drop_embedding_without_recreate,
+            )
+
+            with pytest.raises(CoreMigrationError):
+                await core.ensure_schema()
+
+            # The version was never advanced to 12 over the incomplete schema.
+            version_row = await (await db.execute("PRAGMA user_version")).fetchone()
+            assert version_row is not None
+            assert version_row[0] < 12
+
+    async def test_mid_recreate_failure_rolls_back_and_retry_completes(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A mid-recreate failure rolls the DROP back; a clean retry reaches v20.
+
+        Under sqlite3 legacy isolation (aiosqlite's default) DDL is not enrolled
+        in an implicit transaction, so without the SAVEPOINT a failure after the
+        recreate's ``DROP`` could leave the child table permanently gone and a
+        later attempt (``*_exists`` recomputed False) could stamp v12 over the
+        missing table. The savepoint rolls the swap back so the original table
+        survives with its row, foreign-key enforcement is restored, and a second
+        ``ensure_schema`` (fault removed) converges on a complete v20 schema with
+        every foreign key — never a v12 stamp over a missing table.
+        """
+        db_path = tmp_path / "midfail-v11.sqlite"
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await TestMigrationV11ToV12._bootstrap_v11_schema(db)
+            await db.execute(
+                "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+                "VALUES ('t1', 'OBSERVATION', 'a', 'a', 'P3')",
+            )
+            await db.execute(
+                "INSERT INTO embedding (embedding_id, owner_type, owner_id, model_name, "
+                " dimension, vector_blob, created_at) "
+                "VALUES ('emb1', 'THOUGHT', 't1', 'm', 3, ?, '2026-01-01T00:00:00+00:00')",
+                (b"\x00\x01\x02",),
+            )
+            await db.commit()
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            core = SqliteEngravaCore(db=db, embedding_provider=None, auto_embed=False)
+
+            async def _drop_then_fail() -> None:
+                # Mimic a recreate that drops the old table and then fails before
+                # completing the swap (e.g. crash before RENAME).
+                await db.execute("DROP TABLE embedding")
+                msg = "injected mid-recreate failure"
+                raise RuntimeError(msg)
+
+            # First attempt: the recreate fails mid-swap.
+            with (
+                patch.object(core, "_recreate_embedding_with_fk", _drop_then_fail),
+                pytest.raises(RuntimeError, match="injected mid-recreate"),
+            ):
+                await core.ensure_schema()
+
+            # The savepoint rolled the DROP back: embedding survives with its row,
+            # and the version was not advanced to 12.
+            present = await (
+                await db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embedding'"
+                )
+            ).fetchone()
+            assert present is not None, "savepoint should have rolled back the DROP"
+            count_row = await (await db.execute("SELECT COUNT(*) FROM embedding")).fetchone()
+            assert count_row is not None
+            assert count_row[0] == 1, "the original embedding row must survive the rollback"
+            version_row = await (await db.execute("PRAGMA user_version")).fetchone()
+            assert version_row is not None
+            assert version_row[0] < 12
+            # Foreign-key enforcement was restored after the failed attempt (the
+            # outer finally re-enables it even though the swap failed).
+            fk_row = await (await db.execute("PRAGMA foreign_keys")).fetchone()
+            assert fk_row is not None
+            assert fk_row[0] == 1
+
+            # Second attempt with the fault removed converges on a complete v20.
+            await core.ensure_schema()
+            version_row = await (await db.execute("PRAGMA user_version")).fetchone()
+            assert version_row is not None
+            assert version_row[0] == 20
+            for table, column in (
+                ("edge", "from_thought_id"),
+                ("edge", "to_thought_id"),
+                ("embedding", "owner_id"),
+                ("action", "source_thought_id"),
+            ):
+                fks = list(
+                    await (await db.execute(f"PRAGMA foreign_key_list({table})")).fetchall(),
+                )
+                assert any(row["from"] == column for row in fks), f"{table}.{column} FK missing"
+            violations = list(
+                await (await db.execute("PRAGMA foreign_key_check")).fetchall(),
+            )
+            assert violations == [], f"unexpected FK violations: {violations}"
+
+    @pytest.mark.parametrize(
+        ("failing_statement", "fail_body"),
+        [
+            ("PRAGMA foreign_keys=OFF", False),
+            ("SAVEPOINT", False),
+            (None, True),
+            ("ROLLBACK TO", True),
+            ("RELEASE", True),
+            # RELEASE also runs on the success path, where it commits the swap.
+            ("RELEASE", False),
+        ],
+        ids=[
+            "off-pragma",
+            "savepoint",
+            "body",
+            "rollback-to",
+            "release-after-body-failure",
+            "release-on-success-path",
+        ],
+    )
+    async def test_control_statement_failure_never_leaks_fk_or_savepoint(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        failing_statement: str | None,
+        fail_body: bool,
+    ) -> None:
+        """No failure path leaves FK off, a transaction open, or a ``*_new`` table.
+
+        ``PRAGMA foreign_keys`` is per-connection and is silently ignored inside
+        an open transaction, so a leaked "off" state (or a stuck savepoint that
+        keeps a transaction open) would make the rest of the session accept
+        orphans and skip ``ON DELETE CASCADE`` with no error at all. This injects
+        a failure at every transaction-control point of the swap — disabling FK,
+        establishing the savepoint, the recreate body itself, ``ROLLBACK TO`` and
+        ``RELEASE`` — and asserts the connection is always left safe.
+        """
+        db_path = tmp_path / f"leak-{failing_statement or 'body'}-{fail_body}.sqlite"
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await TestMigrationV11ToV12._bootstrap_v11_schema(db)
+            await db.execute(
+                "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+                "VALUES ('t1', 'OBSERVATION', 'a', 'a', 'P3')",
+            )
+            await db.execute(
+                "INSERT INTO embedding (embedding_id, owner_type, owner_id, model_name, "
+                " dimension, vector_blob, created_at) "
+                "VALUES ('emb1', 'THOUGHT', 't1', 'm', 3, ?, '2026-01-01T00:00:00+00:00')",
+                (b"\x00\x01\x02",),
+            )
+            await db.commit()
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            core = SqliteEngravaCore(db=db, embedding_provider=None, auto_embed=False)
+
+            if fail_body:
+
+                async def _fail_body() -> None:
+                    # A recreate that drops the old table and then fails, i.e. the
+                    # worst case the savepoint has to undo.
+                    await db.execute("DROP TABLE embedding")
+                    msg = "injected body failure"
+                    raise RuntimeError(msg)
+
+                monkeypatch.setattr(core, "_recreate_embedding_with_fk", _fail_body)
+
+            if failing_statement is not None:
+                real_execute = db.execute
+
+                async def _execute(sql: str, *args: object, **kwargs: object) -> object:
+                    if failing_statement in sql:
+                        msg = f"injected failure at {failing_statement}"
+                        raise RuntimeError(msg)
+                    return await real_execute(sql, *args, **kwargs)
+
+                monkeypatch.setattr(db, "execute", _execute)
+
+            with pytest.raises(RuntimeError, match="injected"):
+                await core.ensure_schema()
+
+            # Restore the real driver before inspecting the connection state.
+            monkeypatch.undo()
+
+            # (a) Foreign-key enforcement is back on for the rest of the session.
+            fk_row = await (await db.execute("PRAGMA foreign_keys")).fetchone()
+            assert fk_row is not None
+            assert fk_row[0] == 1, "foreign-key enforcement leaked OFF"
+
+            # (b) No transaction (or savepoint) is left open.
+            assert not db.in_transaction, "a transaction/savepoint was left open"
+
+            # (c) No half-swap scratch table survives.
+            leftovers = [
+                str(row[0])
+                for row in await (
+                    await db.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'table' AND name LIKE '%\\_new' ESCAPE '\\'"
+                    )
+                ).fetchall()
+            ]
+            assert leftovers == [], f"leftover swap tables: {leftovers}"
+
+            # (d) The ORIGINAL pre-migration child table and its row survived —
+            # the swap is either fully applied or fully undone. The legacy v11
+            # table declares no foreign key, so an absent FK proves this is the
+            # rolled-back original rather than a half-swap that got committed.
+            present = await (
+                await db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embedding'"
+                )
+            ).fetchone()
+            assert present is not None, "the original embedding table was lost"
+            count_row = await (await db.execute("SELECT COUNT(*) FROM embedding")).fetchone()
+            assert count_row is not None
+            assert count_row[0] == 1, "the original embedding row was lost"
+            recreated_fks = list(
+                await (await db.execute("PRAGMA foreign_key_list(embedding)")).fetchall(),
+            )
+            assert recreated_fks == [], "a half-swapped embedding table was committed"
+
+
+class TestAddColumnIfAbsentExactMatch:
+    """``_add_column_if_absent`` tolerates only the exact duplicate-column race."""
+
+    @pytest.fixture
+    async def store(self) -> AsyncIterator[SqliteEngravaCore]:
+        async with aiosqlite.connect(":memory:") as db:
+            db.row_factory = aiosqlite.Row
+            core = SqliteEngravaCore(db=db, embedding_provider=None, auto_embed=False)
+            await core.ensure_schema()
+            yield core
+
+    async def test_tolerates_only_this_columns_duplicate(
+        self,
+        store: SqliteEngravaCore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The exact "duplicate column name: <column>" race is swallowed."""
+
+        async def _absent(_table: str, _column: str) -> bool:
+            return False
+
+        async def _raise_dup_same(_sql: str, *_a: object, **_k: object) -> object:
+            msg = "duplicate column name: mycol"
+            raise aiosqlite.OperationalError(msg)
+
+        monkeypatch.setattr(store, "_column_exists", _absent)
+        monkeypatch.setattr(store._db, "execute", _raise_dup_same)
+        # No raise: the exact duplicate signal for this column is the idempotent
+        # re-run marker and is tolerated.
+        await store._add_column_if_absent("thought", "mycol", "TEXT")
+
+    async def test_duplicate_message_for_other_column_propagates(
+        self,
+        store: SqliteEngravaCore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A duplicate-column message naming a DIFFERENT column propagates."""
+
+        async def _absent(_table: str, _column: str) -> bool:
+            return False
+
+        async def _raise_dup_other(_sql: str, *_a: object, **_k: object) -> object:
+            msg = "duplicate column name: othercol"
+            raise aiosqlite.OperationalError(msg)
+
+        monkeypatch.setattr(store, "_column_exists", _absent)
+        monkeypatch.setattr(store._db, "execute", _raise_dup_other)
+        with pytest.raises(aiosqlite.OperationalError, match="othercol"):
+            await store._add_column_if_absent("thought", "mycol", "TEXT")
+
+    async def test_duplicate_message_for_prefix_column_propagates(
+        self,
+        store: SqliteEngravaCore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A duplicate for a column that HAS ours as a prefix still propagates.
+
+        Our column ``mycol`` is a prefix of the error's ``mycol_extra``. The
+        match is whole-message exact (not a substring), so the ``mycol_extra``
+        duplicate is not mistaken for the ``mycol`` idempotent signal.
+        """
+
+        async def _absent(_table: str, _column: str) -> bool:
+            return False
+
+        async def _raise_dup_prefix(_sql: str, *_a: object, **_k: object) -> object:
+            msg = "duplicate column name: mycol_extra"
+            raise aiosqlite.OperationalError(msg)
+
+        monkeypatch.setattr(store, "_column_exists", _absent)
+        monkeypatch.setattr(store._db, "execute", _raise_dup_prefix)
+        with pytest.raises(aiosqlite.OperationalError, match="mycol_extra"):
+            await store._add_column_if_absent("thought", "mycol", "TEXT")
+
+    async def test_unrelated_operational_error_propagates(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """A non-duplicate OperationalError (e.g. no such table) propagates."""
+        with pytest.raises(aiosqlite.OperationalError):
+            await store._add_column_if_absent("no_such_table", "c", "TEXT")

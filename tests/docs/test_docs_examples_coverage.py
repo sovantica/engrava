@@ -76,7 +76,6 @@ BEHAVIOUR_BLOCKS: tuple[tuple[str, str], ...] = (
     # dreaming.md
     ("docs/dreaming.md", "promote_threshold=0.55"),  # run_consolidation
     ("docs/dreaming.md", "store.consolidate(current_cycle=1)"),  # consolidate()
-    ("docs/dreaming.md", "ASSOCIATED edges created"),  # result fields
     # extension-hooks.md
     ("docs/extension-hooks.md", "class RecencyBoostHooks"),  # hooks protocol + score
     # extensions.md
@@ -120,8 +119,8 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "README.md",
-        "class MyHooks(EngravaHooksProtocol):",
-        "class-definition-only Protocol impl; conformance asserted in the hooks test",
+        "class MyHooks(DefaultEngravaHooks):",
+        "class-definition-only hooks impl; conformance asserted in the hooks test",
     ),
     (
         "README.md",
@@ -155,8 +154,8 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "docs/api-reference.md",
-        'list_services()   # -> ["my-service"]',
-        "requires an on-disk data_dir and an unimported Path; illustrative manager usage",
+        "await mgr.list_services()",
+        "requires an on-disk data_dir; illustrative manager list/delete usage",
     ),
     (
         "docs/api-reference.md",
@@ -177,6 +176,41 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
         "docs/api-reference.md",
         "class DerivedRecordProducerProtocol(Protocol)",
         "Protocol-definition only",
+    ),
+    (
+        "docs/api-reference.md",
+        "async def search_hybrid(",
+        "bare search_hybrid signature (`...`); result shape asserted in the behaviour test",
+    ),
+    (
+        "docs/error-handling.md",
+        "async def create_with_partial_state",
+        "helper-function def assuming a store; partial-persistence recovery illustrative",
+    ),
+    (
+        "docs/error-handling.md",
+        "async def repair_embedding",
+        "helper-function def assuming a store + provider; embedding repair illustrative",
+    ),
+    (
+        "docs/error-handling.md",
+        "async def store_atomically",
+        "helper-function def assuming a store; suspend_auto_commit runs in the migrating example",
+    ),
+    (
+        "docs/error-handling.md",
+        "async def verify_journal_with_lock_retry",
+        "helper-function def assuming a store; verify_journal asserted in the audit-trail test",
+    ),
+    (
+        "docs/error-handling.md",
+        "async def recall_with_degradation_flags",
+        "helper-function def assuming a store; degradation counters illustrative",
+    ),
+    (
+        "docs/error-handling.md",
+        "async def replace_and_reconcile",
+        "helper-function def assuming a store; from_config reconnection illustrative",
     ),
     (
         "docs/extension-hooks.md",
@@ -311,7 +345,7 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "docs/extensions.md",
-        "on_store / on_retrieve are now called automatically",
+        "on_store / on_retrieve now run during CRUD",
         "opens a real on-disk database; invocation asserted via hooks/STATS tests",
     ),
     (
@@ -500,6 +534,11 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
         "fragment assuming a conn; FIND/COUNT asserted in the MindQL behaviour test",
     ),
     (
+        "docs/mindql.md",
+        "from engrava import parse\n\nresult = await store.execute_mindql",
+        "fragment assuming a store; execute_mindql asserted in the api-reference behaviour test",
+    ),
+    (
         "docs/observability.md",
         "engrava_search_p99_ms",
         "requires optional prometheus_client and a file-backed store; illustrative export",
@@ -596,13 +635,18 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "docs/recipes/index.md",
-        "PLANNED → EXECUTING → CONFIRMED / FAILED / BLOCKED",
+        "source_thought_id=prompting_thought_id",
         "undefined prompting_thought_id; action lifecycle asserted in the action test",
     ),
     (
         "docs/recipes/index.md",
         "recent = await store.list_thoughts(limit=1)        # ordered",
         "fragment assuming a store; illustrative cycle bootstrap",
+    ),
+    (
+        "docs/search.md",
+        "print(store.fts_match_failure_count)",
+        "fragment assuming a store; degradation counters illustrative",
     ),
     (
         "docs/search.md",

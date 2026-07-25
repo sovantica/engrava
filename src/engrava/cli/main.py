@@ -38,11 +38,11 @@ from engrava.cli.snapshot_records import (
     parse_snapshot_record,
 )
 from engrava.config import (
-    ConfigError,
     EmbeddingConfig,
     ServicesConfig,
     resolve_embedding_provider,
 )
+from engrava.config_validation import ConfigError
 from engrava.domain.protocols.hooks import MindQLExtension
 from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
 
@@ -243,8 +243,7 @@ class _ExtensionAwareGroup(click.Group):
         """Capture the disable control before eager options such as help run."""
         env_value = os.environ.get("ENGRAVA_DISABLE_EXTENSIONS")
         disabled_by_env = (
-            env_value is not None
-            and env_value.strip().lower() not in _FALSE_ENV_FLAG_VALUES
+            env_value is not None and env_value.strip().lower() not in _FALSE_ENV_FLAG_VALUES
         )
         ctx.meta[_DISABLE_EXTENSIONS_META_KEY] = "--no-extensions" in args or disabled_by_env
         return super().parse_args(ctx, args)
@@ -294,9 +293,7 @@ class _ExtensionAwareGroup(click.Group):
         """Resolve built-ins first and load entry points only for unknown commands."""
         disabled = self._extensions_disabled(ctx)
         command = super().get_command(ctx, cmd_name)
-        if command is not None and (
-            not disabled or cmd_name not in self._extension_command_names
-        ):
+        if command is not None and (not disabled or cmd_name not in self._extension_command_names):
             return command
         if disabled:
             return None
@@ -659,6 +656,13 @@ def snapshot(ctx: click.Context, output_path: str | None, service_name: str | No
     effective_service = service_name
     if effective_service is None and services_cfg is not None:
         effective_service = services_cfg.default_service
+
+    # Validate any resolved service name — an explicit --service (including an
+    # empty string, which is falsy) or a config default — up front so a malformed
+    # value is a clean ClickException rather than a silent fall-through to the
+    # single-database path or a later traceback.
+    if effective_service is not None:
+        _require_valid_cli_service_name(effective_service)
 
     async def _snapshot() -> None:
         if effective_service:
@@ -1106,6 +1110,149 @@ async def _import_records_to_db(
     return total
 
 
+def _require_valid_cli_service_name(service_name: str) -> None:
+    """Reject a malformed ``--service`` value with a distinct CLI error.
+
+    ``EngravaManager.service_exists`` / ``get_store`` validate the service name
+    and raise :class:`ConfigError` for a malformed value (e.g. a path-escape
+    attempt like ``../escape``). Surfacing that as a plain ``ClickException``
+    keeps it a clean, user-facing message — never a traceback — and keeps it
+    distinct from an embedding-provider initialisation failure.
+
+    Args:
+        service_name: The ``--service`` value supplied on the command line.
+
+    Raises:
+        click.ClickException: If ``service_name`` is not a valid service name.
+
+    """
+    from engrava.config import _validate_service_name  # noqa: PLC0415
+
+    try:
+        _validate_service_name(service_name)
+    except ConfigError as exc:
+        msg = f"Invalid --service value: {exc}"
+        raise click.ClickException(msg) from exc
+
+
+async def _restore_service_snapshot(
+    *,
+    effective_service: str,
+    input_path: str,
+    clear: bool,
+    skip_embeddings: bool,
+    re_embed: bool,
+    cfg: EngravaCLIConfig,
+    services_cfg: ServicesConfig | None,
+    default_embeddings: EmbeddingConfig | None,
+) -> None:
+    """Restore a JSONL snapshot into a named service database.
+
+    Raises:
+        click.ClickException: On an invalid service name, an embedding-provider
+            initialisation failure, or a missing ``--re-embed`` provider.
+
+    """
+    from engrava.infrastructure.service_manager import EngravaManager  # noqa: PLC0415
+
+    # The service name was validated up front by the command (see restore()), so
+    # ``effective_service`` is a well-formed, non-empty name here.
+    data_dir = services_cfg.data_dir if services_cfg else cfg.db_path.parent
+    manager = EngravaManager(
+        data_dir=data_dir,
+        default_embeddings=default_embeddings if re_embed else None,
+        services_config=services_cfg,
+    )
+    try:
+        try:
+            store = await manager.get_store(effective_service)
+        except ConfigError as exc:
+            msg = (
+                f"Cannot initialize service {effective_service!r} from the configured "
+                f"embedding provider: {exc}"
+            )
+            raise click.ClickException(msg) from exc
+        emb_provider = None
+        if re_embed:
+            emb_provider = store._embedding_provider  # noqa: SLF001
+            if emb_provider is None:
+                msg = (
+                    "--re-embed requires an embedding provider, but none is "
+                    f"configured for service {effective_service!r}. "
+                    "Set 'embeddings.provider' in engrava.yaml or "
+                    "use --skip-embeddings instead."
+                )
+                raise click.ClickException(msg)
+        total = await _import_records_to_db(
+            store._db,  # noqa: SLF001
+            Path(input_path),
+            clear=clear,
+            skip_embeddings=skip_embeddings,
+            re_embed=re_embed,
+            embedding_provider=emb_provider,
+        )
+        click.echo(f"Restored {total} records to service {effective_service!r} from {input_path}")
+    finally:
+        await manager.close_all()
+
+
+async def _restore_single_db(
+    *,
+    input_path: str,
+    clear: bool,
+    skip_embeddings: bool,
+    re_embed: bool,
+    cfg: EngravaCLIConfig,
+    default_embeddings: EmbeddingConfig | None,
+) -> None:
+    """Restore a JSONL snapshot into the single-file database.
+
+    Raises:
+        click.ClickException: On an embedding-provider initialisation failure or
+            a missing ``--re-embed`` provider.
+
+    """
+    import aiosqlite as _aiosqlite  # noqa: PLC0415
+
+    from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore  # noqa: PLC0415
+
+    emb_provider = None
+    if re_embed:
+        try:
+            emb_provider = resolve_embedding_provider(default_embeddings)
+        except ConfigError as exc:
+            msg = f"Cannot initialize the configured embedding provider: {exc}"
+            raise click.ClickException(msg) from exc
+        if emb_provider is None:
+            msg = (
+                "--re-embed requires an embedding provider, but none is configured. "
+                "Set top-level 'embeddings.provider' in engrava.yaml and pass "
+                "--config, or use --skip-embeddings instead."
+            )
+            raise click.ClickException(msg)
+
+    conn = await _aiosqlite.connect(str(cfg.db_path))
+    conn.row_factory = _aiosqlite.Row
+    await conn.execute("PRAGMA journal_mode = WAL")
+    await conn.execute("PRAGMA foreign_keys = ON")
+
+    store = SqliteEngravaCore(conn)
+    await store.ensure_schema()
+
+    try:
+        total = await _import_records_to_db(
+            conn,
+            Path(input_path),
+            clear=clear,
+            skip_embeddings=skip_embeddings,
+            re_embed=re_embed,
+            embedding_provider=emb_provider,
+        )
+        click.echo(f"Restored {total} records from {input_path}")
+    finally:
+        await conn.close()
+
+
 @cli.command()
 @click.option("-i", "--input", "input_path", required=True, help="JSONL snapshot file to restore.")
 @click.option("--clear", is_flag=True, help="Clear existing data before restore.")
@@ -1153,91 +1300,34 @@ def restore(
     if effective_service is None and services_cfg is not None:
         effective_service = services_cfg.default_service
 
+    # Validate any resolved service name — an explicit --service (including an
+    # empty string, which is falsy) or a config default — up front so a malformed
+    # value is a clean ClickException rather than a silent fall-through to the
+    # single-database path or a mislabelled embedding-provider error.
+    if effective_service is not None:
+        _require_valid_cli_service_name(effective_service)
+
     async def _restore() -> None:
-        import aiosqlite as _aiosqlite  # noqa: PLC0415
-
-        from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore  # noqa: PLC0415
-
-        emb_provider = None
-
         if effective_service:
-            from engrava.infrastructure.service_manager import (  # noqa: PLC0415
-                EngravaManager,
+            await _restore_service_snapshot(
+                effective_service=effective_service,
+                input_path=input_path,
+                clear=clear,
+                skip_embeddings=skip_embeddings,
+                re_embed=re_embed,
+                cfg=cfg,
+                services_cfg=services_cfg,
+                default_embeddings=default_embeddings,
             )
-
-            data_dir = services_cfg.data_dir if services_cfg else cfg.db_path.parent
-            manager = EngravaManager(
-                data_dir=data_dir,
-                default_embeddings=default_embeddings if re_embed else None,
-                services_config=services_cfg,
-            )
-            try:
-                try:
-                    store = await manager.get_store(effective_service)
-                except ConfigError as exc:
-                    msg = (
-                        f"Cannot initialize service {effective_service!r} from the configured "
-                        f"embedding provider: {exc}"
-                    )
-                    raise click.ClickException(msg) from exc
-                if re_embed:
-                    emb_provider = store._embedding_provider  # noqa: SLF001
-                    if emb_provider is None:
-                        msg = (
-                            "--re-embed requires an embedding provider, but none is "
-                            f"configured for service {effective_service!r}. "
-                            "Set 'embeddings.provider' in engrava.yaml or "
-                            "use --skip-embeddings instead."
-                        )
-                        raise click.ClickException(msg)
-                total = await _import_records_to_db(
-                    store._db,  # noqa: SLF001
-                    Path(input_path),
-                    clear=clear,
-                    skip_embeddings=skip_embeddings,
-                    re_embed=re_embed,
-                    embedding_provider=emb_provider,
-                )
-                click.echo(
-                    f"Restored {total} records to service {effective_service!r} from {input_path}"
-                )
-            finally:
-                await manager.close_all()
         else:
-            if re_embed:
-                try:
-                    emb_provider = resolve_embedding_provider(default_embeddings)
-                except ConfigError as exc:
-                    msg = f"Cannot initialize the configured embedding provider: {exc}"
-                    raise click.ClickException(msg) from exc
-                if emb_provider is None:
-                    msg = (
-                        "--re-embed requires an embedding provider, but none is configured. "
-                        "Set top-level 'embeddings.provider' in engrava.yaml and pass "
-                        "--config, or use --skip-embeddings instead."
-                    )
-                    raise click.ClickException(msg)
-
-            conn = await _aiosqlite.connect(str(cfg.db_path))
-            conn.row_factory = _aiosqlite.Row
-            await conn.execute("PRAGMA journal_mode = WAL")
-            await conn.execute("PRAGMA foreign_keys = ON")
-
-            store = SqliteEngravaCore(conn)
-            await store.ensure_schema()
-
-            try:
-                total = await _import_records_to_db(
-                    conn,
-                    Path(input_path),
-                    clear=clear,
-                    skip_embeddings=skip_embeddings,
-                    re_embed=re_embed,
-                    embedding_provider=emb_provider,
-                )
-                click.echo(f"Restored {total} records from {input_path}")
-            finally:
-                await conn.close()
+            await _restore_single_db(
+                input_path=input_path,
+                clear=clear,
+                skip_embeddings=skip_embeddings,
+                re_embed=re_embed,
+                cfg=cfg,
+                default_embeddings=default_embeddings,
+            )
 
     _run(_restore())
 

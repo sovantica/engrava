@@ -186,9 +186,7 @@ class TestDreamingExtension:
         cycle: int,
         expected: bool,
     ) -> None:
-        ext = DreamingExtension(
-            config=DreamingConfig(enabled=enabled, schedule_every_n_cycles=100)
-        )
+        ext = DreamingExtension(config=DreamingConfig(enabled=enabled, schedule_every_n_cycles=100))
         assert ext.is_due(cycle) is expected
 
     @pytest.mark.parametrize("cycle", [-1, 1.5, True])
@@ -198,9 +196,7 @@ class TestDreamingExtension:
             ext.is_due(cycle)  # type: ignore[arg-type]
 
     async def test_run_if_due_skips_or_delegates(self) -> None:
-        ext = DreamingExtension(
-            config=DreamingConfig(enabled=True, schedule_every_n_cycles=10)
-        )
+        ext = DreamingExtension(config=DreamingConfig(enabled=True, schedule_every_n_cycles=10))
         expected = ConsolidationResult(candidates_evaluated=0, promoted_count=0)
         run = AsyncMock(return_value=expected)
         ext.run_consolidation = run  # type: ignore[method-assign]
