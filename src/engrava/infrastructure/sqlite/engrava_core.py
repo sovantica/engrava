@@ -6998,8 +6998,10 @@ class SqliteEngravaCore:
         Raises:
             MindQLParseError: If the executor rejects the query at
                 execution time (for example a ``SELECT`` whose raw SQL is
-                not a ``SELECT`` statement, or a ``FIND`` referencing an
-                invalid column).
+                not a ``SELECT`` statement, or a ``FIND`` naming a table,
+                column, sort direction or ``LIMIT``/``OFFSET`` outside what
+                the executor will interpolate). A directly constructed
+                ``MindQLQuery`` is validated here just as a parsed one is.
 
         """
         from engrava.mindql.executor import MindQLExecutor  # noqa: PLC0415
