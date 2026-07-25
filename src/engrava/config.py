@@ -1647,7 +1647,8 @@ def _reject_unknown_keys(raw: dict[str, Any], allowed: set[str], path: str) -> N
     unknown = sorted((key for key in raw if key not in allowed), key=repr)
     if unknown:
         rendered = ", ".join(repr(key) for key in unknown)
-        raise ConfigError(f"Unknown configuration key(s) at {path}: {rendered}")
+        msg = f"Unknown configuration key(s) at {path}: {rendered}"
+        raise ConfigError(msg)
 
 
 def load_config(path: str | Path) -> EngravaConfig:

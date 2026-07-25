@@ -184,10 +184,18 @@ class DreamingExtension:
             ValueError: If ``current_cycle`` is negative or not an integer.
 
         """
-        if isinstance(current_cycle, bool) or not isinstance(current_cycle, int):
-            raise ValueError("current_cycle must be an integer")
-        if current_cycle < 0:
-            raise ValueError("current_cycle must be >= 0")
+        # A single value-domain contract: the cycle must be a non-negative,
+        # non-bool integer. Combining the type and range guards keeps the public
+        # ValueError contract (documented above and asserted by the tests) rather
+        # than splitting into a TypeError for the type case.
+        is_nonneg_int = (
+            not isinstance(current_cycle, bool)
+            and isinstance(current_cycle, int)
+            and current_cycle >= 0
+        )
+        if not is_nonneg_int:
+            msg = "current_cycle must be a non-negative integer"
+            raise ValueError(msg)
         return (
             self._config.enabled
             and current_cycle > 0
@@ -683,7 +691,6 @@ class DreamingExtension:
             Number of edges successfully created.
 
         """
-        import sqlite3  # noqa: PLC0415
         import struct  # noqa: PLC0415
 
         from engrava.domain.enums import EdgeType, KnowledgeSource  # noqa: PLC0415
@@ -738,7 +745,10 @@ class DreamingExtension:
                     try:
                         await store.create_edge(edge)
                         created += 1
-                    except (sqlite3.IntegrityError, DuplicateEdgeError):
+                    except DuplicateEdgeError:
+                        # Only an exact directed-endpoint + type duplicate is a
+                        # benign skip. Any other integrity failure (CHECK,
+                        # trigger, FK) propagates rather than being silenced.
                         logger.debug(
                             "Edge %s→%s already exists, skipping",
                             thought_id,
@@ -1193,7 +1203,6 @@ class DreamingExtension:
         """
         import hashlib  # noqa: PLC0415
         import json  # noqa: PLC0415
-        import sqlite3  # noqa: PLC0415
         import struct  # noqa: PLC0415
 
         from engrava.domain.enums import (  # noqa: PLC0415
@@ -1559,7 +1568,11 @@ class DreamingExtension:
                     )
                     try:
                         await store.create_edge(edge)
-                    except (sqlite3.IntegrityError, DuplicateEdgeError):
+                    except DuplicateEdgeError:
+                        # Only an exact duplicate is a benign skip. A real
+                        # integrity failure (CHECK, trigger, FK) propagates so a
+                        # REFLECTION is never counted as created while its
+                        # lineage edges are silently missing.
                         logger.debug(
                             "CONSOLIDATED_FROM edge %s→%s already exists",
                             reflection_id,

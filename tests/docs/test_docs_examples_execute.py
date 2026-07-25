@@ -109,6 +109,10 @@ EXECUTABLE_BLOCKS: tuple[tuple[str, str], ...] = (
     ("docs/bitemporal.md", "# valid_until omitted -> open upper bound -> still valid"),
     ("docs/bitemporal.md", "assert len(march.rows) == 1  # inside the valid window"),
     ("docs/bitemporal.md", "await store.invalidate_thought("),
+    # docs/evidence-and-conflicts.md — the end-to-end single-value-slot conflict
+    # workflow: create evidence + claims, detect the conflict with a caller-owned
+    # rule, record a CONTESTED_BY edge, and open a clarification task.
+    ("docs/evidence-and-conflicts.md", "incompatible_single_value_claims"),
 )
 
 # Pages that build one example across a contiguous run of code blocks, identified
