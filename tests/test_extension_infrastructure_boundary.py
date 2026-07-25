@@ -1,4 +1,29 @@
-"""Architecture contracts for the Dreaming extension boundary."""
+"""Architecture contracts for the Dreaming extension boundary.
+
+The import walk below is a **static source-dependency contract**, not a model
+of Python's runtime import closure.  It parses each ``engrava`` source file and
+follows only the module names those files name literally, so it deliberately
+does not see:
+
+* dynamic imports -- ``importlib.import_module`` and friends, or any import
+  whose target is assembled at runtime;
+* string-based plugin or entry-point discovery, where the dependency is a
+  configuration value rather than an import statement;
+* module-level ``__getattr__`` hooks that resolve attributes lazily;
+* dependencies that are not ``.py`` sources, such as native extension modules
+  and stub-only ``.pyi`` files;
+* imports performed by implicitly-loaded parent ``__init__.py`` files.  These
+  are excluded on purpose: importing anything under ``engrava`` executes
+  ``engrava/__init__.py``, which re-exports the whole public surface, so
+  charging every module with its ancestors' imports would make every module
+  depend on everything and the graph would say nothing.
+
+What it does catch is the case this boundary is about: a source file naming a
+module it must not depend on, including imports deferred into a function body
+and imports guarded by ``TYPE_CHECKING``, since both couple the two modules at
+the source level and neither may be used to slip a dependency past the
+contract.
+"""
 
 from __future__ import annotations
 
@@ -220,15 +245,10 @@ def _resolve_relative_import(module: str, path: Path, node: ast.ImportFrom) -> s
 
 
 def _module_edges(module: str, path: Path, known: set[str]) -> set[str]:
-    """Collect the ``engrava`` modules one source file imports.
+    """Collect the ``engrava`` modules one source file names in an import.
 
-    Every import statement counts, including ones deferred into a function body
-    and ones guarded by ``TYPE_CHECKING``: both couple the two modules at the
-    source level, so neither may be used to slip a forbidden dependency past
-    this contract.  Implicit parent-package imports are deliberately not
-    modelled -- ``engrava/__init__.py`` re-exports the whole public surface, so
-    charging every module with its ancestors' imports would make the graph
-    say nothing.
+    See the module docstring for what this static walk covers and what it
+    deliberately leaves out.
     """
     tree = ast.parse(path.read_text(encoding="utf-8"))
     edges: set[str] = set()
@@ -374,11 +394,13 @@ def test_sanctioned_dreaming_path_is_the_only_bridge_to_the_extension() -> None:
 # Protocol signature compatibility
 # ------------------------------------------------------------------
 
-#: ``SqliteEngravaCore.suspend_auto_commit`` is an ``@asynccontextmanager``
-#: generator, so ``functools.wraps`` keeps the *generator's* annotation while
-#: the call returns the async context manager the protocol declares.  Both
-#: spellings are pinned, so a change to either side still fails.
-_RETURN_ANNOTATION_EXCEPTIONS = {
+#: Members the implementation supplies as an ``@asynccontextmanager``
+#: generator: ``functools.wraps`` keeps the *generator's* annotation while the
+#: call returns the async context manager the protocol declares.  Each entry
+#: pins both spellings, so a change to either side still fails, and the checks
+#: below verify that the implementation really is such a factory -- otherwise
+#: the exception could quietly cover a genuine mismatch.
+_ASYNC_CONTEXT_MANAGER_MEMBERS = {
     "suspend_auto_commit": ("AbstractAsyncContextManager[None]", "AsyncIterator[None]"),
 }
 
@@ -453,7 +475,7 @@ def _return_annotation_mismatches(
 ) -> list[str]:
     expected = protocol_signature.return_annotation
     actual = impl_signature.return_annotation
-    exception = _RETURN_ANNOTATION_EXCEPTIONS.get(member)
+    exception = _ASYNC_CONTEXT_MANAGER_MEMBERS.get(member)
     if exception is not None:
         if (str(expected), str(actual)) != exception:
             return [
@@ -461,11 +483,45 @@ def _return_annotation_mismatches(
                 f" got ({str(expected)!r}, {str(actual)!r}), expected {exception!r}"
             ]
         return []
-    if inspect.Signature.empty in (expected, actual):
+    if expected is inspect.Signature.empty:
         return []
+    # A protocol return type the implementation stopped declaring is drift, not
+    # a comparison to skip.
+    if actual is inspect.Signature.empty:
+        return [f"declares no return annotation, protocol declares {expected!r}"]
     if str(expected) != str(actual):
         return [f"returns {actual!r}, protocol declares {expected!r}"]
     return []
+
+
+def _callable_nature(member: object) -> str:
+    """Describe how a callable delivers its result, in protocol-visible terms."""
+    if inspect.iscoroutinefunction(member):
+        return "a coroutine function"
+    if inspect.isasyncgenfunction(member):
+        return "an async generator function"
+    return "a plain function"
+
+
+def _async_nature_mismatches(
+    member: str,
+    protocol_member: object,
+    implementation: object,
+) -> list[str]:
+    """Compare await-ability, which a signature comparison alone cannot see."""
+    mismatches = []
+    expected_nature = _callable_nature(protocol_member)
+    actual_nature = _callable_nature(implementation)
+    if expected_nature != actual_nature:
+        mismatches.append(f"is {actual_nature}, protocol declares {expected_nature}")
+    if member in _ASYNC_CONTEXT_MANAGER_MEMBERS:
+        wrapped = getattr(implementation, "__wrapped__", None)
+        if not inspect.isasyncgenfunction(wrapped):
+            mismatches.append(
+                "is exempted as an @asynccontextmanager factory but does not wrap"
+                " an async generator"
+            )
+    return mismatches
 
 
 def test_dreaming_store_protocol_signatures_match_the_sqlite_implementation() -> None:
@@ -475,12 +531,12 @@ def test_dreaming_store_protocol_signatures_match_the_sqlite_implementation() ->
         if implementation is None:
             failures[member] = ["SqliteEngravaCore does not implement this capability"]
             continue
-        protocol_signature = inspect.signature(
-            getattr(dreaming_protocols.DreamingStoreProtocol, member)
-        )
+        declaration = getattr(dreaming_protocols.DreamingStoreProtocol, member)
+        protocol_signature = inspect.signature(declaration)
         impl_signature = inspect.signature(implementation)
         mismatches = _parameter_mismatches(protocol_signature, impl_signature)
         mismatches += _return_annotation_mismatches(member, protocol_signature, impl_signature)
+        mismatches += _async_nature_mismatches(member, declaration, implementation)
         if mismatches:
             failures[member] = mismatches
     report = "\n".join(f"{member}: {'; '.join(reasons)}" for member, reasons in failures.items())
