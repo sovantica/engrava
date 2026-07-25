@@ -389,6 +389,7 @@ class TestSqliteVecRealConnection:
         dimension: int,
         search_config: object | None = None,
         db_name: str | None = None,
+        ttl_strategy: str = "archive",
     ) -> SqliteEngravaCore:
         """Construct a store with a real connection and the given backend.
 
@@ -396,7 +397,9 @@ class TestSqliteVecRealConnection:
         ``_configure_vector_backend``) but lets the test pick the backend.
         ``search_config`` threads a custom :class:`SearchConfig` (e.g. a
         ``vec0_overfetch_factor`` override); ``db_name`` disambiguates the file
-        when a single test builds two stores of the same backend.
+        when a single test builds two stores of the same backend;
+        ``ttl_strategy`` selects the cleanup strategy so a test can exercise
+        the physical-delete TTL path against a real vec0 index.
         """
         from engrava.config import SearchConfig
 
@@ -405,7 +408,7 @@ class TestSqliteVecRealConnection:
         db.row_factory = aiosqlite.Row
         await db.execute("PRAGMA foreign_keys=ON")
         cfg = search_config if isinstance(search_config, SearchConfig) else None
-        store = SqliteEngravaCore(db, search_config=cfg)
+        store = SqliteEngravaCore(db, search_config=cfg, ttl_strategy=ttl_strategy)
         store._owns_connection = True
         await store.ensure_schema()
         await store._configure_vector_backend(
@@ -604,6 +607,87 @@ class TestVec0DeleteRemovesVector(TestSqliteVecRealConnection):
             after = await store.search_similar([0.9, 0.1, 0.0], top_k=2)
             assert "t-drop" not in [r[0] for r in after]
             assert "t-keep" in [r[0] for r in after]
+        finally:
+            await store.close()
+
+    async def test_ttl_delete_sweep_purges_only_the_expired_vector(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The delete-strategy TTL sweep drops the expired vectors and no others.
+
+        ``cleanup_expired`` reaches the same orphan-vector purge as
+        ``delete_thought``, and ``embedding_vec`` is the one store a widened
+        purge could empty without any foreign key or ``embedding`` read-back
+        noticing. Both halves are therefore read from the index itself: the
+        expired rowids are gone, and what remains is **exactly** the surviving
+        set, still returned by a search.
+
+        The corpus is interleaved survivor · **doomed** · survivor · **doomed**
+        · survivor on the two ordering axes it controls: the thought id
+        (``t-anchor`` < ``t-drop`` < ``t-keep`` < ``t-purge`` < ``t-vault``) and
+        ``rowid``, the key the vec0 table is actually addressed by. A purge that
+        picks a row by **rowid** position — lowest, highest, any other row —
+        instead of by the rowid it was handed therefore cannot land on a doomed
+        one by luck, and **two** doomed vectors make a sweep that purges only
+        the first distinguishable from one that purges both. Rowids follow
+        insertion order, and the interleaving is asserted, not assumed. The
+        stored vectors themselves are chosen for a deterministic search order,
+        not to bracket anything.
+        """
+        store = await self._build_store(
+            tmp_path,
+            backend="sqlite-vec",
+            dimension=3,
+            ttl_strategy="delete",
+        )
+        try:
+            expired_at = _past_iso()
+            for thought_id, expires_at in (
+                ("t-anchor", None),
+                ("t-drop", expired_at),
+                ("t-keep", None),
+                ("t-purge", expired_at),
+                ("t-vault", None),
+            ):
+                await _make_thought(store, thought_id, expires_at=expires_at)
+            for thought_id, vector in (
+                ("t-anchor", [0.8, 0.2, 0.0]),
+                ("t-drop", [0.9, 0.1, 0.0]),
+                ("t-keep", [1.0, 0.0, 0.0]),
+                ("t-purge", [0.95, 0.05, 0.0]),
+                ("t-vault", [0.6, 0.4, 0.0]),
+            ):
+                await store.store_embedding(
+                    thought_id=thought_id, vector=vector, model_name=_PARITY_MODEL
+                )
+            order = ("t-anchor", "t-drop", "t-keep", "t-purge", "t-vault")
+            rowids_by_thought: dict[str, int] = {}
+            for tid in order:
+                rowid = await _embedding_rowid(store, tid)
+                assert rowid is not None, f"no embedding stored for {tid}"
+                rowids_by_thought[tid] = rowid
+            surviving = {rowids_by_thought[t] for t in ("t-anchor", "t-keep", "t-vault")}
+            doomed = {rowids_by_thought[t] for t in ("t-drop", "t-purge")}
+            # Corpus precondition: survivors sit either side of each doomed
+            # rowid in the index's own key space, and the doomed pair is not
+            # adjacent by rowid, so no rowid-positional purge selects exactly it.
+            assert [rowids_by_thought[t] for t in order] == sorted(
+                rowids_by_thought[t] for t in order
+            )
+            assert await _vec_rowids(store) == surviving | doomed
+
+            result = await store.cleanup_expired()
+
+            rowids = await _vec_rowids(store)
+            assert not doomed & rowids, "an expired vector survived the sweep"
+            # Set equality, not containment: containment would hold just as well
+            # if the sweep had left extra rows behind in the index.
+            assert rowids == surviving
+            hits = [r[0] for r in await store.search_similar([1.0, 0.0, 0.0], top_k=5)]
+            assert hits == ["t-keep", "t-anchor", "t-vault"]
+            # Only once the index is settled does the reported count matter.
+            assert result.expired_count == len(doomed)
         finally:
             await store.close()
 
