@@ -6,7 +6,7 @@ as well as executor integration with aiosqlite.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Literal, SupportsIndex, cast
 
 import aiosqlite
 import pytest
@@ -2732,3 +2732,480 @@ class TestAllowedColumnsAllowlist:
             assert actual, f"table {table!r} is absent from the core schema"
             missing = sorted(columns - actual)
             assert not missing, f"{table}: allowlisted columns absent from the schema: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# SELECT passthrough: read-only-ness decided on a value the module owns
+# ---------------------------------------------------------------------------
+
+
+# The passthrough is documented as read-only, and that guarantee is established
+# by inspecting the statement the caller hands in. ``str`` is subclassable and
+# every method such an inspection reaches for — ``strip``, ``upper``,
+# ``startswith``, ``endswith``, ``__len__``, ``__str__`` — is overridable, while
+# SQLite still reads the object's real text. A guard built out of the caller's
+# own methods can therefore be told it is running a SELECT and hand a DELETE to
+# the database.
+#
+# Every refusal below is judged against the store rather than against the
+# exception: the rows are read back — or the driver is watched — *before*
+# anything about the raised error is asserted. "It raised" is the weaker claim
+# and would be satisfied by a guard that raised only after the write had
+# already run; asserting it first would abort the test at the wrong place and
+# hide what actually happened.
+
+_WRITE_PAYLOAD = "DELETE FROM thought"
+_READ_STATEMENT = "SELECT thought_id FROM thought"
+# Two statements in one string: the second one is what a single-statement guard
+# exists to keep out.
+_SMUGGLED_PAYLOAD = "SELECT 1; DELETE FROM thought"
+
+
+class _LyingSelectSql(str):
+    """Answers ``strip`` with itself and ``upper`` with a SELECT it is not.
+
+    The reported vector. An inspection built from these two methods sees a
+    read; the buffer SQLite receives is a write.
+    """
+
+    __slots__ = ()
+
+    def strip(self, chars: str | None = None, /) -> _LyingSelectSql:
+        return self
+
+    def upper(self) -> str:
+        return "SELECT"
+
+
+class _LyingStartswithSql(str):
+    """Stays in play through ``strip``/``upper``, then lies in ``startswith``."""
+
+    __slots__ = ()
+
+    def strip(self, chars: str | None = None, /) -> _LyingStartswithSql:
+        return self
+
+    def upper(self) -> _LyingStartswithSql:
+        return self
+
+    def startswith(
+        self,
+        prefix: str | tuple[str, ...],
+        start: SupportsIndex | None = None,
+        end: SupportsIndex | None = None,
+        /,
+    ) -> bool:
+        return True
+
+
+class _LyingSeparatorSql(str):
+    """Inverts every answer about its own trailing statement separator.
+
+    Aimed at the other half of the guard: a statement that really ends in
+    ``;`` claims it does not, and one that does not claims it does.
+    """
+
+    __slots__ = ()
+
+    def strip(self, chars: str | None = None, /) -> _LyingSeparatorSql:
+        return self
+
+    def endswith(
+        self,
+        suffix: str | tuple[str, ...],
+        start: SupportsIndex | None = None,
+        end: SupportsIndex | None = None,
+        /,
+    ) -> bool:
+        return not str.endswith(self, suffix)
+
+
+class _LyingEqualitySql(str):
+    """Compares equal to anything, while carrying a write."""
+
+    __slots__ = ()
+
+    def strip(self, chars: str | None = None, /) -> _LyingEqualitySql:
+        return self
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __hash__(self) -> int:
+        return str.__hash__(self)
+
+
+class _HiddenSeparatorSql(str):
+    """Reports its length as everything before the first ``;``.
+
+    A lexical scan that walks the caller's object never reaches the second
+    statement, so the single-statement check passes on a string that carries
+    two.
+    """
+
+    __slots__ = ()
+
+    def strip(self, chars: str | None = None, /) -> _HiddenSeparatorSql:
+        return self
+
+    def __len__(self) -> int:
+        return str.find(self, ";")
+
+
+class _MaskedWriteSql(str):
+    """Carries a write while ``__str__`` shows a read."""
+
+    __slots__ = ()
+
+    def __str__(self) -> str:
+        return _READ_STATEMENT
+
+
+class _MaskedReadSql(str):
+    """Carries a read while ``__str__`` shows a write."""
+
+    __slots__ = ()
+
+    def __str__(self) -> str:
+        return _WRITE_PAYLOAD
+
+
+class _PassthroughStripSql(str):
+    """A legitimate statement whose ``strip`` keeps the object itself in play."""
+
+    __slots__ = ()
+
+    def strip(self, chars: str | None = None, /) -> _PassthroughStripSql:
+        return self
+
+
+class _ShiftingSql(str):  # noqa: SLOT000 -- carries state; str takes no non-empty __slots__
+    """Answers the guard's first question one way and tells the truth after.
+
+    Time-of-check/time-of-use: the statement the guard inspects is not the
+    statement a later reader — including SQLite — would see.
+    """
+
+    def __init__(self, _value: str) -> None:
+        super().__init__()
+        self._answered = False
+
+    def strip(self, chars: str | None = None, /) -> _ShiftingSql:
+        return self
+
+    def upper(self) -> str:
+        if self._answered:
+            return str.upper(self)
+        self._answered = True
+        return "SELECT"
+
+
+class _ExplodingRepr:
+    """A non-string that raises when anything tries to represent it.
+
+    The refusal message is the last place on the guard's path where a caller's
+    code could still run. This value makes that visible: formatting it into an
+    error would replace the module's own exception with whatever ``__repr__``
+    chose to raise.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        msg = "__repr__ must not run inside a guard"
+        raise RuntimeError(msg)
+
+
+async def _refusal(store: SqliteEngravaCore, query: MindQLQuery) -> Exception | None:
+    """Run a query that must be refused and return what it raised, if anything.
+
+    The exception is returned rather than asserted so the caller can read the
+    stored rows first. A refusal that arrives *after* the write has run is not
+    a refusal, and asserting on the exception ahead of the state would hide
+    exactly that.
+    """
+    try:
+        await store.execute_mindql(query)
+    except Exception as exc:  # noqa: BLE001 -- returned so state is asserted first
+        return exc
+    return None
+
+
+class TestSelectPassthroughGuardOwnsItsValue:
+    """The read-only guard cannot be talked out of its decision."""
+
+    async def test_reported_bypass_destroys_nothing(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        before = await _thought_ids(populated_db)
+
+        raised = await _refusal(
+            store,
+            MindQLQuery(
+                command=MindQLCommand.SELECT,
+                raw_sql=_LyingSelectSql(_WRITE_PAYLOAD),
+            ),
+        )
+
+        after = await _thought_ids(populated_db)
+        assert after == before == _POPULATED_IDS
+        assert isinstance(raised, MindQLParseError)
+        assert "Only SELECT statements are allowed" in str(raised)
+
+    @pytest.mark.parametrize(
+        ("payload", "expected"),
+        [
+            pytest.param(
+                _LyingStartswithSql(_WRITE_PAYLOAD),
+                "Only SELECT statements are allowed",
+                id="lying-startswith",
+            ),
+            pytest.param(
+                _LyingEqualitySql(_WRITE_PAYLOAD),
+                "Only SELECT statements are allowed",
+                id="lying-eq",
+            ),
+            pytest.param(
+                _MaskedWriteSql(_WRITE_PAYLOAD),
+                "Only SELECT statements are allowed",
+                id="masked-str-dunder",
+            ),
+            pytest.param(
+                _HiddenSeparatorSql(_SMUGGLED_PAYLOAD),
+                "Only a single SELECT statement is allowed",
+                id="hidden-length",
+            ),
+        ],
+    )
+    async def test_adversarial_statement_writes_nothing(
+        self,
+        populated_db: aiosqlite.Connection,
+        payload: str,
+        expected: str,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        before = await _thought_ids(populated_db)
+
+        raised = await _refusal(
+            store,
+            MindQLQuery(command=MindQLCommand.SELECT, raw_sql=payload),
+        )
+
+        after = await _thought_ids(populated_db)
+        assert after == before == _POPULATED_IDS
+        assert isinstance(raised, MindQLParseError)
+        assert expected in str(raised)
+
+    async def test_statement_that_changes_its_answer_writes_nothing(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # Built fresh: this one keeps state, and its lie is spent on first use.
+        store = SqliteEngravaCore(populated_db)
+        before = await _thought_ids(populated_db)
+
+        raised = await _refusal(
+            store,
+            MindQLQuery(
+                command=MindQLCommand.SELECT,
+                raw_sql=_ShiftingSql(_WRITE_PAYLOAD),
+            ),
+        )
+
+        after = await _thought_ids(populated_db)
+        assert after == before == _POPULATED_IDS
+        assert isinstance(raised, MindQLParseError)
+        assert "Only SELECT statements are allowed" in str(raised)
+
+    @pytest.mark.parametrize(
+        ("value", "value_id"),
+        [
+            pytest.param(None, "none", id="none"),
+            pytest.param(5, "int", id="int"),
+            pytest.param(b"SELECT thought_id FROM thought", "bytes", id="bytes"),
+            pytest.param(["SELECT thought_id FROM thought"], "list", id="list"),
+        ],
+    )
+    async def test_non_string_sql_is_refused_with_a_typed_error(
+        self,
+        populated_db: aiosqlite.Connection,
+        value: object,
+        value_id: str,
+    ) -> None:
+        # A constructed query is not type-checked at runtime, so the guard owns
+        # the type as well as the value — and refuses with its own exception
+        # rather than whatever the value's methods happen to raise.
+        store = SqliteEngravaCore(populated_db)
+        before = await _thought_ids(populated_db)
+
+        raised = await _refusal(
+            store,
+            MindQLQuery(command=MindQLCommand.SELECT, raw_sql=cast("str", value)),
+        )
+
+        after = await _thought_ids(populated_db)
+        assert after == before == _POPULATED_IDS
+        assert isinstance(raised, MindQLParseError), f"{value_id}: {raised!r}"
+        assert "must be a string" in str(raised)
+
+    async def test_a_hostile_repr_cannot_change_the_error_type(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # The refusal owes a typed domain error for *every* non-string, which
+        # means its message may not be built out of the value being refused.
+        # Formatting the rejected value would hand the last word on the guard's
+        # path back to the caller.
+        store = SqliteEngravaCore(populated_db)
+        before = await _thought_ids(populated_db)
+
+        raised = await _refusal(
+            store,
+            MindQLQuery(
+                command=MindQLCommand.SELECT,
+                raw_sql=cast("str", _ExplodingRepr()),
+            ),
+        )
+
+        after = await _thought_ids(populated_db)
+        assert after == before == _POPULATED_IDS
+        assert isinstance(raised, MindQLParseError)
+        assert "must be a string" in str(raised)
+
+    async def test_no_refused_statement_reaches_the_driver(
+        self,
+        populated_db: aiosqlite.Connection,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        executed: list[str] = []
+        original_execute = populated_db.execute
+
+        async def _spy(sql: str, *args: object, **kwargs: object) -> object:
+            executed.append(str(sql))
+            return await original_execute(sql, *args, **kwargs)
+
+        monkeypatch.setattr(populated_db, "execute", _spy)
+
+        hostile: list[str] = [
+            _LyingSelectSql(_WRITE_PAYLOAD),
+            _LyingStartswithSql(_WRITE_PAYLOAD),
+            _LyingEqualitySql(_WRITE_PAYLOAD),
+            _MaskedWriteSql(_WRITE_PAYLOAD),
+            _HiddenSeparatorSql(_SMUGGLED_PAYLOAD),
+            _ShiftingSql(_WRITE_PAYLOAD),
+        ]
+        raised = [
+            await _refusal(
+                store,
+                MindQLQuery(command=MindQLCommand.SELECT, raw_sql=payload),
+            )
+            for payload in hostile
+        ]
+
+        # "Nothing reached SQLite" is the stronger claim and goes first: a
+        # guard that ran the statement and then raised would satisfy every
+        # assertion about the exception while the write had already happened.
+        assert executed == []
+        assert [type(exc) for exc in raised] == [MindQLParseError] * len(hostile)
+
+    async def test_the_guard_returns_the_modules_own_string(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # The statement that was validated is the statement that runs: the
+        # guard hands back a plain ``str`` it built, never the caller's object,
+        # so nothing the object overrides can act between check and use.
+        store = SqliteEngravaCore(populated_db)
+        plan = await store.execute_mindql(
+            MindQLQuery(
+                command=MindQLCommand.SELECT,
+                raw_sql=_PassthroughStripSql(_READ_STATEMENT),
+                explain=True,
+            ),
+        )
+
+        compiled = plan.rows[0]["sql"]
+        assert type(compiled) is str
+        assert compiled == _READ_STATEMENT
+
+    async def test_str_dunder_cannot_redirect_execution(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # The mirror of the masked-write case: a legitimate SELECT whose
+        # ``__str__`` reports a DELETE must run the SELECT it actually is.
+        # Normalising through ``str()`` rather than the buffer would validate,
+        # and return, a statement that is not the one handed in — which is the
+        # property that matters, whatever that other statement happens to do.
+        store = SqliteEngravaCore(populated_db)
+        before = await _thought_ids(populated_db)
+
+        result = await store.execute_mindql(
+            MindQLQuery(
+                command=MindQLCommand.SELECT,
+                raw_sql=_MaskedReadSql(_READ_STATEMENT),
+            ),
+        )
+
+        assert await _thought_ids(populated_db) == before == _POPULATED_IDS
+        assert [str(row["thought_id"]) for row in result.rows] == _POPULATED_IDS
+
+
+class TestSelectPassthroughLegitimateShapes:
+    """Owning the value must not cost the passthrough anything it accepted."""
+
+    @pytest.mark.parametrize(
+        "raw_sql",
+        [
+            pytest.param(_READ_STATEMENT, id="plain"),
+            pytest.param(f"   {_READ_STATEMENT}   ", id="surrounding-whitespace"),
+            pytest.param(f"{_READ_STATEMENT};", id="trailing-separator"),
+            pytest.param(f"{_READ_STATEMENT} ;  ", id="spaced-trailing-separator"),
+            pytest.param("select thought_id from thought", id="lower-case"),
+            pytest.param(f"\n{_READ_STATEMENT}\n", id="newlines"),
+            pytest.param(_PassthroughStripSql(_READ_STATEMENT), id="str-subclass"),
+            pytest.param(_LyingSeparatorSql(_READ_STATEMENT), id="lying-separator-absent"),
+            pytest.param(_LyingSeparatorSql(f"{_READ_STATEMENT};"), id="lying-separator-present"),
+        ],
+    )
+    async def test_legitimate_statement_still_executes(
+        self,
+        populated_db: aiosqlite.Connection,
+        raw_sql: str,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        result = await store.execute_mindql(
+            MindQLQuery(command=MindQLCommand.SELECT, raw_sql=raw_sql),
+        )
+        assert [str(row["thought_id"]) for row in result.rows] == _POPULATED_IDS
+
+    async def test_bound_parameters_survive_a_str_subclass(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        result = await store.execute_mindql(
+            MindQLQuery(
+                command=MindQLCommand.SELECT,
+                raw_sql=_PassthroughStripSql(
+                    "SELECT thought_id FROM thought WHERE priority = ?",
+                ),
+                select_params=("P1",),
+            ),
+        )
+        assert [str(row["thought_id"]) for row in result.rows] == ["t-000", "t-001"]
+
+    async def test_quoted_separator_is_still_not_a_second_statement(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # The single-statement scan runs on the guard's own copy; a ``;`` inside
+        # a string literal is still data, not a separator.
+        store = SqliteEngravaCore(populated_db)
+        result = await store.execute_mindql(
+            MindQLQuery(command=MindQLCommand.SELECT, raw_sql="SELECT ';' AS s"),
+        )
+        assert result.rows == [{"s": ";"}]

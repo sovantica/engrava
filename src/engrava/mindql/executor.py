@@ -274,7 +274,7 @@ def _guard_row_bound(value: object, clause: str) -> int:
     return bound
 
 
-def _guard_select_sql(sql: str) -> str:
+def _guard_select_sql(sql: object) -> str:
     """Validate a SELECT-passthrough statement and return it trimmed.
 
     Belt-and-suspenders read-only guard: the statement must begin with
@@ -282,18 +282,43 @@ def _guard_select_sql(sql: str) -> str:
     tolerated (and stripped); any ``;`` remaining mid-string is rejected so a
     second statement can never be smuggled in.
 
+    Read-only-ness is decided on a value this module owns. ``str`` is
+    subclassable and every method an inspection would reach for — ``strip``,
+    ``upper``, ``startswith``, ``endswith``, ``__len__`` — is overridable,
+    while SQLite still reads the object's real text: a guard built out of the
+    caller's own methods can be told it is running a ``SELECT`` and hand a
+    ``DELETE`` to the database. So the statement is normalised once through the
+    unbound ``str.strip``, which reads that real text and yields a plain
+    ``str``; every later check runs on that copy, and the copy is what the
+    caller gets back to execute. ``isinstance`` alone would not close this —
+    the subclass *is* a ``str`` — but it is still required, because
+    ``str.strip`` applies to nothing else.
+
     Args:
         sql: The raw SQL from a SELECT passthrough query.
 
     Returns:
-        The validated, trimmed SQL statement (without a trailing ``;``).
+        The validated, trimmed SQL statement (without a trailing ``;``), as a
+        plain ``str``.
 
     Raises:
-        MindQLParseError: If the statement is not a single SELECT statement.
+        MindQLParseError: If the value is not a string, or is not a single
+            SELECT statement.
 
     """
-    trimmed = sql.strip()
-    if not trimmed.upper().startswith("SELECT"):
+    if not isinstance(sql, str):
+        # The message names no part of the rejected value. Representing it
+        # would run the caller's ``__repr__`` on the guard's own path, and a
+        # hostile one raises in place of the error this guard promises; what
+        # failed and what was expected is the whole of what a caller needs.
+        msg = "SELECT passthrough SQL must be a string"
+        raise MindQLParseError(msg)
+    # ``str.strip(sql)``, not ``sql.strip()``: the unbound built-in reads the
+    # object's real text and returns a plain ``str``, so no override decides
+    # what is inspected below — nor what is executed, since this is the value
+    # every branch returns.
+    statement = str.strip(sql)
+    if not statement.upper().startswith("SELECT"):
         msg = "Only SELECT statements are allowed"
         raise MindQLParseError(msg)
     # Strip a single real trailing separator, then reject any that remain
@@ -301,7 +326,7 @@ def _guard_select_sql(sql: str) -> str:
     # quote would be the final char instead). The mid-statement check ignores
     # ``;`` inside quoted string literals, so a valid ``SELECT ';' AS s`` is
     # not falsely rejected.
-    without_trailing = trimmed[:-1].rstrip() if trimmed.endswith(";") else trimmed
+    without_trailing = statement[:-1].rstrip() if statement.endswith(";") else statement
     if ";" in strip_string_literals(without_trailing):
         msg = "Only a single SELECT statement is allowed"
         raise MindQLParseError(msg)
@@ -374,8 +399,9 @@ class MindQLExecutor:
                 or boolean joiner outside its keyword set, or a ``LIMIT`` /
                 ``OFFSET`` that is not a non-negative integer. Also for a
                 temporal predicate on a table without valid-time columns, a
-                SELECT passthrough that is not a single SELECT statement, an
-                unregistered extension command, and an unsupported command.
+                SELECT passthrough whose raw SQL is not a string or not a
+                single SELECT statement, an unregistered extension command,
+                and an unsupported command.
                 ``MindQLQuery`` can be constructed directly, so all of this is
                 validated here and not only by
                 :func:`~engrava.mindql.parser.parse`.
@@ -409,10 +435,11 @@ class MindQLExecutor:
             Query result.
 
         Raises:
-            MindQLParseError: If the SQL is not a single SELECT statement.
+            MindQLParseError: If the raw SQL is not a string, or is not a
+                single SELECT statement.
 
         """
-        sql = _guard_select_sql(query.raw_sql or "")
+        sql = _guard_select_sql(query.raw_sql)
         if query.select_params is not None:
             cursor = await self._db.execute(sql, query.select_params)
         else:
@@ -755,7 +782,7 @@ class MindQLExecutor:
 
         """
         if query.command == MindQLCommand.SELECT:
-            sql = _guard_select_sql(query.raw_sql or "")
+            sql = _guard_select_sql(query.raw_sql)
             params: list[object] = (
                 list(query.select_params) if query.select_params is not None else []
             )
