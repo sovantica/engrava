@@ -7,8 +7,8 @@ reason, and the run-result value object — while the loop's orchestration (the
 two-stage archive then garbage-collect, journaling, and database access) lives
 on :class:`~engrava.infrastructure.sqlite.engrava_core.SqliteEngravaCore`.
 
-The keep-score reuses the dreaming signal library
-(:mod:`engrava.extensions.dreaming_signals`) and the same active-signal
+The keep-score reuses the inward dreaming signal library
+(:mod:`engrava.domain.dreaming`) and the same active-signal
 redistribution the dreaming scorer uses (a signal whose data source is flat
 across the candidate pool is dropped and its weight renormalised over the active
 set), but carries the hygiene weight vector and threshold so the two loops tune
@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from engrava.extensions.dreaming_signals import (
+from engrava.domain.dreaming import (
     DEFAULT_SIGNALS,
     DreamingContext,
     default_signal_active,
@@ -144,7 +144,7 @@ def compute_active_hygiene_weights(
 
     A signal is *active* when its data source yields a non-default value for at
     least one candidate in the pool (see
-    :func:`~engrava.extensions.dreaming_signals.default_signal_active`); an
+    :func:`~engrava.domain.dreaming.default_signal_active`); an
     inactive (structurally flat) signal contributes the same constant to every
     candidate and so carries no ranking information. Its configured weight is
     dropped and the remainder renormalised over the active set, mirroring the
@@ -230,7 +230,7 @@ def has_active_usage_signal(
     pool. Without any usage evidence a "cold" thought cannot be distinguished from
     one merely ingested early, so cycle-recency alone must not drive eviction. The
     per-signal activeness test is delegated to the shared
-    :func:`~engrava.extensions.dreaming_signals.default_signal_active` predicate
+    :func:`~engrava.domain.dreaming.default_signal_active` predicate
     (the same one :func:`compute_active_hygiene_weights` uses) so the gate stays in
     lock-step with the scorer rather than re-deriving the test.
 

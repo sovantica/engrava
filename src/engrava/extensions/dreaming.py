@@ -16,27 +16,25 @@ from __future__ import annotations
 
 import logging
 import uuid
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from engrava.config import DreamingConfig
-from engrava.domain.exceptions import DuplicateEdgeError
-from engrava.extensions.dreaming_signals import (
+from engrava.domain.dreaming import (
+    CENTROID_MODEL_NAME,
     DEFAULT_SIGNALS,
+    ConsolidationResult,
     DreamingContext,
     DreamingSignalProtocol,
+    compute_centroid,
     default_signal_active,
 )
-from engrava.infrastructure.sqlite.centroid import (
-    CENTROID_MODEL_NAME,
-    compute_centroid,
-)
+from engrava.domain.exceptions import DuplicateEdgeError
+from engrava.domain.protocols.dreaming import DreamingStoreProtocol
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from engrava.domain.models.thought import ThoughtRecord
-    from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
 
 logger = logging.getLogger(__name__)
 
@@ -48,71 +46,6 @@ logger = logging.getLogger(__name__)
 # constant so tests can monkey-patch it to exercise the chunked path on
 # small synthetic inputs.
 _VECTORIZED_CLUSTERING_CHUNK_SIZE = 10_000
-
-
-# ------------------------------------------------------------------
-# Result value object
-# ------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class ConsolidationResult:
-    """Result of a dreaming consolidation run.
-
-    Attributes:
-        candidates_evaluated: Total number of thoughts assessed.
-        promoted_count: Number of thoughts that passed gates + threshold.
-        promoted_ids: Thought IDs that were promoted.
-        skipped_gate_count: Thoughts that failed gate checks.
-        scores: Mapping of thought_id to computed weighted score.
-        edges_created: Number of edges created during this run.
-        reflections_created: Number of REFLECTION thoughts created from
-            clusters during this run.
-        orphans_retired: Number of orphaned REFLECTIONs retired
-            (transitioned ACTIVE -> ARCHIVED) during this run because every
-            one of their consolidated source thoughts had left the active
-            set.
-        active_signal_weights: The **effective** per-signal weights used to
-            score this run — the configured weights after inactive
-            (structurally flat) signals have been dropped and their weight
-            redistributed onto the active signals (renormalised to sum to
-            ``1.0``; all-zero when no signal is active). A signal name absent
-            from this mapping, or mapped to ``0.0``, contributed nothing to
-            the promotion score this run. This is the programmatic companion
-            to the per-signal INFO log line.
-        flat_signals: Names of configured signals that were **inactive** this
-            run — their data source produced the same default value for every
-            candidate, so they carried no ranking information and their weight
-            was redistributed. Sorted for stable output.
-
-    Examples:
-        >>> r = ConsolidationResult(
-        ...     candidates_evaluated=100,
-        ...     promoted_count=5,
-        ...     promoted_ids=["t1", "t2", "t3", "t4", "t5"],
-        ... )
-        >>> r.promoted_count
-        5
-
-    """
-
-    candidates_evaluated: int
-    promoted_count: int
-    promoted_ids: list[str] = field(default_factory=list)
-    skipped_gate_count: int = 0
-    scores: dict[str, float] = field(default_factory=dict)
-    edges_created: int = 0
-    reflections_created: int = 0
-    promotion_capped: bool = False
-    """True when promotion stopped because the P1 fraction cap was reached."""
-    p1_fraction_after: float = 0.0
-    """Fraction of total corpus at priority P1 after this consolidation run."""
-    orphans_retired: int = 0
-    """Number of orphaned REFLECTIONs retired (ACTIVE -> ARCHIVED) this run."""
-    active_signal_weights: dict[str, float] = field(default_factory=dict)
-    """Effective per-signal weights after inactive-signal redistribution."""
-    flat_signals: list[str] = field(default_factory=list)
-    """Configured signals that were structurally flat (no data source) this run."""
 
 
 # ------------------------------------------------------------------
@@ -204,7 +137,7 @@ class DreamingExtension:
 
     async def run_if_due(
         self,
-        store: SqliteEngravaCore,
+        store: DreamingStoreProtocol,
         current_cycle: int,
     ) -> ConsolidationResult | None:
         """Run consolidation only when the configured cadence is due.
@@ -261,7 +194,7 @@ class DreamingExtension:
 
     async def run_consolidation(
         self,
-        store: SqliteEngravaCore,
+        store: DreamingStoreProtocol,
         current_cycle: int,
     ) -> ConsolidationResult:
         """Execute one consolidation pass over candidate thoughts.
@@ -280,7 +213,7 @@ class DreamingExtension:
           Default is ``"OBS_ONLY"`` (OBSERVATION thoughts only).
 
         Args:
-            store: The ``SqliteEngravaCore`` instance to consolidate.
+            store: A store implementing the Dreaming capability protocol.
             current_cycle: Current cognitive cycle number.
 
         Returns:
@@ -403,16 +336,13 @@ class DreamingExtension:
             flat_signals=flat_signals,
         )
 
-    async def _sweep_orphan_reflections(self, store: SqliteEngravaCore) -> int:
+    async def _sweep_orphan_reflections(self, store: DreamingStoreProtocol) -> int:
         """Retire REFLECTIONs whose entire source cluster has left ACTIVE.
 
-        Thin delegation to the store-owned
-        :meth:`~engrava.infrastructure.sqlite.engrava_core.SqliteEngravaCore.retire_orphan_reflections`,
-        which is the single shared implementation (also used by the Memory
-        Hygiene GC stage). Orphan retirement is a store maintenance operation —
-        it reads and writes only lifecycle / edge state through public store
-        methods — so it lives on the store; this wrapper preserves the
-        consolidation call-site.
+        Thin delegation to the store-owned ``retire_orphan_reflections``
+        capability, which is the single shared implementation also used by the
+        Memory Hygiene GC stage. This wrapper preserves the consolidation
+        call-site without binding Dreaming to a concrete backend.
 
         Args:
             store: The store to sweep.
@@ -434,7 +364,7 @@ class DreamingExtension:
         The promotion score is a **weighted average over the signals active
         for the run**. A signal is active when its data source yields a
         non-default value for at least one candidate in the pool (see
-        :func:`~engrava.extensions.dreaming_signals.default_signal_active`);
+        :func:`~engrava.domain.dreaming.default_signal_active`);
         an inactive signal contributes the same constant to every candidate
         and so carries no ranking information. This mirrors the hybrid-search
         precedent ``_redistribute_hybrid_weights``: the configured weights of
@@ -500,7 +430,7 @@ class DreamingExtension:
 
     async def _apply_promotions(
         self,
-        store: SqliteEngravaCore,
+        store: DreamingStoreProtocol,
         candidates: list[ThoughtRecord],
         ctx: DreamingContext,
         current_cycle: int,
@@ -667,7 +597,7 @@ class DreamingExtension:
 
     async def _create_edges_for_promoted(
         self,
-        store: SqliteEngravaCore,
+        store: DreamingStoreProtocol,
         promoted_ids: list[str],
         current_cycle: int,
     ) -> int:
@@ -763,7 +693,7 @@ class DreamingExtension:
 
     async def _run_clustering_if_needed(
         self,
-        store: SqliteEngravaCore,
+        store: DreamingStoreProtocol,
         current_cycle: int,
     ) -> list[frozenset[str]]:
         """Apply the early-stop guard before delegating to ``_build_clusters``.
@@ -815,7 +745,7 @@ class DreamingExtension:
 
     async def _build_clusters(
         self,
-        store: SqliteEngravaCore,
+        store: DreamingStoreProtocol,
         current_cycle: int,
     ) -> list[frozenset[str]]:
         """Build thought clusters using ASSOCIATED edges in the graph.
@@ -896,7 +826,7 @@ class DreamingExtension:
 
     async def _cold_start_agglomerative_clusters(
         self,
-        store: SqliteEngravaCore,
+        store: DreamingStoreProtocol,
     ) -> list[frozenset[str]]:
         """Cluster the eligible candidate pool with agglomerative clustering.
 
@@ -956,7 +886,7 @@ class DreamingExtension:
 
     @staticmethod
     async def _agglomerative_clusters(  # noqa: C901
-        store: SqliteEngravaCore,
+        store: DreamingStoreProtocol,
         node_ids: list[str],
         threshold: float,
     ) -> list[frozenset[str]]:
@@ -1066,7 +996,7 @@ class DreamingExtension:
 
     @staticmethod
     async def _agglomerative_clusters_python_legacy(  # noqa: C901
-        store: SqliteEngravaCore,
+        store: DreamingStoreProtocol,
         node_ids: list[str],
         threshold: float,
     ) -> list[frozenset[str]]:
@@ -1150,7 +1080,7 @@ class DreamingExtension:
 
     async def _create_reflections(  # noqa: C901, PLR0912, PLR0915
         self,
-        store: SqliteEngravaCore,
+        store: DreamingStoreProtocol,
         clusters: list[frozenset[str]],
         current_cycle: int,
         candidate_corpus: list[str] | None = None,
