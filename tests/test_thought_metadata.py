@@ -159,7 +159,7 @@ class TestThoughtMetadataPersistence:
         self,
         store: SqliteEngravaCore,
     ) -> None:
-        """F12 contract: UPDATE writes metadata via _CORE_UPDATE_SQL."""
+        """F12 contract: an update persists modified metadata."""
         await store.create_thought(
             _make_thought("t-update", metadata={"role": "user", "lang": "en"}),
         )

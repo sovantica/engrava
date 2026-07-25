@@ -103,7 +103,7 @@ from engrava.infrastructure.sqlite.hygiene import (
 from engrava.infrastructure.sqlite.journal_writer import JournalWriter
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 
     from engrava.config import HygienePolicyConfig, MetricsConfig, SearchConfig
     from engrava.domain.manifest import ExtensionManifest
@@ -3492,76 +3492,117 @@ class SqliteEngravaCore:
             thought.archived_at,
         )
 
-    _CORE_UPDATE_SQL = (
-        "UPDATE thought SET "
-        " thought_type = ?, essence = ?, content = ?, priority = ?,"
-        " lifecycle_status = ?, created_cycle = ?, updated_cycle = ?,"
-        " source = ?, confidence = ?, embedding_ref = ?,"
-        " source_type = ?, confirmation_count = ?,"
-        " consolidated_from = ?, visibility = ?,"
-        " access_count = ?, action_outcome_score = ?, last_accessed_at = ?,"
-        " created_at = ?, updated_at = ?, expires_at = ?,"
-        " valid_from = ?, valid_until = ?,"
-        " metadata_json = ?, provenance = ?, pinned = ?, archived_at_cycle = ?,"
-        " archived_at = ? "
-        "WHERE thought_id = ? AND updated_cycle = ?"
-    )
+    #: Guard clause every core thought UPDATE carries: the row identity plus
+    #: the optimistic-concurrency version the caller read.
+    _CORE_UPDATE_GUARD = "thought_id = ? AND updated_cycle = ?"
 
-    def _thought_to_core_update_params(
-        self,
-        updated: ThoughtRecord,
-        thought_id: str,
-        expected_cycle: int,
-    ) -> tuple[object, ...]:
-        """Extract core SQL parameters for UPDATE from a ThoughtRecord.
+    def _thought_to_core_columns(self, thought: ThoughtRecord) -> dict[str, object]:
+        """Map a ThoughtRecord to the column values an UPDATE may write.
 
-        Mirrors :py:meth:`_thought_to_core_params` for the SET column
-        ordering, including the trailing ``metadata_json`` value, so a
-        round trip through ``update_thought`` preserves caller-supplied
-        metadata instead of silently reverting it to the column default.
+        Mirrors :py:meth:`_thought_to_core_params` for the value encoding of
+        every column, but keyed by column name rather than positional so an
+        update can write a **subset**. That is what keeps an edit from
+        rewriting columns it does not own: high-volume telemetry
+        (``access_count``, ``last_accessed_at``) and ``confirmation_count`` are
+        maintained by other operations, and a whole-record write would silently
+        roll back whatever they stored since the row was read.
+
+        Two columns are absent, for different reasons. ``thought_id``
+        identifies the row being updated, so it is correctly not assignable
+        here. ``content_hash`` is a **known defect being preserved, not a
+        design choice**: no update has ever written it, so editing ``content``
+        leaves the stored hash pointing at the superseded text and content-hash
+        deduplication then matches the row on content it no longer holds.
+        Repairing it changes deduplication behaviour and belongs to a change of
+        its own; it is carried unchanged here so this rewrite stays
+        behaviour-preserving.
 
         Args:
-            updated: The updated thought record.
-            thought_id: UUID of the thought to update.
-            expected_cycle: The OCC version guard.
+            thought: The thought record to encode.
 
         Returns:
-            Tuple of parameter values for ``_CORE_UPDATE_SQL`` — SET
-            columns first (in declaration order), then the WHERE
-            ``thought_id`` and ``expected_cycle`` guard.
+            Mapping of column name to the SQL value for that column.
 
         """
-        return (
-            updated.thought_type.value,
-            updated.essence,
-            updated.content,
-            updated.priority.value,
-            updated.lifecycle_status.value,
-            updated.created_cycle,
-            updated.updated_cycle,
-            updated.source,
-            updated.confidence,
-            updated.embedding_ref,
-            updated.source_type.value,
-            updated.confirmation_count,
-            _encode_consolidated(updated.consolidated_from),
-            updated.visibility.value,
-            updated.access_count,
-            updated.action_outcome_score,
-            updated.last_accessed_at,
-            updated.created_at,
-            updated.updated_at,
-            updated.expires_at,
-            updated.valid_from,
-            updated.valid_until,
-            json.dumps(updated.metadata, ensure_ascii=False),
-            _encode_provenance(updated.provenance),
-            int(updated.pinned),
-            updated.archived_at_cycle,
-            updated.archived_at,
-            thought_id,
-            expected_cycle,
-        )
+        return {
+            "thought_type": thought.thought_type.value,
+            "essence": thought.essence,
+            "content": thought.content,
+            "priority": thought.priority.value,
+            "lifecycle_status": thought.lifecycle_status.value,
+            "created_cycle": thought.created_cycle,
+            "updated_cycle": thought.updated_cycle,
+            "source": thought.source,
+            "confidence": thought.confidence,
+            "embedding_ref": thought.embedding_ref,
+            "source_type": thought.source_type.value,
+            "confirmation_count": thought.confirmation_count,
+            "consolidated_from": _encode_consolidated(thought.consolidated_from),
+            "visibility": thought.visibility.value,
+            "access_count": thought.access_count,
+            "action_outcome_score": thought.action_outcome_score,
+            "last_accessed_at": thought.last_accessed_at,
+            "created_at": thought.created_at,
+            "updated_at": thought.updated_at,
+            "expires_at": thought.expires_at,
+            "valid_from": thought.valid_from,
+            "valid_until": thought.valid_until,
+            "metadata_json": json.dumps(thought.metadata, ensure_ascii=False),
+            "provenance": _encode_provenance(thought.provenance),
+            "pinned": int(thought.pinned),
+            "archived_at_cycle": thought.archived_at_cycle,
+            "archived_at": thought.archived_at,
+        }
+
+    def _thought_update_columns(
+        self,
+        current: ThoughtRecord,
+        updated: ThoughtRecord,
+    ) -> dict[str, object]:
+        """Return the columns an edit owns: what it changed, plus the stamp.
+
+        A column is owned when the operation gave it a new value; everything
+        else keeps whatever is in storage, including values written by another
+        writer since ``current`` was read. ``updated_at`` is always owned
+        because :py:meth:`ThoughtRecord.evolve` restamps it on every edit.
+
+        Args:
+            current: The record as it was read at the start of the operation.
+            updated: The record the operation wants to persist.
+
+        Returns:
+            Mapping of column name to SQL value, never empty.
+
+        """
+        before = self._thought_to_core_columns(current)
+        after = self._thought_to_core_columns(updated)
+        columns = {name: value for name, value in after.items() if before[name] != value}
+        columns["updated_at"] = after["updated_at"]
+        return columns
+
+    async def _read_back_thought(self, thought_id: str) -> ThoughtRecord:
+        """Re-read a thought a write just landed on.
+
+        The record handed back to the caller — and the ``after`` image written
+        to the journal — must be the row that is actually stored, not the
+        in-memory picture the operation intended to store. Only a read after
+        the write can tell the two apart once updates are partial.
+
+        Args:
+            thought_id: UUID of the thought.
+
+        Returns:
+            The thought as it is stored now.
+
+        Raises:
+            ThoughtNotFoundError: If the row no longer exists, so the write
+                cannot be confirmed and no record may be reported for it.
+
+        """
+        row = await self._get_thought_row(thought_id)
+        if row is None:
+            raise ThoughtNotFoundError(thought_id)
+        return self._row_to_thought(row)
 
     async def _get_thought_by_content_hash(
         self,
@@ -3600,37 +3641,42 @@ class SqliteEngravaCore:
     ) -> ThoughtRecord:
         """Bump ``confirmation_count`` + ``updated_at`` for an existing thought.
 
-        Implements the dedup-hit branch of ``create_thought``.  Persists
-        the bump in SQLite, refreshes ``updated_at`` to the current UTC
-        time, and returns a rebuilt frozen ``ThoughtRecord`` reflecting
-        the new state (Pydantic ``model_copy`` because the model is
-        ``frozen=True`` and forbids in-place mutation).
+        Implements the dedup-hit branch of ``create_thought``.  The bump is
+        **relative** — ``confirmation_count = confirmation_count + 1``
+        evaluated by SQLite against the stored row — so a confirmation
+        recorded by another writer since ``existing`` was read is counted
+        too, instead of being overwritten by an absolute value derived from
+        a stale read.  ``updated_at`` is refreshed to the current UTC time.
+        The row is read back so the returned record and the journal ``after``
+        image carry the count that is actually stored.
 
         Args:
             existing: The thought already in the database.
 
         Returns:
-            A new ``ThoughtRecord`` instance with
-            ``confirmation_count = existing.confirmation_count + 1``
-            and a refreshed ``updated_at``.
+            The stored thought, with the incremented ``confirmation_count``
+            and refreshed ``updated_at``.
+
+        Raises:
+            ThoughtNotFoundError: If the row disappeared between the
+                content-hash probe and this bump, so no confirmation was
+                recorded.
 
         """
-        new_count = existing.confirmation_count + 1
         now_iso = datetime.datetime.now(datetime.UTC).isoformat()
 
-        await self._db.execute(
-            "UPDATE thought SET confirmation_count = ?, updated_at = ? WHERE thought_id = ?",
-            (new_count, now_iso, existing.thought_id),
+        cursor = await self._db.execute(
+            "UPDATE thought SET confirmation_count = confirmation_count + 1, "
+            "updated_at = ? WHERE thought_id = ?",
+            (now_iso, existing.thought_id),
         )
+        if cursor.rowcount == 0:
+            raise ThoughtNotFoundError(existing.thought_id)
         await self._maybe_commit()
 
+        after = await self._read_back_thought(existing.thought_id)
+
         if self._journal is not None:
-            after = existing.model_copy(
-                update={
-                    "confirmation_count": new_count,
-                    "updated_at": now_iso,
-                },
-            )
             await self._journal.append(
                 mutation_type="UPDATE_THOUGHT",
                 target_id=existing.thought_id,
@@ -3639,14 +3685,8 @@ class SqliteEngravaCore:
                     "after": after.model_dump(mode="json"),
                 },
             )
-            return after
 
-        return existing.model_copy(
-            update={
-                "confirmation_count": new_count,
-                "updated_at": now_iso,
-            },
-        )
+        return after
 
     async def _create_thought_with_dedup(
         self,
@@ -3738,6 +3778,10 @@ class SqliteEngravaCore:
                 ``thought.provenance`` is not a
                 :class:`~engrava.domain.models.provenance.ProvenanceContext`
                 (per :func:`_validate_provenance`).
+            ThoughtNotFoundError: When ``deduplicate=True`` matched an existing
+                thought that was then deleted before its ``confirmation_count``
+                could be bumped — the sighting was not recorded, so no record
+                is returned for it.
             ConnectionQuarantinedError: When the connection has been quarantined.
 
         """
@@ -3866,6 +3910,9 @@ class SqliteEngravaCore:
                 size invariants (validated up front on both the hit and miss
                 paths, matching ``create_thought(deduplicate=True)`` which
                 validates before it branches).
+            ThoughtNotFoundError: If a matched thought was deleted before its
+                ``confirmation_count`` could be bumped — the sighting was not
+                recorded, so no record is returned for it.
             ConnectionQuarantinedError: When the connection has been quarantined.
 
         """
@@ -5271,15 +5318,26 @@ class SqliteEngravaCore:
 
         Uses ``updated_cycle`` as a version guard.
 
+        Writes **only the columns this edit owns** — the fields ``changes``
+        gives a new value to, plus the ``updated_at`` stamp ``evolve`` always
+        refreshes. Columns the caller did not touch keep whatever is in
+        storage, so an access recorded by :meth:`record_access` or a
+        confirmation counted since the row was read is not rolled back.
+
+        The record returned is read back from storage after the write, so it is
+        the row that exists rather than the one the call intended to write; the
+        journal ``after`` image is the same read-back.
+
         Args:
             thought_id: UUID of the thought to update.
             **changes: Fields to update.
 
         Returns:
-            The updated thought record.
+            The stored thought record, as persisted by this update.
 
         Raises:
-            ThoughtNotFoundError: If the thought does not exist.
+            ThoughtNotFoundError: If the thought does not exist, or if the row
+                was deleted before the write could be read back.
             StaleDataError: If the row was modified since it was read.
             ValueError: If the post-``evolve`` metadata violates the
                 metadata-shape or size invariants enforced by
@@ -5303,9 +5361,10 @@ class SqliteEngravaCore:
         _validate_metadata(updated.metadata)
         _validate_provenance(updated.provenance)
 
+        columns = self._thought_update_columns(current, updated)
         cursor = await self._db.execute(
-            self._CORE_UPDATE_SQL,
-            self._thought_to_core_update_params(updated, thought_id, expected_cycle),
+            _build_update_sql("thought", columns, self._CORE_UPDATE_GUARD),
+            (*columns.values(), thought_id, expected_cycle),
         )
         if cursor.rowcount == 0:
             raise StaleDataError(
@@ -5314,13 +5373,15 @@ class SqliteEngravaCore:
                 expected_version=expected_cycle,
             )
 
+        persisted = await self._read_back_thought(thought_id)
+
         if self._journal is not None:
             await self._journal.append(
                 mutation_type="UPDATE_THOUGHT",
                 target_id=thought_id,
                 delta={
                     "before": current.model_dump(mode="json"),
-                    "after": updated.model_dump(mode="json"),
+                    "after": persisted.model_dump(mode="json"),
                 },
             )
 
@@ -5330,9 +5391,9 @@ class SqliteEngravaCore:
         if (
             self._auto_embed
             and self._embedding_provider is not None
-            and (updated.essence != current.essence or updated.content != current.content)
+            and (persisted.essence != current.essence or persisted.content != current.content)
         ):
-            await self._auto_embed_thought(updated)
+            await self._auto_embed_thought(persisted)
             # The member's vector moved, so any REFLECTION that summarizes it
             # must re-bind to the current cluster instead of scoring on a
             # frozen centroid. Strictly on the essence/content path — a
@@ -5340,7 +5401,7 @@ class SqliteEngravaCore:
             await self._rebind_consolidated_reflections(thought_id)
 
         await self._maybe_auto_cleanup(exclude_id=thought_id)
-        return updated
+        return persisted
 
     async def restore_thought(
         self, thought_id: str, *, current_cycle: int | None = None
@@ -5367,6 +5428,9 @@ class SqliteEngravaCore:
         another reason to prefer this method (and the hygiene / TTL flows) over
         low-level lifecycle writes.
 
+        Like :meth:`update_thought`, this writes only the columns the restore
+        owns and returns the row read back from storage after the write.
+
         Args:
             thought_id: UUID of the archived thought to restore.
             current_cycle: Optional cycle to stamp as the new ``updated_cycle``;
@@ -5376,7 +5440,8 @@ class SqliteEngravaCore:
             The restored thought record (``lifecycle_status`` is ``ACTIVE``).
 
         Raises:
-            ThoughtNotFoundError: If the thought does not exist.
+            ThoughtNotFoundError: If the thought does not exist, or if the row
+                was deleted before the write could be read back.
             InvalidTransitionError: If the thought is not currently ``ARCHIVED``.
             StaleDataError: If the row was modified since it was read.
 
@@ -5406,9 +5471,10 @@ class SqliteEngravaCore:
             changes["updated_cycle"] = current_cycle
         updated = current.evolve(**changes)
 
+        columns = self._thought_update_columns(current, updated)
         cursor = await self._db.execute(
-            self._CORE_UPDATE_SQL,
-            self._thought_to_core_update_params(updated, thought_id, expected_cycle),
+            _build_update_sql("thought", columns, self._CORE_UPDATE_GUARD),
+            (*columns.values(), thought_id, expected_cycle),
         )
         if cursor.rowcount == 0:
             raise StaleDataError(
@@ -5417,17 +5483,19 @@ class SqliteEngravaCore:
                 expected_version=expected_cycle,
             )
 
+        persisted = await self._read_back_thought(thought_id)
+
         if self._journal is not None:
             await self._journal.append(
                 mutation_type="UPDATE_THOUGHT",
                 target_id=thought_id,
                 delta={
                     "before": current.model_dump(mode="json"),
-                    "after": updated.model_dump(mode="json"),
+                    "after": persisted.model_dump(mode="json"),
                 },
             )
         await self._maybe_commit()
-        return updated
+        return persisted
 
     async def invalidate_thought(
         self,
@@ -5769,15 +5837,23 @@ class SqliteEngravaCore:
     async def update_edge(self, edge_id: str, **changes: object) -> EdgeRecord:
         """Update an edge by its ID.
 
+        Writes **only the columns whose value this edit changes**, so a field
+        another writer set since the row was read is not rolled back. An edit
+        that changes nothing writes nothing at all. The record returned is read
+        back from storage after the write — the row that exists, not the one
+        the call intended to write — and the journal ``after`` image is the
+        same read-back.
+
         Args:
             edge_id: UUID of the edge to update.
             **changes: Fields to update.
 
         Returns:
-            The updated edge record.
+            The stored edge record, as persisted by this update.
 
         Raises:
-            ValueError: If the edge does not exist, or if the merged
+            ValueError: If the edge does not exist (including when it was
+                deleted before the write could be read back), or if the merged
                 ``metadata`` violates the shared metadata contract (a
                 non-scalar / list value, a non-finite float, or a serialized
                 size over the 64 KiB hard limit).
@@ -5792,25 +5868,19 @@ class SqliteEngravaCore:
         updated = type(current).model_validate({**current.model_dump(mode="json"), **changes})
         _validate_metadata(updated.metadata)
 
-        await self._db.execute(
-            "UPDATE edge SET from_thought_id = ?, to_thought_id = ?, edge_type = ?, "
-            "weight = ?, created_cycle = ?, source = ?, decay_multiplier = ?, "
-            "valid_from = ?, valid_until = ?, metadata_json = ? "
-            "WHERE edge_id = ?",
-            (
-                updated.from_thought_id,
-                updated.to_thought_id,
-                updated.edge_type.value,
-                updated.weight,
-                updated.created_cycle,
-                updated.source.value,
-                updated.decay_multiplier,
-                updated.valid_from,
-                updated.valid_until,
-                json.dumps(updated.metadata, ensure_ascii=False),
-                edge_id,
-            ),
-        )
+        before = _edge_to_core_columns(current)
+        columns = {
+            name: value
+            for name, value in _edge_to_core_columns(updated).items()
+            if before[name] != value
+        }
+        if columns:
+            await self._db.execute(
+                _build_update_sql("edge", columns, "edge_id = ?"),
+                (*columns.values(), edge_id),
+            )
+
+        persisted = await self._read_back_edge(edge_id)
 
         if self._journal is not None:
             await self._journal.append(
@@ -5818,12 +5888,36 @@ class SqliteEngravaCore:
                 target_id=edge_id,
                 delta={
                     "before": current.model_dump(mode="json"),
-                    "after": updated.model_dump(mode="json"),
+                    "after": persisted.model_dump(mode="json"),
                 },
             )
 
         await self._maybe_commit()
-        return updated
+        return persisted
+
+    async def _read_back_edge(self, edge_id: str) -> EdgeRecord:
+        """Re-read an edge a write just landed on.
+
+        The counterpart of :py:meth:`_read_back_thought` for edges: once an
+        update writes only the columns it owns, the stored row is the only
+        thing that can be reported to the caller or journaled.
+
+        Args:
+            edge_id: UUID of the edge.
+
+        Returns:
+            The edge as it is stored now.
+
+        Raises:
+            ValueError: If the row no longer exists, so the write cannot be
+                confirmed and no record may be reported for it.
+
+        """
+        row = await self._get_edge_row(edge_id)
+        if row is None:
+            msg = f"Edge not found: {edge_id}"
+            raise ValueError(msg)
+        return _row_to_edge(row)
 
     async def invalidate_edge(
         self,
@@ -9550,13 +9644,17 @@ class SqliteEngravaCore:
         it writes nothing) no commit — it never flushes unrelated pending
         writes on the connection.
 
-        On a real change the new status/verification is persisted, the
-        mutation is journaled as ``UPDATE_ACTION`` (only when journaling is
-        enabled), and the source thought's ``action_outcome_score`` is
-        recomputed when the change is **outcome-affecting** — that is, when
-        it lands a terminal status, or changes ``verification_status`` on an
-        already-terminal action. A purely non-terminal move (e.g.
-        ``PLANNED`` → ``EXECUTING``) is journaled but triggers no recompute.
+        On a real change **only the column that changed** is written — a
+        status-only update does not re-assert the verification column it read a
+        moment ago, so a verification recorded by another writer meanwhile is
+        not rolled back. The mutation is journaled as ``UPDATE_ACTION`` (only
+        when journaling is enabled), and the source thought's
+        ``action_outcome_score`` is recomputed when the change is
+        **outcome-affecting** — that is, when it lands a terminal status, or
+        changes ``verification_status`` on an already-terminal action. A purely
+        non-terminal move (e.g. ``PLANNED`` → ``EXECUTING``) is journaled but
+        triggers no recompute. The record returned is read back from storage
+        after the write, and the journal ``after`` image is the same read-back.
 
         Args:
             action_id: UUID of the action to update.
@@ -9565,10 +9663,11 @@ class SqliteEngravaCore:
                 leave it unchanged.
 
         Returns:
-            The updated (or, for a no-op, the unchanged) action record.
+            The stored action record (or, for a no-op, the unchanged record).
 
         Raises:
-            ActionNotFoundError: If the action does not exist.
+            ActionNotFoundError: If the action does not exist, or if the row
+                was deleted before the write could be read back.
             InvalidTransitionError: If a real ``status`` change is illegal
                 per the action state machine.
 
@@ -9594,10 +9693,21 @@ class SqliteEngravaCore:
         # is a no-op validation-wise for a verification-only change.
         updated = current.evolve(**changes)
 
+        # Write only the column(s) this call moves: a status-only update must
+        # not re-assert the verification column it read a moment ago, which
+        # would roll back a verification recorded by another writer meanwhile.
+        columns: dict[str, object] = {}
+        if status_changes:
+            columns["status"] = updated.status.value
+        if verification_changes:
+            columns["verification_status"] = updated.verification_status.value
+
         await self._db.execute(
-            "UPDATE action SET status = ?, verification_status = ? WHERE action_id = ?",
-            (updated.status.value, updated.verification_status.value, action_id),
+            _build_update_sql("action", columns, "action_id = ?"),
+            (*columns.values(), action_id),
         )
+
+        persisted = await self._read_back_action(action_id)
 
         if self._journal is not None:
             await self._journal.append(
@@ -9609,8 +9719,8 @@ class SqliteEngravaCore:
                         "verification_status": current.verification_status.value,
                     },
                     "after": {
-                        "status": updated.status.value,
-                        "verification_status": updated.verification_status.value,
+                        "status": persisted.status.value,
+                        "verification_status": persisted.verification_status.value,
                     },
                 },
             )
@@ -9619,13 +9729,34 @@ class SqliteEngravaCore:
         # verification on an already-terminal action. Because the aggregate
         # reads both status and verification, a verification change on a
         # terminal action IS outcome-affecting.
-        lands_terminal = status_changes and updated.status in _TERMINAL_ACTION_STATUSES
-        verifies_terminal = verification_changes and updated.status in _TERMINAL_ACTION_STATUSES
+        lands_terminal = status_changes and persisted.status in _TERMINAL_ACTION_STATUSES
+        verifies_terminal = verification_changes and persisted.status in _TERMINAL_ACTION_STATUSES
         if lands_terminal or verifies_terminal:
-            await self._recompute_action_outcome(updated.source_thought_id)
+            await self._recompute_action_outcome(persisted.source_thought_id)
 
         await self._maybe_commit()
-        return updated
+        return persisted
+
+    async def _read_back_action(self, action_id: str) -> ActionRecord:
+        """Re-read an action a write just landed on.
+
+        The counterpart of :py:meth:`_read_back_thought` for actions.
+
+        Args:
+            action_id: UUID of the action.
+
+        Returns:
+            The action as it is stored now.
+
+        Raises:
+            ActionNotFoundError: If the row no longer exists, so the write
+                cannot be confirmed and no record may be reported for it.
+
+        """
+        action = await self._get_action(action_id)
+        if action is None:
+            raise ActionNotFoundError(action_id)
+        return action
 
     async def _get_action(self, action_id: str) -> ActionRecord | None:
         """Fetch a single action by its ID, or ``None`` when absent.
@@ -9741,11 +9872,66 @@ def _row_to_edge(row: aiosqlite.Row) -> EdgeRecord:
         weight=row["weight"],
         created_cycle=row["created_cycle"],
         source=KnowledgeSource(source_raw) if source_raw else KnowledgeSource.EXPERIENCE,
-        decay_multiplier=float(decay_raw) if decay_raw else 1.0,
+        # ``is not None``, never truthiness: ``0.0`` is a valid decay (the field
+        # is bounded ``ge=0.0``, not ``gt=0.0``) and it is falsy, so a truthiness
+        # fallback reports the ``1.0`` default for a row the database says is
+        # ``0.0``. The fallback exists only for a row that predates the column.
+        decay_multiplier=float(decay_raw) if decay_raw is not None else 1.0,
         valid_from=valid_from_raw,
         valid_until=valid_until_raw,
         metadata=metadata_decoded,
     )
+
+
+def _edge_to_core_columns(edge: EdgeRecord) -> dict[str, object]:
+    """Map an EdgeRecord to the column values an UPDATE may write.
+
+    The edge counterpart of
+    :py:meth:`SqliteEngravaCore._thought_to_core_columns`, keyed by column name
+    so an update writes only the columns it owns. ``edge_id`` is absent — it
+    identifies the row being updated.
+
+    Args:
+        edge: The edge record to encode.
+
+    Returns:
+        Mapping of column name to the SQL value for that column.
+
+    """
+    return {
+        "from_thought_id": edge.from_thought_id,
+        "to_thought_id": edge.to_thought_id,
+        "edge_type": edge.edge_type.value,
+        "weight": edge.weight,
+        "created_cycle": edge.created_cycle,
+        "source": edge.source.value,
+        "decay_multiplier": edge.decay_multiplier,
+        "valid_from": edge.valid_from,
+        "valid_until": edge.valid_until,
+        "metadata_json": json.dumps(edge.metadata, ensure_ascii=False),
+    }
+
+
+def _build_update_sql(table: str, columns: Iterable[str], guard: str) -> str:
+    """Compose an UPDATE that assigns exactly ``columns``.
+
+    Every update in the store writes a subset of its table's columns — the ones
+    the operation owns — so the statement is shaped per call instead of being a
+    frozen whole-record string. The table name, the column names and the guard
+    are internal literals; every *value* is bound as a parameter.
+
+    Args:
+        table: Target table name.
+        columns: Column names to assign, each bound to a ``?`` placeholder, in
+            the order their values are passed.
+        guard: The WHERE clause, its own placeholders included.
+
+    Returns:
+        The composed UPDATE statement.
+
+    """
+    assignments = ", ".join(f"{name} = ?" for name in columns)
+    return f"UPDATE {table} SET {assignments} WHERE {guard}"  # noqa: S608 -- table/columns/guard are internal literals; all values are bound
 
 
 def _query_is_expert_syntax(query: str) -> bool:
