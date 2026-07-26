@@ -29,6 +29,7 @@ import datetime
 import importlib.util
 import math
 from typing import TYPE_CHECKING
+from unittest import mock
 
 import aiosqlite
 import pytest
@@ -88,12 +89,18 @@ async def _make_store(
     policy: HygienePolicyConfig | None,
     *,
     journal_enabled: bool = False,
+    ttl_strategy: str = "archive",
 ) -> SqliteEngravaCore:
     """Build a bootstrapped in-memory store carrying the given hygiene policy."""
     conn = await aiosqlite.connect(":memory:")
     conn.row_factory = aiosqlite.Row
     await conn.execute("PRAGMA foreign_keys = ON")
-    s = SqliteEngravaCore(conn, hygiene_policy=policy, journal_enabled=journal_enabled)
+    s = SqliteEngravaCore(
+        conn,
+        hygiene_policy=policy,
+        journal_enabled=journal_enabled,
+        ttl_strategy=ttl_strategy,
+    )
     await s.ensure_schema()
     return s
 
@@ -102,6 +109,25 @@ async def _make_store(
 # is always older than the default minimum-inactivity window (7 days) — used to
 # build a "genuinely aged" store for the eviction path.
 _LONG_AGO = "2000-01-01T00:00:00+00:00"
+
+# An expiry no wall clock this suite runs under will reach. A TTL must be
+# unreached for the row to stay in the hygiene candidate pool at all
+# (``list_thoughts`` excludes expired rows against the real clock), so a test
+# pinning TTL behaviour resolves the expiry only through an injected sweep
+# instant — never by the machine's date.
+_FAR_FUTURE = "2999-01-01T00:00:00+00:00"
+_AFTER_FAR_FUTURE = "2999-01-02T00:00:00+00:00"
+
+# A wall-clock instant tests pin so every wall-clock boundary (the
+# minimum-inactivity age and the GC restore window) is deterministic.
+_NOW = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.UTC)
+_WEEK_SECONDS = 604800
+_MONTH_SECONDS = 2592000  # 30 days — the default wall-clock restore window.
+
+
+def _iso_before(now: datetime.datetime, seconds: float) -> str:
+    """ISO-8601 timestamp ``seconds`` before ``now`` (UTC)."""
+    return (now - datetime.timedelta(seconds=seconds)).isoformat()
 
 
 def _thought(
@@ -120,6 +146,7 @@ def _thought(
     created_at: str | None = None,
     updated_at: str | None = None,
     last_accessed_at: str | None = None,
+    expires_at: str | None = None,
 ) -> ThoughtRecord:
     """Build a thought with hygiene-relevant fields controllable per test.
 
@@ -128,7 +155,8 @@ def _thought(
     ``None`` lets ``create_thought`` stamp ``created_at`` to *now* (a young row).
     ``action_outcome_score`` is the usage-history signal used to satisfy the
     run-level access-gate without perturbing the keep-score (it is not a
-    configured hygiene keep-signal).
+    configured hygiene keep-signal). ``expires_at`` puts the thought under TTL,
+    which hygiene archival must clear.
     """
     return ThoughtRecord(
         thought_id=thought_id,
@@ -148,6 +176,33 @@ def _thought(
         created_at=created_at,
         updated_at=updated_at,
         last_accessed_at=last_accessed_at,
+        expires_at=expires_at,
+    )
+
+
+def _evictable_thought(thought_id: str, *, expires_at: str | None = None) -> ThoughtRecord:
+    """A thought that an *enabled* policy archives at a far-future cycle.
+
+    Every gate other than the ``enabled`` master switch is deliberately
+    satisfied, so a test built on this row isolates that switch:
+
+    * **minimum-inactivity-age gate** — ``created_at`` / ``updated_at`` stamped
+      ``_LONG_AGO``, decades past the default 7-day window. Aged by an absolute
+      timestamp rather than an injected offset, so the row is archivable under
+      *any* wall clock — which is what lets a caller that cannot inject ``now``
+      (``consolidate()``) stay deterministic.
+    * **run-level access-gate** — ``action_outcome_score`` supplies the
+      usage-history signal the pool needs.
+    * **keep-score** — ``updated_cycle=0`` against a far-future cycle makes the
+      row maximally cold, so any threshold above 0 evicts it.
+    """
+    return _thought(
+        thought_id,
+        updated_cycle=0,
+        action_outcome_score=0.0,
+        created_at=_LONG_AGO,
+        updated_at=_LONG_AGO,
+        expires_at=expires_at,
     )
 
 
@@ -193,6 +248,16 @@ async def _raw_archived_at(store: SqliteEngravaCore, thought_id: str) -> str | N
     if row is None or row["archived_at"] is None:
         return None
     return str(row["archived_at"])
+
+
+async def _raw_expires_at(store: SqliteEngravaCore, thought_id: str) -> str | None:
+    cursor = await store._db.execute(
+        "SELECT expires_at FROM thought WHERE thought_id = ?", (thought_id,)
+    )
+    row = await cursor.fetchone()
+    if row is None or row["expires_at"] is None:
+        return None
+    return str(row["expires_at"])
 
 
 # ---------------------------------------------------------------------------
@@ -653,27 +718,80 @@ class TestDefaultOff:
         assert fetched.archived_at_cycle is None
 
     async def test_disabled_policy_consolidate_does_not_forget(self) -> None:
-        """With a policy present but disabled, consolidate() never archives."""
-        policy = HygienePolicyConfig(enabled=False, eviction_threshold=1.0)
-        s = await _make_store(policy)
+        """With a policy present but disabled, consolidate() never archives.
+
+        The pool is the archivable one built by :func:`_evictable_thought`, and
+        the cadence is satisfied (``1000 % 1 == 0``), so ``enabled`` is the only
+        variable — flipping it on at the end archives the same row on the same
+        cycle, which is what proves nothing else was quietly protecting it.
+        """
+        conn = await aiosqlite.connect(":memory:")
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA foreign_keys = ON")
+        from engrava.extensions.dreaming import DreamingExtension
+
+        s = SqliteEngravaCore(
+            conn,
+            hygiene_policy=HygienePolicyConfig(
+                enabled=False, eviction_threshold=1.0, check_every_n_cycles=1
+            ),
+        )
+        s._dreaming_extension = DreamingExtension(config=DreamingConfig(enabled=True))
+        await s.ensure_schema()
         try:
-            await s.create_thought(_thought("cold", updated_cycle=0, action_outcome_score=0.0))
-            # A disabled policy makes ``_hygiene_due`` false regardless of cycle.
-            assert s._hygiene_due(1) is False
-            assert await _raw_lifecycle(s, "cold") == "ACTIVE"
+            await s.create_thought(_evictable_thought("cold"))
+
+            # Spy (``wraps`` — the real pass still runs) so the rejection is
+            # observable on the path itself: the pass is never *invoked*, not
+            # merely inert once invoked.
+            with mock.patch.object(s, "run_hygiene", wraps=s.run_hygiene) as pass_spy:
+                await s.consolidate(current_cycle=1000)
+
+                assert await _raw_lifecycle(s, "cold") == "ACTIVE"
+                assert await _raw_archived_at_cycle(s, "cold") is None
+                assert await _raw_archived_at(s, "cold") is None
+                assert pass_spy.call_count == 0
+                # The cadence gate carries its own ``enabled`` term — the second,
+                # independent guard on this path.
+                assert s._hygiene_due(1000) is False
+
+                # Flip the single variable: same store, same pool, same cycle.
+                s._hygiene_policy = HygienePolicyConfig(
+                    enabled=True, eviction_threshold=1.0, check_every_n_cycles=1
+                )
+                await s.consolidate(current_cycle=1000)
+                assert await _raw_lifecycle(s, "cold") == "ARCHIVED"
+                assert await _raw_archived_at_cycle(s, "cold") == 1000
+                assert pass_spy.call_count == 1
         finally:
-            await s._db.close()
+            await conn.close()
 
     async def test_disabled_policy_direct_run_hygiene_is_a_noop(self) -> None:
-        """``enabled`` is a hard master switch — a direct call also never forgets."""
+        """``enabled`` is a hard master switch — a direct call also never forgets.
+
+        ``run_hygiene`` bypasses the cadence gate, so the master switch is the
+        *only* guard here: the thought is aged past the default 7-day
+        minimum-inactivity window, carries the usage signal the access-gate
+        needs, and scores under the threshold. Flipping ``enabled`` on at the end
+        archives it, so none of those gates is doing the work.
+        """
         policy = HygienePolicyConfig(enabled=False, eviction_threshold=1.0)
         s = await _make_store(policy)
         try:
-            await s.create_thought(_thought("cold", updated_cycle=0, action_outcome_score=0.0))
-            result = await s.run_hygiene(current_cycle=1000)
+            await s.create_thought(_evictable_thought("cold"))
+
+            result = await s.run_hygiene(current_cycle=1000, now=_NOW)
+
+            assert await _raw_lifecycle(s, "cold") == "ACTIVE"
+            assert await _raw_archived_at_cycle(s, "cold") is None
+            assert await _raw_archived_at(s, "cold") is None
             assert result.archived_count == 0
             assert result.gc_count == 0
-            assert await _raw_lifecycle(s, "cold") == "ACTIVE"
+
+            s._hygiene_policy = HygienePolicyConfig(enabled=True, eviction_threshold=1.0)
+            enabled_run = await s.run_hygiene(current_cycle=1000, now=_NOW)
+            assert await _raw_lifecycle(s, "cold") == "ARCHIVED"
+            assert enabled_run.archived_count == 1
         finally:
             await s._db.close()
 
@@ -908,13 +1026,67 @@ class TestProtection:
 
 class TestArchiveReversible:
     async def test_archive_sets_archived_at_cycle_and_clears_expires(self) -> None:
+        """Archival stamps both hygiene markers and drops the row's TTL.
+
+        Both thoughts are created *under TTL* — otherwise ``expires_at`` is
+        already ``NULL`` before the pass and the clear cannot be observed. The
+        pinned row is the non-target: the clear must reach the archived row and
+        only the archived row, so a blanket TTL wipe fails this test.
+        """
         policy = _forgetful_policy(eviction_threshold=1.0)
         s = await _make_store(policy)
         try:
-            await s.create_thought(_thought("cold", updated_cycle=0, action_outcome_score=0.0))
-            await s.run_hygiene(current_cycle=42)
+            await s.create_thought(
+                _thought("cold", updated_cycle=0, action_outcome_score=0.0, expires_at=_FAR_FUTURE)
+            )
+            await s.create_thought(_thought("keep", pinned=True, expires_at=_FAR_FUTURE))
+            assert await _raw_expires_at(s, "cold") == _FAR_FUTURE  # under TTL before the pass
+
+            await s.run_hygiene(current_cycle=42, now=_NOW)
+
             assert await _raw_lifecycle(s, "cold") == "ARCHIVED"
             assert await _raw_archived_at_cycle(s, "cold") == 42
+            assert await _raw_archived_at(s, "cold") == _NOW.isoformat()
+            # No longer subject to TTL — see the delete-strategy test below for
+            # what the surviving TTL would have cost.
+            assert await _raw_expires_at(s, "cold") is None
+            # The non-target keeps its lifecycle, its TTL and its NULL markers.
+            assert await _raw_lifecycle(s, "keep") == "ACTIVE"
+            assert await _raw_expires_at(s, "keep") == _FAR_FUTURE
+            assert await _raw_archived_at_cycle(s, "keep") is None
+        finally:
+            await s._db.close()
+
+    async def test_archived_row_survives_a_later_ttl_delete_sweep(self) -> None:
+        """The cleared TTL is what keeps a reversibly-archived row out of the sweep.
+
+        ``cleanup_expired`` has no lifecycle filter, so a hygiene-archived row
+        that kept its ``expires_at`` would be **physically deleted** under
+        ``ttl_strategy="delete"`` — bypassing both GC restore windows and the
+        ``auto_gc_enabled`` switch. The pinned control row proves the sweep is
+        live and really does delete what is still under TTL.
+        """
+        policy = _forgetful_policy(eviction_threshold=1.0)
+        s = await _make_store(policy, ttl_strategy="delete")
+        try:
+            await s.create_thought(_evictable_thought("cold", expires_at=_FAR_FUTURE))
+            # Pinned, so hygiene never archives it: it keeps its TTL and is the
+            # non-target the sweep is expected to reap.
+            await s.create_thought(_thought("under_ttl", pinned=True, expires_at=_FAR_FUTURE))
+
+            await s.run_hygiene(current_cycle=42, now=_NOW)
+            assert await _raw_lifecycle(s, "cold") == "ARCHIVED"
+            # The non-target came through archival untouched, TTL included —
+            # so its later deletion is the sweep's doing, not hygiene's.
+            assert await _raw_lifecycle(s, "under_ttl") == "ACTIVE"
+            assert await _raw_expires_at(s, "under_ttl") == _FAR_FUTURE
+
+            result = await s.cleanup_expired(now=_AFTER_FAR_FUTURE)
+
+            assert await _raw_lifecycle(s, "cold") == "ARCHIVED"  # not deleted
+            assert await _raw_lifecycle(s, "under_ttl") is None  # the sweep is live
+            assert result.expired_count == 1
+            assert result.strategy_applied == "delete"
         finally:
             await s._db.close()
 
@@ -1213,14 +1385,38 @@ class TestDecayClamp:
 
 class TestGarbageCollection:
     async def test_gc_disabled_by_default_only_archives(self) -> None:
+        """Enabling hygiene never implicitly enables deletion.
+
+        The row is archived on the first pass and then left to age past **both**
+        restore windows before the second pass, so ``auto_gc_enabled`` is the
+        only thing still standing between it and a permanent delete — flipping
+        that switch on at the end reaps it, which is what proves the windows had
+        really elapsed rather than the test having stopped short of them.
+        """
         policy = _forgetful_policy(eviction_threshold=1.0, auto_gc_enabled=False)
         s = await _make_store(policy)
         try:
             await s.create_thought(_thought("cold", updated_cycle=0, action_outcome_score=0.0))
-            result = await s.run_hygiene(current_cycle=1000)
-            assert result.archived_count == 1
-            assert result.gc_count == 0
-            assert await s.get_thought("cold") is not None  # still present, archived
+            # Pinned, never archived: the non-target the GC flip must not touch.
+            await s.create_thought(_thought("keep", pinned=True, updated_cycle=0))
+            archive_run = await s.run_hygiene(current_cycle=5, now=_NOW)
+
+            # Cycle window elapsed (1000 - 5 >= the default 10) and wall-clock
+            # window elapsed (31 days >= the default 30).
+            later = _NOW + datetime.timedelta(seconds=_MONTH_SECONDS + 86400)
+            gc_run = await s.run_hygiene(current_cycle=1000, now=later)
+
+            assert await _raw_lifecycle(s, "cold") == "ARCHIVED"  # archived, not deleted
+            assert await _raw_archived_at_cycle(s, "cold") == 5
+            assert archive_run.archived_count == 1
+            assert gc_run.gc_count == 0
+
+            # Flip the single variable: same store, same cycle, same ``now``.
+            s._hygiene_policy = _forgetful_policy(eviction_threshold=1.0, auto_gc_enabled=True)
+            enabled_run = await s.run_hygiene(current_cycle=1000, now=later)
+            assert await _raw_lifecycle(s, "cold") is None  # physically gone
+            assert await _raw_lifecycle(s, "keep") == "ACTIVE"  # non-target survives
+            assert enabled_run.gc_count == 1
         finally:
             await s._db.close()
 
@@ -1707,16 +1903,6 @@ class TestFromConfigWiring:
 # ---------------------------------------------------------------------------
 # Cold-start guard — minimum-inactivity-age gate (per-thought)
 # ---------------------------------------------------------------------------
-
-
-# A wall-clock instant tests pin so the inactivity age is deterministic.
-_NOW = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.UTC)
-_WEEK_SECONDS = 604800
-
-
-def _iso_before(now: datetime.datetime, seconds: float) -> str:
-    """ISO-8601 timestamp ``seconds`` before ``now`` (UTC)."""
-    return (now - datetime.timedelta(seconds=seconds)).isoformat()
 
 
 class TestInactiveEnoughHelper:
@@ -2253,9 +2439,6 @@ class TestAccessGate:
 # ---------------------------------------------------------------------------
 # Stage 2 GC — wall-clock restore window (required in addition to the cycle window)
 # ---------------------------------------------------------------------------
-
-
-_MONTH_SECONDS = 2592000  # 30 days — the default wall-clock restore window.
 
 
 async def _archive_row_raw(
