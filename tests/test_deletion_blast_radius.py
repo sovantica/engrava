@@ -21,13 +21,17 @@ never stored compares equal to the ``None`` read back from an emptied table,
 and an "it is gone now" assertion is trivially true about a row a drifting
 corpus never inserted.
 
-Three operations are covered, one class each:
+Four operations are covered, one class each:
 
 * :meth:`~engrava.SqliteEngravaCore.delete_edge` — one edge, not the edge table.
 * :meth:`~engrava.SqliteEngravaCore.cleanup_expired` under the ``delete`` TTL
   strategy — the expired thoughts and their cascaded children, not every thought.
 * ``engrava gc`` — the ARCHIVED thoughts and their children, never the edges,
   embeddings or actions belonging to ACTIVE thoughts.
+* ``engrava gc --expired`` — the expiry sweep per ``ttl.strategy``, and whether
+  the archived-collection pass that follows it runs at all. Under ``archive``
+  the command must **stop** after archiving; running on would hard-delete the
+  rows it has just soft-retired.
 """
 
 from __future__ import annotations
@@ -66,6 +70,8 @@ from tests.test_migration_upgrade_chains import _bootstrap_core_at_version
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
     from pathlib import Path
+
+    from click.testing import Result
 
 
 # ---------------------------------------------------------------------------
@@ -940,3 +946,555 @@ class TestGcArchivedBlastRadius:
                 assert after == before, f"embedding of {tid} was modified"
             for aid, before in actions_before.items():
                 assert _sync_row(conn, _ACTION_BY_ID, aid) == before, f"action {aid} was modified"
+
+
+# ---------------------------------------------------------------------------
+# engrava gc --expired
+# ---------------------------------------------------------------------------
+# ``gc --expired`` runs the TTL sweep first and then decides whether to run the
+# archived-collection pass at all. That decision is the whole point of this
+# corpus: under ``ttl.strategy: archive`` the command must stop after archiving,
+# because collecting archived rows in the same pass would hard-delete the very
+# rows it had just soft-retired. Under ``delete`` the sweep removes them
+# outright and the collection pass then runs as usual.
+#
+# The corpus carries a row of each kind the decision distinguishes:
+#
+# * two **expired** thoughts — two rather than one, so "sweep the expired rows"
+#   and "sweep the first expired row" leave different databases;
+# * one thought that was **already ARCHIVED** before the command ran. It is what
+#   makes the two directions of the decision observable on stored state rather
+#   than only on the report: under ``archive`` it must still be there afterwards
+#   (the collection pass never ran), under ``delete`` it must be gone (it did);
+# * three **unexpired** thoughts — one with no TTL at all and two still inside
+#   theirs — which no strategy may touch.
+#
+# Rows are interleaved unexpired · archived · expired · unexpired · expired ·
+# unexpired, so on ``thought_id`` and on ``rowid`` (which follows the write order
+# below) the rows that must change are bracketed by rows that must not, and no
+# contiguous range over either axis selects exactly the rows any one pass
+# removes. ``expires_at`` cannot be interleaved — it is the sweep's own
+# selection axis, so NULL and future values necessarily sort away from past ones
+# — and ``embedding.vector_blob`` is not chased for the reason given for the
+# corpus above.
+
+#: Expiry timestamps. ``gc --expired`` reads the wall clock itself — unlike
+#: ``cleanup_expired`` it takes no injectable "now" — so the corpus brackets any
+#: plausible run time by centuries in both directions instead of freezing it.
+_LONG_PAST = "2020-01-01T00:00:00+00:00"
+_LATER_PAST = "2020-06-01T00:00:00+00:00"
+_NEAR_FUTURE = "2999-01-01T00:00:00+00:00"
+_FAR_FUTURE = "3000-01-01T00:00:00+00:00"
+
+_TTL_THOUGHTS: tuple[tuple[str, LifecycleStatus, str | None], ...] = (
+    ("t-eternal", LifecycleStatus.ACTIVE, None),
+    ("t-boxed", LifecycleStatus.ARCHIVED, None),
+    ("t-expired", LifecycleStatus.ACTIVE, _LONG_PAST),
+    ("t-fresh", LifecycleStatus.ACTIVE, _NEAR_FUTURE),
+    ("t-lapsed", LifecycleStatus.ACTIVE, _LATER_PAST),
+    ("t-young", LifecycleStatus.ACTIVE, _FAR_FUTURE),
+)
+
+#: Every id in the corpus, derived from it so the two cannot drift apart.
+_TTL_THOUGHT_IDS: tuple[str, ...] = tuple(tid for tid, _status, _expiry in _TTL_THOUGHTS)
+
+_TTL_EDGES: tuple[tuple[str, str, str, float], ...] = (
+    ("e-alpha-live", "t-eternal", "t-fresh", 0.2),
+    ("e-bravo-boxed", "t-boxed", "t-eternal", 0.3),
+    ("e-charlie-expired", "t-expired", "t-fresh", 0.4),
+    ("e-delta-live", "t-fresh", "t-eternal", 0.5),
+    ("e-echo-lapsed", "t-lapsed", "t-eternal", 0.6),
+    ("e-foxtrot-live", "t-young", "t-eternal", 0.7),
+)
+
+_TTL_EMBEDDINGS: tuple[tuple[str, list[float]], ...] = (
+    ("t-eternal", [0.7, 0.8, 0.9]),
+    ("t-boxed", [0.3, 0.4, 0.5]),
+    ("t-expired", [0.1, 0.2, 0.3]),
+    ("t-fresh", [0.4, 0.5, 0.6]),
+    ("t-lapsed", [0.2, 0.3, 0.4]),
+    ("t-young", [0.5, 0.6, 0.7]),
+)
+
+_TTL_ACTIONS: tuple[tuple[str, str], ...] = (
+    ("a-alpha-live", "t-eternal"),
+    ("a-bravo-boxed", "t-boxed"),
+    ("a-charlie-expired", "t-expired"),
+    ("a-delta-live", "t-fresh"),
+    ("a-echo-lapsed", "t-lapsed"),
+    ("a-foxtrot-live", "t-young"),
+)
+
+
+@pytest.fixture
+def ttl_lifecycle_db(tmp_path: Path) -> Path:
+    """Materialise the TTL corpus on a head schema via the public API.
+
+    Returns:
+        Path to the populated database file.
+
+    """
+    db_path = tmp_path / "ttl-lifecycle.db"
+
+    async def _setup() -> None:
+        conn = await aiosqlite.connect(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(db=conn, embedding_provider=None, auto_embed=False)
+        await store.ensure_schema()
+
+        for tid, status, expires_at in _TTL_THOUGHTS:
+            await store.create_thought(
+                _make_thought(tid, expires_at=expires_at, lifecycle_status=status),
+            )
+        for eid, src, dst, weight in _TTL_EDGES:
+            await store.create_edge(_make_edge(eid, src, dst, weight=weight))
+        for tid, vector in _TTL_EMBEDDINGS:
+            await store.store_embedding(tid, vector)
+        for aid, src in _TTL_ACTIONS:
+            await store.create_action(_make_action(aid, src))
+
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_setup())
+    return db_path
+
+
+def _write_ttl_config(config_path: Path, db_path: Path, strategy: str) -> Path:
+    """Write a real ``engrava.yaml`` that selects a TTL strategy.
+
+    ``gc --expired`` reads the strategy from the config file and nowhere else,
+    so the tests set it the way a user does — in YAML through ``--config`` —
+    rather than by handing the command a config object. ``database.path`` is
+    written because the loader requires it; the command still takes its database
+    from ``--db``.
+
+    Args:
+        config_path: Where to write the YAML.
+        db_path: Database path recorded in the file.
+        strategy: ``"archive"`` or ``"delete"``.
+
+    Returns:
+        The path that was written.
+
+    """
+    config_path.write_text(
+        f"database:\n  path: {db_path}\nttl:\n  strategy: {strategy}\n",
+        encoding="utf-8",
+    )
+    return config_path
+
+
+class TestGcExpiredBlastRadius:
+    """``engrava gc --expired`` sweeps by strategy, and stops where it must."""
+
+    #: The two thoughts past their expiry when the command runs.
+    _EXPIRED = ("t-expired", "t-lapsed")
+
+    #: Archived before the command ran — the witness for whether the
+    #: archived-collection pass executed.
+    _ALREADY_ARCHIVED = ("t-boxed",)
+
+    #: Thoughts no strategy may touch: one without a TTL, two inside theirs.
+    _UNEXPIRED = ("t-eternal", "t-fresh", "t-young")
+
+    #: Children of the unexpired thoughts — they outlive every pass.
+    _UNEXPIRED_EDGES = ("e-alpha-live", "e-delta-live", "e-foxtrot-live")
+    _UNEXPIRED_ACTIONS = ("a-alpha-live", "a-delta-live", "a-foxtrot-live")
+
+    #: Children of the expired thoughts — they go only when their parent is
+    #: physically deleted, never when it is archived.
+    _EXPIRED_EDGES = ("e-charlie-expired", "e-echo-lapsed")
+    _EXPIRED_ACTIONS = ("a-charlie-expired", "a-echo-lapsed")
+
+    #: Children of the already-archived thought.
+    _ARCHIVED_EDGES = ("e-bravo-boxed",)
+    _ARCHIVED_ACTIONS = ("a-bravo-boxed",)
+
+    @staticmethod
+    def _sweep(
+        runner: CliRunner,
+        db_path: Path,
+        *,
+        config_path: Path | None = None,
+        dry_run: bool = False,
+    ) -> Result:
+        """Run ``engrava gc --expired`` over the corpus and hand back the result.
+
+        Asserts only that the command ran: the ``Cleaned up N`` / ``Collected N``
+        lines are the command's own account of what it did and would abort a
+        test before a single row was read back. They are left to the caller to
+        check *after* the stored state, which fails just as loudly on a no-op as
+        on an over-broad delete.
+
+        Args:
+            runner: The Click test runner.
+            db_path: Database to operate on.
+            config_path: Optional ``engrava.yaml`` selecting the TTL strategy.
+            dry_run: Pass ``--dry-run``.
+
+        Returns:
+            The Click result, for the caller's report assertions.
+
+        """
+        args = ["--db", str(db_path)]
+        if config_path is not None:
+            args += ["--config", str(config_path)]
+        args += ["gc", "--expired"]
+        if dry_run:
+            args.append("--dry-run")
+        result = runner.invoke(cli, args)
+        assert result.exit_code == 0, result.output
+        return result
+
+    @classmethod
+    def _archived_row(cls, before: dict[str, object]) -> dict[str, object]:
+        """Return the row a TTL archival must leave behind, given the row before it.
+
+        Spelled out as the whole row rather than as the few columns the test
+        happens to care about, so an archival that also rewrote something else —
+        content, a timestamp, a cycle counter — is caught here rather than
+        silently accepted.
+
+        Args:
+            before: The thought row as stored before the sweep.
+
+        Returns:
+            The exact row expected afterwards.
+
+        """
+        return {
+            **before,
+            "lifecycle_status": LifecycleStatus.ARCHIVED.value,
+            # TTL archival clears the expiry (the row is no longer subject to
+            # TTL) and the hygiene-archival markers (a TTL archival is not a
+            # hygiene archival).
+            "expires_at": None,
+            "archived_at_cycle": None,
+            "archived_at": None,
+        }
+
+    @classmethod
+    def _assert_corpus_preconditions(cls, before: dict[str, dict[str, object]]) -> None:
+        """Fail if the corpus cannot tell the outcomes apart to begin with.
+
+        Every assertion in this class is about a row *changing* or *not
+        changing*. If the expired pair were already ARCHIVED, "it is archived
+        now" would hold without the sweep running; if the archived witness were
+        not archived, "the collection pass left it alone" would hold because
+        there was nothing to collect.
+
+        Args:
+            before: Every corpus thought row, as stored before the command.
+
+        """
+        for tid in cls._EXPIRED:
+            assert before[tid]["lifecycle_status"] == LifecycleStatus.ACTIVE.value
+            assert before[tid]["expires_at"] is not None, f"{tid} carries no expiry"
+        for tid in cls._ALREADY_ARCHIVED:
+            assert before[tid]["lifecycle_status"] == LifecycleStatus.ARCHIVED.value
+        for tid in cls._UNEXPIRED:
+            assert before[tid]["lifecycle_status"] == LifecycleStatus.ACTIVE.value
+
+    @staticmethod
+    def _read_thoughts(db_path: Path) -> dict[str, dict[str, object]]:
+        """Read every corpus thought row back from the database file.
+
+        Args:
+            db_path: Database the command operated on.
+
+        Returns:
+            Each corpus id mapped to its stored row.
+
+        """
+        with _reopen(db_path) as conn:
+            return {
+                tid: _require(_sync_row(conn, _THOUGHT_BY_ID, tid), tid) for tid in _TTL_THOUGHT_IDS
+            }
+
+    def test_archive_strategy_archives_the_expired_rows_and_deletes_nothing(
+        self,
+        runner: CliRunner,
+        ttl_lifecycle_db: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Under ``archive`` the pass stops: not one thought row is removed.
+
+        This is the interlock. The command archives the expired rows and must
+        then decline to run the archived-collection pass — otherwise it would
+        hard-delete the rows it has just archived, plus every row that was
+        already archived, in a single invocation the user asked to *retire*
+        data. Every corpus row must therefore still be stored afterwards, which
+        is what the documented behaviour promises (``docs/data-lifecycle.md``:
+        the pass "stops there — it does not also garbage-collect archived rows
+        in the same run").
+        """
+        config = _write_ttl_config(tmp_path / "archive.yaml", ttl_lifecycle_db, "archive")
+        before = self._read_thoughts(ttl_lifecycle_db)
+        self._assert_corpus_preconditions(before)
+
+        result = self._sweep(runner, ttl_lifecycle_db, config_path=config)
+
+        with _reopen(ttl_lifecycle_db) as conn:
+            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == set(_TTL_THOUGHT_IDS)
+            for tid in self._EXPIRED:
+                after = _sync_row(conn, _THOUGHT_BY_ID, tid)
+                assert after == self._archived_row(before[tid]), f"{tid} was not archived as such"
+            for tid in (*self._ALREADY_ARCHIVED, *self._UNEXPIRED):
+                assert _sync_row(conn, _THOUGHT_BY_ID, tid) == before[tid], f"{tid} was modified"
+        # Only once the stored state is settled does the reported outcome matter.
+        assert "Cleaned up 2 expired thoughts (strategy: archive)." in result.output
+        assert "Collected" not in result.output
+
+    def test_archive_strategy_leaves_every_child_row_in_place(
+        self,
+        runner: CliRunner,
+        ttl_lifecycle_db: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Archiving is an ``UPDATE``: no edge, embedding or action goes with it.
+
+        The children of the archived rows are the ones a collection pass would
+        take, so they are asserted here in their own right — including those of
+        the thought that was already archived before the command ran.
+
+        The parents are re-read afterwards as well, because "the children are
+        all still there" is equally true of a command that never swept
+        anything: without that read the test would hold for a ``--expired``
+        flag that had stopped doing its job.
+        """
+        config = _write_ttl_config(tmp_path / "archive.yaml", ttl_lifecycle_db, "archive")
+        all_edges = tuple(eid for eid, _src, _dst, _weight in _TTL_EDGES)
+        all_actions = tuple(aid for aid, _src in _TTL_ACTIONS)
+        with _reopen(ttl_lifecycle_db) as conn:
+            edges_before = {
+                eid: _require(_sync_row(conn, _EDGE_BY_ID, eid), eid) for eid in all_edges
+            }
+            embeddings_before = {
+                tid: _require(_sync_row(conn, _EMBEDDING_BY_OWNER, tid), tid)
+                for tid in _TTL_THOUGHT_IDS
+            }
+            actions_before = {
+                aid: _require(_sync_row(conn, _ACTION_BY_ID, aid), aid) for aid in all_actions
+            }
+
+        self._sweep(runner, ttl_lifecycle_db, config_path=config)
+
+        with _reopen(ttl_lifecycle_db) as conn:
+            for tid in self._EXPIRED:
+                parent = _require(_sync_row(conn, _THOUGHT_BY_ID, tid), tid)
+                assert parent["lifecycle_status"] == LifecycleStatus.ARCHIVED.value, (
+                    f"{tid} was never archived, so its children survived vacuously"
+                )
+            assert _sync_id_set(conn, _ALL_EDGE_IDS) == set(all_edges)
+            assert _sync_id_set(conn, _ALL_EMBEDDING_OWNERS) == set(_TTL_THOUGHT_IDS)
+            assert _sync_id_set(conn, _ALL_ACTION_IDS) == set(all_actions)
+            for eid, before in edges_before.items():
+                assert _sync_row(conn, _EDGE_BY_ID, eid) == before, f"edge {eid} was modified"
+            for tid, before in embeddings_before.items():
+                after = _sync_row(conn, _EMBEDDING_BY_OWNER, tid)
+                assert after == before, f"embedding of {tid} was modified"
+            for aid, before in actions_before.items():
+                assert _sync_row(conn, _ACTION_BY_ID, aid) == before, f"action {aid} was modified"
+
+    def test_default_strategy_without_a_config_file_archives(
+        self,
+        runner: CliRunner,
+        ttl_lifecycle_db: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With no config at all the command takes the documented default.
+
+        Without ``--config`` the strategy comes from a ``TTLConfig()`` built in
+        the command rather than from the loader, which is a second way for the
+        default to be wrong. ``ENGRAVA_CONFIG`` is cleared so an environment
+        that happens to point at a config file cannot silently supply one.
+        """
+        monkeypatch.delenv("ENGRAVA_CONFIG", raising=False)
+        before = self._read_thoughts(ttl_lifecycle_db)
+        self._assert_corpus_preconditions(before)
+
+        result = self._sweep(runner, ttl_lifecycle_db)
+
+        with _reopen(ttl_lifecycle_db) as conn:
+            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == set(_TTL_THOUGHT_IDS)
+            for tid in self._EXPIRED:
+                after = _sync_row(conn, _THOUGHT_BY_ID, tid)
+                assert after == self._archived_row(before[tid]), f"{tid} was not archived as such"
+            for tid in (*self._ALREADY_ARCHIVED, *self._UNEXPIRED):
+                assert _sync_row(conn, _THOUGHT_BY_ID, tid) == before[tid], f"{tid} was modified"
+        assert "(strategy: archive)" in result.output
+
+    def test_delete_strategy_removes_the_expired_rows_and_collects_the_archived_one(
+        self,
+        runner: CliRunner,
+        ttl_lifecycle_db: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Under ``delete`` the expired rows go — and the collection pass runs.
+
+        The other direction of the interlock. The sweep deletes outright, so
+        there is nothing freshly archived to protect and the pass that collects
+        pre-existing archived rows must not be skipped: ``t-boxed`` was archived
+        before the command ran and must be gone afterwards. The unexpired rows
+        are untouched by either half.
+        """
+        config = _write_ttl_config(tmp_path / "delete.yaml", ttl_lifecycle_db, "delete")
+        before = self._read_thoughts(ttl_lifecycle_db)
+        self._assert_corpus_preconditions(before)
+
+        result = self._sweep(runner, ttl_lifecycle_db, config_path=config)
+
+        with _reopen(ttl_lifecycle_db) as conn:
+            for tid in (*self._EXPIRED, *self._ALREADY_ARCHIVED):
+                assert _sync_row(conn, _THOUGHT_BY_ID, tid) is None, f"{tid} is still stored"
+            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == set(self._UNEXPIRED)
+            for tid in self._UNEXPIRED:
+                assert _sync_row(conn, _THOUGHT_BY_ID, tid) == before[tid], f"{tid} was modified"
+        assert "Cleaned up 2 expired thoughts (strategy: delete)." in result.output
+        assert "Collected 1 archived thoughts." in result.output
+
+    def test_delete_strategy_keeps_the_children_of_surviving_thoughts(
+        self,
+        runner: CliRunner,
+        ttl_lifecycle_db: Path,
+        tmp_path: Path,
+    ) -> None:
+        """The cascade follows the swept and collected thoughts, and stops there."""
+        config = _write_ttl_config(tmp_path / "delete.yaml", ttl_lifecycle_db, "delete")
+        doomed_children: tuple[tuple[str, str], ...] = (
+            *((eid, _EDGE_BY_ID) for eid in (*self._EXPIRED_EDGES, *self._ARCHIVED_EDGES)),
+            *((tid, _EMBEDDING_BY_OWNER) for tid in (*self._EXPIRED, *self._ALREADY_ARCHIVED)),
+            *((aid, _ACTION_BY_ID) for aid in (*self._EXPIRED_ACTIONS, *self._ARCHIVED_ACTIONS)),
+        )
+        with _reopen(ttl_lifecycle_db) as conn:
+            for doomed, query in doomed_children:
+                _require(_sync_row(conn, query, doomed), doomed)
+            edges_before = {
+                eid: _require(_sync_row(conn, _EDGE_BY_ID, eid), eid)
+                for eid in self._UNEXPIRED_EDGES
+            }
+            embeddings_before = {
+                tid: _require(_sync_row(conn, _EMBEDDING_BY_OWNER, tid), tid)
+                for tid in self._UNEXPIRED
+            }
+            actions_before = {
+                aid: _require(_sync_row(conn, _ACTION_BY_ID, aid), aid)
+                for aid in self._UNEXPIRED_ACTIONS
+            }
+
+        self._sweep(runner, ttl_lifecycle_db, config_path=config)
+
+        with _reopen(ttl_lifecycle_db) as conn:
+            assert _sync_id_set(conn, _ALL_EDGE_IDS) == set(self._UNEXPIRED_EDGES)
+            assert _sync_id_set(conn, _ALL_EMBEDDING_OWNERS) == set(self._UNEXPIRED)
+            assert _sync_id_set(conn, _ALL_ACTION_IDS) == set(self._UNEXPIRED_ACTIONS)
+            for eid, before in edges_before.items():
+                assert _sync_row(conn, _EDGE_BY_ID, eid) == before, f"edge {eid} was modified"
+            for tid, before in embeddings_before.items():
+                after = _sync_row(conn, _EMBEDDING_BY_OWNER, tid)
+                assert after == before, f"embedding of {tid} was modified"
+            for aid, before in actions_before.items():
+                assert _sync_row(conn, _ACTION_BY_ID, aid) == before, f"action {aid} was modified"
+
+    @pytest.mark.parametrize(
+        ("strategy", "reported"),
+        [
+            ("archive", "Would archive 2 expired thoughts."),
+            ("delete", "Would delete 2 expired thoughts."),
+        ],
+    )
+    def test_dry_run_changes_nothing_under_either_strategy(
+        self,
+        runner: CliRunner,
+        ttl_lifecycle_db: Path,
+        tmp_path: Path,
+        strategy: str,
+        reported: str,
+    ) -> None:
+        """``--dry-run`` reports the pass and writes nothing, on either strategy.
+
+        Asserted over all four tables: a dry run that archived instead of
+        deleting would leave every row present and still be wrong.
+        """
+        config = _write_ttl_config(tmp_path / f"{strategy}.yaml", ttl_lifecycle_db, strategy)
+        all_edges = tuple(eid for eid, _src, _dst, _weight in _TTL_EDGES)
+        all_actions = tuple(aid for aid, _src in _TTL_ACTIONS)
+        thoughts_before = self._read_thoughts(ttl_lifecycle_db)
+        self._assert_corpus_preconditions(thoughts_before)
+        with _reopen(ttl_lifecycle_db) as conn:
+            edges_before = {
+                eid: _require(_sync_row(conn, _EDGE_BY_ID, eid), eid) for eid in all_edges
+            }
+            embeddings_before = {
+                tid: _require(_sync_row(conn, _EMBEDDING_BY_OWNER, tid), tid)
+                for tid in _TTL_THOUGHT_IDS
+            }
+            actions_before = {
+                aid: _require(_sync_row(conn, _ACTION_BY_ID, aid), aid) for aid in all_actions
+            }
+
+        result = self._sweep(runner, ttl_lifecycle_db, config_path=config, dry_run=True)
+
+        with _reopen(ttl_lifecycle_db) as conn:
+            # Read back without _require here: a dry run that swept anyway must
+            # report as a row that is now ``None``, not as a missing precondition.
+            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == set(_TTL_THOUGHT_IDS)
+            after = {tid: _sync_row(conn, _THOUGHT_BY_ID, tid) for tid in _TTL_THOUGHT_IDS}
+            assert after == thoughts_before
+            assert _sync_id_set(conn, _ALL_EDGE_IDS) == set(all_edges)
+            assert _sync_id_set(conn, _ALL_EMBEDDING_OWNERS) == set(_TTL_THOUGHT_IDS)
+            assert _sync_id_set(conn, _ALL_ACTION_IDS) == set(all_actions)
+            for eid, before in edges_before.items():
+                assert _sync_row(conn, _EDGE_BY_ID, eid) == before, f"edge {eid} was modified"
+            for tid, before in embeddings_before.items():
+                after = _sync_row(conn, _EMBEDDING_BY_OWNER, tid)
+                assert after == before, f"embedding of {tid} was modified"
+            for aid, before in actions_before.items():
+                assert _sync_row(conn, _ACTION_BY_ID, aid) == before, f"action {aid} was modified"
+        assert reported in result.output
+
+    def test_a_second_pass_collects_what_the_archive_pass_left(
+        self,
+        runner: CliRunner,
+        ttl_lifecycle_db: Path,
+        tmp_path: Path,
+    ) -> None:
+        """The archived rows are removed by the *next* pass, not the one that archived them.
+
+        This is the workflow the documentation prescribes for actually deleting
+        expired data under the ``archive`` strategy — "run a separate
+        ``engrava gc`` afterwards". By the second invocation there is nothing
+        left to expire (the first cleared ``expires_at``), so the collection
+        pass runs and takes all three archived thoughts with their children.
+        Nothing that was never expired is touched by either pass.
+        """
+        config = _write_ttl_config(tmp_path / "archive.yaml", ttl_lifecycle_db, "archive")
+        collected_later = (*self._EXPIRED, *self._ALREADY_ARCHIVED)
+        with _reopen(ttl_lifecycle_db) as conn:
+            for tid in collected_later:
+                _require(_sync_row(conn, _THOUGHT_BY_ID, tid), tid)
+            survivors_before = {
+                tid: _require(_sync_row(conn, _THOUGHT_BY_ID, tid), tid) for tid in self._UNEXPIRED
+            }
+            edges_before = {
+                eid: _require(_sync_row(conn, _EDGE_BY_ID, eid), eid)
+                for eid in self._UNEXPIRED_EDGES
+            }
+
+        self._sweep(runner, ttl_lifecycle_db, config_path=config)
+        result = self._sweep(runner, ttl_lifecycle_db, config_path=config)
+
+        with _reopen(ttl_lifecycle_db) as conn:
+            for tid in collected_later:
+                assert _sync_row(conn, _THOUGHT_BY_ID, tid) is None, f"{tid} is still stored"
+            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == set(self._UNEXPIRED)
+            assert _sync_id_set(conn, _ALL_EDGE_IDS) == set(self._UNEXPIRED_EDGES)
+            assert _sync_id_set(conn, _ALL_EMBEDDING_OWNERS) == set(self._UNEXPIRED)
+            assert _sync_id_set(conn, _ALL_ACTION_IDS) == set(self._UNEXPIRED_ACTIONS)
+            for tid, before in survivors_before.items():
+                assert _sync_row(conn, _THOUGHT_BY_ID, tid) == before, f"{tid} was modified"
+            for eid, before in edges_before.items():
+                assert _sync_row(conn, _EDGE_BY_ID, eid) == before, f"edge {eid} was modified"
+        assert "No expired thoughts to cleanup." in result.output
+        assert "Collected 3 archived thoughts." in result.output

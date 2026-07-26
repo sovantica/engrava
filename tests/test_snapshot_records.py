@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import inspect
 import json
 import struct
@@ -52,6 +53,7 @@ from engrava.cli.snapshot_records import (
 
 if TYPE_CHECKING:
     from pathlib import Path
+    from typing import Self
 
 
 @pytest.fixture
@@ -396,6 +398,44 @@ class TestStreamingIterator:
         gen = _iter_snapshot_lines(snap)
         assert inspect.isgenerator(gen)  # streaming, not a materialised list
         assert list(gen) == [(1, "first"), (4, "third")]
+
+    def test_a_read_failure_part_way_through_is_a_typed_error(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A snapshot that opens and then fails mid-read is still a CLI error.
+
+        Guarding only the open leaves the read able to raise through: a stream
+        that dies part-way (a failing device, a special file) would reach the
+        user as a traceback. The failure is injected at the open seam because
+        no portable real file fails this way on demand.
+        """
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text("first\n", encoding="utf-8")
+
+        class _FailingHandle:
+            """A handle that opens fine and raises on the first line read."""
+
+            def __enter__(self) -> Self:
+                return self
+
+            def __exit__(self, *_exc_info: object) -> bool:
+                return False
+
+            def __iter__(self) -> Self:
+                return self
+
+            def __next__(self) -> str:
+                raise OSError(errno.EIO, "Input/output error")
+
+        monkeypatch.setattr(cli_main, "_open_snapshot", lambda _path: _FailingHandle())
+
+        with pytest.raises(click.ClickException) as excinfo:
+            list(_iter_snapshot_lines(snap))
+
+        assert str(snap) in str(excinfo.value)
+        assert "Input/output error" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------

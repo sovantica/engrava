@@ -48,6 +48,7 @@ from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
+    from typing import TextIO
 
     import aiosqlite
 
@@ -717,6 +718,51 @@ def snapshot(ctx: click.Context, output_path: str | None, service_name: str | No
 # ------------------------------------------------------------------
 
 
+def _unreadable_snapshot_error(input_path: Path, exc: OSError) -> click.ClickException:
+    """Describe an OS-level snapshot read failure as an actionable CLI error.
+
+    ``--input`` is a user-typed path, so the ordinary outcomes of a typo — the
+    file is not there, the path names a directory, the file is not readable —
+    are user errors, not defects, and belong in a message rather than in an
+    interpreter traceback. Shared by the open and the read so both report the
+    same way.
+
+    Args:
+        input_path: Path to the JSONL snapshot file.
+        exc: The failure the operating system reported.
+
+    Returns:
+        The exception to raise at the CLI boundary.
+
+    """
+    detail = exc.strerror or type(exc).__name__
+    msg = (
+        f"Cannot read snapshot file '{input_path}': {detail}. "
+        "Pass an existing JSONL snapshot to --input (-i) — "
+        "'engrava snapshot -o <file>' writes one."
+    )
+    return click.ClickException(msg)
+
+
+def _open_snapshot(input_path: Path) -> TextIO:
+    """Open a snapshot file for reading, or fail with a clean CLI error.
+
+    Args:
+        input_path: Path to the JSONL snapshot file.
+
+    Returns:
+        The opened text handle, which the caller closes.
+
+    Raises:
+        click.ClickException: If the path cannot be opened for reading.
+
+    """
+    try:
+        return input_path.open(encoding="utf-8")
+    except OSError as exc:
+        raise _unreadable_snapshot_error(input_path, exc) from exc
+
+
 def _iter_snapshot_lines(input_path: Path) -> Iterator[tuple[int, str]]:
     """Stream a snapshot file, yielding non-empty ``(line_number, line)`` pairs.
 
@@ -724,18 +770,39 @@ def _iter_snapshot_lines(input_path: Path) -> Iterator[tuple[int, str]]:
     whole snapshot. Lines are stripped and blank lines are skipped; line numbers
     are 1-based and count every physical line for accurate error context.
 
+    This is the only place a restore opens the ``--input`` path, so both restore
+    modes — single-database and ``--service`` — surface an unusable path as the
+    same clean error.
+
     Args:
         input_path: Path to the JSONL snapshot file.
 
     Yields:
         ``(line_number, stripped_line)`` for each non-empty line.
 
+    Raises:
+        click.ClickException: If the path cannot be opened or read, or if its
+            bytes are not UTF-8 text (the shape of pointing ``--input`` at a
+            database or another binary file rather than at a snapshot). Reading
+            is guarded as well as opening: a path that opens can still fail
+            part-way through, and that too is a message rather than a traceback.
+
     """
-    with input_path.open(encoding="utf-8") as handle:
-        for line_number, raw_line in enumerate(handle, start=1):
-            stripped = raw_line.strip()
-            if stripped:
-                yield line_number, stripped
+    with _open_snapshot(input_path) as handle:
+        try:
+            for line_number, raw_line in enumerate(handle, start=1):
+                stripped = raw_line.strip()
+                if stripped:
+                    yield line_number, stripped
+        except UnicodeDecodeError as exc:
+            msg = (
+                f"Snapshot file '{input_path}' is not UTF-8 text: {exc.reason}. "
+                "--input (-i) expects a JSONL snapshot written by "
+                "'engrava snapshot', not a database or other binary file."
+            )
+            raise click.ClickException(msg) from exc
+        except OSError as exc:
+            raise _unreadable_snapshot_error(input_path, exc) from exc
 
 
 def _assert_embedding_model_match(
