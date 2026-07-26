@@ -24,9 +24,15 @@ the field set documented here staying additive within ``0.6.x``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, final, runtime_checkable
 
-from engrava.config_validation import ConfigError, require_bool, require_positive_int
+from engrava.config_validation import (
+    ConfigError,
+    forbid_subclassing,
+    own_config_fields,
+    require_bool,
+    require_positive_int,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -143,6 +149,8 @@ class DeriveContext:
     origin: str
 
 
+@final
+@forbid_subclassing
 @dataclass(frozen=True)
 class DeriveGates:
     """Gates controlling the derived-records extension seam.
@@ -206,6 +214,10 @@ class DeriveGates:
                 not an ``int``, or ``< 1``.
 
         """
+        # Own every field first, so that every check below inspects a value
+        # this module controls and every field this object retains is the
+        # value that was checked.
+        own_config_fields(self)
         require_bool(self.enabled, "DeriveGates.enabled")
         if self.on_error not in ("raise", "log"):
             msg = "DeriveGates.on_error must be 'raise' or 'log'"

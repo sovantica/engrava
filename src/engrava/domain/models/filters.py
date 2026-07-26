@@ -224,8 +224,9 @@ class FieldPredicate:
             if isinstance(value, Iterable) and not isinstance(value, str | bytes):
                 msg = "FieldOp.EQ value must be a single scalar, not a collection"
                 raise InvalidFilterError(msg)
-            _validate_scalar(value, context="EQ value")  # type: ignore[arg-type]
-            normalized = value  # type: ignore[assignment]
+            # The Iterable branch above has already excluded every non-scalar.
+            _validate_scalar(value, context="EQ value")  # type: ignore[arg-type]  # narrowed above
+            normalized = value  # type: ignore[assignment]  # narrowed to a scalar above
 
         # Frozen dataclass: bypass the blocked setattr to store fields.
         object.__setattr__(self, "path", path)

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from engrava.config import DreamingConfig, DreamingGates
+from engrava.config_validation import ConfigError
 from engrava.domain.enums import LifecycleStatus, Priority, ThoughtType
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.extensions.dreaming import ConsolidationResult, DreamingExtension
@@ -594,3 +595,38 @@ class TestSingleWriteScenario:
                 assert promoted.priority == Priority.P1
         finally:
             await db.close()
+
+
+class TestExtensionRequiresItsExactConfig:
+    """Everything this extension does is steered by reading settings off its config.
+
+    Gates, signal weights, eligibility filters, promotion targets and reflection
+    creation are all attribute reads on the object handed to the constructor and
+    retained for the extension's lifetime. Subclassing a configuration is
+    refused outright now, so an impostor arrives another way — with its
+    ``__class__` reassigned to a look-alike, or as something that was never a
+    configuration at all — and only a check on the exact type sees either.
+    """
+
+    def test_a_look_alike_is_refused(self) -> None:
+        class _LookAlike:
+            pass
+
+        config = DreamingConfig(enabled=True)
+        object.__setattr__(config, "__class__", _LookAlike)
+
+        with pytest.raises(ConfigError, match="must be exactly a DreamingConfig"):
+            DreamingExtension(config=config)
+
+    def test_a_non_config_is_refused(self) -> None:
+        with pytest.raises(ConfigError, match="must be exactly a DreamingConfig"):
+            DreamingExtension(config=object())  # type: ignore[arg-type]  # passing the wrong type is the behaviour under test
+
+    def test_the_configuration_cannot_be_subclassed_in_the_first_place(self) -> None:
+        """The route an impostor would have taken is closed at the class."""
+        with pytest.raises(TypeError, match="may not be subclassed"):
+            type("_ConfigSubclass", (DreamingConfig,), {})
+
+    def test_the_exact_class_is_still_accepted(self) -> None:
+        config = DreamingConfig(enabled=True)
+        assert DreamingExtension(config=config).config is config

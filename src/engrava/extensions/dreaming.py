@@ -19,6 +19,7 @@ import uuid
 from typing import TYPE_CHECKING
 
 from engrava.config import DreamingConfig
+from engrava.config_validation import require_exact_type
 from engrava.domain.dreaming import (
     CENTROID_MODEL_NAME,
     DEFAULT_SIGNALS,
@@ -81,7 +82,12 @@ class DreamingExtension:
         config: DreamingConfig,
         custom_signals: dict[str, DreamingSignalProtocol] | None = None,
     ) -> None:
-        self._config = config
+        # Exactly a ``DreamingConfig``, not an instance of one. Everything this
+        # extension does is steered by reading settings off this object -
+        # gates, signal weights, eligibility, promotion targets, reflection
+        # creation - so a subclass answering those reads for itself would steer
+        # all of it, whatever the object reported while it was validated.
+        self._config = require_exact_type(config, DreamingConfig, "DreamingExtension.config")
         self._signals = self._build_signal_map(custom_signals or {})
         # Tracks the ACTIVE OBSERVATION candidate count from the last
         # consolidation run that executed clustering.  Used by the

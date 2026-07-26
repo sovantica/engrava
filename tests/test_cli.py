@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 from click.testing import CliRunner
 
+from engrava.cli.config import EngravaCLIConfig
 from engrava.cli.main import cli
 
 
@@ -521,3 +522,123 @@ class TestExport:
         assert result.exit_code == 0
         default_out = populated_db.with_suffix(".export.json")
         assert default_out.exists()
+
+
+class _FormatThatComparesAsAnother(str):
+    """Reads as its real text; hashes and compares as ``json``."""
+
+    __slots__ = ()
+
+    def __hash__(self) -> int:
+        return hash("json")
+
+    def __eq__(self, other: object) -> bool:
+        return other == "json"
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+
+class TestCliConfigKeepsWhatItResolved:
+    """The CLI config is a public entry point reached straight from the command line.
+
+    ``output_format`` is admitted by a membership test and then selects a
+    renderer by equality — both run the value's own methods — and the paths are
+    built by joining text that a subclass could render differently from the
+    text that was checked.
+    """
+
+    def test_the_resolved_format_is_an_exact_str(self) -> None:
+        config = EngravaCLIConfig.resolve(output_format=_FormatThatComparesAsAnother("table"))
+        assert type(config.output_format) is str
+        assert config.output_format == "table"
+
+    def test_an_unrecognised_format_still_falls_back_to_table(self) -> None:
+        assert EngravaCLIConfig.resolve(output_format="nonsense").output_format == "table"
+
+    def test_every_legitimate_format_survives(self) -> None:
+        for fmt in ("json", "table", "csv"):
+            assert EngravaCLIConfig.resolve(output_format=fmt).output_format == fmt
+
+    def test_the_resolved_path_is_built_from_owned_text(self, tmp_path: Path) -> None:
+        class _PathTextThatRendersDifferently(str):
+            __slots__ = ()
+
+            def __str__(self) -> str:
+                return "/etc/escaped.db"
+
+        declared = str(tmp_path / "real.db")
+        config = EngravaCLIConfig.resolve(db_path=_PathTextThatRendersDifferently(declared))
+        assert str(config.db_path) == declared
+
+    def test_direct_construction_owns_its_fields(self, tmp_path: Path) -> None:
+        config = EngravaCLIConfig(
+            db_path=tmp_path / "t.db",
+            output_format=_FormatThatComparesAsAnother("csv"),  # type: ignore[arg-type]  # a str subclass is what is under test
+        )
+        assert type(config.output_format) is str
+        assert config.output_format == "csv"
+
+
+class TestCliConfigChoosesTheSourceItWasGiven:
+    """An explicitly supplied path is used, whatever the value says about itself.
+
+    The resolution order is written with ``or``, which asks each candidate
+    whether it is truthy — a method the value may define. A string subclass
+    that answers ``False`` erases the ``--db`` the user typed and silently
+    substitutes the environment's value or the built-in default.
+    """
+
+    def test_an_explicit_path_is_not_suppressed_by_the_value(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        class _PathThatDeniesItself(str):
+            __slots__ = ()
+
+            def __bool__(self) -> bool:
+                return False
+
+        monkeypatch.setenv("ENGRAVA_DB", str(tmp_path / "from-env.db"))
+        supplied = str(tmp_path / "explicit.db")
+
+        config = EngravaCLIConfig.resolve(db_path=_PathThatDeniesItself(supplied))
+
+        assert str(config.db_path) == supplied
+
+    def test_an_explicit_config_path_is_not_suppressed_by_the_value(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        class _PathThatDeniesItself(str):
+            __slots__ = ()
+
+            def __bool__(self) -> bool:
+                return False
+
+        monkeypatch.setenv("ENGRAVA_CONFIG", str(tmp_path / "from-env.yaml"))
+        supplied = str(tmp_path / "explicit.yaml")
+
+        config = EngravaCLIConfig.resolve(config_path=_PathThatDeniesItself(supplied))
+
+        assert config.config_path is not None
+        assert str(config.config_path) == supplied
+
+    def test_the_environment_is_still_used_when_nothing_is_supplied(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv("ENGRAVA_DB", str(tmp_path / "from-env.db"))
+        assert str(EngravaCLIConfig.resolve().db_path) == str(tmp_path / "from-env.db")
+
+    def test_an_empty_string_still_falls_through(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Genuine emptiness keeps its old meaning; only the lie is closed."""
+        monkeypatch.setenv("ENGRAVA_DB", str(tmp_path / "from-env.db"))
+        assert str(EngravaCLIConfig.resolve(db_path="").db_path) == str(tmp_path / "from-env.db")

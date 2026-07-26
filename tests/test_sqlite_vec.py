@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import aiosqlite
 import pytest
 
+from engrava.config import ConfigError, EngravaConfig
 from engrava.domain.enums import LifecycleStatus, Priority, ThoughtType
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.extensions.vector_sqlite_vec import (
@@ -18,6 +19,7 @@ from engrava.extensions.vector_sqlite_vec import (
     _load_sqlite_vec_sync,
     load_sqlite_vec,
 )
+from engrava.infrastructure.service_manager import EngravaManager
 from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
 
 # Skip the real-extension integration tests when sqlite-vec is absent, but
@@ -984,3 +986,175 @@ class TestVec0OverfetchConfig:
         )
         cfg = load_config(cfg_file)
         assert cfg.search.vec0_overfetch_factor == 7
+
+
+# ------------------------------------------------------------------
+# The dimension in the DDL is the dimension that was validated
+# ------------------------------------------------------------------
+
+
+class _LyingDimension(int):
+    """A dimension whose numeric value and whose rendering disagree.
+
+    Every numeric check — ``isinstance``, ``>= 1``, comparison against a stored
+    vector length — reads the real value 384. ``__format__`` is what the DDL
+    f-string calls, and it answers with schema text of its own.
+    """
+
+    def __format__(self, format_spec: str) -> str:
+        del format_spec
+        return "1] distance_metric=L2, smuggled float[1"
+
+
+class TestVectorTableDeclarationUsesTheValidatedDimension:
+    """``vec0(...)`` is DDL: it cannot be parameterised, so the value must be owned.
+
+    The dimension is the only caller-supplied value in the declaration, and the
+    declaration decides the vector length, the distance metric and the column
+    list of the index every later search runs against.
+    """
+
+    def test_the_backend_stores_an_exact_int(self) -> None:
+        backend = SqliteVecSearchBackend(_LyingDimension(384))
+        assert type(backend.dimension) is int
+        assert backend.dimension == 384
+        assert f"float[{backend.dimension}]" == "float[384]"
+
+    @pytest.mark.parametrize("dimension", [0, -1, True, 3.5, "384", None])
+    def test_a_dimension_that_is_not_a_positive_int_is_refused(self, dimension: object) -> None:
+        """The class validates at its own boundary; it is a public export."""
+        with pytest.raises(ConfigError, match="must be a positive integer"):
+            SqliteVecSearchBackend(dimension)  # type: ignore[arg-type]  # passing the wrong type is the behaviour under test
+
+    @sqlite_vec_required
+    async def test_the_created_table_declares_the_validated_dimension(self) -> None:
+        db = await aiosqlite.connect(":memory:")
+        try:
+            assert await load_sqlite_vec(db)
+            backend = SqliteVecSearchBackend(_LyingDimension(384))
+            await backend.ensure_index(db)
+
+            cursor = await db.execute("SELECT sql FROM sqlite_master WHERE name = 'embedding_vec'")
+            row = await cursor.fetchone()
+            assert row is not None
+            declaration = str(row[0])
+            assert "float[384]" in declaration
+            assert "distance_metric=cosine" in declaration
+            assert "smuggled" not in declaration
+            assert "L2" not in declaration
+        finally:
+            await db.close()
+
+    @sqlite_vec_required
+    async def test_a_manager_configured_index_declares_its_own_dimension(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The manager takes a dimension straight from its caller — check it there too."""
+        manager = EngravaManager(
+            data_dir=tmp_path / "data",
+            vector_backend="sqlite-vec",
+            embedding_dimension=_LyingDimension(384),
+        )
+        try:
+            store = await manager.get_store("svc")
+            cursor = await store._db.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'embedding_vec'"
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            declaration = str(row[0])
+            assert "float[384]" in declaration
+            assert "smuggled" not in declaration
+        finally:
+            await manager.close_all()
+
+    def test_a_config_stores_an_exact_int(self, tmp_path: Path) -> None:
+        config = EngravaConfig(
+            database_path=tmp_path / "t.db",
+            embedding_dimension=_LyingDimension(384),
+        )
+        assert type(config.embedding_dimension) is int
+        assert config.embedding_dimension == 384
+
+    @sqlite_vec_required
+    async def test_a_legitimate_dimension_still_builds_a_working_index(self) -> None:
+        db = await aiosqlite.connect(":memory:")
+        try:
+            assert await load_sqlite_vec(db)
+            backend = SqliteVecSearchBackend(dimension=4)
+            await backend.ensure_index(db)
+            await db.execute(
+                "INSERT INTO embedding_vec(rowid, embedding) VALUES (?, ?)",
+                (1, "[1.0,0.0,0.0,0.0]"),
+            )
+            cursor = await db.execute("SELECT COUNT(*) FROM embedding_vec")
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row[0] == 1
+        finally:
+            await db.close()
+
+
+class _BackendNameThatComparesAsAnother(str):
+    """Reads as its real text; hashes and compares as ``sqlite-vec``."""
+
+    __slots__ = ()
+
+    def __hash__(self) -> int:
+        return hash("sqlite-vec")
+
+    def __eq__(self, other: object) -> bool:
+        return other == "sqlite-vec"
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+
+class TestVectorBackendSelectionUsesTheValidatedName:
+    """The backend named in the configuration is the backend that gets wired."""
+
+    def test_a_config_stores_an_exact_backend_name(self, tmp_path: Path) -> None:
+        config = EngravaConfig(
+            database_path=tmp_path / "t.db",
+            vector_backend=_BackendNameThatComparesAsAnother("numpy"),
+        )
+        assert type(config.vector_backend) is str
+        assert config.vector_backend == "numpy"
+
+    async def test_a_numpy_backend_builds_no_vector_table(self, tmp_path: Path) -> None:
+        manager = EngravaManager(
+            data_dir=tmp_path / "data",
+            vector_backend=_BackendNameThatComparesAsAnother("numpy"),
+        )
+        try:
+            store = await manager.get_store("svc")
+            cursor = await store._db.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'embedding_vec'"
+            )
+            assert await cursor.fetchone() is None
+        finally:
+            await manager.close_all()
+
+    @sqlite_vec_required
+    async def test_an_explicit_sqlite_vec_backend_still_builds_one(self, tmp_path: Path) -> None:
+        manager = EngravaManager(data_dir=tmp_path / "data", vector_backend="sqlite-vec")
+        try:
+            store = await manager.get_store("svc")
+            cursor = await store._db.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'embedding_vec'"
+            )
+            assert await cursor.fetchone() is not None
+        finally:
+            await manager.close_all()
+
+    async def test_a_non_string_backend_name_is_a_configuration_error(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        manager = EngravaManager(data_dir=tmp_path / "data", vector_backend=object())  # type: ignore[arg-type]  # passing the wrong type is the behaviour under test
+        try:
+            with pytest.raises(ConfigError, match="vector_backend must be a string"):
+                await manager.get_store("svc")
+        finally:
+            await manager.close_all()

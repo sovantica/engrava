@@ -21,7 +21,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, final
 
 import yaml
 
@@ -29,10 +29,25 @@ from engrava.config_validation import (
     ConfigError,
 )
 from engrava.config_validation import (
+    forbid_subclassing as _forbid_subclassing,
+)
+from engrava.config_validation import (
     is_finite as _is_finite,
 )
 from engrava.config_validation import (
+    own_config_fields as _own_config_fields,
+)
+from engrava.config_validation import (
+    own_str as _own_str,
+)
+from engrava.config_validation import (
     require_bool as _require_bool,
+)
+from engrava.config_validation import (
+    require_exact_type as _require_exact_type,
+)
+from engrava.config_validation import (
+    require_exact_type_or_none as _require_exact_type_or_none,
 )
 from engrava.config_validation import (
     require_finite_number as _require_finite_number,
@@ -59,6 +74,8 @@ from engrava.domain.protocols.derived_records import DeriveGates
 from engrava.domain.protocols.hooks import DefaultEngravaHooks
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from engrava.domain.manifest import ExtensionManifest
     from engrava.domain.protocols.embedding_provider import EmbeddingProviderProtocol
     from engrava.domain.protocols.hooks import EngravaHooksProtocol
@@ -111,6 +128,8 @@ what drives an archive.
 # ------------------------------------------------------------------
 
 
+@final
+@_forbid_subclassing
 @dataclass(frozen=True)
 class DreamingGates:
     """Gate thresholds for dreaming consolidation.
@@ -251,6 +270,10 @@ class DreamingGates:
                 a numeric field, which is rejected explicitly.
 
         """
+        # Own every field first, so that every check below inspects a value
+        # this module controls and every field this object retains is the
+        # value that was checked.
+        _own_config_fields(self)
         _require_nonneg_int(self.min_confirmations, "DreamingGates.min_confirmations")
         _require_nonneg_int(self.min_age_cycles, "DreamingGates.min_age_cycles")
         _require_positive_int(self.max_promoted_per_run, "DreamingGates.max_promoted_per_run")
@@ -310,17 +333,26 @@ class DreamingGates:
         rejects it before the non-empty check — matching the YAML loader, which
         requires a list/tuple of thought-type strings.
 
+        The decoded tuple replaces the field, so the emptiness check and every
+        later read see the same owned value (see :func:`~engrava.config_validation.own_str`).
+
         Raises:
             ConfigError: When the value is a bare string, is not a
                 list/tuple/set/frozenset, holds a non-string entry, or is empty.
 
         """
-        _require_str_collection(self.cluster_allowed_types, "DreamingGates.cluster_allowed_types")
-        if not self.cluster_allowed_types:
+        owned = _require_str_collection(
+            self.cluster_allowed_types,
+            "DreamingGates.cluster_allowed_types",
+        )
+        object.__setattr__(self, "cluster_allowed_types", owned)
+        if not owned:
             msg = "DreamingGates.cluster_allowed_types must list at least one thought type"
             raise ConfigError(msg)
 
 
+@final
+@_forbid_subclassing
 @dataclass(frozen=True)
 class EdgeCreationConfig:
     """Configuration for dream-created edges.
@@ -360,12 +392,18 @@ class EdgeCreationConfig:
                 (including a ``bool`` in a numeric field).
 
         """
+        # Own every field first, so that every check below inspects a value
+        # this module controls and every field this object retains is the
+        # value that was checked.
+        _own_config_fields(self)
         _require_bool(self.enabled, "EdgeCreationConfig.enabled")
         _require_positive_int(self.top_k, "EdgeCreationConfig.top_k")
         _require_unit_float(self.min_similarity, "EdgeCreationConfig.min_similarity")
         _require_nonneg_float(self.edge_weight_factor, "EdgeCreationConfig.edge_weight_factor")
 
 
+@final
+@_forbid_subclassing
 @dataclass(frozen=True)
 class DreamingConfig:
     """Configuration for the dreaming memory-consolidation extension.
@@ -584,6 +622,10 @@ class DreamingConfig:
                 a numeric field, which is rejected explicitly).
 
         """
+        # Own every field first, so that every check below inspects a value
+        # this module controls and every field this object retains is the
+        # value that was checked.
+        _own_config_fields(self)
         self._validate_scalars()
         self._validate_signals()
         self._validate_literals()
@@ -602,12 +644,8 @@ class DreamingConfig:
                 is not an :class:`EdgeCreationConfig`.
 
         """
-        if not isinstance(self.gates, DreamingGates):
-            msg = "DreamingConfig.gates must be a DreamingGates"
-            raise ConfigError(msg)
-        if not isinstance(self.edges, EdgeCreationConfig):
-            msg = "DreamingConfig.edges must be an EdgeCreationConfig"
-            raise ConfigError(msg)
+        _require_exact_type(self.gates, DreamingGates, "DreamingConfig.gates")
+        _require_exact_type(self.edges, EdgeCreationConfig, "DreamingConfig.edges")
 
     def _validate_scalars(self) -> None:
         """Validate the numeric and boolean scalar fields.
@@ -704,12 +742,15 @@ class DreamingConfig:
             msg = "DreamingConfig.min_source_confidence must be 'high', 'medium', or 'low'"
             raise ConfigError(msg)
         if self.eligible_perspectives is not None:
-            _require_str_collection(
-                self.eligible_perspectives,
-                "DreamingConfig.eligible_perspectives",
+            owned = frozenset(
+                _require_str_collection(
+                    self.eligible_perspectives,
+                    "DreamingConfig.eligible_perspectives",
+                )
             )
+            object.__setattr__(self, "eligible_perspectives", owned)
             allowed_perspectives = {"percept", "utterance", "thought"}
-            invalid = set(self.eligible_perspectives) - allowed_perspectives
+            invalid = set(owned) - allowed_perspectives
             if invalid:
                 msg = (
                     f"DreamingConfig.eligible_perspectives contains unsupported "
@@ -724,23 +765,42 @@ class DreamingConfig:
         A bare ``str`` iterates character-by-character, so the shared decoder
         rejects it — matching the YAML loader, which requires a list of strings.
 
+        Both sets gate eligibility through ``in``, so each is replaced by the
+        decoded ``frozenset`` the declared type promises: a caller's container is
+        free to answer ``__contains__`` however it likes, which would decide
+        eligibility on something other than the entries that were validated.
+
         Raises:
             ConfigError: When ``excluded_content_types`` or a non-``None``
                 ``eligible_content_types`` is a bare string or holds a non-string
                 entry.
 
         """
-        _require_str_collection(
-            self.excluded_content_types,
-            "DreamingConfig.excluded_content_types",
+        object.__setattr__(
+            self,
+            "excluded_content_types",
+            frozenset(
+                _require_str_collection(
+                    self.excluded_content_types,
+                    "DreamingConfig.excluded_content_types",
+                )
+            ),
         )
         if self.eligible_content_types is not None:
-            _require_str_collection(
-                self.eligible_content_types,
-                "DreamingConfig.eligible_content_types",
+            object.__setattr__(
+                self,
+                "eligible_content_types",
+                frozenset(
+                    _require_str_collection(
+                        self.eligible_content_types,
+                        "DreamingConfig.eligible_content_types",
+                    )
+                ),
             )
 
 
+@final
+@_forbid_subclassing
 @dataclass(frozen=True)
 class HygienePolicyConfig:
     """Configuration for the deterministic Memory Hygiene forgetting loop.
@@ -876,6 +936,10 @@ class HygienePolicyConfig:
                 numeric field, which is rejected explicitly.
 
         """
+        # Own every field first, so that every check below inspects a value
+        # this module controls and every field this object retains is the
+        # value that was checked.
+        _own_config_fields(self)
         _require_bool(self.enabled, "HygienePolicyConfig.enabled")
         _require_unit_float(self.eviction_threshold, "HygienePolicyConfig.eviction_threshold")
         self._validate_collections()
@@ -913,9 +977,18 @@ class HygienePolicyConfig:
                 explicitly).
 
         """
-        _require_str_collection(
-            self.protected_priorities,
-            "HygienePolicyConfig.protected_priorities",
+        # The decoded tuple replaces the field. ``protected_priorities`` is the
+        # keep-decision the hygiene pass consults through ``in`` before it
+        # archives or physically deletes a thought, and through ``bool`` before
+        # it adds the ``priority NOT IN (...)`` guard to the SQL. A caller's
+        # container answering either of those for itself decides what survives.
+        object.__setattr__(
+            self,
+            "protected_priorities",
+            _require_str_collection(
+                self.protected_priorities,
+                "HygienePolicyConfig.protected_priorities",
+            ),
         )
         signal_weights = _require_mapping(
             self.signal_weights,
@@ -945,6 +1018,8 @@ _VALID_PROVIDERS = frozenset(
 """Valid built-in embedding provider identifiers."""
 
 
+@final
+@_forbid_subclassing
 @dataclass(frozen=True)
 class EmbeddingConfig:
     """Configuration for the built-in embedding provider.
@@ -1016,6 +1091,10 @@ class EmbeddingConfig:
                 boolean field is not a ``bool``.
 
         """
+        # Own every field first, so that every check below inspects a value
+        # this module controls and every field this object retains is the
+        # value that was checked.
+        _own_config_fields(self)
         # Check the type before the membership test: an unhashable ``provider``
         # (e.g. a list) would raise ``TypeError`` from ``in`` on a frozenset, so the
         # ``isinstance`` short-circuit keeps the failure a ``ConfigError``.
@@ -1040,6 +1119,8 @@ class EmbeddingConfig:
         _require_positive_int(self.batch_size, "EmbeddingConfig.batch_size")
 
 
+@final
+@_forbid_subclassing
 @dataclass(frozen=True)
 class SearchConfig:
     """Default weights and parameters for hybrid search.
@@ -1169,6 +1250,10 @@ class SearchConfig:
                 ``graph_expansion_enabled`` is not a ``bool``.
 
         """
+        # Own every field first, so that every check below inspects a value
+        # this module controls and every field this object retains is the
+        # value that was checked.
+        _own_config_fields(self)
         self._validate_weights()
         self._validate_counts()
         _require_bool(self.graph_expansion_enabled, "SearchConfig.graph_expansion_enabled")
@@ -1229,6 +1314,8 @@ class SearchConfig:
         _require_positive_int(self.vec0_overfetch_factor, "SearchConfig.vec0_overfetch_factor")
 
 
+@final
+@_forbid_subclassing
 @dataclass(frozen=True)
 class ServiceConfig:
     """Per-service configuration within a multi-service setup.
@@ -1257,11 +1344,15 @@ class ServiceConfig:
                 :class:`EmbeddingConfig`.
 
         """
-        if self.embeddings is not None and not isinstance(self.embeddings, EmbeddingConfig):
-            msg = "ServiceConfig.embeddings must be an EmbeddingConfig or None"
-            raise ConfigError(msg)
+        # Own every field first, so that every check below inspects a value
+        # this module controls and every field this object retains is the
+        # value that was checked.
+        _own_config_fields(self)
+        _require_exact_type_or_none(self.embeddings, EmbeddingConfig, "ServiceConfig.embeddings")
 
 
+@final
+@_forbid_subclassing
 @dataclass(frozen=True)
 class ServicesConfig:
     """Multi-service mode configuration.
@@ -1300,24 +1391,35 @@ class ServicesConfig:
                 not a mapping, or a config key/value is ill-formed.
 
         """
+        # Own every field first, so that every check below inspects a value
+        # this module controls and every field this object retains is the
+        # value that was checked.
+        _own_config_fields(self)
         if not isinstance(self.data_dir, Path):
             msg = "ServicesConfig.data_dir must be a Path"
             raise ConfigError(msg)
         if not isinstance(self.default_service, str):
             msg = "ServicesConfig.default_service must be a string"
             raise ConfigError(msg)
-        _validate_service_name(self.default_service)
+        object.__setattr__(self, "default_service", _validate_service_name(self.default_service))
         configs = _require_mapping(self.configs, "ServicesConfig.configs")
+        # Rebuilt with the validated names as keys: a lookup keyed on a caller's
+        # ``str`` subclass resolves through that subclass's ``__hash__`` /
+        # ``__eq__``, so the mapping would answer for a name other than the one
+        # validated here.
+        owned_configs: dict[str, ServiceConfig] = {}
         for name, service in configs.items():
             if not isinstance(name, str):
                 msg = "ServicesConfig.configs keys must be strings"
                 raise ConfigError(msg)
-            _validate_service_name(name)
-            if not isinstance(service, ServiceConfig):
-                msg = f"ServicesConfig.configs[{name!r}] must be a ServiceConfig"
-                raise ConfigError(msg)
+            owned_name = _validate_service_name(name)
+            _require_exact_type(service, ServiceConfig, f"ServicesConfig.configs[{owned_name!r}]")
+            owned_configs[owned_name] = service
+        object.__setattr__(self, "configs", owned_configs)
 
 
+@final
+@_forbid_subclassing
 @dataclass(frozen=True)
 class JournalConfig:
     """Configuration for the hash-chain audit journal.
@@ -1359,10 +1461,16 @@ class JournalConfig:
             ConfigError: When ``enabled`` or ``verify_on_open`` is not a ``bool``.
 
         """
+        # Own every field first, so that every check below inspects a value
+        # this module controls and every field this object retains is the
+        # value that was checked.
+        _own_config_fields(self)
         _require_bool(self.enabled, "JournalConfig.enabled")
         _require_bool(self.verify_on_open, "JournalConfig.verify_on_open")
 
 
+@final
+@_forbid_subclassing
 @dataclass(frozen=True)
 class TTLConfig:
     """TTL / auto-expiry configuration.
@@ -1398,6 +1506,10 @@ class TTLConfig:
                 ``default_ttl_seconds`` is neither ``None`` nor a positive integer.
 
         """
+        # Own every field first, so that every check below inspects a value
+        # this module controls and every field this object retains is the
+        # value that was checked.
+        _own_config_fields(self)
         if self.strategy not in ("archive", "delete"):
             msg = f"TTLConfig.strategy must be 'archive' or 'delete', got {self.strategy!r}"
             raise ConfigError(msg)
@@ -1406,6 +1518,8 @@ class TTLConfig:
             _require_positive_int(self.default_ttl_seconds, "TTLConfig.default_ttl_seconds")
 
 
+@final
+@_forbid_subclassing
 @dataclass(frozen=True)
 class MetricsConfig:
     """Configuration for the metrics snapshot API.
@@ -1433,10 +1547,16 @@ class MetricsConfig:
                 ``enabled`` is not a ``bool``.
 
         """
+        # Own every field first, so that every check below inspects a value
+        # this module controls and every field this object retains is the
+        # value that was checked.
+        _own_config_fields(self)
         _require_positive_int(self.window_size, "MetricsConfig.window_size")
         _require_bool(self.enabled, "MetricsConfig.enabled")
 
 
+@final
+@_forbid_subclassing
 @dataclass(frozen=True)
 class IngestConfig:
     """Configuration for ingest-layer behaviours.
@@ -1482,9 +1602,15 @@ class IngestConfig:
             ConfigError: When ``deduplication_enabled`` is not a ``bool``.
 
         """
+        # Own every field first, so that every check below inspects a value
+        # this module controls and every field this object retains is the
+        # value that was checked.
+        _own_config_fields(self)
         _require_bool(self.deduplication_enabled, "IngestConfig.deduplication_enabled")
 
 
+@final
+@_forbid_subclassing
 @dataclass(frozen=True)
 class EngravaConfig:
     """Parsed configuration for ``SqliteEngravaCore``.
@@ -1565,6 +1691,10 @@ class EngravaConfig:
                 type.
 
         """
+        # Own every field first, so that every check below inspects a value
+        # this module controls and every field this object retains is the
+        # value that was checked.
+        _own_config_fields(self)
         if not isinstance(self.database_path, Path):
             msg = "EngravaConfig.database_path must be a Path"
             raise ConfigError(msg)
@@ -1575,16 +1705,31 @@ class EngravaConfig:
                 f"got {self.vector_backend!r}"
             )
             raise ConfigError(msg)
-        _require_positive_int(self.embedding_dimension, "EngravaConfig.embedding_dimension")
+        # The decoded dimension replaces the field: it is interpolated into the
+        # ``vec0`` virtual-table DDL, where an ``int`` subclass answering
+        # ``__format__`` writes whatever it likes into the schema.
+        object.__setattr__(
+            self,
+            "embedding_dimension",
+            _require_positive_int(self.embedding_dimension, "EngravaConfig.embedding_dimension"),
+        )
         _require_bool(self.extension_discover, "EngravaConfig.extension_discover")
         if self.hooks_class is not None and not isinstance(self.hooks_class, str):
             msg = "EngravaConfig.hooks_class must be a string or None"
             raise ConfigError(msg)
-        _require_str_collection(
-            self.extension_manifest_paths,
-            "EngravaConfig.extension_manifest_paths",
+        # Decoded once, then stored: these paths select the modules
+        # :func:`resolve_manifests` imports, and the caller's list is re-read at
+        # that point unless the validated list is the one kept here.
+        object.__setattr__(
+            self,
+            "extension_manifest_paths",
+            _validate_manifest_paths(
+                _require_str_collection(
+                    self.extension_manifest_paths,
+                    "EngravaConfig.extension_manifest_paths",
+                )
+            ),
         )
-        _validate_manifest_paths(self.extension_manifest_paths)
         self._validate_nested_types()
 
     def _validate_nested_types(self) -> None:
@@ -1594,9 +1739,16 @@ class EngravaConfig:
         linter budget. The YAML loader always produces the right types; direct
         construction must reject an ill-typed nested config the same way.
 
+        The type required is the **exact** class, not an instance of it. Owning
+        each field is worth nothing if the object holding those fields is the
+        caller's: a subclass passes ``isinstance``, and its
+        ``__getattribute__`` can report the settings it was validated as
+        holding and different ones every time it is read afterwards.
+
         Raises:
-            ConfigError: When an optional nested config is neither ``None`` nor its
-                type, or a required nested config is not its type.
+            ConfigError: When an optional nested config is neither ``None`` nor
+                exactly its type, or a required nested config is not exactly
+                its type.
 
         """
         optional: tuple[tuple[str, type], ...] = (
@@ -1606,10 +1758,7 @@ class EngravaConfig:
             ("services", ServicesConfig),
         )
         for name, cls in optional:
-            value = getattr(self, name)
-            if value is not None and not isinstance(value, cls):
-                msg = f"EngravaConfig.{name} must be a {cls.__name__} or None"
-                raise ConfigError(msg)
+            _require_exact_type_or_none(getattr(self, name), cls, f"EngravaConfig.{name}")
         required: tuple[tuple[str, type], ...] = (
             ("search", SearchConfig),
             ("journal", JournalConfig),
@@ -1619,9 +1768,7 @@ class EngravaConfig:
             ("derive", DeriveGates),
         )
         for name, cls in required:
-            if not isinstance(getattr(self, name), cls):
-                msg = f"EngravaConfig.{name} must be a {cls.__name__}"
-                raise ConfigError(msg)
+            _require_exact_type(getattr(self, name), cls, f"EngravaConfig.{name}")
 
 
 # ------------------------------------------------------------------
@@ -1911,22 +2058,44 @@ _SERVICE_NAME_RE_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,62}$")
 """Compiled pattern for valid service names (lowercase, alphanumeric, hyphens, underscores)."""
 
 
-def _validate_service_name(name: str) -> None:
-    """Validate that a service name is well-formed.
+def _validate_service_name(name: object) -> str:
+    """Validate a service name and return the name this module owns.
+
+    A service name is a **filename component**: it is joined onto the data
+    directory to address a database file, so a value that escapes the pattern
+    escapes the data directory. The pattern check itself cannot be fooled —
+    :mod:`re` reads the real text buffer — but the checked text and the text
+    that later reaches the filesystem are only the same value if the caller's
+    object is never consulted again. A ``str`` subclass may return anything at
+    all from ``__format__`` or ``__str__``, so the name is re-owned here and
+    **the returned value is the one callers must use**; passing the caller's
+    object on to build a path re-opens the escape.
 
     Args:
         name: Candidate service name.
 
+    Returns:
+        The validated name as an exact ``str``.
+
     Raises:
-        ConfigError: If the name does not match the allowed pattern.
+        ConfigError: If the value is not a string, or the name does not match
+            the allowed pattern.
 
     """
-    if not _SERVICE_NAME_RE_PATTERN.match(name):
+    if not isinstance(name, str):
+        # The message carries no caller-derived text: ``repr`` and
+        # ``type(...).__name__`` are both attribute lookups on an object the
+        # caller controls, and either can raise from inside the rejection path.
+        msg = "Invalid service name: must be a string"
+        raise ConfigError(msg)
+    owned = _own_str(name)
+    if not _SERVICE_NAME_RE_PATTERN.match(owned):
         msg = (
-            f"Invalid service name {name!r}: must match {_SERVICE_NAME_RE_PATTERN.pattern} "
+            f"Invalid service name {owned!r}: must match {_SERVICE_NAME_RE_PATTERN.pattern} "
             f"(lowercase alphanumeric, hyphens, underscores, max 63 chars)"
         )
         raise ConfigError(msg)
+    return owned
 
 
 def _parse_service_config(name: str, raw: Any) -> ServiceConfig:  # noqa: ANN401
@@ -1982,7 +2151,7 @@ def _parse_services(raw: Any) -> ServicesConfig | None:  # noqa: ANN401
     if not isinstance(default_service, str):
         msg = "'services.default_service' must be a string"
         raise ConfigError(msg)
-    _validate_service_name(default_service)
+    owned_default = _validate_service_name(default_service)
 
     configs_raw = _require_mapping(raw.get("configs", {}), "services.configs")
 
@@ -1991,12 +2160,12 @@ def _parse_services(raw: Any) -> ServicesConfig | None:  # noqa: ANN401
         if not isinstance(svc_name, str):
             msg = f"Service name must be a string, got {type(svc_name).__name__}"
             raise ConfigError(msg)
-        _validate_service_name(svc_name)
-        configs[svc_name] = _parse_service_config(svc_name, svc_raw)
+        owned_name = _validate_service_name(svc_name)
+        configs[owned_name] = _parse_service_config(owned_name, svc_raw)
 
     return ServicesConfig(
         data_dir=Path(data_dir),
-        default_service=default_service,
+        default_service=owned_default,
         configs=configs,
     )
 
@@ -3086,6 +3255,14 @@ def _parse_ttl(raw: Any) -> TTLConfig:  # noqa: ANN401
 def resolve_hooks(hooks_class: str | None) -> EngravaHooksProtocol:
     """Dynamically import and instantiate a hooks class from a dotted path.
 
+    This imports a module and instantiates a class out of it, which makes the
+    supplied path the most consequential string a configuration can carry: the
+    object it returns is retained by the store and called back on every
+    mutation. It is a public entry point, so it re-owns the path at its own
+    boundary rather than assuming a config validated it — ``rsplit`` is an
+    ordinary overridable method, and the module named by a ``str`` subclass need
+    bear no relation to the text any validator inspected.
+
     Args:
         hooks_class: Dotted import path (e.g. ``"my_pkg.MyHooks"``),
             or ``None`` for the default no-op hooks.
@@ -3094,7 +3271,8 @@ def resolve_hooks(hooks_class: str | None) -> EngravaHooksProtocol:
         An instance of ``EngravaHooksProtocol``.
 
     Raises:
-        ConfigError: If the class cannot be imported or instantiated.
+        ConfigError: If the value is not a string, or the class cannot be
+            imported or instantiated.
 
     Examples:
         >>> hooks = resolve_hooks(None)
@@ -3104,11 +3282,15 @@ def resolve_hooks(hooks_class: str | None) -> EngravaHooksProtocol:
     """
     if hooks_class is None:
         return DefaultEngravaHooks()
+    if not isinstance(hooks_class, str):
+        msg = "hooks.class must be a string"
+        raise ConfigError(msg)
+    path = _own_str(hooks_class)
 
     try:
-        module_path, class_name = hooks_class.rsplit(".", maxsplit=1)
+        module_path, class_name = path.rsplit(".", maxsplit=1)
     except ValueError:
-        msg = f"hooks.class must be a dotted path (got {hooks_class!r})"
+        msg = f"hooks.class must be a dotted path (got {path!r})"
         raise ConfigError(msg) from None
 
     try:
@@ -3123,9 +3305,9 @@ def resolve_hooks(hooks_class: str | None) -> EngravaHooksProtocol:
         raise ConfigError(msg)
 
     try:
-        return cls()  # type: ignore[no-any-return]
+        return cls()  # type: ignore[no-any-return]  # a dynamically imported class is untyped by construction
     except Exception as exc:
-        msg = f"Cannot instantiate hooks class {hooks_class!r}: {exc}"
+        msg = f"Cannot instantiate hooks class {path!r}: {exc}"
         raise ConfigError(msg) from exc
 
 
@@ -3197,14 +3379,20 @@ def _parse_manifests(raw: Any) -> tuple[list[str], bool]:  # noqa: ANN401
     return paths, discover
 
 
-def _validate_manifest_paths(raw_paths: list[Any]) -> list[str]:
+def _validate_manifest_paths(raw_paths: Sequence[object]) -> list[str]:
     """Validate and return a list of manifest dotted-path strings.
 
+    Each accepted entry is re-owned before it is collected: the pattern check
+    reads the real text, but the returned path selects a module for
+    ``importlib.import_module``, and a ``str`` subclass is free to name a
+    different module from ``rsplit`` / ``__str__`` than the one that matched
+    here. Callers must import from the returned list, never from *raw_paths*.
+
     Args:
-        raw_paths: Raw list from YAML.
+        raw_paths: Raw sequence from YAML or from a directly-constructed config.
 
     Returns:
-        Validated list of strings matching ``module.path:ATTRIBUTE``.
+        Validated list of exact ``str`` matching ``module.path:ATTRIBUTE``.
 
     Raises:
         ConfigError: If any entry is not a valid dotted path.
@@ -3213,15 +3401,19 @@ def _validate_manifest_paths(raw_paths: list[Any]) -> list[str]:
     result: list[str] = []
     for entry in raw_paths:
         if not isinstance(entry, str):
-            msg = f"Manifest path must be a string, got {type(entry).__name__}"
+            # No caller-derived text in the message: ``type(entry).__name__``
+            # is an attribute lookup on a type the caller controls, and a
+            # metaclass is free to raise from it — out of the rejection path.
+            msg = "Manifest path must be a string"
             raise ConfigError(msg)
-        if not _MANIFEST_PATH_RE_PATTERN.match(entry):
+        owned = _own_str(entry)
+        if not _MANIFEST_PATH_RE_PATTERN.match(owned):
             msg = (
-                f"Invalid manifest path {entry!r}: must be in the form "
+                f"Invalid manifest path {owned!r}: must be in the form "
                 f"'module.path:ATTRIBUTE' (e.g. 'my_plugin.manifest:MANIFEST')"
             )
             raise ConfigError(msg)
-        result.append(entry)
+        result.append(owned)
     return result
 
 
@@ -3234,6 +3426,14 @@ def resolve_manifests(
 
     Optionally appends manifests discovered via the ``engrava.extensions``
     entry-point group when *discover* is ``True``.
+
+    This is a public entry point that decides which modules get imported, so it
+    re-owns every path at its own boundary rather than trusting that some other
+    entry point validated it. ``rsplit`` and ``__str__`` are overridable, so the
+    module name split out of a caller's ``str`` subclass need bear no relation
+    to the text any validator inspected; splitting an exact ``str`` obtained
+    from :func:`~engrava.config_validation.own_str` makes the path that was
+    checked the path that is imported.
 
     Args:
         manifest_paths: List of ``"module.path:ATTRIBUTE"`` strings.  Each
@@ -3257,7 +3457,11 @@ def resolve_manifests(
 
     result: list[ExtensionManifest] = []
 
-    for path in manifest_paths:
+    for raw_path in manifest_paths:
+        if not isinstance(raw_path, str):
+            msg = "Manifest path must be a string"
+            raise ConfigError(msg)
+        path = _own_str(raw_path)
         try:
             module_path, attr_name = path.rsplit(":", maxsplit=1)
         except ValueError:

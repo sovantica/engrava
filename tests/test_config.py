@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -16,6 +17,9 @@ from engrava.config import (
     resolve_hooks,
 )
 from engrava.domain.protocols.hooks import DefaultEngravaHooks
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 # ------------------------------------------------------------------
 # Value object defaults
@@ -670,6 +674,229 @@ class TestResolveManifests:
         # No installed 'engrava.extensions' EPs in test env — no-op is correct
         result = resolve_manifests([], discover=False)
         assert result == []
+
+
+class _LyingManifestPath(str):
+    """A path that names one module to the validator and another to the loader.
+
+    The real text is a well-formed dotted path and satisfies the pattern check.
+    ``rsplit`` — the operation that actually decides which module is imported —
+    answers with a different module entirely.
+    """
+
+    __slots__ = ()
+
+    def rsplit(self, sep: str | None = None, maxsplit: int = -1) -> list[str]:
+        del sep, maxsplit
+        return [_LYING_TARGET_MODULE, "MANIFEST"]
+
+
+_DECLARED_MODULE = "_engrava_declared_manifest_mod"
+_LYING_TARGET_MODULE = "_engrava_lying_target_manifest_mod"
+
+
+def _register_manifest_modules() -> None:
+    """Install two importable modules, each carrying a distinguishable manifest."""
+    import sys
+    import types
+
+    from engrava.domain.manifest import ExtensionManifest
+    from engrava.domain.protocols.hooks import DefaultEngravaHooks
+
+    for module_name, manifest_name in (
+        (_DECLARED_MODULE, "declared"),
+        (_LYING_TARGET_MODULE, "lying-target"),
+    ):
+        module = types.ModuleType(module_name)
+        module.MANIFEST = ExtensionManifest(  # type: ignore[attr-defined]  # attribute set on a module built for this test
+            name=manifest_name, version="0.0.1", hooks_class=DefaultEngravaHooks
+        )
+        sys.modules[module_name] = module
+
+
+def _unregister_manifest_modules() -> None:
+    import sys
+
+    for module_name in (_DECLARED_MODULE, _LYING_TARGET_MODULE):
+        del sys.modules[module_name]
+
+
+class TestManifestPathsAreOwnedBeforeImport:
+    """The path that passed validation is the path that selects a module.
+
+    ``extension_manifest_paths`` decides what engrava imports into the running
+    process, which makes it the most consequential string in the config file.
+    The pattern check reads the real text; ``rsplit`` and ``__str__`` do not
+    have to agree with it.
+    """
+
+    def test_the_declared_module_is_the_imported_module(self) -> None:
+        from engrava.config import resolve_manifests
+
+        _register_manifest_modules()
+        try:
+            resolved = resolve_manifests([_LyingManifestPath(f"{_DECLARED_MODULE}:MANIFEST")])
+            assert [manifest.name for manifest in resolved] == ["declared"]
+        finally:
+            _unregister_manifest_modules()
+
+    def test_a_config_stores_the_validated_paths_as_plain_strings(self, tmp_path: Path) -> None:
+        config = EngravaConfig(
+            database_path=tmp_path / "t.db",
+            extension_manifest_paths=[_LyingManifestPath(f"{_DECLARED_MODULE}:MANIFEST")],
+        )
+        assert [type(path) for path in config.extension_manifest_paths] == [str]
+        assert config.extension_manifest_paths == [f"{_DECLARED_MODULE}:MANIFEST"]
+
+    def test_a_config_path_still_reaches_the_module_it_names(self, tmp_path: Path) -> None:
+        from engrava.config import resolve_manifests
+
+        _register_manifest_modules()
+        try:
+            config = EngravaConfig(
+                database_path=tmp_path / "t.db",
+                extension_manifest_paths=[_LyingManifestPath(f"{_DECLARED_MODULE}:MANIFEST")],
+            )
+            resolved = resolve_manifests(config.extension_manifest_paths)
+            assert [manifest.name for manifest in resolved] == ["declared"]
+        finally:
+            _unregister_manifest_modules()
+
+    def test_a_container_cannot_smuggle_a_path_it_does_not_hold(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The paths decoded are the paths the list actually contains."""
+
+        class _PathsThatIterateDifferently(list):  # type: ignore[type-arg]  # the adversary is the subclassing itself
+            def __init__(self) -> None:
+                super().__init__([f"{_DECLARED_MODULE}:MANIFEST"])
+
+            def __iter__(self) -> Iterator[str]:
+                return iter([f"{_LYING_TARGET_MODULE}:MANIFEST"])
+
+        config = EngravaConfig(
+            database_path=tmp_path / "t.db",
+            extension_manifest_paths=_PathsThatIterateDifferently(),
+        )
+        assert config.extension_manifest_paths == [f"{_DECLARED_MODULE}:MANIFEST"]
+
+    def test_a_non_string_path_is_refused_without_naming_its_type(self) -> None:
+        """The refusal reads nothing off the value it is refusing.
+
+        Naming the offending type is the natural thing to put in this message
+        and it is a lookup on a type the caller controls, so a metaclass can
+        raise from inside the rejection and replace a clean ``ConfigError``
+        with something unrelated.
+        """
+        from engrava.config import _validate_manifest_paths
+
+        class _HostileTypeNameMeta(type):
+            @property
+            def __name__(cls) -> str:
+                msg = "type name lookup ran caller-controlled code"
+                raise RuntimeError(msg)
+
+        class _HostileTypeName(metaclass=_HostileTypeNameMeta):
+            def __repr__(self) -> str:
+                return "<a value whose type name raises>"
+
+        with pytest.raises(ConfigError, match="Manifest path must be a string"):
+            _validate_manifest_paths([_HostileTypeName()])
+
+    def test_legitimate_paths_are_unchanged(self, tmp_path: Path) -> None:
+        paths = ["my_plugin.manifest:MANIFEST", "other.ext:MY_EXT"]
+        config = EngravaConfig(database_path=tmp_path / "t.db", extension_manifest_paths=paths)
+        assert config.extension_manifest_paths == paths
+
+    def test_a_non_string_path_is_refused_at_the_resolver_boundary(self) -> None:
+        """``resolve_manifests`` is public; it does not assume a config ran first."""
+        from engrava.config import resolve_manifests
+
+        with pytest.raises(ConfigError, match="Manifest path must be a string"):
+            resolve_manifests([object()])  # type: ignore[list-item]  # passing the wrong type is the behaviour under test
+
+
+class _LyingHooksPath(str):
+    """A hooks path that names one class to the validator and another to the loader."""
+
+    __slots__ = ()
+
+    def rsplit(self, sep: str | None = None, maxsplit: int = -1) -> list[str]:
+        del sep, maxsplit
+        return [_HOOKS_ATTACKER_MODULE, "AttackerHooks"]
+
+
+_HOOKS_DECLARED_PATH = "engrava.domain.protocols.hooks.DefaultEngravaHooks"
+_HOOKS_ATTACKER_MODULE = "_engrava_attacker_hooks_mod"
+
+
+class TestHooksClassIsOwnedBeforeImport:
+    """The hooks path that passed validation is the class that gets instantiated.
+
+    This is the manifest defect with a worse ending. A manifest that names the
+    wrong module still has to survive an ``ExtensionManifest`` type check; a
+    hooks path does not. Whatever class the path resolves to is constructed and
+    handed to the store, which then calls it back on every mutation — so a value
+    that reads as one thing to every check and names another to ``rsplit`` is
+    arbitrary code execution out of a configuration string.
+    """
+
+    @staticmethod
+    def _install_attacker_module() -> list[str]:
+        import sys
+        import types
+
+        instantiated: list[str] = []
+        module = types.ModuleType(_HOOKS_ATTACKER_MODULE)
+
+        class AttackerHooks:
+            def __init__(self) -> None:
+                instantiated.append("constructed")
+
+        module.AttackerHooks = AttackerHooks  # type: ignore[attr-defined]  # attribute set on a module built for this test
+        sys.modules[_HOOKS_ATTACKER_MODULE] = module
+        return instantiated
+
+    @staticmethod
+    def _remove_attacker_module() -> None:
+        import sys
+
+        sys.modules.pop(_HOOKS_ATTACKER_MODULE, None)
+
+    def test_the_declared_class_is_the_instantiated_class(self) -> None:
+        instantiated = self._install_attacker_module()
+        try:
+            hooks = resolve_hooks(_LyingHooksPath(_HOOKS_DECLARED_PATH))
+
+            # State first: whether the attacker's code ran is the question, and
+            # it is answered before anything about the returned object.
+            assert instantiated == []
+            assert isinstance(hooks, DefaultEngravaHooks)
+        finally:
+            self._remove_attacker_module()
+
+    def test_a_config_carried_path_reaches_the_class_it_names(self, tmp_path: Path) -> None:
+        instantiated = self._install_attacker_module()
+        try:
+            config = EngravaConfig(
+                database_path=tmp_path / "t.db",
+                hooks_class=_LyingHooksPath(_HOOKS_DECLARED_PATH),
+            )
+            assert type(config.hooks_class) is str
+
+            hooks = resolve_hooks(config.hooks_class)
+            assert instantiated == []
+            assert isinstance(hooks, DefaultEngravaHooks)
+        finally:
+            self._remove_attacker_module()
+
+    def test_a_non_string_hooks_path_is_a_configuration_error(self) -> None:
+        with pytest.raises(ConfigError, match=r"hooks\.class must be a string"):
+            resolve_hooks(object())  # type: ignore[arg-type]  # passing the wrong type is the behaviour under test
+
+    def test_a_legitimate_hooks_path_still_resolves(self) -> None:
+        assert isinstance(resolve_hooks(_HOOKS_DECLARED_PATH), DefaultEngravaHooks)
 
 
 # ------------------------------------------------------------------

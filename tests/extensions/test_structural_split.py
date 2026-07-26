@@ -523,3 +523,79 @@ async def test_fixed_window_children_carry_window_metadata_when_persisted(
     assert child.metadata["char_end"] == len(_DEMO_SEGMENTS[0])
     # The recorded span slices the source back to the child content.
     assert _DEMO_CONTENT[0 : len(_DEMO_SEGMENTS[0])] == _DEMO_SEGMENTS[0]
+
+
+# ---------------------------------------------------------------------------
+# The window numbers the producer keeps are the numbers it checked
+# ---------------------------------------------------------------------------
+
+
+class _NumberThatIsNeverTooSmall(int):
+    """An integer that answers ``<`` for itself, so no lower bound holds."""
+
+    __slots__ = ()
+
+    def __lt__(self, other: object) -> bool:
+        del other
+        return False
+
+
+class _UnitThatComparesAsAnother(str):
+    """Reads as its real text; compares equal to ``word``."""
+
+    __slots__ = ()
+
+    def __hash__(self) -> int:
+        return hash("word")
+
+    def __eq__(self, other: object) -> bool:
+        return other == "word"
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+
+class TestConstructorKeepsTheValuesItValidated:
+    """This producer is a public entry point and validates its own inputs.
+
+    It sits outside ``engrava.config``, so nothing else validates for it. The
+    numbers it stores drive the window arithmetic over caller content, and the
+    unit selects which arithmetic runs — both compared with methods the value
+    itself may define.
+    """
+
+    def test_a_lower_bound_cannot_be_answered_by_the_value(self) -> None:
+        with pytest.raises(ValueError, match="window_size must be >= 1"):
+            StructuralSplitProducer(window_size=_NumberThatIsNeverTooSmall(0))
+
+    def test_a_negative_overlap_cannot_be_answered_by_the_value(self) -> None:
+        with pytest.raises(ValueError, match="window_overlap must be >= 0"):
+            StructuralSplitProducer(window_overlap=_NumberThatIsNeverTooSmall(-1))
+
+    def test_a_negative_minimum_cannot_be_answered_by_the_value(self) -> None:
+        with pytest.raises(ValueError, match="min_chars must be >= 0"):
+            StructuralSplitProducer(min_chars=_NumberThatIsNeverTooSmall(-1))
+
+    def test_the_stored_numbers_are_exact_ints(self) -> None:
+        producer = StructuralSplitProducer(
+            window_size=_NumberThatIsNeverTooSmall(10),
+            window_overlap=_NumberThatIsNeverTooSmall(2),
+            min_chars=_NumberThatIsNeverTooSmall(1),
+        )
+        assert type(producer.window_size) is int
+        assert type(producer.window_overlap) is int
+        assert type(producer.min_chars) is int
+
+    def test_the_stored_unit_is_an_exact_str(self) -> None:
+        producer = StructuralSplitProducer(window_unit=_UnitThatComparesAsAnother("char"))
+        assert type(producer.window_unit) is str
+        assert producer.window_unit == "char"
+
+    def test_a_non_integer_window_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="window_size must be >= 1"):
+            StructuralSplitProducer(window_size="10")  # type: ignore[arg-type]  # the rejection is the behaviour under test
+
+    def test_legitimate_values_are_unchanged(self) -> None:
+        producer = StructuralSplitProducer(window_size=42, window_overlap=7, min_chars=3)
+        assert (producer.window_size, producer.window_overlap, producer.min_chars) == (42, 7, 3)
+        assert producer.window_unit == "char"

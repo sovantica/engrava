@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import datetime
 import hashlib
 import json
 from pathlib import Path
@@ -25,8 +26,11 @@ from engrava import (
     EdgeType,
     EmbeddingConfig,
     EngravaConfig,
+    HygienePolicyConfig,
     LifecycleStatus,
+    MetricsConfig,
     Priority,
+    SearchConfig,
     ServiceConfig,
     ServicesConfig,
     SqliteEngravaCore,
@@ -39,7 +43,80 @@ from engrava.config import (
     _validate_service_name,
     load_config,
 )
+from engrava.domain.protocols.derived_records import DeriveGates
 from engrava.infrastructure.service_manager import EngravaManager
+
+
+def _entry_names(directory: Path) -> list[str]:
+    """Sorted names directly under *directory* (kept out of the async test body)."""
+    return sorted(entry.name for entry in directory.iterdir())
+
+
+class _LyingName(str):
+    """A service name whose text and whose rendering disagree.
+
+    Every character-level check — the name pattern above all — reads the real
+    text ``"prod"`` and passes. ``__format__`` then answers with a relative path
+    that climbs out of the data directory, so any ``f"{name}.db"`` built from
+    this object addresses a file the store was never given.
+    """
+
+    __slots__ = ()
+
+    def __format__(self, format_spec: str) -> str:
+        del format_spec
+        return "../escaped"
+
+
+class _LyingCacheKey(str):
+    """A service name that refuses to equal itself.
+
+    ``__eq__`` and ``__hash__`` decide which entry of the store cache a name
+    resolves to. A name that answers them for itself resolves to no entry, so
+    the same service opens twice over one database file.
+    """
+
+    __slots__ = ()
+
+    def __eq__(self, other: object) -> bool:
+        del other
+        return False
+
+    def __ne__(self, other: object) -> bool:
+        del other
+        return True
+
+    def __hash__(self) -> int:
+        return 0
+
+
+class _HostileRepr:
+    """A rejected value whose ``repr`` raises."""
+
+    def __repr__(self) -> str:
+        msg = "repr ran caller-controlled code"
+        raise RuntimeError(msg)
+
+
+class _HostileNameMeta(type):
+    """Metaclass whose ``__name__`` raises, like a hostile third-party type."""
+
+    @property
+    def __name__(cls) -> str:
+        msg = "type name lookup ran caller-controlled code"
+        raise RuntimeError(msg)
+
+
+class _HostileTypeName(metaclass=_HostileNameMeta):
+    """A rejected value whose *type name* raises.
+
+    ``repr`` is deliberately well-behaved: naming the type is the other half of
+    the "describe what you rejected" reflex, and it is a caller-controlled
+    lookup just as much as ``repr`` is.
+    """
+
+    def __repr__(self) -> str:
+        return "<a value whose type name raises>"
 
 
 class _RestoreEmbeddingProvider:
@@ -129,7 +206,41 @@ class TestServicesConfig:
 class TestServiceNameValidation:
     def test_valid_names(self) -> None:
         for name in ("main", "alpha", "home-assistant", "coding_helper", "a1b2"):
-            _validate_service_name(name)  # should not raise
+            assert _validate_service_name(name) == name
+
+    def test_returns_an_exact_str_for_a_subclass(self) -> None:
+        """The name handed back is one the module owns, not the caller's object.
+
+        A ``str`` subclass passes the pattern check (the pattern reads the real
+        text) and then answers ``__format__`` however it likes. The validator
+        exists to hand callers a value with no such freedom.
+        """
+        validated = _validate_service_name(_LyingName("prod"))
+        assert type(validated) is str
+        assert validated == "prod"
+        assert f"{validated}.db" == "prod.db"
+
+    def test_rejects_a_non_string_with_a_config_error(self) -> None:
+        """A non-string is a domain rejection, not a leaked ``TypeError``."""
+        with pytest.raises(ConfigError, match="must be a string"):
+            _validate_service_name(object())
+
+    def test_rejection_message_never_calls_the_caller_repr(self) -> None:
+        """Building the refusal must not call back into caller-controlled code.
+
+        ``repr`` is a lookup on something the caller supplies and can raise from
+        inside the rejection path, turning a clean refusal into an unrelated
+        error. (The adversaries here are built in the test body rather than
+        parametrised so that a failure stays reportable — an object that fights
+        ``repr`` also fights the test runner printing it.)
+        """
+        with pytest.raises(ConfigError, match="must be a string"):
+            _validate_service_name(_HostileRepr())
+
+    def test_rejection_message_never_reads_the_caller_type_name(self) -> None:
+        """The other half of the same reflex: naming the rejected value's type."""
+        with pytest.raises(ConfigError, match="must be a string"):
+            _validate_service_name(_HostileTypeName())
 
     def test_invalid_uppercase(self) -> None:
         with pytest.raises(ConfigError, match="Invalid service name"):
@@ -1329,3 +1440,346 @@ class TestServiceExistsMethod:
         mgr = EngravaManager(data_dir=tmp_path / "svc")
         with pytest.raises(ConfigError, match="Invalid service name"):
             mgr.service_exists(service_name)
+
+
+# ------------------------------------------------------------------
+# Every file the manager addresses is named by the validated name
+# ------------------------------------------------------------------
+
+
+class TestServiceNameNeverEscapesTheDataDirectory:
+    """The name that passed the pattern check is the name that reaches the disk.
+
+    The pattern check cannot be fooled — ``re`` reads the real text — but that
+    only constrains the caller's object at the instant it is checked. Every
+    filesystem operation below builds its path by interpolating a name, which
+    runs ``__format__`` on whatever object it was handed, so the guarantee holds
+    only while the checked value and the used value are the same value.
+    """
+
+    async def test_delete_service_leaves_files_outside_the_data_directory_alone(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A deletion touches its own database and nothing else on the disk."""
+        data_dir = tmp_path / "data"
+        async with EngravaManager(data_dir=data_dir) as mgr:
+            await mgr.get_store("prod")
+        target = data_dir / "prod.db"
+        assert target.exists()
+
+        victim = tmp_path / "escaped.db"
+        victim.write_bytes(b"not engrava's to delete")
+
+        mgr = EngravaManager(data_dir=data_dir)
+        error: Exception | None = None
+        try:
+            await mgr.delete_service(_LyingName("prod"))
+        except Exception as exc:  # noqa: BLE001 -- the effect is asserted first
+            error = exc
+
+        # State first: a test that only asserted "something was raised" would
+        # pass just as happily against code that unlinks the file and *then*
+        # fails, which is the outcome this exists to rule out.
+        assert victim.exists()
+        assert victim.read_bytes() == b"not engrava's to delete"
+        assert not target.exists()
+        assert error is None
+
+    async def test_get_store_creates_no_database_outside_the_data_directory(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Opening a service creates its file under ``data_dir`` and nowhere else."""
+        data_dir = tmp_path / "data"
+        async with EngravaManager(data_dir=data_dir) as mgr:
+            await mgr.get_store(_LyingName("prod"))
+
+        assert _entry_names(tmp_path) == ["data"]
+        assert (data_dir / "prod.db").exists()
+
+    async def test_service_exists_probes_only_the_data_directory(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Existence is answered about the named service, not an arbitrary path."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (tmp_path / "escaped.db").write_bytes(b"someone else's file")
+
+        mgr = EngravaManager(data_dir=data_dir)
+        assert mgr.service_exists(_LyingName("prod")) is False
+
+    async def test_the_same_service_opens_once_however_the_name_compares(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The store cache is keyed on the validated name, not the caller's object."""
+        async with EngravaManager(data_dir=tmp_path / "data") as mgr:
+            first = await mgr.get_store("prod")
+            second = await mgr.get_store(_LyingCacheKey("prod"))
+            assert second is first
+
+    async def test_legitimate_names_still_address_their_own_database(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Ordinary names round-trip through create, exist, and delete unchanged."""
+        data_dir = tmp_path / "data"
+        names = ("main", "home-assistant", "coding_helper", "a1b2")
+        async with EngravaManager(data_dir=data_dir) as mgr:
+            for name in names:
+                await mgr.get_store(name)
+                assert mgr.service_exists(name)
+            assert await mgr.list_services() == sorted(names)
+
+        mgr = EngravaManager(data_dir=data_dir)
+        await mgr.delete_service("main")
+        assert await mgr.list_services() == sorted(names[1:])
+
+
+class TestServicesConfigOwnsItsNames:
+    """``ServicesConfig`` stores the names it validated, as plain strings."""
+
+    def test_default_service_is_an_exact_str(self) -> None:
+        cfg = ServicesConfig(data_dir=Path("./data"), default_service=_LyingName("prod"))
+        assert type(cfg.default_service) is str
+        assert cfg.default_service == "prod"
+
+    def test_config_keys_are_the_validated_names(self) -> None:
+        cfg = ServicesConfig(
+            data_dir=Path("./data"),
+            default_service="main",
+            configs={_LyingCacheKey("prod"): ServiceConfig()},
+        )
+        assert [type(key) for key in cfg.configs] == [str]
+        assert cfg.configs["prod"] == ServiceConfig()
+
+
+def _look_alike_of(config: object) -> object:
+    """Return *config* with its ``__class__`` reassigned to a non-subclass."""
+
+    class _LookAlike:
+        pass
+
+    object.__setattr__(config, "__class__", _LookAlike)
+    return config
+
+
+class TestConfigObjectsMustBeExactlyTheirClass:
+    """The store and the manager retain configuration and read it for themselves.
+
+    Each is a public entry point, so each requires the exact class at its own
+    boundary rather than assuming the other did. Subclassing a configuration is
+    refused at the class now, so what still has to be caught here is a
+    ``__class__`` reassigned to a look-alike that was never a subclass, and
+    anything that was never a configuration at all.
+    """
+
+    async def test_the_store_refuses_a_look_alike_hygiene_policy(self) -> None:
+        conn = await aiosqlite.connect(":memory:")
+        try:
+            with pytest.raises(ConfigError, match="must be exactly a HygienePolicyConfig"):
+                SqliteEngravaCore(conn, hygiene_policy=_look_alike_of(HygienePolicyConfig()))
+        finally:
+            await conn.close()
+
+    def test_a_hygiene_policy_cannot_be_subclassed_in_the_first_place(self) -> None:
+        """The two-faced policy that reopened this needed a subclass to exist."""
+        with pytest.raises(TypeError, match="may not be subclassed"):
+            type("_TwoFacedPolicy", (HygienePolicyConfig,), {})
+
+    @pytest.mark.parametrize(
+        ("kwarg", "cls"),
+        [
+            ("search_config", SearchConfig),
+            ("metrics_config", MetricsConfig),
+            ("hygiene_policy", HygienePolicyConfig),
+            ("derive_gates", DeriveGates),
+        ],
+    )
+    async def test_every_config_the_store_retains_requires_its_exact_class(
+        self,
+        kwarg: str,
+        cls: type,
+    ) -> None:
+        conn = await aiosqlite.connect(":memory:")
+        try:
+            with pytest.raises(ConfigError, match=f"must be exactly a {cls.__name__}"):
+                SqliteEngravaCore(conn, **{kwarg: _look_alike_of(cls())})
+        finally:
+            await conn.close()
+
+    @pytest.mark.parametrize(
+        ("kwarg", "cls"),
+        [
+            ("default_embeddings", EmbeddingConfig),
+            ("default_search", SearchConfig),
+        ],
+    )
+    def test_every_config_the_manager_retains_requires_its_exact_class(
+        self,
+        tmp_path: Path,
+        kwarg: str,
+        cls: type,
+    ) -> None:
+        with pytest.raises(ConfigError, match=f"must be exactly a {cls.__name__}"):
+            EngravaManager(data_dir=tmp_path / "data", **{kwarg: _look_alike_of(cls())})
+
+    def test_the_manager_refuses_a_look_alike_services_config(self, tmp_path: Path) -> None:
+        services = _look_alike_of(ServicesConfig(data_dir=tmp_path / "data"))
+        with pytest.raises(ConfigError, match="must be exactly a ServicesConfig"):
+            EngravaManager(data_dir=tmp_path / "data", services_config=services)
+
+    async def test_the_exact_classes_are_still_accepted(self, tmp_path: Path) -> None:
+        conn = await aiosqlite.connect(":memory:")
+        try:
+            store = SqliteEngravaCore(
+                conn,
+                search_config=SearchConfig(),
+                metrics_config=MetricsConfig(),
+                hygiene_policy=HygienePolicyConfig(),
+                derive_gates=DeriveGates(),
+            )
+            assert store is not None
+        finally:
+            await conn.close()
+
+        async with EngravaManager(
+            data_dir=tmp_path / "data",
+            default_search=SearchConfig(),
+            services_config=ServicesConfig(data_dir=tmp_path / "data"),
+        ) as manager:
+            assert await manager.get_store("main") is not None
+
+
+class TestStoreConstructorParametersAreOwned:
+    """The store takes raw numbers straight from its caller, not only via config.
+
+    The configuration sweep never sees these, which is why the whole class of
+    defect reappeared here one layer out. The cadence in particular decides
+    whether an automatic cleanup runs at all, and under the ``delete`` strategy
+    that cleanup destroys rows.
+    """
+
+    async def test_a_cadence_that_denies_its_own_value_deletes_nothing(self) -> None:
+        """Configured off, it stays off — whatever the value answers to ``< 1``."""
+
+        class _CadenceThatDeniesItsOwnValue(int):
+            __slots__ = ()
+
+            def __lt__(self, other: object) -> bool:
+                del other
+                return False
+
+        conn = await aiosqlite.connect(":memory:")
+        conn.row_factory = aiosqlite.Row
+        try:
+            store = SqliteEngravaCore(
+                conn,
+                ttl_strategy="delete",
+                ttl_check_every_n=_CadenceThatDeniesItsOwnValue(0),
+            )
+            await store.ensure_schema()
+            expired = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=1)).isoformat()
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id="victim",
+                    thought_type=ThoughtType.OBSERVATION,
+                    essence="e",
+                    content="c",
+                    priority=Priority.P3,
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    source="test",
+                    expires_at=expired,
+                )
+            )
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id="other",
+                    thought_type=ThoughtType.OBSERVATION,
+                    essence="e",
+                    content="c",
+                    priority=Priority.P3,
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    source="test",
+                )
+            )
+
+            # State first: the row is the question. An automatic cleanup the
+            # caller switched off must not have run at all.
+            cursor = await conn.execute(
+                "SELECT COUNT(*) FROM thought WHERE thought_id = ?", ("victim",)
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row[0] == 1
+        finally:
+            await conn.close()
+
+    async def test_the_stored_cadence_is_an_exact_int(self) -> None:
+        class _Cadence(int):
+            __slots__ = ()
+
+        conn = await aiosqlite.connect(":memory:")
+        try:
+            store = SqliteEngravaCore(conn, ttl_check_every_n=_Cadence(5))
+            assert type(store._ttl_check_every_n) is int
+            assert store._ttl_check_every_n == 5
+        finally:
+            await conn.close()
+
+    @pytest.mark.parametrize("kwarg", ["ttl_check_every_n", "ttl_default_seconds"])
+    async def test_a_non_integer_is_a_configuration_error(self, kwarg: str) -> None:
+        conn = await aiosqlite.connect(":memory:")
+        try:
+            with pytest.raises(ConfigError, match="must be an integer"):
+                SqliteEngravaCore(conn, **{kwarg: "5"})
+        finally:
+            await conn.close()
+
+    async def test_a_legitimate_cadence_still_runs_cleanup(self) -> None:
+        conn = await aiosqlite.connect(":memory:")
+        conn.row_factory = aiosqlite.Row
+        try:
+            store = SqliteEngravaCore(conn, ttl_strategy="delete", ttl_check_every_n=1)
+            await store.ensure_schema()
+            expired = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=1)).isoformat()
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id="victim",
+                    thought_type=ThoughtType.OBSERVATION,
+                    essence="e",
+                    content="c",
+                    priority=Priority.P3,
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    source="test",
+                    expires_at=expired,
+                )
+            )
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id="other",
+                    thought_type=ThoughtType.OBSERVATION,
+                    essence="e",
+                    content="c",
+                    priority=Priority.P3,
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    source="test",
+                )
+            )
+            cursor = await conn.execute(
+                "SELECT COUNT(*) FROM thought WHERE thought_id = ?", ("victim",)
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row[0] == 0
+        finally:
+            await conn.close()
+
+    def test_the_manager_stores_an_exact_embedding_dimension(self, tmp_path: Path) -> None:
+        class _Dimension(int):
+            __slots__ = ()
+
+        manager = EngravaManager(data_dir=tmp_path / "data", embedding_dimension=_Dimension(384))
+        assert type(manager._embedding_dimension) is int

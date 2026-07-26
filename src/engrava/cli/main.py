@@ -1119,6 +1119,12 @@ def _require_valid_cli_service_name(service_name: str) -> None:
     keeps it a clean, user-facing message — never a traceback — and keeps it
     distinct from an embedding-provider initialisation failure.
 
+    This is a rejection gate only, so it discards the validated name the
+    validator hands back. That is safe precisely here and nowhere else: the
+    value is a command-line argument, which ``click`` always supplies as an
+    exact ``str``, and ``EngravaManager`` re-validates and re-owns the name at
+    its own boundary before it ever addresses a file with it.
+
     Args:
         service_name: The ``--service`` value supplied on the command line.
 

@@ -31,8 +31,9 @@ from __future__ import annotations
 
 import re
 from enum import StrEnum, unique
-from typing import TYPE_CHECKING, Literal, NamedTuple
+from typing import TYPE_CHECKING, Literal, NamedTuple, cast
 
+from engrava.config_validation import own_int, own_str
 from engrava.domain.enums import Priority, ThoughtType
 from engrava.domain.protocols.derived_records import DerivedRecord
 from engrava.domain.protocols.hooks import DefaultEngravaHooks
@@ -90,6 +91,33 @@ class _Segment(NamedTuple):
     content: str
     char_start: int
     char_end: int
+
+
+def _own_bounded_int(value: int, minimum: int, message: str) -> int:
+    """Return *value* as an exact ``int`` at or above *minimum*, else raise.
+
+    The order is the point: the bound is checked on the owned copy, because
+    ``<`` is a method on the value being compared and an ``int`` subclass may
+    answer it for itself.
+
+    Args:
+        value: Candidate number.
+        minimum: Inclusive lower bound.
+        message: The rejection message, owned by this module.
+
+    Returns:
+        The validated number as an exact ``int``.
+
+    Raises:
+        ValueError: When *value* is not an integer, or falls below *minimum*.
+
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(message)  # noqa: TRY004 -- this constructor's documented rejection type
+    owned = own_int(value)
+    if owned < minimum:
+        raise ValueError(message)
+    return owned
 
 
 class StructuralSplitProducer(DefaultEngravaHooks):
@@ -161,21 +189,25 @@ class StructuralSplitProducer(DefaultEngravaHooks):
         boundary: re.Pattern[str] = _PARAGRAPH_BOUNDARY,
         attach_edges: bool = True,
     ) -> None:
-        if window_size < 1:
-            msg = "window_size must be >= 1"
-            raise ValueError(msg)
-        if window_overlap < 0:
-            msg = "window_overlap must be >= 0"
-            raise ValueError(msg)
+        # Own before comparing, and keep what was owned. These numbers drive the
+        # window arithmetic over caller content and the unit selects which
+        # arithmetic runs, so a subclass answering ``<`` for itself would clear
+        # a bound the retained value does not satisfy - and the retained value
+        # is what every later window is computed from. This producer is a public
+        # entry point outside the configuration module, so nothing else does
+        # this for it.
+        window_size = _own_bounded_int(window_size, 1, "window_size must be >= 1")
+        window_overlap = _own_bounded_int(window_overlap, 0, "window_overlap must be >= 0")
+        min_chars = _own_bounded_int(min_chars, 0, "min_chars must be >= 0")
         if window_overlap >= window_size:
             msg = "window_overlap must be < window_size (windows must advance)"
             raise ValueError(msg)
-        if min_chars < 0:
-            msg = "min_chars must be >= 0"
-            raise ValueError(msg)
+        unit_msg = "window_unit must be 'char' or 'word'"
+        if not isinstance(window_unit, str):
+            raise ValueError(unit_msg)  # noqa: TRY004 -- this constructor's documented rejection type
+        window_unit = cast("WindowUnit", own_str(window_unit))
         if window_unit not in ("char", "word"):
-            msg = "window_unit must be 'char' or 'word'"
-            raise ValueError(msg)
+            raise ValueError(unit_msg)
         try:
             split_mode = SplitMode(split_mode)
         except ValueError as exc:

@@ -33,6 +33,14 @@ import aiosqlite
 import numpy as np
 import numpy.typing as npt
 
+from engrava.config_validation import (
+    ConfigError,
+    own_str,
+    require_exact_type,
+    require_exact_type_or_none,
+    require_int,
+    require_int_or_none,
+)
 from engrava.domain.dreaming import (
     CENTROID_MODEL_NAME,
     ConsolidationResult,
@@ -595,7 +603,7 @@ async def _embed_document(provider: object, text: str) -> list[float]:
     """
     if isinstance(provider, RoleAwareEmbeddingProvider):
         return await provider.embed_document(text)
-    return await provider.embed(text)  # type: ignore[attr-defined,no-any-return]
+    return await provider.embed(text)  # type: ignore[attr-defined,no-any-return]  # the non-role-aware branch: an untyped provider protocol
 
 
 async def _embed_documents_batch(provider: object, texts: list[str]) -> list[list[float]]:
@@ -620,7 +628,7 @@ async def _embed_documents_batch(provider: object, texts: list[str]) -> list[lis
     """
     if isinstance(provider, RoleAwareEmbeddingProvider):
         return await provider.embed_document_batch(texts)
-    return await provider.embed_batch(texts)  # type: ignore[attr-defined,no-any-return]
+    return await provider.embed_batch(texts)  # type: ignore[attr-defined,no-any-return]  # the non-role-aware branch: an untyped provider protocol
 
 
 async def _embed_query(provider: object, text: str) -> list[float]:
@@ -644,7 +652,7 @@ async def _embed_query(provider: object, text: str) -> list[float]:
     """
     if isinstance(provider, RoleAwareEmbeddingProvider):
         return await provider.embed_query(text)
-    return await provider.embed(text)  # type: ignore[attr-defined,no-any-return]
+    return await provider.embed(text)  # type: ignore[attr-defined,no-any-return]  # the non-role-aware branch: an untyped provider protocol
 
 
 def _query_vector_is_degenerate(query_vector: list[float]) -> bool:
@@ -1047,20 +1055,56 @@ class SqliteEngravaCore:
         # provider call after the insert loop. False for every other caller.
         self._suppress_auto_embed: bool = False
         self._embedding_model_verified: bool = False
-        self._search_config: SearchConfig | None = search_config
+        # Configuration objects are required to be *exactly* their class, not
+        # instances of it. A subclass passes ``isinstance`` and is still free to
+        # report one set of settings while it is validated and another every
+        # time it is read afterwards - which puts a lying hygiene policy back on
+        # the deletion path that owning its fields was meant to close. The
+        # classes are imported here rather than at module scope because the
+        # config module imports this one.
+        from engrava.config import (  # noqa: PLC0415 -- deferred: the config module imports this one
+            HygienePolicyConfig as _HygienePolicyConfig,
+        )
+        from engrava.config import (  # noqa: PLC0415 -- deferred: the config module imports this one
+            MetricsConfig as _MetricsConfig,
+        )
+        from engrava.config import (  # noqa: PLC0415 -- deferred: the config module imports this one
+            SearchConfig as _SearchConfig,
+        )
+
+        self._search_config: SearchConfig | None = require_exact_type_or_none(
+            search_config, _SearchConfig, "SqliteEngravaCore.search_config"
+        )
         self._journal_enabled: bool = journal_enabled
         self._journal: JournalWriter | None = (
             JournalWriter(db, revocation=self._revocation) if journal_enabled else None
         )
-        self._ttl_strategy: str = ttl_strategy
-        self._ttl_check_every_n: int = ttl_check_every_n
-        self._ttl_default_seconds: int | None = ttl_default_seconds
+        # The TTL strategy decides archive-versus-physical-delete, and it is
+        # resolved by value lookup against ``CleanupStrategy``, which consults
+        # the value's own ``__hash__`` / ``__eq__``. A ``str`` subclass can
+        # therefore read as ``archive`` everywhere it is inspected and still
+        # select ``DELETE`` here, so the store owns the text it was handed.
+        if not isinstance(ttl_strategy, str):
+            msg = "ttl_strategy must be a string"
+            raise ConfigError(msg)
+        self._ttl_strategy: str = own_str(ttl_strategy)
+        # These arrive as raw constructor arguments, not through a config
+        # object, so nothing has decoded them. The cadence decides whether an
+        # automatic cleanup runs at all, and under the ``delete`` strategy that
+        # cleanup destroys rows: an ``int`` subclass whose real value is ``0``
+        # ("off") but which answers ``< 1`` as false turns the feature on.
+        self._ttl_check_every_n: int = require_int(
+            ttl_check_every_n, "SqliteEngravaCore.ttl_check_every_n"
+        )
+        self._ttl_default_seconds: int | None = require_int_or_none(
+            ttl_default_seconds, "SqliteEngravaCore.ttl_default_seconds"
+        )
         if metrics_config is not None:
-            self._metrics_config = metrics_config
+            self._metrics_config = require_exact_type(
+                metrics_config, _MetricsConfig, "SqliteEngravaCore.metrics_config"
+            )
         else:
-            from engrava.config import MetricsConfig  # noqa: PLC0415
-
-            self._metrics_config = MetricsConfig()
+            self._metrics_config = _MetricsConfig()
         self._latency_buffer = _LatencyRingBuffer(self._metrics_config.window_size)
         self._operation_count: int = 0
         self._manifests: tuple[ExtensionManifest, ...] = tuple(manifests)
@@ -1100,14 +1144,19 @@ class SqliteEngravaCore:
         # or ``enabled=False`` ⇒ the forgetting loop never runs and no existing
         # read/write path changes. ``run_hygiene`` and the ``consolidate()``
         # convenience invocation both no-op when this is ``None``/disabled.
-        self._hygiene_policy: HygienePolicyConfig | None = hygiene_policy
+        self._hygiene_policy: HygienePolicyConfig | None = require_exact_type_or_none(
+            hygiene_policy, _HygienePolicyConfig, "SqliteEngravaCore.hygiene_policy"
+        )
         # Derived-records extension seam. ``enabled=False`` (the default) ⇒ the
         # seam is inert and every write path is byte-identical to a store
         # without it. When enabled *and* the hooks object implements
         # ``DerivedRecordProducerProtocol``, a successful source store is
         # followed by a core-controlled, guarded, per-child persistence of the
         # producer's derived records (see ``_dispatch_derivation``).
-        self._derive_gates: DeriveGates = derive_gates or DeriveGates()
+        self._derive_gates: DeriveGates = (
+            require_exact_type_or_none(derive_gates, DeriveGates, "SqliteEngravaCore.derive_gates")
+            or DeriveGates()
+        )
         # Opt-in, runtime-only cognitive-cycle source. When set, the read /
         # eligibility paths pull ``current_cycle`` from it only when the caller
         # omitted one (an explicit ``current_cycle`` — including ``0`` — wins);
@@ -1593,7 +1642,15 @@ class SqliteEngravaCore:
             "numpy": self._configure_numpy_vector_backend,
             "sqlite-vec": self._configure_sqlite_vec_vector_backend,
         }
-        await backend_handlers[backend_name](embedding_dimension)
+        # Which handler runs is decided by ``__hash__`` / ``__eq__`` on the name,
+        # so a ``str`` subclass can read as one backend everywhere it is checked
+        # and select the other here. Both entry points reach this line — the
+        # config, which validates the name, and the manager, which does not — so
+        # the choke point owns the text rather than either of them.
+        if not isinstance(backend_name, str):
+            msg = "vector_backend must be a string"
+            raise ConfigError(msg)
+        await backend_handlers[own_str(backend_name)](embedding_dimension)
 
     async def _configure_numpy_vector_backend(self, embedding_dimension: int) -> None:
         """Use the default numpy brute-force vector search backend.
@@ -3294,7 +3351,7 @@ class SqliteEngravaCore:
         self._quarantine_reason = reason
         self._revocation.revoke(reason)
         real_conn = self._db
-        self._db = _QuarantinedConnection(reason)  # type: ignore[assignment]  # terminal proxy
+        self._db = _QuarantinedConnection(reason)  # type: ignore[assignment]  # terminal proxy: every later use must fail
         # Detached best-effort close: schedule and return; do NOT await it, so a
         # hung close can never block quarantine (safety is already guaranteed by
         # the proxy + token). Retain the task and consume its result via callback.
@@ -7327,7 +7384,7 @@ class SqliteEngravaCore:
         for edge in edge_rows:
             from_id = str(edge["from"])
             to_id = str(edge["to"])
-            w = float(edge["weight"])  # type: ignore[arg-type]
+            w = float(edge["weight"])  # type: ignore[arg-type]  # the row's weight column is numeric
             if from_id in candidate_set:
                 adjacency.setdefault(from_id, []).append((to_id, w))
             if to_id in candidate_set:

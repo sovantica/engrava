@@ -20,6 +20,8 @@ import sqlite3
 import struct
 from typing import TYPE_CHECKING
 
+from engrava.config_validation import require_positive_int
+
 if TYPE_CHECKING:
     import aiosqlite
 
@@ -38,12 +40,23 @@ class SqliteVecSearchBackend:
     the cached ``dimension``.
 
     Args:
-        dimension: Embedding vector length (e.g. 384 for MiniLM).
+        dimension: Embedding vector length (e.g. 384 for MiniLM). Must be a
+            positive integer.
+
+    Raises:
+        ConfigError: If *dimension* is not a positive integer.
 
     """
 
     def __init__(self, dimension: int) -> None:
-        self._dimension = dimension
+        # The dimension is interpolated into the ``vec0`` table declaration.
+        # DDL cannot be parameterised, ``int`` is subclassable, and
+        # ``__format__`` is overridable — so a caller's object reaching the
+        # f-string writes its own text into the schema. Decode it here into an
+        # exact ``int`` this object owns: the class is a public export and is
+        # constructed directly as well as from a config, so it validates at its
+        # own boundary instead of assuming an earlier one did.
+        self._dimension = require_positive_int(dimension, "SqliteVecSearchBackend.dimension")
 
     @property
     def dimension(self) -> int:
@@ -308,6 +321,7 @@ async def load_sqlite_vec(db: aiosqlite.Connection) -> bool:
     # aiosqlite ships ``py.typed`` but leaves ``_execute`` unannotated, so
     # --strict flags the call as untyped; the loader itself is fully typed.
     try:
+        # aiosqlite's private _execute is untyped; the loader passed to it is not.
         await db._execute(_load_sqlite_vec_sync, db._conn)  # type: ignore[no-untyped-call]  # noqa: SLF001
     except (AttributeError, OSError, sqlite3.Error) as exc:
         logger.warning("Cannot load sqlite-vec extension: %s — falling back to numpy", exc)

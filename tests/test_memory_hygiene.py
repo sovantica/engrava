@@ -2707,3 +2707,128 @@ class TestGarbageCollectionWallClockWindow:
             assert await s.get_thought("t") is not None
         finally:
             await s._db.close()
+
+
+# ---------------------------------------------------------------------------
+# The protection list the policy holds is the one it validated
+# ---------------------------------------------------------------------------
+
+
+class _LyingPriorities(tuple):  # type: ignore[type-arg]  # a bare built-in base is exactly what the adversary subclasses
+    """A protection list that denies protecting anything.
+
+    ``protected_priorities`` is consulted twice on the way to a deletion: once
+    as a truth value, to decide whether the ``priority NOT IN (...)`` guard is
+    added to the SQL, and once with ``in``, on the row that came back. A
+    container answering both for itself un-protects every priority it holds
+    while still reporting the right entries to anything that iterates it.
+    """
+
+    __slots__ = ()
+
+    def __contains__(self, item: object) -> bool:
+        del item
+        return False
+
+    def __bool__(self) -> bool:
+        return False
+
+
+class TestProtectedPrioritiesAreOwnedByThePolicy:
+    """A pinned-by-priority thought survives whatever its policy's list claims."""
+
+    def test_the_stored_list_is_a_plain_tuple_of_plain_strings(self) -> None:
+        """Construction keeps the decoded list, not the caller's container."""
+
+        class _Priority(str):
+            __slots__ = ()
+
+        policy = HygienePolicyConfig(protected_priorities=_LyingPriorities([_Priority("P1")]))
+        assert type(policy.protected_priorities) is tuple
+        assert [type(entry) for entry in policy.protected_priorities] == [str]
+        assert policy.protected_priorities == ("P1",)
+        assert "P1" in policy.protected_priorities
+        assert bool(policy.protected_priorities) is True
+
+    async def test_gc_never_reaps_a_protected_priority(self) -> None:
+        """A ``P1`` row archived past both windows is still not deleted."""
+        policy = HygienePolicyConfig(
+            enabled=True,
+            eviction_threshold=0.0,
+            auto_gc_enabled=True,
+            gc_min_archive_age_cycles=0,
+            gc_restore_window_seconds=0,
+            protected_priorities=_LyingPriorities(("P1",)),
+        )
+        s = await _make_store(policy)
+        try:
+            await s.create_thought(_thought("keep", priority=Priority.P1))
+            await s.update_thought(
+                "keep",
+                lifecycle_status=LifecycleStatus.ARCHIVED,
+                archived_at_cycle=0,
+            )
+            result = await s.run_hygiene(current_cycle=1000)
+
+            # State first: the row is what matters, and a run that deleted it
+            # and then reported ``gc_count == 0`` would satisfy the count alone.
+            assert await s.get_thought("keep") is not None
+            assert await _raw_lifecycle(s, "keep") == "ARCHIVED"
+            assert result.gc_count == 0
+        finally:
+            await s._db.close()
+
+    async def test_archival_never_touches_a_protected_priority(self) -> None:
+        """The archive stage skips a ``P1`` row for the same reason GC does."""
+        policy = _forgetful_policy(
+            eviction_threshold=1.0,
+            protected_priorities=_LyingPriorities(("P1",)),
+        )
+        s = await _make_store(policy)
+        try:
+            await s.create_thought(
+                _thought("keep", priority=Priority.P1, created_at=_LONG_AGO, updated_at=_LONG_AGO)
+            )
+            await s.create_thought(
+                _thought(
+                    "drop",
+                    action_outcome_score=0.9,
+                    created_at=_LONG_AGO,
+                    updated_at=_LONG_AGO,
+                )
+            )
+            result = await s.run_hygiene(current_cycle=10)
+
+            # Both halves: the protected row survives and the unprotected one
+            # does not, so the run is shown to have done real work either way.
+            assert await _raw_lifecycle(s, "keep") == "ACTIVE"
+            assert await _raw_archived_at_cycle(s, "keep") is None
+            assert await _raw_lifecycle(s, "drop") == "ARCHIVED"
+            assert result.archived_count == 1
+        finally:
+            await s._db.close()
+
+    async def test_an_unprotected_priority_is_still_collected(self) -> None:
+        """The protection is a filter, not an off switch — GC still reaps."""
+        policy = HygienePolicyConfig(
+            enabled=True,
+            eviction_threshold=0.0,
+            auto_gc_enabled=True,
+            gc_min_archive_age_cycles=0,
+            gc_restore_window_seconds=0,
+            protected_priorities=("P1",),
+        )
+        s = await _make_store(policy)
+        try:
+            await s.create_thought(_thought("drop", priority=Priority.P3))
+            await s.update_thought(
+                "drop",
+                lifecycle_status=LifecycleStatus.ARCHIVED,
+                archived_at_cycle=0,
+            )
+            result = await s.run_hygiene(current_cycle=1000)
+
+            assert await s.get_thought("drop") is None
+            assert result.gc_count == 1
+        finally:
+            await s._db.close()
