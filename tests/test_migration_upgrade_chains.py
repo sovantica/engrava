@@ -8,7 +8,7 @@ generalises that to the **entire** ladder so an off-by-one step (a wrong start
 version or a skipped step) can no longer strand one specific source version
 undetected.
 
-Three properties are asserted:
+Four properties are asserted:
 
 * **Exhaustive convergence.** For every seed version ``v`` in
   ``{fresh, 2..19}`` a *real-shape* schema-at-``v`` fixture (the actual tables,
@@ -33,6 +33,12 @@ Three properties are asserted:
   ``tests/upgrade/test_upgrade_matrix.py`` is intentionally kept so local runs
   stay offline.
 
+* **Static structure of the bootstrap script.** ``schema_core.sql`` must stamp
+  ``PRAGMA user_version`` as its final statement, exactly once. Runtime
+  failure-injection can only probe the offsets it injects at, so the invariant
+  is also asserted statically against the script text, where it cannot drift
+  with the script.
+
 Reconstruction fidelity note: because the parity test asserts a migrated
 database equals a freshly bootstrapped one, a fixture that invented a column /
 table a version never had, or omitted one it did, would surface as a parity
@@ -44,6 +50,7 @@ from __future__ import annotations
 import re
 import struct
 from dataclasses import dataclass
+from importlib import resources
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -66,7 +73,11 @@ if TYPE_CHECKING:
 _HEAD_VERSION = 20
 
 # The user (non-shadow) tables that exist at head v20, compared column-by-column
-# for fresh-vs-migrated parity.
+# for fresh-vs-migrated parity. This list mirrors a source of truth (the tables a
+# head database actually carries), so ``_capture_schema_shape`` derives that set
+# from ``PRAGMA table_list`` on every capture and refuses to compare against a
+# stale list — otherwise a table outside the tuple is invisible to the parity
+# check and its columns, defaults and foreign keys are never read at all.
 _CORE_TABLES = (
     "thought",
     "edge",
@@ -76,6 +87,12 @@ _CORE_TABLES = (
     "journal_entry",
     "extension_schema_versions",
 )
+
+# The FTS5 virtual table at head. Its structure is fingerprinted through
+# ``_SchemaShape.fts`` rather than column-by-column, but it is still named here
+# so the derived table set covers it: a virtual table added to one bootstrap
+# path and not the other is as much of a divergence as a missing plain table.
+_FTS_VIRTUAL_TABLE = "thought_fts"
 
 # Distinctive FTS terms seeded into the legacy thought so a post-migration
 # search proves the index survived (and was rebuilt where the ladder rebuilds
@@ -428,8 +445,61 @@ class _SchemaShape:
         )
 
 
+#: The ``PRAGMA table_list`` types that belong to the declared schema. Only
+#: SQLite's own ``shadow`` classification is dropped: shadow tables are an
+#: implementation detail of the virtual table that owns them, and that virtual
+#: table is compared in its own right.
+_DECLARED_TABLE_TYPES = frozenset({"table", "virtual", "view"})
+
+
+async def _schema_table_names(db: aiosqlite.Connection) -> set[str]:
+    """Return the declared objects of ``db``'s main schema, as SQLite classifies them.
+
+    ``PRAGMA table_list`` reports every entry as ``table``, ``virtual``,
+    ``shadow`` or ``view``, so the FTS5 shadow tables are recognised **by SQLite
+    itself** instead of by guessing at a name prefix. That matters three times
+    over: a plain table that merely happens to share a virtual table's name
+    prefix stays visible; a virtual table added to one bootstrap path and not the
+    other is reported rather than skipped; and a view is reported too — each
+    would otherwise be exactly as invisible as a missing plain table. SQLite's
+    own ``sqlite_*`` objects are dropped, as is anything outside ``main``.
+
+    ``table_list`` needs SQLite 3.37 (2021). That is a requirement of this test
+    module only — nothing in the package depends on it — and an unknown pragma
+    is a silent no-op rather than an error, so the empty result is caught below
+    instead of quietly reporting that the database has no tables at all.
+    """
+    cursor = await db.execute("PRAGMA table_list")
+    rows = await cursor.fetchall()
+    assert rows, "PRAGMA table_list returned nothing — this test module needs SQLite 3.37+"
+    return {
+        str(row["name"])
+        for row in rows
+        if str(row["schema"]) == "main"
+        and str(row["type"]) in _DECLARED_TABLE_TYPES
+        and not str(row["name"]).startswith("sqlite_")
+    }
+
+
 async def _capture_schema_shape(db: aiosqlite.Connection) -> _SchemaShape:
-    """Read a :class:`_SchemaShape` from a live connection."""
+    """Read a :class:`_SchemaShape` from a live connection.
+
+    The captured facets are read per table from ``_CORE_TABLES`` (plus the FTS
+    virtual table, fingerprinted separately), so the first thing asserted is that
+    those names still *are* the tables the database carries. Without that, a
+    table present in one database and absent from the other is simply never
+    looked at, and every parity comparison below is blind to exactly the
+    divergence it exists to catch.
+    """
+    present = await _schema_table_names(db)
+    expected = {*_CORE_TABLES, _FTS_VIRTUAL_TABLE}
+    assert present == expected, (
+        "the captured schema shape only covers the tables named in _CORE_TABLES "
+        "and the FTS virtual table, so the parity check cannot see a table "
+        f"outside them. Only in the database: {sorted(present - expected)}; "
+        f"only in the expected set: {sorted(expected - present)}"
+    )
+
     columns: dict[str, dict[str, tuple[str, int, str | None, int]]] = {}
     columns_ordered: dict[str, tuple[str, ...]] = {}
     foreign_keys: dict[str, tuple[tuple[str, str, str, str], ...]] = {}
@@ -669,6 +739,26 @@ async def test_version_ladder_converges_and_preserves_data(
 # ---------------------------------------------------------------------------
 # 2. Fresh-vs-migrated schema-drift parity
 # ---------------------------------------------------------------------------
+
+
+async def test_core_tables_list_matches_the_bootstrapped_schema() -> None:
+    """``_CORE_TABLES`` + the FTS table are the tables a head database carries.
+
+    The parity comparison reads its facets per table from this hand-maintained
+    tuple, so a table the bootstrap gains (or loses) without the tuple following
+    is invisible to every parity case — the list cannot detect its own rot. This
+    names that invariant directly, so a stale tuple fails here with an
+    attributable message rather than only as a side effect of a parity case.
+    """
+    expected = {*_CORE_TABLES, _FTS_VIRTUAL_TABLE}
+    fresh = await _new_fresh_db()
+    migrated = await _new_migrated_db(2, seed=False)
+    try:
+        assert await _schema_table_names(fresh) == expected
+        assert await _schema_table_names(migrated) == expected
+    finally:
+        await fresh.close()
+        await migrated.close()
 
 
 async def test_fresh_equals_migrated_from_v2() -> None:
@@ -978,3 +1068,475 @@ async def test_postcondition_failure_raises_and_leaves_version_retryable(
         await _assert_api_roundtrip(store)
     finally:
         await conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 4. Static structure of the bootstrap script
+# ---------------------------------------------------------------------------
+#
+# ``schema_core.sql`` stamps ``PRAGMA user_version`` as its very last statement
+# so a bootstrap that fails part-way leaves the database unstamped (0) and
+# therefore retryable. ``executescript`` is not atomic: every statement that
+# already ran is durable, so a stamp placed anywhere but last would mark a
+# database current over a schema still missing everything that follows the
+# stamp — permanently, because ``ensure_schema`` neither re-bootstraps nor
+# migrates a database that already reads as head.
+#
+# Runtime failure-injection (``TestBootstrapAtomicity`` in
+# ``test_referential_integrity.py``) can only ever probe the offsets it injects
+# at. The assertions below read the script text instead, so they hold for every
+# offset at once and cannot drift as statements are added to the script.
+
+#: Matches a quoted token — SQLite's four quoting styles, ``'x'`` ``"x"`` ``[x]``
+#: and ```x``` — or a ``--`` line comment or a ``/* */`` block comment. Quoted
+#: tokens come first so a ``--``, ``;``, ``/*`` or ``*/`` *inside* one is never
+#: mistaken for a comment or a statement boundary; a token spelled ``[/*]`` would
+#: otherwise open a comment that swallowed the statements after it, a version
+#: stamp among them. A block comment may run to end-of-input without its closing
+#: ``*/`` — SQLite accepts that, so a scan demanding the terminator would go red
+#: on a purely cosmetic trailing note.
+_SQL_LITERAL_OR_COMMENT = re.compile(
+    r"""
+      (?P<quoted>'(?:[^']|'')*'|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\])
+    | (?P<comment>--[^\n]*|/\*.*?(?:\*/|\Z))
+    """,
+    re.VERBOSE | re.DOTALL,
+)
+
+#: Characters a quoted token may keep once unquoted: ASCII word characters plus
+#: a leading sign, since SQLite takes a quoted value too (``= '+20'`` stamps 20).
+#: Everything else is neutralised, so ``'a;b'`` cannot forge a statement boundary
+#: while ``'user_version'`` still reads as the pragma it names. ``re.ASCII``
+#: matters: without it a confusable (a LATIN SMALL LETTER LONG S standing in
+#: for the plain one) survives as a word character and Python's Unicode
+#: case-folding then equates it with the real pragma, while SQLite treats it
+#: as an unknown pragma and stamps nothing.
+_QUOTED_TOKEN_SAFE = re.compile(r"[^\w+-]", re.ASCII)
+
+#: The version stamp: an optional ``main.`` qualifier, then either the assignment
+#: form (``PRAGMA main.user_version = 20``) or the call form
+#: (``PRAGMA user_version(20)``). The two forms are separate alternatives rather
+#: than a shared optional bracket, so an unbalanced ``user_version(20`` is not
+#: accepted. The qualifier is restricted to ``main`` on purpose: SQLite accepts
+#: ``PRAGMA temp.user_version = 20`` and it leaves the durable database at 0, so
+#: treating it as the stamp would be exactly wrong. Quoted spellings need no
+#: alternatives here — the scrubber has already unquoted them.
+_VERSION_STAMP = re.compile(
+    r"""PRAGMA\s+(?:main\s*\.\s*)?user_version\s*
+        (?: =\s*(?P<assigned>[+-]?\d+)
+          | \(\s*(?P<called>[+-]?\d+)\s*\)
+        )""",
+    re.ASCII | re.IGNORECASE | re.VERBOSE,
+)
+
+#: A lexical tripwire, deliberately broader than the stamp pattern: any
+#: occurrence of the token at all. The "exactly once" check counts these rather
+#: than recognised stamps, so a spelling this module failed to anticipate trips
+#: it instead of being silently ignored. It fails *closed* — a future statement
+#: merely naming a ``user_version`` column would also trip it, which is the
+#: intended direction for a bootstrap invariant. ASCII-only for the same reason
+#: as the stamp pattern: a Unicode confusable is not this pragma.
+_MENTIONS_USER_VERSION = re.compile(r"\buser_version\b", re.ASCII | re.IGNORECASE)
+
+#: The first statement of the trailing index block. Relocating the stamp above
+#: this line is the mutation these assertions exist to catch: every statement
+#: after it is a ``CREATE INDEX``, so a failure there would leave a database
+#: stamped at head while missing its hot-path, valid-time and provenance indexes.
+_INDEX_BLOCK_HEAD = "CREATE INDEX IF NOT EXISTS idx_thought_valid_from"
+
+#: The stamp exactly as the script spells it, for the mutation helpers below.
+_STAMP_STATEMENT = f"PRAGMA user_version = {_HEAD_VERSION};"
+
+
+def _scrub_sql(sql: str) -> str:
+    """Return ``sql`` normalised so statement boundaries and pragma names are readable.
+
+    Comments become a single space — never nothing, so removing one cannot glue
+    two tokens together.
+
+    Every **quoted token** is unquoted: word characters are kept, everything else
+    is neutralised, and the result is padded so it cannot fuse with the token
+    before it. Both halves of that are load-bearing. Neutralising is what makes
+    the ``;`` split safe against a value or identifier containing a semicolon or
+    a comment marker. *Keeping* the word characters is what stops a quoted pragma
+    name from hiding: SQLite accepts all four quoting styles for a pragma name —
+    ``PRAGMA 'user_version' = 20`` and ``PRAGMA [user_version] = 20`` both stamp
+    the database for real — so a token whose contents were blanked out would let
+    an early stamp pass unseen. Treating value literals the same way costs only
+    a fail-*closed* over-report: a literal that happens to contain the bare word
+    would trip the mention counter, which is the safe direction here.
+
+    Unquoting also means the patterns above never need a quoted alternative,
+    which is what lets the schema qualifier stay strict. The one thing it cannot
+    distinguish is a quoted token in *keyword* position (``"PRAGMA"
+    "user_version" = 20`` reads as a stamp after unquoting) — but SQLite rejects
+    that outright, so such a script never bootstraps and the rest of this module
+    fails loudly rather than silently.
+    """
+
+    def _normalise(match: re.Match[str]) -> str:
+        if match.lastgroup != "quoted":
+            return " "
+        return f" {_QUOTED_TOKEN_SAFE.sub('x', match.group()[1:-1])} "
+
+    return _SQL_LITERAL_OR_COMMENT.sub(_normalise, sql)
+
+
+def _sql_fragments(sql: str) -> list[str]:
+    """Return the non-empty ``;``-delimited fragments of ``sql``, whitespace-collapsed.
+
+    A ``CREATE TRIGGER`` body splits into several fragments here, because its
+    inner ``;`` cannot be told apart from a statement terminator without a real
+    parser — hence "fragments", not "statements". That is irrelevant to the
+    tail-of-script invariant asserted below: the final fragment is the final
+    statement, whatever precedes it.
+    """
+    return [" ".join(part.split()) for part in _scrub_sql(sql).split(";") if part.strip()]
+
+
+def _read_schema_core_sql() -> str:
+    """Return the bundled bootstrap script exactly as ``ensure_schema`` reads it."""
+    return (
+        resources.files("engrava.infrastructure.sqlite")
+        .joinpath("schema_core.sql")
+        .read_text(encoding="utf-8")
+    )
+
+
+def _stamped_version(fragment: str) -> int | None:
+    """Return the version ``fragment`` stamps, or ``None`` if it is not a stamp."""
+    stamp = _VERSION_STAMP.fullmatch(fragment)
+    if stamp is None:
+        return None
+    return int(stamp.group("assigned") or stamp.group("called"))
+
+
+def _count_user_version_mentions(fragments: list[str]) -> int:
+    """Return how many of ``fragments`` name ``user_version`` at all.
+
+    Lexical, not syntactic: it counts the token rather than parsing pragmas, so
+    it over-reports rather than under-reports. That is the safe direction here —
+    an unrecognised early stamp must not be silently ignored.
+    """
+    return sum(1 for fragment in fragments if _MENTIONS_USER_VERSION.search(fragment))
+
+
+def _replace_once(sql: str, needle: str, replacement: str) -> str:
+    """Return ``sql`` with the single occurrence of ``needle`` replaced.
+
+    Asserting the count rather than mere presence keeps a mutation from landing
+    somewhere other than the statement it names — a second textual occurrence
+    (a longer object name sharing the prefix, a stray fragment) would otherwise
+    silently redirect it and the mutation would prove nothing.
+    """
+    assert sql.count(needle) == 1, f"expected exactly one occurrence of {needle!r}"
+    return sql.replace(needle, replacement, 1)
+
+
+def _with_stamp_moved_above_the_index_block(sql: str) -> str:
+    """Return ``sql`` with the version stamp relocated ahead of the index block."""
+    without_stamp = _replace_once(sql, _STAMP_STATEMENT, "")
+    return _replace_once(
+        without_stamp, _INDEX_BLOCK_HEAD, f"{_STAMP_STATEMENT}\n{_INDEX_BLOCK_HEAD}"
+    )
+
+
+def test_schema_core_stamps_the_version_as_its_last_statement() -> None:
+    """The final statement of ``schema_core.sql`` is the head version stamp.
+
+    Structural, not positional: it holds for every DDL statement in the script
+    at once, rather than for the one a failure-injection test happens to target.
+    """
+    fragments = _sql_fragments(_read_schema_core_sql())
+    assert fragments, "schema_core.sql yielded no statements at all"
+
+    assert _stamped_version(fragments[-1]) == _HEAD_VERSION, (
+        "the version stamp must be the last statement of schema_core.sql: "
+        "executescript is not atomic, so a stamp placed any earlier marks the "
+        "database current over whatever DDL fails after it, and ensure_schema "
+        f"never revisits a database that reads as head. Last statement: {fragments[-1]!r}"
+    )
+
+
+def test_schema_core_names_user_version_exactly_once() -> None:
+    """No second stamp precedes the last one, in any spelling.
+
+    "The last statement is a stamp" is on its own satisfied by a script that
+    *also* stamps early, which reopens the same hole without moving anything —
+    and SQLite accepts several spellings of the pragma, so this counts every
+    statement that mentions ``user_version`` rather than only recognised stamps.
+    """
+    assert _count_user_version_mentions(_sql_fragments(_read_schema_core_sql())) == 1
+
+
+# Each spelling is checked through the real pipeline (scrub, split, recognise),
+# not against the pattern in isolation — the quoted forms only reduce to
+# something the pattern can see because the scrubber unquotes them first.
+# Verified against SQLite 3.53: every "accepted" case below really does stamp
+# ``main.user_version``, and every rejected one either does not stamp it or is
+# not executable at all.
+#: A stamp whose pragma name carries a Unicode confusable (LATIN SMALL LETTER
+#: LONG S in place of the plain one), written as an escape so this file stays
+#: ASCII. SQLite reads it as an unknown pragma and stamps nothing.
+_CONFUSABLE_STAMP = "PRAGMA 'u\u017fer_version' = 20"
+
+_STAMP_SPELLINGS = [
+    pytest.param("PRAGMA user_version = 20", 20, id="assignment"),
+    pytest.param("PRAGMA user_version(20)", 20, id="call-form"),
+    pytest.param("PRAGMA main.user_version = 20", 20, id="schema-qualified"),
+    pytest.param('PRAGMA "main".user_version = 20', 20, id="quoted-schema-qualified"),
+    pytest.param("PRAGMA [user_version] = 20", 20, id="bracketed-pragma-name"),
+    pytest.param('PRAGMA "user_version" = 20', 20, id="double-quoted-pragma-name"),
+    pytest.param("PRAGMA `user_version` = 20", 20, id="backticked-pragma-name"),
+    pytest.param("PRAGMA 'user_version' = 20", 20, id="single-quoted-pragma-name"),
+    pytest.param("PRAGMA 'main'.user_version = 20", 20, id="single-quoted-qualifier"),
+    pytest.param("PRAGMA user_version = +20", 20, id="explicitly-signed"),
+    pytest.param("PRAGMA user_version = '20'", 20, id="quoted-value"),
+    pytest.param("PRAGMA user_version = '+20'", 20, id="quoted-signed-value"),
+    pytest.param("pragma  USER_VERSION=20", 20, id="restyled"),
+    # Accepted by SQLite, but it leaves main.user_version at 0 — recognising any
+    # of these as the stamp would report an unstamped database as stamped.
+    pytest.param("PRAGMA temp.user_version = 20", None, id="wrong-schema"),
+    pytest.param(_CONFUSABLE_STAMP, None, id="unicode-confusable-name"),
+    pytest.param("PRAGMA user_version(20", None, id="unclosed-call-form"),
+    pytest.param("PRAGMA user_version = 20)", None, id="stray-closing-bracket"),
+    pytest.param("PRAGMA main].user_version = 20", None, id="malformed-qualifier"),
+    pytest.param("CREATE INDEX idx_x ON thought(essence)", None, id="not-a-stamp"),
+]
+
+
+@pytest.mark.parametrize(("statement", "expected"), _STAMP_SPELLINGS)
+def test_stamp_recognition_covers_the_spellings_sqlite_accepts(
+    statement: str,
+    expected: int | None,
+) -> None:
+    """Every spelling that really stamps is recognised; nothing else is.
+
+    Both directions matter. Failing to recognise a legitimate spelling makes the
+    last-statement assertion fire on a restyled script — a false positive that
+    gets the assertion deleted. Accepting something that does *not* stamp the
+    durable database (a ``temp.`` qualifier, an unbalanced bracket) lets a
+    script satisfy the invariant while leaving it broken.
+    """
+    assert _stamped_version(_sql_fragments(f"{statement};")[-1]) == expected
+
+
+#: SQLite's four quoting styles, as (open, close) pairs. Every one of them can
+#: spell a pragma name and every one of them can contain a comment marker, so
+#: each is exercised in both roles below.
+_QUOTING_STYLES = [
+    pytest.param("'", "'", id="single-quoted"),
+    pytest.param('"', '"', id="double-quoted"),
+    pytest.param("[", "]", id="bracketed"),
+    pytest.param("`", "`", id="backticked"),
+]
+
+
+@pytest.mark.parametrize(("open_quote", "close_quote"), _QUOTING_STYLES)
+def test_quoted_tokens_cannot_open_a_comment(open_quote: str, close_quote: str) -> None:
+    """A comment marker inside a quoted token does not start a comment.
+
+    A scan that did not know a quoting style would read ``[/*]`` as opening a
+    block comment — which would swallow every statement up to the next ``*/``,
+    an early version stamp among them, and report the script as clean.
+    """
+    opener = f"{open_quote}/*{close_quote}"
+    closer = f"{open_quote}*/{close_quote}"
+    fragments = _sql_fragments(
+        f"CREATE TABLE {opener}(x);\n"
+        "PRAGMA user_version = 19;\n"
+        f"CREATE TABLE {closer}(x);\n"
+        "PRAGMA user_version = 20;\n"
+    )
+
+    assert _count_user_version_mentions(fragments) == 2
+    assert _stamped_version(fragments[-1]) == _HEAD_VERSION
+
+
+@pytest.mark.parametrize(("open_quote", "close_quote"), _QUOTING_STYLES)
+def test_an_early_stamp_with_a_quoted_pragma_name_is_still_counted(
+    open_quote: str,
+    close_quote: str,
+) -> None:
+    """A quoted pragma name does not hide an early stamp from the mention counter.
+
+    ``PRAGMA [user_version] = 20`` and ``PRAGMA 'user_version' = 20`` stamp the
+    database exactly like the bare spelling (verified against SQLite). A scrubber
+    that blanked the quoted token out would leave the script reporting a single
+    mention and both invariants green, while the bootstrap durably marked an
+    incomplete schema as current.
+    """
+    quoted_name = f"{open_quote}user_version{close_quote}"
+    fragments = _sql_fragments(f"PRAGMA {quoted_name} = 19;\nPRAGMA user_version = 20;")
+
+    assert _count_user_version_mentions(fragments) == 2
+    assert _stamped_version(fragments[0]) == 19
+
+
+def test_a_unicode_confusable_is_not_counted_as_the_pragma() -> None:
+    """A confusable pragma name is not the pragma, so it must not read as one.
+
+    A LATIN SMALL LETTER LONG S standing in for the plain one makes an *unknown*
+    pragma to SQLite: a silent no-op leaving the version at 0. Python's folding
+    equates the long s with a plain one, so an ASCII-blind scan would report a
+    script that never stamps as correctly stamped — the fail-*open* direction.
+    """
+    fragments = _sql_fragments(f"{_CONFUSABLE_STAMP};")
+
+    assert _count_user_version_mentions(fragments) == 0
+    assert _stamped_version(fragments[-1]) is None
+
+
+@pytest.mark.parametrize(("open_quote", "close_quote"), _QUOTING_STYLES)
+def test_a_quoted_semicolon_cannot_forge_a_statement_boundary(
+    open_quote: str,
+    close_quote: str,
+) -> None:
+    """A ``;`` inside a quoted token does not split a statement.
+
+    The other half of the unquoting trade: keeping the word characters must not
+    also keep the punctuation, or a default value spelled ``'a;b'`` would make
+    the scan see a statement that is not there — and the one it reported as last
+    would not be the last.
+    """
+    quoted = f"{open_quote}a;b{close_quote}"
+    fragments = _sql_fragments(
+        f"CREATE TABLE t (c TEXT DEFAULT {quoted});\nPRAGMA user_version = 20;"
+    )
+
+    assert len(fragments) == 2
+    assert _stamped_version(fragments[-1]) == _HEAD_VERSION
+
+
+# Each case carries its own id, so there is no second list to keep in step with
+# this one: a reordering cannot silently mislabel a case.
+_LAYOUT_REWRITES = [
+    pytest.param(
+        _STAMP_STATEMENT,
+        f"{_STAMP_STATEMENT}\n-- a note after the stamp\n",
+        id="trailing-line-comment",
+    ),
+    pytest.param(
+        _STAMP_STATEMENT,
+        f"{_STAMP_STATEMENT}\n/* a note; with a semicolon */\n",
+        id="trailing-block-comment",
+    ),
+    pytest.param(
+        _STAMP_STATEMENT,
+        f"{_STAMP_STATEMENT}\n/* a note left unterminated",
+        id="unterminated-trailing-block-comment",
+    ),
+    pytest.param(
+        _STAMP_STATEMENT,
+        f"{_STAMP_STATEMENT}\n-- CREATE INDEX IF NOT EXISTS idx_note ON thought(essence);\n",
+        id="commented-out-trailing-statement",
+    ),
+    pytest.param(
+        _STAMP_STATEMENT,
+        f"{_STAMP_STATEMENT}  -- head",
+        id="inline-comment-on-the-stamp-line",
+    ),
+    pytest.param(
+        _STAMP_STATEMENT,
+        f"{_STAMP_STATEMENT}   \n\n\t\n   ",
+        id="trailing-blank-lines-and-whitespace",
+    ),
+    pytest.param(
+        _STAMP_STATEMENT,
+        f"pragma  user_version={_HEAD_VERSION} ;",
+        id="restyled-stamp-statement",
+    ),
+    pytest.param(
+        _STAMP_STATEMENT,
+        f"PRAGMA main.user_version = {_HEAD_VERSION};",
+        id="schema-qualified-stamp",
+    ),
+    pytest.param(
+        _STAMP_STATEMENT,
+        f'PRAGMA "main".user_version = {_HEAD_VERSION};',
+        id="quoted-schema-qualified-stamp",
+    ),
+    pytest.param(
+        _STAMP_STATEMENT,
+        f"PRAGMA user_version({_HEAD_VERSION});",
+        id="call-form-stamp",
+    ),
+    pytest.param(
+        _STAMP_STATEMENT,
+        f"PRAGMA user_version = +{_HEAD_VERSION};",
+        id="signed-stamp-value",
+    ),
+    pytest.param(
+        "CREATE TABLE IF NOT EXISTS _metadata",
+        'CREATE TABLE IF NOT EXISTS "_metadata"',
+        id="quoted-table-identifier",
+    ),
+    pytest.param("\n", "\r\n", id="crlf-line-endings"),
+    pytest.param("\n", "\n\n", id="extra-blank-line-everywhere"),
+]
+
+
+@pytest.mark.parametrize(("needle", "replacement"), _LAYOUT_REWRITES)
+def test_last_statement_scan_survives_reformatting(needle: str, replacement: str) -> None:
+    """Reformatting ``schema_core.sql`` does not make the stamp assertion fire.
+
+    An assertion that goes red when somebody adds a comment gets deleted by the
+    next person to touch the file, which is worse than not having it. Each case
+    rewrites the real script in a way that changes only its layout, its comments
+    or the spelling of the stamp itself — a *commented-out* trailing statement,
+    which is what a scan that strips whitespace but not comments would trip over;
+    an unterminated trailing block comment, which SQLite accepts and runs to
+    end-of-input; and every pragma spelling SQLite takes. The stamp must still be
+    found as the last statement, at the head version, exactly once.
+    """
+    original = _read_schema_core_sql()
+    rewritten = original.replace(needle, replacement)
+    # Without this the case would pass by rewriting nothing at all.
+    assert rewritten != original, f"rewrite matched nothing: {needle!r} is not in the script"
+
+    fragments = _sql_fragments(rewritten)
+
+    assert _stamped_version(fragments[-1]) == _HEAD_VERSION
+    assert _count_user_version_mentions(fragments) == 1
+
+
+def test_last_statement_scan_detects_a_relocated_stamp() -> None:
+    """Moving the stamp above the index block is seen — the scan is not a tautology.
+
+    This is the mutation the assertion exists to catch, applied to the real
+    script: the last statement is then a ``CREATE INDEX``, not the stamp.
+    """
+    fragments = _sql_fragments(_with_stamp_moved_above_the_index_block(_read_schema_core_sql()))
+
+    assert _stamped_version(fragments[-1]) is None
+    assert fragments[-1].startswith("CREATE INDEX")
+    # Still exactly one stamp: only its position changed, which is precisely why
+    # a count-based check alone would not catch this.
+    assert _count_user_version_mentions(fragments) == 1
+
+
+@pytest.mark.parametrize(
+    "early_stamp",
+    [
+        f"PRAGMA user_version = {_HEAD_VERSION};",
+        f"PRAGMA main.user_version = {_HEAD_VERSION};",
+        f"PRAGMA user_version({_HEAD_VERSION});",
+    ],
+    ids=["plain", "schema-qualified", "call-form"],
+)
+def test_stamp_count_scan_detects_a_duplicate_stamp(early_stamp: str) -> None:
+    """An *added* early stamp is seen even though the script still ends with one.
+
+    The mirror image of the test above: the position is unchanged, so only the
+    count catches it. Together the two assertions cover both ways the invariant
+    breaks. Each SQLite spelling of the pragma is exercised, because an early
+    stamp written in an unanticipated form is exactly how this check would be
+    defeated while staying green.
+    """
+    duplicated = _replace_once(
+        _read_schema_core_sql(), _INDEX_BLOCK_HEAD, f"{early_stamp}\n{_INDEX_BLOCK_HEAD}"
+    )
+    fragments = _sql_fragments(duplicated)
+
+    assert _stamped_version(fragments[-1]) == _HEAD_VERSION
+    assert _count_user_version_mentions(fragments) == 2

@@ -781,12 +781,36 @@ class TestMigrationV11ToV12:
             assert violations == [], f"unexpected FK violations: {violations}"
 
 
+# Failure-injection points spread across ``schema_core.sql``: the fourth
+# statement, the FTS virtual table, a table declared late in the script, the
+# middle of the hot-path index block, and the very last statement before the
+# version stamp. A single injection point only ever pins the stamp as being
+# *somewhere after* it — the last two entries are what make relocating the stamp
+# above the trailing index block observable at runtime. Each entry is the prefix
+# of the statement to fail at, paired with the object that statement creates.
+_BOOTSTRAP_INJECTION_POINTS = [
+    ("CREATE TABLE IF NOT EXISTS edge", "edge"),
+    ("CREATE VIRTUAL TABLE IF NOT EXISTS thought_fts", "thought_fts"),
+    ("CREATE TABLE IF NOT EXISTS extension_schema_versions", "extension_schema_versions"),
+    ("CREATE INDEX IF NOT EXISTS idx_edge_to_thought", "idx_edge_to_thought"),
+    ("CREATE INDEX IF NOT EXISTS idx_thought_prov_actor", "idx_thought_prov_actor"),
+]
+_BOOTSTRAP_INJECTION_IDS = [name for _statement, name in _BOOTSTRAP_INJECTION_POINTS]
+
+
 class TestBootstrapAtomicity:
     """Fresh bootstrap stamps ``user_version`` only after the full schema applies."""
 
+    @pytest.mark.parametrize(
+        ("fail_at", "unreached_object"),
+        _BOOTSTRAP_INJECTION_POINTS,
+        ids=_BOOTSTRAP_INJECTION_IDS,
+    )
     async def test_bootstrap_failure_leaves_version_unstamped_and_retryable(
         self,
         tmp_path: Path,
+        fail_at: str,
+        unreached_object: str,
     ) -> None:
         """A mid-bootstrap DDL failure leaves version 0; a retry reaches v20.
 
@@ -794,6 +818,14 @@ class TestBootstrapAtomicity:
         failure before it leaves ``user_version = 0`` (never a partial 20). The
         next ``ensure_schema`` then re-runs the idempotent bootstrap rather than
         skipping every migration against an incomplete schema.
+
+        ``executescript`` is not atomic — whatever ran before the failure is
+        durable — so this is asserted at several offsets, right up to the last
+        statement before the stamp. A stamp moved even one statement earlier
+        would durably mark an incomplete schema as current, and ``ensure_schema``
+        never revisits a database that already reads as head. The structural
+        counterpart (the stamp *is* the final statement, for every offset at
+        once) lives in ``test_migration_upgrade_chains.py``.
         """
         db_path = tmp_path / "bootstrap.sqlite"
         async with aiosqlite.connect(db_path) as db:
@@ -803,34 +835,40 @@ class TestBootstrapAtomicity:
             real_executescript = db.executescript
 
             async def _failing_executescript(script: str) -> object:
-                # Run only the FIRST table (``thought``) then fail — a genuine
-                # mid-bootstrap DDL error that leaves a *partial* schema well
-                # before the final ``PRAGMA user_version`` stamp.
-                head, sep, _tail = script.partition("CREATE TABLE IF NOT EXISTS edge")
-                assert sep, "bootstrap script must create the edge table"
+                # Run the script up to ``fail_at`` then fail — a genuine
+                # mid-bootstrap DDL error that leaves a *partial* schema before
+                # the final ``PRAGMA user_version`` stamp. The count assertion
+                # keeps the split at the statement this case names: a second
+                # textual occurrence would silently move the injection point and
+                # the test would stop probing what it claims to.
+                assert script.count(fail_at) == 1, f"expected one occurrence of {fail_at!r}"
+                head, _sep, _tail = script.partition(fail_at)
                 await real_executescript(head)
                 msg = "injected bootstrap DDL failure"
                 raise aiosqlite.OperationalError(msg)
 
             with (
                 patch.object(db, "executescript", _failing_executescript),
-                pytest.raises(aiosqlite.OperationalError, match="injected bootstrap"),
+                pytest.raises(aiosqlite.OperationalError) as bootstrap_error,
             ):
                 await core.ensure_schema()
 
-            # The failed bootstrap left a PARTIAL schema (thought only, no edge)
-            # and did NOT durably stamp the version.
+            # The failed bootstrap left a PARTIAL schema (everything before the
+            # injection point) and did NOT durably stamp the version. Asserted
+            # before the raised error is inspected, so a mismatched message
+            # cannot shadow what actually happened to the database.
             version_row = await (await db.execute("PRAGMA user_version")).fetchone()
             assert version_row is not None
             assert version_row[0] == 0
             present = {
                 str(row[0])
-                for row in await (
-                    await db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
-                ).fetchall()
+                for row in await (await db.execute("SELECT name FROM sqlite_master")).fetchall()
             }
             assert "thought" in present
-            assert "edge" not in present, "partial bootstrap should not have reached the edge table"
+            assert unreached_object not in present, (
+                f"partial bootstrap should not have reached {unreached_object}"
+            )
+            assert "injected bootstrap" in str(bootstrap_error.value)
 
             # A retry with the real bootstrap converges on a complete head schema.
             await core.ensure_schema()
