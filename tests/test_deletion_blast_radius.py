@@ -32,17 +32,29 @@ Four operations are covered, one class each:
   the archived-collection pass that follows it runs at all. Under ``archive``
   the command must **stop** after archiving; running on would hard-delete the
   rows it has just soft-retired.
+
+Both ``gc`` passes are additionally asserted against the ``embedding_vec`` vec0
+index. That table is the one store in the database no foreign key reaches, so
+nothing removes a deleted thought's vector for the command: on a store carrying
+the index, a pass that forgets it leaves the vector behind to occupy a KNN slot
+for a thought that no longer exists, and — once SQLite reuses the freed
+``embedding`` rowid — to stand in for a different thought's embedding entirely.
+It is also the one store an over-broad purge could empty without any foreign key
+or ``embedding`` read-back noticing, so both halves are read from the index
+itself.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.util
 import sqlite3
 import struct
 from typing import TYPE_CHECKING
 
 import aiosqlite
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -62,13 +74,17 @@ from engrava import (
 )
 from engrava.cli.main import cli
 
+# The extension's own load sequence, reused so the read-back connections in this
+# module cannot come to load sqlite-vec differently from the code under test.
+from engrava.extensions.vector_sqlite_vec import _load_sqlite_vec_sync
+
 # The real-shape per-version schema builder the migration-ladder suite already
 # maintains. Reused rather than re-derived so the pre-cascade fixture below
 # cannot drift from the schema that version actually shipped.
 from tests.test_migration_upgrade_chains import _bootstrap_core_at_version
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
     from pathlib import Path
 
     from click.testing import Result
@@ -89,6 +105,26 @@ _ALL_THOUGHT_IDS = "SELECT thought_id FROM thought"
 _ALL_EDGE_IDS = "SELECT edge_id FROM edge"
 _ALL_EMBEDDING_OWNERS = "SELECT owner_id FROM embedding"
 _ALL_ACTION_IDS = "SELECT action_id FROM action"
+_ARCHIVED_THOUGHT_IDS = "SELECT thought_id FROM thought WHERE lifecycle_status = 'ARCHIVED'"
+
+#: The vec0 index is addressed by ``rowid`` alone — it holds no thought id — so
+#: it is read as a set of rowids and mapped back through ``embedding``.
+_ALL_VEC_ROWIDS = "SELECT rowid FROM embedding_vec"
+_THOUGHT_EMBEDDING_ROWIDS = "SELECT owner_id, rowid FROM embedding WHERE owner_type = 'THOUGHT'"
+
+#: Whether the database carries a persisted vec0 index at all. Readable without
+#: sqlite-vec loaded (``sqlite_master`` is an ordinary table), unlike every
+#: statement that names ``embedding_vec`` itself.
+_VEC_INDEX_IN_SCHEMA = (
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'embedding_vec'"
+)
+
+#: sqlite-vec ships as an optional extra (``engrava[vec]``); the tests that need
+#: a real vec0 index skip without it, exactly as the other vec0 suites do.
+sqlite_vec_required = pytest.mark.skipif(
+    importlib.util.find_spec("sqlite_vec") is None,
+    reason="sqlite-vec package not installed",
+)
 
 
 def _as_mapping(row: sqlite3.Row | None) -> dict[str, object] | None:
@@ -204,6 +240,93 @@ def _sync_id_set(conn: sqlite3.Connection, query: str) -> set[str]:
 
     """
     return {str(row[0]) for row in conn.execute(query).fetchall()}
+
+
+@contextlib.contextmanager
+def _reopen_with_vector_index(db_path: Path) -> Iterator[sqlite3.Connection]:
+    """Open a read-back connection that can also read the vec0 index.
+
+    ``embedding_vec`` is a virtual table, so every statement naming it fails
+    with ``no such module: vec0`` unless sqlite-vec has been loaded into that
+    particular connection first — :func:`_reopen` cannot see the index at all.
+
+    Args:
+        db_path: Path to the database the CLI operated on.
+
+    Yields:
+        A connection with sqlite-vec loaded and a row factory, closed on exit.
+
+    """
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        _load_sqlite_vec_sync(conn)
+        yield conn
+    finally:
+        conn.close()
+
+
+def _sync_vec_rowids(conn: sqlite3.Connection) -> set[int]:
+    """Read every rowid currently held in the vec0 index.
+
+    Args:
+        conn: A connection opened by :func:`_reopen_with_vector_index`.
+
+    Returns:
+        Every rowid in ``embedding_vec``.
+
+    """
+    return {int(row[0]) for row in conn.execute(_ALL_VEC_ROWIDS).fetchall()}
+
+
+def _sync_embedding_rowids(conn: sqlite3.Connection) -> dict[str, int]:
+    """Map each thought to the ``embedding`` rowid its vector is indexed under.
+
+    The vec0 index shares the ``embedding`` table's rowid, which is the only
+    thing that ties a vector back to a thought.
+
+    Args:
+        conn: A connection opened by either reopen helper.
+
+    Returns:
+        Thought id -> the rowid of its stored embedding.
+
+    """
+    rows = conn.execute(_THOUGHT_EMBEDDING_ROWIDS).fetchall()
+    return {str(row["owner_id"]): int(row["rowid"]) for row in rows}
+
+
+def _purge_that_removes_a_vector_then_fails(
+    removed: list[int],
+) -> Callable[[aiosqlite.Connection], Awaitable[int]]:
+    """Build a stand-in purge that empties one index row and *then* raises.
+
+    A stub that raises on entry proves only that ordinary rows roll back; the
+    vec0 table keeps its data in shadow tables of its own, and whether those
+    come back is the half worth asserting. Removing a vector first puts the
+    index inside the failed transaction, so the read-back afterwards is a real
+    test of the rollback rather than of a write that never happened.
+
+    Args:
+        removed: Collects the rowid the stub deleted, so a caller can tell a
+            rollback that worked from a purge that was never reached.
+
+    Returns:
+        A drop-in for the module-level ``purge_orphan_vectors``.
+
+    """
+
+    async def _purge_then_fail(db: aiosqlite.Connection) -> int:
+        cursor = await db.execute("SELECT MIN(rowid) FROM embedding_vec")
+        row = await cursor.fetchone()
+        lowest = None if row is None else row[0]
+        assert lowest is not None, "the index was empty when the purge ran"
+        await db.execute("DELETE FROM embedding_vec WHERE rowid = ?", (lowest,))
+        removed.append(int(lowest))
+        msg = "disk I/O error"
+        raise sqlite3.OperationalError(msg)
+
+    return _purge_then_fail
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +511,68 @@ _GC_ACTIONS: tuple[tuple[str, str], ...] = (
 #: migration is what introduced the foreign keys, so at v11 nothing cascades.
 _PRE_CASCADE_VERSION = 11
 
+#: Every corpus vector is three-dimensional, so the vec0 index is declared at
+#: that width and indexes exactly the corpus the other fixtures materialise.
+_VECTOR_DIMENSION = 3
+
+#: The two backends a corpus can be written behind. ``numpy`` leaves the
+#: database without a vec0 table at all — the shape most stores have — while
+#: ``sqlite-vec`` persists one, which is the shape ``gc`` has to clean up after.
+_NO_VECTOR_INDEX = "numpy"
+_PERSISTED_VECTOR_INDEX = "sqlite-vec"
+
+
+async def _materialise_mixed_lifecycle(db_path: Path, *, vector_backend: str) -> None:
+    """Write the mixed-lifecycle corpus through the public API.
+
+    Args:
+        db_path: Where to create the database.
+        vector_backend: ``_NO_VECTOR_INDEX`` or ``_PERSISTED_VECTOR_INDEX`` —
+            the store creates and populates ``embedding_vec`` only while a
+            sqlite-vec backend is configured.
+
+    """
+    conn = await aiosqlite.connect(str(db_path))
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(db=conn, embedding_provider=None, auto_embed=False)
+    await store.ensure_schema()
+    await store._configure_vector_backend(
+        backend_name=vector_backend,
+        embedding_dimension=_VECTOR_DIMENSION,
+    )
+
+    for tid, status in _GC_THOUGHTS:
+        await store.create_thought(_make_thought(tid, lifecycle_status=status))
+    for eid, src, dst, edge_type, weight in _GC_EDGES:
+        await store.create_edge(_make_edge(eid, src, dst, edge_type=edge_type, weight=weight))
+    for tid, vector in _GC_EMBEDDINGS:
+        await store.store_embedding(tid, vector)
+    for aid, src in _GC_ACTIONS:
+        await store.create_action(_make_action(aid, src))
+
+    await conn.commit()
+    await conn.close()
+
+
+def _assert_index_mirrors_corpus(db_path: Path) -> None:
+    """Fail unless the vec0 index holds exactly one row per stored embedding.
+
+    A sqlite-vec backend that cannot load its extension falls back to numpy
+    *silently*, leaving a database with no index and no vectors. Every
+    assertion about what such an index still holds would then pass vacuously —
+    "nothing was left behind" is trivially true of a table that was never
+    created. The fixtures therefore refuse to hand one over.
+
+    Args:
+        db_path: The database just materialised.
+
+    """
+    with _reopen_with_vector_index(db_path) as conn:
+        indexed = _sync_vec_rowids(conn)
+        stored = set(_sync_embedding_rowids(conn).values())
+        assert stored, "fixture precondition failed: no embeddings were stored"
+        assert indexed == stored, "fixture precondition failed: the vec0 index is not the corpus"
+
 
 @pytest.fixture
 def mixed_lifecycle_db(tmp_path: Path) -> Path:
@@ -398,26 +583,22 @@ def mixed_lifecycle_db(tmp_path: Path) -> Path:
 
     """
     db_path = tmp_path / "mixed-lifecycle.db"
+    asyncio.run(_materialise_mixed_lifecycle(db_path, vector_backend=_NO_VECTOR_INDEX))
+    return db_path
 
-    async def _setup() -> None:
-        conn = await aiosqlite.connect(str(db_path))
-        conn.row_factory = aiosqlite.Row
-        store = SqliteEngravaCore(db=conn, embedding_provider=None, auto_embed=False)
-        await store.ensure_schema()
 
-        for tid, status in _GC_THOUGHTS:
-            await store.create_thought(_make_thought(tid, lifecycle_status=status))
-        for eid, src, dst, edge_type, weight in _GC_EDGES:
-            await store.create_edge(_make_edge(eid, src, dst, edge_type=edge_type, weight=weight))
-        for tid, vector in _GC_EMBEDDINGS:
-            await store.store_embedding(tid, vector)
-        for aid, src in _GC_ACTIONS:
-            await store.create_action(_make_action(aid, src))
+@pytest.fixture
+def vec_indexed_mixed_lifecycle_db(tmp_path: Path) -> Path:
+    """Materialise the same corpus behind a persisted vec0 index.
 
-        await conn.commit()
-        await conn.close()
+    Returns:
+        Path to the populated database file, carrying an ``embedding_vec``
+        table with one vector per stored embedding.
 
-    asyncio.run(_setup())
+    """
+    db_path = tmp_path / "mixed-lifecycle-vec.db"
+    asyncio.run(_materialise_mixed_lifecycle(db_path, vector_backend=_PERSISTED_VECTOR_INDEX))
+    _assert_index_mirrors_corpus(db_path)
     return db_path
 
 
@@ -947,6 +1128,240 @@ class TestGcArchivedBlastRadius:
             for aid, before in actions_before.items():
                 assert _sync_row(conn, _ACTION_BY_ID, aid) == before, f"action {aid} was modified"
 
+    @sqlite_vec_required
+    def test_gc_purges_only_the_collected_thoughts_vectors(
+        self,
+        runner: CliRunner,
+        vec_indexed_mixed_lifecycle_db: Path,
+    ) -> None:
+        """The collected thoughts' vectors leave the index; the survivors' stay.
+
+        ``embedding_vec`` is reached by no foreign key, so the parent delete
+        cannot take a vector with it: unless the command removes it itself, the
+        vector stays in the index for a thought that no longer exists.
+
+        The corpus is interleaved live · archived · live · archived · live on
+        ``rowid``, the only key the index is addressed by, so the doomed rowids
+        are bracketed by surviving ones and are not adjacent — no purge that
+        picks by rowid position can land on exactly them. Set equality, not
+        containment: containment would hold just as well for a purge that had
+        emptied the index, and this is the one store where that would go
+        unnoticed by any foreign key or ``embedding`` read-back.
+        """
+        with _reopen_with_vector_index(vec_indexed_mixed_lifecycle_db) as conn:
+            rowids = _sync_embedding_rowids(conn)
+            assert set(rowids) == {*self._DOOMED, *self._SURVIVORS}, (
+                f"corpus precondition failed: embeddings stored for {sorted(rowids)}"
+            )
+            written = [rowids[tid] for tid, _vector in _GC_EMBEDDINGS]
+            assert written == sorted(written), (
+                "corpus precondition failed: rowids do not follow the write order"
+            )
+            doomed = {rowids[tid] for tid in self._DOOMED}
+            surviving = {rowids[tid] for tid in self._SURVIVORS}
+            assert _sync_vec_rowids(conn) == doomed | surviving
+
+        self._collect(runner, vec_indexed_mixed_lifecycle_db)
+
+        with _reopen_with_vector_index(vec_indexed_mixed_lifecycle_db) as conn:
+            remaining = _sync_vec_rowids(conn)
+            assert not doomed & remaining, "a collected thought's vector survived"
+            assert remaining == surviving
+            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == set(self._SURVIVORS)
+
+    @sqlite_vec_required
+    def test_gc_dry_run_leaves_every_vector_in_the_index(
+        self,
+        runner: CliRunner,
+        vec_indexed_mixed_lifecycle_db: Path,
+    ) -> None:
+        """``--dry-run`` reports the collection and leaves every vector stored.
+
+        The purge is a write like any other, so it owes the same guarantee as
+        the row deletes it follows. Every rowid is asserted, the doomed ones
+        included: under ``--dry-run`` they are non-targets too.
+
+        What this pins is the **committed** state. The dry-run path reaches no
+        ``commit``, so a purge wrongly attempted there would still be rolled
+        back when the command closes its connection; the test that no purge is
+        attempted at all is the one below, which withholds the module and
+        expects the command to run anyway.
+        """
+        with _reopen_with_vector_index(vec_indexed_mixed_lifecycle_db) as conn:
+            before = _sync_vec_rowids(conn)
+            assert before, "corpus precondition failed: the index is empty"
+
+        result = runner.invoke(
+            cli, ["--db", str(vec_indexed_mixed_lifecycle_db), "gc", "--dry-run"]
+        )
+        assert result.exit_code == 0, result.output
+
+        with _reopen_with_vector_index(vec_indexed_mixed_lifecycle_db) as conn:
+            assert _sync_vec_rowids(conn) == before
+            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == {*self._DOOMED, *self._SURVIVORS}
+        assert "Would delete 2 archived thoughts" in result.output
+
+    @sqlite_vec_required
+    def test_dry_run_does_not_need_sqlite_vec_on_an_indexed_store(
+        self,
+        runner: CliRunner,
+        vec_indexed_mixed_lifecycle_db: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A run that deletes nothing is never refused for want of the module.
+
+        The refusal above exists because a collection that cannot reach the
+        index would strand vectors. A dry run deletes nothing, so it strands
+        nothing, and demanding the optional extra to *preview* a collection
+        would be a refusal with no guarantee behind it. Withholding the module
+        is what makes this observable — without it the command loads sqlite-vec
+        successfully and the question is never asked.
+        """
+
+        async def _refuse_to_load(db: object) -> bool:
+            del db
+            return False
+
+        monkeypatch.setattr(
+            "engrava.extensions.vector_sqlite_vec.load_sqlite_vec",
+            _refuse_to_load,
+        )
+        with _reopen_with_vector_index(vec_indexed_mixed_lifecycle_db) as conn:
+            vectors_before = _sync_vec_rowids(conn)
+            assert vectors_before, "corpus precondition failed: the index is empty"
+
+        result = runner.invoke(
+            cli, ["--db", str(vec_indexed_mixed_lifecycle_db), "gc", "--dry-run"]
+        )
+        assert result.exit_code == 0, result.output
+
+        with _reopen_with_vector_index(vec_indexed_mixed_lifecycle_db) as conn:
+            assert _sync_vec_rowids(conn) == vectors_before
+            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == {*self._DOOMED, *self._SURVIVORS}
+        assert "Would delete 2 archived thoughts" in result.output
+
+    def test_gc_without_a_vector_index_collects_and_creates_none(
+        self,
+        runner: CliRunner,
+        mixed_lifecycle_db: Path,
+    ) -> None:
+        """A store that never carried a vec0 index collects exactly as before.
+
+        Most stores have no ``embedding_vec`` table, and on those the purge has
+        nothing to address: it must be a no-op rather than an error, and must
+        not bring the index into existence. No sqlite-vec is needed to assert
+        either — ``sqlite_master`` is an ordinary table.
+        """
+        with _reopen(mixed_lifecycle_db) as conn:
+            assert conn.execute(_VEC_INDEX_IN_SCHEMA).fetchone() is None, (
+                "corpus precondition failed: this fixture carries a vec0 index"
+            )
+
+        result = runner.invoke(cli, ["--db", str(mixed_lifecycle_db), "gc"])
+        # An execution precondition, not the command's account of itself: it
+        # fires only when there was no effect to read back at all.
+        assert result.exit_code == 0, result.output
+
+        with _reopen(mixed_lifecycle_db) as conn:
+            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == set(self._SURVIVORS)
+            assert _sync_id_set(conn, _ALL_EMBEDDING_OWNERS) == set(self._SURVIVORS)
+            assert conn.execute(_VEC_INDEX_IN_SCHEMA).fetchone() is None
+
+    @sqlite_vec_required
+    def test_gc_refuses_to_collect_when_the_index_cannot_be_purged(
+        self,
+        runner: CliRunner,
+        vec_indexed_mixed_lifecycle_db: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Without sqlite-vec loaded the command collects nothing at all.
+
+        A vec0 table is unwritable — unreadable, even — on a connection that
+        has not loaded the module, so a store carrying the index cannot be
+        collected without it. Continuing anyway would delete the rows and leave
+        their vectors stranded until something else reconciles the index — and
+        permanently, in the vector's own terms, once SQLite hands the freed
+        rowid to a new embedding, after which the stale vector reads as owned
+        and no reconciliation can tell. The command therefore refuses
+        **before** it deletes anything: the store is asserted to be exactly as
+        it was, and only then the raised error.
+        """
+
+        async def _refuse_to_load(db: object) -> bool:
+            del db
+            return False
+
+        monkeypatch.setattr(
+            "engrava.extensions.vector_sqlite_vec.load_sqlite_vec",
+            _refuse_to_load,
+        )
+        with _reopen_with_vector_index(vec_indexed_mixed_lifecycle_db) as conn:
+            vectors_before = _sync_vec_rowids(conn)
+            thoughts_before = _sync_id_set(conn, _ALL_THOUGHT_IDS)
+            assert thoughts_before == {*self._DOOMED, *self._SURVIVORS}
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(vec_indexed_mixed_lifecycle_db), "gc"],
+            standalone_mode=False,
+        )
+
+        with _reopen_with_vector_index(vec_indexed_mixed_lifecycle_db) as conn:
+            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == thoughts_before
+            assert _sync_vec_rowids(conn) == vectors_before
+        assert isinstance(result.exception, click.ClickException), result.exception
+        assert "engrava[vec]" in str(result.exception)
+
+    @sqlite_vec_required
+    def test_gc_collects_nothing_when_the_purge_itself_fails(
+        self,
+        runner: CliRunner,
+        vec_indexed_mixed_lifecycle_db: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A purge that fails takes the whole collection down with it.
+
+        The purge runs last, once the rows it cleans up after are already
+        deleted. Were it outside their transaction, failing there would leave
+        behind precisely the stranded vectors it exists to remove — the
+        ``pytest.raises``-shaped hole where an operation validates after it has
+        written. The deletes and the purge therefore share one transaction, and
+        what proves it is the stored state after the failure, not the error.
+
+        The stub removes a vector *before* it raises, so the rollback under
+        test is the one that has to reach the vec0 table's own shadow storage,
+        not merely the ordinary rows. Every canonical table is read back: a
+        transaction that gave up half way would show there first.
+        """
+        removed_by_the_stub: list[int] = []
+        monkeypatch.setattr(
+            "engrava.extensions.vector_sqlite_vec.purge_orphan_vectors",
+            _purge_that_removes_a_vector_then_fails(removed_by_the_stub),
+        )
+        with _reopen_with_vector_index(vec_indexed_mixed_lifecycle_db) as conn:
+            vectors_before = _sync_vec_rowids(conn)
+            thoughts_before = _sync_id_set(conn, _ALL_THOUGHT_IDS)
+            edges_before = _sync_id_set(conn, _ALL_EDGE_IDS)
+            actions_before = _sync_id_set(conn, _ALL_ACTION_IDS)
+            assert thoughts_before == {*self._DOOMED, *self._SURVIVORS}
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(vec_indexed_mixed_lifecycle_db), "gc"],
+            standalone_mode=False,
+        )
+        # An instrumentation precondition: without it, a purge that was never
+        # reached would read as a rollback that worked.
+        assert removed_by_the_stub, "the purge never reached the index"
+
+        with _reopen_with_vector_index(vec_indexed_mixed_lifecycle_db) as conn:
+            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == thoughts_before
+            assert _sync_id_set(conn, _ALL_EDGE_IDS) == edges_before
+            assert _sync_id_set(conn, _ALL_EMBEDDING_OWNERS) == thoughts_before
+            assert _sync_id_set(conn, _ALL_ACTION_IDS) == actions_before
+            assert _sync_vec_rowids(conn) == vectors_before
+        assert isinstance(result.exception, sqlite3.OperationalError), result.exception
+
 
 # ---------------------------------------------------------------------------
 # engrava gc --expired
@@ -1026,6 +1441,38 @@ _TTL_ACTIONS: tuple[tuple[str, str], ...] = (
 )
 
 
+async def _materialise_ttl_lifecycle(db_path: Path, *, vector_backend: str) -> None:
+    """Write the TTL corpus through the public API.
+
+    Args:
+        db_path: Where to create the database.
+        vector_backend: ``_NO_VECTOR_INDEX`` or ``_PERSISTED_VECTOR_INDEX``.
+
+    """
+    conn = await aiosqlite.connect(str(db_path))
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(db=conn, embedding_provider=None, auto_embed=False)
+    await store.ensure_schema()
+    await store._configure_vector_backend(
+        backend_name=vector_backend,
+        embedding_dimension=_VECTOR_DIMENSION,
+    )
+
+    for tid, status, expires_at in _TTL_THOUGHTS:
+        await store.create_thought(
+            _make_thought(tid, expires_at=expires_at, lifecycle_status=status),
+        )
+    for eid, src, dst, weight in _TTL_EDGES:
+        await store.create_edge(_make_edge(eid, src, dst, weight=weight))
+    for tid, vector in _TTL_EMBEDDINGS:
+        await store.store_embedding(tid, vector)
+    for aid, src in _TTL_ACTIONS:
+        await store.create_action(_make_action(aid, src))
+
+    await conn.commit()
+    await conn.close()
+
+
 @pytest.fixture
 def ttl_lifecycle_db(tmp_path: Path) -> Path:
     """Materialise the TTL corpus on a head schema via the public API.
@@ -1035,28 +1482,22 @@ def ttl_lifecycle_db(tmp_path: Path) -> Path:
 
     """
     db_path = tmp_path / "ttl-lifecycle.db"
+    asyncio.run(_materialise_ttl_lifecycle(db_path, vector_backend=_NO_VECTOR_INDEX))
+    return db_path
 
-    async def _setup() -> None:
-        conn = await aiosqlite.connect(str(db_path))
-        conn.row_factory = aiosqlite.Row
-        store = SqliteEngravaCore(db=conn, embedding_provider=None, auto_embed=False)
-        await store.ensure_schema()
 
-        for tid, status, expires_at in _TTL_THOUGHTS:
-            await store.create_thought(
-                _make_thought(tid, expires_at=expires_at, lifecycle_status=status),
-            )
-        for eid, src, dst, weight in _TTL_EDGES:
-            await store.create_edge(_make_edge(eid, src, dst, weight=weight))
-        for tid, vector in _TTL_EMBEDDINGS:
-            await store.store_embedding(tid, vector)
-        for aid, src in _TTL_ACTIONS:
-            await store.create_action(_make_action(aid, src))
+@pytest.fixture
+def vec_indexed_ttl_lifecycle_db(tmp_path: Path) -> Path:
+    """Materialise the same TTL corpus behind a persisted vec0 index.
 
-        await conn.commit()
-        await conn.close()
+    Returns:
+        Path to the populated database file, carrying an ``embedding_vec``
+        table with one vector per stored embedding.
 
-    asyncio.run(_setup())
+    """
+    db_path = tmp_path / "ttl-lifecycle-vec.db"
+    asyncio.run(_materialise_ttl_lifecycle(db_path, vector_backend=_PERSISTED_VECTOR_INDEX))
+    _assert_index_mirrors_corpus(db_path)
     return db_path
 
 
@@ -1498,3 +1939,227 @@ class TestGcExpiredBlastRadius:
                 assert _sync_row(conn, _EDGE_BY_ID, eid) == before, f"edge {eid} was modified"
         assert "No expired thoughts to cleanup." in result.output
         assert "Collected 3 archived thoughts." in result.output
+
+    @sqlite_vec_required
+    def test_delete_strategy_purges_only_the_swept_thoughts_vectors(
+        self,
+        runner: CliRunner,
+        vec_indexed_ttl_lifecycle_db: Path,
+        tmp_path: Path,
+    ) -> None:
+        """The expiry sweep removes its own thoughts' vectors, on its own.
+
+        The sweep deletes through the core rather than through the collection
+        pass's statements, so it is a second, independent route to a stranded
+        vector. Isolating it takes a first plain ``gc``: that collects the one
+        pre-archived thought, after which the collection pass has nothing left
+        to do and returns before reaching any purge of its own. Whatever the
+        vectors of the two swept thoughts do next is therefore the sweep's
+        doing and nothing else's — which is asserted, not assumed, by reading
+        the lifecycle column back in between.
+
+        The corpus is interleaved unexpired · archived · expired · unexpired ·
+        expired · unexpired on ``rowid``, the index's own key, so no purge
+        picking by rowid position selects exactly the swept pair.
+        """
+        config = _write_ttl_config(tmp_path / "delete.yaml", vec_indexed_ttl_lifecycle_db, "delete")
+        with _reopen_with_vector_index(vec_indexed_ttl_lifecycle_db) as conn:
+            rowids = _sync_embedding_rowids(conn)
+            assert set(rowids) == set(_TTL_THOUGHT_IDS), (
+                f"corpus precondition failed: embeddings stored for {sorted(rowids)}"
+            )
+            written = [rowids[tid] for tid, _vector in _TTL_EMBEDDINGS]
+            assert written == sorted(written), (
+                "corpus precondition failed: rowids do not follow the write order"
+            )
+            swept = {rowids[tid] for tid in self._EXPIRED}
+            surviving = {rowids[tid] for tid in self._UNEXPIRED}
+
+        collect = runner.invoke(cli, ["--db", str(vec_indexed_ttl_lifecycle_db), "gc"])
+        assert collect.exit_code == 0, collect.output
+
+        with _reopen(vec_indexed_ttl_lifecycle_db) as conn:
+            assert _sync_id_set(conn, _ARCHIVED_THOUGHT_IDS) == set(), (
+                "isolation precondition failed: the collection pass still has work to do"
+            )
+
+        self._sweep(runner, vec_indexed_ttl_lifecycle_db, config_path=config)
+
+        with _reopen_with_vector_index(vec_indexed_ttl_lifecycle_db) as conn:
+            remaining = _sync_vec_rowids(conn)
+            assert not swept & remaining, "a swept thought's vector survived"
+            assert remaining == surviving
+            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == set(self._UNEXPIRED)
+
+    @sqlite_vec_required
+    def test_delete_strategy_purges_both_passes_vectors_in_one_run(
+        self,
+        runner: CliRunner,
+        vec_indexed_ttl_lifecycle_db: Path,
+        tmp_path: Path,
+    ) -> None:
+        """One ``--expired`` run leaves the index holding exactly the survivors.
+
+        The test above isolates the sweep by emptying the collection pass
+        first; this is the shape a user actually gets, where both passes delete
+        in the same invocation. Each reaches the index independently — the
+        module is loaded twice on the one connection, which must be harmless —
+        and between them they must account for all three departing vectors: the
+        two the sweep expires and the one the collection reaps.
+        """
+        config = _write_ttl_config(tmp_path / "delete.yaml", vec_indexed_ttl_lifecycle_db, "delete")
+        collected = (*self._EXPIRED, *self._ALREADY_ARCHIVED)
+        with _reopen_with_vector_index(vec_indexed_ttl_lifecycle_db) as conn:
+            rowids = _sync_embedding_rowids(conn)
+            assert set(rowids) == set(_TTL_THOUGHT_IDS), (
+                f"corpus precondition failed: embeddings stored for {sorted(rowids)}"
+            )
+            doomed = {rowids[tid] for tid in collected}
+            surviving = {rowids[tid] for tid in self._UNEXPIRED}
+            assert _sync_vec_rowids(conn) == doomed | surviving
+
+        result = self._sweep(runner, vec_indexed_ttl_lifecycle_db, config_path=config)
+
+        with _reopen_with_vector_index(vec_indexed_ttl_lifecycle_db) as conn:
+            remaining = _sync_vec_rowids(conn)
+            assert not doomed & remaining, "a deleted thought's vector survived"
+            assert remaining == surviving
+            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == set(self._UNEXPIRED)
+        assert "Cleaned up 2 expired thoughts (strategy: delete)." in result.output
+        assert "Collected 1 archived thoughts." in result.output
+
+    @sqlite_vec_required
+    def test_archive_strategy_leaves_every_vector_in_the_index(
+        self,
+        runner: CliRunner,
+        vec_indexed_ttl_lifecycle_db: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Under ``archive`` nothing is deleted, so no vector may be either.
+
+        The strategy that archives stops before the collection pass, so this
+        run removes no row from any table — including the pre-archived
+        ``t-boxed``, whose vector is the non-target that tells a purge which
+        correctly did nothing apart from one which swept the index anyway.
+
+        This pins the resulting state, not the branch. An archiving sweep
+        orphans no vector, so calling the reconciliation here would be
+        observationally identical to skipping it; what would show is a purge
+        that reached wider than an orphan.
+        """
+        config = _write_ttl_config(
+            tmp_path / "archive.yaml", vec_indexed_ttl_lifecycle_db, "archive"
+        )
+        with _reopen_with_vector_index(vec_indexed_ttl_lifecycle_db) as conn:
+            rowids = _sync_embedding_rowids(conn)
+            assert set(rowids) == set(_TTL_THOUGHT_IDS), (
+                f"corpus precondition failed: embeddings stored for {sorted(rowids)}"
+            )
+            before = _sync_vec_rowids(conn)
+            assert before == set(rowids.values())
+
+        result = self._sweep(runner, vec_indexed_ttl_lifecycle_db, config_path=config)
+
+        with _reopen_with_vector_index(vec_indexed_ttl_lifecycle_db) as conn:
+            assert _sync_vec_rowids(conn) == before
+            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == set(_TTL_THOUGHT_IDS)
+        assert "(strategy: archive)" in result.output
+
+    @sqlite_vec_required
+    def test_archive_strategy_does_not_need_sqlite_vec_on_an_indexed_store(
+        self,
+        runner: CliRunner,
+        vec_indexed_ttl_lifecycle_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An archiving sweep is never refused for want of the module.
+
+        It deletes no row, so it strands no vector and needs no access to the
+        index. Withholding the module is what makes that observable: a command
+        that asked for it before knowing whether it would delete anything would
+        refuse to archive here, for a guarantee that is not at stake.
+        """
+        config = _write_ttl_config(
+            tmp_path / "archive.yaml", vec_indexed_ttl_lifecycle_db, "archive"
+        )
+
+        async def _refuse_to_load(db: object) -> bool:
+            del db
+            return False
+
+        monkeypatch.setattr(
+            "engrava.extensions.vector_sqlite_vec.load_sqlite_vec",
+            _refuse_to_load,
+        )
+        before = self._read_thoughts(vec_indexed_ttl_lifecycle_db)
+        self._assert_corpus_preconditions(before)
+
+        result = self._sweep(runner, vec_indexed_ttl_lifecycle_db, config_path=config)
+
+        with _reopen_with_vector_index(vec_indexed_ttl_lifecycle_db) as conn:
+            for tid in self._EXPIRED:
+                after = _sync_row(conn, _THOUGHT_BY_ID, tid)
+                assert after == self._archived_row(before[tid]), f"{tid} was not archived as such"
+            for tid in (*self._ALREADY_ARCHIVED, *self._UNEXPIRED):
+                assert _sync_row(conn, _THOUGHT_BY_ID, tid) == before[tid], f"{tid} was modified"
+        assert "(strategy: archive)" in result.output
+
+    @sqlite_vec_required
+    def test_delete_strategy_sweeps_nothing_when_the_purge_itself_fails(
+        self,
+        runner: CliRunner,
+        vec_indexed_ttl_lifecycle_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A purge that fails takes the expiry sweep down with it.
+
+        The sweep runs through the core, which commits per operation, so its
+        deletions are durable the moment it returns. A purge failing after that
+        would leave the swept thoughts' vectors stranded — and would open a
+        window in which another writer can claim a freed ``embedding`` rowid,
+        after which the stale vector is owned and no reconciliation can tell.
+        The sweep and its purge therefore share one transaction, and what
+        proves it is the stored state after the failure, not the error.
+
+        The stub removes a vector *before* it raises, so the rollback under
+        test is the one that has to reach the vec0 table's own shadow storage.
+        Every canonical table is read back, the children included: the sweep
+        cascades to them, so a transaction that gave up half way would show
+        there even where the thought rows had been restored.
+        """
+        config = _write_ttl_config(tmp_path / "delete.yaml", vec_indexed_ttl_lifecycle_db, "delete")
+        removed_by_the_stub: list[int] = []
+        monkeypatch.setattr(
+            "engrava.extensions.vector_sqlite_vec.purge_orphan_vectors",
+            _purge_that_removes_a_vector_then_fails(removed_by_the_stub),
+        )
+        all_edges = {eid for eid, _src, _dst, _weight in _TTL_EDGES}
+        all_actions = {aid for aid, _src in _TTL_ACTIONS}
+        with _reopen_with_vector_index(vec_indexed_ttl_lifecycle_db) as conn:
+            vectors_before = _sync_vec_rowids(conn)
+            thoughts_before = {
+                tid: _require(_sync_row(conn, _THOUGHT_BY_ID, tid), tid) for tid in _TTL_THOUGHT_IDS
+            }
+            assert _sync_id_set(conn, _ALL_EDGE_IDS) == all_edges
+            assert _sync_id_set(conn, _ALL_ACTION_IDS) == all_actions
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(vec_indexed_ttl_lifecycle_db), "--config", str(config), "gc", "--expired"],
+            standalone_mode=False,
+        )
+        # An instrumentation precondition: without it, a purge that was never
+        # reached would read as a rollback that worked.
+        assert removed_by_the_stub, "the purge never reached the index"
+
+        with _reopen_with_vector_index(vec_indexed_ttl_lifecycle_db) as conn:
+            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == set(_TTL_THOUGHT_IDS)
+            after = {tid: _sync_row(conn, _THOUGHT_BY_ID, tid) for tid in _TTL_THOUGHT_IDS}
+            assert after == thoughts_before
+            assert _sync_id_set(conn, _ALL_EDGE_IDS) == all_edges
+            assert _sync_id_set(conn, _ALL_EMBEDDING_OWNERS) == set(_TTL_THOUGHT_IDS)
+            assert _sync_id_set(conn, _ALL_ACTION_IDS) == all_actions
+            assert _sync_vec_rowids(conn) == vectors_before
+        assert isinstance(result.exception, sqlite3.OperationalError), result.exception

@@ -966,6 +966,27 @@ async def _assert_reembed_target_is_safe(
         raise click.ClickException(msg)
 
 
+async def _has_persisted_vector_index(conn: aiosqlite.Connection) -> bool:
+    """Report whether the database carries a persisted vec0 index.
+
+    Asked of ``sqlite_master``, which is an ordinary table: every statement
+    naming ``embedding_vec`` itself fails with ``no such module: vec0`` unless
+    sqlite-vec has been loaded into the connection first, so this is the only
+    question about the index that can be answered before loading it.
+
+    Args:
+        conn: An open connection to the database.
+
+    Returns:
+        ``True`` when an ``embedding_vec`` table exists.
+
+    """
+    cursor = await conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embedding_vec'"
+    )
+    return await cursor.fetchone() is not None
+
+
 async def _reset_sqlite_vec_index_for_restore(conn: aiosqlite.Connection) -> None:
     """Drop a persisted vec0 index before replacing its canonical vectors.
 
@@ -983,10 +1004,7 @@ async def _reset_sqlite_vec_index_for_restore(conn: aiosqlite.Connection) -> Non
             sqlite-vec module cannot be loaded to remove it safely.
 
     """
-    cursor = await conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embedding_vec'"
-    )
-    if await cursor.fetchone() is None:
+    if not await _has_persisted_vector_index(conn):
         return
 
     from engrava.extensions.vector_sqlite_vec import load_sqlite_vec  # noqa: PLC0415
@@ -1410,6 +1428,75 @@ def restore(
 # ------------------------------------------------------------------
 
 
+async def _prepare_vector_index_purge(conn: aiosqlite.Connection) -> bool:
+    """Load sqlite-vec when the store has an index the collection must maintain.
+
+    ``embedding_vec`` is a vec0 virtual table that no foreign key reaches, so
+    deleting a thought — by any route — leaves its vector behind unless the
+    vector is removed explicitly, and removing it needs the module loaded on
+    this connection, which the CLI's plain connection helper does not do.
+
+    Called by each pass that is about to physically delete, immediately before
+    it does, because the failure has to be refused while the store is still
+    whole: continuing would strand the vectors of rows that are already gone,
+    which is the state the purge exists to prevent. A pass that deletes nothing
+    — a dry run, an archiving expiry sweep, a collection with nothing to
+    collect — cannot strand a vector and is never refused for want of the
+    module. Loading twice on one connection is harmless, so the two passes ask
+    independently rather than sharing a resolution neither of them owns.
+
+    Args:
+        conn: The command's open connection.
+
+    Returns:
+        ``True`` when a persisted index exists and is now reachable, so the
+        collection paths must purge it; ``False`` when there is none.
+
+    Raises:
+        click.ClickException: If a persisted vec0 index exists but sqlite-vec
+            cannot be loaded to maintain it.
+
+    """
+    if not await _has_persisted_vector_index(conn):
+        return False
+
+    from engrava.extensions.vector_sqlite_vec import load_sqlite_vec  # noqa: PLC0415
+
+    if not await load_sqlite_vec(conn):
+        msg = (
+            "This database has a sqlite-vec index, and collecting thoughts "
+            "without removing their vectors would strand them in it. "
+            "Install 'engrava[vec]' and retry."
+        )
+        raise click.ClickException(msg)
+    return True
+
+
+async def _reconcile_vector_index(conn: aiosqlite.Connection) -> None:
+    """Bring the vec0 index back into agreement with the rows behind it.
+
+    Called after a pass has deleted, so the vectors whose ``embedding`` row
+    went with those rows are **among** what this removes — it is the index's
+    own reconciliation, not a targeted delete, so a vector some earlier writer
+    left behind goes with them provided its rowid is still unowned. One that
+    SQLite has since handed to a new embedding is not, and no reconciliation
+    phrased this way can tell.
+
+    Phrased as "no ``embedding`` row owns it" rather than as a list of rowids
+    on purpose: it is the predicate the index is reconciled by everywhere else,
+    it needs no second reading of which rows a sweep actually took, and it
+    cannot remove the vector of a thought that is still stored.
+
+    Args:
+        conn: The command's connection, with sqlite-vec already loaded by
+            :func:`_prepare_vector_index_purge`.
+
+    """
+    from engrava.extensions.vector_sqlite_vec import purge_orphan_vectors  # noqa: PLC0415
+
+    await purge_orphan_vectors(conn)
+
+
 async def _gc_expired(
     conn: aiosqlite.Connection,
     cfg: EngravaCLIConfig,
@@ -1418,10 +1505,19 @@ async def _gc_expired(
 ) -> bool:
     """Cleanup expired TTL thoughts.
 
+    Under the ``delete`` strategy the sweep physically removes thoughts, so it
+    owes their vectors the same purge the collection pass owes its own. The
+    sweep and that purge run in **one** transaction: the core commits per
+    operation by default, and a purge that failed after that commit would leave
+    behind exactly the stranded vectors it exists to remove — and would hand a
+    concurrent writer a window in which to reuse a freed ``embedding`` rowid,
+    after which the stale vector is indistinguishable from a live one.
+
     Returns True when the caller should skip the subsequent archived-GC
     (i.e. archive strategy was used and thoughts were moved).
     """
     from engrava.config import TTLConfig, load_config  # noqa: PLC0415
+    from engrava.domain.models.ttl import CleanupStrategy  # noqa: PLC0415
     from engrava.infrastructure.sqlite.engrava_core import (  # noqa: PLC0415
         SqliteEngravaCore,
     )
@@ -1448,12 +1544,18 @@ async def _gc_expired(
         click.echo(f"Would {ttl_cfg.strategy} {exp_count} expired thoughts.")
         return False
 
-    result = await store.cleanup_expired()
-    await conn.commit()
+    purge_vectors = False
+    if ttl_cfg.strategy == CleanupStrategy.DELETE:
+        purge_vectors = await _prepare_vector_index_purge(conn)
+
+    async with store.suspend_auto_commit():
+        result = await store.cleanup_expired()
+        if purge_vectors and result.expired_count > 0:
+            await _reconcile_vector_index(conn)
     click.echo(
         f"Cleaned up {result.expired_count} expired thoughts (strategy: {result.strategy_applied})."
     )
-    return result.strategy_applied == "archive" and result.expired_count > 0
+    return result.strategy_applied == CleanupStrategy.ARCHIVE and result.expired_count > 0
 
 
 async def _gc_archived(
@@ -1462,7 +1564,13 @@ async def _gc_archived(
     dry_run: bool,
     quiet: bool,
 ) -> None:
-    """Physically delete all ARCHIVED thoughts and their orphaned edges."""
+    """Physically delete all ARCHIVED thoughts, their orphaned edges and vectors.
+
+    Every statement below — the child deletes, the parent delete and the vector
+    purge — runs in the one transaction this function's ``commit`` closes, so a
+    failed purge takes the deletes with it rather than stranding the vectors of
+    rows that are already gone.
+    """
     cursor = await conn.execute("SELECT COUNT(*) FROM thought WHERE lifecycle_status = 'ARCHIVED'")
     row = await cursor.fetchone()
     archived_count = row[0] if row else 0
@@ -1475,6 +1583,8 @@ async def _gc_archived(
     if dry_run:
         click.echo(f"Would delete {archived_count} archived thoughts and orphaned edges.")
         return
+
+    purge_vectors = await _prepare_vector_index_purge(conn)
 
     await conn.execute(
         "DELETE FROM edge WHERE from_thought_id IN "
@@ -1491,8 +1601,11 @@ async def _gc_archived(
         "(SELECT thought_id FROM thought WHERE lifecycle_status = 'ARCHIVED')"
     )
     cursor = await conn.execute("DELETE FROM thought WHERE lifecycle_status = 'ARCHIVED'")
+    collected = cursor.rowcount
+    if purge_vectors:
+        await _reconcile_vector_index(conn)
     await conn.commit()
-    click.echo(f"Collected {cursor.rowcount} archived thoughts.")
+    click.echo(f"Collected {collected} archived thoughts.")
 
 
 @cli.command()
