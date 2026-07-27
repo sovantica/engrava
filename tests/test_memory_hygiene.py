@@ -150,9 +150,14 @@ def _thought(
 ) -> ThoughtRecord:
     """Build a thought with hygiene-relevant fields controllable per test.
 
-    The transaction-time fields (``created_at`` / ``updated_at`` /
-    ``last_accessed_at``) drive the minimum-inactivity-age gate; leaving them
-    ``None`` lets ``create_thought`` stamp ``created_at`` to *now* (a young row).
+    The transaction-time fields drive the minimum-inactivity-age gate through a
+    COALESCE ladder — ``last_accessed_at`` → ``updated_at`` → ``created_at`` —
+    in which the first one present decides the row's age. ``create_thought``
+    stamps **both** ``created_at`` and ``updated_at`` to *now* when they are
+    ``None``, so ``created_at=_LONG_AGO`` on its own still yields a *young* row:
+    the stamped ``updated_at`` outranks it. Ageing a row past the gate means
+    setting ``updated_at`` (or ``last_accessed_at``) as well — which is what
+    :func:`_evictable_thought` does.
     ``action_outcome_score`` is the usage-history signal used to satisfy the
     run-level access-gate without perturbing the keep-score (it is not a
     configured hygiene keep-signal). ``expires_at`` puts the thought under TTL,
@@ -989,32 +994,81 @@ class TestProtection:
         assert not _hygiene_protected(_thought("c", priority=Priority.P3, confidence=1.0), policy)
 
     async def test_archive_write_time_recheck_skips_now_protected(self) -> None:
-        """A thought protected after selection is skipped at the archive write (TOCTOU)."""
+        """The **pin** is what skips a now-protected thought at the archive write (TOCTOU).
+
+        Both rows go straight to the archive stage — selection already skips
+        protected thoughts, so only the write-time re-check is under test — and
+        both are aged through ``updated_at``, not ``created_at`` alone. Ageing by
+        ``created_at`` alone would leave this test unable to observe the pin:
+        ``create_thought`` stamps a ``None`` ``updated_at`` to *now*, and
+        ``updated_at`` outranks ``created_at`` in the COALESCE ladder
+        (``last_accessed_at`` → ``updated_at`` → ``created_at``), so the row stays
+        inside the inactivity window and the **minimum-inactivity-age** re-check
+        performs the skip the pin is supposed to perform.
+
+        With ``updated_at`` at ``_LONG_AGO`` the age gate cannot be what skips
+        either row — it passes ``unpinned``, and for ``pinned_late`` it is never
+        reached at all (below). Both rows are ``ACTIVE`` and ``P3`` is outside the
+        default ``protected_priorities``, so ``pinned`` is the only difference
+        left between them.
+
+        **What is covered, and what is not — a documented limit.**
+        ``_hygiene_protected`` is the first term of the write-time ``or`` chain,
+        so ``pinned_late`` is skipped by the **Python re-check** and the age
+        predicate is never evaluated for it (it would pass if it were reached,
+        which is not the same as being what this test observes). The row
+        therefore never reaches the predicate-guarded ``UPDATE``, so that
+        statement's ``pinned = 0`` clause is **not** independently observable
+        here — delete the clause and this test, and this whole file, stay green.
+        Reaching it needs a row that clears the Python re-check and is only then
+        found pinned — a genuine check-to-write race, which this file does not
+        set up. The machinery for one already exists: ``_interleave_once`` in
+        ``tests/test_partial_field_updates.py`` fires an intruder immediately
+        after a wrapped store read returns, which is exactly where a pin would
+        have to land for the re-check to act on an unpinned snapshot while the
+        ``UPDATE`` meets the pinned row.
+
+        ``unpinned`` is the control: the same call must leave it ``ARCHIVED``,
+        which is what proves the stage ran. A stage that did nothing at all would
+        satisfy "``pinned_late`` is still ``ACTIVE``" just as well.
+        """
         from engrava.infrastructure.sqlite.hygiene import EvictionReason
 
         policy = HygienePolicyConfig(enabled=True)
         s = await _make_store(policy)
         try:
-            # Feed a protected thought straight to the archive stage (selection
-            # already skips protected) to exercise the write-time re-check. The
-            # row is aged past the inactivity window so *only* the pin drives the
-            # skip (not the minimum-inactivity-age re-check).
             await s.create_thought(
-                _thought("pinned_late", pinned=True, updated_cycle=0, created_at=_LONG_AGO)
+                _thought(
+                    "pinned_late",
+                    pinned=True,
+                    updated_cycle=0,
+                    created_at=_LONG_AGO,
+                    updated_at=_LONG_AGO,
+                )
             )
-            reason = EvictionReason(
-                thought_id="pinned_late",
-                keep_score=0.0,
-                eviction_score=0.0,
-                decay_multiplier=1.0,
-                threshold=0.2,
+            await s.create_thought(
+                _thought(
+                    "unpinned",
+                    updated_cycle=0,
+                    created_at=_LONG_AGO,
+                    updated_at=_LONG_AGO,
+                )
             )
+            reasons = [
+                EvictionReason(
+                    thought_id=thought_id,
+                    keep_score=0.0,
+                    eviction_score=0.0,
+                    decay_multiplier=1.0,
+                    threshold=0.2,
+                )
+                for thought_id in ("pinned_late", "unpinned")
+            ]
             now = datetime.datetime.now(datetime.UTC)
-            archived = await s._hygiene_archive(
-                [reason], policy=policy, current_cycle=1000, now=now
-            )
-            assert archived == 0
+            archived = await s._hygiene_archive(reasons, policy=policy, current_cycle=1000, now=now)
             assert await _raw_lifecycle(s, "pinned_late") == "ACTIVE"
+            assert await _raw_lifecycle(s, "unpinned") == "ARCHIVED"
+            assert archived == 1
         finally:
             await s._db.close()
 
@@ -1807,7 +1861,25 @@ class TestConsolidateInvocation:
             await conn.close()
 
     async def test_consolidate_skips_hygiene_off_cadence(self) -> None:
-        """When the cycle misses the cadence, consolidate() does not forget."""
+        """The **cadence** is what stops ``consolidate()`` forgetting on an off-cadence cycle.
+
+        The row comes from :func:`_evictable_thought`, so every other gate is
+        already satisfied — including the minimum-inactivity-age gate, which this
+        policy leaves at its 7-day default. Clearing that gate needs
+        ``updated_at``, not ``created_at`` alone: ``create_thought`` stamps a
+        ``None`` ``updated_at`` to *now* and ``updated_at`` outranks
+        ``created_at`` in the COALESCE ladder, so a row aged only by
+        ``created_at`` sits inside the window and it is the **age** gate, not the
+        cadence, that keeps it ``ACTIVE`` on cycle 7.
+
+        The second, on-cadence ``consolidate()`` is the control: the same row
+        under the same policy comes out ``ARCHIVED`` on cycle 10, which rules out
+        a dead pass — or a row nothing would ever evict — as the reason cycle 7
+        left it alone. Its limit is worth naming too: the control runs a *later*
+        cycle, where the row is strictly colder, so it establishes evictability
+        at cycle 10 and not at cycle 7. The cadence predicate itself is pinned
+        directly, by the ``_hygiene_due`` assertions below.
+        """
         conn = await aiosqlite.connect(":memory:")
         conn.row_factory = aiosqlite.Row
         await conn.execute("PRAGMA foreign_keys = ON")
@@ -1818,10 +1890,13 @@ class TestConsolidateInvocation:
         s._dreaming_extension = DreamingExtension(config=DreamingConfig(enabled=True))
         await s.ensure_schema()
         try:
-            await s.create_thought(_thought("cold", updated_cycle=0, action_outcome_score=0.0))
+            await s.create_thought(_evictable_thought("cold"))
             # cycle 7 % 5 != 0 -> hygiene skipped.
             await s.consolidate(current_cycle=7)
             assert await _raw_lifecycle(s, "cold") == "ACTIVE"
+            # cycle 10 % 5 == 0 -> the same row, same policy, now archived.
+            await s.consolidate(current_cycle=10)
+            assert await _raw_lifecycle(s, "cold") == "ARCHIVED"
             assert s._hygiene_due(7) is False
             assert s._hygiene_due(10) is True
         finally:
