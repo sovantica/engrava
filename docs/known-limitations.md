@@ -131,14 +131,32 @@ print("FTS5 is available")
 ## Concurrent Write Safety
 
 SQLite supports one writer at a time. With WAL mode, readers do not block
-writers and vice versa. If your application uses multiple async tasks that
-write concurrently, `aiosqlite` serializes them automatically via its
-background thread.
+writers and vice versa. `aiosqlite` marshals every call onto one background
+thread, so concurrent tasks' **statements** do not run at the same time.
 
-For multi-service setups via `EngravaManager`, each service has its own
-database file with independent locking.
+That is statement-level serialisation, and it is not the same as operation-level
+safety. Engrava's update methods (`update_thought`, `restore_thought`,
+`upsert_by_hash`, `update_edge`, `update_action`) read the row, apply the change
+in memory, then write — and another writer's whole update can land in that
+window. Two writers editing the **same field** of the same row therefore lose one
+of the two writes, silently and without an error. Editing different fields is
+safe — an update writes only the columns it owns — **except** when one of the two
+writers stamps a new `updated_cycle`: every thought update carries a version
+guard on that column, so the other update then matches no row and is rejected in
+full with `StaleDataError`, sharing no field with it or not.
 
-Under this single-writer contract, if the store ever quarantines its connection
+**Only one store may write a given database file.** The locks that order
+engrava's own operations live on the store instance, so a second store — in
+another process, or a second connection in this one — is outside all of them.
+WAL and `busy_timeout` keep the *file* intact under that topology; they do not
+make the *operations* correct.
+
+The full contract, the guarantees that do hold, and the idioms that close the
+gap are in [Concurrency](concurrency.md). For multi-service setups via
+`EngravaManager`, each service has its own database file with independent
+locking — that is the supported way to run independent writers.
+
+Separately: if the store ever quarantines its connection
 (an internal safety response to an indeterminate transaction), quarantine
 revokes admission synchronously: every new operation on the store or its journal
 then fails fast with `ConnectionQuarantinedError`, so no write can flush an

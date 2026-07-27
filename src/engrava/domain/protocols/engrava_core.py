@@ -197,7 +197,14 @@ class EngravaCoreProtocol(EngravaReadProtocol, Protocol):
         ...
 
     async def update_thought(self, thought_id: str, **changes: object) -> ThoughtRecord:
-        """Update a thought with optimistic concurrency.
+        """Update a thought's fields in place.
+
+        Only the fields named in ``changes`` are written, so a column another
+        writer changed meanwhile is preserved — unless that writer stamped a new
+        ``updated_cycle``, which trips the version guard carried by every update
+        and rejects this one in full, shared column or not. The call is a
+        read-modify-write and is not atomic: two writers naming the *same* field
+        lose one of the two writes, and the guard does not report it.
 
         Args:
             thought_id: UUID of the thought to update.
@@ -207,8 +214,12 @@ class EngravaCoreProtocol(EngravaReadProtocol, Protocol):
             The updated thought record.
 
         Raises:
-            ThoughtNotFoundError: If the thought does not exist.
-            StaleDataError: If the row was modified by another writer.
+            ThoughtNotFoundError: If the thought does not exist when the call
+                starts.
+            StaleDataError: If the guarded write matches no row — another writer
+                stamped a new ``updated_cycle`` since the row was read, or
+                deleted the row. Nothing of this update is written when it is
+                raised.
 
         """
         ...
@@ -228,7 +239,8 @@ class EngravaCoreProtocol(EngravaReadProtocol, Protocol):
         Raises:
             ThoughtNotFoundError: If the thought does not exist.
             InvalidTransitionError: If the thought is not currently ``ARCHIVED``.
-            StaleDataError: If the row was modified by another writer.
+            StaleDataError: If the guarded write matches no row — a competing
+                cycle stamp or a delete (see :meth:`update_thought`).
 
         """
         ...

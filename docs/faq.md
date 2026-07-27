@@ -53,13 +53,28 @@ and [Known Limitations](known-limitations.md#sqlite-vec-pre-v1-status).
 
 ## Can multiple processes or tasks use the same store at once?
 
-A single process can drive **many async tasks** against one store safely —
-aiosqlite serialises them on its background thread, and WAL mode lets readers and
-a single writer coexist. SQLite is **single-writer**, so heavy concurrent writes
-from **multiple processes** are out of scope. For multi-tenant isolation, give
-each tenant its own database file via `EngravaManager` (each has its own lock).
-See [Known Limitations → Concurrent Write Safety](known-limitations.md#concurrent-write-safety)
-and the [migration guide's scoping section](guides/migrating-from-other-memory.md#filtering-scoping--multi-tenancy).
+**Tasks: yes, with limits.** Share one store across the tasks in your event
+loop — aiosqlite serialises their statements on its background thread and WAL
+lets readers and a single writer coexist. What engrava does not do is make a
+read-modify-write atomic, so two tasks editing the *same field* of the same row
+lose one of the two writes, silently. Editing *different* fields is safe — unless
+one of the two passes `updated_cycle=`, which trips the version guard and gets
+the other update rejected with `StaleDataError` even though they share no field.
+Serialise the edits yourself when tasks genuinely compete for a row. See
+[Concurrency](concurrency.md#many-async-tasks-one-store).
+
+**Processes: no.** Only one store may *write* a given database file; any number
+may read it. This is not a contention trade-off you can tune away — the locks
+that order engrava's own operations stop at the store instance, so a second
+writer loses updates and can duplicate deduplicated content. For multi-tenant or
+multi-worker setups, give each writer its own database file via `EngravaManager`
+(each has its own lock).
+
+See [Concurrency](concurrency.md) for the full contract,
+[Known Limitations → Concurrent Write Safety](known-limitations.md#concurrent-write-safety)
+for the short version, and the
+[migration guide's scoping section](guides/migrating-from-other-memory.md#filtering-scoping--multi-tenancy)
+for the isolation options.
 
 ## How do I scope search to one user or session?
 

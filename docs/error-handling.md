@@ -16,7 +16,7 @@ Engrava does not make every write idempotent.
 | `ThoughtNotFoundError`, `ActionNotFoundError`, `SourceThoughtNotFoundError`, `ReferentialIntegrityError` | Required data is absent | Refresh identifiers or create the missing parent deliberately | No |
 | `DuplicateEdgeError` | The requested directed, typed relationship already exists | Treat the write as idempotent success or choose a different direction/type | No |
 | `InvalidTransitionError`, `ReadOnlyViolationError` | Requested operation is not allowed in the current state/view | Change the requested transition or use a writable capability | No |
-| `StaleDataError` | Another writer won the optimistic-concurrency race | Re-read, recompute the intended change, then issue a new update | No, not without re-reading |
+| `StaleDataError` | The guarded update matched no row — a competing writer stamped a new `updated_cycle` **or deleted the row**; **nothing** of the rejected update was written | Re-read, recompute the intended change, then issue a new update — and handle the row being gone | No, not without re-reading |
 | Remote embedding timeout, network error, `408`, `409`, `425`, `429`, or selected `5xx` | Depends on the operation; a single thought/update may already be committed | Let the provider exhaust its bounded retry policy, then reconcile by thought ID | Not the whole write blindly |
 | SQLite `OperationalError` containing `locked` or `busy` | The operation did not complete successfully; reconcile durable state when the write boundary is ambiguous | Reduce writer contention or increase `busy_timeout`; retry only an operation known to converge | Only with operation-specific proof |
 | Rising `fts_match_failure_count` | Search retried with sanitized FTS syntax; the vector and other hybrid arms can still contribute | Inspect warning logs and offending queries | Engrava already retries the FTS arm once |
@@ -51,7 +51,13 @@ These failures require a changed request, not backoff:
 - `InvalidTransitionError` rejects an illegal lifecycle/action transition, and
   `ReadOnlyViolationError` rejects a write through `ReadOnlyEngrava`.
 - `StaleDataError` is recoverable only through a new read-modify-write cycle. Do
-  not replay stale `changes` without checking the newer record.
+  not replay stale `changes` without checking the newer record — and do not
+  assume the record still exists, because a row deleted mid-call raises this too.
+  Note what it does **not** tell you: the guard compares `updated_cycle`, which
+  only a caller advances, so an ordinary competing edit passes through it and
+  overwrites — see
+  [Concurrency](concurrency.md#optimistic-concurrency-and-staledataerror). Its
+  absence is not evidence that no one else wrote.
 - `DerivedRecordError` means a producer violated a derivation gate or collided
   with an unrelated identity. The source thought is already durable on the
   automatic post-store path; some earlier derived children may also be durable.
@@ -216,7 +222,10 @@ Operational rules:
   normally tells the context manager to commit.
 - Do not nest `suspend_auto_commit()` and do not run another writer concurrently
   on the same store instance. The deferred-commit flag belongs to the instance,
-  not to an individual task. Use a separate connection per writer.
+  not to an individual task: a write issued by any other task while the window is
+  open joins the window's transaction, and a rollback discards it too — with no
+  error reaching the task that issued it. Drive the window from one task at a
+  time.
 - Automatic on-store derivation is skipped inside a caller-held transaction.
   After commit, invoke `derive_existing()` explicitly for sources that need it.
 - In v0.6, the rollback branch catches `Exception`; `asyncio.CancelledError` is a
@@ -243,6 +252,12 @@ Prefer removing contention over adding a generic retry loop:
 3. Partition independent writers into separate database files with
    `EngravaManager`.
 4. Increase `busy_timeout` only when the added tail latency is acceptable.
+
+`busy_timeout` is a latency knob, not a correctness one. It decides how long a
+connection waits for the file lock; it does nothing about two stores interleaving
+inside one of engrava's read-modify-write operations, which is why only one store
+may write a given file
+([Concurrency](concurrency.md#multiple-stores-one-database-file)).
 
 If an operation is known to be read-only and repeatable, bounded retry is
 reasonable. This example deliberately retries journal verification, not an

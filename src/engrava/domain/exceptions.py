@@ -64,9 +64,18 @@ class ActionNotFoundError(EngravaError):
 
 
 class StaleDataError(EngravaError):
-    """Raised when an optimistic-concurrency check fails.
+    """Raised when a guarded write matches no row.
 
-    The row was modified by another writer between read and write.
+    Two situations produce that, and this error does not tell them apart:
+    another writer stamped a new ``updated_cycle`` between this operation's read
+    and its write, or the row was deleted in that window. Either way nothing of
+    the operation was applied.
+
+    It is narrower than "the row changed" — nothing in engrava advances
+    ``updated_cycle`` on its own, so an ordinary competing edit passes the guard
+    and overwrites rather than raising — and also broader, because a delete
+    raises it too. Recover by re-reading the record (which may now be gone) and
+    recomputing the change.
 
     Args:
         entity_type: Type of entity (e.g., 'ThoughtRecord').
@@ -599,8 +608,7 @@ class ConnectionQuarantinedError(EngravaError):
     Scope: quarantine revokes *admission* — every NEW operation on the store or
     its journal fails fast with this error, so no write/commit can flush an
     orphaned transaction. It does not retract an operation already admitted
-    before revocation: under the single-writer contract overlapping writes are
-    unsupported, but a reader admitted just before revocation may complete its
+    before revocation: a reader admitted just before revocation may complete its
     in-flight read on the pre-revocation connection (a possibly-stale read,
     never a commit).
 

@@ -280,6 +280,12 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "docs/concurrency.md",
+        "async with edit_lock:",
+        "fragment assuming a store and a caller-owned lock; the read-modify-write "
+        "window it closes is asserted in the concurrency-contract tests",
+    ),
+    (
+        "docs/concurrency.md",
         "PRAGMA busy_timeout",
         "opens a real on-disk database file; illustrative connection tuning",
     ),

@@ -838,9 +838,10 @@ class _AccessBuffer:
     is evicted (FIFO) and the eviction is logged. Coalescing an access into an
     id already in the buffer never triggers eviction.
 
-    **Single-writer scoped.** The buffer holds no lock: it is owned by one
-    store instance and, like every deferred-write path in the store, assumes a
-    single writer drives that instance (the documented concurrency contract).
+    **No lock, and none needed.** Every mutation of the buffer happens inside a
+    synchronous method with no ``await`` in it, so no other task can interleave
+    part-way through one. Concurrent tasks on the same store record accesses
+    safely; the buffer does not rely on a single writer.
 
     Access counts are high-volume regenerable telemetry: they are **not**
     journaled, and a crash before a flush simply undercounts — the signal
@@ -3202,16 +3203,19 @@ class SqliteEngravaCore:
         Batches every write in the block into one transaction: the block
         commits once on clean exit and rolls back entirely on any exception.
 
-        **Single-writer contract.** The store owns one connection and holds the
-        deferred-commit state on the instance, so a suspended-commit window is
-        not safe for a *second* writer running on the same store instance
-        concurrently: another coroutine's writes would interleave into this
-        block's transaction (and, under auto-embed, be affected by the batch's
-        embedding deferral). Drive writes on a given store instance from one
-        task at a time. This is the established contract that ``bulk_store``
-        and every deferred-commit caller rely on; concurrent same-instance
-        writers are unsupported (a separate connection per writer is the
-        supported concurrency model).
+        **One writer for the duration of the window** — a restriction on this
+        block, not on the store in general. The window belongs to the store
+        instance, not to the task that opened it: the deferred-commit state lives
+        on the instance, so a write issued by *any* task while the window is open
+        joins this block's transaction (and, under auto-embed, is affected by the
+        batch's embedding deferral). A rollback then discards that write too,
+        and the task that issued it is never told. Drive writes on a given store
+        instance from one task at a time *while a window is open* — this is the
+        established contract that ``bulk_store`` and every deferred-commit caller
+        rely on. Note that
+        opening a *second* store on the same database file is not the way out:
+        only one store may write a given file (see the concurrency
+        documentation).
 
         Note on the derived-records seam: a create issued inside this block does
         **not** auto-derive (the source is not yet durable and this block owns
@@ -3335,11 +3339,9 @@ class SqliteEngravaCore:
         :class:`ConnectionQuarantinedError`, and direct core connection access is
         terminal via the proxy — so no write/commit can flush an orphaned
         transaction, regardless of whether the physical close succeeds. It does
-        NOT retract an operation already admitted before revocation: overlapping
-        writes on one store are unsupported (single-writer contract), but a
-        concurrent reader admitted just before revocation may complete its
-        in-flight read on the pre-revocation connection — a possibly-stale read,
-        never a commit.
+        NOT retract an operation already admitted before revocation: a reader
+        admitted just before revocation may complete its in-flight read on the
+        pre-revocation connection — a possibly-stale read, never a commit.
 
         Args:
             reason: Human-readable cause, surfaced on every raised error.
@@ -3549,8 +3551,13 @@ class SqliteEngravaCore:
             thought.archived_at,
         )
 
-    #: Guard clause every core thought UPDATE carries: the row identity plus
-    #: the optimistic-concurrency version the caller read.
+    #: Guard clause every core thought UPDATE carries: the row identity plus the
+    #: ``updated_cycle`` the caller read. Nothing in the store advances that
+    #: column, so a write is rejected only when a *caller* stamped a new cycle in
+    #: between, or the row was deleted — the two cases ``rowcount == 0`` cannot
+    #: tell apart. Being on *every* update, it also rejects an edit that shares
+    #: no column with the cycle-stamping one; the public docstrings say both
+    #: rather than implying a general staleness check.
     _CORE_UPDATE_GUARD = "thought_id = ? AND updated_cycle = ?"
 
     def _thought_to_core_columns(self, thought: ThoughtRecord) -> dict[str, object]:
@@ -3754,9 +3761,12 @@ class SqliteEngravaCore:
         """Lock-protected dedup branch of ``create_thought``.
 
         Acquires ``self._dedup_lock`` for the entire ``check existing
-        → INSERT or UPDATE`` window so concurrent calls with identical
-        ``content`` never race past the existence probe.  When the
-        content has not been seen the call delegates back to
+        → INSERT or UPDATE`` window so concurrent calls **on this store
+        instance** with identical ``content`` never race past the existence
+        probe.  The lock stops at that boundary: a second store on the same
+        database file can insert between this call's probe and its insert, so
+        deduplication is an in-instance guarantee only.  When the content has
+        not been seen the call delegates back to
         ``create_thought(..., deduplicate=False)`` so the regular
         insert / journal / auto-embed pipeline runs unchanged; when it
         has been seen ``confirmation_count`` is bumped and the existing
@@ -3928,7 +3938,10 @@ class SqliteEngravaCore:
 
         A thin convenience over the existing content-hash deduplication that
         removes the check-then-create round trip (and its TOCTOU window)
-        callers otherwise write by hand. The content hash is the same
+        callers otherwise write by hand. That window is closed against other
+        callers of **this store instance**, which is where the deduplication
+        lock lives; a second store on the same database file is outside it and
+        can still insert the same content. The content hash is the same
         byte-exact SHA-256 of ``content`` used by
         ``create_thought(deduplicate=True)``:
 
@@ -4045,10 +4058,11 @@ class SqliteEngravaCore:
         match the stored thought is a no-op that returns it untouched (and, in
         particular, an unchanged ``lifecycle_status`` is never re-asserted,
         which would otherwise be rejected as a same-state transition). The
-        update reuses :meth:`update_thought`, so it participates in
-        optimistic-concurrency control and re-embeds when ``essence`` changed,
-        exactly like any other edit. A miss delegates to :meth:`create_thought`
-        (regular insert / journal / auto-embed pipeline).
+        update reuses :meth:`update_thought`, so it carries the same
+        ``updated_cycle`` guard — and the same limits on what that guard catches
+        — and re-embeds when ``essence`` changed, exactly like any other edit.
+        A miss delegates to :meth:`create_thought` (regular insert / journal /
+        auto-embed pipeline).
 
         Choose :meth:`get_or_create` for "ensure it exists, don't touch it if it
         does"; choose ``upsert_by_hash`` for "make the stored thought match this
@@ -4072,8 +4086,13 @@ class SqliteEngravaCore:
             ValueError: If ``thought.metadata`` violates the metadata-shape or
                 size invariants (validated up front on both the hit and miss
                 paths).
-            StaleDataError: If the matched row is modified concurrently between
-                the hash probe and the in-place update.
+            StaleDataError: If the matched row's guarded update writes no row —
+                another writer stamped a new ``updated_cycle`` between the hash
+                probe and the in-place update, or deleted the row. The probe and
+                the update are **not** one atomic step, and the guard is
+                :meth:`update_thought`'s: an ordinary competing edit to a field
+                this upsert also writes is overwritten silently rather than
+                reported here.
             ConnectionQuarantinedError: When the connection has been quarantined.
 
         """
@@ -5371,9 +5390,7 @@ class SqliteEngravaCore:
         return await self._hooks.on_retrieve(self._row_to_thought(row))
 
     async def update_thought(self, thought_id: str, **changes: object) -> ThoughtRecord:
-        """Update a thought with optimistic concurrency.
-
-        Uses ``updated_cycle`` as a version guard.
+        """Update a thought's fields in place.
 
         Writes **only the columns this edit owns** — the fields ``changes``
         gives a new value to, plus the ``updated_at`` stamp ``evolve`` always
@@ -5385,6 +5402,23 @@ class SqliteEngravaCore:
         the row that exists rather than the one the call intended to write; the
         journal ``after`` image is the same read-back.
 
+        **What the version guard does and does not catch.** The write carries a
+        guard on ``updated_cycle`` as read at the start of the call, and nothing
+        in engrava advances that column on its own — only a caller passing
+        ``updated_cycle=`` here, or ``current_cycle=`` to
+        :meth:`restore_thought`, moves it. ``StaleDataError`` therefore does not
+        mean *the row changed*: it means the guarded ``UPDATE`` matched no row,
+        which happens when a competing writer stamped a cycle **or deleted the
+        row**. This call is a read-modify-write and is **not** atomic: another
+        writer's whole update can land between the read and the write, and if
+        both name the same field the later write wins silently. Two edits to
+        *different* fields survive each other — but only while neither stamps a
+        cycle: the guard is part of every update, so a competing cycle stamp
+        rejects this call in full even when the two edits share no column. A
+        ``lifecycle_status`` change is validated against the record *this* call
+        read, so a competing move in that window can leave the row in a state
+        the machine would not have allowed as a single step.
+
         Args:
             thought_id: UUID of the thought to update.
             **changes: Fields to update.
@@ -5393,9 +5427,13 @@ class SqliteEngravaCore:
             The stored thought record, as persisted by this update.
 
         Raises:
-            ThoughtNotFoundError: If the thought does not exist, or if the row
-                was deleted before the write could be read back.
-            StaleDataError: If the row was modified since it was read.
+            ThoughtNotFoundError: If the thought does not exist when the call
+                starts, or if the row was deleted before the write could be read
+                back.
+            StaleDataError: If the guarded write matches no row — another writer
+                stamped a new ``updated_cycle`` since the row was read, or
+                deleted the row. Nothing of this update is written when it is
+                raised.
             ValueError: If the post-``evolve`` metadata violates the
                 metadata-shape or size invariants enforced by
                 :func:`_validate_metadata`, or if the post-``evolve``
@@ -5500,7 +5538,11 @@ class SqliteEngravaCore:
             ThoughtNotFoundError: If the thought does not exist, or if the row
                 was deleted before the write could be read back.
             InvalidTransitionError: If the thought is not currently ``ARCHIVED``.
-            StaleDataError: If the row was modified since it was read.
+            StaleDataError: If the guarded write matches no row — another writer
+                stamped a new ``updated_cycle`` since the row was read, or
+                deleted the row (see :meth:`update_thought` for what that guard
+                does and does not catch). Nothing of the restore is written when
+                it is raised.
 
         """
         current_row = await self._get_thought_row(thought_id)
@@ -5585,7 +5627,8 @@ class SqliteEngravaCore:
 
         Raises:
             ThoughtNotFoundError: If the thought does not exist.
-            StaleDataError: If the row was modified since it was read.
+            StaleDataError: If the guarded write matches no row — a competing
+                cycle stamp or a delete (see :meth:`update_thought`).
             ValueError: If ``valid_until`` is not a valid ISO-8601 timestamp,
                 or is earlier than the thought's existing ``valid_from`` (an
                 inverted validity interval).
@@ -5900,6 +5943,11 @@ class SqliteEngravaCore:
         back from storage after the write — the row that exists, not the one
         the call intended to write — and the journal ``after`` image is the
         same read-back.
+
+        The write is keyed on ``edge_id`` alone — there is no version guard on
+        this path, so it never raises ``StaleDataError``. It is a
+        read-modify-write like :meth:`update_thought`, so a competing edit to a
+        field this call also writes is overwritten silently.
 
         Args:
             edge_id: UUID of the edge to update.
@@ -9691,7 +9739,12 @@ class SqliteEngravaCore:
         verification-only update never touches the status machine and is
         therefore permitted in **any** status, including a terminal
         ``CONFIRMED`` / ``FAILED`` action (verification legitimately advances
-        while the status stays terminal). ``verification_status`` is not gated
+        while the status stays terminal). The transition is validated against the
+        record *this* call read, and the write carries no version guard, so a
+        competing move landing in between is neither rejected nor detected: two
+        individually-legal transitions can leave the action in a state the
+        machine would not have allowed as a single step. ``verification_status``
+        is not gated
         by the lifecycle state: it may be set on a non-terminal action too, but
         such an action contributes nothing to ``action_outcome_score`` (the
         aggregate counts only terminal actions), so a premature verification

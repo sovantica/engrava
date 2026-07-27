@@ -44,11 +44,11 @@ relates to the other memory options you might be choosing between.
   embedded library, not a clustered database. One store is one SQLite file
   written by one process. If you need sharding, replication, or a multi-writer
   service across many machines, use a dedicated vector database.
-- **You need many processes writing the same store concurrently.** SQLite is
-  single-writer. WAL mode lets readers and a single writer coexist, and a
-  single process can drive many async tasks safely, but heavy multi-process
-  write fan-out is out of scope. See
-  [Known Limitations → Concurrent Write Safety](known-limitations.md#concurrent-write-safety).
+- **You need more than one process writing the same store.** Only one store may
+  write a database file; any number may read it. WAL lets readers and that one
+  writer coexist, and one process can drive many async tasks against the store —
+  but two writers on one file is unsupported, not merely contended. See
+  [Concurrency](concurrency.md#multiple-stores-one-database-file).
 - **You want the library to call an LLM for you.** Engrava does no LLM-side fact
   extraction, summarisation, or entity resolution (see [Non-goals](#non-goals)).
   It stores and retrieves what you give it; your agent decides what to write.
