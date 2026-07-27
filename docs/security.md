@@ -191,6 +191,17 @@ the whole database: thought and edge mutations plus action status transitions;
 embeddings, action creation, and read-derived access telemetry are outside the
 chain.
 
+Within the entries it does cover, the chain binds **ordering and content**
+(`sequence_number`, `parent_hash`, `mutation_type`, `target_id`, `delta`) but
+**not timestamps**: neither `created_at` nor `entry_id` is in the hash preimage.
+Rewriting every `created_at` produces a fully backdated trail that still
+verifies. Moving a timestamp across a `get_entries(since=...)` lower bound also
+changes that window in either direction — downward removes an entry from an audit
+window, upward inserts one into it — so a time-bounded audit query cannot
+compensate: it reads the same unprotected column. Treat journal timestamps as
+informative and anchor any time-bounded claim on a `(sequence_number,
+entry_hash)` pair captured externally.
+
 For a stronger control:
 
 - enable scheduled verification or `journal.verify_on_open` where its linear

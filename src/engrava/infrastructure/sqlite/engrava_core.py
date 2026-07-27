@@ -1245,6 +1245,12 @@ class SqliteEngravaCore:
         Detecting a missing tail needs an external high-water-mark and is out of
         scope here. Mid-chain tampering, deletion, and reordering are all caught.
 
+        It also verifies **ordering and content, not timestamps**: neither
+        ``created_at`` nor ``entry_id`` is in the hash preimage, so a journal with
+        every timestamp rewritten verifies exactly like an untouched one — and a
+        timestamp moved across a ``journal.get_entries(since=...)`` bound leaves
+        or enters that window, which filters on the same uncovered column.
+
         Returns:
             A :class:`JournalIntegrityResult` describing chain validity —
             ``valid`` plus ``entries_checked``, and on a break the

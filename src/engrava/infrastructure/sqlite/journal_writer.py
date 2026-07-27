@@ -119,6 +119,15 @@ class JournalWriter:
             "{sequence_number}|{mutation_type}|{target_id or ''}|
              {json.dumps(delta, sort_keys=True)}|{parent_hash or ''}"
 
+        The preimage therefore binds an entry's **ordering** (``sequence_number``,
+        ``parent_hash``) and its **content** (``mutation_type``, ``target_id``,
+        ``delta``). It does **not** include ``created_at`` or ``entry_id``: a
+        journal whose timestamps have all been rewritten still verifies as
+        ``valid=True``, and moving a timestamp across a :meth:`get_entries`
+        ``since`` bound changes that window either way — downward hides the entry,
+        upward plants it — because the filter reads the same uncovered column.
+        Timestamps are informative, not tamper-evident.
+
         Args:
             sequence_number: Monotonic sequence number of this entry.
             mutation_type: The mutation classification string.
@@ -231,6 +240,11 @@ class JournalWriter:
         Iterates every entry in sequence order, recomputes each hash,
         and validates parent-hash linkage.
 
+        The walk proves the **ordering and content** of the rows it read — it
+        proves nothing about their ``created_at`` values, which are outside the
+        hash preimage (see :meth:`compute_hash`), nor about the chain's length
+        (a removed tail leaves a verifying prefix).
+
         Returns:
             A ``JournalIntegrityResult`` describing chain validity.
 
@@ -306,10 +320,19 @@ class JournalWriter:
     ) -> list[JournalEntry]:
         """Query journal entries with optional filters.
 
+        ``since`` is a convenience filter, **not** an audit boundary: it compares
+        ``created_at >= since``, and ``created_at`` is outside the hash preimage
+        (as is ``entry_id`` — see :meth:`compute_hash`). Rewriting an entry's
+        ``created_at`` across ``since`` drops it out of the window or adds it in,
+        and either way leaves the chain verifying: an empty result does not prove
+        that nothing happened in that period, and a returned entry does not prove
+        that it happened within it.
+
         Args:
             target_id: Filter by target entity ID.
             mutation_type: Filter by mutation type string.
-            since: ISO-8601 timestamp lower bound (inclusive).
+            since: ISO-8601 timestamp lower bound (inclusive) on the
+                chain-uncovered ``created_at`` column.
             limit: Maximum number of entries to return.
 
         Returns:

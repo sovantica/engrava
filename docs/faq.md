@@ -147,7 +147,13 @@ It is **tamper-evident**, not tamper-proof. The journal is a keyless in-file
 SHA-256 hash chain: it detects changed retained journal rows and broken links
 when the affected hashes are not recomputed. It cannot detect self-consistent
 tail removal without an external high-water mark/tail anchor, and it does not
-reconcile live thought or edge rows against journal history. A write-capable
+reconcile live thought or edge rows against journal history. It covers entry
+**ordering and content**, not entry **timestamps**: neither `created_at` nor
+`entry_id` is in the hash preimage, so a journal with every timestamp rewritten
+still verifies. A rewrite across a `get_entries(since=...)` lower bound also
+changes that window either way — downward hides an entry from it, upward plants
+one inside it — so a time-bounded query is no safer than the timestamps it reads.
+A write-capable
 actor who rewrites the file and recomputes the chain is also out of scope. Treat
 it as integrity evidence with OS file permissions and periodic off-box
 checkpointing, not as a cryptographic guarantee against a privileged attacker.

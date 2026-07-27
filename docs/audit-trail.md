@@ -130,6 +130,22 @@ The hash is computed over the canonical string
 via `JournalWriter.compute_hash(...)` (a static method, exposed for callers who
 want to recompute a hash independently).
 
+> **Entry ordering and content are tamper-evident; entry timestamps are not.**
+> Read the canonical string above for what the chain covers: `sequence_number`
+> and `parent_hash` bind each entry's position in the order, and `mutation_type`,
+> `target_id`, and `delta` bind what it says happened — change any of them
+> without recomputing the affected hashes and verification fails. `created_at`
+> and `entry_id` are **not** in the hash preimage, so rewriting them changes no
+> hash: a journal whose every `created_at` has been rewritten still verifies as
+> `valid=True`. Treat `created_at` as an informative timestamp, not as evidence
+> of when a mutation happened. This is a property of the current chain format,
+> not a bug with a cheap fix — bringing `created_at` into the preimage changes
+> the expected hash of every entry ever written, so covering it is a
+> chain-format migration or verifier-versioning decision (keeping existing
+> journals verifiable is part of the problem, not a detail after it), never a
+> one-line change. See
+> [Security model & guarantees](#security-model--guarantees).
+
 ## Querying history
 
 Use `store.journal.get_entries(...)` to read the trail. All filters are
@@ -155,6 +171,24 @@ deletions = await store.journal.get_entries(
 | `mutation_type` | `None` | Filter by mutation type string |
 | `since` | `None` | ISO-8601 lower bound on `created_at` (inclusive) |
 | `limit` | `100` | Maximum entries returned |
+
+> **`since=` is a convenience filter, not an audit boundary.** It compares
+> `created_at >= since`, and `created_at` is outside the hash preimage (as is
+> `entry_id` — see [the schema note above](#the-journalentry-schema)). Rewriting
+> an entry's `created_at` **across** a window's lower bound can therefore remove
+> it from **or add it to** that window while `verify_journal()` still reports
+> `valid=True` — the two effects compound instead of one catching the other. A
+> rewrite that stays inside one particular window leaves membership in that window
+> unchanged, but it still changes the timestamp `get_entries` returns to the
+> caller and may change membership under other lower bounds; because the deciding
+> column is unprotected, no `since=` result is evidence. Use `since=` to narrow a
+> report over a trusted journal; do not treat "nothing since T" as proof that
+> nothing happened since T, nor an entry's presence in the window as proof that it
+> happened after T. Chain-covered fields (`sequence_number`, `parent_hash`) are
+> what a
+> time-bounded claim has to be anchored on: record the
+> `(sequence_number, entry_hash)` you saw at T and audit forward from that
+> sequence number.
 
 ## Verifying integrity
 
@@ -192,12 +226,16 @@ An empty journal verifies as `valid=True` with `entries_checked=0`.
 disk has self-consistent hashed content and links to the preceding row that was
 walked. It detects an in-row journal mutation, a changed parent link, or a
 mid-chain deletion/reordering when the affected hashes have not been
-recomputed. It does **not** provide either of these separate guarantees:
+recomputed. It does **not** provide any of these separate guarantees:
 
 - **Chain length / tail completeness.** Removing a self-consistent suffix leaves
   a valid prefix, so `verify_journal()` cannot know that newer entries once
   existed. Detect this with an externally retained high-water mark and tail
   anchor, such as the expected `(sequence_number, entry_hash)` at a checkpoint.
+- **Entry timestamps.** `created_at` is outside the hash preimage, so a chain
+  whose timestamps have all been rewritten verifies exactly like an untouched
+  one. What the walk proves is the order and the content of the entries it read,
+  not when they were written.
 - **Live-table reconciliation.** The verifier reads `journal_entry`; it does not
   compare the current thought, edge, embedding, or action tables with the latest
   journal deltas. A direct edit to a live thought or edge row is outside this
@@ -294,7 +332,9 @@ SQLite file** it protects. `verify_integrity()` recomputes each entry's hash
 from that entry's own stored data — there is no secret key, HMAC, signature, or
 external anchor.
 
-**What it protects against (in scope):**
+**What it protects against (in scope):** the **ordering and content** of the
+entries still on disk — both are in the hash preimage, so neither can be changed
+without breaking the chain unless the affected hashes are recomputed.
 
 - **Accidental corruption inside the retained journal rows** — changed hashed
   content or parent linkage makes verification fail.
@@ -306,6 +346,17 @@ external anchor.
 
 - **Self-consistent tail removal.** The retained prefix still verifies. An
   external high-water mark or tail anchor is required to prove expected length.
+- **Entry timestamps (`created_at`) and `entry_id`.** Neither is in the hash
+  preimage. Rewriting every `created_at` in the journal — backdating the whole
+  trail — leaves a chain that verifies as `valid=True`. A rewrite that moves an
+  entry across a `get_entries(since=...)` lower bound also changes that window's
+  contents, in either direction: downward hides the entry from the window,
+  upward plants it inside one it did not belong to. The filter reads the same
+  unprotected column, so a timestamp-based claim about the journal ("no
+  deletions in the last 24 hours", or "this deletion happened during the
+  incident") rests on data the chain does not protect. Anchor time claims on the
+  chain-covered `(sequence_number, entry_hash)` pair recorded at a known point
+  instead.
 - **Direct edits to live records.** Verification does not replay the journal or
   reconcile thought/edge/action state against it.
 - **A chain-aware actor with write access to the database file.** Because the
