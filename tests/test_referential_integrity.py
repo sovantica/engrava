@@ -13,6 +13,11 @@ Covered surface:
 * The v11 → v12 migration recreates child tables with FK clauses,
   purges pre-existing orphans, preserves valid rows, is idempotent,
   and recovers cleanly when re-run after a partial completion.
+* The documented consequence of running *without* that migration:
+  on a pre-cascade (core-11) database a deleted thought's ``embedding``
+  row survives, so ``sync_embeddings`` puts its vector back and
+  ``search_similar`` keeps returning the deleted **identifier** while the
+  content is gone. Pinned against the head-schema control, which does not.
 
 Every assertion uses raw SQLite reads (not the public ORM) so the
 data-layer guarantees stay visible even if the higher-level API ever
@@ -22,7 +27,9 @@ masks them.
 from __future__ import annotations
 
 import datetime
+import importlib.util
 import uuid
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -50,6 +57,7 @@ from engrava.domain.exceptions import (
 from engrava.domain.models.action import ActionRecord
 from engrava.domain.models.edge import EdgeRecord
 from engrava.domain.models.thought import ThoughtRecord
+from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
 from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
 
 if TYPE_CHECKING:
@@ -1233,3 +1241,190 @@ class TestAddColumnIfAbsentExactMatch:
         """A non-duplicate OperationalError (e.g. no such table) propagates."""
         with pytest.raises(aiosqlite.OperationalError):
             await store._add_column_if_absent("no_such_table", "c", "TEXT")
+
+
+# ----------------------------------------------------------------------
+# Deletion on a database that never ran the v11 → v12 migration
+# ----------------------------------------------------------------------
+
+#: The core ``user_version`` that first declares ``ON DELETE CASCADE`` on the
+#: child tables (reached by ``_migrate_core_v11_to_v12``). Anything below it is
+#: a "pre-cascade" database: the constraint is simply not in the schema.
+_FIRST_CASCADING_CORE_VERSION = 12
+
+_PRE_CASCADE_DIMENSION = 3
+_PRE_CASCADE_MODEL = "unmigrated-probe"
+_SURVIVOR_ID = "t-keep"
+_DELETED_ID = "t-drop"
+#: Chosen so the *deleted* thought is the nearest neighbour and the survivor the
+#: second: a result set that dropped everything, or returned everything, is
+#: distinguishable from one that returns exactly the phantom plus the survivor.
+_QUERY_VECTOR = [0.9, 0.1, 0.0]
+
+
+@dataclass(frozen=True)
+class _PostDeleteObservation:
+    """What one delete-then-reconcile run left behind, read back from storage."""
+
+    core_version: int
+    #: ``owner_id``s still present in the ``embedding`` table after the delete.
+    embedding_owner_ids: list[str]
+    #: Rows ``sync_embeddings`` considered valid backfill sources afterwards.
+    backfilled: int
+    #: Identifiers ``search_similar`` returns after the reconcile.
+    search_similar_ids: list[str]
+    #: The deleted id hydrated through the public read API.
+    hydrated_deleted: ThoughtRecord | None
+    #: ``delete_thought``'s own report — a self-report, asserted last.
+    delete_reported: bool
+
+
+async def _delete_then_reconcile(
+    db_path: Path,
+    *,
+    pre_cascade: bool,
+) -> _PostDeleteObservation:
+    """Run the same deletion scenario against one schema version or the other.
+
+    The **only** difference between the two arms is the schema the store is
+    opened on: ``pre_cascade=True`` bootstraps the legacy core-11 tables (the
+    shared :meth:`TestMigrationV11ToV12._bootstrap_v11_schema`, i.e. no FK
+    clauses), ``pre_cascade=False`` runs ``ensure_schema`` up to the head
+    version. Corpus, vectors, query, delete call and reconcile are identical.
+
+    The reconcile step is a direct ``sync_embeddings`` call, which is what a
+    fresh sqlite-vec-enabled open performs against an existing database.
+    """
+    db = await aiosqlite.connect(str(db_path))
+    db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA foreign_keys=ON")
+    store = SqliteEngravaCore(db, embedding_provider=None, auto_embed=False)
+    store._owns_connection = True
+    try:
+        if pre_cascade:
+            await TestMigrationV11ToV12._bootstrap_v11_schema(db)
+        else:
+            await store.ensure_schema()
+        cursor = await db.execute("PRAGMA user_version")
+        version_row = await cursor.fetchone()
+        assert version_row is not None
+        core_version = int(version_row[0])
+
+        await store._configure_vector_backend(
+            backend_name="sqlite-vec",
+            embedding_dimension=_PRE_CASCADE_DIMENSION,
+        )
+        backend = store._vector_backend
+        # Precondition, not a self-report: without a real vec0 backend the whole
+        # scenario measures the numpy fallback instead.
+        assert isinstance(backend, SqliteVecSearchBackend)
+
+        for tid in (_SURVIVOR_ID, _DELETED_ID):
+            await db.execute(
+                "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+                "VALUES (?, 'OBSERVATION', ?, ?, 'P3')",
+                (tid, tid, tid),
+            )
+        await db.commit()
+        await store.store_embedding(
+            thought_id=_SURVIVOR_ID,
+            vector=[1.0, 0.0, 0.0],
+            model_name=_PRE_CASCADE_MODEL,
+        )
+        await store.store_embedding(
+            thought_id=_DELETED_ID,
+            vector=list(_QUERY_VECTOR),
+            model_name=_PRE_CASCADE_MODEL,
+        )
+        # Precondition: both ids are live search hits before anything is deleted,
+        # so an "absent afterwards" reading cannot be an index that never worked.
+        seeded = [r[0] for r in await store.search_similar(_QUERY_VECTOR, top_k=5)]
+        assert seeded == [_DELETED_ID, _SURVIVOR_ID], seeded
+
+        delete_reported = await store.delete_thought(_DELETED_ID)
+
+        cursor = await db.execute("SELECT owner_id FROM embedding WHERE owner_type = 'THOUGHT'")
+        embedding_owner_ids = [str(row["owner_id"]) for row in await cursor.fetchall()]
+        backfilled = await backend.sync_embeddings(db)
+        search_similar_ids = [r[0] for r in await store.search_similar(_QUERY_VECTOR, top_k=5)]
+        hydrated_deleted = await store.get_thought(_DELETED_ID)
+    finally:
+        await store.close()
+
+    return _PostDeleteObservation(
+        core_version=core_version,
+        embedding_owner_ids=embedding_owner_ids,
+        backfilled=backfilled,
+        search_similar_ids=search_similar_ids,
+        hydrated_deleted=hydrated_deleted,
+        delete_reported=delete_reported,
+    )
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("sqlite_vec") is None,
+    reason="sqlite-vec package not installed",
+)
+class TestDeletionOnAPreCascadeSchema:
+    """Deleting on a database below core-12 leaves the identifier reachable.
+
+    This pins a **documented non-guarantee**, not a wanted behaviour: see
+    ``docs/known-limitations.md`` ("Deletion on a database that has not been
+    migrated") and ``docs/data-lifecycle.md``. A durable fix would make the
+    first test below fail, which is the point of pinning it.
+    """
+
+    async def test_pre_cascade_delete_leaves_the_identifier_in_vector_results(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Core-11: the embedding row survives, so the deleted id comes back.
+
+        Chain, each link asserted here: no FK cascade leaves the ``embedding``
+        row → ``sync_embeddings`` treats it as a valid backfill source →
+        ``search`` maps the restored vec rowid back through ``embedding`` →
+        ``search_similar`` returns the deleted identifier. The content does
+        **not** come back: hydrating the id yields ``None``.
+        """
+        observed = await _delete_then_reconcile(
+            tmp_path / "pre-cascade.db",
+            pre_cascade=True,
+        )
+
+        assert observed.core_version < _FIRST_CASCADING_CORE_VERSION
+        # The mechanism: nothing cascaded the embedding row away.
+        assert sorted(observed.embedding_owner_ids) == [_DELETED_ID, _SURVIVOR_ID]
+        assert observed.backfilled == 1
+        # The disclosure: the deleted identifier is back in the ranked window.
+        assert _DELETED_ID in observed.search_similar_ids
+        # Second control — the un-deleted sibling is still returned, so this
+        # cannot pass against a search path that returns everything or nothing.
+        assert _SURVIVOR_ID in observed.search_similar_ids
+        # ...and the content really is gone. The caveat is identifier
+        # reachability, never resurfaced content.
+        assert observed.hydrated_deleted is None
+        assert observed.delete_reported is True
+
+    async def test_head_schema_delete_removes_the_identifier(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Head schema: the same run leaves the id absent from the same query.
+
+        The schema-version control for the test above. Same corpus, same
+        query, same delete — only the schema differs, so a phantom that shows
+        up there and not here is attributable to the missing cascade and to
+        nothing else about the scenario.
+        """
+        observed = await _delete_then_reconcile(
+            tmp_path / "head.db",
+            pre_cascade=False,
+        )
+
+        assert observed.core_version >= _FIRST_CASCADING_CORE_VERSION
+        assert observed.embedding_owner_ids == [_SURVIVOR_ID]
+        assert observed.backfilled == 0
+        assert _DELETED_ID not in observed.search_similar_ids
+        assert _SURVIVOR_ID in observed.search_similar_ids
+        assert observed.hydrated_deleted is None
+        assert observed.delete_reported is True

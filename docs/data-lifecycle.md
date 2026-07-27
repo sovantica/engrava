@@ -177,6 +177,20 @@ archive-then-gc) the thought rows → purge the matching `journal_entry` rows if
 journaling is on → roll the deletion through your backup retention. Don't treat
 "the thought no longer appears in search" as "the data is gone."
 
+> **On an un-migrated database the identifier outlives the content.** This is a
+> fourth residue and it is not content: on a database still below the **core-12**
+> schema (no foreign-key cascades), with a sqlite-vec backend actually active, a
+> deleted thought's `embedding` row is not cascaded away, so the reconcile puts
+> its vector back and the `vec0` arm keeps returning the **deleted id**. That arm
+> serves `search_similar()` always, and `search_hybrid()` / `recall()` whenever
+> `filters` / `visibility` compile to no effective predicate — which includes an
+> **empty** `MetadataFilter`, so passing one is not protection. The row and its
+> `content` really are gone — hydrating that id yields `None` — but the index
+> still discloses that a thought matching the query existed, and if the phantom
+> reaches the returned window it consumes one of the `top_k` slots. Run
+> `engrava migrate` before treating a deletion as an erasure. Full mechanism:
+> [Known Limitations → Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated).
+
 > **Memory-hygiene GC is a hard delete, not erasure.** The opt-in
 > [Forgetting](memory-hygiene.md) garbage-collection stage removes archived rows
 > exactly like the deletes above: it reclaims the live/queryable working set, but

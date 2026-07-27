@@ -220,6 +220,83 @@ a forgotten (archived) thought stops surfacing without being deleted.
   include archived rows (they are not ranked retrieval) — filter on
   `lifecycle_status` yourself if you need them excluded there.
 
+## Deletion on a database that has not been migrated
+
+Foreign-key `ON DELETE CASCADE` on the child tables (`edge`, `embedding`,
+`action`) arrives with the **core-12** schema migration. A database carried
+forward from an older engrava and never migrated is still below that version, so
+nothing cascades. On such a database a deleted thought's **identifier** stays
+reachable through the `vec0` vector arm.
+
+**Three conditions must all hold.**
+
+1. The database is **below core-12**. A freshly created store is not affected: a
+   new database is bootstrapped at the head schema version, cascades included.
+2. **A sqlite-vec backend is actually active on the store** — `vector_backend:
+   sqlite-vec` *and* the extension loaded. If the load fails the store logs a
+   warning and falls back to NumPy, which closes the gap; so does the default
+   `vector_backend: numpy`. Either way the NumPy candidate query joins
+   `thought`, and a row that is gone cannot be scored.
+3. **The query reaches the `vec0` arm**, which it does whenever no *effective*
+   metadata predicate applies. `search_similar()` takes no filter argument, so
+   it is always on that arm. For `search_hybrid()` / `recall()`, `filters` and
+   `visibility` are compiled together into one predicate, and a query carrying
+   one is routed to the NumPy path even under sqlite-vec (the `vec0` table
+   declares no metadata columns, so the predicate could only run as a
+   post-`MATCH` join). What matters is whether that compilation produces
+   anything:
+   - `filters=None`, **an empty `MetadataFilter`**, and `visibility=None`
+     compile to nothing. The query stays on the `vec0` arm and **is** affected —
+     passing an empty filter is not protection.
+   - a `MetadataFilter` holding at least one predicate, or **any**
+     `VisibilityQueryFilter` at all, compiles to a predicate. That query takes
+     the NumPy path, which joins `thought` and excludes the orphan on any schema
+     version.
+
+**What deletion does regardless of schema version.** The `thought` row is
+removed and its `content` with it. Resolving the identifier — `get_thought()`,
+or any read that hydrates an id into a record — returns `None`. The content does
+not come back.
+
+**What survives below core-12.** Nothing removes the thought's `embedding` row,
+so it stays. Two lookups then read ownership as that row rather than as the
+thought behind it:
+
+- `sync_embeddings`, the reconcile that runs when a sqlite-vec-enabled
+  connection opens, picks backfill candidates from the `embedding` table alone.
+  The leftover row qualifies, so its vector is re-inserted into `embedding_vec`
+  — including the vector that `delete_thought` had explicitly removed moments
+  earlier.
+- Vector search maps `embedding_vec` rowids back to ids through that same
+  `embedding` table, and the post-search eligibility filter is an *exclusion*
+  query over `thought`: a thought row that no longer exists produces no
+  exclusion, so the id passes through.
+
+So on such a database, after a delete that reported success:
+
+- the `vec0` arm returns the **deleted identifier** with a similarity score.
+  From `search_similar()` that arm's output *is* the result; in
+  `search_hybrid()` / `recall()` it is one input to fusion;
+- a caller therefore learns that **a thought matching this query exists** in the
+  index. Where the deletion answered an erasure request rather than being
+  routine housekeeping, that existence signal is the disclosure that matters;
+- **if the phantom reaches the returned window** it consumes one of the `top_k`
+  slots. It need not: on a hybrid query, fusion and the final truncation to
+  `top_k` can leave it outside the window altogether. And when it does land
+  there, it costs you a live result only if at least one further live candidate
+  would otherwise have qualified — the window is a truncation of whatever
+  ranked, not a fixed-size budget the phantom takes a share of.
+
+**What to do: migrate.** Run `engrava migrate` (or open the store through
+`from_config()`, which calls `ensure_schema()`). The core-12 step recreates the
+three child tables with `ON DELETE CASCADE` and purges any orphan rows that had
+already accumulated. After it, deleting a thought takes its `embedding` row with
+it and the reconcile has nothing left to backfill.
+
+```bash
+engrava --db engrava.db migrate
+```
+
 ## Maximum Database Size
 
 SQLite supports databases up to 281 TB (theoretical). In practice, engrava
