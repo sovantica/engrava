@@ -125,11 +125,25 @@ jobs:
   #
   # ENGRAVA_UPGRADE_FROM_SPEC pins the previous release; bump it on every
   # release so the job always exercises the real previous-release -> HEAD path
-  # (e.g. 0.5.0 ships schema 18, HEAD ships schema 19, so this run drives the
-  # v18 -> v19 migration through a genuine reinstall).
+  # (e.g. 0.5.0 ships schema 18, HEAD ships schema 20, so this run drives the
+  # v18 -> v20 migration through a genuine reinstall).
   upgrade-matrix:
     name: Upgrade matrix (last released -> current)
     runs-on: ubuntu-latest
+    # This job's regression mode is a hang rather than a red run: it drives
+    # aiosqlite connections, whose worker runs on a non-daemon thread, so a
+    # failure escaping before close() blocks the interpreter at shutdown and an
+    # uncapped job would burn the six-hour default.
+    #
+    # The fixture's own connections close in finally: blocks, but that does not
+    # cover everything this job runs. It also invokes the engrava CLI, which
+    # opens connections on paths that are not equally guarded: a corrupt or
+    # unreadable database can still hang the `snapshot`, `gc` and `migrate`
+    # commands this job runs. Repairing that is a source change, tracked
+    # separately and deliberately not made here. Until it lands, this cap is the
+    # backstop, and it is what turns such a hang into a failure instead of a
+    # stalled run.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
