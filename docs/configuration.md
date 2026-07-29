@@ -195,6 +195,18 @@ behaviour.
   install the `sqlite-vec` extra (and check for the load warning) if you intend
   to run on the native index.
 
+  **`engrava gc` is the one path that does not fall back — it refuses.** If the
+  database already carries an `embedding_vec` table from an earlier run *with*
+  the extra, a `gc` pass that is about to physically delete stops before
+  deleting anything and exits `1` (`Install 'engrava[vec]' and retry`), because
+  removing the rows without removing their vectors would strand those vectors in
+  the index. `--dry-run` is never refused, and neither is a run with nothing to
+  delete — but note that `gc --expired` under the default `ttl.strategy: archive`
+  stops after archiving only when it actually archived something, and with no
+  expired rows falls through to the archived-collection pass, which *is* refused
+  when there are archived rows to collect. See
+  [CLI reference → `gc`](cli.md#gc).
+
 ### `embeddings`
 
 Embedding provider configuration. (The YAML key is `embeddings`, plural.) The

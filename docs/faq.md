@@ -138,8 +138,9 @@ Advance the cycle each turn when your application has a meaningful cadence; use
 Because Engrava uses WAL mode, a naive copy of just the `.db` file can miss
 in-flight data in the `-wal` file. Use a WAL-safe approach — checkpoint then
 copy, `VACUUM INTO`, or SQLite's backup API. Note that a logical snapshot does
-**not** include the audit journal. See [Upgrade Guide](upgrade.md) for the
-current backup guidance.
+**not** include the audit journal. See
+[Backup & Recovery](backup-and-recovery.md) for the current backup guidance —
+both backup kinds, the WAL-safe procedure, and restore.
 
 ## Is the audit trail tamper-proof?
 

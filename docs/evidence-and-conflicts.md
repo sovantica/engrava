@@ -105,6 +105,18 @@ claim cascades to this edge row. That cascade does not produce a separate
 deleted through a journaled store path, the journal records its
 `DELETE_THOUGHT` mutation instead.
 
+**Below core schema 12 this cascade does not happen.** The `ON DELETE CASCADE` on
+`edge`, `embedding` and `action` arrives with the core-12 migration, so on a database
+carried forward from an older engrava and never migrated the thought's `embedding` row
+outlives the delete. The delete does still purge that thought's own `vec0` vector, so
+the identifier is **not** reachable straight afterwards; it returns once the reconcile
+that runs on the next sqlite-vec-enabled open backfills the index from the surviving
+`embedding` row. From then on it is an ordinary candidate on that arm whenever a
+sqlite-vec backend is **active** on the store and the query carries no effective
+metadata predicate — the arm *can* return it, subject to the same similarity threshold
+and `top_k` window as any live row. Run `engrava migrate`. See
+[Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated).
+
 ## Complete example
 
 The following script uses an explicit single-value domain rule. It stores two

@@ -184,6 +184,18 @@ Stage 2 (garbage collection) runs **only** when `auto_gc_enabled` is set (it is
   [REFLECTION](dreaming.md) is left summarising a cluster the delete would empty),
   then cascades to edges/embeddings/actions, then purges the vector index.
 
+**Below core schema 12 this cascade does not happen.** The `ON DELETE CASCADE` on
+`edge`, `embedding` and `action` arrives with the core-12 migration, so on a database
+carried forward from an older engrava and never migrated the thought's `embedding` row
+outlives the delete. The delete does still purge that thought's own `vec0` vector, so
+the identifier is **not** reachable straight afterwards; it returns once the reconcile
+that runs on the next sqlite-vec-enabled open backfills the index from the surviving
+`embedding` row. From then on it is an ordinary candidate on that arm whenever a
+sqlite-vec backend is **active** on the store and the query carries no effective
+metadata predicate — the arm *can* return it, subject to the same similarity threshold
+and `top_k` window as any live row. Run `engrava migrate`. See
+[Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated).
+
 > **GC is not erasure.** Garbage collection reclaims the live, queryable working
 > set — it does **not** purge history. When the [hash-chain journal](audit-trail.md)
 > is enabled, a GC delete is recorded as a `DELETE_THOUGHT` entry that keeps a full

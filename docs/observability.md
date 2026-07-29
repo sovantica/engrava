@@ -143,17 +143,21 @@ SQL queries.
 The expired-backlog and audit-integrity signals are **not** in the metrics
 snapshot — compute them from the calls shown above on your own cadence.
 
-The audit-integrity check applies **only when journaling is enabled**
-(`journal.enabled: true`). With journaling off, `store.journal` is `None`, so
-guard the call:
+`store.journal.verify_integrity()` needs an active writer: with
+`journal.enabled: false`, `store.journal` is `None`. Do **not** report that case
+as healthy — entries written in an earlier session stay in `journal_entry`, so a
+store reopened with journaling off still has a chain that can be tampered with
+and still needs verifying. Monitor through `store.verify_journal()`, which audits
+whatever chain is on disk **independent of the current `journal.enabled` state**
+and returns `valid=True` with `entries_checked=0` when there is no chain at all:
 
 ```python
 async def journal_ok(store) -> bool:
-    if store.journal is None:
-        return True  # journaling disabled — nothing to verify
-    result = await store.journal.verify_integrity()
+    result = await store.verify_journal()
     return result.valid
 ```
+
+See [Audit Trail → verifying integrity](audit-trail.md#verifying-integrity).
 
 ### Health check
 

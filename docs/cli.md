@@ -275,9 +275,31 @@ engrava --db engrava.db gc --expired --dry-run
 
 The behaviour of `gc --expired` depends on `ttl.strategy`: with `delete` it
 removes expired rows and then collects pre-existing archived rows; with the
-default `archive` it archives the expired rows and stops (it does not collect
-them in the same pass). See
+default `archive` it archives the expired rows and stops **only if it archived at
+least one** — collecting the rows it just archived would defeat the soft-retire.
+With no expired rows to archive it falls through to collecting pre-existing
+`ARCHIVED` rows. See
 [Data lifecycle → running cleanup](data-lifecycle.md#running-cleanup).
+
+> **`gc` refuses to delete on a `vec0`-indexed store without the vector extra.**
+> If the database carries an `embedding_vec` table and `sqlite-vec` cannot be
+> loaded — most commonly because `engrava[vec]` is not installed, though an
+> unsupported build, an OS error or a SQLite error fail the same way — a pass that
+> is about to physically delete stops **before deleting anything** and exits `1`
+> with:
+>
+> ```text
+> Error: This database has a sqlite-vec index, and collecting thoughts without removing their vectors would strand them in it. Install 'engrava[vec]' and retry.
+> ```
+>
+> Removing the rows without removing their vectors would strand those vectors in
+> an index nothing can then reach them through. Only *deleting* passes are
+> refused: `--dry-run` is never refused, and neither is a run with nothing to
+> delete. Read the archive strategy carefully, though — `gc --expired` under the
+> default `ttl.strategy: archive` stops after archiving **only when it actually
+> archived something**. With no expired rows to archive it falls through to the
+> archived-collection pass, which *is* refused when there are archived rows to
+> collect. Install the extra (`pip install 'engrava[vec]'`) and retry.
 
 ### `migrate`
 

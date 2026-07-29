@@ -130,12 +130,25 @@ note in the API reference.
 Engrava validates edge shape and referential integrity but does not infer the
 relationship or reason over it. The database permits at most one edge for each
 `(from_thought_id, to_thought_id, edge_type)` triple, independent of `edge_id`;
-creating a duplicate triple raises a database integrity error. Deleting either
+attempting to insert the same directed, typed relationship twice raises
+`DuplicateEdgeError`. Deleting either
 endpoint thought cascades to the edge row. That cascade is part of the thought
 deletion and, when journaling is enabled, does not emit a separate `DELETE_EDGE`
 journal entry. For a recommended direction convention for claims, evidence, and
 `CONTESTED_BY`, see
 [Evidence and conflicts](evidence-and-conflicts.md).
+
+**Below core schema 12 this cascade does not happen.** The `ON DELETE CASCADE` on
+`edge`, `embedding` and `action` arrives with the core-12 migration, so on a database
+carried forward from an older engrava and never migrated the thought's `embedding` row
+outlives the delete. The delete does still purge that thought's own `vec0` vector, so
+the identifier is **not** reachable straight afterwards; it returns once the reconcile
+that runs on the next sqlite-vec-enabled open backfills the index from the surviving
+`embedding` row. From then on it is an ordinary candidate on that arm whenever a
+sqlite-vec backend is **active** on the store and the query carries no effective
+metadata predicate — the arm *can* return it, subject to the same similarity threshold
+and `top_k` window as any live row. Run `engrava migrate`. See
+[Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated).
 
 ## Embedding
 

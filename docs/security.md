@@ -202,6 +202,23 @@ compensate: it reads the same unprotected column. Treat journal timestamps as
 informative and anchor any time-bounded claim on a `(sequence_number,
 entry_hash)` pair captured externally.
 
+The preimage joins those five fields with `|` and no escaping, writing an absent
+field as the empty string. Their separation therefore rests on what the fields
+themselves can hold — a decimal `sequence_number`, one of seven fixed
+`mutation_type` literals, a SHA-256 hex `parent_hash`, and a `delta` that is
+always a JSON object dump whose quoting a caller-chosen `target_id` cannot
+imitate — rather than on the encoding. Those grammars hold **for the entries the
+store emits**; they are not enforced by `JournalWriter.append()`, which is
+exported, so a caller writing entries through it directly can produce two
+distinct entries with one preimage and one hash. That takes in-process code
+execution against your own store, which this threat model already treats as past
+the boundary — but read the binding as a property of the store's field grammars,
+not as one the format guarantees. Verification also re-serialises the stored `delta`
+before hashing it, so the chain binds that delta's decoded **value** and not its
+stored bytes: a rewrite of the blob's key order, whitespace, or escaping that
+preserves the value verifies clean. See
+[Audit Trail → security model](audit-trail.md#security-model--guarantees).
+
 For a stronger control:
 
 - enable scheduled verification or `journal.verify_on_open` where its linear
@@ -229,6 +246,19 @@ backups, and freed SQLite pages do not shrink the file until a rebuild such as
 snapshots and physical backups, replicas or exports, and the retention policy of
 any remote provider that received the text. Purging journal entries breaks the
 chain and requires an explicit re-baseline if journal verification is retained.
+
+One residue is version-dependent and easy to miss: **on a database still below
+core schema 12 a hard delete leaves the thought's `embedding` row behind**. The
+delete does purge that thought's own `vec0` vector, so the index is clean
+immediately afterwards — but the reconcile on the next sqlite-vec-enabled open
+backfills it from the surviving `embedding` row, and from then on the deleted
+**identifier** — not its content, which is gone — is returned by a vector query
+that carries no effective metadata predicate on an active sqlite-vec backend.
+That is an existence signal about a record an erasure request asked you to
+remove, and checking the index straight after the delete will not reveal it.
+`engrava migrate` closes it and purges the orphans that had already accumulated.
+See
+[Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated).
 
 See [Data Lifecycle](data-lifecycle.md) for the complete retention and erasure
 procedure.

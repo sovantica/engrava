@@ -225,8 +225,12 @@ a forgotten (archived) thought stops surfacing without being deleted.
 Foreign-key `ON DELETE CASCADE` on the child tables (`edge`, `embedding`,
 `action`) arrives with the **core-12** schema migration. A database carried
 forward from an older engrava and never migrated is still below that version, so
-nothing cascades. On such a database a deleted thought's **identifier** stays
-reachable through the `vec0` vector arm.
+nothing cascades. On such a database a deleted thought's **identifier** becomes
+reachable again through the `vec0` vector arm — not immediately. The delete does
+purge that thought's own vector from the index; what it cannot remove is the
+`embedding` row behind it, and the reconcile that runs on the next
+sqlite-vec-enabled open puts the vector back from that row. Everything below
+describes the state **after** that reconcile.
 
 **Three conditions must all hold.**
 
@@ -272,7 +276,8 @@ thought behind it:
   query over `thought`: a thought row that no longer exists produces no
   exclusion, so the id passes through.
 
-So on such a database, after a delete that reported success:
+So on such a database, after a delete that reported success **and after that
+reconcile has run** — the delete itself leaves the index clean:
 
 - the `vec0` arm returns the **deleted identifier** with a similarity score.
   From `search_similar()` that arm's output *is* the result; in

@@ -110,6 +110,18 @@ are outside journal coverage generally; only action status and verification
 transitions are covered. Call `delete_edge()` explicitly when an individually
 journaled edge deletion is required.
 
+**Below core schema 12 this cascade does not happen.** The `ON DELETE CASCADE` on
+`edge`, `embedding` and `action` arrives with the core-12 migration, so on a database
+carried forward from an older engrava and never migrated the thought's `embedding` row
+outlives the delete. The delete does still purge that thought's own `vec0` vector, so
+the identifier is **not** reachable straight afterwards; it returns once the reconcile
+that runs on the next sqlite-vec-enabled open backfills the index from the surviving
+`embedding` row. From then on it is an ordinary candidate on that arm whenever a
+sqlite-vec backend is **active** on the store and the query carries no effective
+metadata predicate — the arm *can* return it, subject to the same similarity threshold
+and `top_k` window as any live row. Run `engrava migrate`. See
+[Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated).
+
 ## The `JournalEntry` schema
 
 Each entry is an immutable `JournalEntry`:
@@ -335,6 +347,34 @@ external anchor.
 **What it protects against (in scope):** the **ordering and content** of the
 entries still on disk — both are in the hash preimage, so neither can be changed
 without breaking the chain unless the affected hashes are recomputed.
+
+That preimage is the five fields joined by `|` with no escaping, an absent field
+written as the empty string:
+`"{sequence_number}|{mutation_type}|{target_id}|{json.dumps(delta, sort_keys=True)}|{parent_hash}"`.
+Nothing in the encoding marks where one field ends and the next begins, so the
+fields stay distinguishable because of what they can hold, not because the format
+separates them. **For the entries the store emits** those grammars settle it:
+`sequence_number` is decimal digits, `mutation_type` is one of seven fixed
+literals, `parent_hash` is a SHA-256 hex digest (empty on the first entry), and
+`delta` is always a JSON object dump — whose quoting rules a caller-chosen
+`target_id` cannot imitate, so no identifier written through the store can move a
+field boundary.
+
+**That guarantee does not extend to arbitrary `JournalWriter.append()` calls.**
+`JournalWriter` is exported, and `append()` does not enforce the `mutation_type`
+vocabulary before hashing, so a caller driving it directly can write two distinct
+entries with one preimage and therefore one hash — `mutation_type="INSERT_THOUGHT"`
+with `target_id="x|"` collides with `mutation_type="INSERT_THOUGHT|x"` and no
+`target_id`. Exploiting it takes in-process code execution against your own store,
+which is already past the boundary this chain defends; treat the binding as a
+property of the store's own field grammars, not of the encoding.
+
+Verification also re-serialises the stored `delta` before hashing it
+(`json.loads` in, `json.dumps(..., sort_keys=True)` out), so what the chain binds
+is the delta's **decoded value**, not its stored bytes: rewriting the blob's key
+order, whitespace, or escaping without changing the value it decodes to verifies
+clean. Nothing the delta *says* can change that way — but do not read a matching
+hash as proof that the stored bytes are the ones originally written.
 
 - **Accidental corruption inside the retained journal rows** — changed hashed
   content or parent linkage makes verification fail.

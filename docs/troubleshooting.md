@@ -117,9 +117,17 @@ to error or to be interpreted as an FTS column filter.
 
 **Cause / behaviour.** It does neither. Only the real `essence:` and `content:`
 column filters are honoured; any other `token:token` (a URL scheme, a clock time)
-is split into ordinary search terms, so the query is safe to run and a genuinely
-malformed FTS expression degrades to zero FTS hits rather than raising. No action
-needed — this is the intended robustness.
+is split into ordinary search terms, so the query is safe to run. When a
+normalized full-text expression is a genuinely malformed FTS5 query, engrava logs
+a warning, increments the read-only `fts_match_failure_count` counter, and
+**retries once** through the bare normalization (unsafe characters dropped,
+wildcards collapsed to legal prefixes, any exposed `AND`/`OR`/`NOT` phrase-quoted
+so FTS5 cannot read it as an operator), which is always a valid MATCH; the FTS arm
+returns that query's matches (an empty set when the sanitized query matches
+nothing). It does not raise. No action needed — this is the intended robustness —
+though a rising `fts_match_failure_count` is how you see it happening. See
+[Keyword query syntax (FTS)](search.md#keyword-query-syntax-fts) and
+[Observability signals](observability.md#observability-signals).
 
 ## Dreaming promotes nothing (consolidation is inert)
 

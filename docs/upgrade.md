@@ -88,6 +88,21 @@ engrava --db my-data.db migrate
   file — freed pages return to SQLite's free-list. To reclaim file size, run
   `VACUUM`. See [Data lifecycle → reclaiming disk space](data-lifecycle.md#reclaiming-disk-space).
 
+  **If the upgraded install dropped the vector extra, `gc` will refuse rather
+  than run.** A database that carries an `embedding_vec` table from an earlier
+  run *with* `sqlite-vec` cannot be collected without it: a `gc` pass that is
+  about to physically delete stops **before deleting anything** and exits `1`
+  with `Install 'engrava[vec]' and retry`, because removing the rows without
+  removing their vectors would strand those vectors in the index. The same
+  refusal follows any other reason `sqlite-vec` fails to load — an unsupported
+  build, an OS error, a SQLite error — not only a missing extra. Reinstall as
+  `pip install 'engrava[vec]'` and retry. `--dry-run` is never refused, and
+  neither is a run with nothing to delete; but `gc --expired` under the default
+  `ttl.strategy: archive` stops after archiving only when it actually archived
+  something, and with no expired rows falls through to the archived-collection
+  pass, which *is* refused when there are archived rows to collect. See
+  [CLI reference → `gc`](cli.md#gc).
+
 ## If Migration Fails
 
 Migration errors should include the failing SQL or the extension responsible for

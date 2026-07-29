@@ -552,7 +552,7 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     (
         "docs/observability.md",
         "async def journal_ok",
-        "helper-function def assuming a store; verify_integrity asserted in the journal test",
+        "helper-function def assuming a store; verify_journal asserted in the journal test",
     ),
     (
         "docs/observability.md",

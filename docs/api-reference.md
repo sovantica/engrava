@@ -82,7 +82,7 @@ keyword arguments and does **not** return a UUID string.
 | `await restore_thought(thought_id, *, current_cycle=None)` | `ThoughtRecord` | Un-archive: transition an `ARCHIVED` thought back to `ACTIVE`, clearing both hygiene markers (`archived_at_cycle` and `archived_at`) so an archive round-trips with no data loss. The reversible counterpart to the memory-hygiene / TTL / manual archive paths, journaled as an `UPDATE_THOUGHT`. Raises `ThoughtNotFoundError` if missing, `InvalidTransitionError` if the thought is not currently `ARCHIVED`, `StaleDataError` if the guarded write matches no row — a competing cycle stamp or a delete (see `update_thought` for what that guard does and does not catch). This is the **canonical** un-archive path; a raw `update_thought(lifecycle_status=...)` back to `ACTIVE` does not manage those markers. |
 | `await list_thoughts(...)` | `list[ThoughtRecord]` | List with filters (keyword-only) |
 | `await count_thoughts(...)` | `int` | Count with filters (keyword-only) |
-| `await delete_thought(thought_id)` | `bool` | Hard delete; `True` if a row was removed. Deleting a thought also deletes every edge for which it is either endpoint, its embedding, and its linked actions. This is a physical cascade, unlike valid-time invalidation. |
+| `await delete_thought(thought_id)` | `bool` | Hard delete; `True` if a row was removed. Deleting a thought also deletes every edge for which it is either endpoint, its embedding, and its linked actions. This is a physical cascade, unlike valid-time invalidation. **Below core schema 12 this cascade does not happen.** The `ON DELETE CASCADE` on `edge`, `embedding` and `action` arrives with the core-12 migration, so on a database carried forward from an older engrava and never migrated the thought's `embedding` row outlives the delete. The delete does still purge that thought's own `vec0` vector, so the identifier is **not** reachable straight afterwards; it returns once the reconcile that runs on the next sqlite-vec-enabled open backfills the index from the surviving `embedding` row. From then on it is an ordinary candidate on that arm whenever a sqlite-vec backend is **active** on the store and the query carries no effective metadata predicate — the arm *can* return it, subject to the same similarity threshold and `top_k` window as any live row. Run `engrava migrate`. See [Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated). |
 | `await invalidate_thought(thought_id, valid_until)` | `ThoughtRecord` | Close the thought's *valid-time* interval at the given ISO-8601 instant — deterministic, idempotent, non-cascading, and **not a delete** (the row stays on file and remains retrievable for instants before `valid_until`). Raises `ThoughtNotFoundError` if missing. See [Bi-temporal Model](bitemporal.md#invalidate-vs-delete) |
 | `await record_access(thought_id)` | `None` | Mark a thought as accessed — bumps `access_count` and sets `last_accessed_at`; raises `ThoughtNotFoundError` if missing. Drives the access-frequency dreaming signal. |
 
@@ -218,6 +218,18 @@ different relationship remains a separate integrity failure. A **hard** thought
 delete cascades to edges where
 the thought is either endpoint; `invalidate_thought()` does not remove or
 invalidate any edge.
+
+**Below core schema 12 this cascade does not happen.** The `ON DELETE CASCADE` on
+`edge`, `embedding` and `action` arrives with the core-12 migration, so on a database
+carried forward from an older engrava and never migrated the thought's `embedding` row
+outlives the delete. The delete does still purge that thought's own `vec0` vector, so
+the identifier is **not** reachable straight afterwards; it returns once the reconcile
+that runs on the next sqlite-vec-enabled open backfills the index from the surviving
+`embedding` row. From then on it is an ordinary candidate on that arm whenever a
+sqlite-vec backend is **active** on the store and the query carries no effective
+metadata predicate — the arm *can* return it, subject to the same similarity threshold
+and `top_k` window as any live row. Run `engrava migrate`. See
+[Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated).
 
 ```python
 import uuid

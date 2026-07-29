@@ -140,14 +140,35 @@ engrava gc                      # delete ARCHIVED thoughts (+ orphaned edges)
 - **With `ttl.strategy: delete`:** the expired rows are deleted outright, and the
   same pass then garbage-collects any pre-existing `ARCHIVED` thoughts.
 - **With `ttl.strategy: archive` (default):** the expired rows are *archived*
-  (marked `ARCHIVED`), and the pass **stops there** — it does **not** also
-  garbage-collect archived rows in the same run. (Collecting the rows it just
-  archived would defeat the soft-retire.) To physically remove archived rows you
-  must either run a **separate** `engrava gc`, or switch to `ttl.strategy:
-  delete`.
+  (marked `ARCHIVED`), and the pass **stops there — but only if it archived at
+  least one row.** (Collecting the rows it just archived would defeat the
+  soft-retire.) With **no** expired rows to archive it falls through to collecting
+  pre-existing `ARCHIVED` rows, exactly as a plain `engrava gc` would. So a
+  repeated `gc --expired` under the archive strategy does eventually collect: it
+  stops on the run that archives something and collects on the run that does not.
 
 Plain `engrava gc` (no `--expired`) removes `ARCHIVED` thoughts and their
 orphaned edges. This is how archived data is finally deleted from the live table.
+
+> **`gc` refuses to delete on a `vec0`-indexed store without the vector extra.**
+> If the database carries an `embedding_vec` table and `sqlite-vec` cannot be
+> loaded — most commonly because `engrava[vec]` is not installed, though an
+> unsupported build, an OS error or a SQLite error fail the same way — a pass that
+> is about to physically delete stops **before deleting anything** and exits `1`
+> with:
+>
+> ```text
+> Error: This database has a sqlite-vec index, and collecting thoughts without removing their vectors would strand them in it. Install 'engrava[vec]' and retry.
+> ```
+>
+> Removing the rows without removing their vectors would strand those vectors in
+> an index nothing can then reach them through. Only *deleting* passes are
+> refused: `--dry-run` is never refused, and neither is a run with nothing to
+> delete. Read the archive strategy carefully, though — `gc --expired` under the
+> default `ttl.strategy: archive` stops after archiving **only when it actually
+> archived something**. With no expired rows to archive it falls through to the
+> archived-collection pass, which *is* refused when there are archived rows to
+> collect. Install the extra (`pip install 'engrava[vec]'`) and retry.
 
 ## GDPR and hard deletion
 
@@ -158,9 +179,12 @@ can retain the content:
 1. **Archive does not erase.** Under the default `ttl.strategy: archive`, an
    "expired" thought is only marked `ARCHIVED` — the row and its `content` remain
    in the database. Note that `engrava gc --expired` under the `archive` strategy
-   *archives* the rows and stops; it does **not** delete archived rows in the same
-   pass. To remove the row you must run a **separate** `engrava gc` afterwards, or
-   use `ttl.strategy: delete` so the row is deleted outright.
+   *archives* the rows and stops **only if it archived at least one** — on that run
+   it does not also delete archived rows. With no expired rows to archive the same
+   command falls through and **does** collect pre-existing `ARCHIVED` rows, so do
+   not read "it only archives" as a guarantee that nothing was deleted. To remove
+   the row deliberately, run a **separate** `engrava gc`, or use
+   `ttl.strategy: delete` so the row is deleted outright.
 2. **The audit journal retains a content delta.** If the
    [audit journal](audit-trail.md) is enabled, deleting a thought does **not**
    remove its content from the journal. The original `INSERT_THOUGHT` entry holds
