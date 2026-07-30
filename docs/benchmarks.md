@@ -76,19 +76,27 @@ can expose regressions that the curated binding subsets do not.
 
 ## Observed v0.5/v0.6-candidate baseline
 
-The following results were measured on 2026-07-23 with:
+The v0.5.0 and v0.3.0 columns were measured on 2026-07-23; the v0.6.0 column was
+**re-measured on 2026-07-30 against the release candidate itself**, because this
+page's own reproduction rule forbids carrying a prior revision's numbers under a
+release heading. Both measurements used:
 
 - Python `3.12.13`;
 - `sentence-transformers 5.6.0`;
-- `sentence-transformers/all-MiniLM-L6-v2`;
-- Engrava v0.5.0 revision `88b535b`; and
-- the v0.6.0 release candidate source at `1033a2e`.
+- `sentence-transformers/all-MiniLM-L6-v2` (the harness default); and
+- Engrava v0.5.0 revision `88b535b`.
 
-The v0.5.0 and v0.6.0-candidate JSON reports were byte-identical
-(`sha256:73acdc582a8dbe98d84e4ca42d83a57113ac35b3809a25a8cdc3207820ad51a0`).
-That establishes no benchmark regression between those two Engrava revisions
-under the recorded environment. It is not a performance comparison: the runs
-were concurrent, so their wall times are not comparable.
+The v0.6.0 column now reports the candidate at `2918e38`. The 2026-07-23 run had
+measured a **provisional** candidate at `1033a2e`, twenty `src/` commits earlier —
+including two in the dreaming path the binding measurements exercise — so those
+numbers were superseded before the tag rather than wrong when taken.
+
+**All four binding values are unchanged between the two candidate revisions.**
+That is the substantive result of the re-measurement: those twenty commits moved
+none of them. It is not a performance comparison — wall times across separate
+runs are not comparable — and the byte-identity claim recorded for the earlier
+pair is not restated here, because the reports were not compared byte for byte
+this time.
 
 ### Binding results
 
