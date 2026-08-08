@@ -41,7 +41,7 @@ engrava = "engrava.cli.main:main"
 
 [project.urls]
 Homepage = "https://engrava.ai"
-Documentation = "https://engrava.ai/docs"
+Documentation = "https://engrava.ai/docs/"
 Repository = "https://github.com/sovantica/engrava"
 Issues = "https://github.com/sovantica/engrava/issues"
 Changelog = "https://github.com/sovantica/engrava/blob/main/CHANGELOG.md"
