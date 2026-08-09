@@ -189,6 +189,38 @@ Review these behavior changes before deployment:
   vector returning `[]`, must catch the typed error instead. Empty, all-zero, or
   non-finite vectors remain a graceful empty result and increment
   `vector_arm_degradation_count`.
+- **Custom embedding providers must expose a public `dimension`.**
+  `EmbeddingProviderProtocol` has always required it, but nothing checked it at
+  construction and the 0.5 core read it at exactly one site, off the query path
+  — so a provider that kept the value privately (`self._dimension`, no public property)
+  worked on 0.5 for as long as nothing called `verify_embedding_model()`, which
+  is that site. 0.6 reads it on **every** vector search, before any comparison —
+  unless a `sqlite-vec` backend is configured, whose own `vec0` table declares
+  the dimension and is consulted first. Such a provider now raises
+  `EmbeddingProviderContractError` (an `EngravaError` subclass) naming the
+  provider class and the missing member:
+
+  ```text
+  embedding provider 'MyProvider' does not expose the required
+  EmbeddingProviderProtocol member 'dimension'. Add a public 'dimension'
+  property to 'MyProvider' — a private attribute such as '_dimension' does not
+  satisfy the protocol.
+  ```
+
+  The fix is to add the property:
+
+  ```python
+  @property
+  def dimension(self) -> int:
+      return self._dimension
+  ```
+
+  The check is **lazy**: constructing a store with such a provider still
+  succeeds, and a store that never searches by vector — and never calls
+  `verify_embedding_model()` — is unaffected. Call `verify_embedding_model()`
+  after construction to fail at startup instead; it raises the same typed error.
+  This is not a contract change — the protocol required the member before 0.6;
+  only the point at which it is read, and the error you get, have changed.
 - **Malformed FTS syntax gets one safe retry.** A failed expert `MATCH`
   expression is retried through bare-query normalization before the FTS arm is
   dropped; every failed first attempt increments `fts_match_failure_count`.

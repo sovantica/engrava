@@ -42,6 +42,12 @@ These failures require a changed request, not backoff:
   `VectorDimensionMismatchError` protect the corpus from incompatible vectors.
   Restore the matching model/prefix/dimension or deliberately re-embed the
   corpus; repeating the same call cannot repair the mismatch.
+- `EmbeddingProviderContractError` identifies a custom embedding provider that
+  does not expose a required `EmbeddingProviderProtocol` member — today a public
+  `dimension`. It names the provider class and the member; retrying cannot help,
+  add the property. A provider that *has* the property and fails inside it does
+  not raise this: its own exception propagates unchanged, and is classified by
+  whatever raised it.
 - `ThoughtNotFoundError`, `ActionNotFoundError`,
   `SourceThoughtNotFoundError`, and `ReferentialIntegrityError` identify a
   missing target or parent.

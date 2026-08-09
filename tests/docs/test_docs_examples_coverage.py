@@ -85,6 +85,11 @@ BEHAVIOUR_BLOCKS: tuple[tuple[str, str], ...] = (
     ("docs/extensions.md", "class ImportanceSignal:"),  # custom signal
     # guides/embeddings.md
     ("docs/guides/embeddings.md", "query_prefix="),  # asymmetric role prefixes
+    # guides/migrating-from-other-memory.md
+    (
+        "docs/guides/migrating-from-other-memory.md",
+        "async def bulk_import_and_derive",
+    ),  # bulk import derives nothing; derive_existing backfills it
     # memory-hygiene.md
     ("docs/memory-hygiene.md", "never auto-archived or auto-GC'd"),  # pinned
     ("docs/memory-hygiene.md", "preview.would_evict"),  # run_hygiene
@@ -171,6 +176,12 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
         "docs/api-reference.md",
         "class EmbeddingProviderProtocol(Protocol)",
         "Protocol-definition only",
+    ),
+    (
+        "docs/upgrade.md",
+        "def dimension(self) -> int:",
+        "method fragment; a conformant provider's search path is asserted in "
+        "test_embedding_providers.TestProviderMissingRequiredMember",
     ),
     (
         "docs/api-reference.md",

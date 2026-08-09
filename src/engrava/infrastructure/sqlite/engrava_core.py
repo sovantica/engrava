@@ -15,6 +15,7 @@ import contextlib
 import contextvars
 import datetime
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -27,7 +28,7 @@ from dataclasses import dataclass
 from importlib import resources
 from itertools import islice
 from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn, Self
+from typing import TYPE_CHECKING, Final, NoReturn, Self
 
 import aiosqlite
 import numpy as np
@@ -67,6 +68,7 @@ from engrava.domain.exceptions import (
     DuplicateEdgeError,
     EmbeddingGenerationError,
     EmbeddingModelMismatchError,
+    EmbeddingProviderContractError,
     EmbeddingQueryPrefixMismatchError,
     InvalidRecencyArgumentError,
     InvalidTransitionError,
@@ -653,6 +655,64 @@ async def _embed_query(provider: object, text: str) -> list[float]:
     if isinstance(provider, RoleAwareEmbeddingProvider):
         return await provider.embed_query(text)
     return await provider.embed(text)  # type: ignore[attr-defined,no-any-return]  # the non-role-aware branch: an untyped provider protocol
+
+
+# Sentinel for :func:`_provider_dimension`'s absence check. ``None`` will not do:
+# a provider may legitimately hold ``dimension = None`` in its class dictionary.
+_MEMBER_ABSENT: Final = object()
+
+
+def _provider_dimension(provider: EmbeddingProviderProtocol) -> int:
+    """Read a provider's ``dimension``, or say which member it is missing.
+
+    ``dimension`` is a required member of
+    :class:`~engrava.domain.protocols.embedding_provider.EmbeddingProviderProtocol`,
+    but the protocol is structural and nothing enforces it at construction: a
+    provider holding the value privately (``self._dimension``) with no public
+    property is accepted and then fails when the core reads it — on the search
+    path, from library internals, as a bare ``AttributeError``. Translate that
+    into the typed error: a catchable engrava type, structured fields, and a
+    message that says the attribute is a required protocol member and what to
+    add.
+
+    A conformant provider is read **exactly once**, as before — the member is
+    accessed in the ``try`` and everything else lives in the ``except``.
+    ``hasattr(provider, ...)`` would be the shorter spelling and is deliberately
+    not used: it evaluates the property to answer, so the read would happen twice
+    and a provider whose ``dimension`` is stateful, expensive, or single-use
+    would behave differently than it does today.
+
+    Only a *missing* member is translated. A provider that declares ``dimension``
+    and whose own property raises ``AttributeError`` has not violated the
+    protocol — it has failed at something else, possibly transiently — so its
+    exception propagates unchanged rather than being relabelled as a contract
+    error and handed remediation advice that does not apply. The two are told
+    apart with :func:`inspect.getattr_static`, which resolves the attribute
+    through the class dictionaries without invoking any descriptor, so the
+    already-failed property is not entered a second time.
+
+    Args:
+        provider: The store's configured embedding provider.
+
+    Returns:
+        The provider's declared embedding dimension.
+
+    Raises:
+        EmbeddingProviderContractError: When the provider exposes no public
+            ``dimension``.
+        AttributeError: Unchanged, when the provider declares ``dimension`` and
+            its own property raised.
+
+    """
+    try:
+        return provider.dimension
+    except AttributeError as exc:
+        if inspect.getattr_static(provider, "dimension", _MEMBER_ABSENT) is not _MEMBER_ABSENT:
+            raise
+        raise EmbeddingProviderContractError(
+            provider_class=type(provider).__name__,
+            member="dimension",
+        ) from exc
 
 
 def _query_vector_is_degenerate(query_vector: list[float]) -> bool:
@@ -3163,13 +3223,23 @@ class SqliteEngravaCore:
         Raises:
             EmbeddingModelMismatchError: When the configured model differs
                 from the one stored in ``_metadata``.
+            EmbeddingProviderContractError: When the configured provider
+                exposes no public ``dimension``.
 
         """
         if self._embedding_provider is None:
             return
+        # Read in the order this method has always read: ``model_name`` first,
+        # then the dimension. Only ``dimension`` is translated into a typed
+        # error, so a provider missing ``model_name`` as well still fails on that
+        # member — as it did before — rather than being told about a different
+        # one. Reversing the order to catch that case would change what a
+        # conformant provider with stateful properties observes, which this
+        # change is required not to do.
+        model_name = self._embedding_provider.model_name
         await self._ensure_embedding_model_lock(
-            self._embedding_provider.model_name,
-            self._embedding_provider.dimension,
+            model_name,
+            _provider_dimension(self._embedding_provider),
         )
 
     # ------------------------------------------------------------------
@@ -6597,11 +6667,15 @@ class SqliteEngravaCore:
             The declared embedding dimension, or ``None`` when the store
             declares none.
 
+        Raises:
+            EmbeddingProviderContractError: When the configured embedding
+                provider exposes no public ``dimension``.
+
         """
         if self._vector_backend is not None:
             return self._vector_backend.dimension
         if self._embedding_provider is not None:
-            return self._embedding_provider.dimension
+            return _provider_dimension(self._embedding_provider)
         return None
 
     async def search_similar(
@@ -6667,6 +6741,13 @@ class SqliteEngravaCore:
             List of ``(thought_id, similarity_score)`` sorted descending
             (ties broken by ``thought_id`` ascending for a deterministic
             total order).
+
+        Raises:
+            VectorDimensionMismatchError: When ``query_vector`` is not the
+                dimension the store declares.
+            EmbeddingProviderContractError: When the store's embedding provider
+                exposes no public ``dimension``, so the store cannot say what
+                dimension it declares.
 
         """
         import time as _time  # noqa: PLC0415

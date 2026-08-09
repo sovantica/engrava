@@ -356,6 +356,11 @@ class TestOffOnPair:
 # declares and is type-checked against exactly the capabilities it forwards. An
 # additive, non-breaking public-API addition: EngravaCoreProtocol now inherits from it
 # and every full store satisfies it by construction, so no existing consumer changes.
+# Later extended with EmbeddingProviderContractError, raised when a configured
+# embedding provider omits a required EmbeddingProviderProtocol member (today:
+# a public ``dimension``). The protocol has always required it; the error only
+# replaces the bare AttributeError the core previously raised from internals, so
+# it is additive and unreachable for any conformant provider.
 _PRE_WS_ALL_BASELINE = frozenset(
     {
         "ActionNotFoundError",
@@ -394,6 +399,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "EmbeddingConfig",
         "EmbeddingGenerationError",
         "EmbeddingModelMismatchError",
+        "EmbeddingProviderContractError",
         "EmbeddingProviderProtocol",
         "EmbeddingQueryPrefixMismatchError",
         "EmbeddingRecord",

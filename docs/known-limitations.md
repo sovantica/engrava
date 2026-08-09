@@ -36,6 +36,28 @@ it on, even though the separate curated release gates passed. Enable it for the
 cognitive-hygiene mechanics it provides, not for an expected accuracy gain. See
 [Dreaming](dreaming.md) and the current [benchmark evidence](benchmarks.md).
 
+## Embedding-provider conformance is not checked at construction
+
+`EmbeddingProviderProtocol` requires public `dimension` and `model_name`
+members, but the protocol is **structural**: a store accepts any object passed
+as `embedding_provider=` and only discovers a missing member when it reads one.
+A provider that keeps the dimension privately (`self._dimension`) with no public
+property therefore constructs cleanly and fails later — on the first vector
+search that has to ask the provider — with `EmbeddingProviderContractError`
+naming the class and the member. A store whose vector backend is `sqlite-vec`
+takes the dimension from its dimension-typed `vec0` table instead, so that search
+path does not ask the provider for it; `verify_embedding_model()` asks
+regardless.
+
+This is deliberate. Construction does not read the member, and a store that
+never searches by vector — and never calls `verify_embedding_model()` — never
+needs it, so failing at construction would reject stores that work today. Call
+`verify_embedding_model()` after construction when you want the failure at
+startup instead.
+
+Note that the requirement is not new: `dimension` has been a required member of
+the protocol since the first public release. See [Upgrade](upgrade.md#05---06).
+
 ## Validity intervals cannot be inverted
 
 The bi-temporal `valid_from` / `valid_until` bounds on a `ThoughtRecord` or

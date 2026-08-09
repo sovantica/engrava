@@ -779,6 +779,7 @@ store-replacement guidance, see [Error handling and recovery](error-handling.md)
 | `DuplicateEdgeError` | `EngravaError` | The directed `(from_thought_id, to_thought_id, edge_type)` relationship already exists |
 | `ReadOnlyViolationError` | `EngravaError` | Write attempt on read-only store |
 | `EmbeddingModelMismatchError` | `EngravaError` | Embedding model mismatch on restore |
+| `EmbeddingProviderContractError` | `EngravaError` | A configured embedding provider does not expose `dimension`, a required `EmbeddingProviderProtocol` member. Carries `provider_class` / `member`. Raised where the core reads the member (vector search, `verify_embedding_model`), never at construction. A provider that has the property and fails inside it raises its own exception instead |
 | `EmbeddingGenerationError` | `EngravaError` | Auto-embed failed under `require_embedding=True` (the thought is committed but unembedded); carries the failing `thought_id` |
 | `ExtensionMigrationError` | `EngravaError` | Extension schema migration failed (e.g. attempted downgrade) |
 | `ActionNotFoundError` | `EngravaError` | Action record ID not found; carries the failing `action_id` |

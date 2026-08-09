@@ -109,6 +109,59 @@ class ReadOnlyViolationError(EngravaError):
         super().__init__(f"Write operation blocked on read-only store: {operation}")
 
 
+class EmbeddingProviderContractError(EngravaError):
+    """Raised when a configured embedding provider omits a required protocol member.
+
+    :class:`~engrava.domain.protocols.embedding_provider.EmbeddingProviderProtocol`
+    has required ``dimension`` and ``model_name`` as public members since the
+    first public release, but
+    the protocol is structural: a provider that keeps the value privately (say
+    ``self._dimension``) and exposes no public property is accepted at
+    construction and only fails when the core reads it. Without this error that
+    failure surfaces as a bare :class:`AttributeError` raised from library
+    internals mid-search. Python's own message does name the class and the
+    attribute, but it is not a type a caller can catch by meaning, it carries no
+    structured fields, and it says nothing about the attribute being a required
+    protocol member or about what to do next. This error supplies all three.
+
+    This means the member is **absent**. A provider that declares ``dimension``
+    and whose own property raises is not this error: that exception propagates
+    unchanged, because it is a failure inside the provider rather than a protocol
+    violation, and it may not be permanent. This one is: repeating the call
+    cannot repair it. Add the public property.
+
+    The originating ``AttributeError`` is chained as ``__cause__`` so the
+    traceback still shows where the read happened.
+
+    Args:
+        provider_class: Name of the offending provider's class.
+        member: The required protocol member the provider does not expose.
+
+    Examples:
+        >>> raise EmbeddingProviderContractError(
+        ...     provider_class="MyProvider", member="dimension"
+        ... )
+        Traceback (most recent call last):
+            ...
+        engrava.domain.exceptions.EmbeddingProviderContractError: \
+embedding provider 'MyProvider' does not expose the required \
+EmbeddingProviderProtocol member 'dimension'. Add a public 'dimension' property \
+to 'MyProvider' — a private attribute such as '_dimension' does not satisfy the \
+protocol.
+
+    """
+
+    def __init__(self, *, provider_class: str, member: str) -> None:
+        self.provider_class = provider_class
+        self.member = member
+        super().__init__(
+            f"embedding provider {provider_class!r} does not expose the required "
+            f"EmbeddingProviderProtocol member {member!r}. Add a public {member!r} "
+            f"property to {provider_class!r} — a private attribute such as "
+            f"'_{member}' does not satisfy the protocol."
+        )
+
+
 class EmbeddingModelMismatchError(EngravaError):
     """Raised when the configured embedding model differs from the stored one.
 

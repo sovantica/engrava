@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import aiosqlite
 import pytest
 
+from engrava import EmbeddingProviderContractError
 from engrava.config import ConfigError, EngravaConfig
 from engrava.domain.enums import LifecycleStatus, Priority, ThoughtType
 from engrava.domain.models.thought import ThoughtRecord
@@ -570,6 +571,135 @@ async def _embedding_rowid(store: SqliteEngravaCore, thought_id: str) -> int | N
 # ------------------------------------------------------------------
 # R4 — vec0 delete leaves no ghost vector
 # ------------------------------------------------------------------
+
+
+class _PrivateDimensionProvider:
+    """A provider that keeps its dimension private, violating the protocol.
+
+    ``EmbeddingProviderProtocol`` requires a public ``dimension``; this shape
+    (the value held as ``self._dimension`` with no property) is the natural way
+    to get it wrong, and the core raises ``EmbeddingProviderContractError`` the
+    moment it has to read the member.
+    """
+
+    def __init__(self, dimension: int = 3) -> None:
+        self._dimension = dimension
+
+    @property
+    def model_name(self) -> str:
+        """Return the embedding model name."""
+        return "private-dimension"
+
+    async def embed(self, text: str) -> list[float]:
+        """Return a fixed-length vector for the given text."""
+        return [float(len(text) % 3)] * self._dimension
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Return one fixed-length vector per input text."""
+        return [await self.embed(text) for text in texts]
+
+
+@sqlite_vec_required
+class TestVec0DimensionTakesPrecedenceOverTheProvider(TestSqliteVecRealConnection):
+    """A configured vec0 index answers for the dimension, so the provider is not asked.
+
+    The upgrade note and the known-limitations page both say a store with a
+    ``sqlite-vec`` backend takes the dimension from its dimension-typed ``vec0``
+    table and therefore never asks the provider *for its dimension* on the
+    vector-search path. That is a documented guarantee, so it is exercised
+    against a real loaded extension rather than read off the branch order.
+
+    Both stores are built the way ``from_config`` builds one — the provider is
+    passed to the constructor, and the backend is selected through
+    ``_configure_vector_backend`` — so the guarantee is checked under real
+    initialisation rather than by assigning to store internals afterwards.
+    """
+
+    async def _store_with_private_dimension_provider(
+        self,
+        tmp_path: Path,
+        *,
+        backend: str,
+    ) -> SqliteEngravaCore:
+        """Build a store whose provider omits ``dimension``, on the given backend."""
+        db = await aiosqlite.connect(str(tmp_path / f"{backend}-precedence.db"))
+        db.row_factory = aiosqlite.Row
+        await db.execute("PRAGMA foreign_keys=ON")
+        store = SqliteEngravaCore(db, embedding_provider=_PrivateDimensionProvider())  # type: ignore[arg-type]  # the non-conformant shape is the subject
+        store._owns_connection = True
+        await store.ensure_schema()
+        await store._configure_vector_backend(backend_name=backend, embedding_dimension=3)
+        return store
+
+    async def test_vector_search_succeeds_with_a_non_conformant_provider(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The search runs to a result even though the provider has no ``dimension``."""
+        store = await self._store_with_private_dimension_provider(tmp_path, backend="sqlite-vec")
+        try:
+            await _make_thought(store, "vec-precedence-1")
+            await store.store_embedding("vec-precedence-1", [1.0, 0.0, 0.0], model_name="m")
+
+            results = await store.search_similar([1.0, 0.0, 0.0], top_k=5)
+
+            assert [tid for tid, _ in results] == ["vec-precedence-1"]
+        finally:
+            await store.close()
+
+    async def test_from_config_produces_the_state_this_precedence_relies_on(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """``from_config`` really leaves a store whose vec0 index declares the dimension.
+
+        The two tests around this one build the store the way ``from_config``
+        does; this one closes the gap between "the way it does" and what it
+        actually does. A ``from_config`` that chose another backend, or left the
+        dimension unresolved, would make the guarantee those tests establish a
+        statement about a store no user has.
+        """
+        from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
+
+        db_path = tmp_path / "from_config_vec.db"
+        cfg_file = tmp_path / "engrava.yaml"
+        cfg_file.write_text(
+            f"database:\n  path: {db_path}\n"
+            f"extensions:\n  vector:\n    backend: sqlite-vec\n    dimension: 3\n",
+            encoding="utf-8",
+        )
+
+        async with await SqliteEngravaCore.from_config(cfg_file) as store:
+            assert isinstance(store._vector_backend, SqliteVecSearchBackend)
+            assert store._declared_embedding_dimension() == 3
+
+    async def test_the_same_provider_is_asked_on_the_numpy_backend(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The counter-state: the store that declares no vec0 dimension raises.
+
+        Same construction, same provider, the supported ``numpy`` backend — which
+        declares no dimension of its own, so the provider is asked. Without this
+        the test above would pass just as well against a store that never
+        consults the provider under any configuration.
+        """
+        store = await self._store_with_private_dimension_provider(tmp_path, backend="numpy")
+        try:
+            await _make_thought(store, "vec-precedence-2")
+            await store.store_embedding("vec-precedence-2", [1.0, 0.0, 0.0], model_name="m")
+            before = await store.count_thoughts()
+
+            with pytest.raises(EmbeddingProviderContractError) as excinfo:
+                await store.search_similar([1.0, 0.0, 0.0], top_k=5)
+
+            assert await store.count_thoughts() == before
+            assert (await store.get_thought("vec-precedence-2")) is not None
+            assert store.vector_arm_degradation_count == 0
+            assert excinfo.value.provider_class == "_PrivateDimensionProvider"
+            assert excinfo.value.member == "dimension"
+        finally:
+            await store.close()
 
 
 @sqlite_vec_required
