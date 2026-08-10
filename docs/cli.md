@@ -259,8 +259,11 @@ snapshot model metadata against the target provider; on mismatch, choose
 
 ### `gc`
 
-Garbage-collects `ARCHIVED` thoughts and their orphaned edges. With `--expired`
-it also runs the TTL expiry cleanup first.
+Garbage-collects `ARCHIVED` thoughts together with every edge touching one on
+either end — including edges whose other end is still live — their embeddings and
+the actions sourced from them, then reconciles the vector index by removing every
+`vec0` row no `embedding` row owns. With `--expired` it also runs the TTL expiry
+cleanup first.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
@@ -268,7 +271,7 @@ it also runs the TTL expiry cleanup first.
 | `--expired` | flag | off | Also run expiry cleanup (archive or delete per `ttl.strategy`) before collecting. |
 
 ```bash
-engrava --db engrava.db gc                 # delete ARCHIVED thoughts + orphaned edges
+engrava --db engrava.db gc                 # delete ARCHIVED thoughts + their edges/embeddings/actions
 engrava --db engrava.db gc --expired       # run expiry cleanup first (per strategy)
 engrava --db engrava.db gc --expired --dry-run
 ```

@@ -134,7 +134,7 @@ strategy. What it does next depends on that strategy:
 ```bash
 engrava gc --expired            # run expiry cleanup (per ttl.strategy)
 engrava gc --expired --dry-run  # show what would happen, change nothing
-engrava gc                      # delete ARCHIVED thoughts (+ orphaned edges)
+engrava gc                      # delete ARCHIVED thoughts + their edges/embeddings/actions
 ```
 
 - **With `ttl.strategy: delete`:** the expired rows are deleted outright, and the
@@ -147,8 +147,11 @@ engrava gc                      # delete ARCHIVED thoughts (+ orphaned edges)
   repeated `gc --expired` under the archive strategy does eventually collect: it
   stops on the run that archives something and collects on the run that does not.
 
-Plain `engrava gc` (no `--expired`) removes `ARCHIVED` thoughts and their
-orphaned edges. This is how archived data is finally deleted from the live table.
+Plain `engrava gc` (no `--expired`) removes `ARCHIVED` thoughts together with
+every edge touching one on either end — including edges whose other end is still
+live — their embeddings and the actions sourced from them, then reconciles the
+vector index by removing every `vec0` row no `embedding` row owns. This is how
+archived data is finally deleted from the live table.
 
 > **`gc` refuses to delete on a `vec0`-indexed store without the vector extra.**
 > If the database carries an `embedding_vec` table and `sqlite-vec` cannot be
