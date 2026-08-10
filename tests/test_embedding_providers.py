@@ -17,8 +17,10 @@ from engrava import (
     CallbackProvider,
     EmbeddingConfig,
     EmbeddingModelMismatchError,
+    EmbeddingProviderContractError,
     EmbeddingProviderProtocol,
     EmbeddingQueryPrefixMismatchError,
+    EngravaError,
     HuggingFaceProvider,
     OllamaProvider,
     SentenceTransformerProvider,
@@ -497,7 +499,7 @@ class TestSchemaMigration:
             cursor = await conn.execute("PRAGMA user_version")
             row = await cursor.fetchone()
             assert row is not None
-            assert int(row[0]) == 18
+            assert int(row[0]) == 20
 
             # _metadata table should exist.
             cursor = await conn.execute(
@@ -1913,3 +1915,311 @@ class TestPrefixConfigParsing:
         # No prefixing surface — structurally symmetric.
         assert not isinstance(provider, RoleAwareEmbeddingProvider)
         assert not hasattr(provider, "query_prefix")
+
+
+# ---------------------------------------------------------------------------
+# A provider that omits a required protocol member
+# ---------------------------------------------------------------------------
+
+
+class _PrivateDimensionProvider:
+    """A natural non-conformant shape: the dimension is held privately.
+
+    ``EmbeddingProviderProtocol`` requires a public ``dimension``, but nothing
+    checks that at construction, so a provider written this way is accepted and
+    then fails the first time the core reads the member.
+    """
+
+    def __init__(self, dimension: int = 4) -> None:
+        self._dimension = dimension
+
+    @property
+    def model_name(self) -> str:
+        """Return the embedding model name."""
+        return "private-dimension"
+
+    async def embed(self, text: str) -> list[float]:
+        """Return a fixed-length vector for the given text."""
+        return [float(len(text) % 3)] * self._dimension
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Return one fixed-length vector per input text."""
+        return [await self.embed(text) for text in texts]
+
+
+class _CountingDimensionProvider:
+    """A conformant provider that records how often ``dimension`` is read."""
+
+    def __init__(self, dimension: int = 4) -> None:
+        self._dimension = dimension
+        self.dimension_reads = 0
+
+    @property
+    def dimension(self) -> int:
+        """Return the embedding dimension, counting the access."""
+        self.dimension_reads += 1
+        return self._dimension
+
+    @property
+    def model_name(self) -> str:
+        """Return the embedding model name."""
+        return "counting-dimension"
+
+    async def embed(self, text: str) -> list[float]:
+        """Return a fixed-length vector for the given text."""
+        return [float(len(text) % 3)] * self._dimension
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Return one fixed-length vector per input text."""
+        return [await self.embed(text) for text in texts]
+
+
+class _NoPublicMembersProvider(_PrivateDimensionProvider):
+    """A provider missing ``model_name`` as well as ``dimension``."""
+
+    @property
+    def model_name(self) -> str:
+        """Raise: this provider exposes no public members at all."""
+        msg = "model_name"
+        raise AttributeError(msg)
+
+
+class _RaisingDimensionProvider(_PrivateDimensionProvider):
+    """A provider whose own ``dimension`` property raises ``AttributeError``."""
+
+    @property
+    def dimension(self) -> int:
+        """Raise, standing in for a provider with a broken internal attribute."""
+        msg = "the provider's own lookup failed"
+        raise AttributeError(msg)
+
+
+class TestProviderMissingRequiredMember:
+    """The core names the provider and the missing member instead of raising AttributeError."""
+
+    async def test_search_similar_raises_typed_error_naming_class_and_member(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """The query path reports which class is missing which protocol member."""
+        provider = _PrivateDimensionProvider()
+        store = SqliteEngravaCore(db, embedding_provider=provider)  # type: ignore[arg-type]
+        stored = await store.create_thought(_make_thought())
+        before = await store.count_thoughts()
+
+        with pytest.raises(EmbeddingProviderContractError) as excinfo:
+            await store.search_similar([0.1, 0.2, 0.3, 0.4], top_k=5)
+
+        assert await store.count_thoughts() == before
+        assert (await store.get_thought(stored.thought_id)) is not None
+        # The message is the deliverable: a test asserting only the type passes
+        # against any other guard that happens to raise the same class.
+        message = str(excinfo.value)
+        assert "_PrivateDimensionProvider" in message
+        assert "dimension" in message
+        assert excinfo.value.provider_class == "_PrivateDimensionProvider"
+        assert excinfo.value.member == "dimension"
+        # The guard fires before the degenerate-vector branch, so the read-only
+        # degradation counter must not have moved.
+        assert store.vector_arm_degradation_count == 0
+
+    async def test_typed_error_is_an_engrava_error(self) -> None:
+        """Callers catching EngravaError catch this too."""
+        assert issubclass(EmbeddingProviderContractError, EngravaError)
+
+    async def test_search_hybrid_surfaces_the_same_typed_error(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """The hybrid path reaches the same guard through its vector arm.
+
+        Hybrid search embeds the query before it reaches the guard, so its
+        rejection boundary is its own: the corpus, the degradation counter and
+        the store's usability are re-read here rather than inferred from the
+        ``search_similar`` test.
+        """
+        provider = _PrivateDimensionProvider()
+        store = SqliteEngravaCore(db, embedding_provider=provider)  # type: ignore[arg-type]
+        stored = await store.create_thought(_make_thought())
+        before = await store.count_thoughts()
+
+        with pytest.raises(EmbeddingProviderContractError) as excinfo:
+            await store.search_hybrid("test content", top_k=5)
+
+        assert await store.count_thoughts() == before
+        assert (await store.get_thought(stored.thought_id)) is not None
+        assert store.vector_arm_degradation_count == 0
+        assert excinfo.value.provider_class == "_PrivateDimensionProvider"
+        assert excinfo.value.member == "dimension"
+
+    async def test_verify_embedding_model_surfaces_the_same_typed_error(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """The explicit startup check reports the contract violation too.
+
+        This is the fail-fast entry point a caller reaches for when it wants the
+        failure at startup rather than at first search, so it must not be the one
+        place that still raises a bare AttributeError.
+        """
+        provider = _PrivateDimensionProvider()
+        store = SqliteEngravaCore(db, embedding_provider=provider)  # type: ignore[arg-type]
+
+        with pytest.raises(EmbeddingProviderContractError) as excinfo:
+            await store.verify_embedding_model()
+
+        # The whole point of this call is to write the embedding-model lock. It
+        # must not have written a partial one on the way to raising, or a later
+        # conformant provider would collide with a lock nobody agreed to.
+        cursor = await db.execute("SELECT key, value FROM _metadata")
+        assert await cursor.fetchall() == []
+        assert excinfo.value.provider_class == "_PrivateDimensionProvider"
+        assert excinfo.value.member == "dimension"
+
+    async def test_only_dimension_is_translated_not_model_name(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """A provider missing ``model_name`` too still fails on that member.
+
+        The guard translates one member. ``verify_embedding_model`` reads
+        ``model_name`` first, as it always has — reversing that to reach the
+        typed check would change the order a conformant provider's properties are
+        evaluated in, which this change is required not to do. So a provider
+        exposing neither member is told about ``model_name``, exactly as before,
+        and nothing is written on the way out.
+        """
+        store = SqliteEngravaCore(db, embedding_provider=_NoPublicMembersProvider())  # type: ignore[arg-type]
+
+        with pytest.raises(AttributeError) as excinfo:
+            await store.verify_embedding_model()
+
+        cursor = await db.execute("SELECT key, value FROM _metadata")
+        assert await cursor.fetchall() == []
+        assert not isinstance(excinfo.value, EmbeddingProviderContractError)
+        assert "model_name" in str(excinfo.value)
+
+    async def test_construction_does_not_read_the_member(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """The check stays lazy: building a store with such a provider still works.
+
+        Construction does not read the member, and a store that neither searches
+        by vector nor calls ``verify_embedding_model`` never needs it. Raising
+        here instead would break stores that work today, so the guard
+        deliberately does not.
+        """
+        store = SqliteEngravaCore(db, embedding_provider=_PrivateDimensionProvider())  # type: ignore[arg-type]
+        stored = await store.create_thought(_make_thought())
+        assert (await store.get_thought(stored.thought_id)) is not None
+
+    async def test_conformant_provider_ranking_is_frozen(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """A conformant provider's ranked output is unchanged, order and scores.
+
+        The discriminating half of the pair above: a multi-candidate corpus with
+        a provider whose vectors actually differ, frozen as an ordered
+        ``(thought_id, score)`` expectation. A guard that changed the resolved
+        dimension, the candidate set, or the cosine inputs would move one of
+        these values.
+
+        The frozen values were produced by this same scenario with the guard
+        removed — i.e. reading ``provider.dimension`` directly, as the code did
+        before this change — and are unchanged with it in place, to the six
+        decimal places asserted here.
+        """
+        provider = CallbackProvider(
+            callback=lambda text: [float(len(text) % 7) / 7.0, 0.5, 0.25, 0.125],
+            dimension=4,
+            model_name="frozen-rank",
+        )
+        store = SqliteEngravaCore(db, embedding_provider=provider, auto_embed=True)
+        for index, essence in enumerate(("alpha", "bravo two", "charlie three four")):
+            await store.create_thought(_make_thought(f"t-rank-{index}", essence, essence))
+
+        results = await store.search_similar(await provider.embed("bravo two"), top_k=5)
+
+        assert [(tid, round(score, 6)) for tid, score in results] == [
+            ("t-rank-1", 1.0),
+            ("t-rank-2", 0.948761),
+            ("t-rank-0", 0.908049),
+        ]
+        assert store.vector_arm_degradation_count == 0
+
+    async def test_conformant_provider_dimension_is_read_exactly_once(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """The guard adds no extra read of a conformant provider's ``dimension``.
+
+        ``dimension`` is a property, so a presence check that evaluates it (say
+        ``hasattr``) would double the reads on every vector search. A provider
+        whose property is stateful or expensive would then behave differently
+        than it does today, which the change is required not to do.
+        """
+        provider = _CountingDimensionProvider()
+        store = SqliteEngravaCore(db, embedding_provider=provider)  # type: ignore[arg-type]
+        await store.create_thought(_make_thought())
+        provider.dimension_reads = 0
+
+        await store.search_similar([0.1, 0.2, 0.3, 0.4], top_k=5)
+
+        assert provider.dimension_reads == 1
+
+    async def test_provider_whose_property_raises_is_not_relabelled(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """A provider that declares ``dimension`` and fails inside it is not this error.
+
+        Such a provider satisfies the protocol; something inside it broke, and
+        that may be transient. Relabelling it as a contract violation would hand
+        the caller remediation advice — "add the public property" — that does not
+        apply to a property they already have. Its own exception propagates.
+        """
+        store = SqliteEngravaCore(db, embedding_provider=_RaisingDimensionProvider())  # type: ignore[arg-type]
+        stored = await store.create_thought(_make_thought())
+        before = await store.count_thoughts()
+
+        with pytest.raises(AttributeError) as excinfo:
+            await store.search_similar([0.1, 0.2, 0.3, 0.4], top_k=5)
+
+        assert await store.count_thoughts() == before
+        assert (await store.get_thought(stored.thought_id)) is not None
+        assert store.vector_arm_degradation_count == 0
+        assert not isinstance(excinfo.value, EmbeddingProviderContractError)
+        assert "the provider's own lookup failed" in str(excinfo.value)
+
+    async def test_rejected_search_leaves_the_store_unchanged(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """The rejection leaves the corpus, the counters and the store unchanged.
+
+        The corpus, the store's degradation counter and the store's usability
+        must all be exactly as they were, and a search that does not need the
+        member must still work afterwards. This observes the absence of *effects*
+        — it does not instrument reads, and the provider's ``dimension`` is of
+        course read, since that read is what raises.
+        """
+        provider = _PrivateDimensionProvider()
+        store = SqliteEngravaCore(db, embedding_provider=provider)  # type: ignore[arg-type]
+        stored = await store.create_thought(_make_thought())
+        before = await store.count_thoughts()
+
+        with pytest.raises(EmbeddingProviderContractError) as excinfo:
+            await store.search_similar([0.1, 0.2, 0.3, 0.4], top_k=5)
+
+        assert await store.count_thoughts() == before
+        assert (await store.get_thought(stored.thought_id)) is not None
+        assert store.vector_arm_degradation_count == 0
+        # Named here too, not only in the message test: a different guard raising
+        # the same class would otherwise satisfy this one.
+        assert excinfo.value.provider_class == "_PrivateDimensionProvider"
+        assert excinfo.value.member == "dimension"
+        # The store instance is not poisoned: a path that does not need the
+        # member still works after the rejection.
+        assert await store.search_fts("Test content", top_k=5) != []

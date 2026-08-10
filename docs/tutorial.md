@@ -2,17 +2,25 @@
 
 The [Quick Start](quickstart.md) shows the primitives in isolation. This
 tutorial builds one small, real thing end to end — a personal-notes memory you
-can search by meaning and consolidate — typing each step yourself. By the end
+can search, link, and consolidate — typing each step yourself. By the end
 you'll have a script that runs.
 
-It uses no external services: embeddings come from a tiny deterministic function
-(swap in a real provider from the [Embeddings guide](guides/embeddings.md) for
-production). Read [Core Concepts](concepts.md) first if "thought", "cycle", or
-"reflection" are unfamiliar.
+It uses no external services: embeddings come from a tiny deterministic hash
+function. That keeps the tutorial dependency-free, but a hash carries no meaning.
+The vector arm still produces a score for every note, and those scores still move
+the ranking — they are just a function of the text's hash rather than of what it
+says. So the keyword (FTS5) signal is the only one carrying a real relationship
+to your query, while meaningless vector scores still influence where everything
+lands. Swap in a provider backed by a semantic embedding model — see the
+[Embeddings guide](guides/embeddings.md) — to search by meaning.
+Read [Core Concepts](concepts.md) first if "thought", "cycle", or "reflection"
+are unfamiliar.
 
 ## 1. Imports and a store
 
-Open an in-memory store with a (toy) embedding provider so search is semantic:
+Open an in-memory store with a (toy) embedding provider, so the vector arm of
+hybrid search is wired up end to end. The vectors are hashes, not meanings — see
+the note above:
 
 ```python
 import asyncio
@@ -92,7 +100,7 @@ async def link(store, a, b, weight=0.8):
     )
 ```
 
-## 4. Search by meaning
+## 4. Search the notes
 
 Ask a question; `search_hybrid` embeds the query for you and returns ranked
 `(thought_id, score)` tuples, which we turn back into text:
@@ -134,8 +142,38 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-Run it and you'll see the coffee notes rank for the coffee query, plus the total
-count. That's a working memory: ingest, embed, link, search.
+Run it and you'll see the top three notes for the coffee query, plus the total
+count:
+
+```text
+Query: 'anything about coffee?'  (signals: ['fts5', 'priority', 'vector'])
+  0.844  Coffee tastes better with freshly ground beans.
+  0.504  The espresso machine descaling is overdue.
+  0.494  Standup moved to 10am on Thursdays.
+
+Stored 4 notes.
+```
+
+Of the two notes containing the word `coffee`, only one reaches the top three.
+The other — `"Buy oat milk and coffee beans on the way home."` — never reaches
+`top_k=3` at all, while a standup note that mentions neither coffee nor espresso
+does. That is the toy `embed` showing. Two things
+combine to produce it:
+
+- Only two notes match the keyword query, and the FTS arm is min-max normalized
+  across its candidates, so the weaker of the two matches is pinned to `0.0` —
+  the oat-milk note loses its entire keyword contribution.
+- The hash vectors still score every note, but a sha256 digest has no relation
+  to meaning, so those scores are effectively arbitrary. They are what separates
+  the bottom three: run the same query with `vector_weight=0.0` and those three
+  come back with one and the same score (`0.043`, to three decimals). Here the
+  arbitrary scores happen to put the standup note above the oat-milk note.
+
+Swap the toy `embed` for a provider backed by a semantic embedding model (see the
+[Embeddings guide](guides/embeddings.md)) and the vector scores start reflecting
+what the notes say instead of what their digests do.
+
+That's a working memory: ingest, embed, link, search.
 
 The complete script is also shipped as
 [`examples/notes_memory.py`](https://github.com/sovantica/engrava/blob/main/examples/notes_memory.py)

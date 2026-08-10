@@ -176,6 +176,20 @@ result = await MindQLExecutor(conn).execute(query)
 When `select_params` is `None` (the default, and what `parse()` produces) the
 statement runs with no bound parameters, exactly as before.
 
+> **The executor re-validates a hand-built query.** A `MindQLQuery` is public API
+> and can be constructed directly, as above, so validation is not left to
+> `parse()`: every identifier and keyword that has to be interpolated is checked
+> again where the query runs. The executor validates the target table against its
+> allowlist (defaulting to `thought`), every column named in a `WHERE` comparison,
+> an `IN` list or an `ORDER BY` key against that table's column allowlist, the sort
+> direction against `ASC`/`DESC` and the boolean joiner against `AND`/`OR` (either
+> case accepted), and `limit`/`offset` as non-negative, non-boolean integers.
+> Anything outside those sets raises `MindQLParseError` before a statement is
+> built. Each check also emits the module's *own* string — or, for the row bounds,
+> a rebuilt plain `int` — rather than the object you passed, so a `str` or `int`
+> subclass cannot pass the membership check and then render different text through
+> `__format__`.
+
 ## EXPLAIN
 
 Any read query may be prefixed with `EXPLAIN` to see the compiled SQL and its
@@ -277,6 +291,21 @@ except MindQLParseError as exc:
 ```
 
 ### Execution
+
+When you already have a `SqliteEngravaCore`, use its `execute_mindql()`
+convenience method. It executes a **parsed** query on the store's own connection
+and accepts the same optional extension-command mapping as the lower-level
+executor:
+
+```python
+from engrava import parse
+
+result = await store.execute_mindql(
+    parse("FIND thoughts WHERE thought_type = 'OBSERVATION' LIMIT 10")
+)
+for row in result.rows:
+    print(row["essence"])
+```
 
 `MindQLExecutor` runs against an open `aiosqlite.Connection`, and `execute()`
 takes a **parsed** `MindQLQuery` — parse the string first. `MindQLResult`

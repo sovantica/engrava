@@ -1,7 +1,6 @@
 """engrava — standalone thought-graph persistence engine."""
 
 from engrava.config import (
-    ConfigError,
     DreamingConfig,
     DreamingGates,
     EmbeddingConfig,
@@ -18,6 +17,23 @@ from engrava.config import (
     resolve_hooks,
     resolve_manifests,
 )
+from engrava.config_validation import ConfigError
+from engrava.cycle_providers import (
+    CallableCycleProvider,
+    MaxCycleProvider,
+    StaticCycleProvider,
+)
+from engrava.domain.dreaming import (
+    ActionOutcomeSignal,
+    ConfidenceSignal,
+    ConfirmationSignal,
+    ConsolidationResult,
+    DreamingContext,
+    DreamingSignalProtocol,
+    FrequencySignal,
+    RecencySignal,
+    StalenessSignal,
+)
 from engrava.domain.enums import (
     ActionStatus,
     ActionType,
@@ -31,18 +47,26 @@ from engrava.domain.enums import (
 )
 from engrava.domain.exceptions import (
     ActionNotFoundError,
+    ConnectionQuarantinedError,
+    CycleProviderError,
+    DerivedRecordError,
     EmbeddingGenerationError,
     EmbeddingModelMismatchError,
+    EmbeddingProviderContractError,
     EmbeddingQueryPrefixMismatchError,
     EngravaError,
     ExtensionMigrationError,
     InvalidFilterError,
     InvalidFilterPathError,
+    InvalidRecencyArgumentError,
     InvalidTransitionError,
     JournalIntegrityError,
     ReadOnlyViolationError,
+    RecencyModeConflictError,
+    SourceThoughtNotFoundError,
     StaleDataError,
     ThoughtNotFoundError,
+    VectorDimensionMismatchError,
 )
 from engrava.domain.manifest import ExtensionManifest
 from engrava.domain.models.action import ActionRecord
@@ -68,11 +92,20 @@ from engrava.domain.models.search import HybridSearchResult
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.domain.models.thought import ThoughtRecord as CoreThoughtRecord
 from engrava.domain.models.ttl import CleanupResult, CleanupStrategy
+from engrava.domain.protocols.cycle_provider import CycleProvider
+from engrava.domain.protocols.derived_records import (
+    DeriveContext,
+    DerivedRecord,
+    DerivedRecordProducerProtocol,
+    DeriveGates,
+    DeriveResult,
+)
 from engrava.domain.protocols.embedding_provider import (
     EmbeddingProviderProtocol,
     RoleAwareEmbeddingProvider,
 )
 from engrava.domain.protocols.engrava_core import EngravaCoreProtocol
+from engrava.domain.protocols.engrava_read import EngravaReadProtocol
 from engrava.domain.protocols.hooks import (
     DefaultEngravaHooks,
     EngravaHooksProtocol,
@@ -85,17 +118,8 @@ from engrava.embeddings.ollama import OllamaProvider
 from engrava.embeddings.openai_compatible import OpenAICompatibleProvider
 from engrava.embeddings.sentence_transformer import SentenceTransformerProvider
 from engrava.extensions.discovery import discover_manifests
-from engrava.extensions.dreaming import ConsolidationResult, DreamingExtension
-from engrava.extensions.dreaming_signals import (
-    ActionOutcomeSignal,
-    ConfidenceSignal,
-    ConfirmationSignal,
-    DreamingContext,
-    DreamingSignalProtocol,
-    FrequencySignal,
-    RecencySignal,
-    StalenessSignal,
-)
+from engrava.extensions.dreaming import DreamingExtension
+from engrava.extensions.structural_split import SplitMode, StructuralSplitProducer
 from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
 from engrava.infrastructure.read_only_store import ReadOnlyEngrava
 from engrava.infrastructure.service_manager import EngravaManager
@@ -112,16 +136,26 @@ __all__ = [
     "ActionRecord",
     "ActionStatus",
     "ActionType",
+    "CallableCycleProvider",
     "CallbackProvider",
     "CleanupResult",
     "CleanupStrategy",
     "ConfidenceSignal",
     "ConfigError",
     "ConfirmationSignal",
+    "ConnectionQuarantinedError",
     "ConsolidationResult",
     "CoreThoughtRecord",
+    "CycleProvider",
+    "CycleProviderError",
     "DefaultEngravaHooks",
     "DefaultMindStoreHooks",
+    "DeriveContext",
+    "DeriveGates",
+    "DeriveResult",
+    "DerivedRecord",
+    "DerivedRecordError",
+    "DerivedRecordProducerProtocol",
     "DreamingConfig",
     "DreamingContext",
     "DreamingExtension",
@@ -133,6 +167,7 @@ __all__ = [
     "EmbeddingConfig",
     "EmbeddingGenerationError",
     "EmbeddingModelMismatchError",
+    "EmbeddingProviderContractError",
     "EmbeddingProviderProtocol",
     "EmbeddingQueryPrefixMismatchError",
     "EmbeddingRecord",
@@ -142,6 +177,7 @@ __all__ = [
     "EngravaHooksProtocol",
     "EngravaManager",
     "EngravaMetrics",
+    "EngravaReadProtocol",
     "EvictionReason",
     "ExtensionManifest",
     "ExtensionMigrationError",
@@ -154,6 +190,7 @@ __all__ = [
     "HygieneResult",
     "InvalidFilterError",
     "InvalidFilterPathError",
+    "InvalidRecencyArgumentError",
     "InvalidTransitionError",
     "JournalConfig",
     "JournalEntry",
@@ -163,6 +200,7 @@ __all__ = [
     "KnowledgeSource",
     "LatencyHistogram",
     "LifecycleStatus",
+    "MaxCycleProvider",
     "MetadataFilter",
     "MetricsConfig",
     "MindQLCommand",
@@ -184,6 +222,7 @@ __all__ = [
     "ReadOnlyEngrava",
     "ReadOnlyMindStore",
     "ReadOnlyViolationError",
+    "RecencyModeConflictError",
     "RecencySignal",
     "RoleAwareEmbeddingProvider",
     "ScoringContext",
@@ -191,18 +230,23 @@ __all__ = [
     "SentenceTransformerProvider",
     "ServiceConfig",
     "ServicesConfig",
+    "SourceThoughtNotFoundError",
+    "SplitMode",
     "SqliteEngravaCore",
     "SqliteMindStoreCore",
     "SqliteVecSearchBackend",
     "StaleDataError",
     "StalenessSignal",
+    "StaticCycleProvider",
     "StorageFootprint",
+    "StructuralSplitProducer",
     "TTLConfig",
     "ThoughtCounts",
     "ThoughtNotFoundError",
     "ThoughtRecord",
     "ThoughtType",
     "ThoughtVisibility",
+    "VectorDimensionMismatchError",
     "VerificationStatus",
     "VisibilityQueryFilter",
     "discover_manifests",

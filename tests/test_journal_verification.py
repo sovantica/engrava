@@ -14,6 +14,7 @@ the opt-in on-open integrity gate that wrap the existing hash-chain walk
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 from typing import TYPE_CHECKING
 
@@ -111,6 +112,29 @@ async def _delete_tail(db_path: Path) -> None:
         await conn.close()
 
 
+async def _backdate_all_timestamps(db_path: Path, timestamp: str) -> None:
+    """Rewrite every row's ``created_at`` in place (no rehash) — full backdating."""
+    conn = await aiosqlite.connect(str(db_path))
+    try:
+        await conn.execute("UPDATE journal_entry SET created_at = ?", (timestamp,))
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
+async def _rewrite_one_timestamp(db_path: Path, sequence_number: int, timestamp: str) -> None:
+    """Rewrite a single row's ``created_at`` in place (no rehash)."""
+    conn = await aiosqlite.connect(str(db_path))
+    try:
+        await conn.execute(
+            "UPDATE journal_entry SET created_at = ? WHERE sequence_number = ?",
+            (timestamp, sequence_number),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
 def _write_config(
     tmp_path: Path,
     db_path: Path,
@@ -184,6 +208,126 @@ class TestVerifyJournal:
             assert result.valid is True  # prefix still verifies — truncation undetected
             assert result.entries_checked == 3
             assert result.first_invalid_sequence is None
+        finally:
+            await store._db.close()
+
+    async def test_full_backdating_is_not_detected(self, tmp_path: Path) -> None:
+        """Rewriting every ``created_at`` verifies clean — a documented limit.
+
+        The hash preimage is
+        ``{seq}|{mutation_type}|{target_id}|{json(delta)}|{parent_hash}``; it
+        excludes ``created_at`` (and ``entry_id``), so no timestamp rewrite
+        changes any hash and a fully backdated chain verifies exactly like an
+        untouched one. It compounds: ``get_entries(since=...)`` compares
+        ``created_at >= since`` on that same uncovered column, so a rewrite across
+        a window's lower bound also changes that window — downward (asserted here)
+        hides an entry a time-bounded query previously returned; the upward,
+        false-inclusion direction is pinned by
+        :meth:`test_forward_dating_plants_an_entry_in_a_since_window`. The two
+        effects reinforce each other instead of one catching the other. Pin both
+        halves so a time-bounded journal claim is never mistaken for a chain-backed
+        one.
+
+        Bringing ``created_at`` into the preimage would change the expected hash
+        of every entry ever written, so covering it is a chain-format migration
+        or verifier-versioning decision; this test asserts the current,
+        documented behaviour rather than the wish.
+        """
+        db_path = tmp_path / "backdated.db"
+        await _seed_chain(db_path)
+
+        # Control for the since= half: before backdating, the whole chain IS
+        # inside this window — so a later absence is caused by the rewrite and
+        # not by a window that never contained the entries.
+        store = await _open(db_path, journal_enabled=True)
+        try:
+            assert store.journal is not None
+            original = await store.journal.get_entries()
+            window_start = original[0].created_at  # first entry's real timestamp
+            in_window = await store.journal.get_entries(since=window_start)
+            assert [e.sequence_number for e in in_window] == [1, 2, 3, 4]
+        finally:
+            await store._db.close()
+
+        await _backdate_all_timestamps(db_path, "1999-01-01T00:00:00+00:00")
+
+        store = await _open(db_path, journal_enabled=True)
+        try:
+            # Half one: verification is blind to the rewrite.
+            result = await store.verify_journal()
+            assert result.valid is True  # chain still verifies — backdating undetected
+            assert result.entries_checked == 4
+            assert result.first_invalid_sequence is None
+
+            # Half two: the same entries are now outside the window above.
+            assert store.journal is not None
+            assert await store.journal.get_entries(since=window_start) == []
+            # Control for that absence: the rows are all still present unfiltered,
+            # so the empty window is the timestamp filter, not deleted entries.
+            assert len(await store.journal.get_entries()) == 4
+        finally:
+            await store._db.close()
+
+    async def test_forward_dating_plants_an_entry_in_a_since_window(self, tmp_path: Path) -> None:
+        """Forward-dating one entry adds it to a window it was outside — undetected.
+
+        The converse of backdating, and a distinct shape: because
+        ``get_entries(since=...)`` compares ``created_at >= since`` on a column the
+        hash preimage does not cover, rewriting one entry's timestamp *upward*
+        across a window's lower bound makes a time-bounded query report an entry
+        that never belonged to that period — false inclusion rather than hiding —
+        while ``verify_journal()`` still reports ``valid=True``.
+
+        What makes this an assertion rather than a restatement is the window
+        boundary: the entry is asserted **absent** from the window first and
+        **present** only after the rewrite, with nothing else changed. Assert the
+        presence alone and the test would pass vacuously against a window whose
+        bound never excluded the entry — or against a ``since=`` filter that
+        ignores its argument and returns everything, which is why the
+        un-rewritten siblings are asserted to stay outside the window.
+
+        The bound is derived from the seeded chain's own latest timestamp rather
+        than written as a future date, so the empty pre-state is a property of the
+        data and not of the calendar the suite happens to run on.
+        """
+        db_path = tmp_path / "forward-dated.db"
+        await _seed_chain(db_path)
+
+        store = await _open(db_path, journal_enabled=True)
+        try:
+            assert store.journal is not None
+            original = await store.journal.get_entries()
+            # Derive the bound from the seeded data, never from the calendar: it
+            # sits one second after the chain's latest real timestamp, so the
+            # pre-state below is empty whatever the wall clock reads.
+            latest = max(datetime.datetime.fromisoformat(e.created_at) for e in original)
+            window_start = (latest + datetime.timedelta(seconds=1)).isoformat()
+            planted_at = (latest + datetime.timedelta(seconds=2)).isoformat()
+
+            # Pre-state, the vacuity guard: nothing is in the window yet, so any
+            # later presence is caused by the rewrite and not by the bound.
+            assert await store.journal.get_entries(since=window_start) == []
+            assert len(original) == 4
+        finally:
+            await store._db.close()
+
+        await _rewrite_one_timestamp(db_path, sequence_number=2, timestamp=planted_at)
+
+        store = await _open(db_path, journal_enabled=True)
+        try:
+            # Half one: verification is blind to the rewrite.
+            result = await store.verify_journal()
+            assert result.valid is True  # chain still verifies — planting undetected
+            assert result.entries_checked == 4
+            assert result.first_invalid_sequence is None
+
+            # Half two: entry 2 is now inside a window that excluded it, and the
+            # control — the three un-rewritten siblings stay outside, so this is
+            # the timestamp filter honouring its bound, not a query returning all.
+            assert store.journal is not None
+            in_window = await store.journal.get_entries(since=window_start)
+            assert [e.sequence_number for e in in_window] == [2]
+            assert in_window[0].created_at == planted_at
         finally:
             await store._db.close()
 

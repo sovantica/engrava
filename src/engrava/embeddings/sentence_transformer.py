@@ -167,7 +167,7 @@ class SentenceTransformerProvider:
         """
         if self._dimension is None:
             self._load_model()
-        return self._dimension  # type: ignore[return-value]
+        return self._dimension  # type: ignore[return-value]  # _load_model above sets it to an int
 
     @property
     def model_name(self) -> str:
@@ -201,7 +201,7 @@ class SentenceTransformerProvider:
         """
         model = self._load_model()
         vec = model.encode(text, normalize_embeddings=True)
-        return vec.tolist()  # type: ignore[no-any-return]
+        return vec.tolist()  # type: ignore[no-any-return]  # numpy's tolist is untyped
 
     def _encode_batch_sync(self, texts: list[str]) -> list[list[float]]:
         """Encode multiple texts synchronously.

@@ -6,7 +6,7 @@ as well as executor integration with aiosqlite.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, SupportsIndex, cast
 
 import aiosqlite
 import pytest
@@ -22,6 +22,7 @@ from engrava import (
 )
 from engrava.domain.protocols.hooks import MindQLExtension
 from engrava.mindql import executor as executor_module
+from engrava.mindql import parser as parser_module
 from engrava.mindql.executor import MindQLExecutor
 from engrava.mindql.parser import (
     BoolExpr,
@@ -1858,3 +1859,1353 @@ class TestLexicalScanQuoteAwareness:
         # than being mis-routed or silently accepted.
         with pytest.raises(MindQLParseError):
             parse("FIND thoughts WHERE content = 'it''s OR mine'")
+
+
+# ---------------------------------------------------------------------------
+# Executor-side query validation (constructed queries — parser bypassed)
+# ---------------------------------------------------------------------------
+
+
+# ``MindQLQuery`` is a public export and ``execute_mindql`` accepts a
+# constructed one, so ``parse()`` is not on the path these tests exercise:
+# every query below is built by hand, exactly as a programmatic caller can.
+# The FIND/COUNT compiler interpolates rather than binds four things: the table
+# and column identifiers, the ORDER BY direction and boolean-joiner keywords,
+# and the LIMIT/OFFSET literals. Each is checked here at that boundary. This is
+# the compiler's boundary only — the raw SELECT passthrough is a separate entry
+# point with its own guard, and it is deliberately not restricted to these
+# tables.
+
+_OFF_LIMITS_TABLE = "offlimits"
+_OFF_LIMITS_VALUE = "off-limits-value"
+
+# A table-position payload that reads the off-limits table through a derived
+# table, so it leaks whatever the target table's column count happens to be
+# (a UNION payload would have to match that count to return anything).
+_TABLE_SUBSELECT_PAYLOAD = "(SELECT secret AS thought_id FROM offlimits)"
+
+# Thought ids created by the ``populated_db`` fixture, in id order.
+_POPULATED_IDS = ["t-000", "t-001", "t-002", "t-003", "t-004"]
+
+# The queryable surface, restated here on purpose. The executor's per-table
+# allowlist is hand-maintained and has no derivable source of truth — which
+# columns are safe to expose is a policy choice — so this second statement is
+# what makes a silent collapse or widening of it fail a test. The ``thought``
+# entry is every column the public MindQL guide documents as filterable, plus
+# ``source_type``. Changing the queryable surface means changing both.
+_EXPECTED_FILTERABLE_COLUMNS: dict[str, list[str]] = {
+    "thought": [
+        "thought_id",
+        "thought_type",
+        "lifecycle_status",
+        "priority",
+        "essence",
+        "content",
+        "source",
+        "source_type",
+        "confidence",
+        "visibility",
+        "confirmation_count",
+        "created_cycle",
+        "updated_cycle",
+    ],
+    "edge": [
+        "edge_id",
+        "from_thought_id",
+        "to_thought_id",
+        "edge_type",
+        "weight",
+        "created_cycle",
+        "source",
+        "decay_multiplier",
+    ],
+    "embedding": [
+        "embedding_id",
+        "owner_type",
+        "owner_id",
+        "model_name",
+        "dimension",
+    ],
+    "action": [
+        "action_id",
+        "source_thought_id",
+        "action_type",
+        "intent",
+        "status",
+        "verification_status",
+    ],
+}
+
+
+class _FormatHijackingInt(int):
+    """An ``int`` that emits text of its choosing when interpolated.
+
+    Passing an ``isinstance`` check is not enough: a value is only safe once
+    the executor stops interpolating the caller's object.
+    """
+
+    __slots__ = ()
+
+    def __format__(self, format_spec: str) -> str:
+        return "1 -- "
+
+
+class _FormatHijackingStr(str):
+    """A ``str`` that compares equal to one table but emits another."""
+
+    __slots__ = ()
+
+    def __format__(self, format_spec: str) -> str:
+        return _OFF_LIMITS_TABLE
+
+
+class _FormatHijackingColumn(str):
+    """A ``str`` equal to an allowlisted column that emits a predicate."""
+
+    __slots__ = ()
+
+    def __format__(self, format_spec: str) -> str:
+        return "priority = 'P1' OR 1=1 OR 'x'"
+
+
+@pytest.fixture
+async def guarded_db(populated_db: aiosqlite.Connection) -> aiosqlite.Connection:
+    """Populated store plus a table outside the FIND/COUNT allowlist."""
+    await populated_db.execute("CREATE TABLE offlimits (secret TEXT)")
+    await populated_db.execute("INSERT INTO offlimits VALUES (?)", (_OFF_LIMITS_VALUE,))
+    await populated_db.commit()
+    return populated_db
+
+
+async def _schema_snapshot(conn: aiosqlite.Connection) -> list[tuple[object, ...]]:
+    """Return the full ``sqlite_master`` contents as a comparable snapshot."""
+    cursor = await conn.execute(
+        "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name",
+    )
+    return [tuple(row) for row in await cursor.fetchall()]
+
+
+async def _off_limits_rows(conn: aiosqlite.Connection) -> list[str]:
+    """Read the off-limits table directly, bypassing the FIND/COUNT compiler."""
+    cursor = await conn.execute("SELECT secret FROM offlimits")
+    return [str(row[0]) for row in await cursor.fetchall()]
+
+
+async def _thought_ids(conn: aiosqlite.Connection) -> list[str]:
+    """Read every stored thought id directly, bypassing the compiler."""
+    cursor = await conn.execute("SELECT thought_id FROM thought ORDER BY thought_id")
+    return [str(row[0]) for row in await cursor.fetchall()]
+
+
+class TestExecutorTableIdentifierValidation:
+    """FIND/COUNT validate the target table themselves, not only via the parser."""
+
+    async def test_off_limits_table_is_not_readable_through_find(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(guarded_db)
+        schema_before = await _schema_snapshot(guarded_db)
+        query = MindQLQuery(command=MindQLCommand.FIND, table=_OFF_LIMITS_TABLE)
+
+        with pytest.raises(MindQLParseError, match="Table 'offlimits' not allowed"):
+            await store.execute_mindql(query)
+
+        # Not merely "raises": the store is untouched. That a rejected query
+        # never runs at all is pinned separately, by the driver-spy test.
+        assert await _schema_snapshot(guarded_db) == schema_before
+        assert await _off_limits_rows(guarded_db) == [_OFF_LIMITS_VALUE]
+        assert await _thought_ids(guarded_db) == _POPULATED_IDS
+
+    async def test_derived_table_payload_cannot_exfiltrate_through_find(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(guarded_db)
+        schema_before = await _schema_snapshot(guarded_db)
+        query = MindQLQuery(command=MindQLCommand.FIND, table=_TABLE_SUBSELECT_PAYLOAD)
+
+        with pytest.raises(MindQLParseError, match="not allowed"):
+            await store.execute_mindql(query)
+
+        assert await _schema_snapshot(guarded_db) == schema_before
+        assert await _off_limits_rows(guarded_db) == [_OFF_LIMITS_VALUE]
+
+    async def test_off_limits_table_is_not_countable(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        # COUNT builds its own SQL, so it is a second interpolation site.
+        store = SqliteEngravaCore(guarded_db)
+        schema_before = await _schema_snapshot(guarded_db)
+        query = MindQLQuery(command=MindQLCommand.COUNT, table=_OFF_LIMITS_TABLE)
+
+        with pytest.raises(MindQLParseError, match="Table 'offlimits' not allowed"):
+            await store.execute_mindql(query)
+
+        assert await _schema_snapshot(guarded_db) == schema_before
+        assert await _thought_ids(guarded_db) == _POPULATED_IDS
+
+    async def test_schema_table_is_not_readable_through_find(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        # ``sqlite_master`` is the whole database's DDL, including every
+        # extension table a MindQL caller was never granted.
+        store = SqliteEngravaCore(guarded_db)
+        query = MindQLQuery(command=MindQLCommand.FIND, table="sqlite_master")
+
+        with pytest.raises(MindQLParseError, match="Table 'sqlite_master' not allowed"):
+            await store.execute_mindql(query)
+
+    async def test_explain_does_not_compile_an_off_limits_table(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        # EXPLAIN returns the compiled statement as data. An unvalidated table
+        # there hands the caller a ready-to-run statement over that table.
+        store = SqliteEngravaCore(guarded_db)
+        find = MindQLQuery(
+            command=MindQLCommand.FIND,
+            table=_OFF_LIMITS_TABLE,
+            explain=True,
+        )
+        count = MindQLQuery(
+            command=MindQLCommand.COUNT,
+            table=_OFF_LIMITS_TABLE,
+            explain=True,
+        )
+
+        with pytest.raises(MindQLParseError, match="Table 'offlimits' not allowed"):
+            await store.execute_mindql(find)
+        with pytest.raises(MindQLParseError, match="Table 'offlimits' not allowed"):
+            await store.execute_mindql(count)
+
+    async def test_every_canonical_table_still_executes(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        # The guard must not narrow the surface: every table the grammar
+        # accepts still runs, on both FIND and COUNT.
+        store = SqliteEngravaCore(guarded_db)
+        for table in sorted(parser_module._TABLE_MAP.values()):
+            found = await store.execute_mindql(
+                MindQLQuery(command=MindQLCommand.FIND, table=table, explain=True),
+            )
+            # Not just "no exception": the plan must name the table asked for.
+            find_sql = f"SELECT * FROM {table} LIMIT 100"  # noqa: S608 -- expectation
+            assert found.rows[0]["sql"] == find_sql
+            ran_find = await store.execute_mindql(
+                MindQLQuery(command=MindQLCommand.FIND, table=table),
+            )
+            assert ran_find.command == "FIND"
+            counted = await store.execute_mindql(
+                MindQLQuery(command=MindQLCommand.COUNT, table=table, explain=True),
+            )
+            count_sql = f"SELECT COUNT(*) AS cnt FROM {table}"  # noqa: S608 -- expectation
+            assert counted.rows[0]["sql"] == count_sql
+            ran = await store.execute_mindql(
+                MindQLQuery(command=MindQLCommand.COUNT, table=table),
+            )
+            assert ran.count is not None
+
+    async def test_unset_table_still_defaults_to_thought(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(guarded_db)
+        result = await store.execute_mindql(MindQLQuery(command=MindQLCommand.FIND))
+        assert sorted(str(row["thought_id"]) for row in result.rows) == _POPULATED_IDS
+
+    async def test_str_subclass_cannot_redirect_the_query(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        # The allowlist check passes on equality, but the emitted statement
+        # must carry the canonical name, not whatever the object formats to.
+        store = SqliteEngravaCore(guarded_db)
+        query = MindQLQuery(
+            command=MindQLCommand.FIND,
+            table=_FormatHijackingStr("thought"),
+        )
+
+        result = await store.execute_mindql(query)
+        assert sorted(str(row["thought_id"]) for row in result.rows) == _POPULATED_IDS
+        assert all(_OFF_LIMITS_VALUE not in row.values() for row in result.rows)
+
+    async def test_non_string_table_is_rejected_with_a_typed_error(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        # A falsy non-string must not slip through the ``or`` default, and an
+        # unhashable one must not surface as an untyped lookup failure.
+        store = SqliteEngravaCore(guarded_db)
+        for bad_table in (cast("str", []), cast("str", ["thought"]), cast("str", 0)):
+            with pytest.raises(MindQLParseError, match="Table name must be a string"):
+                await store.execute_mindql(
+                    MindQLQuery(command=MindQLCommand.FIND, table=bad_table),
+                )
+
+
+class TestExecutorSortDirectionValidation:
+    """The ORDER BY direction is an interpolated keyword, and is validated."""
+
+    async def test_direction_payload_cannot_hijack_the_row_cap(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        # " ASC LIMIT 1 --" comments out the LIMIT the executor appends, so the
+        # emitted statement runs under the caller's cap instead of the store's.
+        store = SqliteEngravaCore(guarded_db)
+        query = MindQLQuery(
+            command=MindQLCommand.FIND,
+            table="thought",
+            order_by=(("created_cycle", "ASC LIMIT 1 --"),),
+        )
+
+        with pytest.raises(MindQLParseError, match="Sort direction"):
+            await store.execute_mindql(query)
+
+        assert await _thought_ids(guarded_db) == _POPULATED_IDS
+
+    async def test_unknown_direction_is_rejected_with_a_typed_error(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(guarded_db)
+        query = MindQLQuery(
+            command=MindQLCommand.FIND,
+            table="thought",
+            order_by=(("created_cycle", "DESCENDING"),),
+        )
+
+        with pytest.raises(MindQLParseError, match="Sort direction 'DESCENDING' not allowed"):
+            await store.execute_mindql(query)
+
+    async def test_lowercase_direction_still_sorts(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        # A constructed query carrying a lowercase direction executes today;
+        # the guard normalises the case instead of rejecting the shape.
+        store = SqliteEngravaCore(guarded_db)
+        query = MindQLQuery(
+            command=MindQLCommand.FIND,
+            table="thought",
+            order_by=(("created_cycle", "desc"),),
+        )
+
+        result = await store.execute_mindql(query)
+        assert [row["thought_id"] for row in result.rows] == list(reversed(_POPULATED_IDS))
+
+    async def test_non_string_direction_is_rejected(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        # The declared ``str`` is not enforced at runtime, so the guard must
+        # not assume it: a non-string must not reach ``.upper()`` and surface
+        # as an untyped ``AttributeError``.
+        store = SqliteEngravaCore(guarded_db)
+        query = MindQLQuery(
+            command=MindQLCommand.FIND,
+            table="thought",
+            order_by=(("created_cycle", cast("str", 5)),),
+        )
+
+        with pytest.raises(MindQLParseError, match="Sort direction 5 not allowed"):
+            await store.execute_mindql(query)
+
+        assert await _thought_ids(guarded_db) == _POPULATED_IDS
+
+    async def test_str_subclass_direction_cannot_reach_the_statement(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        # The keyword guard matches on equality, so what it emits must be its
+        # own literal rather than the object that matched.
+        store = SqliteEngravaCore(guarded_db)
+        plan = await store.execute_mindql(
+            MindQLQuery(
+                command=MindQLCommand.FIND,
+                table="thought",
+                order_by=(("created_cycle", cast("str", _FormatHijackingStr("DESC"))),),
+                explain=True,
+            ),
+        )
+        assert plan.rows[0]["sql"] == (
+            "SELECT * FROM thought ORDER BY created_cycle DESC LIMIT 100"
+        )
+
+    async def test_parser_directions_still_sort_both_ways(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(guarded_db)
+        ascending = await store.execute_mindql(parse("FIND thoughts ORDER BY created_cycle ASC"))
+        descending = await store.execute_mindql(parse("FIND thoughts ORDER BY created_cycle DESC"))
+        assert [row["thought_id"] for row in ascending.rows] == _POPULATED_IDS
+        assert [row["thought_id"] for row in descending.rows] == list(reversed(_POPULATED_IDS))
+
+
+class TestExecutorRowBoundValidation:
+    """LIMIT and OFFSET are interpolated literals, so both are validated."""
+
+    async def test_boolean_limit_is_rejected(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        # ``bool`` is an ``int`` subclass, so this passes a type checker and
+        # SQLite reads ``LIMIT True`` as ``LIMIT 1``.
+        store = SqliteEngravaCore(guarded_db)
+        query = MindQLQuery(command=MindQLCommand.FIND, table="thought", limit=True)
+
+        with pytest.raises(MindQLParseError, match="LIMIT must be a non-negative integer"):
+            await store.execute_mindql(query)
+
+    async def test_boolean_offset_is_rejected(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(guarded_db)
+        query = MindQLQuery(command=MindQLCommand.FIND, table="thought", offset=True)
+
+        with pytest.raises(MindQLParseError, match="OFFSET must be a non-negative integer"):
+            await store.execute_mindql(query)
+
+    async def test_limit_payload_cannot_comment_out_the_offset(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(guarded_db)
+        query = MindQLQuery(
+            command=MindQLCommand.FIND,
+            table="thought",
+            limit=cast("int", "1 -- "),
+            offset=3,
+        )
+
+        with pytest.raises(MindQLParseError, match="LIMIT must be a non-negative integer"):
+            await store.execute_mindql(query)
+
+        assert await _thought_ids(guarded_db) == _POPULATED_IDS
+
+    async def test_negative_offset_is_rejected(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        # SQLite silently treats a negative OFFSET as 0, so this is a
+        # contract violation the database will never report.
+        store = SqliteEngravaCore(guarded_db)
+        query = MindQLQuery(command=MindQLCommand.FIND, table="thought", offset=-5)
+
+        with pytest.raises(MindQLParseError, match="OFFSET must be a non-negative integer"):
+            await store.execute_mindql(query)
+
+    async def test_negative_limit_cannot_bypass_the_default_row_cap(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        # SQLite reads ``LIMIT -1`` as "no limit", which turns the store's
+        # unqualified-FIND cap off entirely.
+        default = executor_module.DEFAULT_FIND_LIMIT
+        store = SqliteEngravaCore(db)
+        for i in range(default + 5):
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id=f"t-cap-{i:04d}",
+                    thought_type=ThoughtType.OBSERVATION,
+                    essence=f"essence {i}",
+                    content=f"content {i}",
+                    priority=Priority.P1,
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    created_cycle=1,
+                    updated_cycle=1,
+                    source="cap",
+                )
+            )
+        query = MindQLQuery(command=MindQLCommand.FIND, table="thought", limit=-1)
+
+        with pytest.raises(MindQLParseError, match="LIMIT must be a non-negative integer"):
+            await store.execute_mindql(query)
+
+        # The cap is still the only bound on an unqualified FIND.
+        uncapped = await store.execute_mindql(MindQLQuery(command=MindQLCommand.FIND))
+        assert len(uncapped.rows) == default
+
+    async def test_int_subclass_cannot_control_the_emitted_bound(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        # The value is a valid bound, so the query is legitimate — but the
+        # emitted text must be the integer, not what the subclass formats to.
+        store = SqliteEngravaCore(guarded_db)
+        query = MindQLQuery(
+            command=MindQLCommand.FIND,
+            table="thought",
+            order_by=(("thought_id", "ASC"),),
+            limit=_FormatHijackingInt(1),
+            offset=3,
+        )
+
+        result = await store.execute_mindql(query)
+        # Pre-guard the subclass commented the OFFSET out and returned t-000.
+        assert [row["thought_id"] for row in result.rows] == ["t-003"]
+
+        explained = await store.execute_mindql(
+            MindQLQuery(
+                command=query.command,
+                table=query.table,
+                order_by=query.order_by,
+                limit=query.limit,
+                offset=query.offset,
+                explain=True,
+            ),
+        )
+        assert explained.rows[0]["sql"] == (
+            "SELECT * FROM thought ORDER BY thought_id ASC LIMIT 1 OFFSET 3"
+        )
+
+    async def test_zero_limit_and_zero_offset_still_execute(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        # Zero is a legal bound on both clauses and must stay legal.
+        store = SqliteEngravaCore(guarded_db)
+        empty = await store.execute_mindql(
+            MindQLQuery(command=MindQLCommand.FIND, table="thought", limit=0),
+        )
+        assert empty.rows == []
+        full = await store.execute_mindql(
+            MindQLQuery(command=MindQLCommand.FIND, table="thought", offset=0),
+        )
+        assert sorted(str(row["thought_id"]) for row in full.rows) == _POPULATED_IDS
+
+    async def test_parser_bounds_still_page(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(guarded_db)
+        result = await store.execute_mindql(
+            parse("FIND thoughts ORDER BY thought_id ASC LIMIT 2 OFFSET 2"),
+        )
+        assert [row["thought_id"] for row in result.rows] == ["t-002", "t-003"]
+
+
+class TestExecutorBooleanJoinerValidation:
+    """The WHERE tree's boolean joiner is interpolated, so it is validated."""
+
+    @staticmethod
+    def _tree_query(joiner: str) -> MindQLQuery:
+        return MindQLQuery(
+            command=MindQLCommand.FIND,
+            table="thought",
+            where=BoolExpr(
+                op=cast("Literal['AND', 'OR']", joiner),
+                operands=(
+                    Comparison(field="priority", operator=MindQLOperator.EQ, value="P1"),
+                    Comparison(field="priority", operator=MindQLOperator.EQ, value="P2"),
+                ),
+            ),
+        )
+
+    async def test_joiner_payload_is_rejected(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        # The joiner sits between two already-parameterised operands, so a
+        # payload here rewrites the predicate without touching a bound value.
+        store = SqliteEngravaCore(guarded_db)
+
+        with pytest.raises(MindQLParseError, match="Boolean operator"):
+            await store.execute_mindql(self._tree_query("OR 1=1 OR"))
+
+        assert await _thought_ids(guarded_db) == _POPULATED_IDS
+
+    async def test_lowercase_joiner_still_compiles(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        # Case is normalised rather than rejected, as it is for sort direction.
+        store = SqliteEngravaCore(guarded_db)
+        result = await store.execute_mindql(self._tree_query("or"))
+        assert sorted(str(row["thought_id"]) for row in result.rows) == _POPULATED_IDS
+
+    async def test_str_subclass_joiner_cannot_reach_the_statement(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(guarded_db)
+        query = self._tree_query(cast("str", _FormatHijackingStr("OR")))
+        plan = await store.execute_mindql(
+            MindQLQuery(
+                command=query.command,
+                table=query.table,
+                where=query.where,
+                explain=True,
+            ),
+        )
+        assert plan.rows[0]["sql"] == (
+            "SELECT * FROM thought WHERE (priority = ? OR priority = ?) LIMIT 100"
+        )
+
+    async def test_parser_joiners_still_compile(
+        self,
+        guarded_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(guarded_db)
+        both = await store.execute_mindql(
+            parse("FIND thoughts WHERE priority = 'P1' OR priority = 'P2'"),
+        )
+        assert sorted(str(row["thought_id"]) for row in both.rows) == _POPULATED_IDS
+        neither = await store.execute_mindql(
+            parse("FIND thoughts WHERE priority = 'P1' AND priority = 'P2'"),
+        )
+        assert neither.rows == []
+
+
+class TestRejectedIdentifiersNeverExecute:
+    """One rejected payload per guard, none of which reaches SQLite at all."""
+
+    async def test_no_rejected_query_reaches_the_driver(
+        self,
+        guarded_db: aiosqlite.Connection,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        store = SqliteEngravaCore(guarded_db)
+        executed: list[str] = []
+        original_execute = guarded_db.execute
+
+        async def _spy(sql: object, *args: object, **kwargs: object) -> object:
+            executed.append(str(sql))
+            return await original_execute(sql, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(guarded_db, "execute", _spy)
+
+        hostile = [
+            MindQLQuery(command=MindQLCommand.FIND, table=_OFF_LIMITS_TABLE),
+            MindQLQuery(command=MindQLCommand.COUNT, table=_OFF_LIMITS_TABLE),
+            MindQLQuery(command=MindQLCommand.FIND, table=_TABLE_SUBSELECT_PAYLOAD),
+            MindQLQuery(command=MindQLCommand.FIND, table="sqlite_master"),
+            MindQLQuery(
+                command=MindQLCommand.FIND,
+                table="thought",
+                order_by=(("created_cycle", "ASC LIMIT 1 --"),),
+            ),
+            MindQLQuery(
+                command=MindQLCommand.FIND,
+                table="thought",
+                order_by=(("created_cycle", cast("str", 5)),),
+            ),
+            MindQLQuery(command=MindQLCommand.FIND, table="thought", limit=True),
+            MindQLQuery(command=MindQLCommand.FIND, table="thought", offset=True),
+            MindQLQuery(command=MindQLCommand.FIND, table="thought", limit=-1),
+            MindQLQuery(
+                command=MindQLCommand.FIND,
+                table="thought",
+                limit=cast("int", "1 -- "),
+            ),
+            MindQLQuery(command=MindQLCommand.FIND, table="thought", offset=-5),
+            MindQLQuery(command=MindQLCommand.FIND, table=cast("str", ["thought"])),
+            MindQLQuery(
+                command=MindQLCommand.FIND,
+                table="thought",
+                conditions=[
+                    Condition(field="valid_from", operator=MindQLOperator.EQ, value="x"),
+                ],
+            ),
+            TestExecutorBooleanJoinerValidation._tree_query("OR 1=1 OR"),
+        ]
+        for query in hostile:
+            with pytest.raises(MindQLParseError):
+                await store.execute_mindql(query)
+
+        assert executed == []
+
+
+class TestAllowedColumnsAllowlist:
+    """The per-table column allowlist is pinned to what it actually scopes."""
+
+    async def test_columns_are_scoped_to_their_own_table(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # ``weight`` exists on edge only, ``essence`` on thought only: each is
+        # queryable on its own table and refused on the other.
+        store = SqliteEngravaCore(populated_db)
+        await store.create_edge(
+            EdgeRecord(
+                edge_id="e-scope",
+                from_thought_id="t-000",
+                to_thought_id="t-001",
+                edge_type=EdgeType.ASSOCIATED,
+                weight=0.5,
+                created_cycle=1,
+            )
+        )
+        await populated_db.commit()
+
+        edge_hit = await store.execute_mindql(
+            MindQLQuery(
+                command=MindQLCommand.FIND,
+                table="edge",
+                conditions=[Condition(field="weight", operator=MindQLOperator.EQ, value=0.5)],
+            ),
+        )
+        assert [row["edge_id"] for row in edge_hit.rows] == ["e-scope"]
+
+        thought_hit = await store.execute_mindql(
+            MindQLQuery(
+                command=MindQLCommand.FIND,
+                table="thought",
+                conditions=[
+                    Condition(
+                        field="essence",
+                        operator=MindQLOperator.EQ,
+                        value="Thought number 1",
+                    ),
+                ],
+            ),
+        )
+        assert [row["thought_id"] for row in thought_hit.rows] == ["t-001"]
+
+        with pytest.raises(MindQLParseError, match="'weight' not allowed for table 'thought'"):
+            await store.execute_mindql(
+                MindQLQuery(
+                    command=MindQLCommand.FIND,
+                    table="thought",
+                    conditions=[
+                        Condition(field="weight", operator=MindQLOperator.EQ, value=0.5),
+                    ],
+                ),
+            )
+        with pytest.raises(MindQLParseError, match="'essence' not allowed for table 'edge'"):
+            await store.execute_mindql(
+                MindQLQuery(
+                    command=MindQLCommand.FIND,
+                    table="edge",
+                    conditions=[
+                        Condition(field="essence", operator=MindQLOperator.EQ, value="x"),
+                    ],
+                ),
+            )
+
+    async def test_str_subclass_column_cannot_rewrite_the_predicate(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # The allowlist check passes on equality, so the emitted statement
+        # must carry the allowlist's own column name at every site that
+        # interpolates one: WHERE, IN, and ORDER BY.
+        store = SqliteEngravaCore(populated_db)
+        hijacked = cast("str", _FormatHijackingColumn("priority"))
+
+        filtered = await store.execute_mindql(
+            MindQLQuery(
+                command=MindQLCommand.FIND,
+                table="thought",
+                conditions=[
+                    Condition(field=hijacked, operator=MindQLOperator.EQ, value="P1"),
+                ],
+            ),
+        )
+        # An "OR 1=1" payload would widen this to all five rows.
+        assert sorted(str(row["thought_id"]) for row in filtered.rows) == ["t-000", "t-001"]
+
+        in_filtered = await store.execute_mindql(
+            MindQLQuery(
+                command=MindQLCommand.FIND,
+                table="thought",
+                where=InCondition(field=hijacked, values=("P1",)),
+            ),
+        )
+        assert sorted(str(row["thought_id"]) for row in in_filtered.rows) == ["t-000", "t-001"]
+
+        tree_filtered = await store.execute_mindql(
+            MindQLQuery(
+                command=MindQLCommand.FIND,
+                table="thought",
+                where=Comparison(
+                    field=hijacked,
+                    operator=MindQLOperator.EQ,
+                    value="P1",
+                ),
+            ),
+        )
+        assert sorted(str(row["thought_id"]) for row in tree_filtered.rows) == ["t-000", "t-001"]
+
+        sorted_plan = await store.execute_mindql(
+            MindQLQuery(
+                command=MindQLCommand.FIND,
+                table="thought",
+                order_by=((hijacked, "ASC"),),
+                explain=True,
+            ),
+        )
+        assert sorted_plan.rows[0]["sql"] == (
+            "SELECT * FROM thought ORDER BY priority ASC LIMIT 100"
+        )
+
+    def test_allowlist_covers_exactly_the_grammar_tables(self) -> None:
+        # The executor's table allowlist is derived from the keys of the
+        # column allowlist, so it must cover every table the grammar accepts —
+        # otherwise a parsed query would be refused at execution.
+        assert set(executor_module._ALLOWED_COLUMNS) == set(parser_module._TABLE_MAP.values())
+
+    async def test_the_queryable_surface_is_exactly_what_is_expected(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # Two directions at once: every expected column really compiles and
+        # runs against the live schema (a collapse, or an allowlisted column
+        # the schema no longer has, fails here), and the allowlist carries
+        # nothing beyond them (a silent widening fails here).
+        store = SqliteEngravaCore(populated_db)
+        for table, columns in _EXPECTED_FILTERABLE_COLUMNS.items():
+            for column in columns:
+                query = MindQLQuery(
+                    command=MindQLCommand.COUNT,
+                    table=table,
+                    conditions=[
+                        Condition(field=column, operator=MindQLOperator.NE, value="\x00"),
+                    ],
+                )
+                plan = await store.execute_mindql(
+                    MindQLQuery(
+                        command=query.command,
+                        table=query.table,
+                        conditions=query.conditions,
+                        explain=True,
+                    ),
+                )
+                # The column asked for is the column compiled, not merely
+                # some accepted column.
+                head = f"SELECT COUNT(*) AS cnt FROM {table}"  # noqa: S608 -- expectation
+                assert plan.rows[0]["sql"] == f"{head} WHERE {column} != ?"
+                result = await store.execute_mindql(query)
+                assert result.count is not None, f"{table}.{column} no longer filters"
+            assert set(executor_module._ALLOWED_COLUMNS[table]) == set(columns)
+
+    async def test_valid_time_columns_are_not_filterable(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # A documented non-guarantee: valid time is reachable only through the
+        # temporal predicates, never as an ordinary column comparison.
+        store = SqliteEngravaCore(populated_db)
+        for table in ("thought", "edge"):
+            for column in ("valid_from", "valid_until"):
+                flat = MindQLQuery(
+                    command=MindQLCommand.FIND,
+                    table=table,
+                    conditions=[
+                        Condition(field=column, operator=MindQLOperator.EQ, value="x"),
+                    ],
+                )
+                tree = MindQLQuery(
+                    command=MindQLCommand.COUNT,
+                    table=table,
+                    where=Comparison(
+                        field=column,
+                        operator=MindQLOperator.EQ,
+                        value="x",
+                    ),
+                )
+                sort = MindQLQuery(
+                    command=MindQLCommand.FIND,
+                    table=table,
+                    order_by=((column, "ASC"),),
+                )
+                for query in (flat, tree, sort):
+                    with pytest.raises(MindQLParseError, match=f"not allowed for table '{table}'"):
+                        await store.execute_mindql(query)
+
+    async def test_every_allowlisted_column_exists_in_the_schema(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        # The allowlist is hand-maintained against the real schema; a renamed
+        # or dropped column would otherwise leave a stale entry that fails as
+        # an untyped SQLite error at query time.
+        for table, columns in executor_module._ALLOWED_COLUMNS.items():
+            cursor = await db.execute("SELECT name FROM pragma_table_info(?)", (table,))
+            actual = {str(row[0]) for row in await cursor.fetchall()}
+            assert actual, f"table {table!r} is absent from the core schema"
+            missing = sorted(columns - actual)
+            assert not missing, f"{table}: allowlisted columns absent from the schema: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# SELECT passthrough: read-only-ness decided on a value the module owns
+# ---------------------------------------------------------------------------
+
+
+# The passthrough is documented as read-only, and that guarantee is established
+# by inspecting the statement the caller hands in. ``str`` is subclassable and
+# every method such an inspection reaches for — ``strip``, ``upper``,
+# ``startswith``, ``endswith``, ``__len__``, ``__str__`` — is overridable, while
+# SQLite still reads the object's real text. A guard built out of the caller's
+# own methods can therefore be told it is running a SELECT and hand a DELETE to
+# the database.
+#
+# Every refusal below is judged against the store rather than against the
+# exception: the rows are read back — or the driver is watched — *before*
+# anything about the raised error is asserted. "It raised" is the weaker claim
+# and would be satisfied by a guard that raised only after the write had
+# already run; asserting it first would abort the test at the wrong place and
+# hide what actually happened.
+
+_WRITE_PAYLOAD = "DELETE FROM thought"
+_READ_STATEMENT = "SELECT thought_id FROM thought"
+# Two statements in one string: the second one is what a single-statement guard
+# exists to keep out.
+_SMUGGLED_PAYLOAD = "SELECT 1; DELETE FROM thought"
+
+
+class _LyingSelectSql(str):
+    """Answers ``strip`` with itself and ``upper`` with a SELECT it is not.
+
+    The reported vector. An inspection built from these two methods sees a
+    read; the buffer SQLite receives is a write.
+    """
+
+    __slots__ = ()
+
+    def strip(self, chars: str | None = None, /) -> _LyingSelectSql:
+        return self
+
+    def upper(self) -> str:
+        return "SELECT"
+
+
+class _LyingStartswithSql(str):
+    """Stays in play through ``strip``/``upper``, then lies in ``startswith``."""
+
+    __slots__ = ()
+
+    def strip(self, chars: str | None = None, /) -> _LyingStartswithSql:
+        return self
+
+    def upper(self) -> _LyingStartswithSql:
+        return self
+
+    def startswith(
+        self,
+        prefix: str | tuple[str, ...],
+        start: SupportsIndex | None = None,
+        end: SupportsIndex | None = None,
+        /,
+    ) -> bool:
+        return True
+
+
+class _LyingSeparatorSql(str):
+    """Inverts every answer about its own trailing statement separator.
+
+    Aimed at the other half of the guard: a statement that really ends in
+    ``;`` claims it does not, and one that does not claims it does.
+    """
+
+    __slots__ = ()
+
+    def strip(self, chars: str | None = None, /) -> _LyingSeparatorSql:
+        return self
+
+    def endswith(
+        self,
+        suffix: str | tuple[str, ...],
+        start: SupportsIndex | None = None,
+        end: SupportsIndex | None = None,
+        /,
+    ) -> bool:
+        return not str.endswith(self, suffix)
+
+
+class _LyingEqualitySql(str):
+    """Compares equal to anything, while carrying a write."""
+
+    __slots__ = ()
+
+    def strip(self, chars: str | None = None, /) -> _LyingEqualitySql:
+        return self
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __hash__(self) -> int:
+        return str.__hash__(self)
+
+
+class _HiddenSeparatorSql(str):
+    """Reports its length as everything before the first ``;``.
+
+    A lexical scan that walks the caller's object never reaches the second
+    statement, so the single-statement check passes on a string that carries
+    two.
+    """
+
+    __slots__ = ()
+
+    def strip(self, chars: str | None = None, /) -> _HiddenSeparatorSql:
+        return self
+
+    def __len__(self) -> int:
+        return str.find(self, ";")
+
+
+class _MaskedWriteSql(str):
+    """Carries a write while ``__str__`` shows a read."""
+
+    __slots__ = ()
+
+    def __str__(self) -> str:
+        return _READ_STATEMENT
+
+
+class _MaskedReadSql(str):
+    """Carries a read while ``__str__`` shows a write."""
+
+    __slots__ = ()
+
+    def __str__(self) -> str:
+        return _WRITE_PAYLOAD
+
+
+class _PassthroughStripSql(str):
+    """A legitimate statement whose ``strip`` keeps the object itself in play."""
+
+    __slots__ = ()
+
+    def strip(self, chars: str | None = None, /) -> _PassthroughStripSql:
+        return self
+
+
+class _ShiftingSql(str):  # noqa: SLOT000 -- carries state; str takes no non-empty __slots__
+    """Answers the guard's first question one way and tells the truth after.
+
+    Time-of-check/time-of-use: the statement the guard inspects is not the
+    statement a later reader — including SQLite — would see.
+    """
+
+    def __init__(self, _value: str) -> None:
+        super().__init__()
+        self._answered = False
+
+    def strip(self, chars: str | None = None, /) -> _ShiftingSql:
+        return self
+
+    def upper(self) -> str:
+        if self._answered:
+            return str.upper(self)
+        self._answered = True
+        return "SELECT"
+
+
+class _ExplodingRepr:
+    """A non-string that raises when anything tries to represent it.
+
+    The refusal message is the last place on the guard's path where a caller's
+    code could still run. This value makes that visible: formatting it into an
+    error would replace the module's own exception with whatever ``__repr__``
+    chose to raise.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        msg = "__repr__ must not run inside a guard"
+        raise RuntimeError(msg)
+
+
+async def _refusal(store: SqliteEngravaCore, query: MindQLQuery) -> Exception | None:
+    """Run a query that must be refused and return what it raised, if anything.
+
+    The exception is returned rather than asserted so the caller can read the
+    stored rows first. A refusal that arrives *after* the write has run is not
+    a refusal, and asserting on the exception ahead of the state would hide
+    exactly that.
+    """
+    try:
+        await store.execute_mindql(query)
+    except Exception as exc:  # noqa: BLE001 -- returned so state is asserted first
+        return exc
+    return None
+
+
+class TestSelectPassthroughGuardOwnsItsValue:
+    """The read-only guard cannot be talked out of its decision."""
+
+    async def test_reported_bypass_destroys_nothing(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        before = await _thought_ids(populated_db)
+
+        raised = await _refusal(
+            store,
+            MindQLQuery(
+                command=MindQLCommand.SELECT,
+                raw_sql=_LyingSelectSql(_WRITE_PAYLOAD),
+            ),
+        )
+
+        after = await _thought_ids(populated_db)
+        assert after == before == _POPULATED_IDS
+        assert isinstance(raised, MindQLParseError)
+        assert "Only SELECT statements are allowed" in str(raised)
+
+    @pytest.mark.parametrize(
+        ("payload", "expected"),
+        [
+            pytest.param(
+                _LyingStartswithSql(_WRITE_PAYLOAD),
+                "Only SELECT statements are allowed",
+                id="lying-startswith",
+            ),
+            pytest.param(
+                _LyingEqualitySql(_WRITE_PAYLOAD),
+                "Only SELECT statements are allowed",
+                id="lying-eq",
+            ),
+            pytest.param(
+                _MaskedWriteSql(_WRITE_PAYLOAD),
+                "Only SELECT statements are allowed",
+                id="masked-str-dunder",
+            ),
+            pytest.param(
+                _HiddenSeparatorSql(_SMUGGLED_PAYLOAD),
+                "Only a single SELECT statement is allowed",
+                id="hidden-length",
+            ),
+        ],
+    )
+    async def test_adversarial_statement_writes_nothing(
+        self,
+        populated_db: aiosqlite.Connection,
+        payload: str,
+        expected: str,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        before = await _thought_ids(populated_db)
+
+        raised = await _refusal(
+            store,
+            MindQLQuery(command=MindQLCommand.SELECT, raw_sql=payload),
+        )
+
+        after = await _thought_ids(populated_db)
+        assert after == before == _POPULATED_IDS
+        assert isinstance(raised, MindQLParseError)
+        assert expected in str(raised)
+
+    async def test_statement_that_changes_its_answer_writes_nothing(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # Built fresh: this one keeps state, and its lie is spent on first use.
+        store = SqliteEngravaCore(populated_db)
+        before = await _thought_ids(populated_db)
+
+        raised = await _refusal(
+            store,
+            MindQLQuery(
+                command=MindQLCommand.SELECT,
+                raw_sql=_ShiftingSql(_WRITE_PAYLOAD),
+            ),
+        )
+
+        after = await _thought_ids(populated_db)
+        assert after == before == _POPULATED_IDS
+        assert isinstance(raised, MindQLParseError)
+        assert "Only SELECT statements are allowed" in str(raised)
+
+    @pytest.mark.parametrize(
+        ("value", "value_id"),
+        [
+            pytest.param(None, "none", id="none"),
+            pytest.param(5, "int", id="int"),
+            pytest.param(b"SELECT thought_id FROM thought", "bytes", id="bytes"),
+            pytest.param(["SELECT thought_id FROM thought"], "list", id="list"),
+        ],
+    )
+    async def test_non_string_sql_is_refused_with_a_typed_error(
+        self,
+        populated_db: aiosqlite.Connection,
+        value: object,
+        value_id: str,
+    ) -> None:
+        # A constructed query is not type-checked at runtime, so the guard owns
+        # the type as well as the value — and refuses with its own exception
+        # rather than whatever the value's methods happen to raise.
+        store = SqliteEngravaCore(populated_db)
+        before = await _thought_ids(populated_db)
+
+        raised = await _refusal(
+            store,
+            MindQLQuery(command=MindQLCommand.SELECT, raw_sql=cast("str", value)),
+        )
+
+        after = await _thought_ids(populated_db)
+        assert after == before == _POPULATED_IDS
+        assert isinstance(raised, MindQLParseError), f"{value_id}: {raised!r}"
+        assert "must be a string" in str(raised)
+
+    async def test_a_hostile_repr_cannot_change_the_error_type(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # The refusal owes a typed domain error for *every* non-string, which
+        # means its message may not be built out of the value being refused.
+        # Formatting the rejected value would hand the last word on the guard's
+        # path back to the caller.
+        store = SqliteEngravaCore(populated_db)
+        before = await _thought_ids(populated_db)
+
+        raised = await _refusal(
+            store,
+            MindQLQuery(
+                command=MindQLCommand.SELECT,
+                raw_sql=cast("str", _ExplodingRepr()),
+            ),
+        )
+
+        after = await _thought_ids(populated_db)
+        assert after == before == _POPULATED_IDS
+        assert isinstance(raised, MindQLParseError)
+        assert "must be a string" in str(raised)
+
+    async def test_no_refused_statement_reaches_the_driver(
+        self,
+        populated_db: aiosqlite.Connection,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        executed: list[str] = []
+        original_execute = populated_db.execute
+
+        async def _spy(sql: str, *args: object, **kwargs: object) -> object:
+            executed.append(str(sql))
+            return await original_execute(sql, *args, **kwargs)
+
+        monkeypatch.setattr(populated_db, "execute", _spy)
+
+        hostile: list[str] = [
+            _LyingSelectSql(_WRITE_PAYLOAD),
+            _LyingStartswithSql(_WRITE_PAYLOAD),
+            _LyingEqualitySql(_WRITE_PAYLOAD),
+            _MaskedWriteSql(_WRITE_PAYLOAD),
+            _HiddenSeparatorSql(_SMUGGLED_PAYLOAD),
+            _ShiftingSql(_WRITE_PAYLOAD),
+        ]
+        raised = [
+            await _refusal(
+                store,
+                MindQLQuery(command=MindQLCommand.SELECT, raw_sql=payload),
+            )
+            for payload in hostile
+        ]
+
+        # "Nothing reached SQLite" is the stronger claim and goes first: a
+        # guard that ran the statement and then raised would satisfy every
+        # assertion about the exception while the write had already happened.
+        assert executed == []
+        assert [type(exc) for exc in raised] == [MindQLParseError] * len(hostile)
+
+    async def test_the_guard_returns_the_modules_own_string(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # The statement that was validated is the statement that runs: the
+        # guard hands back a plain ``str`` it built, never the caller's object,
+        # so nothing the object overrides can act between check and use.
+        store = SqliteEngravaCore(populated_db)
+        plan = await store.execute_mindql(
+            MindQLQuery(
+                command=MindQLCommand.SELECT,
+                raw_sql=_PassthroughStripSql(_READ_STATEMENT),
+                explain=True,
+            ),
+        )
+
+        compiled = plan.rows[0]["sql"]
+        assert type(compiled) is str
+        assert compiled == _READ_STATEMENT
+
+    async def test_str_dunder_cannot_redirect_execution(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # The mirror of the masked-write case: a legitimate SELECT whose
+        # ``__str__`` reports a DELETE must run the SELECT it actually is.
+        # Normalising through ``str()`` rather than the buffer would validate,
+        # and return, a statement that is not the one handed in — which is the
+        # property that matters, whatever that other statement happens to do.
+        store = SqliteEngravaCore(populated_db)
+        before = await _thought_ids(populated_db)
+
+        result = await store.execute_mindql(
+            MindQLQuery(
+                command=MindQLCommand.SELECT,
+                raw_sql=_MaskedReadSql(_READ_STATEMENT),
+            ),
+        )
+
+        assert await _thought_ids(populated_db) == before == _POPULATED_IDS
+        assert [str(row["thought_id"]) for row in result.rows] == _POPULATED_IDS
+
+
+class TestSelectPassthroughLegitimateShapes:
+    """Owning the value must not cost the passthrough anything it accepted."""
+
+    @pytest.mark.parametrize(
+        "raw_sql",
+        [
+            pytest.param(_READ_STATEMENT, id="plain"),
+            pytest.param(f"   {_READ_STATEMENT}   ", id="surrounding-whitespace"),
+            pytest.param(f"{_READ_STATEMENT};", id="trailing-separator"),
+            pytest.param(f"{_READ_STATEMENT} ;  ", id="spaced-trailing-separator"),
+            pytest.param("select thought_id from thought", id="lower-case"),
+            pytest.param(f"\n{_READ_STATEMENT}\n", id="newlines"),
+            pytest.param(_PassthroughStripSql(_READ_STATEMENT), id="str-subclass"),
+            pytest.param(_LyingSeparatorSql(_READ_STATEMENT), id="lying-separator-absent"),
+            pytest.param(_LyingSeparatorSql(f"{_READ_STATEMENT};"), id="lying-separator-present"),
+        ],
+    )
+    async def test_legitimate_statement_still_executes(
+        self,
+        populated_db: aiosqlite.Connection,
+        raw_sql: str,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        result = await store.execute_mindql(
+            MindQLQuery(command=MindQLCommand.SELECT, raw_sql=raw_sql),
+        )
+        assert [str(row["thought_id"]) for row in result.rows] == _POPULATED_IDS
+
+    async def test_bound_parameters_survive_a_str_subclass(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        result = await store.execute_mindql(
+            MindQLQuery(
+                command=MindQLCommand.SELECT,
+                raw_sql=_PassthroughStripSql(
+                    "SELECT thought_id FROM thought WHERE priority = ?",
+                ),
+                select_params=("P1",),
+            ),
+        )
+        assert [str(row["thought_id"]) for row in result.rows] == ["t-000", "t-001"]
+
+    async def test_quoted_separator_is_still_not_a_second_statement(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        # The single-statement scan runs on the guard's own copy; a ``;`` inside
+        # a string literal is still data, not a separator.
+        store = SqliteEngravaCore(populated_db)
+        result = await store.execute_mindql(
+            MindQLQuery(command=MindQLCommand.SELECT, raw_sql="SELECT ';' AS s"),
+        )
+        assert result.rows == [{"s": ";"}]

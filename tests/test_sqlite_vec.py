@@ -11,6 +11,8 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import aiosqlite
 import pytest
 
+from engrava import EmbeddingProviderContractError
+from engrava.config import ConfigError, EngravaConfig
 from engrava.domain.enums import LifecycleStatus, Priority, ThoughtType
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.extensions.vector_sqlite_vec import (
@@ -18,6 +20,7 @@ from engrava.extensions.vector_sqlite_vec import (
     _load_sqlite_vec_sync,
     load_sqlite_vec,
 )
+from engrava.infrastructure.service_manager import EngravaManager
 from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
 
 # Skip the real-extension integration tests when sqlite-vec is absent, but
@@ -389,6 +392,7 @@ class TestSqliteVecRealConnection:
         dimension: int,
         search_config: object | None = None,
         db_name: str | None = None,
+        ttl_strategy: str = "archive",
     ) -> SqliteEngravaCore:
         """Construct a store with a real connection and the given backend.
 
@@ -396,7 +400,9 @@ class TestSqliteVecRealConnection:
         ``_configure_vector_backend``) but lets the test pick the backend.
         ``search_config`` threads a custom :class:`SearchConfig` (e.g. a
         ``vec0_overfetch_factor`` override); ``db_name`` disambiguates the file
-        when a single test builds two stores of the same backend.
+        when a single test builds two stores of the same backend;
+        ``ttl_strategy`` selects the cleanup strategy so a test can exercise
+        the physical-delete TTL path against a real vec0 index.
         """
         from engrava.config import SearchConfig
 
@@ -405,7 +411,7 @@ class TestSqliteVecRealConnection:
         db.row_factory = aiosqlite.Row
         await db.execute("PRAGMA foreign_keys=ON")
         cfg = search_config if isinstance(search_config, SearchConfig) else None
-        store = SqliteEngravaCore(db, search_config=cfg)
+        store = SqliteEngravaCore(db, search_config=cfg, ttl_strategy=ttl_strategy)
         store._owns_connection = True
         await store.ensure_schema()
         await store._configure_vector_backend(
@@ -567,6 +573,135 @@ async def _embedding_rowid(store: SqliteEngravaCore, thought_id: str) -> int | N
 # ------------------------------------------------------------------
 
 
+class _PrivateDimensionProvider:
+    """A provider that keeps its dimension private, violating the protocol.
+
+    ``EmbeddingProviderProtocol`` requires a public ``dimension``; this shape
+    (the value held as ``self._dimension`` with no property) is the natural way
+    to get it wrong, and the core raises ``EmbeddingProviderContractError`` the
+    moment it has to read the member.
+    """
+
+    def __init__(self, dimension: int = 3) -> None:
+        self._dimension = dimension
+
+    @property
+    def model_name(self) -> str:
+        """Return the embedding model name."""
+        return "private-dimension"
+
+    async def embed(self, text: str) -> list[float]:
+        """Return a fixed-length vector for the given text."""
+        return [float(len(text) % 3)] * self._dimension
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Return one fixed-length vector per input text."""
+        return [await self.embed(text) for text in texts]
+
+
+@sqlite_vec_required
+class TestVec0DimensionTakesPrecedenceOverTheProvider(TestSqliteVecRealConnection):
+    """A configured vec0 index answers for the dimension, so the provider is not asked.
+
+    The upgrade note and the known-limitations page both say a store with a
+    ``sqlite-vec`` backend takes the dimension from its dimension-typed ``vec0``
+    table and therefore never asks the provider *for its dimension* on the
+    vector-search path. That is a documented guarantee, so it is exercised
+    against a real loaded extension rather than read off the branch order.
+
+    Both stores are built the way ``from_config`` builds one — the provider is
+    passed to the constructor, and the backend is selected through
+    ``_configure_vector_backend`` — so the guarantee is checked under real
+    initialisation rather than by assigning to store internals afterwards.
+    """
+
+    async def _store_with_private_dimension_provider(
+        self,
+        tmp_path: Path,
+        *,
+        backend: str,
+    ) -> SqliteEngravaCore:
+        """Build a store whose provider omits ``dimension``, on the given backend."""
+        db = await aiosqlite.connect(str(tmp_path / f"{backend}-precedence.db"))
+        db.row_factory = aiosqlite.Row
+        await db.execute("PRAGMA foreign_keys=ON")
+        store = SqliteEngravaCore(db, embedding_provider=_PrivateDimensionProvider())  # type: ignore[arg-type]  # the non-conformant shape is the subject
+        store._owns_connection = True
+        await store.ensure_schema()
+        await store._configure_vector_backend(backend_name=backend, embedding_dimension=3)
+        return store
+
+    async def test_vector_search_succeeds_with_a_non_conformant_provider(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The search runs to a result even though the provider has no ``dimension``."""
+        store = await self._store_with_private_dimension_provider(tmp_path, backend="sqlite-vec")
+        try:
+            await _make_thought(store, "vec-precedence-1")
+            await store.store_embedding("vec-precedence-1", [1.0, 0.0, 0.0], model_name="m")
+
+            results = await store.search_similar([1.0, 0.0, 0.0], top_k=5)
+
+            assert [tid for tid, _ in results] == ["vec-precedence-1"]
+        finally:
+            await store.close()
+
+    async def test_from_config_produces_the_state_this_precedence_relies_on(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """``from_config`` really leaves a store whose vec0 index declares the dimension.
+
+        The two tests around this one build the store the way ``from_config``
+        does; this one closes the gap between "the way it does" and what it
+        actually does. A ``from_config`` that chose another backend, or left the
+        dimension unresolved, would make the guarantee those tests establish a
+        statement about a store no user has.
+        """
+        from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
+
+        db_path = tmp_path / "from_config_vec.db"
+        cfg_file = tmp_path / "engrava.yaml"
+        cfg_file.write_text(
+            f"database:\n  path: {db_path}\n"
+            f"extensions:\n  vector:\n    backend: sqlite-vec\n    dimension: 3\n",
+            encoding="utf-8",
+        )
+
+        async with await SqliteEngravaCore.from_config(cfg_file) as store:
+            assert isinstance(store._vector_backend, SqliteVecSearchBackend)
+            assert store._declared_embedding_dimension() == 3
+
+    async def test_the_same_provider_is_asked_on_the_numpy_backend(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The counter-state: the store that declares no vec0 dimension raises.
+
+        Same construction, same provider, the supported ``numpy`` backend — which
+        declares no dimension of its own, so the provider is asked. Without this
+        the test above would pass just as well against a store that never
+        consults the provider under any configuration.
+        """
+        store = await self._store_with_private_dimension_provider(tmp_path, backend="numpy")
+        try:
+            await _make_thought(store, "vec-precedence-2")
+            await store.store_embedding("vec-precedence-2", [1.0, 0.0, 0.0], model_name="m")
+            before = await store.count_thoughts()
+
+            with pytest.raises(EmbeddingProviderContractError) as excinfo:
+                await store.search_similar([1.0, 0.0, 0.0], top_k=5)
+
+            assert await store.count_thoughts() == before
+            assert (await store.get_thought("vec-precedence-2")) is not None
+            assert store.vector_arm_degradation_count == 0
+            assert excinfo.value.provider_class == "_PrivateDimensionProvider"
+            assert excinfo.value.member == "dimension"
+        finally:
+            await store.close()
+
+
 @sqlite_vec_required
 class TestVec0DeleteRemovesVector(TestSqliteVecRealConnection):
     """Deleting a thought must also drop its vec0 vector (no ghost row)."""
@@ -604,6 +739,87 @@ class TestVec0DeleteRemovesVector(TestSqliteVecRealConnection):
             after = await store.search_similar([0.9, 0.1, 0.0], top_k=2)
             assert "t-drop" not in [r[0] for r in after]
             assert "t-keep" in [r[0] for r in after]
+        finally:
+            await store.close()
+
+    async def test_ttl_delete_sweep_purges_only_the_expired_vector(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The delete-strategy TTL sweep drops the expired vectors and no others.
+
+        ``cleanup_expired`` reaches the same orphan-vector purge as
+        ``delete_thought``, and ``embedding_vec`` is the one store a widened
+        purge could empty without any foreign key or ``embedding`` read-back
+        noticing. Both halves are therefore read from the index itself: the
+        expired rowids are gone, and what remains is **exactly** the surviving
+        set, still returned by a search.
+
+        The corpus is interleaved survivor · **doomed** · survivor · **doomed**
+        · survivor on the two ordering axes it controls: the thought id
+        (``t-anchor`` < ``t-drop`` < ``t-keep`` < ``t-purge`` < ``t-vault``) and
+        ``rowid``, the key the vec0 table is actually addressed by. A purge that
+        picks a row by **rowid** position — lowest, highest, any other row —
+        instead of by the rowid it was handed therefore cannot land on a doomed
+        one by luck, and **two** doomed vectors make a sweep that purges only
+        the first distinguishable from one that purges both. Rowids follow
+        insertion order, and the interleaving is asserted, not assumed. The
+        stored vectors themselves are chosen for a deterministic search order,
+        not to bracket anything.
+        """
+        store = await self._build_store(
+            tmp_path,
+            backend="sqlite-vec",
+            dimension=3,
+            ttl_strategy="delete",
+        )
+        try:
+            expired_at = _past_iso()
+            for thought_id, expires_at in (
+                ("t-anchor", None),
+                ("t-drop", expired_at),
+                ("t-keep", None),
+                ("t-purge", expired_at),
+                ("t-vault", None),
+            ):
+                await _make_thought(store, thought_id, expires_at=expires_at)
+            for thought_id, vector in (
+                ("t-anchor", [0.8, 0.2, 0.0]),
+                ("t-drop", [0.9, 0.1, 0.0]),
+                ("t-keep", [1.0, 0.0, 0.0]),
+                ("t-purge", [0.95, 0.05, 0.0]),
+                ("t-vault", [0.6, 0.4, 0.0]),
+            ):
+                await store.store_embedding(
+                    thought_id=thought_id, vector=vector, model_name=_PARITY_MODEL
+                )
+            order = ("t-anchor", "t-drop", "t-keep", "t-purge", "t-vault")
+            rowids_by_thought: dict[str, int] = {}
+            for tid in order:
+                rowid = await _embedding_rowid(store, tid)
+                assert rowid is not None, f"no embedding stored for {tid}"
+                rowids_by_thought[tid] = rowid
+            surviving = {rowids_by_thought[t] for t in ("t-anchor", "t-keep", "t-vault")}
+            doomed = {rowids_by_thought[t] for t in ("t-drop", "t-purge")}
+            # Corpus precondition: survivors sit either side of each doomed
+            # rowid in the index's own key space, and the doomed pair is not
+            # adjacent by rowid, so no rowid-positional purge selects exactly it.
+            assert [rowids_by_thought[t] for t in order] == sorted(
+                rowids_by_thought[t] for t in order
+            )
+            assert await _vec_rowids(store) == surviving | doomed
+
+            result = await store.cleanup_expired()
+
+            rowids = await _vec_rowids(store)
+            assert not doomed & rowids, "an expired vector survived the sweep"
+            # Set equality, not containment: containment would hold just as well
+            # if the sweep had left extra rows behind in the index.
+            assert rowids == surviving
+            hits = [r[0] for r in await store.search_similar([1.0, 0.0, 0.0], top_k=5)]
+            assert hits == ["t-keep", "t-anchor", "t-vault"]
+            # Only once the index is settled does the reported count matter.
+            assert result.expired_count == len(doomed)
         finally:
             await store.close()
 
@@ -900,3 +1116,175 @@ class TestVec0OverfetchConfig:
         )
         cfg = load_config(cfg_file)
         assert cfg.search.vec0_overfetch_factor == 7
+
+
+# ------------------------------------------------------------------
+# The dimension in the DDL is the dimension that was validated
+# ------------------------------------------------------------------
+
+
+class _LyingDimension(int):
+    """A dimension whose numeric value and whose rendering disagree.
+
+    Every numeric check — ``isinstance``, ``>= 1``, comparison against a stored
+    vector length — reads the real value 384. ``__format__`` is what the DDL
+    f-string calls, and it answers with schema text of its own.
+    """
+
+    def __format__(self, format_spec: str) -> str:
+        del format_spec
+        return "1] distance_metric=L2, smuggled float[1"
+
+
+class TestVectorTableDeclarationUsesTheValidatedDimension:
+    """``vec0(...)`` is DDL: it cannot be parameterised, so the value must be owned.
+
+    The dimension is the only caller-supplied value in the declaration, and the
+    declaration decides the vector length, the distance metric and the column
+    list of the index every later search runs against.
+    """
+
+    def test_the_backend_stores_an_exact_int(self) -> None:
+        backend = SqliteVecSearchBackend(_LyingDimension(384))
+        assert type(backend.dimension) is int
+        assert backend.dimension == 384
+        assert f"float[{backend.dimension}]" == "float[384]"
+
+    @pytest.mark.parametrize("dimension", [0, -1, True, 3.5, "384", None])
+    def test_a_dimension_that_is_not_a_positive_int_is_refused(self, dimension: object) -> None:
+        """The class validates at its own boundary; it is a public export."""
+        with pytest.raises(ConfigError, match="must be a positive integer"):
+            SqliteVecSearchBackend(dimension)  # type: ignore[arg-type]  # passing the wrong type is the behaviour under test
+
+    @sqlite_vec_required
+    async def test_the_created_table_declares_the_validated_dimension(self) -> None:
+        db = await aiosqlite.connect(":memory:")
+        try:
+            assert await load_sqlite_vec(db)
+            backend = SqliteVecSearchBackend(_LyingDimension(384))
+            await backend.ensure_index(db)
+
+            cursor = await db.execute("SELECT sql FROM sqlite_master WHERE name = 'embedding_vec'")
+            row = await cursor.fetchone()
+            assert row is not None
+            declaration = str(row[0])
+            assert "float[384]" in declaration
+            assert "distance_metric=cosine" in declaration
+            assert "smuggled" not in declaration
+            assert "L2" not in declaration
+        finally:
+            await db.close()
+
+    @sqlite_vec_required
+    async def test_a_manager_configured_index_declares_its_own_dimension(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The manager takes a dimension straight from its caller — check it there too."""
+        manager = EngravaManager(
+            data_dir=tmp_path / "data",
+            vector_backend="sqlite-vec",
+            embedding_dimension=_LyingDimension(384),
+        )
+        try:
+            store = await manager.get_store("svc")
+            cursor = await store._db.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'embedding_vec'"
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            declaration = str(row[0])
+            assert "float[384]" in declaration
+            assert "smuggled" not in declaration
+        finally:
+            await manager.close_all()
+
+    def test_a_config_stores_an_exact_int(self, tmp_path: Path) -> None:
+        config = EngravaConfig(
+            database_path=tmp_path / "t.db",
+            embedding_dimension=_LyingDimension(384),
+        )
+        assert type(config.embedding_dimension) is int
+        assert config.embedding_dimension == 384
+
+    @sqlite_vec_required
+    async def test_a_legitimate_dimension_still_builds_a_working_index(self) -> None:
+        db = await aiosqlite.connect(":memory:")
+        try:
+            assert await load_sqlite_vec(db)
+            backend = SqliteVecSearchBackend(dimension=4)
+            await backend.ensure_index(db)
+            await db.execute(
+                "INSERT INTO embedding_vec(rowid, embedding) VALUES (?, ?)",
+                (1, "[1.0,0.0,0.0,0.0]"),
+            )
+            cursor = await db.execute("SELECT COUNT(*) FROM embedding_vec")
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row[0] == 1
+        finally:
+            await db.close()
+
+
+class _BackendNameThatComparesAsAnother(str):
+    """Reads as its real text; hashes and compares as ``sqlite-vec``."""
+
+    __slots__ = ()
+
+    def __hash__(self) -> int:
+        return hash("sqlite-vec")
+
+    def __eq__(self, other: object) -> bool:
+        return other == "sqlite-vec"
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+
+class TestVectorBackendSelectionUsesTheValidatedName:
+    """The backend named in the configuration is the backend that gets wired."""
+
+    def test_a_config_stores_an_exact_backend_name(self, tmp_path: Path) -> None:
+        config = EngravaConfig(
+            database_path=tmp_path / "t.db",
+            vector_backend=_BackendNameThatComparesAsAnother("numpy"),
+        )
+        assert type(config.vector_backend) is str
+        assert config.vector_backend == "numpy"
+
+    async def test_a_numpy_backend_builds_no_vector_table(self, tmp_path: Path) -> None:
+        manager = EngravaManager(
+            data_dir=tmp_path / "data",
+            vector_backend=_BackendNameThatComparesAsAnother("numpy"),
+        )
+        try:
+            store = await manager.get_store("svc")
+            cursor = await store._db.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'embedding_vec'"
+            )
+            assert await cursor.fetchone() is None
+        finally:
+            await manager.close_all()
+
+    @sqlite_vec_required
+    async def test_an_explicit_sqlite_vec_backend_still_builds_one(self, tmp_path: Path) -> None:
+        manager = EngravaManager(data_dir=tmp_path / "data", vector_backend="sqlite-vec")
+        try:
+            store = await manager.get_store("svc")
+            cursor = await store._db.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'embedding_vec'"
+            )
+            assert await cursor.fetchone() is not None
+        finally:
+            await manager.close_all()
+
+    async def test_a_non_string_backend_name_is_a_configuration_error(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        manager = EngravaManager(data_dir=tmp_path / "data", vector_backend=object())  # type: ignore[arg-type]  # passing the wrong type is the behaviour under test
+        try:
+            with pytest.raises(ConfigError, match="vector_backend must be a string"):
+                await manager.get_store("svc")
+        finally:
+            await manager.close_all()

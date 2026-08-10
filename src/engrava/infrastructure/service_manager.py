@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING, Self
 import aiosqlite
 
 from engrava.config import (
+    EmbeddingConfig,
+    SearchConfig,
     ServicesConfig,
     resolve_embedding_provider,
 )
@@ -34,7 +36,6 @@ from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from engrava.config import EmbeddingConfig, SearchConfig
 
 logger = logging.getLogger(__name__)
 
@@ -69,13 +70,31 @@ class EngravaManager:
         embedding_dimension: int = 384,
         services_config: ServicesConfig | None = None,
     ) -> None:
+        from engrava.config_validation import (  # noqa: PLC0415 -- deferred to avoid a config import cycle
+            require_exact_type_or_none,
+            require_positive_int,
+        )
+
         self._data_dir = data_dir
-        self._default_embeddings = default_embeddings
-        self._default_search = default_search
+        # The manager retains these and reads them itself (``configs`` decides
+        # which embedding config a service gets), so it requires the exact
+        # class at its own boundary rather than relying on the store's.
+        self._default_embeddings = require_exact_type_or_none(
+            default_embeddings, EmbeddingConfig, "EngravaManager.default_embeddings"
+        )
+        self._default_search = require_exact_type_or_none(
+            default_search, SearchConfig, "EngravaManager.default_search"
+        )
         self._wal_mode = wal_mode
         self._vector_backend = vector_backend
-        self._embedding_dimension = embedding_dimension
-        self._services_config = services_config
+        # Also a raw constructor argument: it reaches the vector index
+        # declaration, so it is decoded here as well as at that boundary.
+        self._embedding_dimension = require_positive_int(
+            embedding_dimension, "EngravaManager.embedding_dimension"
+        )
+        self._services_config = require_exact_type_or_none(
+            services_config, ServicesConfig, "EngravaManager.services_config"
+        )
         self._stores: dict[str, SqliteEngravaCore] = {}
         self._lock = asyncio.Lock()
 
@@ -126,17 +145,20 @@ class EngravaManager:
         """
         from engrava.config import _validate_service_name  # noqa: PLC0415
 
-        _validate_service_name(service_name)
+        # Everything below addresses the service by the *validated* name, never
+        # by the caller's object: it keys the store cache and, through
+        # :meth:`_service_db_path`, names a file on disk.
+        name = _validate_service_name(service_name)
 
-        if service_name in self._stores:
-            return self._stores[service_name]
+        if name in self._stores:
+            return self._stores[name]
 
         async with self._lock:
             # Double-check after acquiring the lock.
-            if service_name in self._stores:
-                return self._stores[service_name]
-            store = await self._create_store(service_name)
-            self._stores[service_name] = store
+            if name in self._stores:
+                return self._stores[name]
+            store = await self._create_store(name)
+            self._stores[name] = store
             return store
 
     def service_exists(self, service_name: str) -> bool:
@@ -150,8 +172,13 @@ class EngravaManager:
         Returns:
             ``True`` if ``<data_dir>/<service_name>.db`` exists.
 
+        Raises:
+            ConfigError: If the service name is invalid.
+
         """
-        return self._service_db_path(service_name).exists()
+        from engrava.config import _validate_service_name  # noqa: PLC0415
+
+        return self._service_db_path(_validate_service_name(service_name)).exists()
 
     async def list_services(self) -> list[str]:
         """List all service names with existing database files.
@@ -183,15 +210,19 @@ class EngravaManager:
         """
         from engrava.config import _validate_service_name  # noqa: PLC0415
 
-        _validate_service_name(service_name)
+        # The validated name is what addresses the file this method unlinks.
+        # Building the path from the caller's object instead would let a ``str``
+        # subclass name one thing to the pattern check and another to the
+        # filesystem, deleting a file outside ``data_dir``.
+        name = _validate_service_name(service_name)
 
         # Close cached store if open.
-        if service_name in self._stores:
-            store = self._stores.pop(service_name)
+        if name in self._stores:
+            store = self._stores.pop(name)
             store._owns_connection = True  # noqa: SLF001
             await store.close()
 
-        db_path = self._service_db_path(service_name)
+        db_path = self._service_db_path(name)
         if not db_path.exists():
             msg = f"Service database not found: {db_path}"
             raise FileNotFoundError(msg)
@@ -203,7 +234,7 @@ class EngravaManager:
             if journal.exists():
                 journal.unlink()
 
-        logger.info("Deleted service %r database: %s", service_name, db_path)
+        logger.info("Deleted service %r database: %s", name, db_path)
 
     async def close_all(self) -> None:
         """Close all cached store connections.
@@ -239,7 +270,7 @@ class EngravaManager:
         return cls(
             data_dir=config.data_dir,
             services_config=config,
-            **kwargs,  # type: ignore[arg-type]
+            **kwargs,  # type: ignore[arg-type]  # forwarded verbatim to the constructor, which types them
         )
 
     # ------------------------------------------------------------------
@@ -249,8 +280,15 @@ class EngravaManager:
     def _service_db_path(self, service_name: str) -> Path:
         """Compute the database file path for a service.
 
+        The interpolation below runs ``type(service_name).__format__``, so the
+        text that lands in the path is whatever that method returns. Every
+        caller therefore passes a name already returned by
+        ``_validate_service_name`` — an exact ``str`` — and never the object it
+        received from its own caller.
+
         Args:
-            service_name: Service identifier.
+            service_name: Service identifier, already validated and owned by
+                :func:`~engrava.config._validate_service_name`.
 
         Returns:
             Path to ``<data_dir>/<service_name>.db``.

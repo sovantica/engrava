@@ -17,12 +17,15 @@ These apply to every command and go **before** the command name:
 | `--db` | path | `./engrava.db` | Path to the SQLite database. Falls back to the `ENGRAVA_DB` env var, then the default. |
 | `--config` | path | — | Path to `engrava.yaml`. Falls back to the `ENGRAVA_CONFIG` env var. |
 | `--format` | `table` \| `json` \| `csv` | `table` | Output format for commands that print records. |
-| `--verbose` | flag | off | Enable verbose output. |
+| `--verbose` | flag | off | Emit DEBUG logs from Engrava modules to stderr for this invocation. Command data on stdout keeps its selected format. |
+| `--no-extensions` | flag | off | Prevent loading both `engrava.cli` and `engrava.extensions` entry points. `ENGRAVA_DISABLE_EXTENSIONS=1` provides the same control. |
 | `--help` | flag | — | Show help and exit (works on the root and on every command). |
 
 **Environment variables.** `ENGRAVA_DB` and `ENGRAVA_CONFIG` are CLI fallbacks for
 `--db` and `--config` respectively; the explicit flag always wins
 (`--db` > `ENGRAVA_DB` > `./engrava.db`).
+`ENGRAVA_DISABLE_EXTENSIONS=1` activates `--no-extensions` before command
+resolution, including for root help and built-in commands.
 
 ```bash
 export ENGRAVA_DB=/data/engrava.db
@@ -42,6 +45,39 @@ engrava --db other.db info         # flag overrides the env var
 | [`gc`](#gc) | Garbage-collect archived thoughts (and optionally expired ones). |
 | [`migrate`](#migrate) | Run pending schema migrations. |
 | [`export`](#export) | Export thoughts to a portable JSON file. |
+
+## Extension discovery
+
+The executable discovers installed CLI extensions lazily. Built-in commands are
+resolved without scanning `engrava.cli`. Root help scans that entry-point group
+so installed commands appear in the command list, and an otherwise unknown
+command triggers the scan so an installed extension command can resolve.
+
+The built-in `query` command performs a second scan of
+`engrava.extensions`. It loads each discovered manifest and registers its
+`mindql_extensions` for that query. This query-time scan does not apply manifest
+schema migrations.
+
+Both scans import and may execute code from installed packages. Failed entry
+points are skipped with a warning log. Put `--no-extensions` before the command,
+or set `ENGRAVA_DISABLE_EXTENSIONS=1`, to prevent **both** entry-point groups from
+being scanned or loaded:
+
+```bash
+engrava --no-extensions --help
+ENGRAVA_DISABLE_EXTENSIONS=1 engrava --db memory.db info
+engrava --no-extensions --db memory.db query "SELECT thought_id FROM thought LIMIT 5"
+```
+
+This control is specific to automatic CLI entry-point loading. It does not
+disable explicit manifest paths or library-side `manifests.discover` settings
+used by an application-created store. Continue to install only trusted packages;
+see
+[Security and Trust Boundaries](security.md#extensions-hooks-and-migrations).
+
+`--verbose` enables DEBUG logging for the `engrava` logger hierarchy for the
+duration of the command. Logs go to stderr, leaving JSON/CSV/table command data
+on stdout.
 
 ## Service resolution
 
@@ -165,8 +201,14 @@ Restores a database from a JSONL snapshot produced by `snapshot`.
 | `-i`, `--input` | path | **required** | JSONL snapshot file to restore. |
 | `--clear` | flag | off | Clear existing data before restoring. |
 | `--skip-embeddings` | flag | off | Import without embedding records. |
-| `--re-embed` | flag | off | Re-embed all thoughts via the target provider, ignoring source embeddings. |
+| `--re-embed` | flag | off | Re-embed all thoughts via the target provider, ignoring source embeddings. Requires `--config` with top-level or per-service embeddings. |
 | `--service` | name | see below | The service to restore into. |
+
+For any `restore --clear`, an existing sqlite-vec table is dropped in the same
+transaction as the canonical rows. The next sqlite-vec-enabled open recreates
+and backfills it. Because SQLite must load the virtual-table module before it can
+remove that table safely, install `engrava[vec]` before clearing a database that
+already contains a persisted sqlite-vec index.
 
 `--service` resolves exactly as for [`snapshot`](#service-resolution): an explicit
 `--service NAME` targets that service even without a services config (its database
@@ -182,23 +224,46 @@ fails with:
 Error: --re-embed and --skip-embeddings are mutually exclusive.
 ```
 
-Use `--re-embed` when the target uses a different embedding model than the
-snapshot (the embeddings would otherwise be incompatible — see
-[Troubleshooting → EmbeddingModelMismatchError](troubleshooting.md#embeddingmodelmismatcherror-when-opening-an-existing-database)).
-Use `--skip-embeddings` to import text only.
+Use `--re-embed` when the target should use a different embedding model than the
+snapshot. In single-database mode, the provider comes from the top-level
+`embeddings` section of the file passed with `--config`. In service mode,
+`services.configs.<name>.embeddings` takes precedence; when no override exists,
+the same top-level `embeddings` section is the fallback. Restore discards source
+embedding rows, generates replacement vectors with the resolved provider, and
+atomically replaces the stored model, dimension, document-prefix fingerprint,
+and query-prefix pairing. A target that already contains embeddings requires
+`--clear`; without it, restore refuses to relabel vectors that are not part of
+the snapshot. The sqlite-vec reset described above prevents stale index rows
+from surviving that replacement.
+
+If neither level declares a provider, restore fails before importing records and
+names the missing configuration. An explicit `--service` without a config-backed
+provider fails for the same reason. Use `--skip-embeddings` to import text
+without vectors, or restore normally to retain the snapshot vectors.
 
 ```bash
 engrava --db fresh.db restore -i backup.jsonl
-engrava --db fresh.db restore -i backup.jsonl --clear --re-embed
+engrava --db fresh.db restore -i backup.jsonl --clear --skip-embeddings
+engrava --db fresh.db --config engrava.yaml restore -i backup.jsonl --clear --re-embed
+engrava --config engrava.yaml restore -i backup.jsonl --service main --clear --re-embed
 ```
+
+When `services.default_service` names the configured target, `--service main`
+may be omitted. A normal restore into an attached configured service checks the
+snapshot model metadata against the target provider; on mismatch, choose
+`--re-embed` or `--skip-embeddings`. See
+[Troubleshooting → EmbeddingModelMismatchError](troubleshooting.md#embeddingmodelmismatcherror-when-opening-an-existing-database).
 
 > Restore recreates thoughts, edges, embeddings, and actions, **not** the audit
 > journal — a restored database starts with an empty journal.
 
 ### `gc`
 
-Garbage-collects `ARCHIVED` thoughts and their orphaned edges. With `--expired`
-it also runs the TTL expiry cleanup first.
+Garbage-collects `ARCHIVED` thoughts together with every edge touching one on
+either end — including edges whose other end is still live — their embeddings and
+the actions sourced from them, then reconciles the vector index by removing every
+`vec0` row no `embedding` row owns. With `--expired` it also runs the TTL expiry
+cleanup first.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
@@ -206,16 +271,38 @@ it also runs the TTL expiry cleanup first.
 | `--expired` | flag | off | Also run expiry cleanup (archive or delete per `ttl.strategy`) before collecting. |
 
 ```bash
-engrava --db engrava.db gc                 # delete ARCHIVED thoughts + orphaned edges
+engrava --db engrava.db gc                 # delete ARCHIVED thoughts + their edges/embeddings/actions
 engrava --db engrava.db gc --expired       # run expiry cleanup first (per strategy)
 engrava --db engrava.db gc --expired --dry-run
 ```
 
 The behaviour of `gc --expired` depends on `ttl.strategy`: with `delete` it
 removes expired rows and then collects pre-existing archived rows; with the
-default `archive` it archives the expired rows and stops (it does not collect
-them in the same pass). See
+default `archive` it archives the expired rows and stops **only if it archived at
+least one** — collecting the rows it just archived would defeat the soft-retire.
+With no expired rows to archive it falls through to collecting pre-existing
+`ARCHIVED` rows. See
 [Data lifecycle → running cleanup](data-lifecycle.md#running-cleanup).
+
+> **`gc` refuses to delete on a `vec0`-indexed store without the vector extra.**
+> If the database carries an `embedding_vec` table and `sqlite-vec` cannot be
+> loaded — most commonly because `engrava[vec]` is not installed, though an
+> unsupported build, an OS error or a SQLite error fail the same way — a pass that
+> is about to physically delete stops **before deleting anything** and exits `1`
+> with:
+>
+> ```text
+> Error: This database has a sqlite-vec index, and collecting thoughts without removing their vectors would strand them in it. Install 'engrava[vec]' and retry.
+> ```
+>
+> Removing the rows without removing their vectors would strand those vectors in
+> an index nothing can then reach them through. Only *deleting* passes are
+> refused: `--dry-run` is never refused, and neither is a run with nothing to
+> delete. Read the archive strategy carefully, though — `gc --expired` under the
+> default `ttl.strategy: archive` stops after archiving **only when it actually
+> archived something**. With no expired rows to archive it falls through to the
+> archived-collection pass, which *is* refused when there are archived rows to
+> collect. Install the extra (`pip install 'engrava[vec]'`) and retry.
 
 ### `migrate`
 

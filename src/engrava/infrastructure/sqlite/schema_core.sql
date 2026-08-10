@@ -1,9 +1,21 @@
 -- engrava: Core thought-graph schema (free-tier boundary — no internal-cognitive columns).
--- Version: core-18 (Memory Hygiene forgetting-loop columns thought.pinned +
+-- Version: core-20 (thought.archived_at — the wall-clock instant the Memory
+--          Hygiene loop archived a thought; nullable TEXT (UTC-normalised
+--          ISO-8601), stamped only by the hygiene archive path and cleared on
+--          restore, appended last for column-order parity with the in-place
+--          ALTER ... ADD COLUMN; it backs the wall-clock restore window that
+--          must elapse IN ADDITION to the cycle window before the irreversible
+--          GC stage may reap a thought;
+--          core-19 added edge.metadata_json — the generic structured-attribute
+--          carrier mirroring thought.metadata_json; NOT NULL DEFAULT '{}' so
+--          every existing edge reads back an empty mapping, appended last for
+--          column-order parity with the in-place ALTER ... ADD COLUMN; keys
+--          carry no reserved meaning and no secondary index is added;
+--          core-18 added the Memory Hygiene forgetting-loop columns thought.pinned +
 --          thought.archived_at_cycle; both nullable/defaulted so a store that
 --          never enables hygiene reads back unchanged — pinned is the durable
 --          never-forget marker, archived_at_cycle records the cycle hygiene
---          archived a thought and backs the GC restore window;
+--          archived a thought and backs the cycle restore window;
 --          core-17 added the opt-in thought.provenance capture column + the two
 --          JSON expression indexes idx_thought_prov_session /
 --          idx_thought_prov_actor on its identity fields; provenance is captured
@@ -14,8 +26,13 @@
 --          edge(edge_type, to_thought_id) for edge-type-scoped inbound lookups;
 --          core-14 added the hot-path indexes edge.to_thought_id,
 --          embedding.owner_id, thought.updated_cycle, thought.thought_type)
-
-PRAGMA user_version = 18;
+--
+-- ``user_version`` is stamped at the very END of this script (after every DDL
+-- statement below), never here at the top. Stamping last means a bootstrap that
+-- fails part-way leaves ``user_version = 0`` (unstamped): the next
+-- ``ensure_schema()`` re-runs this idempotent (``IF NOT EXISTS``) script and
+-- only reaches the stamp once the full head schema is present — the same
+-- postcondition-before-stamp invariant the incremental migration ladder upholds.
 
 CREATE TABLE IF NOT EXISTS thought (
     thought_id        TEXT    PRIMARY KEY,
@@ -66,11 +83,23 @@ CREATE TABLE IF NOT EXISTS thought (
     -- hygiene loop (default 0 = not pinned). ``archived_at_cycle`` records the
     -- cycle at which the hygiene loop archived a thought (NULL when it was not
     -- archived by hygiene — a restore clears it back to NULL); it backs the
-    -- GC restore window, so a thought archived by any other path (TTL / manual)
+    -- cycle restore window, so a thought archived by any other path (TTL / manual)
     -- keeps NULL and is never reaped by hygiene GC. A store that never enables
     -- hygiene leaves both at their defaults and reads back unchanged.
     pinned            INTEGER NOT NULL DEFAULT 0,
-    archived_at_cycle INTEGER
+    archived_at_cycle INTEGER,
+    -- Wall-clock archival instant (core-20). The UTC-normalised ISO-8601 time
+    -- the hygiene loop archived a thought, or NULL when it was not archived by
+    -- hygiene (a restore clears it back to NULL, exactly like archived_at_cycle).
+    -- Appended last for the same column-order parity as the columns above. It
+    -- backs the wall-clock restore window: the irreversible GC stage may reap a
+    -- hygiene-archived thought only once BOTH the cycle window and this real-time
+    -- window have elapsed, so a fast-cycling store cannot delete a just-archived
+    -- thought before a real-time chance to restore it. A hygiene-archived row
+    -- with archived_at NULL (archived before this column existed) has no
+    -- real-time stamp and is therefore never GC-eligible while the wall-clock
+    -- window is active — the irreversible stage fails closed.
+    archived_at       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS edge (
@@ -84,6 +113,13 @@ CREATE TABLE IF NOT EXISTS edge (
     decay_multiplier  REAL NOT NULL DEFAULT 1.0,
     valid_from        TEXT,
     valid_until       TEXT,
+    -- Generic structured-attribute carrier (core-19), mirroring
+    -- thought.metadata_json. NOT NULL DEFAULT '{}' so every existing edge reads
+    -- back an empty mapping; appended last for column-order parity with the
+    -- in-place ALTER ... ADD COLUMN (which can only append). Keys carry no
+    -- reserved meaning; no secondary index (filtering is a full json_extract
+    -- scan, as with thought metadata).
+    metadata_json     TEXT NOT NULL DEFAULT '{}',
     UNIQUE(from_thought_id, to_thought_id, edge_type),
     FOREIGN KEY (from_thought_id) REFERENCES thought(thought_id) ON DELETE CASCADE,
     FOREIGN KEY (to_thought_id) REFERENCES thought(thought_id) ON DELETE CASCADE
@@ -320,3 +356,9 @@ CREATE INDEX IF NOT EXISTS idx_thought_prov_session
     ON thought(json_extract(provenance, '$.session_id'));
 CREATE INDEX IF NOT EXISTS idx_thought_prov_actor
     ON thought(json_extract(provenance, '$.actor_id'));
+
+-- Stamp the schema version LAST: only a fully-applied head schema is marked
+-- current. A DDL failure above leaves ``user_version = 0`` so the next
+-- ``ensure_schema()`` re-runs this idempotent bootstrap rather than skipping
+-- every migration against an incomplete schema (postcondition-before-stamp).
+PRAGMA user_version = 20;

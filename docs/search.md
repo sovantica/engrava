@@ -9,22 +9,146 @@ into a single ranked result list.
 |---|--------|------------|---------|--------|
 | 1 | **FTS5 keyword** | `default_fts_weight` | `0.30` | BM25 full-text score (min-max normalized) |
 | 2 | **Vector similarity** | `default_vector_weight` | `0.55` | Cosine similarity from embedding search |
-| 3 | **Recency** | `default_recency_weight` | `0.10` | Exponential decay based on `current_cycle` |
+| 3 | **Recency** | `default_recency_weight` | `0.10` | Exponential decay along one recency axis — cognitive-cycle (`current_cycle`) or transaction-time (`recency_now`); see [Two recency axes](#two-recency-axes) |
 | 4 | **Priority** | `default_priority_weight` | `0.05` | Boost multiplier per priority level (P1–P4) |
 | 5 | **Graph** | `default_graph_weight` | `0.00` | 1-hop-weighted neighbour boost (opt-in) |
 
-Default weights sum to `1.0`.  When a signal is unavailable (e.g. no
-`current_cycle` → recency skipped, no embeddings → vector skipped),
+Default weights sum to `1.0`. When a signal is unavailable (e.g. neither
+recency reference nor a cycle provider can resolve recency, or no embeddings
+can resolve the vector arm),
 its weight is **redistributed proportionally** across active signals.
 
 ## Graceful Degradation
 
 - FTS5 unavailable or empty query → FTS skipped.
 - `query_vector` is `None` and no embedding provider → vector skipped.
-- `current_cycle` is `None` → recency skipped.
+- No explicit `current_cycle`, no configured cycle provider, and no
+  `recency_now` → recency skipped.
 - `priority_weight` is `0.0` → priority skipped.
 - `graph_weight` is `0.0` → graph skipped, zero overhead.
-- All signals disabled → fallback to `list_thoughts(LIMIT top_k)`.
+- All signals disabled → a dedicated query-less window of `top_k` rows (not a
+  `list_thoughts` call), pre-ordered `updated_cycle DESC` so the truncation keeps
+  the freshest rows. With no cycle reference to decay against, every row scores a
+  flat `0.0`; a `current_cycle` supplied at `recency_weight=0.0` still yields
+  cycle-decayed scores rather than flat ones, though the resulting order is the
+  same either way, because the window is already ordered by `updated_cycle` and
+  the decay rises with it. The compiled `filters=` / `visibility=` predicate is
+  applied in-query and archived thoughts stay excluded unless `include_archived`
+  is set, so this path enforces the same eligibility as the FTS and vector arms.
+- That same query-less window serves whenever **both** the FTS and vector arms
+  are out, even if recency survives — recency stays active only with a reference
+  **and** a recency weight above `0.0`. The window is then ordered and scored
+  along the active recency axis: `COALESCE(updated_at, created_at) DESC` with
+  transaction-time decay when the transaction axis is active, `updated_cycle DESC`
+  with cognitive-cycle decay otherwise (the two axes are mutually exclusive).
+
+The vector arm distinguishes two bad-query-vector cases:
+
+- A **degenerate** `query_vector` (empty, all-zero, or non-finite) → the vector
+  arm returns nothing and the read-only `vector_arm_degradation_count` counter is
+  incremented (a bad query embedding, not an empty corpus). It does **not** raise.
+- A **wrong-dimension** `query_vector` (its length differs from the store's
+  embedding dimension) is a caller-contract violation and **raises**
+  `VectorDimensionMismatchError` — it is not silently degraded. See
+  [Observability signals](observability.md#observability-signals) and
+  [Known Limitations](known-limitations.md#query-vector-dimension-mismatch).
+
+Both health counters are read-only, monotonically increasing properties on one
+store instance and reset when a new store is constructed:
+
+```python
+print(store.fts_match_failure_count)
+print(store.vector_arm_degradation_count)
+```
+
+`fts_match_failure_count` increments before the one safe fallback retry whenever
+the primary normalized FTS5 `MATCH` expression fails. The fallback may still
+return valid matches; a non-zero count therefore means recovery occurred, not
+that the FTS arm was necessarily lost. `vector_arm_degradation_count` increments
+only for degenerate vectors. A dimension mismatch is not counted because it is
+raised as a typed contract error.
+
+> **v0.6.0 compatibility note.** A wrong-dimension query vector is rejected with
+> `VectorDimensionMismatchError` instead of being confused with an empty
+> neighbourhood or leaking a backend-specific shape error. Callers that accept
+> externally supplied vectors should catch this error (or `EngravaError`) and
+> correct the embedding/model configuration; retrying the same vector cannot
+> produce a valid result.
+
+## Archived thoughts are excluded by default
+
+Every ranked read — `search_hybrid()`, `recall()`, `search_fts()`, and
+`search_similar()` — drops **archived** thoughts (`lifecycle_status = ARCHIVED`)
+from its default candidate set, the same eligibility class as expired rows and
+retired reflections. This is the retrieval side of
+[Forgetting](memory-hygiene.md) — an **opt-in, off-by-default** hygiene loop — but
+the exclusion applies to any archived row, whether or not that loop is enabled: an
+archived (forgotten) thought stops surfacing without being deleted.
+
+The exclusion is **reversible**:
+
+- `store.restore_thought(thought_id)` flips the row back to `ACTIVE`, so it is
+  eligible again; and
+- passing `include_archived=True` to any of the four methods re-admits archived
+  rows for that one call, without restoring them.
+
+> **Behaviour change.** Marking a thought `ARCHIVED` — including via the TTL
+> `archive` strategy — now removes it from default retrieval; previously an
+> archived thought still surfaced in search. It is still counted by
+> `count_thoughts()` / `list_thoughts()` (those are not ranked retrieval); to
+> exclude it there, filter on `lifecycle_status` yourself. The retired-reflection
+> freshness floor is independent — a retired `REFLECTION` stays excluded even under
+> `include_archived=True`. See [Data lifecycle](data-lifecycle.md#lifecycle-states)
+> and [Known Limitations](known-limitations.md#archived-thoughts-and-default-retrieval).
+
+## Two recency axes
+
+Recency ranks along **two separately-typed axes**, and a query picks **exactly
+one**. Passing neither explicit reference uses a configured cycle provider when
+present; without one, recency remains off:
+
+| Axis | Reference | Ages a row by | Half-life unit | For |
+|---|---|---|---|---|
+| **Cognitive-cycle** | `current_cycle` | `updated_cycle` vs the cycle | cycles (`recency_half_life`) | agents that own and advance a logical cycle |
+| **Transaction-time** | `recency_now` | `updated_at` (→ `created_at`) vs the instant | seconds (`recency_now_half_life`) | "recently stored" — wall-time recency on any store |
+
+Both use the same exponential half-life decay; only the clock differs. The
+transaction-time axis makes "recently written" rankable even on a store where
+every row shares one cognitive cycle (the common case for externally-written
+memories) — the signal cycle-recency cannot express there.
+
+`recency_now` is a caller-supplied ISO-8601 instant: engrava's core reads **no
+wall clock** in ranking, so retrieval stays deterministic and replayable (same
+store + same `recency_now` → same ranking). A naive value is interpreted as UTC
+(the host timezone is never consulted); a malformed `recency_now` (or a
+non-positive `recency_now_half_life`) raises `InvalidRecencyArgumentError`. A row
+whose `updated_at`/`created_at` is missing or malformed is treated as maximally
+old (the minimum recency score). An explicit `recency_now` **takes precedence
+over a passive `cycle_provider`** (the provider is not consulted when
+`recency_now` is supplied with no explicit `current_cycle`); supplying **both
+explicit** references — `current_cycle` *and* `recency_now` — raises
+`RecencyModeConflictError`.
+
+```python
+# Transaction-time recency: rank by how recently each memory was written,
+# relative to a caller-supplied "now" (a 24-hour freshness half-life).
+from datetime import UTC, datetime
+
+results = await store.search_hybrid(
+    "incident timeline",
+    recency_now=datetime.now(UTC).isoformat(),  # the caller owns "now"
+    recency_weight=0.4,
+    recency_now_half_life=86400,  # seconds (1 day); default 604800 (7 days)
+)
+```
+
+The units never mix: a wall-clock age is never subtracted from a cognitive
+cycle. To use transaction-time recency on a store that has a cycle provider
+configured, **pass `recency_now` while omitting an explicit `current_cycle`** —
+the provider is passive and is not consulted, so the query ranks by transaction
+time. (Omitting `recency_now` instead selects the provider's cognitive-cycle
+recency.) You only hit `RecencyModeConflictError` if you explicitly pass *both*
+`current_cycle` and `recency_now`.
 
 ## Keyword query syntax (FTS)
 
@@ -62,9 +186,14 @@ rather than breaking the query: a contraction like `sister's` becomes `sister OR
 s`, so it still matches a stored `sister's dog`. Pasting a URL or a timestamp is
 safe too — only the real `essence:` / `content:` column filters are honoured, so
 `http://example.com` and `12:30` are treated as ordinary search terms (they do
-**not** become spurious `http:` / `12:` column filters). A genuinely malformed
-full-text expression is logged and degraded to zero FTS hits, so the rest of a
-hybrid search still returns results.
+**not** become spurious `http:` / `12:` column filters). When a normalized
+full-text expression is a genuinely malformed FTS5 query, engrava logs a warning,
+increments the read-only `fts_match_failure_count` counter, and **retries once**
+through the bare normalization (unsafe characters dropped, wildcards collapsed to
+legal prefixes, any exposed `AND`/`OR`/`NOT` phrase-quoted so FTS5 cannot read it
+as an operator), which is always a valid MATCH; the FTS arm returns that query's
+matches (an empty set when the sanitized query matches nothing). See
+[Observability signals](observability.md#observability-signals).
 
 ## Graph-Aware Ranking
 
@@ -125,6 +254,48 @@ uses a single batch SQL query bounded by
 
 When the graph signal contributes to at least one candidate,
 `"graph"` appears in `HybridSearchResult.backends_used`.
+
+## Reflection-source candidate expansion
+
+Graph expansion is separate from the weighted graph ranking signal above. It
+is a bounded candidate-generation step over dreaming lineage, not a sixth
+fusion signal:
+
+1. After the available fusion signals have scored the current pool, engrava
+   selects up to `graph_expansion_top_n` top-ranked `REFLECTION` candidates.
+2. It follows each reflection's outgoing `CONSOLIDATED_FROM` edges, ordered by
+   edge weight, and admits only source thoughts of type `OBSERVATION`.
+3. Each admitted source receives
+   `parent_score × graph_expansion_propagation_factor × edge.weight`; when the
+   source is already present, the higher of its existing and propagated score
+   wins.
+
+Unlike graph-aware ranking, expansion **can add new candidates** and is not
+controlled by `graph_weight`. It is enabled by default even though the weighted
+graph signal defaults to `0.0`. Expansion re-applies expiry, archive, metadata,
+and visibility eligibility, so it cannot bring back a source excluded by the
+active query (unless `include_archived=True` explicitly re-admits archived
+rows). Non-observation targets are ignored. Expansion runs before the final
+reflection filter, so eligible source observations may still be admitted when
+`include_reflections=False`; only the reflection rows are removed.
+
+The store-level controls are:
+
+```yaml
+search:
+  graph_expansion_enabled: true
+  graph_expansion_top_n: 5
+  graph_expansion_propagation_factor: 0.7
+  graph_expansion_max_sources_per_reflection: 20
+  graph_expansion_reflection_source_ceiling: 50
+```
+
+The per-reflection source cap keeps traversal bounded. A reflection with more
+than `graph_expansion_reflection_source_ceiling` lineage sources is skipped
+entirely, preventing a very large cluster from flooding the candidate pool.
+These settings belong to `SearchConfig`; `search_hybrid()` has no per-query
+expansion override. When expansion adds or improves at least one candidate,
+`"graph_expansion"` appears in `HybridSearchResult.backends_used`.
 
 ## Per-Query Overrides
 
@@ -357,10 +528,11 @@ async def assemble_unit(query: str, thought_id: str) -> str:
   surface you call to read a result's text. `search_hybrid()`'s result stays
   `(thought_id, score)` tuples.
 - **The metadata predicate lives on the ranked search surface**
-  (`search_hybrid`/`recall`/`search_similar` `filters=`), not on `list_thoughts`
-  (whose filters cover the built-in columns + provenance, not arbitrary metadata),
-  so gathering a unit's chunks is a filtered search with a generous `top_k`; the
-  ranking is irrelevant because you re-order by your own ordinal.
+  (`search_hybrid`/`recall` `filters=`), not on the public `search_similar` or
+  `search_fts` methods or on `list_thoughts` (whose filters cover the built-in
+  columns + provenance, not arbitrary metadata), so gathering a unit's chunks
+  is a filtered hybrid search with a generous `top_k`; the ranking is
+  irrelevant because you re-order by your own ordinal.
 - **Precondition (yours to guarantee).** Contiguous order is only as good as the
   metadata you wrote: without a stable, orderable ordinal on each chunk, siblings
   can be *fetched* but not meaningfully *ordered* — engrava has no chunk-sequence
@@ -464,6 +636,9 @@ for thought_id, score in result.results:
 ```
 
 Key difference from `search_hybrid(include_reflections=True)`:
-`search_reflections_only()` fetches **all** REFLECTIONs directly from
+`search_reflections_only()` fetches **all eligible** REFLECTIONs directly from
 the store (no pagination gap) and scores them purely by cosine similarity
 to the query.  It does not compete against regular thoughts for result slots.
+Only active, unexpired REFLECTIONs are eligible. Expiry is compared against one
+UTC instant captured for the call, and a row with `expires_at <= now` is
+excluded. Equal scores are ordered by `thought_id` for deterministic results.

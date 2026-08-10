@@ -64,9 +64,18 @@ class ActionNotFoundError(EngravaError):
 
 
 class StaleDataError(EngravaError):
-    """Raised when an optimistic-concurrency check fails.
+    """Raised when a guarded write matches no row.
 
-    The row was modified by another writer between read and write.
+    Two situations produce that, and this error does not tell them apart:
+    another writer stamped a new ``updated_cycle`` between this operation's read
+    and its write, or the row was deleted in that window. Either way nothing of
+    the operation was applied.
+
+    It is narrower than "the row changed" — nothing in engrava advances
+    ``updated_cycle`` on its own, so an ordinary competing edit passes the guard
+    and overwrites rather than raising — and also broader, because a delete
+    raises it too. Recover by re-reading the record (which may now be gone) and
+    recomputing the change.
 
     Args:
         entity_type: Type of entity (e.g., 'ThoughtRecord').
@@ -100,6 +109,59 @@ class ReadOnlyViolationError(EngravaError):
         super().__init__(f"Write operation blocked on read-only store: {operation}")
 
 
+class EmbeddingProviderContractError(EngravaError):
+    """Raised when a configured embedding provider omits a required protocol member.
+
+    :class:`~engrava.domain.protocols.embedding_provider.EmbeddingProviderProtocol`
+    has required ``dimension`` and ``model_name`` as public members since the
+    first public release, but
+    the protocol is structural: a provider that keeps the value privately (say
+    ``self._dimension``) and exposes no public property is accepted at
+    construction and only fails when the core reads it. Without this error that
+    failure surfaces as a bare :class:`AttributeError` raised from library
+    internals mid-search. Python's own message does name the class and the
+    attribute, but it is not a type a caller can catch by meaning, it carries no
+    structured fields, and it says nothing about the attribute being a required
+    protocol member or about what to do next. This error supplies all three.
+
+    This means the member is **absent**. A provider that declares ``dimension``
+    and whose own property raises is not this error: that exception propagates
+    unchanged, because it is a failure inside the provider rather than a protocol
+    violation, and it may not be permanent. This one is: repeating the call
+    cannot repair it. Add the public property.
+
+    The originating ``AttributeError`` is chained as ``__cause__`` so the
+    traceback still shows where the read happened.
+
+    Args:
+        provider_class: Name of the offending provider's class.
+        member: The required protocol member the provider does not expose.
+
+    Examples:
+        >>> raise EmbeddingProviderContractError(
+        ...     provider_class="MyProvider", member="dimension"
+        ... )
+        Traceback (most recent call last):
+            ...
+        engrava.domain.exceptions.EmbeddingProviderContractError: \
+embedding provider 'MyProvider' does not expose the required \
+EmbeddingProviderProtocol member 'dimension'. Add a public 'dimension' property \
+to 'MyProvider' — a private attribute such as '_dimension' does not satisfy the \
+protocol.
+
+    """
+
+    def __init__(self, *, provider_class: str, member: str) -> None:
+        self.provider_class = provider_class
+        self.member = member
+        super().__init__(
+            f"embedding provider {provider_class!r} does not expose the required "
+            f"EmbeddingProviderProtocol member {member!r}. Add a public {member!r} "
+            f"property to {provider_class!r} — a private attribute such as "
+            f"'_{member}' does not satisfy the protocol."
+        )
+
+
 class EmbeddingModelMismatchError(EngravaError):
     """Raised when the configured embedding model differs from the stored one.
 
@@ -131,6 +193,40 @@ class EmbeddingModelMismatchError(EngravaError):
             f"(dim={stored_dimension}), but provider offers '{configured_model}' "
             f"(dim={configured_dimension}). Use a new database or matching provider."
         )
+
+
+class VectorDimensionMismatchError(EngravaError):
+    """Raised when a query vector's length differs from the store's dimension.
+
+    :meth:`SqliteEngravaCore.search_similar` computes cosine similarity between
+    the query vector and every stored embedding, an operation that is only
+    defined when the two share a dimension. A query vector of the wrong length
+    is a structural caller-contract violation — not a benign query that happens
+    to match nothing — so it is rejected loudly with this typed error instead of
+    silently returning an empty result (which would hide the mistake and let a
+    caller believe the corpus simply had no neighbours). The check is dimension
+    only: it fires regardless of the vector's magnitude, so a wrong-length
+    all-zero vector is still a dimension error rather than a degenerate-vector
+    degradation.
+
+    Args:
+        expected: The embedding dimension the store expects (from its configured
+            vector backend, embedding provider, or stored embeddings).
+        actual: The length of the offending query vector.
+
+    Examples:
+        >>> raise VectorDimensionMismatchError(expected=384, actual=383)
+        Traceback (most recent call last):
+            ...
+        engrava.domain.exceptions.VectorDimensionMismatchError: \
+query vector dimension mismatch: store expects 384, got 383
+
+    """
+
+    def __init__(self, *, expected: int, actual: int) -> None:
+        self.expected = expected
+        self.actual = actual
+        super().__init__(f"query vector dimension mismatch: store expects {expected}, got {actual}")
 
 
 class EmbeddingQueryPrefixMismatchError(EngravaError):
@@ -230,6 +326,31 @@ does not reference an existing thought
         super().__init__(
             f"referential integrity violation: {entity_type}.{column}="
             f"{referenced_id!r} does not reference an existing thought",
+        )
+
+
+class DuplicateEdgeError(EngravaError):
+    """Raised when a directed, typed edge relationship already exists.
+
+    Edge identity is constrained by ``(from_thought_id, to_thought_id,
+    edge_type)`` independently of the caller-supplied ``edge_id``. This typed
+    boundary lets callers handle idempotent graph writes without depending on
+    SQLite error text.
+
+    Args:
+        from_thought_id: Source endpoint of the duplicate relationship.
+        to_thought_id: Target endpoint of the duplicate relationship.
+        edge_type: Edge type value participating in the uniqueness key.
+
+    """
+
+    def __init__(self, from_thought_id: str, to_thought_id: str, edge_type: str) -> None:
+        self.from_thought_id = from_thought_id
+        self.to_thought_id = to_thought_id
+        self.edge_type = edge_type
+        super().__init__(
+            "edge relationship already exists: "
+            f"{from_thought_id!r} -[{edge_type}]-> {to_thought_id!r}",
         )
 
 
@@ -347,3 +468,212 @@ class ExtensionMigrationError(EngravaError):
             prefix += f", file={migration_file!r}"
         prefix += "]"
         super().__init__(f"{prefix} {message}")
+
+
+class CoreMigrationError(EngravaError):
+    """Raised when a core schema migration step fails its postcondition.
+
+    A migration step that returns without leaving its target schema structure
+    (a column, table, index, or foreign key) in place would otherwise let the
+    upgrade loop stamp a higher ``user_version`` over a schema that does not
+    actually carry the migrated structure — a permanently "false-current"
+    database that skips the migration on every future open. Raising here leaves
+    the version at the last fully-applied step, so the next open retries the
+    remaining steps.
+
+    Args:
+        target_version: The core schema version the failed step targets.
+        message: Human-readable description of the unmet postcondition.
+
+    Examples:
+        >>> raise CoreMigrationError(8, "idx_edge_type_from missing after create")
+        Traceback (most recent call last):
+            ...
+        engrava.domain.exceptions.CoreMigrationError: \
+[core schema v8] idx_edge_type_from missing after create
+
+    """
+
+    def __init__(self, target_version: int, message: str) -> None:
+        self.target_version = target_version
+        super().__init__(f"[core schema v{target_version}] {message}")
+
+
+class DerivedRecordError(EngravaError):
+    """Raised when the derived-records extension seam rejects a producer result.
+
+    Covers the deterministic, content-independent failure modes of the seam:
+    a returned sequence that exceeds ``DeriveGates.max_derived_per_source``,
+    or a derived record whose core-assigned identity would collide with its
+    own source thought (a self-referential ``DERIVED_FROM`` edge). It is
+    **not** used for producer-internal exceptions (those propagate or are
+    logged verbatim per ``DeriveGates.on_error``).
+
+    Args:
+        source_thought_id: Identity of the source thought whose derivation
+            was rejected.
+        message: Human-readable description of the rejection.
+
+    Examples:
+        >>> raise DerivedRecordError("t-1", "over cap")
+        Traceback (most recent call last):
+            ...
+        engrava.domain.exceptions.DerivedRecordError: [source='t-1'] over cap
+
+    """
+
+    def __init__(self, source_thought_id: str, message: str) -> None:
+        self.source_thought_id = source_thought_id
+        super().__init__(f"[source={source_thought_id!r}] {message}")
+
+
+class SourceThoughtNotFoundError(EngravaError):
+    """Raised when an explicit backfill targets a source thought that is absent.
+
+    Surfaced by the derived-records backfill entry point when the requested
+    source ``thought_id`` does not exist in the store, so there is nothing to
+    derive from. It is a precondition/contract failure distinct from the clean,
+    empty result the backfill returns for an *ineligible* (already-derived)
+    source — a missing id is an error, an ineligible source is a no-op.
+
+    Args:
+        thought_id: The source ID that was not found.
+
+    Examples:
+        >>> raise SourceThoughtNotFoundError("t-404")
+        Traceback (most recent call last):
+            ...
+        engrava.domain.exceptions.SourceThoughtNotFoundError: \
+source thought not found: 't-404'
+
+    """
+
+    def __init__(self, thought_id: str) -> None:
+        self.thought_id = thought_id
+        super().__init__(f"source thought not found: {thought_id!r}")
+
+
+class CycleProviderError(EngravaError):
+    """Raised when a configured cycle provider returns an invalid value.
+
+    A ``runtime_checkable``
+    :class:`~engrava.domain.protocols.cycle_provider.CycleProvider` protocol
+    verifies only that an object *has* a ``current_cycle()`` method — never that
+    the value it returns is a usable cognitive cycle. The store therefore
+    validates the pulled value at the resolution boundary: it must be a real
+    ``int`` (a ``bool`` is rejected even though it subclasses ``int``) and it
+    must be non-negative (matching the ``created_cycle`` / ``updated_cycle``
+    ``ge=0`` invariant). A value failing either check is a provider-contract
+    violation surfaced as this typed error, rather than a bare ``TypeError`` /
+    ``ValueError`` leaking out of downstream recency arithmetic.
+
+    Engrava can only enforce value *validity* here — a provider's *purity*
+    (that its value is not wall-clock-derived and does not conflate the
+    operation-count / cognitive-cycle / wall-time axes) is the configuring
+    consumer's contract, not something the core can check.
+
+    Args:
+        reason: Human-readable description of why the pulled value is invalid.
+
+    Examples:
+        >>> str(CycleProviderError("expected int, got str"))
+        'invalid cycle provider value: expected int, got str'
+
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"invalid cycle provider value: {reason}")
+
+
+class RecencyModeConflictError(EngravaError):
+    """Raised when a query explicitly supplies both recency reference axes.
+
+    Engrava ranks recency along two separately-typed axes, and a single query
+    selects **exactly one** reference:
+
+    * **cognitive-cycle recency** — chosen by an explicit ``current_cycle``, or
+      (when neither reference is passed) pulled from a configured cycle provider;
+    * **transaction-time recency** — chosen by a caller-supplied ``recency_now``
+      instant, which **takes precedence over a passive cycle provider**.
+
+    The two axes measure age against incomparable clocks (a cognitive tick count
+    versus wall-clock time) and are **never silently combined**. The conflict
+    fires only when the caller **explicitly** supplies **both** ``current_cycle``
+    and ``recency_now``; a configured cycle provider is passive and yields to an
+    explicit ``recency_now`` (it is not consulted), so a provider-configured
+    store *can* still use transaction-time recency. To do so, pass ``recency_now``
+    and omit an explicit ``current_cycle`` — the provider is then not consulted.
+
+    Args:
+        reason: Human-readable description of the conflicting request.
+
+    Examples:
+        >>> str(RecencyModeConflictError("current_cycle and recency_now both set"))
+        'conflicting recency references: current_cycle and recency_now both set'
+
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"conflicting recency references: {reason}")
+
+
+class InvalidRecencyArgumentError(EngravaError):
+    """Raised when a transaction-time recency argument is malformed.
+
+    Covers a ``recency_now`` that is not a valid ISO-8601 timestamp and a
+    non-positive ``recency_now_half_life``. It is raised at the ``search_hybrid``
+    / ``recall`` call boundary (never mid-ranking), a typed sibling of
+    :class:`RecencyModeConflictError` so callers can catch a specific engrava
+    error rather than a bare ``ValueError``. For a malformed timestamp the
+    underlying parser error is chained as the ``__cause__``.
+
+    Args:
+        message: Human-readable description of the invalid argument.
+
+    Examples:
+        >>> raise InvalidRecencyArgumentError("recency_now must be ISO-8601")
+        Traceback (most recent call last):
+            ...
+        engrava.domain.exceptions.InvalidRecencyArgumentError: \
+recency_now must be ISO-8601
+
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+class ConnectionQuarantinedError(EngravaError):
+    """Raised when the store's connection has been quarantined and is unusable.
+
+    A long-lived SQLite connection is quarantined when a compensating rollback
+    could not be guaranteed to complete — most critically when a cancellation
+    interrupted a per-child rollback in the derived-records seam and the
+    rollback ultimately failed, so the connection may still hold an open
+    transaction. Continuing to use such a connection could flush an orphaned
+    partial write or run later operations on an indeterminate transaction, so
+    every public operation fails fast with this error instead. The condition is
+    terminal for the store instance: a new store over a fresh connection must
+    be constructed to recover.
+
+    Scope: quarantine revokes *admission* — every NEW operation on the store or
+    its journal fails fast with this error, so no write/commit can flush an
+    orphaned transaction. It does not retract an operation already admitted
+    before revocation: a reader admitted just before revocation may complete its
+    in-flight read on the pre-revocation connection (a possibly-stale read,
+    never a commit).
+
+    Args:
+        reason: Human-readable description of why the connection was quarantined.
+
+    Examples:
+        >>> str(ConnectionQuarantinedError("open transaction"))
+        'connection quarantined: open transaction'
+
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"connection quarantined: {reason}")

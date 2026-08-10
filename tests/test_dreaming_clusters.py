@@ -739,7 +739,11 @@ class TestSearchHybridReflections:
     """Tests for include_reflections / reflection_boost in search_hybrid."""
 
     async def _insert_reflection(
-        self, store: SqliteEngravaCore, rid: str = "ref-1"
+        self,
+        store: SqliteEngravaCore,
+        rid: str = "ref-1",
+        *,
+        expires_at: str | None = None,
     ) -> ThoughtRecord:
         """Insert a REFLECTION thought directly."""
         import json
@@ -758,6 +762,7 @@ class TestSearchHybridReflections:
             updated_cycle=1,
             source=f"dreaming:{rid}",
             source_type=KnowledgeSource.DREAMING,
+            expires_at=expires_at,
         )
         return await store.create_thought(r)
 
@@ -809,6 +814,58 @@ class TestSearchHybridReflections:
         result_ids = {tid for tid, _ in result.results}
         assert ref.thought_id in result_ids
         assert normal.thought_id not in result_ids
+
+    async def test_search_reflections_only_uses_one_expiry_boundary(
+        self,
+        store: SqliteEngravaCore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Expiry uses one UTC instant; the boundary itself is ineligible."""
+        import datetime
+        from types import SimpleNamespace
+
+        from engrava.infrastructure.sqlite import engrava_core
+
+        fixed_now = datetime.datetime(2026, 7, 23, 12, 0, tzinfo=datetime.UTC)
+        await self._insert_reflection(
+            store,
+            "ref-expired",
+            expires_at="2026-07-23T11:59:59+00:00",
+        )
+        await self._insert_reflection(
+            store,
+            "ref-boundary",
+            expires_at="2026-07-23T12:00:00+00:00",
+        )
+        await self._insert_reflection(
+            store,
+            "ref-future",
+            expires_at="2026-07-23T12:00:01+00:00",
+        )
+        await self._insert_reflection(store, "ref-unbounded")
+
+        class FixedDateTime:
+            calls = 0
+
+            @classmethod
+            def now(cls, tz: datetime.tzinfo | None = None) -> datetime.datetime:
+                cls.calls += 1
+                assert tz is datetime.UTC
+                return fixed_now
+
+        monkeypatch.setattr(
+            engrava_core,
+            "datetime",
+            SimpleNamespace(datetime=FixedDateTime, UTC=datetime.UTC),
+        )
+
+        result = await store.search_reflections_only("", None, top_k=10)
+
+        assert FixedDateTime.calls == 1
+        assert result.results == [
+            ("ref-future", 0.0),
+            ("ref-unbounded", 0.0),
+        ]
 
 
 # ---------------------------------------------------------------------------

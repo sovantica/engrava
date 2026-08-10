@@ -314,7 +314,53 @@ class TestOffOnPair:
 # to before it existed). Later extended with the Memory Hygiene forgetting-loop
 # surface (HygienePolicyConfig / HygieneResult / EvictionReason), an additive,
 # default-off public-API addition (a store that never enables hygiene_policy is
-# unchanged on every read/write path).
+# unchanged on every read/write path). Later extended with the derived-records
+# extension-seam surface (DerivedRecordProducerProtocol / DerivedRecord /
+# DeriveContext / DeriveGates / DerivedRecordError, plus the StructuralSplitProducer
+# reference consumer), an additive, default-off public-API addition (with the seam
+# disabled, or the hooks object not a producer, every write path is byte-identical).
+# Later extended with ConnectionQuarantinedError, the typed error raised only when a
+# derived-child compensating rollback could not be guaranteed to complete under
+# cancellation (the connection is quarantined so a later operation cannot run on an
+# indeterminate transaction) — an additive, default-off public-API addition never
+# raised on any normal read/write path.
+# Later extended with the opt-in cycle-provider seam (the CycleProvider capability
+# protocol + StaticCycleProvider / CallableCycleProvider / MaxCycleProvider reference
+# providers + the typed CycleProviderError), an additive, default-off public-API
+# addition — a store that configures no cycle_provider pulls no cycle and is
+# unchanged on every read/write path.
+# Later extended with the second, separately-typed transaction-time recency axis
+# (the opt-in keyword-only recency_now / recency_now_half_life on search_hybrid /
+# recall + the protocol), which adds two typed public exceptions:
+# RecencyModeConflictError (raised only when a query supplies both explicit recency
+# references — the cognitive current_cycle and the transaction-time recency_now)
+# and InvalidRecencyArgumentError (raised only for a malformed recency_now or a
+# non-positive recency_now_half_life). Both are additive and default-off — never
+# raised on any single-axis (or no-recency) read/write path.
+# Later extended with the explicit derived-records backfill entry point
+# (derive_existing on the writable core, returning DeriveResult, raising
+# SourceThoughtNotFoundError for a missing source) — the explicit counterpart of
+# the on-store derived-records trigger, an additive public-API addition that runs
+# only when a producer capability is registered (a clean no-op otherwise).
+# Later extended with SplitMode, the enum selecting the StructuralSplitProducer's
+# deterministic, dependency-free segmentation strategy (paragraph / fixed-window) —
+# an additive public-API addition; the default (paragraph) leaves the shipped
+# producer byte-identical, and the producer stays inert unless the seam is enabled.
+# Later extended with VectorDimensionMismatchError, the typed error the vector-arm
+# no-silent-degradation guard raises when a search_similar query vector's length
+# differs from the store's embedding dimension (previously an opaque numpy error or
+# a silent empty result) — an additive public-API addition raised only on a
+# malformed query vector, never on any well-formed vector-search path.
+# Later extended with EngravaReadProtocol, the runtime-checkable read (non-mutating)
+# half of EngravaCoreProtocol — extracted so the write-blocking ReadOnlyEngrava view
+# declares and is type-checked against exactly the capabilities it forwards. An
+# additive, non-breaking public-API addition: EngravaCoreProtocol now inherits from it
+# and every full store satisfies it by construction, so no existing consumer changes.
+# Later extended with EmbeddingProviderContractError, raised when a configured
+# embedding provider omits a required EmbeddingProviderProtocol member (today:
+# a public ``dimension``). The protocol has always required it; the error only
+# replaces the bare AttributeError the core previously raised from internals, so
+# it is additive and unreachable for any conformant provider.
 _PRE_WS_ALL_BASELINE = frozenset(
     {
         "ActionNotFoundError",
@@ -322,16 +368,26 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "ActionRecord",
         "ActionStatus",
         "ActionType",
+        "CallableCycleProvider",
         "CallbackProvider",
         "CleanupResult",
         "CleanupStrategy",
         "ConfidenceSignal",
         "ConfigError",
         "ConfirmationSignal",
+        "ConnectionQuarantinedError",
         "ConsolidationResult",
         "CoreThoughtRecord",
+        "CycleProvider",
+        "CycleProviderError",
         "DefaultEngravaHooks",
         "DefaultMindStoreHooks",
+        "DeriveContext",
+        "DeriveGates",
+        "DeriveResult",
+        "DerivedRecord",
+        "DerivedRecordError",
+        "DerivedRecordProducerProtocol",
         "DreamingConfig",
         "DreamingContext",
         "DreamingExtension",
@@ -343,6 +399,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "EmbeddingConfig",
         "EmbeddingGenerationError",
         "EmbeddingModelMismatchError",
+        "EmbeddingProviderContractError",
         "EmbeddingProviderProtocol",
         "EmbeddingQueryPrefixMismatchError",
         "EmbeddingRecord",
@@ -352,6 +409,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "EngravaHooksProtocol",
         "EngravaManager",
         "EngravaMetrics",
+        "EngravaReadProtocol",
         "EvictionReason",
         "ExtensionManifest",
         "ExtensionMigrationError",
@@ -364,6 +422,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "HygieneResult",
         "InvalidFilterError",
         "InvalidFilterPathError",
+        "InvalidRecencyArgumentError",
         "InvalidTransitionError",
         "JournalConfig",
         "JournalEntry",
@@ -373,6 +432,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "KnowledgeSource",
         "LatencyHistogram",
         "LifecycleStatus",
+        "MaxCycleProvider",
         "MetadataFilter",
         "MetricsConfig",
         "MindQLCommand",
@@ -394,6 +454,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "ReadOnlyEngrava",
         "ReadOnlyMindStore",
         "ReadOnlyViolationError",
+        "RecencyModeConflictError",
         "RecencySignal",
         "RoleAwareEmbeddingProvider",
         "ScoringContext",
@@ -401,18 +462,23 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "SentenceTransformerProvider",
         "ServiceConfig",
         "ServicesConfig",
+        "SourceThoughtNotFoundError",
+        "SplitMode",
         "SqliteEngravaCore",
         "SqliteMindStoreCore",
         "SqliteVecSearchBackend",
         "StaleDataError",
         "StalenessSignal",
+        "StaticCycleProvider",
         "StorageFootprint",
+        "StructuralSplitProducer",
         "TTLConfig",
         "ThoughtCounts",
         "ThoughtNotFoundError",
         "ThoughtRecord",
         "ThoughtType",
         "ThoughtVisibility",
+        "VectorDimensionMismatchError",
         "VerificationStatus",
         "VisibilityQueryFilter",
         "discover_manifests",

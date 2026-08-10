@@ -271,7 +271,7 @@ class TestSchemaMigration:
         cursor = await db.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 18
+        assert row[0] == 20
 
     async def test_expires_at_column_exists(self, db: aiosqlite.Connection) -> None:
         cursor = await db.execute("PRAGMA table_info(thought)")
@@ -303,7 +303,7 @@ class TestSchemaMigration:
         cursor = await conn.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 18
+        assert row[0] == 20
         await conn.close()
 
 
@@ -949,3 +949,78 @@ class TestSqliteVecExpiredFilter:
         results = [("t-future", 0.9), ("t-ok", 0.8)]
         filtered = await store._filter_expired_results(results)
         assert len(filtered) == 2
+
+
+# ---------------------------------------------------------------------------
+# The cleanup strategy that was validated is the strategy that runs
+# ---------------------------------------------------------------------------
+
+
+class _StrategyThatReadsOneWayAndComparesAnother(str):
+    """Reads as its real text everywhere; hashes and compares as ``delete``.
+
+    ``CleanupStrategy(value)`` is an enum lookup by value, so the member it
+    resolves to is decided by the value's own ``__hash__`` and ``__eq__`` — not
+    by the text every validator inspected. That is the difference between
+    archiving a thought and destroying it.
+    """
+
+    __slots__ = ()
+
+    def __hash__(self) -> int:
+        return hash("delete")
+
+    def __eq__(self, other: object) -> bool:
+        return other == "delete"
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+
+class TestCleanupStrategyIsTheValidatedValue:
+    """A strategy of ``archive`` archives, whatever the value says about itself."""
+
+    def test_the_config_stores_an_exact_string(self) -> None:
+        config = TTLConfig(strategy=_StrategyThatReadsOneWayAndComparesAnother("archive"))
+        assert type(config.strategy) is str
+        assert config.strategy == "archive"
+
+    async def test_an_archive_strategy_never_deletes(self, db: aiosqlite.Connection) -> None:
+        """The row survives cleanup as ARCHIVED, not as a hole in the table."""
+        store = SqliteEngravaCore(
+            db,
+            ttl_strategy=_StrategyThatReadsOneWayAndComparesAnother("archive"),
+        )
+        await store.ensure_schema()
+        await store.create_thought(_make_thought(expires_at=_past_ts()))
+
+        await store.cleanup_expired()
+
+        # State first, read raw: ``get_thought`` and the result object both
+        # report on a row that a delete strategy would have removed outright.
+        cursor = await db.execute(
+            "SELECT lifecycle_status FROM thought WHERE thought_id = ?", ("t-001",)
+        )
+        row = await cursor.fetchone()
+        assert row is not None, "the thought was physically deleted by an archive strategy"
+        assert row[0] == LifecycleStatus.ARCHIVED.value
+
+    async def test_a_delete_strategy_still_deletes(self, db: aiosqlite.Connection) -> None:
+        """Ownership constrains what the value may lie about, not what it may do."""
+        store = SqliteEngravaCore(db, ttl_strategy="delete")
+        await store.ensure_schema()
+        await store.create_thought(_make_thought(expires_at=_past_ts()))
+
+        await store.cleanup_expired()
+
+        cursor = await db.execute(
+            "SELECT lifecycle_status FROM thought WHERE thought_id = ?", ("t-001",)
+        )
+        assert await cursor.fetchone() is None
+
+    async def test_a_non_string_strategy_is_a_configuration_error(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        with pytest.raises(ConfigError, match="ttl_strategy must be a string"):
+            SqliteEngravaCore(db, ttl_strategy=object())  # type: ignore[arg-type]  # passing the wrong type is the behaviour under test

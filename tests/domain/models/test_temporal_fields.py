@@ -15,7 +15,10 @@ from pydantic import ValidationError
 
 from engrava.domain.enums import EdgeType, LifecycleStatus, Priority, ThoughtType
 from engrava.domain.models import EdgeRecord, ThoughtRecord
-from engrava.domain.models._temporal import validate_iso8601_nullable
+from engrava.domain.models._temporal import (
+    validate_interval_ordering,
+    validate_iso8601_nullable,
+)
 
 
 def _make_thought(**overrides: object) -> ThoughtRecord:
@@ -69,6 +72,70 @@ class TestValidateIso8601Nullable:
             validate_iso8601_nullable("not-a-timestamp")
 
 
+class TestValidateIntervalOrdering:
+    """Direct tests for the shared interval-ordering invariant."""
+
+    def test_open_lower_bound_accepted(self) -> None:
+        assert validate_interval_ordering(None, "2026-01-01T00:00:00") is None
+
+    def test_open_upper_bound_accepted(self) -> None:
+        assert validate_interval_ordering("2026-01-01T00:00:00", None) is None
+
+    def test_both_open_accepted(self) -> None:
+        assert validate_interval_ordering(None, None) is None
+
+    def test_ordered_interval_accepted(self) -> None:
+        assert validate_interval_ordering("2026-01-01T00:00:00", "2026-12-31T00:00:00") is None
+
+    def test_equal_instant_accepted(self) -> None:
+        assert validate_interval_ordering("2026-01-01T00:00:00", "2026-01-01T00:00:00") is None
+
+    def test_equal_across_offsets_accepted(self) -> None:
+        # 12:00+02:00 and 05:00-05:00 are the same UTC instant (10:00Z).
+        assert (
+            validate_interval_ordering("2026-06-01T12:00:00+02:00", "2026-06-01T05:00:00-05:00")
+            is None
+        )
+
+    def test_naive_equals_aware_accepted(self) -> None:
+        # Same instant, one naive (interpreted as UTC) and one UTC-aware. A raw
+        # string comparison would order these differently and wrongly reject
+        # the pair; instant comparison treats them as equal.
+        assert (
+            validate_interval_ordering("2026-06-01T10:00:00+00:00", "2026-06-01T10:00:00") is None
+        )
+
+    def test_inverted_interval_rejected(self) -> None:
+        with pytest.raises(ValueError, match="inverted validity interval"):
+            validate_interval_ordering("2026-06-01T00:00:00", "2026-03-01T00:00:00")
+
+    def test_inverted_across_offsets_rejected(self) -> None:
+        # until 01:00+05:00 == 2026-05-31T20:00Z, which precedes from 00:00Z.
+        with pytest.raises(ValueError, match="inverted validity interval"):
+            validate_interval_ordering("2026-06-01T00:00:00+00:00", "2026-06-01T01:00:00+05:00")
+
+    def test_microsecond_ordered_accepted(self) -> None:
+        # One microsecond apart, in order — accepted.
+        assert (
+            validate_interval_ordering("2026-01-01T00:00:00.000000", "2026-01-01T00:00:00.000001")
+            is None
+        )
+
+    def test_microsecond_inverted_rejected(self) -> None:
+        # One microsecond apart, inverted — rejected at sub-second precision.
+        with pytest.raises(ValueError, match="inverted validity interval"):
+            validate_interval_ordering("2026-01-01T00:00:00.000001", "2026-01-01T00:00:00.000000")
+
+    def test_microsecond_equal_across_offsets_accepted(self) -> None:
+        # 12:00:00.500000+02:00 and 10:00:00.500000+00:00 are the same instant.
+        assert (
+            validate_interval_ordering(
+                "2026-06-01T12:00:00.500000+02:00", "2026-06-01T10:00:00.500000+00:00"
+            )
+            is None
+        )
+
+
 # ---------------------------------------------------------------------------
 # ThoughtRecord
 # ---------------------------------------------------------------------------
@@ -100,6 +167,53 @@ class TestThoughtValidTime:
     def test_malformed_rejected(self, field: str) -> None:
         with pytest.raises(ValidationError, match="Must be ISO-8601 timestamp"):
             _make_thought(**{field: "garbage"})
+
+    def test_inverted_interval_rejected(self) -> None:
+        # AC-1: valid_from strictly after valid_until is rejected.
+        with pytest.raises(ValidationError, match="inverted validity interval"):
+            _make_thought(
+                valid_from="2026-06-01T00:00:00",
+                valid_until="2026-03-01T00:00:00",
+            )
+
+    def test_equal_instant_accepted(self) -> None:
+        # AC-2: a zero-length interval is a legitimate instantaneous fact.
+        thought = _make_thought(
+            valid_from="2026-01-01T00:00:00",
+            valid_until="2026-01-01T00:00:00",
+        )
+        assert thought.valid_from == thought.valid_until == "2026-01-01T00:00:00"
+
+    def test_equal_across_offsets_accepted(self) -> None:
+        # AC-2: equal instants expressed with differing offsets normalise equal.
+        thought = _make_thought(
+            valid_from="2026-06-01T12:00:00+02:00",
+            valid_until="2026-06-01T05:00:00-05:00",
+        )
+        assert thought.valid_from == thought.valid_until == "2026-06-01T10:00:00+00:00"
+
+    def test_naive_equals_aware_accepted(self) -> None:
+        # AC-2: same instant, one naive and one UTC-aware. Instant comparison
+        # accepts it; a raw-string comparison would wrongly reject it.
+        thought = _make_thought(
+            valid_from="2026-06-01T10:00:00+00:00",
+            valid_until="2026-06-01T10:00:00",
+        )
+        assert thought.valid_until == "2026-06-01T10:00:00"
+
+    @pytest.mark.parametrize(
+        ("valid_from", "valid_until"),
+        [
+            ("2026-01-01T00:00:00", None),
+            (None, "2026-01-01T00:00:00"),
+            (None, None),
+        ],
+    )
+    def test_open_bounds_accepted(self, valid_from: str | None, valid_until: str | None) -> None:
+        # AC-3: a NULL on either bound preserves the open interval.
+        thought = _make_thought(valid_from=valid_from, valid_until=valid_until)
+        assert thought.valid_from == valid_from
+        assert thought.valid_until == valid_until
 
 
 # ---------------------------------------------------------------------------
@@ -133,3 +247,50 @@ class TestEdgeValidTime:
     def test_malformed_rejected(self, field: str) -> None:
         with pytest.raises(ValidationError, match="Must be ISO-8601 timestamp"):
             _make_edge(**{field: "garbage"})
+
+    def test_inverted_interval_rejected(self) -> None:
+        # AC-1: valid_from strictly after valid_until is rejected.
+        with pytest.raises(ValidationError, match="inverted validity interval"):
+            _make_edge(
+                valid_from="2026-06-01T00:00:00",
+                valid_until="2026-03-01T00:00:00",
+            )
+
+    def test_equal_instant_accepted(self) -> None:
+        # AC-2: a zero-length interval is a legitimate instantaneous relation.
+        edge = _make_edge(
+            valid_from="2026-01-01T00:00:00",
+            valid_until="2026-01-01T00:00:00",
+        )
+        assert edge.valid_from == edge.valid_until == "2026-01-01T00:00:00"
+
+    def test_equal_across_offsets_accepted(self) -> None:
+        # AC-2: equal instants expressed with differing offsets normalise equal.
+        edge = _make_edge(
+            valid_from="2026-06-01T12:00:00+02:00",
+            valid_until="2026-06-01T05:00:00-05:00",
+        )
+        assert edge.valid_from == edge.valid_until == "2026-06-01T10:00:00+00:00"
+
+    def test_naive_equals_aware_accepted(self) -> None:
+        # AC-2: same instant, one naive and one UTC-aware. Instant comparison
+        # accepts it; a raw-string comparison would wrongly reject it.
+        edge = _make_edge(
+            valid_from="2026-06-01T10:00:00+00:00",
+            valid_until="2026-06-01T10:00:00",
+        )
+        assert edge.valid_until == "2026-06-01T10:00:00"
+
+    @pytest.mark.parametrize(
+        ("valid_from", "valid_until"),
+        [
+            ("2026-01-01T00:00:00", None),
+            (None, "2026-01-01T00:00:00"),
+            (None, None),
+        ],
+    )
+    def test_open_bounds_accepted(self, valid_from: str | None, valid_until: str | None) -> None:
+        # AC-3: a NULL on either bound preserves the open interval.
+        edge = _make_edge(valid_from=valid_from, valid_until=valid_until)
+        assert edge.valid_from == valid_from
+        assert edge.valid_until == valid_until

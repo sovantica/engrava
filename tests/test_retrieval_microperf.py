@@ -430,7 +430,7 @@ class TestCompositeEdgeIndex:
             cursor = await conn.execute("PRAGMA user_version")
             row = await cursor.fetchone()
             assert row is not None
-            assert int(row[0]) == 18
+            assert int(row[0]) == 20
 
             cursor = await conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_edge_type_to'"
@@ -457,11 +457,11 @@ class TestHyphenPreservation:
 
     def test_fragment_formatter_quotes_hyphenated_term(self) -> None:
         """``_format_fts_bare_fragment`` keeps the hyphen and quotes the term."""
-        assert _format_fts_bare_fragment("well-being") == '"well-being"'
+        assert _format_fts_bare_fragment("well-being", in_bare_query=True) == '"well-being"'
 
     def test_fragment_formatter_preserves_hyphen_with_prefix(self) -> None:
         """A trailing ``*`` prefix marker is preserved alongside the hyphen."""
-        assert _format_fts_bare_fragment("co-work*") == '"co-work"*'
+        assert _format_fts_bare_fragment("co-work*", in_bare_query=True) == '"co-work"*'
 
     def test_normalize_keeps_hyphenated_term_whole(self) -> None:
         """The full normaliser does not split a hyphenated term into pieces."""

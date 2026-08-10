@@ -292,6 +292,10 @@ class TestAutoEmbedQuery:
         )
         explicit_vec = [0.9] * 4
         provider_mock = AsyncMock()
+        # Honor the provider protocol: ``dimension`` is a real int, matching the
+        # store's 4-dim embeddings, so the vector arm's dimension guard sees a
+        # valid explicit vector rather than a mock sentinel.
+        provider_mock.dimension = 4
         store_embed._embedding_provider = provider_mock  # type: ignore[assignment]
 
         await store_embed.search_hybrid("explicit", explicit_vec)

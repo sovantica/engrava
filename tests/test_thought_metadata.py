@@ -159,7 +159,7 @@ class TestThoughtMetadataPersistence:
         self,
         store: SqliteEngravaCore,
     ) -> None:
-        """F12 contract: UPDATE writes metadata via _CORE_UPDATE_SQL."""
+        """F12 contract: an update persists modified metadata."""
         await store.create_thought(
             _make_thought("t-update", metadata={"role": "user", "lang": "en"}),
         )
@@ -216,6 +216,29 @@ class TestValidateMetadataHelper:
         with pytest.raises(ValueError, match="not allowed"):
             _validate_metadata(bad)
 
+    @pytest.mark.parametrize("bad_float", [float("nan"), float("inf"), float("-inf")])
+    def test_rejects_non_finite_float(self, bad_float: float) -> None:
+        """NaN / ±Infinity are rejected — they serialize to invalid JSON tokens.
+
+        Without this guard the row would serialize to ``{"score": NaN}`` (not
+        valid JSON), so SQLite's ``json_valid()`` returns 0 and the row becomes
+        silently unmatchable by every metadata filter. A latent defect on the
+        thought path that the finite-float guard fixes for both records.
+        """
+        bad: dict[str, MetadataValue] = {"score": bad_float}
+        with pytest.raises(ValueError, match="finite number"):
+            _validate_metadata(bad)
+
+    def test_rejects_non_finite_float_nested(self) -> None:
+        """The finite-float rule holds at depth, like the list rule."""
+        bad: dict[str, MetadataValue] = {"outer": {"inner": float("inf")}}
+        with pytest.raises(ValueError, match=r"at outer\.inner must be a finite number"):
+            _validate_metadata(bad)
+
+    def test_accepts_finite_float(self) -> None:
+        """A finite float passes (the positive control for the guard)."""
+        _validate_metadata({"score": 0.75, "neg": -3.5, "big": 1e300})
+
     def test_size_under_warn_threshold_passes_silently(
         self,
         caplog: pytest.LogCaptureFixture,
@@ -270,6 +293,15 @@ class TestValidateMetadataAtAPIBoundaries:
         bad: dict[str, MetadataValue] = {"huge_text": "x" * 70_000}
         with pytest.raises(ValueError, match="exceeds maximum"):
             await store.update_thought("t-update-size", metadata=bad)
+
+    async def test_create_thought_rejects_non_finite_float(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """The finite-float guard fires from the create_thought API surface."""
+        bad = _make_thought("t-nan", metadata={"score": float("nan")})
+        with pytest.raises(ValueError, match="finite number"):
+            await store.create_thought(bad)
 
 
 # ---------------------------------------------------------------------------

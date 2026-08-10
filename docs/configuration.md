@@ -19,6 +19,7 @@ search:
   default_priority_weight: 0.05
   default_graph_weight: 0.00       # opt-in graph signal (0.0 = OFF by default)
   recency_half_life: 50
+  recency_now_half_life_seconds: 604800  # transaction-time axis: 7 days
   priority_boost_p1: 1.0
   priority_boost_p2: 0.6
   priority_boost_p3: 0.3
@@ -45,6 +46,11 @@ extensions:
       min_age_cycles: 1
       max_promoted_per_run: 20
       allow_zero_confirmation: true
+
+derive:
+  enabled: false
+  on_error: log
+  max_derived_per_source: 32
 ```
 
 ## Loading Configuration
@@ -57,6 +63,12 @@ config = load_config("engrava.yaml")
 async with await SqliteEngravaCore.from_config("engrava.yaml") as store:
     thought = await store.get_thought("abc")
 ```
+
+> **Unknown keys fail fast.** The YAML loader raises `ConfigError` for
+> unrecognised keys at the top level and inside every statically shaped section,
+> so a misspelling such as `promtoe_threshold` cannot silently retain a default.
+> Dynamic mapping keys remain supported where the contract permits them, such
+> as service names and custom Dreaming signal names.
 
 ### Full Factory Method
 
@@ -81,7 +93,7 @@ provider = resolve_embedding_provider(config.embeddings)
 
 Controls hybrid search behavior (FTS5 + vector + recency + priority).
 
-All 21 `SearchConfig` fields are settable here; every one has a default, so the
+All 22 `SearchConfig` fields are settable here; every one has a default, so the
 whole section is optional.
 
 **Signal weights and per-priority boosts:**
@@ -94,6 +106,7 @@ whole section is optional.
 | `default_priority_weight` | `float` | `0.05` | Weight for priority signal |
 | `default_graph_weight` | `float` | `0.0` | Weight for 1-hop graph signal. **`0.0` ⇒ the graph signal is OFF by default** — no graph queries run and there is zero overhead. Raise it (or pass `graph_weight=` per call) to opt in. |
 | `recency_half_life` | `int` | `50` | Cycles for recency score to halve |
+| `recency_now_half_life_seconds` | `int` | `604800` | Wall-clock seconds for transaction-time recency to halve (7 days). Used when a query supplies `recency_now`; per-call override: `recency_now_half_life`. |
 | `priority_boost_p1` | `float` | `1.0` | Score multiplier for P1 thoughts |
 | `priority_boost_p2` | `float` | `0.6` | Score multiplier for P2 thoughts |
 | `priority_boost_p3` | `float` | `0.3` | Score multiplier for P3 thoughts |
@@ -140,16 +153,26 @@ See [search.md](search.md) for the full 5-signal ranking model.
 
 ### Silent-behaviour footguns
 
-A few defaults keep a signal or a code path quiet unless you opt in. None of
-these raises — they just do less than you might expect — so they are worth
-knowing before you rely on the behaviour.
+A few defaults keep a signal or a code path quiet unless you opt in, while
+conflicting explicit recency arguments fail loudly. The quiet default paths do
+less than you might expect, so they are worth knowing before you rely on the
+behaviour.
 
-- **No `current_cycle` ⇒ recency is silently inactive.** `search_hybrid()` /
-  `recall()` only blend the recency signal when you pass `current_cycle=`.
-  Omit it and recency is skipped entirely (its weight is redistributed to the
-  other signals) — recent thoughts get no ranking advantage. There is no error;
-  a store past an internal size threshold emits a single one-time `DEBUG`
-  breadcrumb, nothing more. Pass the current cognitive cycle to activate it.
+- **Recency needs exactly one resolved reference.** `search_hybrid()` / `recall()`
+  resolve the two recency axes in this order:
+
+  1. Supplying both an explicit `current_cycle` and `recency_now` raises
+     `RecencyModeConflictError`; the two clocks are never combined.
+  2. An explicit `recency_now` with no explicit `current_cycle` selects
+     transaction-time recency and suppresses the passive `cycle_provider`.
+  3. Otherwise an explicit `current_cycle` (including `0`) selects
+     cognitive-cycle recency; if it is absent, a configured `cycle_provider`
+     supplies the cycle.
+  4. With neither explicit reference and no provider, recency is inactive and
+     its weight is redistributed to the other signals.
+
+  The final no-reference/no-provider case does not raise. On a sufficiently
+  large store, `recall()` emits one `DEBUG` breadcrumb per store instance.
 
 - **`default_graph_weight=0.0` ⇒ the graph signal is off.** As noted above, a
   default store runs no graph ranking queries. Give the weight (or a per-call
@@ -171,6 +194,18 @@ knowing before you rely on the behaviour.
   `vec0` index. Searches keep working, so a missing extension is easy to miss;
   install the `sqlite-vec` extra (and check for the load warning) if you intend
   to run on the native index.
+
+  **`engrava gc` is the one path that does not fall back — it refuses.** If the
+  database already carries an `embedding_vec` table from an earlier run *with*
+  the extra, a `gc` pass that is about to physically delete stops before
+  deleting anything and exits `1` (`Install 'engrava[vec]' and retry`), because
+  removing the rows without removing their vectors would strand those vectors in
+  the index. `--dry-run` is never refused, and neither is a run with nothing to
+  delete — but note that `gc --expired` under the default `ttl.strategy: archive`
+  stops after archiving only when it actually archived something, and with no
+  expired rows falls through to the archived-collection pass, which *is* refused
+  when there are archived rows to collect. See
+  [CLI reference → `gc`](cli.md#gc).
 
 ### `embeddings`
 
@@ -201,25 +236,73 @@ vector dimension lives under `extensions.vector.dimension`, not here.
 
 ### `dreaming`
 
-Memory consolidation configuration.
+Memory consolidation configuration. Setting `enabled: true` wires
+`store.consolidate()` when the store is created with `from_config()`; it does
+not start a background task. `DreamingExtension.is_due()` and `run_if_due()`
+apply `schedule_every_n_cycles` for callers that drive a cycle loop.
+`run_consolidation()` and `store.consolidate()` remain explicit, unconditional
+operations.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | `bool` | `false` | Enable dreaming consolidation |
-| `schedule_every_n_cycles` | `int` | `100` | Consolidation cadence (every N cycles) |
-| `promote_threshold` | `float` | `0.7` | Weighted-score cutoff for promotion |
-| `candidates_limit` | `int` | `200` | Max thoughts to evaluate per pass |
+| `schedule_every_n_cycles` | `int` | `100` | Positive cadence consumed by `DreamingExtension.is_due()` / `run_if_due()`; Engrava does not start a background scheduler. |
+| `promote_threshold` | `float` | `0.7` | Promotion requires a redistributed weighted score strictly greater than this value. |
+| `signals` | `map[str, float]` | see below | Relative promotion-signal weights. A partial YAML map merges onto the defaults. Flat signals are removed and active weights are renormalised per run. |
+| `candidates_limit` | `int` | `200` | Limit for the ACTIVE promotion pool and each agglomerative type query. The LPA path reads the existing dream-edge graph rather than applying this as a graph-edge cap. |
+| `clustering_backend` | `"numpy" \| "python"` | `"numpy"` | Similarity backend for agglomerative clustering. `numpy` uses vectorised/chunked float32 matrix operations; `python` is the much slower O(n²) debugging fallback. |
+| `top_keyphrases_count` | `int` | `3` | Number of TF-IDF keyphrases written to each v2 REFLECTION payload. |
+| `top_member_excerpts_count` | `int` | `5` | Number of priority/recency-ordered member excerpts written to a REFLECTION. |
+| `member_excerpt_max_chars` | `int` | `150` | Per-excerpt character cap, including a truncation suffix. |
+| `max_p1_fraction` | `float` | `0.05` | Population cap for P1 thoughts after promotion. `1.0` disables the cap; at least one P1 slot is retained for a non-empty corpus. |
+| `promote_targets` | `"OBS_ONLY" \| "REFL_ONLY" \| "ALL"` | `"OBS_ONLY"` | Thought types eligible for P1 promotion. It does not control the clustering pool. |
+| `reflection_default_priority` | `"P1" \| "P2" \| "P3"` | `"P2"` | Priority assigned to newly created REFLECTION thoughts. |
+| `eligible_perspectives` | `list[str] \| null` | `null` | Optional allow-list over `metadata.perspective`: `percept`, `utterance`, and/or `thought`. Missing annotations remain eligible. |
+| `self_filter_mode` | `"any" \| "self_only" \| "external_only"` | `"any"` | Filter using strict boolean `metadata.source.is_self`. Missing or malformed annotations remain unclassified and eligible. |
+| `min_source_confidence` | `"low" \| "medium" \| "high"` | `"low"` | Minimum `metadata.source.confidence`. With non-empty metadata, missing/unknown values are treated as `low`; absent or empty metadata bypasses all metadata-driven filters. |
+| `excluded_content_types` | `list[str]` | `["code"]` | Reject matching declared `metadata.content_type` values. Missing annotations remain eligible. |
+| `eligible_content_types` | `list[str] \| null` | `null` | Optional positive allow-list for declared content types. Missing annotations remain eligible. |
+| `boilerplate_threshold` | `float` | `0.30` | Drop a keyphrase when its share across clusters is strictly above this value. `1.0` effectively disables removal. |
+| `boilerplate_min_corpus_size` | `int` | `5` | Minimum number of clusters before cross-cluster boilerplate filtering engages. |
+| `boilerplate_min_keyphrases_per_refl` | `int` | `1` | If filtering would leave fewer phrases, retain the unfiltered keyphrase list. `0` disables this fallback. |
+| `access_tracking_enabled` | `bool` | `true` | Buffer accesses from retrieval/get paths and flush them in batches for the `frequency` signal. Tracking is active only when dreaming itself is enabled. |
+
+Default `signals`: `recency 0.25`, `staleness 0.20`, `confirmation 0.20`,
+`confidence 0.15`, `frequency 0.20`, `action_outcome 0.15`. These are relative
+weights and intentionally sum to `1.15`. A configured signal name must be a
+built-in signal or be supplied through `custom_signals` when constructing
+`DreamingExtension`; otherwise extension construction raises `ValueError`.
 
 #### `dreaming.gates`
 
-Gate thresholds — a thought must pass all active gates to be scored.
+Promotion, clustering, and cluster-quality gates.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `min_confirmations` | `int` | `2` | Minimum confirmation count. **Bypassed** when `allow_zero_confirmation` is `true`. |
-| `min_age_cycles` | `int` | `1` | Minimum `current_cycle - created_cycle`. Always enforced. |
+| `min_confirmations` | `int` | `2` | Minimum confirmation count when the confirmation gate is active. |
+| `min_age_cycles` | `int` | `1` | Minimum `current_cycle - created_cycle`; always enforced for promotion. |
 | `max_promoted_per_run` | `int` | `20` | Cap on promotions per consolidation run |
 | `allow_zero_confirmation` | `bool` | `true` | Bypass the confirmation gate for single-write batches. Set to `false` only when your application explicitly tracks confirmations. |
+| `min_cluster_size` | `int` | `3` | Minimum eligible members required to materialise a REFLECTION. Applied after metadata filtering too. |
+| `cluster_similarity_threshold` | `float` | `0.7` | Cosine link threshold for agglomerative clustering. Not used by LPA. |
+| `cluster_algorithm` | `"lpa" \| "agglomerative"` | `"lpa"` | Cluster over dream-created ASSOCIATED edges, or use graph-independent single-linkage cosine clustering. |
+| `enable_reflections` | `bool` | `true` | Enable clustering and REFLECTION creation. Promotion and dream-edge creation still run when false. |
+| `cold_start_clustering` | `bool` | `false` | With `lpa`, fall back to agglomerative clustering only when the dream-edge graph is empty. |
+| `cluster_allowed_types` | `list[str]` | `["OBSERVATION"]` | Thought types admitted to the agglomerative candidate pool and counted by the clustering early-stop guard. The default prevents meta-reflection cascades. |
+| `clustering_min_new_candidates` | `int` | `50` | Skip clustering after the first run when the eligible ACTIVE count increased by fewer than this many records. `0` disables the guard. |
+| `max_cluster_size` | `int \| null` | `200` | Reject larger clusters instead of creating overly broad REFLECTIONs. `null` disables this guard. |
+| `cluster_quality_gating_enabled` | `bool` | `true` | Master switch for the content-quality checks below. Size and metadata eligibility gates remain active. |
+| `cluster_quality_persona_threshold` | `float` | `0.75` | Reject a cluster when the detected persona-member fraction reaches this value. |
+| `cluster_quality_cohesion_threshold` | `float` | `0.40` | Reject when mean pairwise embedding cosine is strictly below this value. |
+| `cluster_quality_external_homogeneity_threshold` | `float` | `0.95` | Require at least this fraction of members not to be marked self (`is_self` is not `true`; missing annotations count as external for compatibility). |
+| `cluster_quality_ne_consistency_threshold` | `float` | `0.60` | Require this fraction of members to share a named entity with the first member. |
+| `cluster_quality_require_meaningful_keyphrases` | `bool` | `true` | Reject empty or entirely generic post-filter `top_keyphrases`. |
+
+With quality gating enabled, duplicate-content clusters and clusters flagged by
+the lightweight English token-pair contradiction heuristic are also rejected;
+those checks have no numeric YAML knob. A cluster must survive duplicate,
+persona, contradiction, cohesion, external-source, named-entity, and
+meaningful-keyphrase checks before a REFLECTION is written.
 
 #### `dreaming.edges`
 
@@ -233,7 +316,11 @@ Edge creation from dreaming. Promoted thoughts create
 | `min_similarity` | `float` | `0.7` | Cosine threshold for edge creation |
 | `edge_weight_factor` | `float` | `0.5` | `edge.weight = factor * similarity` |
 
-See [dreaming.md](dreaming.md) for details.
+The REFLECTION payload is structural JSON schema v2 containing legacy
+`member_ids`, `keywords`, and `cluster_hash` fields plus `type`, `version`,
+`member_count`, `cluster_algorithm`, `created_at`, `top_keyphrases`,
+`member_excerpts`, `temporal_span`, and `named_entities`. No LLM is called. See
+[Dreaming](dreaming.md) for execution order and interpretation.
 
 ### `services`
 
@@ -252,6 +339,11 @@ is no per-service `db_path` — the file is derived as `<data_dir>/<name>.db`):
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `embeddings` | `dict` | — | Per-service embedding-provider override (same shape as the top-level `embeddings` section) |
+
+The restore CLI constructs `EngravaManager` from the `services` object without
+passing the top-level `embeddings` section as `default_embeddings`. Therefore a
+service used with `restore --re-embed` must declare its provider explicitly at
+`services.configs.<name>.embeddings`; a top-level provider alone is not enough.
 
 ### `journal`
 
@@ -288,7 +380,7 @@ ttl:
 
 ### `hygiene_policy`
 
-The deterministic [Memory Hygiene](memory-hygiene.md) forgetting loop — a no-LLM
+The rule-based [Memory Hygiene](memory-hygiene.md) forgetting loop — a no-LLM
 pass that archives cold, low-value thoughts and, separately opt-in,
 garbage-collects them after a restore window. **Absent or `enabled: false` (the
 default) ⇒ the loop never runs and no read/write path changes.** Distinct from
@@ -304,7 +396,9 @@ signal-derived keep-score.
 | `check_every_n_cycles` | `int` | `1` | Cadence for the convenience pass from `consolidate()` only — an explicit `run_hygiene` bypasses it. |
 | `max_evictions_per_run` | `int` | `100` | Caps **each** stage per run (≤ N archived and ≤ N GC'd). |
 | `auto_gc_enabled` | `bool` | `false` | Whether Stage 2 (physical delete) runs. Enabling hygiene never implicitly enables deletion. |
-| `gc_min_archive_age_cycles` | `int` | `10` | Restore window: a hygiene-archived thought is GC-eligible only after this many cycles. |
+| `gc_min_archive_age_cycles` | `int` | `10` | Cycle restore window: a hygiene-archived thought is GC-eligible only after this many cycles. `0` makes this window always pass (disabled), symmetric with `gc_restore_window_seconds: 0`. |
+| `gc_restore_window_seconds` | `int` | `2592000` | Wall-clock restore window (seconds), required **in addition to** the cycle window, before GC may delete a hygiene-archived thought. Default `2592000` (30 days). `0` disables the wall-clock window (cycle-only). |
+| `min_inactivity_age_seconds` | `int` | `604800` | Minimum wall-clock inactivity (seconds) before a thought is archivable — a cold-start guard measured from last contact. Default `604800` (7 days). `0` disables the gate. |
 | `dry_run` | `bool` | `false` | Preview mode — compute the would-archive set (returned with reasons) without mutating or journaling. |
 
 Default `signal_weights`: `recency 0.30`, `frequency 0.25`, `confirmation 0.20`,
@@ -324,15 +418,34 @@ hygiene_policy:
     staleness: 0.10
   check_every_n_cycles: 1
   max_evictions_per_run: 100
-  auto_gc_enabled: false         # Stage 2 physical delete is separately opt-in
-  gc_min_archive_age_cycles: 10  # restore window before a GC is eligible
-  dry_run: false                 # set true to preview without mutating
+  auto_gc_enabled: false             # Stage 2 physical delete is separately opt-in
+  gc_min_archive_age_cycles: 10      # cycle restore window before a GC is eligible
+  gc_restore_window_seconds: 2592000 # AND a 30-day wall-clock window; 0 disables it
+  min_inactivity_age_seconds: 604800 # cold-start guard: 7 days untouched; 0 disables
+  dry_run: false                     # set true to preview without mutating
 ```
 
 > Garbage collection here is cognitive hygiene, not compliance deletion — it is
 > best-effort and offers no deletion guarantee. See
 > [Memory Hygiene](memory-hygiene.md) and
 > [Data lifecycle](data-lifecycle.md) for the full mechanics.
+
+**Cold-start archive gates.** A below-threshold score is not sufficient for
+archival. The thought must also be inactive for at least
+`min_inactivity_age_seconds`, measured from
+`COALESCE(last_accessed_at, updated_at, created_at)`. A row with no known contact
+time fails closed and is kept. At the run level, archival is also suppressed
+unless the candidate pool has at least one active usage-history signal:
+frequency (with access tracking enabled), confirmation, or action outcome.
+These two gates prevent cycle/ingest order alone from classifying fresh imports
+as disposable.
+
+Memory Hygiene is rule-based and does not call an LLM, but a run is reproducible
+only for a fixed store, full configuration, `current_cycle`, **and `now`** (and
+only when custom hooks are themselves deterministic). Calling `run_hygiene()`
+without `now=` reads the current UTC wall time once for the run; that instant
+controls both the inactivity gate and the wall-clock GC window. Pass a fixed
+timezone-aware `datetime` as `now=` when replaying or benchmarking a selection.
 
 ### `ingest`
 
@@ -345,6 +458,26 @@ Ingest-layer behaviour (content-hash deduplication).
 > Note: this flag advises ingest-layer callers; the persistence-layer
 > `create_thought` still defaults to `deduplicate=False` — see
 > [Recipes → Deduplicate repeated facts](recipes/index.md).
+
+### `derive`
+
+Controls the optional derived-records extension seam. The section only enables
+and bounds automatic production; a hooks object that implements
+`DerivedRecordProducerProtocol` must also be configured. With no producer, the
+seam is inert even when enabled. See [Extension hooks](extension-hooks.md#1a-derived-records-extension-seam).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | `bool` | `false` | Run the configured producer after a durably auto-committed source create. This gate controls the automatic on-store trigger; explicit `derive_existing()` backfill remains available when a producer is present. |
+| `on_error` | `str` | `"log"` | `"log"` records an ordinary application log and continues; `"raise"` propagates after the source is already durable and stops the remaining children. `CancelledError` always propagates. |
+| `max_derived_per_source` | `int` | `32` | Positive upper bound on records consumed from one producer call. An over-cap or lazy/unbounded result is rejected before any child is written. |
+
+```yaml
+derive:
+  enabled: true
+  on_error: log               # or "raise"
+  max_derived_per_source: 32
+```
 
 ### `hooks`
 

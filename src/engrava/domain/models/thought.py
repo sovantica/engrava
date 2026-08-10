@@ -23,7 +23,10 @@ from engrava.domain.enums import (
     ThoughtVisibility,
 )
 from engrava.domain.exceptions import InvalidTransitionError
-from engrava.domain.models._temporal import validate_iso8601_nullable
+from engrava.domain.models._temporal import (
+    validate_interval_ordering,
+    validate_iso8601_nullable,
+)
 from engrava.domain.models.provenance import ProvenanceContext
 
 #: Allowed value types for ``ThoughtRecord.metadata`` entries.
@@ -118,10 +121,21 @@ class ThoughtRecord(BaseModel):
         archived_at_cycle: The cognitive cycle at which the Memory Hygiene loop
             archived this thought, or ``None`` when it was not archived by
             hygiene.  Only hygiene sets it; a restore (un-archive) clears it back
-            to ``None``.  It backs the garbage-collection restore window
+            to ``None``.  It backs the garbage-collection cycle restore window
             (``current_cycle - archived_at_cycle >= gc_min_archive_age_cycles``),
             so a thought archived by any other path (TTL / manual) keeps
             ``None`` and is never reaped by hygiene GC.  Defaults to ``None``.
+        archived_at: The wall-clock instant (UTC-normalised ISO-8601) at which
+            the Memory Hygiene loop archived this thought, or ``None`` when it was
+            not archived by hygiene.  Only the hygiene archive path sets it,
+            paired with ``archived_at_cycle``; a restore (un-archive) clears both
+            back to ``None``.  It backs the garbage-collection **wall-clock**
+            restore window (``archived_at <= now - gc_restore_window_seconds``),
+            required in addition to the cycle window before the irreversible GC
+            stage may reap the thought, so a fast-cycling store cannot delete a
+            just-archived thought before a real-time chance to restore it.  A
+            thought archived by any other path (TTL / manual) keeps ``None``.
+            Defaults to ``None``.
 
     Examples:
         >>> thought = ThoughtRecord(
@@ -169,6 +183,7 @@ class ThoughtRecord(BaseModel):
     provenance: ProvenanceContext | None = Field(default=None)
     pinned: bool = False
     archived_at_cycle: int | None = Field(default=None, ge=0)
+    archived_at: str | None = None
 
     @model_validator(mode="after")
     def _validate_cycle_ordering(self) -> Self:
@@ -179,6 +194,24 @@ class ThoughtRecord(BaseModel):
                 f"created_cycle ({self.created_cycle})"
             )
             raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_valid_interval(self) -> Self:
+        """Reject an inverted valid-time interval.
+
+        When both ``valid_from`` and ``valid_until`` are set, the validity
+        interval must not run backwards. The bounds are compared as
+        UTC-normalised instants (not raw strings), so equal instants across
+        differing offsets are accepted (a zero-length interval is a legitimate
+        instantaneous fact) while a strictly inverted pair is rejected. A
+        ``None`` on either bound is an open interval and is always accepted.
+
+        Raises:
+            ValueError: If ``valid_from`` is strictly after ``valid_until``.
+
+        """
+        validate_interval_ordering(self.valid_from, self.valid_until)
         return self
 
     @field_validator("thought_id")
@@ -197,6 +230,7 @@ class ThoughtRecord(BaseModel):
         "expires_at",
         "valid_from",
         "valid_until",
+        "archived_at",
     )
     @classmethod
     def _validate_iso8601_nullable(cls, v: str | None) -> str | None:

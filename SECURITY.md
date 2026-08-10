@@ -2,7 +2,7 @@
 
 Full vulnerability-disclosure policy lives on the website:
 
-- **Policy:** <https://engrava.ai/security>
+- **Policy:** <https://engrava.ai/security/>
 - **Machine-readable (RFC 9116):** <https://engrava.ai/.well-known/security.txt>
 
 This file is the GitHub-side pointer so that the "Report a vulnerability"
@@ -61,4 +61,4 @@ engrava is developed by a small team. Complex fixes can take weeks. You
 will be told what is happening and when a release is expected, rather
 than left on a silent thread.
 
-See <https://engrava.ai/security> for the full policy surface.
+See <https://engrava.ai/security/> for the full policy surface.

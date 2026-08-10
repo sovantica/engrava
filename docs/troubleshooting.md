@@ -70,8 +70,8 @@ erroring when its prerequisite is missing. Work through this checklist:
 |---|---|
 | No `embedding_provider` is configured | the **vector** signal is skipped — only FTS/priority run. A purely semantic query with no shared keywords may find nothing. |
 | You pass `query_text` but no provider and no `query_vector` | same as above — there is no vector to compare against. |
-| `current_cycle` is `None` | the **recency** signal is skipped (it cannot compute an age). |
-| `recency_weight` is `0.0` | recency is disabled even if `current_cycle` is set. |
+| No explicit `current_cycle` or `recency_now`, and no configured `cycle_provider` | the **recency** signal is skipped because no recency reference is available. |
+| `recency_weight` is `0.0` | recency is disabled even when a cycle or transaction-time reference is available. |
 | The query shares no FTS tokens with any thought | FTS legitimately returns nothing — this is a real miss, not a bug. Note a *bare* query is `OR`-matched (any shared word hits), so this is rarer than it looks; if you instead get **too many** hits, you may want strict matching — see below. |
 | You used lowercase `and` / `or` between words | These are **not** FTS5 operators — they are matched as ordinary words (and `OR`-joined like any bare query). Booleans must be **uppercase** (`AND`, `OR`, `NOT`). |
 
@@ -84,8 +84,9 @@ print(sorted(result.backends_used))  # e.g. ['fts5', 'priority', 'recency']
 
 If `'vector'` is missing and you expected semantic matching, configure an
 embedding provider (see the [Embeddings guide](guides/embeddings.md)). If
-`'recency'` is missing, pass a non-`None` `current_cycle` **and** a
-`recency_weight > 0`.
+`'recency'` is missing, use a positive `recency_weight` and provide exactly one
+recency mode: pass `current_cycle`, configure a `cycle_provider`, or pass
+`recency_now` for transaction-time recency.
 
 ## Keyword search returns too many results (I wanted all words to match)
 
@@ -116,9 +117,17 @@ to error or to be interpreted as an FTS column filter.
 
 **Cause / behaviour.** It does neither. Only the real `essence:` and `content:`
 column filters are honoured; any other `token:token` (a URL scheme, a clock time)
-is split into ordinary search terms, so the query is safe to run and a genuinely
-malformed FTS expression degrades to zero FTS hits rather than raising. No action
-needed — this is the intended robustness.
+is split into ordinary search terms, so the query is safe to run. When a
+normalized full-text expression is a genuinely malformed FTS5 query, engrava logs
+a warning, increments the read-only `fts_match_failure_count` counter, and
+**retries once** through the bare normalization (unsafe characters dropped,
+wildcards collapsed to legal prefixes, any exposed `AND`/`OR`/`NOT` phrase-quoted
+so FTS5 cannot read it as an operator), which is always a valid MATCH; the FTS arm
+returns that query's matches (an empty set when the sanitized query matches
+nothing). It does not raise. No action needed — this is the intended robustness —
+though a rising `fts_match_failure_count` is how you see it happening. See
+[Keyword query syntax (FTS)](search.md#keyword-query-syntax-fts) and
+[Observability signals](observability.md#observability-signals).
 
 ## Dreaming promotes nothing (consolidation is inert)
 
@@ -193,12 +202,28 @@ different model name or a different dimension, the stored vectors are
 incompatible with new ones, so it refuses rather than silently mixing
 dimensions (which would corrupt similarity results).
 
-**Fix.** Use the same embedding model the database was created with, or
-re-embed the corpus under the new model. The CLI does this safely:
+**Fix.** Use the same embedding model the database was created with, or restore
+a trusted snapshot with a configured provider and deliberately re-embed the
+corpus. Direct mode uses top-level `embeddings`:
 
 ```bash
-engrava restore --re-embed   # validates model consistency, re-embeds
+engrava --db restored.db --config engrava.yaml restore \
+  -i backup.jsonl --clear --re-embed
 ```
+
+Service mode prefers `services.configs.<name>.embeddings` and falls back to the
+top-level provider:
+
+```bash
+engrava --config engrava.yaml restore \
+  --service main -i backup.jsonl --clear --re-embed
+```
+
+`--re-embed` requires `--config` with a provider at one of those levels. If no
+provider is configured, import with `--skip-embeddings` or keep the source
+embeddings unchanged. If the target already contains embeddings, restore also
+requires `--clear`; this prevents old vectors from surviving under the new
+model/dimension/prefix identity.
 
 See [Known Limitations → Embedding Dimension Consistency](known-limitations.md#embedding-dimension-consistency).
 
@@ -243,6 +268,8 @@ base), `ConfigError`, `EmbeddingModelMismatchError`, `ExtensionMigrationError`,
 
 ## Still stuck?
 
+- Use [Error handling and recovery](error-handling.md) to decide whether to
+  retry, repair the input, or replace the store.
 - Re-read the relevant guide: [Core Concepts](concepts.md),
   [Search](search.md), [Embeddings](guides/embeddings.md), [Dreaming](dreaming.md).
 - Check the [FAQ](faq.md) for "is this supposed to work this way?" questions.

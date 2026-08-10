@@ -2,9 +2,15 @@
 """A small notes memory built with engrava — the companion to the tutorial.
 
 This is the complete, runnable version of ``docs/tutorial.md``: ingest a few
-notes, embed them, link related ones with an edge, and search by meaning. It
-uses a tiny deterministic embedding function so it runs with no external
-services (swap in a real provider from the Embeddings guide for production).
+notes, embed them, link related ones with an edge, and search them. It uses a
+tiny deterministic hash function for the embeddings so it runs with no external
+services. A hash carries no meaning: the vector scores are a function of the
+text's digest rather than of what it says, so the keyword (FTS5) signal is the
+only one related to the query while meaningless vector scores still influence
+where everything lands — and only one of the two coffee notes reaches
+``top_k=3``. See the tutorial for the
+walk-through. Swap in a provider backed by a semantic embedding model (see the
+Embeddings guide) to search by meaning.
 
 Run directly::
 

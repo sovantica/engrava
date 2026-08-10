@@ -22,6 +22,9 @@ from engrava.domain.enums import (
 )
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.extensions.dreaming_reflection_content import (
+    MemberExcerpt,
+    ReflectionContentV2,
+    TemporalSpan,
     build_reflection_content_v2,
     extract_named_entities_per_member,
     parse_reflection_content,
@@ -372,3 +375,75 @@ class TestExtractNamedEntitiesPerMember:
         assert entities == sorted(set(entities))
         assert entities.count("Alice") == 1
         assert entities.count("Bob") == 1
+
+
+# ---------------------------------------------------------------------------
+# Typed-shape contract — the runtime payload matches its TypedDict schema
+# ---------------------------------------------------------------------------
+
+
+class TestTypedShapeContract:
+    """Lock the runtime builder output to the declared TypedDict schemas.
+
+    These assertions catch drift in either direction: a field added to the
+    builder without updating :class:`ReflectionContentV2` (and its nested
+    :class:`MemberExcerpt` / :class:`TemporalSpan`), or a schema field the
+    builder stops emitting.
+    """
+
+    def test_v2_keys_exactly_match_typeddict(self) -> None:
+        cluster = [
+            _thought(thought_id="t-001", content="alpha beta gamma decisions monday"),
+            _thought(thought_id="t-002", content="delta epsilon zeta retrospective notes"),
+        ]
+        content = build_reflection_content_v2(
+            cluster, algorithm="lpa", config=DreamingConfig(), now=_FIXED_NOW
+        )
+        assert set(content.keys()) == set(ReflectionContentV2.__annotations__)
+
+    def test_v2_field_value_types(self) -> None:
+        cluster = [
+            _thought(thought_id="t-001", content="alpha beta gamma decisions monday"),
+        ]
+        content = build_reflection_content_v2(
+            cluster, algorithm="lpa", config=DreamingConfig(), now=_FIXED_NOW
+        )
+        assert content["type"] == "reflection"
+        assert content["version"] == 2
+        assert isinstance(content["member_ids"], list)
+        assert all(isinstance(m, str) for m in content["member_ids"])
+        assert isinstance(content["keywords"], list)
+        assert isinstance(content["cluster_hash"], str)
+        assert isinstance(content["member_count"], int)
+        assert isinstance(content["cluster_algorithm"], str)
+        assert isinstance(content["created_at"], str)
+        assert isinstance(content["top_keyphrases"], list)
+        assert isinstance(content["member_excerpts"], list)
+        assert isinstance(content["temporal_span"], dict)
+        assert isinstance(content["named_entities"], list)
+
+    def test_member_excerpt_keys_exactly_match_typeddict(self) -> None:
+        cluster = [_thought(thought_id="t-001", content="alpha beta gamma")]
+        content = build_reflection_content_v2(
+            cluster, algorithm="lpa", config=DreamingConfig(), now=_FIXED_NOW
+        )
+        excerpts = content["member_excerpts"]
+        assert excerpts, "expected at least one excerpt for a non-empty cluster"
+        for excerpt in excerpts:
+            assert set(excerpt.keys()) == set(MemberExcerpt.__annotations__)
+            assert isinstance(excerpt["thought_id"], str)
+            assert isinstance(excerpt["excerpt"], str)
+
+    def test_temporal_span_keys_exactly_match_typeddict(self) -> None:
+        cluster = [
+            _thought(thought_id="t-001", content="alpha", created_at="2026-04-01T00:00:00+00:00"),
+            _thought(thought_id="t-002", content="beta", created_at="2026-04-15T00:00:00+00:00"),
+        ]
+        content = build_reflection_content_v2(
+            cluster, algorithm="lpa", config=DreamingConfig(), now=_FIXED_NOW
+        )
+        span = content["temporal_span"]
+        assert set(span.keys()) == set(TemporalSpan.__annotations__)
+        assert isinstance(span["min_created_at"], str)
+        assert isinstance(span["max_created_at"], str)
+        assert isinstance(span["span_days"], float)

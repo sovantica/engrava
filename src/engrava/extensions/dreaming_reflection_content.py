@@ -34,7 +34,8 @@ import datetime
 import hashlib
 import json
 import re
-from typing import TYPE_CHECKING, Any
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Literal, TypedDict, TypeVar
 
 from engrava.extensions.dreaming_keyphrases import (
     SENTENCE_STARTER_BLOCKLIST,
@@ -48,10 +49,85 @@ if TYPE_CHECKING:
     from engrava.domain.models.thought import ThoughtRecord
 
 __all__ = (
+    "MemberExcerpt",
+    "ReflectionContentV2",
+    "TemporalSpan",
     "build_reflection_content_v2",
     "extract_named_entities_per_member",
     "parse_reflection_content",
 )
+
+
+class MemberExcerpt(TypedDict):
+    """A cluster member's id paired with a bounded content excerpt.
+
+    Attributes:
+        thought_id: The member thought's stable identifier.
+        excerpt: The member's ``content`` truncated at a word boundary to
+            the configured maximum length.
+
+    """
+
+    thought_id: str
+    excerpt: str
+
+
+class TemporalSpan(TypedDict):
+    """Creation-time bounds and span across a cluster's members.
+
+    Attributes:
+        min_created_at: Earliest member ``created_at`` (ISO-8601), or the
+            fallback timestamp when no member carries one.
+        max_created_at: Latest member ``created_at`` (ISO-8601), or the
+            fallback timestamp when no member carries one.
+        span_days: Day span between the bounds, rounded to two decimals.
+
+    """
+
+    min_created_at: str
+    max_created_at: str
+    span_days: float
+
+
+class ReflectionContentV2(TypedDict):
+    """Structural REFLECTION content payload (schema v2).
+
+    The stable, documented schema produced by
+    :func:`build_reflection_content_v2`. Additive over legacy v1 (which
+    carried only ``member_ids``, ``keywords`` and ``cluster_hash``): all
+    seven mandated cognitive-boundary fields plus four structural
+    enrichments are present. See the module docstring for the field-by-field
+    rationale.
+
+    Attributes:
+        type: Discriminator, always ``"reflection"``.
+        version: Schema version, always ``2``.
+        member_ids: Sorted member thought identifiers.
+        keywords: Simple frequency keywords (<=10) across member content.
+        cluster_hash: Legacy 16-char SHA-256 prefix over ``member_ids``.
+        member_count: Number of members in the cluster.
+        cluster_algorithm: Clustering algorithm name.
+        created_at: ISO-8601 build timestamp.
+        top_keyphrases: TF-IDF keyphrase dicts (``{"phrase", "score"}``).
+        member_excerpts: Top members with bounded content excerpts.
+        temporal_span: Creation-time bounds and span days.
+        named_entities: Sorted unique entities drawn from every member.
+
+    """
+
+    type: Literal["reflection"]
+    version: Literal[2]
+    member_ids: list[str]
+    keywords: list[str]
+    cluster_hash: str
+    member_count: int
+    cluster_algorithm: str
+    created_at: str
+    top_keyphrases: list[dict[str, float | str]]
+    member_excerpts: list[MemberExcerpt]
+    temporal_span: TemporalSpan
+    named_entities: list[str]
+
 
 _EXCERPT_LENGTH = 80
 _EXCERPT_TRUNCATION_SUFFIX = "..."
@@ -96,7 +172,7 @@ def _build_member_excerpts(
     *,
     top_n: int,
     max_length: int = _EXCERPT_LENGTH,
-) -> list[dict[str, str]]:
+) -> list[MemberExcerpt]:
     """Top-N members by priority + recency, each with a bounded excerpt.
 
     Sort key: ``(Priority.__lt__, created_at-or-fallback descending)``.
@@ -114,7 +190,7 @@ def _build_member_excerpts(
             give operators a single config knob over excerpt size.
 
     Returns:
-        List of ``{"thought_id": str, "excerpt": str}`` dicts.
+        List of :class:`MemberExcerpt` mappings.
 
     """
     ordered = sorted(
@@ -150,7 +226,7 @@ def _negative_iso(value: str | None) -> str:
     return "".join(chr(0xFFFF - ord(c)) for c in value)
 
 
-def _build_temporal_span(cluster: list[ThoughtRecord]) -> dict[str, Any]:
+def _build_temporal_span(cluster: list[ThoughtRecord]) -> TemporalSpan:
     """Compute min/max ``created_at`` and span days across cluster members.
 
     Members with ``created_at is None`` are skipped.  When every member
@@ -161,8 +237,8 @@ def _build_temporal_span(cluster: list[ThoughtRecord]) -> dict[str, Any]:
         cluster: Member ThoughtRecords.
 
     Returns:
-        Dict with ``min_created_at`` (str), ``max_created_at`` (str),
-        and ``span_days`` (float, 2dp).
+        A :class:`TemporalSpan` with ``min_created_at`` (str),
+        ``max_created_at`` (str), and ``span_days`` (float, 2dp).
 
     """
     timestamps = [m.created_at for m in cluster if m.created_at is not None]
@@ -332,7 +408,7 @@ def build_reflection_content_v2(
     cluster_phrase_df: dict[str, int] | None = None,
     total_clusters: int | None = None,
     now: datetime.datetime | None = None,
-) -> dict[str, Any]:
+) -> ReflectionContentV2:
     """Build a v2 REFLECTION content dict from a cluster.
 
     Pure function: identical inputs produce byte-identical output (the
@@ -377,7 +453,8 @@ def build_reflection_content_v2(
             value to keep assertions stable.
 
     Returns:
-        v2 content dict ready to ``json.dumps`` and persist.
+        A :class:`ReflectionContentV2` payload ready to ``json.dumps`` and
+        persist.
 
     """
     if now is None:
@@ -423,7 +500,16 @@ def build_reflection_content_v2(
     }
 
 
-def parse_reflection_content(content_dict: dict[str, Any]) -> dict[str, Any]:
+_ReflectionContentT = TypeVar("_ReflectionContentT", bound=Mapping[str, object])
+"""A REFLECTION content mapping: a v1/v2 ``dict`` or a :class:`ReflectionContentV2`.
+
+Bounding to a read-only :class:`~collections.abc.Mapping` lets the dispatch parser
+accept a builder's ``TypedDict`` result (or a JSON-decoded ``dict``) and echo back
+the caller's *exact* type — it only reads keys and returns its argument unchanged.
+"""
+
+
+def parse_reflection_content(content_dict: _ReflectionContentT) -> _ReflectionContentT:
     """Dispatch parser handling both legacy v1 and v2 REFLECTION content.
 
     Legacy v1 has no ``version`` field at all; this function detects it
