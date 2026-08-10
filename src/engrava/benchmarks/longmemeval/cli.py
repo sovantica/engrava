@@ -27,6 +27,7 @@ from engrava.benchmarks.longmemeval.dataset_loader import (
     load_dataset,
 )
 from engrava.benchmarks.longmemeval.runner import (
+    DEFAULT_HYGIENE_EVICTION_THRESHOLD,
     DEFAULT_TOP_K,
     EvalMode,
     LongMemEvalResults,
@@ -86,6 +87,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             embedding_provider=provider,
             eval_mode=args.eval_mode,
             retrieval_top_k=args.top_k,
+            hygiene_enabled=args.hygiene,
+            hygiene_eviction_threshold=args.hygiene_eviction_threshold,
         )
     except DatasetDownloadError as exc:
         sys.stderr.write(f"LongMemEval: {exc}\n")
@@ -152,6 +155,32 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="Disable dreaming for this run (default).",
     )
     parser.set_defaults(dreaming=False)
+    parser.add_argument(
+        "--hygiene",
+        dest="hygiene",
+        action="store_true",
+        help=(
+            "Run one conservative Memory Hygiene (forgetting) pass per question "
+            "after ingestion, archiving cold thoughts before retrieval. "
+            "Archive-only (no GC), P1/pins protected."
+        ),
+    )
+    parser.add_argument(
+        "--no-hygiene",
+        dest="hygiene",
+        action="store_false",
+        help="Disable hygiene for this run (default).",
+    )
+    parser.set_defaults(hygiene=False)
+    parser.add_argument(
+        "--hygiene-eviction-threshold",
+        type=float,
+        default=DEFAULT_HYGIENE_EVICTION_THRESHOLD,
+        help=(
+            "Eviction-score cutoff for the hygiene pass (default: %(default)s). "
+            "Lower forgets less; consulted only with --hygiene."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -165,6 +194,8 @@ def _emit_report(
     sys.stdout.write("=" * 60 + "\n")
     sys.stdout.write(f"variant questions evaluated: {results.total_questions}\n")
     sys.stdout.write(f"dreaming enabled: {results.dreaming_enabled}\n")
+    sys.stdout.write(f"hygiene enabled: {results.hygiene_enabled}\n")
+    sys.stdout.write(f"thoughts archived (hygiene): {results.archived_count}\n")
     sys.stdout.write(f"top_k: {results.top_k}\n")
     sys.stdout.write(f"eval_mode: {results.eval_mode}\n")
     sys.stdout.write("-" * 60 + "\n")

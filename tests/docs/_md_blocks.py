@@ -23,7 +23,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DOCS_DIR = REPO_ROOT / "docs"
 README = REPO_ROOT / "README.md"
 
-_PYTHON_FENCE = "```python"
 _CLOSING_FENCE = "```"
 
 
@@ -74,6 +73,27 @@ def extract_python_blocks(path: Path) -> list[CodeBlock]:
         file contains no ``python`` fences.
 
     """
+    return extract_fenced_blocks(path, "python")
+
+
+def extract_fenced_blocks(path: Path, language: str) -> list[CodeBlock]:
+    """Extract every fenced block of one info-string language from a Markdown file.
+
+    ``python`` blocks are the executable-example surface; other languages carry
+    documented *output* (a ``text`` block showing what an example prints), which
+    a test can compare against a real run so the page cannot promise a result it
+    does not produce.
+
+    Args:
+        path: The Markdown file to scan.
+        language: The fence info-string language, e.g. ``"python"`` or ``"text"``.
+
+    Returns:
+        A list of :class:`CodeBlock` in document order. Empty when the file
+        contains no fence of that language.
+
+    """
+    fence = f"```{language}"
     rel = path.relative_to(REPO_ROOT).as_posix()
     lines = path.read_text(encoding="utf-8").splitlines()
 
@@ -86,7 +106,7 @@ def extract_python_blocks(path: Path) -> list[CodeBlock]:
     for index, raw in enumerate(lines):
         stripped = raw.lstrip()
         if not in_block:
-            if stripped.startswith(_PYTHON_FENCE):
+            if stripped.startswith(fence):
                 in_block = True
                 indent = len(raw) - len(stripped)
                 body_lines = []

@@ -88,6 +88,21 @@ engrava --db my-data.db migrate
   file — freed pages return to SQLite's free-list. To reclaim file size, run
   `VACUUM`. See [Data lifecycle → reclaiming disk space](data-lifecycle.md#reclaiming-disk-space).
 
+  **If the upgraded install dropped the vector extra, `gc` will refuse rather
+  than run.** A database that carries an `embedding_vec` table from an earlier
+  run *with* `sqlite-vec` cannot be collected without it: a `gc` pass that is
+  about to physically delete stops **before deleting anything** and exits `1`
+  with `Install 'engrava[vec]' and retry`, because removing the rows without
+  removing their vectors would strand those vectors in the index. The same
+  refusal follows any other reason `sqlite-vec` fails to load — an unsupported
+  build, an OS error, a SQLite error — not only a missing extra. Reinstall as
+  `pip install 'engrava[vec]'` and retry. `--dry-run` is never refused, and
+  neither is a run with nothing to delete; but `gc --expired` under the default
+  `ttl.strategy: archive` stops after archiving only when it actually archived
+  something, and with no expired rows falls through to the archived-collection
+  pass, which *is* refused when there are archived rows to collect. See
+  [CLI reference → `gc`](cli.md#gc).
+
 ## If Migration Fails
 
 Migration errors should include the failing SQL or the extension responsible for
@@ -129,7 +144,8 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 | 0.2.2 | 0.3.0 | Yes | Minor upgrade with extension migration tracking and upgrade CI coverage |
 | 0.3.0 | 0.3.1 | Yes | Patch-level upgrade; no schema change (`user_version` unchanged) — safe to roll across workers |
 | 0.3.x | 0.4.0 | Yes | **Schema-changing** minor upgrade — adds the valid-time columns (additive, zero data loss). Back up first and follow the [rolling-upgrades](#rolling-upgrades-multiple-workers) note |
-| 0.4.x | 0.5.0 | Yes | Library upgrade is drop-in. **Breaking for MCP-server users only:** the `engrava[mcp]` extra and the in-engrava `engrava-mcp` command are removed — the server moved to the standalone [`engrava-mcp`](https://github.com/sovantica/engrava-mcp) package (see the 0.4 → 0.5 note) |
+| 0.4.x | 0.5.0 | Yes | **Schema-changing** minor upgrade (`user_version` 14 → 18), although the library API is drop-in. **Breaking for MCP-server users only:** the `engrava[mcp]` extra and the in-engrava `engrava-mcp` command are removed — the server moved to the standalone [`engrava-mcp`](https://github.com/sovantica/engrava-mcp) package (see the 0.4 → 0.5 note) |
+| 0.5.0 | 0.6.0 | Yes | **Schema-changing** minor upgrade (`user_version` 18 → 20), with two additive columns. Default retrieval now excludes archived thoughts, and wrong-dimension query vectors raise a typed error. Back up, quiesce shared-store workers, migrate once, and review the [0.5 → 0.6 notes](#05---06) |
 
 For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 `0.x.*` line do not change the schema and are low-risk; **minor** upgrades
@@ -138,18 +154,114 @@ For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 
 ## Version Notes
 
+### 0.5 -> 0.6
+
+Version 0.6 is a **schema-changing minor upgrade**. Do not roll it across old and
+new workers sharing one database file. Back up the database, stop the 0.5
+workers, let one 0.6 process run `ensure_schema()` (or `engrava migrate`) to
+completion, and then start the 0.6 workers. The migration is automatic and
+forward-only.
+
+The core schema advances from `user_version = 18` to `user_version = 20` in two
+additive steps:
+
+| Step | Change | Existing-row behavior |
+|---|---|---|
+| 18 → 19 | Adds `edge.metadata_json` | Existing edges read back `metadata == {}`. |
+| 19 → 20 | Adds nullable `thought.archived_at` | An older hygiene-archived row has no wall-clock timestamp and fails closed: it is not auto-GC-eligible while the wall-clock restore window is active. |
+
+Neither step drops a table or rewrites user content. The columns are added
+automatically with a neutral default or `NULL`. A physical pre-upgrade backup is
+still required because downgrades and reverse migrations are unsupported.
+
+Review these behavior changes before deployment:
+
+- **Archived thoughts leave default retrieval.** `search_similar`, `search_fts`,
+  `search_hybrid`, and `recall` now exclude `LifecycleStatus.ARCHIVED` rows by
+  default. Pass `include_archived=True` for an archive-search call, or use
+  `restore_thought(...)` to return a thought to `ACTIVE`. `list_thoughts` and
+  `count_thoughts` retain their lifecycle-neutral behavior unless you filter
+  them explicitly.
+- **Query-vector dimensions fail loudly.** `search_similar` and the vector arm
+  reject a vector whose length does not match the store dimension with
+  `VectorDimensionMismatchError` (an `EngravaError` subclass). Code that caught
+  the previous incidental `ValueError`, or relied on a wrong-dimension all-zero
+  vector returning `[]`, must catch the typed error instead. Empty, all-zero, or
+  non-finite vectors remain a graceful empty result and increment
+  `vector_arm_degradation_count`.
+- **Custom embedding providers must expose a public `dimension`.**
+  `EmbeddingProviderProtocol` has always required it, but nothing checked it at
+  construction and the 0.5 core read it at exactly one site, off the query path
+  — so a provider that kept the value privately (`self._dimension`, no public property)
+  worked on 0.5 for as long as nothing called `verify_embedding_model()`, which
+  is that site. 0.6 reads it on **every** vector search, before any comparison —
+  unless a `sqlite-vec` backend is configured, whose own `vec0` table declares
+  the dimension and is consulted first. Such a provider now raises
+  `EmbeddingProviderContractError` (an `EngravaError` subclass) naming the
+  provider class and the missing member:
+
+  ```text
+  embedding provider 'MyProvider' does not expose the required
+  EmbeddingProviderProtocol member 'dimension'. Add a public 'dimension'
+  property to 'MyProvider' — a private attribute such as '_dimension' does not
+  satisfy the protocol.
+  ```
+
+  The fix is to add the property:
+
+  ```python
+  @property
+  def dimension(self) -> int:
+      return self._dimension
+  ```
+
+  The check is **lazy**: constructing a store with such a provider still
+  succeeds, and a store that never searches by vector — and never calls
+  `verify_embedding_model()` — is unaffected. Call `verify_embedding_model()`
+  after construction to fail at startup instead; it raises the same typed error.
+  This is not a contract change — the protocol required the member before 0.6;
+  only the point at which it is read, and the error you get, have changed.
+- **Malformed FTS syntax gets one safe retry.** A failed expert `MATCH`
+  expression is retried through bare-query normalization before the FTS arm is
+  dropped; every failed first attempt increments `fts_match_failure_count`.
+- **Recency has two explicit modes.** Existing `current_cycle` behavior remains,
+  with an optional runtime `cycle_provider`. Callers without a cognitive cadence
+  can select transaction-time recency with `recency_now`; supplying both explicit
+  references raises `RecencyModeConflictError` rather than combining clocks.
+- **Configuration validation is uniform.** Invalid values in supported config
+  sections are rejected consistently whether the store is built from YAML or
+  through the corresponding typed construction path. Fix invalid legacy values
+  rather than relying on a path that previously skipped validation.
+- **Enabled hygiene gains conservative wall-clock guards.** Memory Hygiene is
+  still off by default. For a store that already enabled it in 0.5, omitted new
+  fields resolve to a seven-day minimum inactivity age and a 30-day wall-clock
+  restore window; archival also requires an active usage-history signal. Pass a
+  fixed `now` when replaying a selection, and review the new defaults before the
+  first 0.6 hygiene run. Existing hygiene archives without `archived_at` fail
+  closed and are not auto-GC'd while the wall-clock window is active.
+
+The new edge-metadata, derived-record, cycle-provider, and transaction-time
+recency surfaces are additive. Existing stores do not enable automatic
+derivation or a cycle provider merely by being migrated.
+
 ### 0.4 -> 0.5
 
 The library upgrade is drop-in: `pip install --upgrade engrava` and your normal
 startup. The schema migration runs automatically on first open as usual.
 
-**Schema change (additive, zero data loss).** 0.5 steps the core schema forward
-one step, `user_version = 14 → 15`, adding a single composite index
-`edge(edge_type, to_thought_id)` so edge-type-scoped inbound edge lookups seek
-on both columns instead of filtering `edge_type` as a residual. It touches no
-row, column, or query result — purely a query-plan improvement — and runs inside
-a transaction on the first `ensure_schema()`. Nothing to do beyond your normal
-startup.
+**Schema change (additive, zero data loss).** 0.5 steps the core schema from
+`user_version = 14` to `user_version = 18` in four migrations:
+
+| Step | Change | Existing-row behavior |
+|---|---|---|
+| 14 → 15 | Adds the composite `edge(edge_type, to_thought_id)` lookup index | Query-plan improvement only; no row changes. |
+| 15 → 16 | Adds nullable `thought.action_outcome_score` and `idx_action_source_thought` | Existing thoughts have no action-outcome aggregate until linked terminal actions produce one. |
+| 16 → 17 | Adds nullable `thought.provenance` plus session/actor JSON expression indexes | Existing thoughts have no captured provenance. |
+| 17 → 18 | Adds `thought.pinned` and nullable `thought.archived_at_cycle` | Existing thoughts read as `pinned=False`; no row is treated as hygiene-archived. |
+
+All four steps run automatically inside the migration transaction on first
+`ensure_schema()`. They add columns or indexes without dropping or rewriting
+user content.
 
 **Breaking change for MCP-server users.** The Model Context Protocol server moved
 out of `engrava` into its own package, **`engrava-mcp`**. Removed from `engrava`

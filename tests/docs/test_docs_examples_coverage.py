@@ -76,7 +76,6 @@ BEHAVIOUR_BLOCKS: tuple[tuple[str, str], ...] = (
     # dreaming.md
     ("docs/dreaming.md", "promote_threshold=0.55"),  # run_consolidation
     ("docs/dreaming.md", "store.consolidate(current_cycle=1)"),  # consolidate()
-    ("docs/dreaming.md", "ASSOCIATED edges created"),  # result fields
     # extension-hooks.md
     ("docs/extension-hooks.md", "class RecencyBoostHooks"),  # hooks protocol + score
     # extensions.md
@@ -86,6 +85,11 @@ BEHAVIOUR_BLOCKS: tuple[tuple[str, str], ...] = (
     ("docs/extensions.md", "class ImportanceSignal:"),  # custom signal
     # guides/embeddings.md
     ("docs/guides/embeddings.md", "query_prefix="),  # asymmetric role prefixes
+    # guides/migrating-from-other-memory.md
+    (
+        "docs/guides/migrating-from-other-memory.md",
+        "async def bulk_import_and_derive",
+    ),  # bulk import derives nothing; derive_existing backfills it
     # memory-hygiene.md
     ("docs/memory-hygiene.md", "never auto-archived or auto-GC'd"),  # pinned
     ("docs/memory-hygiene.md", "preview.would_evict"),  # run_hygiene
@@ -120,8 +124,8 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "README.md",
-        "class MyHooks(EngravaHooksProtocol):",
-        "class-definition-only Protocol impl; conformance asserted in the hooks test",
+        "class MyHooks(DefaultEngravaHooks):",
+        "class-definition-only hooks impl; conformance asserted in the hooks test",
     ),
     (
         "README.md",
@@ -155,8 +159,8 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "docs/api-reference.md",
-        'list_services()   # -> ["my-service"]',
-        "requires an on-disk data_dir and an unimported Path; illustrative manager usage",
+        "await mgr.list_services()",
+        "requires an on-disk data_dir; illustrative manager list/delete usage",
     ),
     (
         "docs/api-reference.md",
@@ -165,8 +169,85 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "docs/api-reference.md",
+        'FieldPredicate("$.subtype", FieldOp.EQ, "supports")',
+        "undefined store; illustrative edge-metadata filter usage",
+    ),
+    (
+        "docs/api-reference.md",
         "class EmbeddingProviderProtocol(Protocol)",
         "Protocol-definition only",
+    ),
+    (
+        "docs/upgrade.md",
+        "def dimension(self) -> int:",
+        "method fragment; a conformant provider's search path is asserted in "
+        "test_embedding_providers.TestProviderMissingRequiredMember",
+    ),
+    (
+        "docs/api-reference.md",
+        "class DerivedRecordProducerProtocol(Protocol)",
+        "Protocol-definition only",
+    ),
+    (
+        "docs/api-reference.md",
+        "async def search_hybrid(",
+        "bare search_hybrid signature (`...`); result shape asserted in the behaviour test",
+    ),
+    (
+        "docs/error-handling.md",
+        "async def create_with_partial_state",
+        "helper-function def assuming a store; partial-persistence recovery illustrative",
+    ),
+    (
+        "docs/error-handling.md",
+        "async def repair_embedding",
+        "helper-function def assuming a store + provider; embedding repair illustrative",
+    ),
+    (
+        "docs/error-handling.md",
+        "async def store_atomically",
+        "helper-function def assuming a store; suspend_auto_commit runs in the migrating example",
+    ),
+    (
+        "docs/error-handling.md",
+        "async def verify_journal_with_lock_retry",
+        "helper-function def assuming a store; verify_journal asserted in the audit-trail test",
+    ),
+    (
+        "docs/error-handling.md",
+        "async def recall_with_degradation_flags",
+        "helper-function def assuming a store; degradation counters illustrative",
+    ),
+    (
+        "docs/error-handling.md",
+        "async def replace_and_reconcile",
+        "helper-function def assuming a store; from_config reconnection illustrative",
+    ),
+    (
+        "docs/extension-hooks.md",
+        "-> Sequence[DerivedRecord]: ...",
+        "bare derive_records signature fragment; conformance asserted in the seam tests",
+    ),
+    (
+        "docs/extension-hooks.md",
+        "hooks=StructuralSplitProducer(),",
+        "opens a real on-disk database file; derived-records wiring illustrative",
+    ),
+    (
+        "docs/extension-hooks.md",
+        "class SentenceSplitter(DefaultEngravaHooks):",
+        "class-definition-only producer; the shipped StructuralSplitProducer is behaviour-tested",
+    ),
+    (
+        "docs/extension-hooks.md",
+        'window_unit="word",',
+        "StructuralSplitProducer FIXED_WINDOW constructor fragment; segmentation "
+        "asserted in the structural-split tests",
+    ),
+    (
+        "docs/extension-hooks.md",
+        "store.derive_existing(thought_id)",
+        "fragment assuming a store; derive_existing asserted in the derived-records backfill tests",
     ),
     (
         "docs/audit-trail.md",
@@ -197,6 +278,22 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
         "docs/concepts.md",
         "inner/outer-speech boundary",
         "illustrative ThoughtRecord field tour; construction asserted in the CRUD tests",
+    ),
+    (
+        "docs/concepts.md",
+        "cycle_provider=StaticCycleProvider(0)",
+        "undefined conn; opt-in cycle-provider wiring (behaviour in cycle-provider tests)",
+    ),
+    (
+        "docs/concepts.md",
+        "resume_from = await store.max_cycle()",
+        "fragment assuming a store; max_cycle recovery asserted in the cycle-provider tests",
+    ),
+    (
+        "docs/concurrency.md",
+        "async with edit_lock:",
+        "fragment assuming a store and a caller-owned lock; the read-modify-write "
+        "window it closes is asserted in the concurrency-contract tests",
     ),
     (
         "docs/concurrency.md",
@@ -265,7 +362,7 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "docs/extensions.md",
-        "on_store / on_retrieve are now called automatically",
+        "on_store / on_retrieve now run during CRUD",
         "opens a real on-disk database; invocation asserted via hooks/STATS tests",
     ),
     (
@@ -340,7 +437,7 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "docs/guides/agent-memory.md",
-        "ordered by updated_cycle desc",
+        "cycle = await store.max_cycle()   # the highest cycle stored",
         "fragment assuming a store; illustrative cycle bootstrap",
     ),
     (
@@ -454,6 +551,11 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
         "fragment assuming a conn; FIND/COUNT asserted in the MindQL behaviour test",
     ),
     (
+        "docs/mindql.md",
+        "from engrava import parse\n\nresult = await store.execute_mindql",
+        "fragment assuming a store; execute_mindql asserted in the api-reference behaviour test",
+    ),
+    (
         "docs/observability.md",
         "engrava_search_p99_ms",
         "requires optional prometheus_client and a file-backed store; illustrative export",
@@ -461,7 +563,7 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     (
         "docs/observability.md",
         "async def journal_ok",
-        "helper-function def assuming a store; verify_integrity asserted in the journal test",
+        "helper-function def assuming a store; verify_journal asserted in the journal test",
     ),
     (
         "docs/observability.md",
@@ -550,13 +652,24 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "docs/recipes/index.md",
-        "PLANNED → EXECUTING → CONFIRMED / FAILED / BLOCKED",
+        "source_thought_id=prompting_thought_id",
         "undefined prompting_thought_id; action lifecycle asserted in the action test",
     ),
     (
         "docs/recipes/index.md",
-        "recent = await store.list_thoughts(limit=1)        # ordered",
+        "resume from the stored high-water mark",
         "fragment assuming a store; illustrative cycle bootstrap",
+    ),
+    (
+        "docs/search.md",
+        "print(store.fts_match_failure_count)",
+        "fragment assuming a store; degradation counters illustrative",
+    ),
+    (
+        "docs/search.md",
+        "the caller owns",
+        "fragment assuming a store; transaction-time recency asserted in "
+        "test_transaction_recency.py",
     ),
     (
         "docs/search.md",

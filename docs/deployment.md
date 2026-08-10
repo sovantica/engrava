@@ -29,13 +29,19 @@ async def main() -> None:
 - **Do not open a new store per request.** Opening a store applies schema checks
   and PRAGMAs; doing it per request is wasteful and multiplies open handles to
   the same file.
-- **Do not share one store across event loops.** The underlying connection is
-  bound to the loop/thread that aiosqlite created it on — see
-  [Known Limitations](known-limitations.md#aiosqlite-proxy-architecture). One
-  store belongs to one running loop.
-- **A single store safely serves many concurrent async tasks** within that one
-  loop — see [Concurrency](concurrency.md). You do **not** need a pool of stores
-  for in-process concurrency.
+- **Do not share one store across event loops.** The store holds `asyncio.Lock`s
+  that bind to one loop the first time they have to wait, and reject a waiter
+  from any other loop — see
+  [Concurrency](concurrency.md#many-async-tasks-one-store). One store belongs to
+  one running loop.
+- **Share that one store across the tasks in the loop.** You do **not** need a
+  pool of stores for in-process concurrency. What the store does not do is make a
+  read-modify-write atomic: two tasks editing the *same field* of the same row
+  lose one of the two writes, silently, and a task that stamps `updated_cycle`
+  gets a concurrent update rejected with `StaleDataError` whatever field it
+  touched. See
+  [Concurrency](concurrency.md#many-async-tasks-one-store) for the exact
+  guarantees and the idioms that close the gap.
 
 ## The database files on disk
 
@@ -70,19 +76,23 @@ Operational consequences:
   `engrava --db` flag; it does **not** configure `from_config`, so application
   code should set `database.path`, not rely on `ENGRAVA_DB`.)
 - One container instance = one writer. If you scale to multiple replicas, they
-  must **not** all write the same database file (see
-  [multi-process](concurrency.md#multiple-processes)). Either run a single writer
-  replica, or give each replica its own database via
+  must **not** all write the same database file — that is unsupported, not merely
+  contended (see
+  [multiple stores, one file](concurrency.md#multiple-stores-one-database-file)).
+  Either run a single writer replica, or give each replica its own database via
   [`EngravaManager`](concurrency.md#per-service-isolation).
 
 ## Multiple workers
 
-Engrava follows SQLite's single-writer model. For multi-worker app servers
-(Gunicorn/Uvicorn workers, etc.):
+Engrava supports **one writing store per database file**. For multi-worker app
+servers (Gunicorn/Uvicorn workers, etc.):
 
-- **Reads scale freely** under WAL — many readers and one writer coexist.
-- **Concentrate writes.** Heavy write fan-out across many OS processes hitting the
-  same file is out of scope; see [Concurrency → Multiple processes](concurrency.md#multiple-processes).
+- **Reads scale freely** under WAL — many readers and one writer coexist, across
+  processes as well as within one.
+- **Route every write to one process.** Two workers writing one file is not a
+  contention trade-off you can tune with `busy_timeout`; it silently loses updates
+  and can duplicate deduplicated content. See
+  [Concurrency → Multiple stores, one database file](concurrency.md#multiple-stores-one-database-file).
 - **Per-tenant or per-worker isolation:** give each its own database file via
   [`EngravaManager`](concurrency.md#per-service-isolation) when you need
   independent writers.
@@ -127,7 +137,9 @@ Wire whichever applies into your framework's shutdown hook (e.g. FastAPI
 
 ## See also
 
-- [Concurrency](concurrency.md) — the single-writer model, busy timeout, isolation
+- [Concurrency](concurrency.md) — what one store guarantees, busy timeout, isolation
 - [Backup & Recovery](backup-and-recovery.md) — WAL-safe backup and restore
+- [Security](security.md) — file, network, extension, and tenant trust boundaries
+- [Error handling and recovery](error-handling.md) — retry, repair, or replace
 - [Configuration](configuration.md) — the YAML the deployment loads
 - [Known Limitations](known-limitations.md) — filesystem and locking constraints

@@ -20,6 +20,8 @@ import sqlite3
 import struct
 from typing import TYPE_CHECKING
 
+from engrava.config_validation import require_positive_int
+
 if TYPE_CHECKING:
     import aiosqlite
 
@@ -38,12 +40,23 @@ class SqliteVecSearchBackend:
     the cached ``dimension``.
 
     Args:
-        dimension: Embedding vector length (e.g. 384 for MiniLM).
+        dimension: Embedding vector length (e.g. 384 for MiniLM). Must be a
+            positive integer.
+
+    Raises:
+        ConfigError: If *dimension* is not a positive integer.
 
     """
 
     def __init__(self, dimension: int) -> None:
-        self._dimension = dimension
+        # The dimension is interpolated into the ``vec0`` table declaration.
+        # DDL cannot be parameterised, ``int`` is subclassable, and
+        # ``__format__`` is overridable — so a caller's object reaching the
+        # f-string writes its own text into the schema. Decode it here into an
+        # exact ``int`` this object owns: the class is a public export and is
+        # constructed directly as well as from a config, so it validates at its
+        # own boundary instead of assuming an earlier one did.
+        self._dimension = require_positive_int(dimension, "SqliteVecSearchBackend.dimension")
 
     @property
     def dimension(self) -> int:
@@ -103,33 +116,10 @@ class SqliteVecSearchBackend:
                 (row["rowid"], vec_json),
             )
             count += 1
-        pruned = await self._prune_orphan_vectors(db)
+        pruned = await purge_orphan_vectors(db)
         if count or pruned:
             await db.commit()
         return count
-
-    async def _prune_orphan_vectors(self, db: aiosqlite.Connection) -> int:
-        """Delete ``embedding_vec`` rows whose rowid is absent from ``embedding``.
-
-        The ``embedding_vec`` virtual table is not reachable by the
-        ``embedding`` table's ``ON DELETE CASCADE`` foreign key, so a
-        thought delete (or any direct ``DELETE FROM embedding``) can leave a
-        vector behind as a ghost. Running as part of :meth:`sync_embeddings`
-        makes the backend self-healing: on next startup any accumulated
-        orphans are swept out. Idempotent and additive — a clean store
-        deletes nothing.
-
-        Args:
-            db: Active database connection with sqlite-vec loaded.
-
-        Returns:
-            Number of orphan vector rows deleted.
-
-        """
-        cursor = await db.execute(
-            "DELETE FROM embedding_vec WHERE rowid NOT IN (SELECT rowid FROM embedding)"
-        )
-        return cursor.rowcount if cursor.rowcount is not None and cursor.rowcount > 0 else 0
 
     async def search(
         self,
@@ -246,6 +236,48 @@ class SqliteVecSearchBackend:
         )
 
 
+async def purge_orphan_vectors(db: aiosqlite.Connection) -> int:
+    """Delete ``embedding_vec`` rows whose rowid is absent from ``embedding``.
+
+    The ``embedding_vec`` virtual table is not reachable by the ``embedding``
+    table's ``ON DELETE CASCADE`` foreign key, so a thought delete (or any
+    direct ``DELETE FROM embedding``) can leave a vector behind as a ghost.
+    Two callers reconcile the index by this predicate: the backend's own
+    :meth:`SqliteVecSearchBackend.sync_embeddings`, which makes it self-healing
+    on every sqlite-vec-enabled open, and the ``gc`` command, which cleans up
+    after a collection over a connection that owns no backend instance. It
+    lives here, as one statement, so the two cannot come to disagree about what
+    an orphan is.
+
+    Idempotent and additive — a clean store deletes nothing — and it can never
+    remove the vector of an embedding that is still stored, whatever the caller
+    believes it deleted.
+
+    Ownership here is the ``embedding`` row, not the thought behind it. On a
+    schema whose foreign keys cascade — every schema at or above the version
+    that introduced them — the two are the same question, because deleting a
+    thought takes its embedding with it. On an older one they are not: a
+    delete leaves the embedding row behind, so its vector is still owned and
+    stays. Nor would removing that vector by rowid help while
+    :meth:`SqliteVecSearchBackend.sync_embeddings` treats a dangling embedding
+    row as a valid source to backfill from: the same row puts the vector back
+    at the next open. Both halves read ownership as the embedding row rather
+    than the thought behind it, and changing that is a decision about the
+    backend's semantics, not about any one caller.
+
+    Args:
+        db: Active database connection with sqlite-vec loaded.
+
+    Returns:
+        Number of orphan vector rows deleted.
+
+    """
+    cursor = await db.execute(
+        "DELETE FROM embedding_vec WHERE rowid NOT IN (SELECT rowid FROM embedding)"
+    )
+    return cursor.rowcount if cursor.rowcount is not None and cursor.rowcount > 0 else 0
+
+
 def _load_sqlite_vec_sync(raw_conn: sqlite3.Connection) -> None:
     """Load the sqlite-vec extension into a raw sqlite3 connection.
 
@@ -308,6 +340,7 @@ async def load_sqlite_vec(db: aiosqlite.Connection) -> bool:
     # aiosqlite ships ``py.typed`` but leaves ``_execute`` unannotated, so
     # --strict flags the call as untyped; the loader itself is fully typed.
     try:
+        # aiosqlite's private _execute is untyped; the loader passed to it is not.
         await db._execute(_load_sqlite_vec_sync, db._conn)  # type: ignore[no-untyped-call]  # noqa: SLF001
     except (AttributeError, OSError, sqlite3.Error) as exc:
         logger.warning("Cannot load sqlite-vec extension: %s — falling back to numpy", exc)

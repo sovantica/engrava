@@ -29,6 +29,60 @@ jobs:
             @commitlint/cli@19 \
             @commitlint/config-conventional@19
 
+      # The scope vocabulary lives in commit-scopes.json and .commitlintrc.js only
+      # spreads it. This step asks commitlint for its effective rule instead of
+      # reading the config, so it covers `extends`, an alternate rc file or a
+      # `commitlint` key in package.json shadowing ours, and a rule rebuilt after the
+      # config object is constructed — routes a textual pin cannot see.
+      #
+      # Boundary, so nobody reads more into a green check than it earns:
+      #   - it compares *sets*: a duplicated or reordered entry in commit-scopes.json
+      #     passes here (the test suite is what rejects duplicates);
+      #   - it verifies the rule resolved by *this* invocation, at the repository root
+      #     with no flags, so it does not prove the lint steps below resolve the same
+      #     configuration if their flags, working directory, environment or parser
+      #     differ — keeping the three invocations identical in context is a review
+      #     responsibility, not something this step can enforce;
+      #   - it says nothing about `ignores`, which skips whole messages before any
+      #     rule runs. See the note on that in .commitlintrc.js.
+      - name: Verify commitlint admits the same scope set as commit-scopes.json
+        run: |
+          set -euo pipefail
+          npx commitlint --print-config json | node -e '
+            const fs = require("fs");
+            const effective = JSON.parse(fs.readFileSync(0, "utf8"));
+            const source = JSON.parse(fs.readFileSync("commit-scopes.json", "utf8"));
+            const problems = [];
+            const tiers = Object.keys(source).sort().join(",");
+            if (tiers !== "canonical,deprecated") {
+              problems.push("commit-scopes.json tiers are [" + tiers + "], expected [canonical,deprecated]");
+            }
+            const expected = (source.canonical || []).concat(source.deprecated || []);
+            if (expected.length === 0) {
+              problems.push("commit-scopes.json declares no scopes at all");
+            }
+            const rule = (effective.rules || {})["scope-enum"];
+            if (!Array.isArray(rule)) {
+              problems.push("the effective config has no scope-enum rule");
+            } else {
+              const enforced = Array.isArray(rule[2]) ? rule[2] : [];
+              if (rule[0] !== 2) problems.push("severity is " + rule[0] + ", expected 2 (error)");
+              if (rule[1] !== "always") problems.push("condition is " + rule[1] + ", expected always");
+              if (enforced.length === 0) problems.push("the enforced scope list is empty");
+              const extra = enforced.filter((s) => !expected.includes(s));
+              const missing = expected.filter((s) => !enforced.includes(s));
+              if (extra.length) problems.push("enforced but not in commit-scopes.json: " + extra.join(", "));
+              if (missing.length) problems.push("in commit-scopes.json but not enforced: " + missing.join(", "));
+            }
+            if (problems.length) {
+              console.error("commitlint does not enforce commit-scopes.json:");
+              for (const problem of problems) console.error("  - " + problem);
+              process.exit(1);
+            }
+            const distinct = new Set(expected).size;
+            console.log("commitlint admits the same set of scopes as commit-scopes.json (" + distinct + " distinct)");
+          '
+
       - name: Lint PR title
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}

@@ -139,6 +139,48 @@ class TestEdgeCreationOnPromotion:
         associated = [e for e in edges if e.edge_type == EdgeType.ASSOCIATED]
         assert len(associated) >= 1
 
+    async def test_non_duplicate_integrity_error_is_not_swallowed(
+        self,
+        store: SqliteEngravaCore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A real integrity failure during dream edge creation propagates.
+
+        Only a ``DuplicateEdgeError`` is a benign "already exists" skip. A
+        CHECK / trigger / other integrity failure must surface rather than being
+        logged away — otherwise the run reports edges it never persisted.
+        """
+        t1 = await store.create_thought(
+            _make("t-c1-1", essence="async python", content="async/await patterns"),
+        )
+        t2 = await store.create_thought(
+            _make("t-c1-2", essence="python coroutines", content="coroutine semantics"),
+        )
+        await store.store_embedding(t1.thought_id, [0.9, 0.1, 0.0, 0.0], model_name="test")
+        await store.store_embedding(t2.thought_id, [0.85, 0.15, 0.0, 0.0], model_name="test")
+
+        cfg = DreamingConfig(
+            enabled=True,
+            promote_threshold=0.0,
+            gates=DreamingGates(min_age_cycles=0, allow_zero_confirmation=True),
+            edges=EdgeCreationConfig(
+                enabled=True,
+                top_k=1,
+                min_similarity=0.5,
+                edge_weight_factor=0.5,
+            ),
+        )
+        ext = DreamingExtension(config=cfg)
+
+        async def _raise_check_violation(_edge: EdgeRecord) -> EdgeRecord:
+            msg = "CHECK constraint failed: edge_weight_range"
+            raise aiosqlite.IntegrityError(msg)
+
+        monkeypatch.setattr(store, "create_edge", _raise_check_violation)
+
+        with pytest.raises(aiosqlite.IntegrityError, match="CHECK constraint failed"):
+            await ext.run_consolidation(store, current_cycle=10)
+
     async def test_edge_weight_equals_half_cosine(
         self,
         store: SqliteEngravaCore,

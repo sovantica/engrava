@@ -3,32 +3,47 @@
 Defines the abstract interface for thought-graph CRUD, edge management,
 embedding storage, and similarity search.  This is the **core** protocol
 — no cognitive-layer-specific methods belong here (free-tier boundary).
+
+The read (non-mutating) half lives in
+:class:`~engrava.domain.protocols.engrava_read.EngravaReadProtocol`, which this
+protocol extends; the methods declared *here* are the writable capabilities
+(persist, update, delete, and the derived-records write entry point).  A full
+store satisfies both by construction.  A read-only view
+(:class:`~engrava.infrastructure.read_only_store.ReadOnlyEngrava`) delegates the
+``EngravaReadProtocol`` reads and typed-rejects every write; because it must
+still expose the write method *names* in order to reject them, it also
+structurally satisfies ``EngravaCoreProtocol`` — so its read-only guarantee is
+**behavioural** (a write call raises ``ReadOnlyViolationError``), not a
+structural exclusion.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-if TYPE_CHECKING:
-    from collections.abc import Sequence
+from engrava.domain.protocols.engrava_read import EngravaReadProtocol
 
-    from engrava.domain.enums import ActionStatus, VerificationStatus
+if TYPE_CHECKING:
+    from engrava.domain.enums import (
+        ActionStatus,
+        VerificationStatus,
+    )
     from engrava.domain.models.action import ActionRecord
     from engrava.domain.models.edge import EdgeRecord
     from engrava.domain.models.embedding import EmbeddingRecord
-    from engrava.domain.models.filters import MetadataFilter, VisibilityQueryFilter
-    from engrava.domain.models.metrics import EngravaMetrics
-    from engrava.domain.models.search import HybridSearchResult
     from engrava.domain.models.thought import MetadataValue, ThoughtRecord
     from engrava.domain.models.ttl import CleanupResult
+    from engrava.domain.protocols.derived_records import DeriveResult
 
 
 @runtime_checkable
-class EngravaCoreProtocol(Protocol):
+class EngravaCoreProtocol(EngravaReadProtocol, Protocol):
     """Abstract persistence interface for core thought-graph data.
 
     Implementations must provide async CRUD for thoughts, edges,
-    and embedding-based search.
+    and embedding-based search.  Extends
+    :class:`~engrava.domain.protocols.engrava_read.EngravaReadProtocol` with the
+    writable capabilities; the read surface is inherited unchanged.
     """
 
     async def create_thought(
@@ -181,73 +196,15 @@ class EngravaCoreProtocol(Protocol):
         """
         ...
 
-    async def recall(
-        self,
-        query: str,
-        *,
-        top_k: int = 10,
-        current_cycle: int | None = None,
-        filters: MetadataFilter | None = None,
-        visibility: VisibilityQueryFilter | None = None,
-        collapse_key: str | Sequence[str] | None = None,
-        collapse_max_per_unit: int | None = None,
-    ) -> HybridSearchResult:
-        """Retrieve thoughts relevant to a query with one call.
-
-        Ergonomic shorthand over :meth:`search_hybrid` for the common
-        retrieval case: implementations delegate to ``search_hybrid`` with
-        the query text and the given ``top_k``/``current_cycle``.
-
-        Args:
-            query: Natural-language text to search for.
-            top_k: Maximum number of results to return.
-            current_cycle: Current cognitive cycle.  When provided, the
-                recency signal is blended into ranking; when ``None``,
-                recency is skipped.
-            filters: Optional metadata filter (an ``AND`` of typed field
-                predicates over ``metadata``); delegated to
-                ``search_hybrid``. ``None`` leaves the candidate set
-                unchanged.
-            visibility: Optional bounded visibility query filter; delegated
-                to ``search_hybrid``. A query refinement, not access
-                control — it enforces nothing and is bypassable.
-            collapse_key: Optional de-fragmentation unit key (a single
-                metadata path or an ordered sequence forming a composite key);
-                delegated to ``search_hybrid``. Keeps one best-ranked row per
-                caller-defined unit and backfills deeper distinct units. A
-                presentation / de-dup convenience, not a filter and not
-                isolation. The collapse step mutates no score, but *setting*
-                ``collapse_key`` widens the internal candidate pool, which can
-                rescale normalized fusion scores and shift order among units;
-                only ``collapse_key=None`` leaves the result path unchanged.
-            collapse_max_per_unit: Optional intra-unit retention depth for
-                ``collapse_key``; delegated to ``search_hybrid``. ``None``
-                (default) keeps one best row per unit; an integer ``>= 1`` keeps
-                up to that many highest-ranked members of a unit and backfills
-                the freed slots with deeper distinct units. Only effective with
-                ``collapse_key``; rejected when ``< 1``.
-
-        Returns:
-            A ``HybridSearchResult`` with the ranked matches and the set of
-            backends that contributed.
-
-        """
-        ...
-
-    async def get_thought(self, thought_id: str) -> ThoughtRecord | None:
-        """Retrieve a thought by its ID.
-
-        Args:
-            thought_id: UUID of the thought to retrieve.
-
-        Returns:
-            The thought record, or None if not found.
-
-        """
-        ...
-
     async def update_thought(self, thought_id: str, **changes: object) -> ThoughtRecord:
-        """Update a thought with optimistic concurrency.
+        """Update a thought's fields in place.
+
+        Only the fields named in ``changes`` are written, so a column another
+        writer changed meanwhile is preserved — unless that writer stamped a new
+        ``updated_cycle``, which trips the version guard carried by every update
+        and rejects this one in full, shared column or not. The call is a
+        read-modify-write and is not atomic: two writers naming the *same* field
+        lose one of the two writes, and the guard does not report it.
 
         Args:
             thought_id: UUID of the thought to update.
@@ -257,8 +214,12 @@ class EngravaCoreProtocol(Protocol):
             The updated thought record.
 
         Raises:
-            ThoughtNotFoundError: If the thought does not exist.
-            StaleDataError: If the row was modified by another writer.
+            ThoughtNotFoundError: If the thought does not exist when the call
+                starts.
+            StaleDataError: If the guarded write matches no row — another writer
+                stamped a new ``updated_cycle`` since the row was read, or
+                deleted the row. Nothing of this update is written when it is
+                raised.
 
         """
         ...
@@ -278,48 +239,8 @@ class EngravaCoreProtocol(Protocol):
         Raises:
             ThoughtNotFoundError: If the thought does not exist.
             InvalidTransitionError: If the thought is not currently ``ARCHIVED``.
-            StaleDataError: If the row was modified by another writer.
-
-        """
-        ...
-
-    async def list_thoughts(
-        self,
-        *,
-        priority: str | None = None,
-        lifecycle_status: str | None = None,
-        thought_type: str | None = None,
-        min_cycle: int | None = None,
-        max_cycle: int | None = None,
-        visibility: str | None = None,
-        exclude_visibility: str | None = None,
-        include_expired: bool = False,
-        provenance_filter: MetadataFilter | None = None,
-        limit: int = 50,
-        offset: int = 0,
-    ) -> list[ThoughtRecord]:
-        """List thoughts matching the given filters.
-
-        Args:
-            priority: Filter by priority level.
-            lifecycle_status: Filter by lifecycle status.
-            thought_type: Filter by thought type.
-            min_cycle: Minimum updated_cycle (inclusive).
-            max_cycle: Maximum updated_cycle (inclusive).
-            visibility: Include only thoughts with this visibility.
-            exclude_visibility: Exclude thoughts with this visibility.
-            include_expired: If True, include expired thoughts.
-            provenance_filter: Optional typed ``AND`` filter over the
-                ``provenance`` JSON column (read-only; reuses the metadata
-                filter machinery). ``None`` leaves the result unchanged. A
-                ``session_id`` / ``actor_id`` predicate uses the provenance
-                identity index. Provenance is an untrusted hint, not a security
-                boundary.
-            limit: Maximum number of results to return.
-            offset: Number of results to skip.
-
-        Returns:
-            List of matching thought records.
+            StaleDataError: If the guarded write matches no row — a competing
+                cycle stamp or a delete (see :meth:`update_thought`).
 
         """
         ...
@@ -354,149 +275,6 @@ class EngravaCoreProtocol(Protocol):
         """
         ...
 
-    async def search_similar(
-        self,
-        query_vector: list[float],
-        top_k: int = 10,
-        threshold: float = 0.0,
-    ) -> list[tuple[str, float]]:
-        """Search for thoughts similar to the query vector.
-
-        Args:
-            query_vector: Query embedding vector.
-            top_k: Maximum number of results.
-            threshold: Minimum cosine similarity score.
-
-        Returns:
-            List of (thought_id, similarity_score) tuples, sorted descending.
-
-        """
-        ...
-
-    async def search_fts(
-        self,
-        query: str,
-        top_k: int = 10,
-    ) -> list[tuple[str, float]]:
-        """Full-text search using SQLite FTS5 with BM25 ranking.
-
-        Searches ``essence`` and ``content`` fields for keyword matches.
-        Best for proper names, identifiers, and codes where embedding
-        similarity is weak (e.g. ``"Kowalski"``, ``"REQ-FUNC*"``).
-
-        Args:
-            query: Search query string.  FTS5 syntax is supported
-                (e.g. ``"projekt AND Alpha"``, ``"REQ-FUNC*"``).
-            top_k: Maximum number of results.
-
-        Returns:
-            List of ``(thought_id, bm25_score)`` tuples sorted by
-            relevance (higher score = more relevant).  Returns an empty
-            list when the FTS5 index is not available (backward compat
-            with databases that have not been migrated).
-
-        """
-        ...
-
-    async def search_hybrid(
-        self,
-        query_text: str,
-        query_vector: list[float] | None = None,
-        *,
-        top_k: int = 10,
-        fts_weight: float | None = None,
-        vector_weight: float | None = None,
-        recency_weight: float | None = None,
-        recency_half_life: int | None = None,
-        current_cycle: int | None = None,
-        fts_top_k: int = 50,
-        vector_top_k: int = 50,
-        filters: MetadataFilter | None = None,
-        visibility: VisibilityQueryFilter | None = None,
-        collapse_key: str | Sequence[str] | None = None,
-        collapse_max_per_unit: int | None = None,
-    ) -> HybridSearchResult:
-        """Hybrid search combining FTS5 keyword + vector cosine similarity.
-
-        Calls ``search_fts()`` and ``search_similar()`` independently,
-        normalizes scores to ``[0, 1]``, applies weighted fusion,
-        deduplicates by ``thought_id``, and returns merged results.
-
-        Score normalization:
-            - BM25 (FTS5): min-max normalization within result set.
-            - Cosine (vector): already in ``[0, 1]``, used as-is.
-            - Recency: exponential decay from ``updated_cycle``.
-
-        Graceful degradation:
-            - If FTS5 is unavailable, returns pure vector results.
-            - If no embeddings exist, returns pure FTS5 results.
-            - If ``query_vector`` is ``None`` and no embedding provider
-              is configured, vector search is skipped.
-            - If ``current_cycle`` is ``None``, recency is skipped.
-            - Disabled component weights are redistributed
-              proportionally to active components.
-
-        Args:
-            query_text: Text query for FTS5 keyword search.
-            query_vector: Embedding vector for similarity search.
-                When ``None`` and an embedding provider is configured,
-                the query text is auto-embedded.
-            top_k: Maximum number of final merged results.
-            fts_weight: Optional FTS5 fusion-weight override.
-            vector_weight: Optional vector fusion-weight override.
-            recency_weight: Optional recency fusion-weight override.
-            recency_half_life: Optional recency half-life override.
-            current_cycle: Current cycle number for recency calculation.
-            fts_top_k: Max candidates from FTS5 before fusion.
-            vector_top_k: Max candidates from vector search before fusion.
-            filters: Optional metadata filter (an ``AND`` of typed field
-                predicates over ``metadata``), applied in-arm before each
-                arm's limit so it never starves ``top_k``. ``None`` (or an
-                empty filter) leaves the candidate set unchanged.
-            visibility: Optional bounded visibility query filter for the
-                "public-or-mine" pattern. A query refinement, **not** access
-                control — it performs no authentication, authorization, or
-                ownership enforcement; the caller can forge ``owner``; it is
-                bypassable; it must not be used to protect tenant data.
-            collapse_key: Optional de-fragmentation unit key — a single
-                metadata path or an ordered sequence of paths forming a
-                composite key. When set, among the already-ranked candidates
-                only the single best-ranked row per caller-defined unit reaches
-                the result and the freed slots are backfilled by deeper
-                distinct units. A **presentation / de-dup convenience, not a
-                filter and not isolation**: it does not change which rows are
-                *eligible*, and the collapse step itself mutates no score (it
-                only drops lower-ranked same-unit members). *Setting*
-                ``collapse_key`` does, however, widen the internal candidate
-                pool for deeper backfill, which — because the keyword arm is
-                min-max normalized over the candidate set — can rescale
-                normalized fusion scores and shift order among units; only
-                ``collapse_key=None`` leaves the candidate, score, and order
-                path byte-identical to the unfiltered query. It is only as
-                meaningful as the unit metadata the application writes (a
-                missing or malformed key ⇒ the row is its own unit, never
-                collapsed).
-            collapse_max_per_unit: Optional intra-unit retention depth for
-                ``collapse_key`` — how many rows of one unit may reach the
-                result. ``None`` (default) keeps one best row per unit; an
-                integer ``>= 1`` keeps up to that many highest-ranked members of
-                a unit and lets the freed slots backfill deeper distinct units.
-                Only takes effect together with ``collapse_key``, only relaxes
-                the intra-unit count (never adds a non-candidate row, mutates a
-                score, or drops a distinct unit as a side effect), and is
-                rejected when ``< 1``.
-
-        Returns:
-            ``HybridSearchResult`` with ranked results and the set of
-            backends that contributed (e.g. ``{"fts5", "vector"}``).
-
-        """
-        ...
-
-    async def metrics(self) -> EngravaMetrics:
-        """Return a point-in-time snapshot of store health and workload metrics."""
-        ...
-
     async def record_access(self, thought_id: str) -> None:
         """Record an explicit access to a thought.
 
@@ -522,24 +300,6 @@ class EngravaCoreProtocol(Protocol):
 
         Returns:
             The persisted edge record.
-
-        """
-        ...
-
-    async def get_edges(
-        self,
-        thought_id: str,
-        *,
-        direction: str = "BOTH",
-    ) -> list[EdgeRecord]:
-        """Retrieve edges connected to a thought.
-
-        Args:
-            thought_id: UUID of the thought.
-            direction: 'IN', 'OUT', or 'BOTH'.
-
-        Returns:
-            List of matching edge records.
 
         """
         ...
@@ -594,18 +354,6 @@ class EngravaCoreProtocol(Protocol):
         """
         ...
 
-    async def get_embedding(self, thought_id: str) -> EmbeddingRecord | None:
-        """Retrieve the embedding for a thought.
-
-        Args:
-            thought_id: UUID of the thought.
-
-        Returns:
-            The EmbeddingRecord, or None if not found.
-
-        """
-        ...
-
     async def create_action(self, action: ActionRecord) -> ActionRecord:
         """Persist a new action record.
 
@@ -643,14 +391,47 @@ class EngravaCoreProtocol(Protocol):
         """
         ...
 
-    async def get_actions(self, thought_id: str) -> list[ActionRecord]:
-        """Retrieve actions linked to a thought.
+    async def derive_existing(self, thought_id: str) -> DeriveResult:
+        """Run the registered derived-records producer over a stored thought.
+
+        The explicit backfill counterpart of the automatic on-store derived-
+        records trigger: for an already-stored source thought, invoke the
+        configured producer capability and persist every returned child through
+        the **same** core-owned per-child lifecycle the on-store path uses
+        (content-addressed identity, per-child commit, auto-embed, conflict-as-
+        reuse, and the single ``DERIVED_FROM`` provenance edge). It exists so a
+        base built *before* a producer was installed can be enriched
+        retroactively, and because backfilled children share the on-store path's
+        exact identity they **converge** with it (deduped, idempotent).
+
+        Gating: this runs whenever a producer capability is present, honouring
+        ``DeriveGates.on_error`` and ``max_derived_per_source``, but
+        **independently of** ``DeriveGates.enabled`` (the master switch that
+        governs only the automatic on-store trigger) — so an existing base can
+        be backfilled without committing to automatic derivation on every future
+        write. When no producer capability is registered it is a clean no-op.
+
+        Idempotent by construction: because derived-child identity is content-
+        addressed and insertion is conflict-as-reuse, re-running it converges
+        (already-present children are reused, missing ones filled). A source that
+        is itself a derived record is never re-derived (a clean, empty result).
+
+        Stability: additive public method under the ``X.Y.x`` guarantee — it is a
+        write entry point, so it belongs to the writable core, never a read-only
+        view.
 
         Args:
-            thought_id: UUID of the thought.
+            thought_id: The already-stored source thought to derive from.
 
         Returns:
-            List of action records.
+            A :class:`~engrava.domain.protocols.derived_records.DeriveResult`
+            tallying children created / reused / skipped for this run.
+
+        Raises:
+            SourceThoughtNotFoundError: If ``thought_id`` does not exist.
+            DerivedRecordError: If the producer's return violates the seam's
+                deterministic contract (over cap, or an identity collision) and
+                ``DeriveGates.on_error="raise"``.
 
         """
         ...

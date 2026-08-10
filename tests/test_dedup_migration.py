@@ -182,7 +182,7 @@ async def test_ensure_schema_fresh_db_starts_at_head(
     store = SqliteEngravaCore(fresh_db)
     await store.ensure_schema()
 
-    assert await _user_version(fresh_db) == 18
+    assert await _user_version(fresh_db) == 20
     assert "content_hash" in await _table_columns(fresh_db, "thought")
     assert await _index_exists(fresh_db, "idx_thought_content_hash")
 
@@ -197,7 +197,7 @@ async def test_ensure_schema_from_v9_to_head(
     store = SqliteEngravaCore(fresh_db)
     await store.ensure_schema()
 
-    assert await _user_version(fresh_db) == 18
+    assert await _user_version(fresh_db) == 20
     assert "content_hash" in await _table_columns(fresh_db, "thought")
     assert await _index_exists(fresh_db, "idx_thought_content_hash")
 
@@ -212,7 +212,7 @@ async def test_ensure_schema_from_v9_idempotent(
     for _ in range(3):
         await store.ensure_schema()
 
-    assert await _user_version(fresh_db) == 18
+    assert await _user_version(fresh_db) == 20
 
 
 async def test_ensure_schema_at_head_skips_all_migration_branches(
@@ -221,11 +221,11 @@ async def test_ensure_schema_at_head_skips_all_migration_branches(
     """Already-migrated DB stays at head across repeat ``ensure_schema`` calls."""
     store = SqliteEngravaCore(fresh_db)
     await store.ensure_schema()  # bootstrap fresh -> head
-    assert await _user_version(fresh_db) == 18
+    assert await _user_version(fresh_db) == 20
 
     # Re-run; helpers should not fire (idempotent on user_version branch).
     await store.ensure_schema()
-    assert await _user_version(fresh_db) == 18
+    assert await _user_version(fresh_db) == 20
     assert "content_hash" in await _table_columns(fresh_db, "thought")
 
 

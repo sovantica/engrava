@@ -7,8 +7,8 @@ reason, and the run-result value object — while the loop's orchestration (the
 two-stage archive then garbage-collect, journaling, and database access) lives
 on :class:`~engrava.infrastructure.sqlite.engrava_core.SqliteEngravaCore`.
 
-The keep-score reuses the dreaming signal library
-(:mod:`engrava.extensions.dreaming_signals`) and the same active-signal
+The keep-score reuses the inward dreaming signal library
+(:mod:`engrava.domain.dreaming`) and the same active-signal
 redistribution the dreaming scorer uses (a signal whose data source is flat
 across the candidate pool is dropped and its weight renormalised over the active
 set), but carries the hygiene weight vector and threshold so the two loops tune
@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from engrava.extensions.dreaming_signals import (
+from engrava.domain.dreaming import (
     DEFAULT_SIGNALS,
     DreamingContext,
     default_signal_active,
@@ -144,7 +144,7 @@ def compute_active_hygiene_weights(
 
     A signal is *active* when its data source yields a non-default value for at
     least one candidate in the pool (see
-    :func:`~engrava.extensions.dreaming_signals.default_signal_active`); an
+    :func:`~engrava.domain.dreaming.default_signal_active`); an
     inactive (structurally flat) signal contributes the same constant to every
     candidate and so carries no ranking information. Its configured weight is
     dropped and the remainder renormalised over the active set, mirroring the
@@ -201,6 +201,60 @@ def compute_active_hygiene_weights(
         for name in signal_weights
     }
     return weights, sorted(flat_signals)
+
+
+USAGE_HISTORY_SIGNALS: tuple[str, ...] = ("frequency", "confirmation", "action_outcome")
+"""The usage-history keep-signals that gate a hygiene run (the access-gate).
+
+``frequency`` (reads), ``confirmation`` (reinforcements), and ``action_outcome``
+(applied-outcome aggregates) are the only signals grounded in a thought actually
+being *used*. Cycle-based signals (``recency`` / ``staleness``) and ``confidence``
+are deliberately excluded: they are present on any store, so on a bulk import with
+no usage history they would let ingest order alone drive eviction. Membership is
+independent of the configured ``signal_weights`` — the access-gate asks whether the
+pool holds *any* usage evidence, not whether a signal is weighted into the score.
+"""
+
+
+def has_active_usage_signal(
+    candidates: list[ThoughtRecord],
+    *,
+    current_cycle: int,
+    access_tracking_enabled: bool,
+) -> bool:
+    """Report whether any usage-history signal is active across the candidate pool.
+
+    The run-level *access-gate*: a hygiene run may archive nothing unless at least
+    one of the usage-history signals (:data:`USAGE_HISTORY_SIGNALS` —
+    ``frequency`` / ``confirmation`` / ``action_outcome``) has a data source in the
+    pool. Without any usage evidence a "cold" thought cannot be distinguished from
+    one merely ingested early, so cycle-recency alone must not drive eviction. The
+    per-signal activeness test is delegated to the shared
+    :func:`~engrava.domain.dreaming.default_signal_active` predicate
+    (the same one :func:`compute_active_hygiene_weights` uses) so the gate stays in
+    lock-step with the scorer rather than re-deriving the test.
+
+    Args:
+        candidates: The candidate pool for this run.
+        current_cycle: The run's cycle number, passed through to the shared
+            predicate. The usage signals are not cycle-based, so it does not affect
+            their result — it is threaded only to honour the predicate's signature.
+        access_tracking_enabled: Whether access tracking is on. The ``frequency``
+            signal can only be active when it is.
+
+    Returns:
+        ``True`` when at least one usage-history signal is active this run.
+
+    """
+    return any(
+        default_signal_active(
+            name,
+            candidates,
+            current_cycle=current_cycle,
+            access_tracking_enabled=access_tracking_enabled,
+        )
+        for name in USAGE_HISTORY_SIGNALS
+    )
 
 
 def compute_keep_score(

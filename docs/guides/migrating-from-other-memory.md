@@ -29,7 +29,7 @@ common concepts onto Engrava:
 | "Memory type" / "role" | **`thought_type`** (`OBSERVATION`, `BELIEF`, `TASK`, …) | A small fixed taxonomy; see [Core Concepts](../concepts.md). |
 | Free-form metadata / `metadata={...}` | **`ThoughtRecord.metadata`** | An arbitrary JSON dict, persisted and round-tripped. |
 | "User id" / "session id" / namespace | A key inside **`metadata`** (or `source`) | Engrava has no built-in tenant field — see [scoping](#filtering-scoping--multi-tenancy). |
-| Relationship / link between memories | **`EdgeRecord`** (typed, weighted) | First-class graph; edges also feed ranking. |
+| Relationship / link between memories | **`EdgeRecord`** (typed, weighted) | First-class graph. Letting edges feed ranking is **opt-in**: `default_graph_weight` is `0.0`, so imported relationships change no ranking until you raise it — see [Search](../search.md). |
 | Embedding / vector | Stored on write only with `embedding_provider=...` **and** `auto_embed=True`; otherwise call `store_embedding(thought_id, vector)` yourself | See the [Embeddings guide](embeddings.md). |
 | Vector / similarity search | **`search_similar(query_vector, …)`** | Needs a ready query vector. |
 | Keyword / BM25 search | **`search_fts(query, …)`** | Returns `list[(thought_id, score)]`. |
@@ -168,6 +168,44 @@ async def main() -> None:
 if __name__ == "__main__":
     asyncio.run(main())
 ```
+
+### If you use the derived-records seam, backfill after the import
+
+The recipe above **does not produce derived records**, and nothing in its output
+says so. The transaction suppresses derivation for the rows it inserts, and a
+deduplication *hit* never dispatches it in the first place:
+
+- Inside a `suspend_auto_commit()` block the source thought is not yet durable,
+  so the on-store derivation trigger returns without dispatching — a caller-held
+  transaction is expected to derive through an explicit backfill instead.
+- A `deduplicate=True` hit bumps `confirmation_count` on the existing row and
+  returns it. No new thought is stored, so nothing is derived for it either.
+
+So the import dispatches no derivation at all — not for the rows it inserts, and
+not for the ones it collapses. Run `derive_existing(thought_id)` over the
+imported sources once the
+import block has exited: it attaches the same `DERIVED_FROM` edge back to the
+source. See `derive_existing` for what else it guarantees about a backfilled
+record, and under which conditions.
+
+```python
+async def bulk_import_and_derive(store, items: list[dict[str, str]]) -> int:
+    async with store.suspend_auto_commit():
+        stored = [
+            await store.create_thought(to_thought(item), deduplicate=True) for item in items
+        ]
+
+    # The transaction has committed; derivation can run now. Deduplicate the ids
+    # first: a dedup hit returns the *existing* thought, so a corpus with repeats
+    # would otherwise ask for the same source to be derived more than once.
+    for thought_id in dict.fromkeys(thought.thought_id for thought in stored):
+        await store.derive_existing(thought_id)
+    return await store.count_thoughts()
+```
+
+This affects you only if you have registered a derived-records producer
+capability. With the seam disabled — the default — the recipe above is complete
+as written.
 
 For large corpora, import in batches (e.g. a few thousand rows per
 `suspend_auto_commit()` block) to keep each transaction short — long

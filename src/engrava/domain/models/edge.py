@@ -5,10 +5,16 @@ Represents a lightweight directional edge in the thought graph.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from typing import Self
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from engrava.domain.enums import EdgeType, KnowledgeSource
-from engrava.domain.models._temporal import validate_iso8601_nullable
+from engrava.domain.models._temporal import (
+    validate_interval_ordering,
+    validate_iso8601_nullable,
+)
+from engrava.domain.models.thought import MetadataValue
 
 
 class EdgeRecord(BaseModel):
@@ -31,6 +37,15 @@ class EdgeRecord(BaseModel):
             during which the relation is true in the world (valid time).
             ``None`` means an open upper bound — the relation has no
             known end and is treated as currently valid.
+        metadata: Extensible structured attributes carried on the relation
+            (e.g. ``subtype``, ``sequence``, ``session_id``). Mirrors
+            :attr:`~engrava.domain.models.thought.ThoughtRecord.metadata`
+            exactly: leaf values must be scalars (``str``, ``int``,
+            ``float``, ``bool`` or ``None``); nested
+            ``dict[str, MetadataValue]`` values are accepted for structured
+            namespaces. Lists and other rich containers are rejected at
+            write time. Keys carry no reserved meaning — the field is a
+            generic caller-facing carrier. Defaults to an empty dict.
 
     Examples:
         >>> edge = EdgeRecord(
@@ -56,6 +71,7 @@ class EdgeRecord(BaseModel):
     decay_multiplier: float = Field(default=1.0, ge=0.0)
     valid_from: str | None = None
     valid_until: str | None = None
+    metadata: dict[str, MetadataValue] = Field(default_factory=dict)
 
     @field_validator("edge_id", "from_thought_id", "to_thought_id")
     @classmethod
@@ -86,3 +102,21 @@ class EdgeRecord(BaseModel):
 
         """
         return validate_iso8601_nullable(v)
+
+    @model_validator(mode="after")
+    def _validate_valid_interval(self) -> Self:
+        """Reject an inverted valid-time interval.
+
+        When both ``valid_from`` and ``valid_until`` are set, the validity
+        interval must not run backwards. The bounds are compared as
+        UTC-normalised instants (not raw strings), so equal instants across
+        differing offsets are accepted (a zero-length interval is a legitimate
+        instantaneous relation) while a strictly inverted pair is rejected. A
+        ``None`` on either bound is an open interval and is always accepted.
+
+        Raises:
+            ValueError: If ``valid_from`` is strictly after ``valid_until``.
+
+        """
+        validate_interval_ordering(self.valid_from, self.valid_until)
+        return self

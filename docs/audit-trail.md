@@ -100,6 +100,28 @@ captured according to the configured TTL strategy:
 (The separate `engrava gc` CLI command, which physically purges already-archived
 rows, operates at the storage layer and is not journaled.)
 
+Deleting a thought also removes its incident edges, embeddings, and actions
+through database cascades (and purges its vector-index row). When deletion goes
+through a journaled store path, the only entry for that operation is
+`DELETE_THOUGHT`: cascade-removed edges do not receive `DELETE_EDGE` entries,
+and cascade-removed embeddings, actions, and vector-index rows receive no
+separate journal entry. Embedding/vector mutations and action creation/deletion
+are outside journal coverage generally; only action status and verification
+transitions are covered. Call `delete_edge()` explicitly when an individually
+journaled edge deletion is required.
+
+**Below core schema 12 this cascade does not happen.** The `ON DELETE CASCADE` on
+`edge`, `embedding` and `action` arrives with the core-12 migration, so on a database
+carried forward from an older engrava and never migrated the thought's `embedding` row
+outlives the delete. The delete does still purge that thought's own `vec0` vector, so
+the identifier is **not** reachable straight afterwards; it returns once the reconcile
+that runs on the next sqlite-vec-enabled open backfills the index from the surviving
+`embedding` row. From then on it is an ordinary candidate on that arm whenever a
+sqlite-vec backend is **active** on the store and the query carries no effective
+metadata predicate — the arm *can* return it, subject to the same similarity threshold
+and `top_k` window as any live row. Run `engrava migrate`. See
+[Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated).
+
 ## The `JournalEntry` schema
 
 Each entry is an immutable `JournalEntry`:
@@ -119,6 +141,22 @@ The hash is computed over the canonical string
 `"{sequence_number}|{mutation_type}|{target_id}|{json(delta, sort_keys)}|{parent_hash}"`
 via `JournalWriter.compute_hash(...)` (a static method, exposed for callers who
 want to recompute a hash independently).
+
+> **Entry ordering and content are tamper-evident; entry timestamps are not.**
+> Read the canonical string above for what the chain covers: `sequence_number`
+> and `parent_hash` bind each entry's position in the order, and `mutation_type`,
+> `target_id`, and `delta` bind what it says happened — change any of them
+> without recomputing the affected hashes and verification fails. `created_at`
+> and `entry_id` are **not** in the hash preimage, so rewriting them changes no
+> hash: a journal whose every `created_at` has been rewritten still verifies as
+> `valid=True`. Treat `created_at` as an informative timestamp, not as evidence
+> of when a mutation happened. This is a property of the current chain format,
+> not a bug with a cheap fix — bringing `created_at` into the preimage changes
+> the expected hash of every entry ever written, so covering it is a
+> chain-format migration or verifier-versioning decision (keeping existing
+> journals verifiable is part of the problem, not a detail after it), never a
+> one-line change. See
+> [Security model & guarantees](#security-model--guarantees).
 
 ## Querying history
 
@@ -145,6 +183,24 @@ deletions = await store.journal.get_entries(
 | `mutation_type` | `None` | Filter by mutation type string |
 | `since` | `None` | ISO-8601 lower bound on `created_at` (inclusive) |
 | `limit` | `100` | Maximum entries returned |
+
+> **`since=` is a convenience filter, not an audit boundary.** It compares
+> `created_at >= since`, and `created_at` is outside the hash preimage (as is
+> `entry_id` — see [the schema note above](#the-journalentry-schema)). Rewriting
+> an entry's `created_at` **across** a window's lower bound can therefore remove
+> it from **or add it to** that window while `verify_journal()` still reports
+> `valid=True` — the two effects compound instead of one catching the other. A
+> rewrite that stays inside one particular window leaves membership in that window
+> unchanged, but it still changes the timestamp `get_entries` returns to the
+> caller and may change membership under other lower bounds; because the deciding
+> column is unprotected, no `since=` result is evidence. Use `since=` to narrow a
+> report over a trusted journal; do not treat "nothing since T" as proof that
+> nothing happened since T, nor an entry's presence in the window as proof that it
+> happened after T. Chain-covered fields (`sequence_number`, `parent_hash`) are
+> what a
+> time-bounded claim has to be anchored on: record the
+> `(sequence_number, entry_hash)` you saw at T and audit forward from that
+> sequence number.
 
 ## Verifying integrity
 
@@ -177,6 +233,25 @@ else:
 | `error_message` | `str \| None` | Description of the first error, or `None` |
 
 An empty journal verifies as `valid=True` with `entries_checked=0`.
+
+**What this check proves.** Verification proves that every journal row still on
+disk has self-consistent hashed content and links to the preceding row that was
+walked. It detects an in-row journal mutation, a changed parent link, or a
+mid-chain deletion/reordering when the affected hashes have not been
+recomputed. It does **not** provide any of these separate guarantees:
+
+- **Chain length / tail completeness.** Removing a self-consistent suffix leaves
+  a valid prefix, so `verify_journal()` cannot know that newer entries once
+  existed. Detect this with an externally retained high-water mark and tail
+  anchor, such as the expected `(sequence_number, entry_hash)` at a checkpoint.
+- **Entry timestamps.** `created_at` is outside the hash preimage, so a chain
+  whose timestamps have all been rewritten verifies exactly like an untouched
+  one. What the walk proves is the order and the content of the entries it read,
+  not when they were written.
+- **Live-table reconciliation.** The verifier reads `journal_entry`; it does not
+  compare the current thought, edge, embedding, or action tables with the latest
+  journal deltas. A direct edit to a live thought or edge row is outside this
+  check unless the edit also changes a journal row or breaks the SQLite file.
 
 **Verification is independent of the current `journal.enabled` state.** Entries
 are recorded only while journaling is on, but once written they stay in the
@@ -269,20 +344,66 @@ SQLite file** it protects. `verify_integrity()` recomputes each entry's hash
 from that entry's own stored data — there is no secret key, HMAC, signature, or
 external anchor.
 
-**What it protects against (in scope):**
+**What it protects against (in scope):** the **ordering and content** of the
+entries still on disk — both are in the hash preimage, so neither can be changed
+without breaking the chain unless the affected hashes are recomputed.
 
-- **Accidental corruption** — bit-rot, a truncated file, a half-written row: the
-  recomputed hash or the parent linkage will not match, and verification fails.
-- **Naive tampering** — someone who edits, deletes, or reorders a journal row
-  (or an audited record) *without* recomputing the rest of the chain: the break
-  is detected at the first inconsistent entry.
+That preimage is the five fields joined by `|` with no escaping, an absent field
+written as the empty string:
+`"{sequence_number}|{mutation_type}|{target_id}|{json.dumps(delta, sort_keys=True)}|{parent_hash}"`.
+Nothing in the encoding marks where one field ends and the next begins, so the
+fields stay distinguishable because of what they can hold, not because the format
+separates them. **For the entries the store emits** those grammars settle it:
+`sequence_number` is decimal digits, `mutation_type` is one of seven fixed
+literals, `parent_hash` is a SHA-256 hex digest (empty on the first entry), and
+`delta` is always a JSON object dump — whose quoting rules a caller-chosen
+`target_id` cannot imitate, so no identifier written through the store can move a
+field boundary.
+
+**That guarantee does not extend to arbitrary `JournalWriter.append()` calls.**
+`JournalWriter` is exported, and `append()` does not enforce the `mutation_type`
+vocabulary before hashing, so a caller driving it directly can write two distinct
+entries with one preimage and therefore one hash — `mutation_type="INSERT_THOUGHT"`
+with `target_id="x|"` collides with `mutation_type="INSERT_THOUGHT|x"` and no
+`target_id`. Exploiting it takes in-process code execution against your own store,
+which is already past the boundary this chain defends; treat the binding as a
+property of the store's own field grammars, not of the encoding.
+
+Verification also re-serialises the stored `delta` before hashing it
+(`json.loads` in, `json.dumps(..., sort_keys=True)` out), so what the chain binds
+is the delta's **decoded value**, not its stored bytes: rewriting the blob's key
+order, whitespace, or escaping without changing the value it decodes to verifies
+clean. Nothing the delta *says* can change that way — but do not read a matching
+hash as proof that the stored bytes are the ones originally written.
+
+- **Accidental corruption inside the retained journal rows** — changed hashed
+  content or parent linkage makes verification fail.
+- **Naive journal tampering** — someone who edits, deletes from the middle, or
+  reorders a journal row *without* recomputing the affected chain: the break is
+  detected at the first inconsistent entry.
 
 **What it does NOT protect against (out of scope):**
 
+- **Self-consistent tail removal.** The retained prefix still verifies. An
+  external high-water mark or tail anchor is required to prove expected length.
+- **Entry timestamps (`created_at`) and `entry_id`.** Neither is in the hash
+  preimage. Rewriting every `created_at` in the journal — backdating the whole
+  trail — leaves a chain that verifies as `valid=True`. A rewrite that moves an
+  entry across a `get_entries(since=...)` lower bound also changes that window's
+  contents, in either direction: downward hides the entry from the window,
+  upward plants it inside one it did not belong to. The filter reads the same
+  unprotected column, so a timestamp-based claim about the journal ("no
+  deletions in the last 24 hours", or "this deletion happened during the
+  incident") rests on data the chain does not protect. Anchor time claims on the
+  chain-covered `(sequence_number, entry_hash)` pair recorded at a known point
+  instead.
+- **Direct edits to live records.** Verification does not replay the journal or
+  reconcile thought/edge/action state against it.
 - **A chain-aware actor with write access to the database file.** Because the
   chain is keyless and self-contained, anyone who can write to the `.db` can
   edit an entry **and** recompute every subsequent hash, producing a fully
-  self-consistent chain that passes `verify_integrity()` with `valid=True`. The
+  self-consistent chain that passes `store.verify_journal()` (or the enabled
+  writer's `store.journal.verify_integrity()`) with `valid=True`. The
   journal is **not** forgery-proof against an adversary (including the agent
   process itself) who controls the file.
 
@@ -292,11 +413,13 @@ layer and add at least one of:
 - **Restrict write access** — store the `.db` on a volume only the trusted
   writer process can modify (OS file permissions / ownership).
 - **Anchor the chain externally** — periodically export the latest
-  `entry_hash` (the chain tail) to an append-only / WORM store, a signed log, or
-  another system out of the writer's control. A later `verify_integrity()` plus
-  a match against the externally-anchored tail hash detects a full-file rewrite.
-- **Verify on a schedule** — run `verify_integrity()` from a separate monitored
-  process so a detected mismatch raises an alert.
+  `(sequence_number, entry_hash)` to an append-only / WORM store, a signed log,
+  or another system out of the writer's control. A later integrity walk plus a
+  match against that checkpoint adds the length/tail expectation the in-file
+  walk does not possess.
+- **Verify on a schedule** — run `store.verify_journal()` from a separate
+  monitored process so a detected mismatch raises an alert. This store-level
+  entry point also works when journaling is currently disabled.
 
 State this boundary plainly to stakeholders: Engrava's journal gives you
 **integrity detection for accidental damage and unsophisticated edits**, not

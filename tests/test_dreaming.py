@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import math
+from unittest.mock import AsyncMock
 
 import pytest
 
 from engrava.config import DreamingConfig, DreamingGates
+from engrava.config_validation import ConfigError
 from engrava.domain.enums import LifecycleStatus, Priority, ThoughtType
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.extensions.dreaming import ConsolidationResult, DreamingExtension
@@ -168,6 +170,44 @@ class TestDreamingExtension:
         )
         with pytest.raises(ValueError, match=r"Unknown dreaming signal.*unknown_signal"):
             DreamingExtension(config=cfg)
+
+    @pytest.mark.parametrize(
+        ("enabled", "cycle", "expected"),
+        [
+            (False, 100, False),
+            (True, 0, False),
+            (True, 99, False),
+            (True, 100, True),
+            (True, 200, True),
+        ],
+    )
+    def test_is_due_honors_enabled_and_cycle_cadence(
+        self,
+        enabled: bool,
+        cycle: int,
+        expected: bool,
+    ) -> None:
+        ext = DreamingExtension(config=DreamingConfig(enabled=enabled, schedule_every_n_cycles=100))
+        assert ext.is_due(cycle) is expected
+
+    @pytest.mark.parametrize("cycle", [-1, 1.5, True])
+    def test_is_due_rejects_invalid_cycle(self, cycle: object) -> None:
+        ext = DreamingExtension(config=DreamingConfig(enabled=True))
+        with pytest.raises(ValueError, match="current_cycle"):
+            ext.is_due(cycle)  # type: ignore[arg-type]
+
+    async def test_run_if_due_skips_or_delegates(self) -> None:
+        ext = DreamingExtension(config=DreamingConfig(enabled=True, schedule_every_n_cycles=10))
+        expected = ConsolidationResult(candidates_evaluated=0, promoted_count=0)
+        run = AsyncMock(return_value=expected)
+        ext.run_consolidation = run  # type: ignore[method-assign]
+        store = object()
+
+        assert await ext.run_if_due(store, 9) is None  # type: ignore[arg-type]
+        run.assert_not_awaited()
+
+        assert await ext.run_if_due(store, 10) is expected  # type: ignore[arg-type]
+        run.assert_awaited_once_with(store, 10)
 
     def test_custom_signal_overrides_default(self) -> None:
         class ConstantSignal:
@@ -555,3 +595,38 @@ class TestSingleWriteScenario:
                 assert promoted.priority == Priority.P1
         finally:
             await db.close()
+
+
+class TestExtensionRequiresItsExactConfig:
+    """Everything this extension does is steered by reading settings off its config.
+
+    Gates, signal weights, eligibility filters, promotion targets and reflection
+    creation are all attribute reads on the object handed to the constructor and
+    retained for the extension's lifetime. Subclassing a configuration is
+    refused outright now, so an impostor arrives another way — with its
+    ``__class__` reassigned to a look-alike, or as something that was never a
+    configuration at all — and only a check on the exact type sees either.
+    """
+
+    def test_a_look_alike_is_refused(self) -> None:
+        class _LookAlike:
+            pass
+
+        config = DreamingConfig(enabled=True)
+        object.__setattr__(config, "__class__", _LookAlike)
+
+        with pytest.raises(ConfigError, match="must be exactly a DreamingConfig"):
+            DreamingExtension(config=config)
+
+    def test_a_non_config_is_refused(self) -> None:
+        with pytest.raises(ConfigError, match="must be exactly a DreamingConfig"):
+            DreamingExtension(config=object())  # type: ignore[arg-type]  # passing the wrong type is the behaviour under test
+
+    def test_the_configuration_cannot_be_subclassed_in_the_first_place(self) -> None:
+        """The route an impostor would have taken is closed at the class."""
+        with pytest.raises(TypeError, match="may not be subclassed"):
+            type("_ConfigSubclass", (DreamingConfig,), {})
+
+    def test_the_exact_class_is_still_accepted(self) -> None:
+        config = DreamingConfig(enabled=True)
+        assert DreamingExtension(config=config).config is config

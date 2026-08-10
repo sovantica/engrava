@@ -766,3 +766,72 @@ class TestReflectionFilterIntegration:
             assert sources[0] != sources[1]
         finally:
             await db.close()
+
+
+# ---------------------------------------------------------------------------
+# The filter sets the config holds are the ones it validated
+# ---------------------------------------------------------------------------
+
+
+class _LyingSet(frozenset):  # type: ignore[type-arg]  # a bare built-in base is exactly what the adversary subclasses
+    """A filter set that answers membership for itself.
+
+    Each of the three metadata filters is a single ``in`` against a configured
+    collection. A collection that decides ``__contains__`` on its own terms
+    decides eligibility, whatever entries it reports to anything that iterates
+    or prints it. Answering the *opposite* of the truth in every case flips
+    every filter axis at once: an exclusion list excludes everything, an
+    inclusion list admits nothing.
+    """
+
+    def __contains__(self, item: object) -> bool:
+        return not frozenset.__contains__(self, item)
+
+
+class TestFilterSetsAreOwnedByTheConfig:
+    """Eligibility is decided by the entries that were validated."""
+
+    def test_the_stored_sets_are_plain_frozensets_of_plain_strings(self) -> None:
+        class _ContentType(str):
+            __slots__ = ()
+
+        config = DreamingConfig(
+            excluded_content_types=[_ContentType("code")],
+            eligible_content_types=_LyingSet({_ContentType("prose")}),
+            eligible_perspectives=_LyingSet({"percept"}),
+        )
+        for value in (
+            config.excluded_content_types,
+            config.eligible_content_types,
+            config.eligible_perspectives,
+        ):
+            assert type(value) is frozenset
+            assert [type(entry) for entry in value] == [str]  # type: ignore[union-attr]  # the None case is excluded by the assertion above
+        assert config.excluded_content_types == frozenset({"code"})
+        assert config.eligible_content_types == frozenset({"prose"})
+        assert config.eligible_perspectives == frozenset({"percept"})
+
+    def test_an_excluded_set_only_excludes_what_it_lists(self) -> None:
+        config = DreamingConfig(excluded_content_types=_LyingSet({"code"}))
+        thought = _make_thought(metadata={"content_type": "prose"})
+        assert _is_eligible_for_dreaming(thought, config) is True
+
+    def test_an_excluded_set_still_excludes_what_it_does_list(self) -> None:
+        config = DreamingConfig(excluded_content_types=frozenset({"code"}))
+        thought = _make_thought(metadata={"content_type": "code"})
+        assert _is_eligible_for_dreaming(thought, config) is False
+
+    def test_an_eligible_set_admits_what_it_lists(self) -> None:
+        config = DreamingConfig(eligible_content_types=_LyingSet({"prose"}))
+        thought = _make_thought(metadata={"content_type": "prose"})
+        assert _is_eligible_for_dreaming(thought, config) is True
+
+    def test_a_perspective_set_admits_what_it_lists(self) -> None:
+        config = DreamingConfig(eligible_perspectives=_LyingSet({"percept"}))
+        thought = _make_thought(metadata={"perspective": "percept"})
+        assert _is_eligible_for_dreaming(thought, config) is True
+
+    def test_a_perspective_outside_the_set_is_still_filtered_out(self) -> None:
+        config = DreamingConfig(eligible_perspectives=frozenset({"percept"}))
+        thought = _make_thought(metadata={"perspective": "utterance"})
+        assert _is_eligible_for_dreaming(thought, config) is False

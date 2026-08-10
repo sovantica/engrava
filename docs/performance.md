@@ -228,7 +228,7 @@ clustering algorithm:
    vectors.
 4. **Multi-tenant?** One database file per tenant via `EngravaManager` keeps each
    store smaller and independently lockable (see the
-   [scoping section](guides/migrating-from-other-memory.md#filtering-scoping-and-multi-tenancy)).
+   [scoping section](guides/migrating-from-other-memory.md#filtering-scoping--multi-tenancy)).
 5. **Dreaming heavy?** Cap `candidates_limit`, run it on a schedule, pick the
    right `clustering_backend`.
 

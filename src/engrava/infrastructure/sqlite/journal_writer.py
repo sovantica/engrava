@@ -17,11 +17,14 @@ import json
 import uuid as _uuid
 from sqlite3 import IntegrityError
 from typing import TYPE_CHECKING, ClassVar
+from weakref import WeakKeyDictionary
 
 from engrava.domain.models.journal import JournalEntry, JournalIntegrityResult
 
 if TYPE_CHECKING:
     import aiosqlite
+
+    from engrava.infrastructure.sqlite.connection_revocation import ConnectionRevocationToken
 
 
 class JournalWriter:
@@ -35,6 +38,12 @@ class JournalWriter:
     Args:
         db: An open aiosqlite connection with the ``journal_entry``
             table already created.
+        revocation: Optional shared revocation token. When the owning store
+            quarantines the connection it revokes this token, and every
+            connection-touching method here then fails hard with
+            :class:`~engrava.domain.exceptions.ConnectionQuarantinedError` —
+            so this holder of the real connection cannot bypass the store's
+            terminal quarantine. ``None`` (standalone use) disables the check.
 
     Examples:
         >>> writer = JournalWriter(db)  # doctest: +SKIP
@@ -46,11 +55,38 @@ class JournalWriter:
 
     """
 
-    _connection_locks: ClassVar[dict[int, asyncio.Lock]] = {}
+    # Process-global registry that serialises appends across every writer
+    # sharing one connection (aiosqlite exposes no row-level locking, so two
+    # writers on the same connection must contend on the same lock or they race
+    # the gapless-sequence read/insert). Keyed **by the connection object** via a
+    # weak-key map so each entry is reclaimed automatically when its connection is
+    # garbage-collected: the registry cannot grow without bound as long-lived
+    # processes open and drop transient connections, and — because keys are object
+    # identity, not ``id(connection)`` — a fresh connection can never inherit a
+    # dead connection's stale lock through address reuse.
+    _connection_locks: ClassVar[WeakKeyDictionary[aiosqlite.Connection, asyncio.Lock]] = (
+        WeakKeyDictionary()
+    )
 
-    def __init__(self, db: aiosqlite.Connection) -> None:
+    def __init__(
+        self,
+        db: aiosqlite.Connection,
+        *,
+        revocation: ConnectionRevocationToken | None = None,
+    ) -> None:
         self._db = db
-        self._lock = self._connection_locks.setdefault(id(db), asyncio.Lock())
+        self._revocation = revocation
+        self._lock = self._connection_locks.setdefault(db, asyncio.Lock())
+
+    def _check_revoked(self) -> None:
+        """Fail hard if the shared connection has been revoked (quarantined).
+
+        Raises:
+            ConnectionQuarantinedError: When the revocation token is revoked.
+
+        """
+        if self._revocation is not None:
+            self._revocation.check()
 
     async def _get_latest_entry_state(self) -> tuple[int, str | None]:
         """Read the current chain tail from the database.
@@ -82,6 +118,15 @@ class JournalWriter:
 
             "{sequence_number}|{mutation_type}|{target_id or ''}|
              {json.dumps(delta, sort_keys=True)}|{parent_hash or ''}"
+
+        The preimage therefore binds an entry's **ordering** (``sequence_number``,
+        ``parent_hash``) and its **content** (``mutation_type``, ``target_id``,
+        ``delta``). It does **not** include ``created_at`` or ``entry_id``: a
+        journal whose timestamps have all been rewritten still verifies as
+        ``valid=True``, and moving a timestamp across a :meth:`get_entries`
+        ``since`` bound changes that window either way — downward hides the entry,
+        upward plants it — because the filter reads the same uncovered column.
+        Timestamps are informative, not tamper-evident.
 
         Args:
             sequence_number: Monotonic sequence number of this entry.
@@ -132,7 +177,12 @@ class JournalWriter:
         Returns:
             The persisted ``JournalEntry`` with computed hash.
 
+        Raises:
+            ConnectionQuarantinedError: When the shared connection has been
+                revoked (the owning store quarantined it).
+
         """
+        self._check_revoked()
         for _attempt in range(5):
             async with self._lock:
                 last_sequence, parent_hash = await self._get_latest_entry_state()
@@ -190,10 +240,20 @@ class JournalWriter:
         Iterates every entry in sequence order, recomputes each hash,
         and validates parent-hash linkage.
 
+        The walk proves the **ordering and content** of the rows it read — it
+        proves nothing about their ``created_at`` values, which are outside the
+        hash preimage (see :meth:`compute_hash`), nor about the chain's length
+        (a removed tail leaves a verifying prefix).
+
         Returns:
             A ``JournalIntegrityResult`` describing chain validity.
 
+        Raises:
+            ConnectionQuarantinedError: When the shared connection has been
+                revoked (the owning store quarantined it).
+
         """
+        self._check_revoked()
         cursor = await self._db.execute(
             "SELECT entry_id, sequence_number, mutation_type, target_id, "
             "       delta, parent_hash, entry_hash, created_at "
@@ -260,17 +320,31 @@ class JournalWriter:
     ) -> list[JournalEntry]:
         """Query journal entries with optional filters.
 
+        ``since`` is a convenience filter, **not** an audit boundary: it compares
+        ``created_at >= since``, and ``created_at`` is outside the hash preimage
+        (as is ``entry_id`` — see :meth:`compute_hash`). Rewriting an entry's
+        ``created_at`` across ``since`` drops it out of the window or adds it in,
+        and either way leaves the chain verifying: an empty result does not prove
+        that nothing happened in that period, and a returned entry does not prove
+        that it happened within it.
+
         Args:
             target_id: Filter by target entity ID.
             mutation_type: Filter by mutation type string.
-            since: ISO-8601 timestamp lower bound (inclusive).
+            since: ISO-8601 timestamp lower bound (inclusive) on the
+                chain-uncovered ``created_at`` column.
             limit: Maximum number of entries to return.
 
         Returns:
             List of matching ``JournalEntry`` objects ordered by
             ``sequence_number`` ascending.
 
+        Raises:
+            ConnectionQuarantinedError: When the shared connection has been
+                revoked (the owning store quarantined it).
+
         """
+        self._check_revoked()
         clauses: list[str] = []
         params: list[object] = []
 

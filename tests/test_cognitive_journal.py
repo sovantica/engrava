@@ -14,8 +14,10 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import gc
 import hashlib
 import json
+import weakref
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -467,6 +469,100 @@ class TestJournalWriterRestart:
 
 
 # ---------------------------------------------------------------------------
+# JournalWriter — connection-lock registry lifecycle
+# ---------------------------------------------------------------------------
+
+
+async def _wait_until_reclaimed(ref: weakref.ref[aiosqlite.Connection]) -> None:
+    """Poll, with a bounded positive-time budget, until a connection is reclaimed.
+
+    aiosqlite runs the connection on a background worker thread, but that thread
+    holds no reference back to the ``Connection`` object, so a single
+    ``gc.collect()`` after the last strong reference is dropped reclaims it in
+    practice. This helper adds a bounded, real-time-spaced retry so the assertion
+    never couples to that internal detail or to scheduler timing: it returns as
+    soon as the weak reference is cleared, and a genuine reference leak still fails
+    the caller's assertion once the budget is spent — keeping the test both
+    deterministic and leak-sensitive.
+    """
+    for _ in range(100):
+        gc.collect()
+        if ref() is None:
+            return
+        await asyncio.sleep(0.01)
+    gc.collect()
+
+
+class TestJournalLockRegistryLifecycle:
+    """Verify the per-connection lock registry is bounded and connection-scoped.
+
+    The registry serialises appends across every writer sharing one connection,
+    yet must not accumulate entries for transient connections nor let a fresh
+    connection inherit a dead connection's lock through address reuse.
+    """
+
+    async def test_same_connection_writers_share_one_lock(self, db: aiosqlite.Connection) -> None:
+        """Two writers on one connection share a lock (append serialisation)."""
+        w1 = JournalWriter(db)
+        w2 = JournalWriter(db)
+        assert w1._lock is w2._lock
+
+    async def test_distinct_connections_get_distinct_locks(self) -> None:
+        """A fresh connection never inherits another connection's lock state."""
+        conn_a = await aiosqlite.connect(":memory:")
+        conn_b = await aiosqlite.connect(":memory:")
+        try:
+            lock_a = JournalWriter(conn_a)._lock
+            lock_b = JournalWriter(conn_b)._lock
+            assert lock_a is not lock_b
+        finally:
+            await conn_a.close()
+            await conn_b.close()
+
+    async def test_lock_entry_reclaimed_when_connection_released(self) -> None:
+        """Closing + releasing a connection reclaims its process-global lock entry."""
+        gc.collect()
+        registry = JournalWriter._connection_locks
+        before = len(registry)
+
+        conn = await aiosqlite.connect(":memory:")
+        JournalWriter(conn)
+        assert len(registry) == before + 1
+
+        alive = weakref.ref(conn)
+        await conn.close()
+        del conn
+        await _wait_until_reclaimed(alive)
+
+        # The connection object is gone, so its weak-keyed entry is reclaimed:
+        # no process-global lock state survives a released connection.
+        assert alive() is None
+        assert len(registry) == before
+
+    async def test_store_release_reclaims_lock_entry(self) -> None:
+        """Releasing a journal-enabled store reclaims its connection's lock entry."""
+        gc.collect()
+        registry = JournalWriter._connection_locks
+        before = len(registry)
+
+        conn = await aiosqlite.connect(":memory:")
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn, journal_enabled=True)
+        await store.ensure_schema()
+        assert store.journal is not None
+        await store.journal.append("INSERT_THOUGHT", "t-001", {"before": None, "after": {}})
+        assert len(registry) == before + 1
+
+        alive = weakref.ref(conn)
+        await conn.close()
+        del conn, store
+        await _wait_until_reclaimed(alive)
+
+        assert alive() is None
+        assert len(registry) == before
+
+
+# ---------------------------------------------------------------------------
 # SqliteEngravaCore integration — journal recording
 # ---------------------------------------------------------------------------
 
@@ -718,7 +814,7 @@ class TestSchemaMigration:
 
             cursor = await conn.execute("PRAGMA user_version")
             row = await cursor.fetchone()
-            assert row[0] == 18
+            assert row[0] == 20
         finally:
             await conn.close()
 
@@ -760,7 +856,7 @@ class TestSchemaMigration:
 
             cursor = await conn.execute("PRAGMA user_version")
             row = await cursor.fetchone()
-            assert row[0] == 18
+            assert row[0] == 20
         finally:
             await conn.close()
 
@@ -775,7 +871,7 @@ class TestSchemaMigration:
 
             cursor = await conn.execute("PRAGMA user_version")
             row = await cursor.fetchone()
-            assert row[0] == 18
+            assert row[0] == 20
         finally:
             await conn.close()
 

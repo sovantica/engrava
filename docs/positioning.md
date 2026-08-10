@@ -26,6 +26,13 @@ relates to the other memory options you might be choosing between.
   OpenAI-compatible endpoint, Ollama, HuggingFace, or your own callback — or run
   with FTS-only and no embeddings at all. See the
   [Embeddings guide](guides/embeddings.md).
+- **You want memory that maintains itself.** Engrava models both halves of memory
+  maintenance: [Dreaming](dreaming.md) (consolidation) keeps and strengthens what
+  matters, and [Forgetting](memory-hygiene.md) (opt-in, reversible memory hygiene)
+  lets cold, low-signal memories fade rather than being kept indefinitely. The
+  built-in mechanisms use no LLM; reproducibility requires fixed inputs and
+  deterministic custom hooks/signals, and Forgetting additionally requires a
+  fixed wall-clock `now`.
 - **Small-to-medium corpora.** The default backend brute-forces vector search in
   Python and works well up to roughly 100k embeddings; beyond that, switch to
   the `sqlite-vec` backend. See
@@ -37,11 +44,11 @@ relates to the other memory options you might be choosing between.
   embedded library, not a clustered database. One store is one SQLite file
   written by one process. If you need sharding, replication, or a multi-writer
   service across many machines, use a dedicated vector database.
-- **You need many processes writing the same store concurrently.** SQLite is
-  single-writer. WAL mode lets readers and a single writer coexist, and a
-  single process can drive many async tasks safely, but heavy multi-process
-  write fan-out is out of scope. See
-  [Known Limitations → Concurrent Write Safety](known-limitations.md#concurrent-write-safety).
+- **You need more than one process writing the same store.** Only one store may
+  write a database file; any number may read it. WAL lets readers and that one
+  writer coexist, and one process can drive many async tasks against the store —
+  but two writers on one file is unsupported, not merely contended. See
+  [Concurrency](concurrency.md#multiple-stores-one-database-file).
 - **You want the library to call an LLM for you.** Engrava does no LLM-side fact
   extraction, summarisation, or entity resolution (see [Non-goals](#non-goals)).
   It stores and retrieves what you give it; your agent decides what to write.
@@ -56,12 +63,16 @@ relates to the other memory options you might be choosing between.
 
 These are deliberate boundaries, not missing features:
 
-- **No LLM-side intelligence.** Engrava never calls a language model. It does no
-  fact extraction, no summarisation, no entity resolution, no automatic
-  "memory writing" from raw text. Those belong in your agent (or a downstream
-  extension), above the storage layer. The one consolidation feature that *does*
-  synthesise — [dreaming](dreaming.md) — is purely structural (clustering +
-  centroids + keyword counts), with **no LLM involved**.
+- **No LLM-side intelligence.** Engrava core and built-in Dreaming do not call a
+  language model. They do no fact extraction, no summarisation, no entity
+  resolution, no semantic
+  contradiction detection, no truth arbitration, and no automatic "memory
+  writing" from raw text. Those belong in your agent (or a downstream
+  extension), above the storage layer. The one consolidation feature that
+  *does* synthesise — [dreaming](dreaming.md) — is purely structural
+  (clustering + centroids + keyword counts), with **no LLM involved**. See
+  [Evidence and conflicts](evidence-and-conflicts.md) for the explicit graph
+  pattern available in core.
 - **Retrieval is unscoped by default.** Queries rank across the whole store unless
   you scope them: `search_hybrid`/`recall` accept optional `filters=`/`visibility=`
   (a query filter, not access control); `search_similar`/`search_fts` take no filter

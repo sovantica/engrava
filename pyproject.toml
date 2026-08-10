@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "engrava"
-version = "0.5.0"
+version = "0.6.0"
 description = "The memory database for AI agents — graph memory, hybrid search, tamper-evident thought/edge journal."
 readme = "README.md"
 license = {text = "MIT"}
@@ -41,7 +41,7 @@ engrava = "engrava.cli.main:main"
 
 [project.urls]
 Homepage = "https://engrava.ai"
-Documentation = "https://engrava.ai/docs"
+Documentation = "https://engrava.ai/docs/"
 Repository = "https://github.com/sovantica/engrava"
 Issues = "https://github.com/sovantica/engrava/issues"
 Changelog = "https://github.com/sovantica/engrava/blob/main/CHANGELOG.md"
@@ -57,7 +57,11 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=5.0.0",
     "mypy>=1.11.0",
-    "ruff>=0.7.0",
+    # ``select = ["ALL"]`` opts into rules that do not exist yet, so any ruff
+    # release can turn the lint gate red without a line of this project
+    # changing.  Pinned exactly so the gate verifies the toolchain the release
+    # was verified with; the controlled upgrade is a separate follow-up.
+    "ruff==0.15.20",
     "types-PyYAML>=6.0",
     # Synthetic benchmark suite needs a real embedding provider in CI
     # to exercise the OFF/ON evaluator path.  Pinned to the same
@@ -137,3 +141,22 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.coverage.run]
+# Measure coverage of the package only. Without this, a bare ``--cov`` (as the
+# CI gate runs it) instruments the whole repository — including ``tests/`` and
+# ``scripts/`` — which inflates the denominator: those trees sit near 100%, so
+# the aggregate can read comfortably above the 90% gate while ``src/engrava``
+# itself sits below it. Scoping the source here keeps the local and CI ``--cov``
+# invocations measuring exactly the same thing, so there is a single source of
+# truth and the ``--cov-fail-under=90`` floor guards the package, not the repo.
+source = ["src/engrava"]
+
+[tool.coverage.report]
+# No blanket excludes. Coverage's built-in default already omits the narrow,
+# individually-justified ``# pragma: no cover`` defensive lines in the source
+# (see ``infrastructure/sqlite/engrava_core.py``); this section deliberately
+# does not set ``exclude_lines`` so that default stays in force, and adds no
+# broader exclusion. ``show_missing`` surfaces the uncovered lines so a gate
+# failure names the exact spots to test.
+show_missing = true

@@ -4,6 +4,11 @@ Get up and running with engrava in 5 minutes.
 
 ## Installation
 
+Engrava requires Python `>=3.11`; the maintained CI matrix covers Python 3.11,
+3.12, and 3.13. Its SQLite build must include FTS5 (standard in normal Python
+distributions). See [Known Limitations](known-limitations.md#fts5-availability)
+for a quick capability check and optional-backend platform notes.
+
 ```bash
 pip install engrava
 ```
@@ -134,14 +139,19 @@ for thought_id, score in result.results:
 returns the stored `ThoughtRecord`. `recall()` runs the same hybrid search as
 `search_hybrid()` and returns the ranked results.
 
-> **A note on time.** `recall()` leaves *recency* ranking off until you pass a
-> `current_cycle`. A *cycle* is a logical clock **you** own (see
+> **A note on time.** `recall()` can rank recency against either an explicit
+> cognitive cycle (`current_cycle=n`), an explicit caller-owned wall-clock
+> instant (`recency_now="..."`), or a `cycle_provider` configured on the store.
+> A *cycle* is a logical clock **you** own (see
 > [Cycle](concepts.md#cycle-the-agent-clock)): increment it once per turn and pass
-> it to `recall(..., current_cycle=n)` on read, and newer memories start ranking
-> ahead of older ones. `remember()` stamps both cycle fields at `0`; when you need
-> to set the cycle on a *write*, build a `ThoughtRecord` with `created_cycle=n` and
-> call `create_thought()` (shown below). Until you supply a cycle, search ranks on
-> keyword + vector + priority only — nothing is faked.
+> it on reads, or configure a provider to supply it when the argument is omitted.
+> Passing `recency_now` without an explicit `current_cycle` selects
+> transaction-time recency and does not consult a passive cycle provider;
+> passing both explicit references is an error. With none of these three
+> sources, recency is off and search ranks on the remaining available signals —
+> nothing is faked. `remember()` stamps both cycle fields at `0`; when you need
+> to set the cycle on a *write*, build a `ThoughtRecord` with `created_cycle=n`
+> and call `create_thought()` (shown below).
 
 The rest of this page shows the full-control path: building a `ThoughtRecord`
 yourself, linking thoughts with edges, and querying with MindQL. Reach for it

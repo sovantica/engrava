@@ -37,6 +37,91 @@ thought / edge / embedding / action.
 `restore` options worth knowing (see the [CLI reference](cli.md#restore) for the
 full list): `--clear` to wipe the target first, `--skip-embeddings` / `--re-embed`
 to control embedding handling, and `--service` for multi-service targets.
+When `--clear` encounters a persisted sqlite-vec index, restore drops the derived
+table transactionally and the next configured open rebuilds it. Keep
+`engrava[vec]` installed for that virtual-table reset.
+
+### Embedding handling during restore
+
+A normal restore imports the embedding rows carried by the snapshot.
+`--skip-embeddings` discards those rows and restores text/graph/action data
+without vectors.
+
+`--re-embed` also discards the snapshot vectors, then generates new vectors for
+every imported thought. The provider must come from the configuration passed via
+`--config`. A top-level provider supports single-database restore and acts as the
+fallback for configured services:
+
+```yaml
+database:
+  path: ./fresh.db
+embeddings:
+  provider: sentence-transformer
+  model: sentence-transformers/all-MiniLM-L6-v2
+```
+
+```bash
+engrava --db fresh.db --config engrava.yaml restore -i backup.jsonl --clear --re-embed
+```
+
+A service can inherit that top-level provider or override it:
+
+```yaml
+embeddings:
+  provider: ollama
+  model: nomic-embed-text
+services:
+  data_dir: ./data
+  default_service: main
+  configs:
+    main:
+      embeddings:
+        provider: sentence-transformer
+        model: sentence-transformers/all-MiniLM-L6-v2
+```
+
+```bash
+engrava --config engrava.yaml restore -i backup.jsonl --service main --clear --re-embed
+```
+
+`services.configs.<name>.embeddings` has precedence over the top-level fallback.
+Without either provider, `--re-embed` fails before importing records. Retain the
+snapshot embeddings or use `--skip-embeddings` when no provider is available.
+The re-embed and its model/dimension/prefix identity update commit atomically.
+Use a fresh target or `--clear`: a target with existing embeddings is rejected
+without `--clear` so surviving vectors cannot be mislabeled as the new corpus.
+The general `--clear` sqlite-vec reset described above also protects this path.
+`--skip-embeddings` and `--re-embed` are mutually exclusive.
+
+### Trust boundary
+
+`restore` is designed for **snapshots you produced yourself** with `engrava
+snapshot` — your own trusted backups. That is the supported input boundary.
+
+Restore does not blindly trust the file. Every line must be a JSON object, and
+each record targeting a known table (thought, edge, embedding, action) is
+validated against a fixed, code-owned schema: its columns must be a known subset
+of that table's columns, the required columns must be present and non-null, and
+each value must match its column's type (an imported embedding vector must be
+valid base64 — the base64 check applies only when embeddings are actually
+imported, not under `--skip-embeddings` or `--re-embed`, which never read the
+stored vectors). A record whose type is not one of those tables is skipped, so a newer snapshot restored
+into an older build ignores record types it does not understand rather than
+failing. The whole restore runs as **one transaction**: if any record is
+malformed or carries a bad value, the transaction is rolled back and **no rows
+are written** — not even a `--clear` that ran first, and not the records that
+validated before the bad one. Column names never come from the file; the SQL
+uses a fixed, built-in column set, so a hand-edited or corrupted key cannot
+alter the statements that run.
+
+What restore does **not** do is vouch for the *content* of a snapshot from
+someone else. The thought text, metadata, and other values are restored
+verbatim, so a snapshot obtained from an untrusted third party is untrusted data
+in your database — treat it with the same caution as any external import.
+Restore a snapshot you trust the origin of; if you must ingest an external one,
+review it first. Restore also assumes the file is **not being modified while it
+runs**; point it at a completed backup, not a snapshot that is still being
+written.
 
 ## Physical file backup (WAL-safe)
 
@@ -92,7 +177,8 @@ multi-file copy when writers are stopped or behind a consistent snapshot.
 
 - **From a snapshot:** `engrava --db <target> restore -i backup.jsonl`. Restore
   into a **fresh** database (optionally `--clear` an existing one). Remember the
-  journal is not restored.
+  journal is not restored. For `--re-embed`, pass `--config` with a top-level
+  provider or a per-service provider override.
 - **From a physical backup:** stop the process, put the backed-up file in place,
   and start again. A backup made with the Online Backup API, `VACUUM INTO`, or a
   checkpoint-then-copy is a single self-contained `.db`. If instead you captured a
