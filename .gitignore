@@ -72,6 +72,7 @@ pytest-out.txt
 .agent-shared/
 .agent-overrides.yaml
 .agent-overrides.yml
+.claude/
 
 # Template artefacts — should only ever exist in private workspace.
 *.tmpl
