@@ -188,14 +188,17 @@ actions = await store.get_actions(prompting_thought_id)
 ## Restore the cycle counter after a restart
 
 The cycle is the agent's logical clock and Engrava does **not** persist it — on
-startup, seed it from the highest cycle already stored so it keeps increasing.
-`list_thoughts` returns rows ordered by `updated_cycle` descending, so the most
-recent thought carries the highest value:
+startup, seed it from the store's high-water mark so it keeps increasing.
+`max_cycle()` reads the highest cycle across **thoughts and edges**, so an edge
+created later than any thought is not missed:
 
 ```python
-recent = await store.list_thoughts(limit=1)        # ordered by updated_cycle desc
-cycle = (recent[0].updated_cycle + 1) if recent else 0
+cycle = await store.max_cycle()            # resume from the stored high-water mark
 ```
+
+It returns `0` for an empty store — and also for a store whose records are all
+stamped cycle `0`, so a writer that never advanced the clock has nothing to
+recover.
 
 See [Cycle (the agent clock)](../concepts.md#cycle-the-agent-clock) for why this
 matters (a frozen clock disables recency and stalls dreaming).

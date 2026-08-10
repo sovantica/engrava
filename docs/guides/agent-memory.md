@@ -229,14 +229,17 @@ knobs.
   you change the embedding model; the CLI supports it while restoring a
   snapshot into a configured service (see [CLI restore](../cli.md#restore)).
 - **The cycle counter does not persist** — Engrava doesn't store it. Recover it
-  on startup so it keeps increasing. `list_thoughts` returns rows ordered by
-  `updated_cycle` descending, so the most recent thought carries the highest
-  cycle you've used; resume one past it:
+  on startup with `max_cycle()`, the store's high-water mark across **both**
+  thoughts and edges (reading thoughts alone under-reports it whenever an edge
+  was created at a later cycle); resume your counter from it:
 
   ```python
-  recent = await store.list_thoughts(limit=1)   # ordered by updated_cycle desc
-  cycle = (recent[0].updated_cycle + 1) if recent else 0
+  cycle = await store.max_cycle()   # the highest cycle stored
   ```
+
+  It answers `0` for an empty store, and equally for a store where every record
+  is stamped cycle `0` — a loop that never advances the clock leaves nothing to
+  recover.
 
 - **Model lock.** If you configured an embedding provider, the store remembers
   which model produced its vectors; calling `store_embedding` later with a

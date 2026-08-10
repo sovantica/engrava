@@ -437,7 +437,7 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "docs/guides/agent-memory.md",
-        "ordered by updated_cycle desc",
+        "cycle = await store.max_cycle()   # the highest cycle stored",
         "fragment assuming a store; illustrative cycle bootstrap",
     ),
     (
@@ -657,7 +657,7 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "docs/recipes/index.md",
-        "recent = await store.list_thoughts(limit=1)        # ordered",
+        "resume from the stored high-water mark",
         "fragment assuming a store; illustrative cycle bootstrap",
     ),
     (
