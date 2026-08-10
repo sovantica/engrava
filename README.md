@@ -208,7 +208,10 @@ action `status`/`verification_status` transitions) as SHA-256-linked, before/aft
 entries — a tamper-evident thought/edge journal, **not** a whole-database audit
 (embeddings and action *creation* are not covered). Off by default, one config flag to
 enable. Query history with `store.journal.get_entries(...)` and validate the
-chain with `store.journal.verify_integrity()`.
+chain with `store.verify_journal()`, which audits whatever chain is on disk
+independent of the current `journal.enabled` state — the `store.journal` writer
+handle does not exist while journaling is off, but the chain earlier sessions
+wrote is still in `journal_entry` and still needs verifying.
 
 → See [`docs/audit-trail.md`](https://github.com/sovantica/engrava/blob/main/docs/audit-trail.md) for enabling, querying,
 verification, and the security model (what "tamper-evident" does and does not
@@ -254,10 +257,19 @@ engrava --db mydata.db info          # Database stats
 engrava --db mydata.db query "FIND thoughts WHERE thought_type = 'OBSERVATION' LIMIT 5"
 engrava --db mydata.db snapshot -o backup.jsonl
 engrava --db mydata.db restore -i backup.jsonl
-engrava --db mydata.db gc            # Garbage-collect archived thoughts
+engrava --db mydata.db gc            # Collect ARCHIVED thoughts + their edges/embeddings/actions
 engrava --db mydata.db migrate       # Ensure schema is up-to-date
 engrava --db mydata.db export -o portable.json
 ```
+
+`gc` physically deletes `ARCHIVED` thoughts together with every edge touching one
+on either end — including edges whose other end is still live — their embeddings
+and the actions sourced from them, then reconciles the vector index by removing
+every `vec0` row no `embedding` row owns; on a `vec0`-indexed store where
+`sqlite-vec` cannot be loaded — most commonly because `engrava[vec]` is not
+installed — a pass that is about to delete stops **before deleting anything** and
+exits `1` rather than stranding those vectors in an index nothing can then reach
+them through.
 
 `engrava info` now renders the same metrics snapshot contract exposed by
 `await store.metrics()`.
