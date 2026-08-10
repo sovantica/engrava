@@ -5,6 +5,48 @@ All notable changes to engrava will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0](https://github.com/sovantica/engrava/compare/v0.5.0...v0.6.0) (2026-08-10)
+
+### Added
+
+* add derived-records extension seam ([c9d55cb](https://github.com/sovantica/engrava/commit/c9d55cb1cb6dbcbd980078994b59819f07daacca))
+* **core:** add derive_existing() backfill for the derived-records seam ([1c79611](https://github.com/sovantica/engrava/commit/1c79611490a179b9b141ca685a48e76c22a4c3b9))
+* **core:** add opt-in cycle-provider seam and max_cycle accessor ([29d46e5](https://github.com/sovantica/engrava/commit/29d46e58afcbd371229654aeba9605ff3f6f88ea))
+* **edges:** add generic metadata carrier with schema v19 migration ([08a4cb3](https://github.com/sovantica/engrava/commit/08a4cb3c9923f304bce3011050c95846598308a1))
+* **extensions:** add zero-dependency split modes to StructuralSplitProducer ([320b88e](https://github.com/sovantica/engrava/commit/320b88e0cb9f66981f51abd5b48c4f389167ead8))
+* **hygiene:** add a wall-clock restore window before permanent GC ([35c2769](https://github.com/sovantica/engrava/commit/35c276997a47b1091e56a62425132329c8e5eca9))
+* **hygiene:** guard archival behind a minimum inactivity age and a usage-signal gate ([0ce64b7](https://github.com/sovantica/engrava/commit/0ce64b74e91d3ee270c9ecb4d480d6b621f7491d))
+* **search:** add transaction-time recency axis with caller-supplied now ([49f8c9b](https://github.com/sovantica/engrava/commit/49f8c9b8141bbff07f4fb6a7bbfb377d5f069abe))
+* **search:** exclude archived thoughts from default retrieval ([963e60c](https://github.com/sovantica/engrava/commit/963e60c32e222f52f2d05d9eb443fc2e4d214e87))
+* **search:** reject wrong-dimension query vectors and count vector-arm degradation ([fe128f1](https://github.com/sovantica/engrava/commit/fe128f1161309d700ccb6e3860daaac489d521e4))
+
+### Fixed
+
+* **cli:** cover the expiry sweep and report an unreadable snapshot ([4ab31e4](https://github.com/sovantica/engrava/commit/4ab31e4a01aa174ecb1432d152ae22342d79c304))
+* **cli:** give an invalid --service name a distinct, clean error ([5f5372d](https://github.com/sovantica/engrava/commit/5f5372d4408b7836ce72004e4f824e0d60cd2556))
+* **cli:** purge the vector index when gc collects a thought ([44c6ffc](https://github.com/sovantica/engrava/commit/44c6ffc956340387b675a431458c7863bf1106a3))
+* **cli:** validate a resolved empty or default service name ([6318f98](https://github.com/sovantica/engrava/commit/6318f98c564bd20a3cc1cf40be45fdc450aeedc1))
+* **cli:** validate snapshot-restore input against a typed model and restore atomically ([d35dc5b](https://github.com/sovantica/engrava/commit/d35dc5b4bd56635f766f10198b7cbfbb484ba679))
+* close Free audit source follow-ups ([d919d85](https://github.com/sovantica/engrava/commit/d919d85e43de1eaae5fce953b684446aa97f58fd))
+* **config:** enforce uniform validation across sections and construction paths ([97a9af7](https://github.com/sovantica/engrava/commit/97a9af7d0ddd31fe050e033bea5b7a23c4ffa2b5))
+* **config:** make the validated value the value that gets used ([e1d7d00](https://github.com/sovantica/engrava/commit/e1d7d003b4cb5bbebdc0d2a2e1801fdd1378d56f))
+* **config:** use assign-to-variable message in unknown-key rejection ([69bce4e](https://github.com/sovantica/engrava/commit/69bce4e0b205cfa36c040def917296b573775097))
+* **core:** reject inverted valid_from/valid_until intervals ([dd9305f](https://github.com/sovantica/engrava/commit/dd9305febd4e2d85a4c4c06f0f90d1fc504fa6b0))
+* **dreaming:** propagate real integrity failures during edge creation ([79241c2](https://github.com/sovantica/engrava/commit/79241c239f06f17a12430fa8097d467b20fad9a7))
+* **embeddings:** name the provider member a search needs instead of failing on it ([5e461f6](https://github.com/sovantica/engrava/commit/5e461f65ae905c2ba2c56947834e41e4c5140790))
+* **infra:** harden core bootstrap and edge integrity classification ([be054f6](https://github.com/sovantica/engrava/commit/be054f665422580a032dc4b928d61ca73cd14add))
+* **infra:** keep foreign-key enforcement safe on every swap failure path ([c393980](https://github.com/sovantica/engrava/commit/c39398044774293c6ce1ac34ce3bd74a656571b7))
+* **infra:** make the v11->v12 child-table swap atomic via a savepoint ([7b9a1d0](https://github.com/sovantica/engrava/commit/7b9a1d0603d69c99912569b0ca2c229952225169))
+* **infra:** write only the fields an update owns ([9d72125](https://github.com/sovantica/engrava/commit/9d721252d6408b6fc4e4eb64af1b05c28079dba4))
+* **journal:** reclaim per-connection append locks with a weak-key registry ([412dcd8](https://github.com/sovantica/engrava/commit/412dcd8cca67bcff33fd3764cc765b0371fb0840))
+* **mindql:** build the passthrough guard on a value the module owns ([6e8db02](https://github.com/sovantica/engrava/commit/6e8db02c1b98b8f30a76d205f016e114f836edb8))
+* **mindql:** validate identifiers where the query is executed ([d4d8111](https://github.com/sovantica/engrava/commit/d4d811130cd1e0f3bd57ab2707164fc930a10be6))
+* **read-only:** capability-separate the read-only view from the core protocol ([1033a2e](https://github.com/sovantica/engrava/commit/1033a2e8932d92d2944e305d819a1d46a0cd64cd))
+* **search:** keep FTS5 MATCH valid so quoted and wildcard queries never silently drop BM25 ([5c99b88](https://github.com/sovantica/engrava/commit/5c99b88a5ec4582c099ed9e767b48b90038a65a0))
+* **search:** quote exposed FTS5 boolean operators so bare queries never lose BM25 ([ad7ec85](https://github.com/sovantica/engrava/commit/ad7ec8583e68ed4cba530aca3de31e6f2383302d))
+* **sqlite:** harden core migration registry ([5c9ec91](https://github.com/sovantica/engrava/commit/5c9ec9189f27f3a9a7996560ac839af66cae15ee))
+* **sqlite:** harden extension migration identity and statement splitting ([cfc5e95](https://github.com/sovantica/engrava/commit/cfc5e9533c869ab96e2c5b7dc701de6eaa1049dc))
+
 ## [0.5.0](https://github.com/sovantica/engrava/compare/v0.4.0...v0.5.0) (2026-07-08)
 
 ### ⚠ BREAKING CHANGES
