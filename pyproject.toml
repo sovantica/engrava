@@ -57,7 +57,11 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=5.0.0",
     "mypy>=1.11.0",
-    "ruff>=0.7.0",
+    # ``select = ["ALL"]`` opts into rules that do not exist yet, so any ruff
+    # release can turn the lint gate red without a line of this project
+    # changing.  Pinned exactly so the gate verifies the toolchain the release
+    # was verified with; the controlled upgrade is a separate follow-up.
+    "ruff==0.15.20",
     "types-PyYAML>=6.0",
     # Synthetic benchmark suite needs a real embedding provider in CI
     # to exercise the OFF/ON evaluator path.  Pinned to the same
