@@ -145,7 +145,7 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 | 0.3.0 | 0.3.1 | Yes | Patch-level upgrade; no schema change (`user_version` unchanged) — safe to roll across workers |
 | 0.3.x | 0.4.0 | Yes | **Schema-changing** minor upgrade — adds the valid-time columns (additive, zero data loss). Back up first and follow the [rolling-upgrades](#rolling-upgrades-multiple-workers) note |
 | 0.4.x | 0.5.0 | Yes | **Schema-changing** minor upgrade (`user_version` 14 → 18), although the library API is drop-in. **Breaking for MCP-server users only:** the `engrava[mcp]` extra and the in-engrava `engrava-mcp` command are removed — the server moved to the standalone [`engrava-mcp`](https://github.com/sovantica/engrava-mcp) package (see the 0.4 → 0.5 note) |
-| 0.5.0 | 0.6.0 | Yes | **Schema-changing** minor upgrade (`user_version` 18 → 20), with two additive columns. Default retrieval now excludes archived thoughts, and wrong-dimension query vectors raise a typed error. Back up, quiesce shared-store workers, migrate once, and review the [0.5 → 0.6 notes](#05---06) |
+| 0.5.0 | 0.6.0 | Yes | **Schema-changing** minor upgrade (`user_version` 18 → 20), with two additive columns. Default retrieval now excludes archived thoughts, and wrong-dimension query vectors raise a typed error. An edge `decay_multiplier` of `0.0` no longer reads back as `1.0`, and a later update no longer rewrites it to `1.0` — values a 0.5.x update already overwrote stay overwritten. Back up, quiesce shared-store workers, migrate once, and review the [0.5 → 0.6 notes](#05---06) |
 
 For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 `0.x.*` line do not change the schema and are low-risk; **minor** upgrades
@@ -221,6 +221,19 @@ Review these behavior changes before deployment:
   after construction to fail at startup instead; it raises the same typed error.
   This is not a contract change — the protocol required the member before 0.6;
   only the point at which it is read, and the error you get, have changed.
+- **An edge stored with `decay_multiplier = 0.0` read back as `1.0` on 0.5.x.**
+  The column held the value you wrote, but the decode tested it for truthiness
+  and substituted the `1.0` default, so a deliberate `0.0` never survived the
+  read. Because `update_edge` rebuilds the whole record from that read and
+  writes every column back, any later change to such an edge — a new `weight`,
+  or an `invalidate_edge` call closing its valid-time interval — persisted `1.0`
+  over the stored `0.0`, unless that same call set `decay_multiplier` itself.
+  0.6 decodes the column on presence rather than truthiness, so `0.0` now
+  round-trips as written. **Upgrading does not restore a value that was already
+  overwritten**: where a 0.5.x update replaced a stored `0.0`, the database now
+  holds `1.0`, and 0.6 reads that `1.0` back faithfully. If you set
+  `decay_multiplier = 0.0` on any edge deliberately, check those edges after
+  upgrading and set the value again where it now reads `1.0`.
 - **Malformed FTS syntax gets one safe retry.** A failed expert `MATCH`
   expression is retried through bare-query normalization before the FTS arm is
   dropped; every failed first attempt increments `fts_match_failure_count`.
