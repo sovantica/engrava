@@ -14,6 +14,14 @@ SQLite, it provides thought CRUD, edge-based knowledge graphs, embedding-based
 similarity search, full-text search (FTS5/BM25), and a declarative extension
 system — all in a single package with zero external service dependencies.
 
+Benchmark results are published, and the runs are reproducible from a separate repository. Every
+published run is Group A — `memory_pipeline_llms: []`, no language model anywhere in the memory
+layer. That is a property of the architecture rather than a measurement, so it holds across releases.
+
+- **[Benchmark results](https://engrava.ai/benchmarks/)** — the live table: every published row with the comparability segment it belongs to.
+- **[engrava-benchmark](https://github.com/sovantica/engrava-benchmark)** — the runner. Clone it and reproduce a result against the package from PyPI. MIT.
+- **[Discussions](https://github.com/sovantica/engrava/discussions)** — questions; reproduction questions belong in the Q&A category.
+
 ## Use Cases
 
 - AI agent persistent memory
