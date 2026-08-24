@@ -61,7 +61,7 @@ dev = [
     # release can turn the lint gate red without a line of this project
     # changing.  Pinned exactly so the gate verifies the toolchain the release
     # was verified with; the controlled upgrade is a separate follow-up.
-    "ruff==0.15.20",
+    "ruff==0.16.4",
     "types-PyYAML>=6.0",
     # Synthetic benchmark suite needs a real embedding provider in CI
     # to exercise the OFF/ON evaluator path.  Pinned to the same
