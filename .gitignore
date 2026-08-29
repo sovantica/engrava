@@ -38,6 +38,11 @@ mypy_out.txt
 # Linting
 .ruff_cache/
 
+# Node (commitlint) — installed locally by scripts/install_hooks.sh so the
+# commit-msg hook can enforce the same grammar CI does.
+node_modules/
+package-lock.json
+
 # Package manager cache (uv). The cache dir self-ignores via an internal
 # .gitignore, but that is fragile — ignore it explicitly here too so it can
 # never be tracked. (uv.lock itself is intentionally tracked — see pyproject.)

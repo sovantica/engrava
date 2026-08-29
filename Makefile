@@ -23,13 +23,14 @@ else
 endif
 
 .PHONY: help install clean lint fmt fmt-check typecheck test test-cov check
+.PHONY: gate hooks-active
 .PHONY: verify-wheel-data smoke-gate _check-python
 
 help:
 	@echo ""
 	@echo "$(BLUE)Engrava — Development Commands$(RESET)"
 	@echo ""
-	@echo "  install             Install package + dev dependencies"
+	@echo "  install             Install package + dev dependencies + git hooks"
 	@echo "  clean               Remove build/cache artifacts"
 	@echo ""
 	@echo "  lint                Ruff lint check"
@@ -39,6 +40,8 @@ help:
 	@echo "  test                pytest (90% cov enforced)"
 	@echo "  test-cov            pytest + HTML coverage report"
 	@echo "  check               Full quality gate: lint + fmt-check + typecheck + test"
+	@echo "  gate                Fast gate: hooks-active + lint + fmt-check + typecheck + goldens"
+	@echo "  hooks-active        Confirm core.hooksPath is actually wired"
 	@echo ""
 	@echo "$(GREEN)Pre-release (not part of check — builds wheel + sdist):$(RESET)"
 	@echo "  verify-wheel-data   Verify schema_core.sql + synthetic-v1.json bundled in wheel/sdist"
@@ -49,6 +52,7 @@ install:
 	@echo "$(BLUE)>> Installing engrava + dev dependencies$(RESET)"
 	$(PIP) install --upgrade pip setuptools wheel
 	$(PIP) install -e ".[dev]"
+	@bash scripts/install_hooks.sh
 	@echo "$(GREEN)>> Done. Run 'make check' to verify quality gate.$(RESET)"
 
 clean:
@@ -95,6 +99,29 @@ check: _check-python
 	@$(MAKE) typecheck
 	@$(MAKE) test
 	@echo "$(GREEN)>> Quality gate PASSED$(RESET)"
+
+# Confirms git hooks are actually wired, not just present on disk.
+# core.hooksPath has gone silently unset in this repo family before, and a
+# hook that has quietly stopped running is worse than no hook at all: the
+# absence of failures reads as a pass. See scripts/check_hooks_active.sh.
+hooks-active:
+	@bash scripts/check_hooks_active.sh
+
+# Fast gate — no test suite, so it stays fast enough to run before every
+# merge. Mirrors ci.yml's static jobs (lint, format, types, generated-goldens
+# drift) and additionally confirms the local commit-msg hook is still wired,
+# since that hook is this repository's only defence for a commit a local
+# squash merge creates. See CONTRIBUTING.md for what it does and does not
+# cover on a release branch that never becomes a pull request.
+# Deliberately does NOT rename or replace 'check' above — 'check' keeps
+# meaning exactly what it always has.
+gate: _check-python hooks-active
+	@echo "$(BLUE)>> Fast gate (lint + format + types + goldens)$(RESET)"
+	@$(MAKE) lint
+	@$(MAKE) fmt-check
+	@$(MAKE) typecheck
+	$(PYTHON) scripts/regenerate_search_goldens.py --check
+	@echo "$(GREEN)>> gate PASSED$(RESET)"
 
 # Pre-release check — intentionally NOT part of 'check'.
 # Runs 'python -m build' (slow) and asserts schema_core.sql + synthetic-v1.json

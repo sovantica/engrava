@@ -331,12 +331,17 @@ See the [CLI reference](https://github.com/sovantica/engrava/blob/main/docs/cli.
 ## Development
 
 ```bash
-pip install -e ".[dev]"
-ruff check src/ tests/            # Lint
-ruff format --check src/ tests/   # Format check
-mypy --strict src/                # Type check
-pytest --cov                      # Test with coverage
+make install   # deps + dev extras + local git hooks -- from the primary checkout
+make gate      # fast: hooks-active + lint + format check + type check + goldens drift, ~70s
+make check     # lint + format check + type check + the full test suite with coverage (unchanged; no hooks-active, no goldens drift)
 ```
+
+`make install` also wires a `commit-msg` hook that lints the message of the
+commit a squash merge creates — including on a local branch that never opens
+a pull request, where nothing else does. It refuses to install from a linked
+worktree (`core.hooksPath` is shared across all of them). See
+[CONTRIBUTING.md](https://github.com/sovantica/engrava/blob/main/CONTRIBUTING.md#git-hooks)
+for what it covers and what it does not.
 
 ## License
 
