@@ -93,6 +93,15 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # scripts/verify_release_content_scan.sh runs later, from inside the
+      # `prepare` step of "Run semantic-release" below, and expects a
+      # gitleaks binary already at the repository root. Installed here,
+      # before semantic-release even starts, via the same pinned-and-
+      # verified install this repository's ordinary secret scan
+      # (secret-scan.yml) uses — one trusted binary, not a second copy of
+      # the pin.
+      - name: Install gitleaks (pinned binary, checksum-verified)
+        run: bash scripts/install_gitleaks.sh
       - name: Setup Node
         uses: actions/setup-node@v7
         with:

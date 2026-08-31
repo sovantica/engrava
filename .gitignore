@@ -43,6 +43,11 @@ mypy_out.txt
 node_modules/
 package-lock.json
 
+# gitleaks binary — fetched fresh by scripts/install_gitleaks.sh in every CI
+# job that needs it. Never committed; ignored so a local run of that script
+# (e.g. to reproduce a release-gate failure) can't end up staged by accident.
+/gitleaks
+
 # Package manager cache (uv). The cache dir self-ignores via an internal
 # .gitignore, but that is fragile — ignore it explicitly here too so it can
 # never be tracked. (uv.lock itself is intentionally tracked — see pyproject.)

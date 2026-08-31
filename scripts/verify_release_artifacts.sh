@@ -37,6 +37,18 @@
 # dist/SHA256SUMS, written last, is the byte-identity record the publish job
 # checks before it uploads: the publish job never rebuilds, it only verifies
 # that what it is about to ship still hashes to what this script verified.
+#
+# The very first thing this script does, ahead of even the smoke gate, is
+# scripts/verify_release_content_scan.sh — the one call site both this gate
+# and this repository's ordinary secret scan use for text the ordinary scan
+# never reads at all: the squash-merge commit message this release was
+# built from, and CHANGELOG.md as @semantic-release/changelog already wrote
+# it to disk (which is, by construction, the same text
+# @semantic-release/git embeds in the release commit message and
+# @semantic-release/github publishes as the Release body — see that script
+# for why scanning the file covers all three). It runs first because it is
+# the cheapest check here and needs none of the build below to have
+# happened.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -45,6 +57,9 @@ if [ "$#" -ne 1 ]; then
   exit 2
 fi
 EXPECTED_VERSION="$1"
+
+echo "== Scanning for secrets the ordinary scan never reads (commit messages, generated changelog) =="
+bash scripts/verify_release_content_scan.sh
 
 echo "== Pre-publish smoke gate =="
 python scripts/check_smoke_gate.py
