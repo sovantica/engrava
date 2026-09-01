@@ -23,9 +23,41 @@ all reads and scales freely; writes are comparatively infrequent.
 ## Many async tasks, one store
 
 Share one store instance across the `asyncio` tasks in your event loop. You do
-not need a connection pool or multiple stores for in-process concurrency — but
-the store does **not** make a read-modify-write operation atomic, and the rest of
-this section is the precise line between the two.
+not need a connection pool or multiple stores for in-process concurrency.
+**Every guarded write path on a store instance shares one in-process,
+task-reentrant write lock:** the read, the validation, and the write inside
+`create_thought` / `get_or_create` / `upsert_by_hash` / `bulk_store` /
+`update_thought` / `restore_thought` / `delete_thought` / `create_edge` /
+`update_edge` / `delete_edge` / `create_action` / `update_action` /
+`store_embedding` / `record_access` / `cleanup_expired` / `run_hygiene` /
+`suspend_auto_commit()` is one critical section **with respect to every other
+task on this instance** — a different task's call to any of these blocks until
+the one in progress has committed (or rolled back) rather than landing in the
+middle of it. The lock is **task-reentrant, not call-reentrant**: the *same*
+task may freely nest calls — notably a write issued from inside its own
+`suspend_auto_commit()` window — but a *different* task genuinely waits. This
+closes several races the rest of this page used to document as permanent; the
+exact scope (what changed and what did not) is stated precisely below rather
+than summarised here, because the two are easy to conflate and the difference
+matters.
+
+**What this does not do:** it does not make a read-modify-write your own code
+performs *across two separate calls* atomic — `thought = await
+store.get_thought(id)` followed later by `await store.update_thought(id,
+field=thought.field + 1)` is still two independent critical sections with a gap
+between them, exactly as before (see [the safe idioms](#the-safe-idioms)
+below). It also does not reach across connections — a second store on the same
+database file is unaffected (see
+[Multiple stores, one database file](#multiple-stores-one-database-file)) — or
+around a caller holding a raw, unmediated transaction directly against the
+connection (see [Busy timeout](#busy-timeout)). **Nor does it reach a direct
+call to `store.journal.append()`** — the public `JournalWriter` returned by
+`store.journal` does not hold this lock itself (it only serialises its own
+sequence-number allocation), so appending through it yourself, outside of a
+write this store performs on your behalf, has the same exposure as the raw,
+unmediated connection case: it can land inside another task's open window and
+be rolled back with it. Let the store journal its own mutations; treat a
+direct `append()` call as unmediated use of the connection.
 
 ### What is guaranteed
 
@@ -33,6 +65,19 @@ this section is the precise line between the two.
   on a dedicated background thread and marshals every call onto it, so two tasks'
   statements are serialised rather than executed at once — and SQLite applies
   each statement atomically, so no query observes a half-written row.
+- **A guarded write's own read, validation, and write are now atomic across
+  tasks.** Before this, a different task's entire operation could land
+  between one call's read and its write; now it cannot start until the first
+  call's write lock is released. Concretely: a second task's read inside
+  `update_thought` / `restore_thought` / `update_edge` / `update_action` always
+  observes the *first* task's already-committed result, never a stale
+  in-flight value; a competing cycle stamp that used to spuriously reject an
+  unrelated edit — merely because the two calls' reads and writes happened to
+  straddle each other — no longer does, because the second call's version guard
+  is now captured against the post-first-call row; and a lifecycle transition
+  is now validated against whatever the *most recently completed* call on this
+  instance actually left behind, not a value another task's call might still be
+  mid-write on.
 - **An edit writes only the columns it owns.** `update_thought` writes the fields
   the call gave a new value to, plus the `updated_at` stamp — not the whole
   record. A field another task changed since this call read the row is preserved
@@ -46,78 +91,59 @@ this section is the precise line between the two.
   moved that column, your update matches no row and is **rejected in full** with
   `StaleDataError` — even though the two edits share no field. So two edits to
   different fields both survive when both are ordinary edits, and stop doing so
-  the moment either one stamps a cycle.
+  the moment either one stamps a cycle. (This is a *rule*, not a race: the guard
+  is part of every update's `WHERE` clause, whichever call happens to run
+  second under the write lock above.)
 - **A deduplication sighting counts.** `create_thought(deduplicate=True)` and
   `get_or_create()` bump `confirmation_count` **relative to what is stored**
   (`confirmation_count + 1`, evaluated by SQLite), so a bump made by another
   writer since the row was read is added to, never overwritten.
-- **Deduplication is serialised against itself.** `create_thought(deduplicate=True)`,
-  `get_or_create()` and `upsert_by_hash()` share an internal `asyncio.Lock`
-  covering the whole "probe the content hash, then insert or bump" window, so two
-  tasks on this instance calling **one of these three methods** cannot both race
-  past the probe. The same window is *also* serialised across connections — see
-  [Multiple stores, one database file](#multiple-stores-one-database-file). This
-  is a narrower guarantee than "safe against concurrent activity on the
-  instance" — see the next section for what a *different*, concurrent write can
-  still do to this window.
+- **Deduplication is serialised against itself, and now against every other
+  guarded write too.** `create_thought(deduplicate=True)`, `get_or_create()`
+  and `upsert_by_hash()` share an internal `asyncio.Lock` covering the whole
+  "probe the content hash, then insert or bump" window, so two tasks on this
+  instance calling **one of these three methods** cannot both race past the
+  probe — and that same window is also held under `_write_lock`,
+  so an *unrelated* guarded write from a different task cannot land inside it
+  either (see the "riding along" exposure this closes, described under
+  [Busy timeout](#busy-timeout)). The probe-and-insert window is *also*
+  serialised across connections — see
+  [Multiple stores, one database file](#multiple-stores-one-database-file).
+- **`suspend_auto_commit()` genuinely excludes every other task's guarded
+  write for its duration**, and survives nesting. See
+  [the dedicated section below](#suspend_auto_commit-is-now-a-real-exclusive-window).
 
 ### What is not guaranteed
 
-- **A read-modify-write is not a critical section.** `update_thought` reads the
-  row, applies your changes to it, then writes. aiosqlite serialises individual
-  *statements*, not method bodies, so another task's entire update can land
-  between that read and that write. If both edits name the **same** field, the
-  one whose `UPDATE` runs last wins and the other is discarded — silently, with
-  no error raised and nothing in the row to show it happened. (Edits to
-  *different* fields survive each other, subject to the cycle-guard exception
-  above.) The same window exists in `restore_thought` and
-  `upsert_by_hash`, which share the thought write path, and in `update_edge` /
-  `update_action` — those two carry no version guard at all, so they can never
-  raise `StaleDataError` under any circumstance.
-- **`StaleDataError` does not detect that.** See
+- **A caller-level read-modify-write across two separate calls is still not
+  atomic.** The lock above covers one call's *own* internal read and write —
+  it does not, and cannot, cover a gap between two calls your own code makes
+  (`get_thought` then, later, `update_thought`). See
+  [the safe idioms](#the-safe-idioms) for the caller-owned-lock pattern that
+  closes that gap.
+- **Same-field edits still resolve last-write-wins.** Two tasks legitimately
+  editing the same field is not a bug the lock removes — it removes the
+  *silent corruption* (a call's own read or write being torn by another call
+  landing mid-operation), not the ordinary fact that two edits to the same
+  field can only leave one final value. Whichever call's critical section runs
+  second determines the field's value, deterministically and without error.
+- **`update_edge` / `update_action` still carry no version guard.** They are
+  now inside the same critical section as everything else, but keyed on id
+  alone — a same-field edit still simply overwrites, with no `StaleDataError`
+  possible under any circumstance.
+- **`StaleDataError` does not detect "someone else wrote it."** See
   [Optimistic concurrency](#optimistic-concurrency-and-staledataerror) below for
   what the version guard actually rejects.
-- **A state-machine check is made against the row this call read.**
-  `update_thought(lifecycle_status=...)` and `update_action(status=...)` validate
-  the transition against the record the call itself loaded. If another writer
-  moves the row after that check passes, the write still lands — so two
-  individually-legal transitions can compose into one the state machine forbids
-  (an `ACTIVE -> DONE` edit landing on a row another task already archived leaves
-  it `DONE`, and `ARCHIVED -> DONE` is not an allowed edge). Serialise lifecycle
-  transitions on a row if that matters to you.
-- **`suspend_auto_commit()` belongs to the store, not to the task that opened
-  it.** The deferred-commit flag lives on the store instance, so a write issued
-  by *any* task while the window is open joins the window's transaction. If the
-  window rolls back, that unrelated write is rolled back with it, and the task
-  that issued it is never told.
-- **The dedup guard's own window has the same exposure as `suspend_auto_commit()`,
-  in both directions.** `create_thought(deduplicate=True)`, `get_or_create()`
-  and `upsert_by_hash()` hold a real transaction open across their
-  probe-and-row window (see [Busy timeout](#busy-timeout)). `_dedup_lock` only
-  keeps **another call to one of these three methods** from racing that
-  window — it is not a general per-instance write lock. A concurrent,
-  unrelated write from a different task on the same store instance
-  (`record_access()`, `update_thought()`, a delete, ...) can still land while
-  the window is open, in which case it joins that transaction: it is made
-  durable a little earlier than the other task's own commit would have if
-  this call's own write succeeds, and it is **rolled back along with this
-  call's own work if this call fails** — the same "joins the window's
-  transaction, and shares its fate" behaviour the bullet above describes for
-  `suspend_auto_commit()`, and for the same reason: a connection has exactly
-  one transaction, so once another task's write has joined this one there is
-  no way for this call to tell its own work apart from the other task's when
-  deciding what to commit or roll back. This is not new (every open
-  transaction on this connection has always had this exposure, including
-  before this window existed at all) and it is not fixed by clever bookkeeping
-  inside the guard — an earlier version of this page said this window commits
-  a concurrent task's write but never rolls it back, and that turned out to be
-  false: closing the rollback side inside the guard only moved the defect
-  somewhere else, three times, so the guard now defers every commit to
-  whichever method actually did the write and keeps only a rollback for its
-  own failure path. Closing this for real needs a task-reentrant lock around
-  every write path on the instance, not only the three dedup methods. Engrava
-  does not have that yet; until it does, the safe idioms below (one task owns
-  a row, or partition writes so they never compete) apply here too.
+- **A same-*task* nested call is not blocked by its own lock.** A caller-owned
+  hook or callback that itself issues a write, invoked synchronously from
+  inside another operation's read-modify-write span (not a second `asyncio`
+  task — a genuinely nested call on the *same* task), still runs freely: the
+  lock is task-reentrant by design (see the re-entrancy requirement above), so
+  it does not — and structurally cannot — protect against this shape. This is
+  a narrow, same-task case; ordinary callers issuing a second independent
+  operation from a second task are covered by the guarantee above.
+- **A second store on the same database file is unaffected.** See
+  [Multiple stores, one database file](#multiple-stores-one-database-file).
 - **One store belongs to one event loop.** Not because of the connection —
   aiosqlite creates each operation's future on the *calling* loop, so a plain
   read from a second loop works. It is the store's own synchronisation: the
@@ -128,6 +154,92 @@ this section is the precise line between the two.
   the first time two callers actually contend. Use one store per loop; within
   that loop, share it freely. (See
   [Known Limitations](known-limitations.md#aiosqlite-proxy-architecture).)
+
+### `suspend_auto_commit()` is now a real, exclusive window
+
+Before this, the deferred-commit flag lived on the store instance with
+nothing to stop a *different* task's write from landing inside an open
+`suspend_auto_commit()` window: it joined the window's transaction, and if the
+window rolled back, that unrelated write rolled back with it — silently, with
+the other task never told. `suspend_auto_commit()` now holds `_write_lock` for
+its entire duration, so a different task's call to any guarded write path
+cannot even begin until the window has closed. Concretely:
+
+- **A different task's write now waits, and survives independently.** It
+  cannot join the window's transaction — by the time it runs, the window has
+  already committed or rolled back — so its own outcome no longer depends on
+  the window's.
+- **Nesting is supported and safe.** A nested `suspend_auto_commit()` call —
+  reachable only from the *same* task, since the lock above blocks any other
+  task before it could nest — shares the outer call's transaction. Only the
+  **outermost** call commits on a clean exit or rolls back on an exception; an
+  inner call's own exit does neither.
+- **A write issued from inside your own window still works.** The lock is
+  task-reentrant: the same task's own writes inside the window it opened do
+  not block on themselves.
+
+This governs **this store instance** only. A second store on the same
+database file is unaffected — see
+[Multiple stores, one database file](#multiple-stores-one-database-file) — and
+the residual raw-transaction case described under
+[Busy timeout](#busy-timeout) is still outside what any in-process lock can
+reach.
+
+### A deadlock this store cannot resolve raises, it does not hang
+
+The in-process write lock is task-reentrant: the task that opened a
+`suspend_auto_commit()` window may issue writes of its own inside it freely,
+but a *different* task cannot reuse that grant. If the window's own task then
+spawns a task — `asyncio.create_task`, `gather`, `wait_for`, or one spawned
+inside an `on_store` hook or embedding provider callback — and **awaits it
+before the window closes**, neither can make progress: the spawned task can
+never get the lock the window's task holds, and the window's task can never
+release it while still awaiting the spawned task. This is already out of the
+documented contract above (drive every write inside an open window from the
+one task that opened it), so it is a caller bug, not a case this store can
+make safe by construction.
+
+What it must not become is a silent, unattributable hang. Acquiring this lock
+as a *different* task is bounded, and past the bound the acquiring call raises
+`WriteLockTimeoutError` instead of waiting forever. Raising also ends the
+deadlock itself: the spawned task's failure lets whatever was awaiting it
+unwind, which frees the window's task to finish and release the lock.
+
+**Say plainly what the bound is, since it is easy to state this in a way that
+contradicts itself: it is a backstop that converts an unattributable hang
+into an attributable error, and that backstop *can* fire on a legitimate
+hold longer than the configured value — that is not a contradiction of its
+purpose, it is why the value is configurable rather than fixed.** Sizing it
+requires real care for exactly that reason. `bulk_store`'s batch embedding
+call runs *inside* `suspend_auto_commit()`'s window (the batch's atomicity
+spans insert + embed + commit as one unit), so this lock is held for that
+whole call — a genuine network round trip to an embedding provider, which
+can legitimately take minutes for a large batch. A bound sized for "ordinary
+contention" would fire on this correct, documented usage; the default is
+instead derived from the shipped default provider's own worst-case
+retry-exhaustion time (three attempts at a 60s timeout each, plus backoff —
+about 183 seconds) with headroom on top for larger batches and for other
+providers this store cannot see the timeout/retry budget of. That headroom
+lowers the odds of a false positive; it does not remove them, since this
+store cannot know every caller's actual worst case.
+
+Configure it to match your own embedding provider and batch sizes:
+
+```python
+store = SqliteEngravaCore(
+    conn,
+    embedding_provider=my_slow_provider,
+    auto_embed=True,
+    write_lock_acquire_timeout_seconds=900,  # if your batches legitimately run longer
+)
+```
+
+or via `from_config(..., write_lock_acquire_timeout_seconds=...)`. Raise it
+if your own provider's or batch's worst case is close to or above the
+default — a legitimate hold longer than the configured value fails loudly
+instead of completing, and that failure looks identical to the deadlock case
+from the exception alone. Lower it only for a deployment that never drives
+`bulk_store` with network-bound embedding under load.
 
 ### The safe idioms
 
@@ -152,9 +264,11 @@ this section is the precise line between the two.
 
   This closes the window **within one process only** — see
   [Multiple stores, one database file](#multiple-stores-one-database-file).
-- **Drive `suspend_auto_commit()` from one task at a time**, with no other writer
-  on that store instance for the duration. `bulk_store()` relies on the same
-  contract.
+- **`suspend_auto_commit()` no longer needs this discipline enforced by
+  convention** — see the dedicated section above. It remains true that only
+  the task that opened the window (or a write nested inside it) should be the
+  one issuing writes inside it; a *different* task's write now simply waits
+  rather than racing in, which is what `bulk_store()` relies on.
 
 ## Optimistic concurrency and `StaleDataError`
 
@@ -191,6 +305,18 @@ stamped a cycle" signal: it is "this write found no row to apply to". Do not rea
 its *absence* as proof nobody else wrote. If your application needs caller-level
 staleness detection, keep your own version value in `metadata` and compare it
 yourself, or serialise the edits with the lock idiom above.
+
+**A genuinely concurrent, different task on this instance can no longer trigger
+this by interleaving:** the guard's baseline (`current.updated_cycle`,
+read fresh at the start of the call) and the guarded write it protects are now
+one critical section, so nothing a *different* task does can land between them
+— see [Many async tasks, one store](#many-async-tasks-one-store). What still
+can, in-process, is the narrow same-task nested-call shape noted there: a
+caller-owned hook that issues its own write, invoked synchronously from inside
+this call's own read-modify-write span, still runs (the lock is
+task-reentrant) and can move the cycle before this call's own write executes.
+Across connections, nothing changed: a second store on the same file can still
+trigger it exactly as before.
 
 ## Busy timeout
 
@@ -247,6 +373,22 @@ For the single-row calls — `create_thought(deduplicate=True)`,
 `get_or_create()` and `upsert_by_hash()` — the lock is released again as soon
 as the row is written, before auto-embed or the `on_store` hook run, so a slow
 or stalled embedding call cannot hold the file's write lock hostage.
+
+**The probe-and-row window used to have a second exposure, in-process: a
+concurrent, unrelated write from a *different task on this same instance*
+(`record_access()`, `update_thought()`, a delete, ...) could land while the
+window was open — joining its transaction, made durable a little earlier than
+that other task's own commit would have if this call's write succeeded, and
+rolled back along with this call's own work if it failed.** That was the
+"riding along" exposure: a connection has exactly one transaction, so once
+another task's write had joined this one there was no way to tell the two
+apart when deciding what to commit or roll back. An in-process
+task-reentrant write lock closes it
+in-process — the probe-and-row window now runs under the same `_write_lock`
+every other guarded write does, so a different task's write can no longer even
+start until the window has closed. It is not closed **across connections**: a
+second store's write still can, which is exactly [Multiple stores, one
+database file](#multiple-stores-one-database-file)'s subject.
 **`bulk_store(deduplicate=True)` does not share this property, by design, and
 this fix does not change that.** Its insert loop, and — when auto-embed is on
 — the one batch embedding call it makes afterwards, run inside a single
@@ -265,11 +407,14 @@ One case falls back to the pre-`BEGIN IMMEDIATE` behaviour: a caller already
 holding an open transaction on the connection through means this store does
 not manage (a raw `BEGIN` issued directly against it, with nothing written
 yet). This store cannot open a second `BEGIN` inside an already-open
-transaction, so it cannot acquire the write lock up front in that case, and
-falls back to whatever atomicity the caller's own transaction provides plus
-the in-process lock. Nothing in `bulk_store` or `suspend_auto_commit` triggers
-this — both are covered by the paragraph above — it can only arise from direct,
-unmediated use of the underlying connection.
+transaction, so it cannot acquire the cross-connection write lock up front in
+that case, and falls back to whatever atomicity the caller's own transaction
+provides. It still gets the in-process `_write_lock` — a
+different task on *this* instance still cannot land inside the window — only
+the cross-connection ordering is unavailable here. Nothing in `bulk_store` or
+`suspend_auto_commit` triggers this — both are covered by the paragraph
+above — it can only arise from direct, unmediated use of the underlying
+connection.
 
 ## Multiple stores, one database file
 
@@ -361,10 +506,10 @@ for when to choose per-service isolation over in-store filtering.
 | Many readers (WAL) | ✅ | Readers never block the writer. |
 | One writer at a time | ✅ | SQLite serialises writes. |
 | Two tasks editing **different** fields of one row | ✅ | An update writes only the columns it owns — unless one of them stamps `updated_cycle` (next row). |
-| Either task stamping `updated_cycle` | ❌ | The version guard rejects the other update in full, whatever field it touched. |
-| Two tasks editing the **same** field of one row | ❌ | Last write wins, silently. `StaleDataError` does not fire; serialise it yourself. |
-| Two tasks moving one row through its state machine | ❌ | Each transition is validated against the state its own call read. |
-| `suspend_auto_commit()` with another writer on that store | ❌ | The window is store-wide; the other writer's rows roll back with it. |
+| Either task stamping `updated_cycle` | ✅ | The guard's read and the write it protects are now one critical section across tasks, so a competing stamp can no longer land mid-call and spuriously reject an unrelated edit. |
+| Two tasks editing the **same** field of one row | ✅ | Still last write wins — that is the correct outcome for two genuine edits — but each call's own read and write can no longer be corrupted by the other landing mid-operation. |
+| Two tasks moving one row through its state machine | ✅ | Each transition is validated against the row the *previous, now-completed* call actually left — a forbidden composite move is rejected instead of silently landing. |
+| `suspend_auto_commit()` with another writer on that store | ✅ | The window now holds a task-reentrant lock for its duration; a different task's write waits instead of joining the window's transaction. |
 | One store across multiple event loops | ❌ | The store's `asyncio.Lock`s bind to one loop; one store per loop. |
 | Many processes reading the same file | ✅ | WAL supports concurrent readers. |
 | Many stores/processes **writing** the same file | ❌ | Not supported — one writer per file; use `EngravaManager`. |

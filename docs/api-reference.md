@@ -388,7 +388,7 @@ result = await store.recall(
 | `await consolidate(*, current_cycle=None)` | `ConsolidationResult` | Run the dreaming extension wired by `from_config`; raises `RuntimeError` when dreaming is not enabled and uses `cycle_provider` when no explicit cycle is supplied |
 | `await verify_embedding_model()` | `None` | Raise `EmbeddingModelMismatchError` if the stored model lock disagrees with the configured provider |
 | `async with store.suppress_access_tracking():` | context manager | Suppress implicit retrieval-access buffering inside the current async task; nestable and concurrency-safe, with no effect when access tracking is disabled. Used by internal maintenance and read-only views so their reads do not inflate the frequency signal. |
-| `async with store.suspend_auto_commit():` | context manager | Defer per-call commits so a block of writes commits once (rolls back on error) — use for bulk ingest. The window belongs to the **store instance**, not to the task that opened it: any other task's write joins the same transaction and rolls back with it. Drive it from one task at a time |
+| `async with store.suspend_auto_commit():` | context manager | Defer per-call commits so a block of writes commits once (rolls back on error) — use for bulk ingest. Holds a task-reentrant lock for its duration: a *different* task's write now waits for the window to close rather than joining its transaction; the *same* task's own nested writes (and nested windows) proceed normally. See [Concurrency](concurrency.md#suspend_auto_commit-is-now-a-real-exclusive-window) |
 | `await close()` | `None` | Close the owned connection (only when the store opened it via `from_config`) |
 
 **Read-only health counters** (plain properties, not `await`, not in the metrics
@@ -794,6 +794,7 @@ store-replacement guidance, see [Error handling and recovery](error-handling.md)
 | `RecencyModeConflictError` | `EngravaError` | A query explicitly supplied both `current_cycle` and `recency_now` |
 | `InvalidRecencyArgumentError` | `EngravaError` | `recency_now` is malformed or `recency_now_half_life` is not positive |
 | `ConnectionQuarantinedError` | `EngravaError` | A failed derived-record compensation left the connection potentially indeterminate; the store instance is terminal and must be replaced |
+| `WriteLockTimeoutError` | `EngravaError` | A task could not acquire the store's in-process write lock within `write_lock_acquire_timeout_seconds`. Usually a task spawned and awaited from inside another task's own `suspend_auto_commit()` window (an out-of-contract deadlock this store ends by raising, rather than hanging); can also mean that bound is configured too small for a legitimately slow embedding provider — see [Concurrency](concurrency.md#a-deadlock-this-store-cannot-resolve-raises-it-does-not-hang) |
 | `ConfigError` | `ValueError` | YAML or direct config construction violates a documented configuration invariant |
 
 > `create_edge` raises `ReferentialIntegrityError` when an endpoint thought

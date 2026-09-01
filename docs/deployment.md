@@ -35,13 +35,14 @@ async def main() -> None:
   [Concurrency](concurrency.md#many-async-tasks-one-store). One store belongs to
   one running loop.
 - **Share that one store across the tasks in the loop.** You do **not** need a
-  pool of stores for in-process concurrency. What the store does not do is make a
-  read-modify-write atomic: two tasks editing the *same field* of the same row
-  lose one of the two writes, silently, and a task that stamps `updated_cycle`
-  gets a concurrent update rejected with `StaleDataError` whatever field it
-  touched. See
+  pool of stores for in-process concurrency. A guarded write's own read and
+  write are one critical section across tasks, so a genuinely concurrent
+  task's whole operation can no longer land in the middle of another's — but
+  two tasks editing the *same field* of the same row still leave only the
+  later one's value in place. What this does not cover is a read-modify-write
+  *your own code* spans across two separate calls. See
   [Concurrency](concurrency.md#many-async-tasks-one-store) for the exact
-  guarantees and the idioms that close the gap.
+  guarantees and the idioms that close that gap.
 
 ## The database files on disk
 

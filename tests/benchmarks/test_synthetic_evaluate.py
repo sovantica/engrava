@@ -366,6 +366,13 @@ class TestOffOnPair:
 # upsert_by_hash) cannot acquire its cross-connection BEGIN IMMEDIATE write lock
 # after retrying — an additive public-API addition, unrelated to this benchmark
 # suite, raised only under genuine write contention on that specific path.
+# Later extended with WriteLockTimeoutError, raised when a task cannot acquire
+# the store's in-process write lock within a configurable bound — an additive
+# public-API addition, unrelated to this benchmark suite, raised only when a
+# different task is spawned and awaited from inside another task's own
+# suspend_auto_commit() window (an out-of-contract deadlock this store cannot
+# otherwise resolve) or when that bound is configured too small for a
+# legitimately slow embedding provider.
 _PRE_WS_ALL_BASELINE = frozenset(
     {
         "ActionNotFoundError",
@@ -487,6 +494,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "VerificationStatus",
         "VisibilityQueryFilter",
         "WriteContentionError",
+        "WriteLockTimeoutError",
         "discover_manifests",
         "load_config",
         "parse",

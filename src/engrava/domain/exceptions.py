@@ -722,3 +722,70 @@ could not acquire the write lock for 'create_thought' after 3 attempt(s) \
             f"could not acquire the write lock for {operation!r} after "
             f"{attempts} attempt(s) (the database is busy) — retry the call"
         )
+
+
+class WriteLockTimeoutError(EngravaError):
+    """Raised when a task cannot get the in-process write lock within the bound.
+
+    The store's guarded write paths share one task-reentrant lock per
+    instance: the task that opened it may re-enter freely, and any other task
+    waits for it to be released. **This is not exclusively a contract-violation
+    signal** — a guarded critical section is not always short and network-free:
+    ``bulk_store``'s batch embedding call runs inside the same
+    ``suspend_auto_commit`` window that holds this lock, and that call reaches
+    a real embedding provider over the network, which can legitimately take
+    minutes for a large batch. The bound is sized with margin over that
+    provider's own worst-case retry-exhaustion time (see
+    ``_WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS`` in ``engrava_core.py`` for the
+    derivation), so ordinarily this fires only on the deadlock below — but a
+    bound configured too small for your own provider or batch sizes, or a
+    provider genuinely slower than the default covers, can trip this on
+    entirely correct, documented usage too. If that is what happened, raise
+    ``write_lock_acquire_timeout_seconds`` (a constructor / ``from_config``
+    parameter) to match your provider's real worst case; this exception alone
+    does not tell the two causes apart.
+
+    The other cause — the one this bound exists to convert from a hang into an
+    attributable error — is breaking the documented contract for the
+    transaction-deferral window: opening it, then spawning and awaiting
+    (directly, or transitively through ``gather``/``wait_for``/an ``on_store``
+    hook/embedding provider callback) a *different* task that itself tries to
+    write on this store before the window closes. That other task can never
+    get the lock the window's own task is holding, and the window's task can
+    never finish — and release it — while it is still awaiting that other
+    task. Nothing about re-entrancy helps here: it is keyed on the task
+    actually holding the lock, and the spawned task is a different one. This
+    is a real, unrecoverable deadlock the store cannot resolve on its own —
+    the alternative to raising this is hanging forever with nothing in any log
+    to point at why. Raising it here also ends the deadlock itself: once this
+    task's wait fails, whatever awaited it (directly or not) can observe the
+    failure and unwind, which lets the window's own task resume and close its
+    transaction. Fix that caller by driving every write on a given store
+    instance that is inside an open transaction-deferral window from the one
+    task that opened it (nested calls on that same task are always safe) —
+    never from a task spawned and joined inside the window. See the
+    concurrency documentation.
+
+    Args:
+        timeout_seconds: The bound that was exceeded.
+
+    Examples:
+        >>> raise WriteLockTimeoutError(timeout_seconds=30.0)
+        Traceback (most recent call last):
+            ...
+        engrava.domain.exceptions.WriteLockTimeoutError: \
+a guarded write could not acquire this store's write lock within 30.0s — \
+likely a task spawned and awaited from inside another task's open \
+suspend_auto_commit() window; drive writes on one store instance from one \
+task at a time
+
+    """
+
+    def __init__(self, *, timeout_seconds: float) -> None:
+        self.timeout_seconds = timeout_seconds
+        super().__init__(
+            "a guarded write could not acquire this store's write lock within "
+            f"{timeout_seconds}s — likely a task spawned and awaited from inside "
+            "another task's open suspend_auto_commit() window; drive writes on "
+            "one store instance from one task at a time"
+        )

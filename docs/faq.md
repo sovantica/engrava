@@ -55,12 +55,14 @@ and [Known Limitations](known-limitations.md#sqlite-vec-pre-v1-status).
 
 **Tasks: yes, with limits.** Share one store across the tasks in your event
 loop — aiosqlite serialises their statements on its background thread and WAL
-lets readers and a single writer coexist. What engrava does not do is make a
-read-modify-write atomic, so two tasks editing the *same field* of the same row
-lose one of the two writes, silently. Editing *different* fields is safe — unless
-one of the two passes `updated_cycle=`, which trips the version guard and gets
-the other update rejected with `StaleDataError` even though they share no field.
-Serialise the edits yourself when tasks genuinely compete for a row. See
+lets readers and a single writer coexist. A guarded write's own read and write
+are one critical section across tasks, so a genuinely concurrent task's whole
+operation can no longer land in the middle of another's — but two tasks
+editing the *same field* of the same row still leave only the later one's
+value; that is not a race, just two edits to one field. What this does not
+cover is a read-modify-write *your own code* spans across two separate calls
+(`get_thought()` now, `update_thought()` later) — serialise that yourself when
+tasks genuinely compete for a row. See
 [Concurrency](concurrency.md#many-async-tasks-one-store).
 
 **Processes: no.** Only one store may *write* a given database file; any number

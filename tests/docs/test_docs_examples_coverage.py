@@ -306,6 +306,12 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
         "requires an on-disk engrava.yaml and per-service db files; illustrative",
     ),
     (
+        "docs/concurrency.md",
+        "write_lock_acquire_timeout_seconds=900",
+        "fragment assuming a store, connection, and a caller-defined slow "
+        "embedding provider; illustrative constructor tuning, not runnable as-is",
+    ),
+    (
         "docs/configuration.md",
         'get_thought("abc")',
         "requires an on-disk engrava.yaml; illustrative load_config wiring",

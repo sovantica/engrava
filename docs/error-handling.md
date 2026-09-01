@@ -226,12 +226,15 @@ Operational rules:
 
 - Let an error escape the `async with` block. Catching it inside and then leaving
   normally tells the context manager to commit.
-- Do not nest `suspend_auto_commit()` and do not run another writer concurrently
-  on the same store instance. The deferred-commit flag belongs to the instance,
-  not to an individual task: a write issued by any other task while the window is
-  open joins the window's transaction, and a rollback discards it too — with no
-  error reaching the task that issued it. Drive the window from one task at a
-  time.
+- `suspend_auto_commit()` holds a task-reentrant lock for its whole duration: a
+  *different* task's write on the same store instance now waits for the window
+  to close instead of joining its transaction, and nesting on the *same* task
+  is supported (only the outermost call commits or rolls back). Drive the
+  window from one task at a time regardless — a second task's write is safe
+  from corruption, but it still simply waits, so interleaving unrelated writes
+  through a long-running window serialises them for no benefit. See
+  [Concurrency](concurrency.md#suspend_auto_commit-is-now-a-real-exclusive-window)
+  for the full contract.
 - Automatic on-store derivation is skipped inside a caller-held transaction.
   After commit, invoke `derive_existing()` explicitly for sources that need it.
 - In v0.6, the rollback branch catches `Exception`; `asyncio.CancelledError` is a

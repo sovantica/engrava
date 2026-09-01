@@ -369,6 +369,14 @@ with `target_id="x|"` collides with `mutation_type="INSERT_THOUGHT|x"` and no
 which is already past the boundary this chain defends; treat the binding as a
 property of the store's own field grammars, not of the encoding.
 
+**A direct `append()` call also sits outside the store's in-process write lock**
+(see [Concurrency](concurrency.md#many-async-tasks-one-store)) — a separate,
+non-security concern worth knowing here too: every mutation the store journals
+on your behalf runs the append under the same lock as the write it describes,
+but `JournalWriter` does not hold that lock itself. Appending directly through
+`store.journal` can still land inside another task's open transaction-deferral
+window and be rolled back with it. Let the store journal its own mutations.
+
 Verification also re-serialises the stored `delta` before hashing it
 (`json.loads` in, `json.dumps(..., sort_keys=True)` out), so what the chain binds
 is the delta's **decoded value**, not its stored bytes: rewriting the blob's key
