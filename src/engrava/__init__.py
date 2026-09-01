@@ -67,6 +67,7 @@ from engrava.domain.exceptions import (
     StaleDataError,
     ThoughtNotFoundError,
     VectorDimensionMismatchError,
+    WriteContentionError,
 )
 from engrava.domain.manifest import ExtensionManifest
 from engrava.domain.models.action import ActionRecord
@@ -249,6 +250,7 @@ __all__ = [
     "VectorDimensionMismatchError",
     "VerificationStatus",
     "VisibilityQueryFilter",
+    "WriteContentionError",
     "discover_manifests",
     "load_config",
     "parse",

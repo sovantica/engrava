@@ -51,9 +51,15 @@ this section is the precise line between the two.
   `get_or_create()` bump `confirmation_count` **relative to what is stored**
   (`confirmation_count + 1`, evaluated by SQLite), so a bump made by another
   writer since the row was read is added to, never overwritten.
-- **Deduplication is serialised** inside the store by an internal `asyncio.Lock`
+- **Deduplication is serialised against itself.** `create_thought(deduplicate=True)`,
+  `get_or_create()` and `upsert_by_hash()` share an internal `asyncio.Lock`
   covering the whole "probe the content hash, then insert or bump" window, so two
-  tasks on this instance cannot both race past the probe.
+  tasks on this instance calling **one of these three methods** cannot both race
+  past the probe. The same window is *also* serialised across connections — see
+  [Multiple stores, one database file](#multiple-stores-one-database-file). This
+  is a narrower guarantee than "safe against concurrent activity on the
+  instance" — see the next section for what a *different*, concurrent write can
+  still do to this window.
 
 ### What is not guaranteed
 
@@ -84,6 +90,34 @@ this section is the precise line between the two.
   by *any* task while the window is open joins the window's transaction. If the
   window rolls back, that unrelated write is rolled back with it, and the task
   that issued it is never told.
+- **The dedup guard's own window has the same exposure as `suspend_auto_commit()`,
+  in both directions.** `create_thought(deduplicate=True)`, `get_or_create()`
+  and `upsert_by_hash()` hold a real transaction open across their
+  probe-and-row window (see [Busy timeout](#busy-timeout)). `_dedup_lock` only
+  keeps **another call to one of these three methods** from racing that
+  window — it is not a general per-instance write lock. A concurrent,
+  unrelated write from a different task on the same store instance
+  (`record_access()`, `update_thought()`, a delete, ...) can still land while
+  the window is open, in which case it joins that transaction: it is made
+  durable a little earlier than the other task's own commit would have if
+  this call's own write succeeds, and it is **rolled back along with this
+  call's own work if this call fails** — the same "joins the window's
+  transaction, and shares its fate" behaviour the bullet above describes for
+  `suspend_auto_commit()`, and for the same reason: a connection has exactly
+  one transaction, so once another task's write has joined this one there is
+  no way for this call to tell its own work apart from the other task's when
+  deciding what to commit or roll back. This is not new (every open
+  transaction on this connection has always had this exposure, including
+  before this window existed at all) and it is not fixed by clever bookkeeping
+  inside the guard — an earlier version of this page said this window commits
+  a concurrent task's write but never rolls it back, and that turned out to be
+  false: closing the rollback side inside the guard only moved the defect
+  somewhere else, three times, so the guard now defers every commit to
+  whichever method actually did the write and keeps only a rollback for its
+  own failure path. Closing this for real needs a task-reentrant lock around
+  every write path on the instance, not only the three dedup methods. Engrava
+  does not have that yet; until it does, the safe idioms below (one task owns
+  a row, or partition writes so they never compete) apply here too.
 - **One store belongs to one event loop.** Not because of the connection —
   aiosqlite creates each operation's future on the *calling* loop, so a plain
   read from a second loop works. It is the store's own synchronisation: the
@@ -195,6 +229,48 @@ await store.ensure_schema()
 A longer busy timeout trades latency-on-contention for fewer `database is locked`
 errors; tune it to your write pattern.
 
+**The content-hash dedup path is the one exception to "raw `database is
+locked`."** `create_thought(deduplicate=True)`, `get_or_create()`,
+`upsert_by_hash()` and `bulk_store(deduplicate=True)` open their probe-and-row
+window with `BEGIN IMMEDIATE` instead of letting the probe's `SELECT` open an
+implicit deferred transaction — so lock contention surfaces at the start of the
+window rather than only once the eventual `INSERT`/`UPDATE` needs the lock,
+which is where a deferred transaction would otherwise invite the classic
+embedded-SQLite deadlock. The busy timeout above still applies to each
+attempt; on top of it, the call retries a bounded number of times with a
+short backoff and, only once that is exhausted, raises `WriteContentionError`
+(a subclass of `EngravaError`) instead of leaking `sqlite3.OperationalError`.
+Retrying the call outright is safe — nothing was read or written before the
+lock was acquired.
+
+For the single-row calls — `create_thought(deduplicate=True)`,
+`get_or_create()` and `upsert_by_hash()` — the lock is released again as soon
+as the row is written, before auto-embed or the `on_store` hook run, so a slow
+or stalled embedding call cannot hold the file's write lock hostage.
+**`bulk_store(deduplicate=True)` does not share this property, by design, and
+this fix does not change that.** Its insert loop, and — when auto-embed is on
+— the one batch embedding call it makes afterwards, run inside a single
+`suspend_auto_commit` transaction (see
+[Many async tasks, one store](#many-async-tasks-one-store)), so the write lock
+taken for the first row's probe is held until the whole batch commits at the
+end: across every row's insert *and* across the batch embedding call. This is
+not new behaviour. Before `BEGIN IMMEDIATE` existed on this path, the first
+`INSERT` in the loop already took SQLite's RESERVED lock implicitly and held
+it for exactly as long, because `bulk_store` is documented as one
+all-or-nothing transaction per batch. `BEGIN IMMEDIATE` only moves *when* the
+lock is acquired — to before the first row's probe instead of at the first
+row's insert — it does not change how long the lock is held.
+
+One case falls back to the pre-`BEGIN IMMEDIATE` behaviour: a caller already
+holding an open transaction on the connection through means this store does
+not manage (a raw `BEGIN` issued directly against it, with nothing written
+yet). This store cannot open a second `BEGIN` inside an already-open
+transaction, so it cannot acquire the write lock up front in that case, and
+falls back to whatever atomicity the caller's own transaction provides plus
+the in-process lock. Nothing in `bulk_store` or `suspend_auto_commit` triggers
+this — both are covered by the paragraph above — it can only arise from direct,
+unmediated use of the underlying connection.
+
 ## Multiple stores, one database file
 
 **Engrava does not currently support more than one store *writing* the same
@@ -213,10 +289,20 @@ single store object and stops at its boundary:
    described above does not stop at the store — a second store's edit lands in it
    just the same, and the `updated_cycle` guard does not report it. Between two
    *processes* no in-process lock could close that window even in principle.
-2. **`deduplicate=True` can still insert a duplicate.** The deduplication lock is
-   per store instance. Two stores can both probe the content hash, both miss, and
-   both insert — leaving two rows for byte-identical content, neither of them
-   confirmation-counted, which is exactly what the flag was asked to prevent.
+2. **`deduplicate=True`, `get_or_create()`, `upsert_by_hash()` and
+   `bulk_store(deduplicate=True)` no longer duplicate across stores.** The
+   in-process `asyncio.Lock` is still per store instance, but the
+   probe-and-row window itself now opens with `BEGIN IMMEDIATE` (see
+   [Busy timeout](#busy-timeout)) as soon as no transaction is already open on
+   the connection — including the first row of a `bulk_store` batch, which
+   covers the whole batch under that same lock even though `bulk_store` defers
+   every row's own commit to the end. A second store reaching the same window
+   while it is open cannot even start its own transaction, so the two can no
+   longer both probe unlocked and both insert. Ordinary contention is waited
+   out; only past a bounded number of retries does the second store raise
+   `WriteContentionError` instead of getting a turn. The one case this does not
+   cover — a caller holding a raw, unmediated transaction on the connection —
+   is the same residual gap named under [Busy timeout](#busy-timeout).
 3. **The audit journal's sequence numbers collide.** When journaling is enabled,
    appends are serialised by an `asyncio.Lock` keyed on **the connection**. A
    second store has a second connection and therefore a different lock — in
@@ -229,14 +315,18 @@ single store object and stops at its boundary:
    RuntimeError: Failed to append journal entry after 5 retries due to sequence contention
    ```
 
-   That error is the loud symptom of this topology. The first two failures have
-   no symptom at all.
+   That error is the loud symptom of this topology. The first of the three
+   (the silently-discarded update) has no symptom at all; the second is no
+   longer a failure in the case this store manages — only the raw-transaction
+   fallback described above still fails the same way, silently.
 
-Two things *do* survive a second connection, and they are worth knowing so the
-rule is not read as broader than it is: **reading** (any number of processes may
-read one file under WAL) and the **relative `confirmation_count` bump** described
-above, which is evaluated by SQLite against the stored row rather than derived
-from a prior read.
+Several things *do* survive a second connection, and they are worth knowing so
+the rule is not read as broader than it is: **reading** (any number of
+processes may read one file under WAL); the **relative `confirmation_count`
+bump**, evaluated by SQLite against the stored row rather than derived from a
+prior read; and, as of the `BEGIN IMMEDIATE` window described above, **the
+dedup probe-and-insert itself** — no longer racy, whether it lands as a fresh
+insert or a confirmation bump.
 
 Making the read-modify-write paths correct across connections needs a
 transaction-level mechanism engrava does not have yet. It is deferred, not ruled

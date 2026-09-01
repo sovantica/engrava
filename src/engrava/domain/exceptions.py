@@ -677,3 +677,48 @@ class ConnectionQuarantinedError(EngravaError):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(f"connection quarantined: {reason}")
+
+
+class WriteContentionError(EngravaError):
+    """Raised when the dedup probe-and-insert window cannot get the write lock.
+
+    ``create_thought(deduplicate=True)``, ``get_or_create`` and
+    ``upsert_by_hash`` open their "check existing, then insert or bump" window
+    with ``BEGIN IMMEDIATE`` so a second connection — a second process, or a
+    second store on the same database file — reaching the same window is
+    turned away at transaction *start* rather than mid-transaction, which is
+    the classic embedded-SQLite deadlock shape a deferred ``BEGIN`` invites.
+
+    SQLite's own busy handler (``PRAGMA busy_timeout``) already waits for the
+    lock before giving up, and the store retries the whole ``BEGIN IMMEDIATE``
+    a bounded number of times with backoff on top of that. This error is
+    raised only once both are exhausted, so a caller sees a typed, catchable
+    failure instead of a raw :class:`sqlite3.OperationalError` leaking out of
+    the public API.
+
+    Retrying the call outright is safe: the transaction that would have done
+    the work never started, so nothing was read or written under it — there
+    is no partial state to reconcile, only contention to wait out.
+
+    Args:
+        operation: Name of the guarded method that could not get the lock
+            (e.g. ``"create_thought"``).
+        attempts: Number of ``BEGIN IMMEDIATE`` attempts made before giving up.
+
+    Examples:
+        >>> raise WriteContentionError(operation="create_thought", attempts=3)
+        Traceback (most recent call last):
+            ...
+        engrava.domain.exceptions.WriteContentionError: \
+could not acquire the write lock for 'create_thought' after 3 attempt(s) \
+(the database is busy) — retry the call
+
+    """
+
+    def __init__(self, *, operation: str, attempts: int) -> None:
+        self.operation = operation
+        self.attempts = attempts
+        super().__init__(
+            f"could not acquire the write lock for {operation!r} after "
+            f"{attempts} attempt(s) (the database is busy) — retry the call"
+        )

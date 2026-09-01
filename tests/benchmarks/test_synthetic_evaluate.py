@@ -361,6 +361,11 @@ class TestOffOnPair:
 # a public ``dimension``). The protocol has always required it; the error only
 # replaces the bare AttributeError the core previously raised from internals, so
 # it is additive and unreachable for any conformant provider.
+# Later extended with WriteContentionError, raised when the content-hash dedup
+# probe-and-insert window (create_thought(deduplicate=True), get_or_create,
+# upsert_by_hash) cannot acquire its cross-connection BEGIN IMMEDIATE write lock
+# after retrying — an additive public-API addition, unrelated to this benchmark
+# suite, raised only under genuine write contention on that specific path.
 _PRE_WS_ALL_BASELINE = frozenset(
     {
         "ActionNotFoundError",
@@ -481,6 +486,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "VectorDimensionMismatchError",
         "VerificationStatus",
         "VisibilityQueryFilter",
+        "WriteContentionError",
         "discover_manifests",
         "load_config",
         "parse",

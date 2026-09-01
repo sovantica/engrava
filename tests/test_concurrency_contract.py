@@ -14,9 +14,16 @@ can be exercised in-process is pinned here, in both directions:
   ``StaleDataError`` fires only when a competing writer moved ``updated_cycle``,
   and the edge/action write paths carry no version guard at all; a state-machine
   check is made against the row the call read, so two legal transitions can
-  compose into a forbidden one; a ``suspend_auto_commit`` window belongs to the
-  store instance, not to the task that opened it; and nothing that orders
-  operations inside one store reaches a second store on the same file.
+  compose into a forbidden one; and a ``suspend_auto_commit`` window belongs to
+  the store instance, not to the task that opened it.
+* **The one exception** — the content-hash dedup probe-and-insert window
+  (``create_thought(deduplicate=True)``, ``get_or_create``, ``upsert_by_hash``)
+  now *does* order across a second store on the same file: it opens with
+  ``BEGIN IMMEDIATE``, so a second store reaching the same window while it is
+  open cannot even start its own transaction. It waits out ordinary contention
+  and, only past a bounded number of retries, raises ``WriteContentionError``
+  instead of racing the probe. Nothing else in this module reaches across
+  connections.
 
 The interleavings are deterministic. The single-store cases reuse the one-shot
 seam from ``test_partial_field_updates`` to run the competing write at the exact
@@ -47,6 +54,7 @@ from engrava import (
     ThoughtRecord,
     ThoughtType,
     VerificationStatus,
+    WriteContentionError,
 )
 from tests.test_partial_field_updates import _interleave_once
 
@@ -601,6 +609,59 @@ class TestSuspendAutoCommitIsStoreWide:
 
         assert await _thought_ids(db) == ["t-committed"]
 
+    async def test_cancellation_inside_the_window_releases_the_lock(
+        self,
+        store: SqliteEngravaCore,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """Cancelling a task mid-window rolls back and releases the RESERVED lock.
+
+        ``suspend_auto_commit`` used to catch ``except Exception``, not
+        ``except BaseException``. ``asyncio.CancelledError`` derives from
+        ``BaseException``, so a cancellation landing inside the window (a
+        ``bulk_store`` call whose caller times out or is torn down, for
+        instance) skipped the rollback entirely: ``finally`` still cleared the
+        deferred-commit flag, but ``db.in_transaction`` stayed ``True`` and the
+        RESERVED lock was left stranded, blocking every other writer on the
+        connection until something else eventually committed, rolled back, or
+        closed it.
+
+        Driven by an ``asyncio.Event`` handshake rather than a sleep, matching
+        this module's rule against wall-clock timing: the window signals once
+        its own row is written and it is parked, so the cancellation lands
+        deterministically mid-window instead of hoping a delay was long enough.
+        """
+        window_started = asyncio.Event()
+
+        async def _window() -> None:
+            async with store.suspend_auto_commit():
+                await store.create_thought(_thought("t-cancelled", content="never durable"))
+                window_started.set()
+                await asyncio.Event().wait()  # never set; only cancellation ends this
+
+        task = asyncio.create_task(_window())
+        await window_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert not db.in_transaction, (
+            "the RESERVED lock was left stranded after cancellation inside "
+            "suspend_auto_commit"
+        )
+        # Rolled back, not merely abandoned: the window's own row must not
+        # have survived the cancellation either.
+        assert await _thought_ids(db) == []
+
+        # The store must still be usable -- a stranded lock would make this
+        # hang (waiting on itself) or raise "cannot start a transaction
+        # within a transaction".
+        created = await store.create_thought(
+            _thought("t-after", content="proves the store still works"),
+        )
+        assert created.thought_id == "t-after"
+        assert await _thought_ids(db) == ["t-after"]
+
 
 # ---------------------------------------------------------------------------
 # Two stores, one database file
@@ -608,7 +669,14 @@ class TestSuspendAutoCommitIsStoreWide:
 
 
 class TestTwoStoresOneFile:
-    """Nothing that orders operations inside one store reaches a second store."""
+    """Nothing orders operations across stores — except the dedup probe window.
+
+    ``update_thought`` (below) still lets a second store's edit land unordered
+    with the first's, per the module docstring. The two dedup tests further
+    down are the module's one exception: they now demonstrate
+    ``BEGIN IMMEDIATE`` turning that same shape of race into a typed
+    ``WriteContentionError`` instead of a silent duplicate.
+    """
 
     async def test_an_edit_from_a_second_store_is_discarded_without_raising(
         self,
@@ -640,18 +708,30 @@ class TestTwoStoresOneFile:
         row = await _row(conn_a, "t-1")
         assert row["essence"] == "from the first store"
 
-    async def test_deduplication_still_inserts_a_duplicate_across_stores(
+    async def test_deduplication_across_stores_raises_instead_of_duplicating(
         self,
         two_stores: tuple[SqliteEngravaCore, SqliteEngravaCore, aiosqlite.Connection],
     ) -> None:
-        """``deduplicate=True`` is enforced by a lock that stops at the store.
+        """``deduplicate=True`` now serialises across stores instead of racing.
 
-        Both stores probe the content hash, both miss, and both insert — so the
-        database ends up holding two rows for byte-identical content, neither
-        of them confirmation-counted, which is exactly what the flag was asked
-        to prevent.
+        Before the fix, both stores probed the content hash, both missed, and
+        both inserted — two rows for byte-identical content, neither
+        confirmation-counted. Now the first store's probe-and-insert window
+        holds the write lock (``BEGIN IMMEDIATE``) for its duration; a second
+        store reaching the same window while it is open cannot even start its
+        own transaction. Forced — by this test's interleave — to stay open for
+        the whole nested call, the first store's window outlasts every retry
+        the second store makes, so the second store raises
+        ``WriteContentionError``. That exception then unwinds out of the
+        interleaved call and rolls the first store's own attempt back too:
+        neither row lands, rather than one succeeding partially.
         """
         store_a, store_b, conn_a = two_stores
+        # A short busy_timeout on the second store: its every attempt is
+        # doomed for as long as the first store's window stays open, which by
+        # construction is the whole interleaved call, so a longer timeout
+        # would only slow the test down, not change the outcome.
+        await store_b._db.execute("PRAGMA busy_timeout = 20")
 
         async def _insert_from_the_second_store() -> None:
             await store_b.create_thought(
@@ -661,30 +741,36 @@ class TestTwoStoresOneFile:
 
         _interleave_once(store_a, "_get_thought_by_content_hash", _insert_from_the_second_store)
 
-        await store_a.create_thought(
-            _thought("t-a", content="identical content"),
-            deduplicate=True,
-        )
+        with pytest.raises(WriteContentionError):
+            await store_a.create_thought(
+                _thought("t-a", content="identical content"),
+                deduplicate=True,
+            )
 
-        assert await _thought_ids(conn_a) == ["t-a", "t-b"]
-        for thought_id in ("t-a", "t-b"):
-            row = await _row(conn_a, thought_id)
-            assert row["content"] == "identical content"
-            assert row["confirmation_count"] == 0
+        # Neither insert landed: the second store never got past
+        # ``BEGIN IMMEDIATE``, and the first store's own transaction was
+        # rolled back once the interleaved call raised into it.
+        assert await _thought_ids(conn_a) == []
 
-    async def test_confirmation_counting_survives_a_second_store(
+    async def test_confirmation_counting_across_stores_now_raises_instead_of_racing(
         self,
         two_stores: tuple[SqliteEngravaCore, SqliteEngravaCore, aiosqlite.Connection],
     ) -> None:
-        """A dedup hit counts relative to storage, so neither sighting is lost.
+        """A confirmation racing a second store's open window now fails loudly.
 
-        The guarantee that does cross the connection boundary: the bump is
-        ``confirmation_count = confirmation_count + 1`` evaluated by SQLite, not
-        an absolute value derived from a read. Two stores confirming the same
-        content therefore both count.
+        Before the fix, both stores' relative ``confirmation_count + 1`` bumps
+        landed independently, so a race here was harmless in isolation — but
+        it depended on the same unordered probe that the previous test shows
+        is unsafe for an outright insert. Now the first store's window holds
+        the write lock for its duration, so the second store cannot even
+        start counting while it is open; it raises ``WriteContentionError``,
+        which unwinds the first store's own attempt too rather than leaving
+        it half-applied.
         """
         store_a, store_b, conn_a = two_stores
         await store_a.create_thought(_thought(content="identical content"))
+        # See the previous test for why this needs a short busy_timeout.
+        await store_b._db.execute("PRAGMA busy_timeout = 20")
 
         async def _confirm_from_the_second_store() -> None:
             await store_b.create_thought(
@@ -694,11 +780,14 @@ class TestTwoStoresOneFile:
 
         _interleave_once(store_a, "_get_thought_by_content_hash", _confirm_from_the_second_store)
 
-        await store_a.create_thought(
-            _thought("t-a", content="identical content"),
-            deduplicate=True,
-        )
+        with pytest.raises(WriteContentionError):
+            await store_a.create_thought(
+                _thought("t-a", content="identical content"),
+                deduplicate=True,
+            )
 
+        # Neither confirmation landed: the only row is the original insert,
+        # untouched.
         assert await _thought_ids(conn_a) == ["t-1"]
         row = await _row(conn_a, "t-1")
-        assert row["confirmation_count"] == 2
+        assert row["confirmation_count"] == 0
