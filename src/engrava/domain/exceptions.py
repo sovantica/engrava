@@ -499,6 +499,82 @@ class CoreMigrationError(EngravaError):
         super().__init__(f"[core schema v{target_version}] {message}")
 
 
+class SchemaVersionError(EngravaError):
+    """Raised when ``ensure_schema`` refuses to open a database as-is.
+
+    Two distinct refusals share this type, both because the engine has been
+    handed a database it cannot safely bring to a known state on its own:
+
+    * ``"populated_sub_floor"`` — the stamped ``user_version`` is below the
+      version the bootstrap script assumes (empty), but the file already
+      carries a core table. Stamping it current with a script of
+      ``CREATE ... IF NOT EXISTS`` statements would leave whatever the file
+      actually contains silently mislabelled as a fresh, fully-migrated
+      schema.
+    * ``"newer_than_head"`` — the stamped ``user_version`` is higher than
+      this build's head version. The migration registry has no step to run
+      and nothing tells the caller that the file was written by a newer
+      engrava.
+
+    Constructed via :meth:`populated_sub_floor` or :meth:`newer_than_head`
+    rather than directly, so the message is always built from the same two
+    version numbers the caller already has.
+
+    Args:
+        current_version: The database's stamped ``user_version``.
+        reason: Which refusal this is — ``"populated_sub_floor"`` or
+            ``"newer_than_head"``.
+        message: Human-readable description, built by the named constructor.
+
+    """
+
+    def __init__(self, current_version: int, reason: str, message: str) -> None:
+        self.current_version = current_version
+        self.reason = reason
+        super().__init__(message)
+
+    @classmethod
+    def populated_sub_floor(cls, current_version: int, floor_version: int) -> SchemaVersionError:
+        """Build the refusal for a populated database below the bootstrap floor.
+
+        Args:
+            current_version: The database's stamped ``user_version``.
+            floor_version: The lowest version the bootstrap script may assume
+                is an empty file.
+
+        Returns:
+            A :class:`SchemaVersionError` describing the refusal.
+
+        """
+        message = (
+            f"Database is stamped user_version={current_version}, below the "
+            f"bootstrap floor (v{floor_version}), but already carries a core "
+            "table. Refusing to treat it as an empty database — this build "
+            "does not know how to bring a database this old to a known "
+            "schema state."
+        )
+        return cls(current_version, "populated_sub_floor", message)
+
+    @classmethod
+    def newer_than_head(cls, current_version: int, head_version: int) -> SchemaVersionError:
+        """Build the refusal for a database newer than this build's head.
+
+        Args:
+            current_version: The database's stamped ``user_version``.
+            head_version: This build's head core schema version.
+
+        Returns:
+            A :class:`SchemaVersionError` describing the refusal.
+
+        """
+        message = (
+            f"Database is stamped user_version={current_version}, newer than "
+            f"this engrava build's head version (v{head_version}). Refusing "
+            "to open it — upgrade engrava before opening this database."
+        )
+        return cls(current_version, "newer_than_head", message)
+
+
 class DerivedRecordError(EngravaError):
     """Raised when the derived-records extension seam rejects a producer result.
 

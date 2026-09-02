@@ -75,6 +75,7 @@ from engrava.domain.exceptions import (
     JournalIntegrityError,
     RecencyModeConflictError,
     ReferentialIntegrityError,
+    SchemaVersionError,
     SourceThoughtNotFoundError,
     StaleDataError,
     ThoughtNotFoundError,
@@ -162,6 +163,27 @@ _ORIGIN_DERIVE_EXISTING = "derive_existing"
 #: the head version itself) rather than stepped. A database at or above it is
 #: upgraded through the ordered core-migration registry.
 _CORE_SCHEMA_BOOTSTRAP_FLOOR = 2
+
+#: The core schema version ``ensure_schema`` upgrades a database to. Must
+#: equal the target of the last entry in :meth:`SqliteEngravaCore._core_migration_steps`
+#: — kept as its own constant (rather than read off the registry, which needs
+#: an instance) so a caller that has not opened a store yet — the CLI's
+#: schema-state gate, in particular — can compare a database's stamped
+#: ``user_version`` against head without one.
+CORE_SCHEMA_HEAD_VERSION = 20
+
+#: Core tables whose presence on a sub-floor database means it is a real,
+#: populated store rather than an empty file — see
+#: :meth:`SqliteEngravaCore._has_any_core_table`.
+_CORE_TABLE_NAMES = (
+    "thought",
+    "edge",
+    "embedding",
+    "action",
+    "_metadata",
+    "journal_entry",
+    "extension_schema_versions",
+)
 
 
 @dataclass(frozen=True)
@@ -1316,8 +1338,14 @@ class SqliteEngravaCore:
         # so quarantine revokes them all synchronously, independent of the
         # best-effort physical close.
         self._revocation = ConnectionRevocationToken()
-        # Retains the detached best-effort close task so it is neither GC'd while
-        # pending nor reported as an unretrieved-exception task.
+        # The task performing the real connection's *physical* close, however
+        # it started -- quarantine's own detached best-effort close, or an
+        # ordinary close() call that got there first. Doubles as the "a
+        # physical close is already in progress" marker close() and
+        # _quarantine_connection each check before starting a second,
+        # independent one on the same underlying connection (see close()).
+        # Also retains quarantine's own close task so it is neither GC'd
+        # while pending nor reported as an unretrieved-exception task.
         self._quarantine_close_task: asyncio.Task[None] | None = None
         self._fts_available: bool = False
         self._fts_probed: bool = False
@@ -1951,6 +1979,53 @@ class SqliteEngravaCore:
         failure never blocks the close), then closes the connection when this
         instance owns it. No-op on the connection when it is caller-managed
         (i.e. created via the manual constructor).
+
+        **Coordinates with a concurrent or prior quarantine.**
+        :meth:`_quarantine_connection` schedules its own physical close of
+        the real connection, detached and un-awaited, so that it can return
+        promptly even if that close hangs. If this call finds
+        :attr:`_quarantine_close_task` already set — quarantine got here
+        first, or does so while this call is in flight — it awaits that
+        same task instead of issuing a second, independent ``close()`` on
+        the same underlying connection: two concurrent closes on the pinned
+        aiosqlite version can each enqueue their own stop sentinel to the
+        worker thread, which exits on the first and can leave the other
+        caller's future unresolved forever. Only one physical close is ever
+        entered, whichever caller (this one, or quarantine) gets there
+        first.
+
+        **Both branches drain the task under :meth:`_drain_shielded`,
+        symmetrically** — the branch that creates the task is not exempt
+        just because it is the one that "owns" it. A bare ``await`` on the
+        task would propagate *this call's own* cancellation into the task
+        (unlike a shielded await), which can cancel the physical close
+        before ``_db.close()`` has meaningfully run at all — and that
+        half-run, cancelled task would still be ``done()``, so it would sit
+        in :attr:`_quarantine_close_task` looking exactly like a completed
+        close to every later caller that drains it, none of them any wiser
+        that the real connection was never actually closed. Draining under
+        ``_drain_shielded`` closes that off structurally rather than
+        detecting it afterwards: it re-shields on every repeated
+        cancellation of the awaiting coroutine and never returns until the
+        task is genuinely ``done()``, so the physical close always runs to
+        real completion — success or a real failure — regardless of how
+        many times this call is cancelled while waiting on it.
+
+        **What differs between the two branches is what happens next, not
+        how safely they wait.** When this call is the one that created the
+        task (the ordinary, non-quarantined close), its outcome is
+        actionable: a genuine close failure propagates via
+        :meth:`asyncio.Task.result`, exactly as an unshielded direct
+        ``await`` would have surfaced it. When this call is piggybacking on
+        a task quarantine already started, the outcome is discarded instead
+        — the connection is already terminally unusable via the quarantine
+        proxy, so nothing about how its close turned out is actionable to
+        this caller. Either way, a cancellation of *this specific await* —
+        whoever is awaiting ``close()`` being itself cancelled — is never
+        discarded and always propagates first, ahead of whatever the task
+        itself resolved to; the shared task keeps running to completion
+        regardless, so nothing is left half-closed by letting the
+        cancellation through.
         """
         if self._access_tracking_enabled:
             try:
@@ -1958,7 +2033,21 @@ class SqliteEngravaCore:
             except Exception:  # noqa: BLE001
                 logger.debug("access-buffer flush on close failed; counts are best-effort")
         if self._owns_connection:
-            await self._db.close()
+            if self._quarantine_close_task is not None:
+                cancel_error = await self._drain_shielded(self._quarantine_close_task)
+                if cancel_error is not None:
+                    raise cancel_error
+            else:
+                self._quarantine_close_task = asyncio.ensure_future(self._db.close())
+                cancel_error = await self._drain_shielded(self._quarantine_close_task)
+                if cancel_error is not None:
+                    raise cancel_error
+                # This is the real, non-quarantined close -- unlike the
+                # piggyback branch above, its own outcome is actionable, so
+                # it is surfaced (not discarded): a clean close returns
+                # None, an ordinary failure or an independent cancellation
+                # of the task itself both raise via result().
+                self._quarantine_close_task.result()
 
     async def __aenter__(self) -> Self:
         """Enter the async context manager.
@@ -2071,19 +2160,41 @@ class SqliteEngravaCore:
 
         Applies the full ``schema_core.sql`` (including the FTS5 virtual table
         and sync triggers) only when the database predates the migration-ladder
-        floor. A database at or above the floor is upgraded incrementally
-        through the ordered core-migration registry (see
-        :meth:`_core_migration_steps`) up to the head version (20).
+        floor **and carries no core table yet** — a populated sub-floor
+        database refuses instead (see :class:`SchemaVersionError`). A database
+        at or above the floor is upgraded incrementally through the ordered
+        core-migration registry (see :meth:`_core_migration_steps`) up to the
+        head version (:data:`CORE_SCHEMA_HEAD_VERSION`). A database stamped
+        **above** head also refuses rather than silently skipping every
+        migration step and opening as though it were current.
 
         After core schema creation or upgrade, probes for the ``thought_fts``
         table and then runs any pending extension schema migrations for each
         manifest supplied via the ``manifests`` constructor parameter.
+
+        Raises:
+            SchemaVersionError: When the database is a populated sub-floor
+                schema this build cannot bootstrap, or is stamped newer than
+                this build's head version.
+
         """
         cursor = await self._db.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         current_version = int(row[0]) if row else 0
 
         if current_version < _CORE_SCHEMA_BOOTSTRAP_FLOOR:
+            # A sub-floor database is only safe to bootstrap when it is truly
+            # empty. The bootstrap script is built entirely of
+            # ``CREATE ... IF NOT EXISTS`` statements ending in an
+            # unconditional ``PRAGMA user_version`` stamp — run against a file
+            # that already carries a core table (written by something older
+            # than this migration ladder's public history), it would leave
+            # whatever that file actually contains silently mislabelled as a
+            # fresh, fully-migrated schema.
+            if await self._has_any_core_table():
+                raise SchemaVersionError.populated_sub_floor(
+                    current_version, _CORE_SCHEMA_BOOTSTRAP_FLOOR
+                )
             # Fresh bootstrap: ``schema_core.sql`` already carries the head DDL
             # and stamps ``user_version`` itself, so no incremental step runs
             # for a brand-new database.
@@ -2093,6 +2204,12 @@ class SqliteEngravaCore:
                 .read_text(encoding="utf-8")
             )
             await self._db.executescript(schema_sql)
+        elif current_version > CORE_SCHEMA_HEAD_VERSION:
+            # The migration registry has no step targeting a version this high
+            # — the incremental loop would simply skip every entry and leave
+            # ``user_version`` untouched, opening a file written by a newer
+            # engrava as though it were current and understood.
+            raise SchemaVersionError.newer_than_head(current_version, CORE_SCHEMA_HEAD_VERSION)
         else:
             await self._run_pending_core_migrations(current_version)
 
@@ -2185,6 +2302,43 @@ class SqliteEngravaCore:
             await migrate()
             await self._db.execute(f"PRAGMA user_version = {target_version}")
             await self._db.commit()
+
+    async def _has_any_core_table(self) -> bool:
+        """Return whether the database already carries user data in a core table.
+
+        Used by :meth:`ensure_schema` to tell a genuinely empty file (safe to
+        bootstrap) apart from a **populated** sub-floor database (refused —
+        see :class:`SchemaVersionError`). Checked as row presence, not mere
+        table existence: the bootstrap script (``schema_core.sql``) is pure
+        DDL, so a bootstrap interrupted partway through (a mid-script DDL
+        failure) can leave empty table / index / trigger definitions behind
+        without ever writing a row, and a retry has to be able to re-run the
+        same idempotent ``CREATE ... IF NOT EXISTS`` script against that
+        partial, data-free state rather than being told it looks like a real
+        legacy database (see the failure-injection coverage in
+        ``TestBootstrapAtomicity``). A database that was actually used, by
+        contrast, carries at least one row somewhere — that is what
+        "populated" means here.
+
+        Returns:
+            ``True`` if any table in :data:`_CORE_TABLE_NAMES` exists **and**
+            holds at least one row.
+
+        """
+        for table in _CORE_TABLE_NAMES:
+            cursor = await self._db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            )
+            if await cursor.fetchone() is None:
+                continue
+            # `table` is drawn only from the fixed _CORE_TABLE_NAMES tuple
+            # above, never from caller input, so this interpolation cannot
+            # carry anything the allow-list did not already name.
+            row_cursor = await self._db.execute(f"SELECT 1 FROM {table} LIMIT 1")  # noqa: S608
+            if await row_cursor.fetchone() is not None:
+                return True
+        return False
 
     async def _probe_fts(self) -> None:
         """Detect whether the ``thought_fts`` FTS5 table exists.
@@ -3772,11 +3926,16 @@ class SqliteEngravaCore:
            on its next connection-touching method, so it cannot bypass the proxy.
         3. Detach the real connection, swap in a :class:`_QuarantinedConnection`
            proxy (so every core-initiated op raises), and schedule a **bounded,
-           detached** best-effort close for resource cleanup. Quarantine returns
-           promptly even if that close hangs forever — safety never depends on it.
-           A done-callback consumes the close outcome so a failure/cancellation
-           is never an unretrieved-task warning, and the task is retained so it is
-           not GC'd while pending.
+           detached** best-effort close for resource cleanup — unless
+           :meth:`close` already started (or is starting) that same physical
+           close, in which case this step defers to it entirely rather than
+           entering ``real_conn.close()`` a second time (see :meth:`close`
+           for the race two concurrent closes on the same connection can
+           hit). Quarantine returns promptly even if that close hangs
+           forever — safety never depends on it. A done-callback consumes
+           the close outcome so a failure/cancellation is never an
+           unretrieved-task warning, and the task is retained so it is not
+           GC'd while pending.
 
         Idempotent: a second call is a no-op (already quarantined).
 
@@ -3803,9 +3962,16 @@ class SqliteEngravaCore:
         # Detached best-effort close: schedule and return; do NOT await it, so a
         # hung close can never block quarantine (safety is already guaranteed by
         # the proxy + token). Retain the task and consume its result via callback.
-        close_task = asyncio.get_running_loop().create_task(real_conn.close())
-        self._quarantine_close_task = close_task
-        close_task.add_done_callback(self._consume_quarantine_close)
+        # But only schedule it if nothing has already initiated the physical
+        # close of this same real connection -- self._quarantine_close_task
+        # doubles as that shared "already in progress" marker, checked and set
+        # here with no await in between, which is what makes this race-free
+        # against a concurrent close() under cooperative scheduling: only one
+        # of the two ever wins the check.
+        if self._quarantine_close_task is None:
+            close_task = asyncio.get_running_loop().create_task(real_conn.close())
+            self._quarantine_close_task = close_task
+            close_task.add_done_callback(self._consume_quarantine_close)
 
     async def _maybe_commit(self) -> None:
         """Commit if auto-commit is not suspended.
@@ -6210,10 +6376,13 @@ class SqliteEngravaCore:
                     before_row = (
                         await self._get_thought_row(tid) if self._journal is not None else None
                     )
-                    # Capture the embedding rowid before the cascade drops the
-                    # embedding row; the vec0 vector is not FK-reachable and
-                    # would otherwise linger as a ghost.
+                    # Capture the embedding rowid before the child delete drops
+                    # the embedding row; the vec0 vector is not FK-reachable
+                    # and would otherwise linger as a ghost.
                     vec_rowid = await self._embedding_rowid_for_thought(tid)
+                    # Explicit child deletes rather than a relied-upon cascade
+                    # — see _delete_thought_children_explicit for why.
+                    await self._delete_thought_children_explicit(tid)
                     await self._db.execute(
                         "DELETE FROM thought WHERE thought_id = ?",
                         (tid,),
@@ -6725,11 +6894,21 @@ class SqliteEngravaCore:
                 await self._get_thought_row(thought_id) if self._journal is not None else None
             )
 
-            # Capture the embedding rowid *before* the cascade removes the row:
-            # the vec0 vector table is not reachable by the embedding FK's ON
-            # DELETE CASCADE, so the vector must be deleted explicitly to avoid
-            # a ghost.
+            # Capture the embedding rowid *before* the child delete removes the
+            # row: the vec0 vector table is not reachable by the embedding
+            # FK's ON DELETE CASCADE, so the vector must be purged explicitly
+            # to avoid a ghost.
             vec_rowid = await self._embedding_rowid_for_thought(thought_id)
+
+            # Delete the edge / embedding / action children explicitly rather
+            # than relying on ``ON DELETE CASCADE``: that cascade only exists
+            # from the core-12 schema onward, and a store still on an older
+            # schema would otherwise leave these rows behind, orphaned but
+            # intact — which is exactly what let a later reconciliation pass
+            # treat a dangling ``embedding`` row as proof its thought was
+            # still live and put the vector back. Redundant, and harmless, on
+            # a schema where the cascade already does this.
+            await self._delete_thought_children_explicit(thought_id)
 
             cursor = await self._db.execute(
                 "DELETE FROM thought WHERE thought_id = ?", (thought_id,)
@@ -7434,6 +7613,180 @@ class SqliteEngravaCore:
             created_at=created_at,
         )
 
+    async def _delete_thought_children_explicit(self, thought_id: str) -> None:
+        """Delete a thought's edge / embedding / action rows without a cascade.
+
+        ``ON DELETE CASCADE`` on these three tables only exists from the
+        core-12 schema onward (``_migrate_core_v11_to_v12``); on an older
+        schema a plain ``DELETE FROM thought`` leaves them behind, orphaned
+        but intact. A dangling ``embedding`` row in particular is what let a
+        later reconciliation pass (``sync_embeddings``) treat the thought as
+        still live and restore its vector — the resurrection this deletion
+        rule exists to close off. Every physical thought-delete path in the
+        core (``delete_thought``, the TTL ``delete`` strategy, and hygiene GC)
+        calls this before deleting the parent row, so none of them depends on
+        a cascade the database it is running against may not have. On a
+        core-12+ schema the cascade removes the same rows anyway — deleting
+        them here first is redundant, not incorrect.
+
+        **The three deletes are one indivisible unit, not three independent
+        statements.** A rejection on any of them (e.g. an extension-installed
+        trigger vetoing the ``action`` delete) must not leave the earlier
+        ones sitting in an open transaction: with nothing bracketing them,
+        that half-applied state is exactly what a *later, unrelated* write on
+        this connection would then commit as a side effect — the thought
+        survives, but has silently lost its edges and its embedding. Wrapped
+        in a ``SAVEPOINT`` covering the deletes *and* their own release, so a
+        failure anywhere in that span — including one delivered while
+        awaiting the final ``RELEASE`` itself — ``ROLLBACK TO``s all three at
+        once before propagating.
+
+        The savepoint is kept **nested**, never the outermost one: releasing
+        the outermost savepoint commits the whole transaction immediately
+        (SQLite's rule, not a choice made here), which would force an early,
+        partial commit ahead of the parent thought delete, the vector purge,
+        and the journal entry the caller still has to write — breaking the
+        single deferred commit :meth:`_maybe_commit` (or an active
+        :meth:`suspend_auto_commit` window) is responsible for. So a
+        transaction is opened first when :attr:`self._db.in_transaction
+        <aiosqlite.Connection.in_transaction>` is not already ``True`` — the
+        same check :meth:`_serialize_dedup_probe` uses for the same reason —
+        and, on failure, closed again only if this call is the one that
+        opened it; a transaction the caller already held stays exactly as
+        open as it was, with only this method's own three deletes undone.
+
+        **A trigger using ``RAISE(ROLLBACK, ...)`` is a real limitation of
+        installing one, not a defect this method can close.**
+        ``RAISE(ABORT, ...)`` — the ordinary case, and the only form the
+        rollback-and-reraise above needs — undoes only the failing
+        statement, leaving the transaction (and this savepoint) intact.
+        ``RAISE(ROLLBACK, ...)`` instead ends the *entire* transaction,
+        taking the savepoint down with it and, if the caller already held a
+        transaction of its own, discarding whatever else that caller had
+        written before ever calling this method — not only this method's
+        three deletes. This method cannot prevent that, and does not try to:
+        when ``self._db.in_transaction`` is already ``False`` on entry to the
+        failure path there is nothing left to unwind, and the trigger's own
+        exception (or a cancellation that raced it) propagates unchanged —
+        loudly, to whoever called ``delete_thought`` / ``cleanup_expired`` /
+        hygiene GC, never silently.
+
+        **When the transaction survives but the unwind itself cannot be
+        proven to have worked, this method refuses rather than guesses.**
+        Earlier revisions kept trying to *recover* a consistent state after
+        an unwind failure — checking one more condition, swallowing one more
+        secondary error — and each attempt closed one ordering while leaving
+        another: a savepoint the ``RELEASE`` above already consumed despite
+        this coroutine observing a cancellation instead of that success (the
+        same aiosqlite worker-thread quirk noted below) makes ``ROLLBACK TO``
+        fail with ``"no such savepoint"`` even though the transaction is
+        still open — and swallowing *that* left the three deletes sitting
+        uncommitted-but-applied for a later, unrelated write to commit as a
+        side effect, the exact defect this method exists to close. There is
+        no bounded number of special cases that makes "always recover" true
+        on a connection this method does not exclusively own. So when the
+        unwind itself raises — for any reason, including that race — this
+        method stops trying to restore consistency and instead calls
+        :meth:`_quarantine_connection`, which makes the store terminally
+        unusable *by construction*: every later write, on this instance,
+        fails fast with :class:`ConnectionQuarantinedError` instead of ever
+        reaching a commit that could make the dangling deletes durable.
+        Erring toward a quarantined instance costs one store; erring toward
+        "probably fine" costs the data silently, at whatever commit happens
+        to come next. A cancellation raised *by the unwind itself* always
+        wins over whatever error the unwind was trying to recover from — a
+        cleanup that can defeat a cancellation would make shutdown and
+        timeout both unreliable, which is worse than the error it hid.
+
+        Args:
+            thought_id: UUID of the thought whose children are being removed.
+
+        Raises:
+            aiosqlite.Error: Propagated from any of the three deletes (e.g. a
+                trigger veto) when the savepoint they were made under is
+                still intact and the unwind completes cleanly.
+            asyncio.CancelledError: Propagated when this call is cancelled,
+                or when a cancellation lands during a failed unwind's own
+                cleanup attempt — always in preference to the error that
+                unwind was trying to recover from.
+            ConnectionQuarantinedError: On this store's *next* guarded call,
+                after this method quarantined the connection because an
+                unwind attempt itself failed and a consistent state could
+                not be proven. This call itself still raises the original
+                failure (or the cancellation that pre-empted its cleanup),
+                not this error — quarantine changes what happens *after*.
+
+        """
+        opened_transaction = not self._db.in_transaction
+        if opened_transaction:
+            await self._db.execute("BEGIN")
+        await self._db.execute("SAVEPOINT delete_thought_children")
+        try:
+            await self._db.execute(
+                "DELETE FROM edge WHERE from_thought_id = ? OR to_thought_id = ?",
+                (thought_id, thought_id),
+            )
+            await self._db.execute(
+                "DELETE FROM embedding WHERE owner_id = ?",
+                (thought_id,),
+            )
+            await self._db.execute(
+                "DELETE FROM action WHERE source_thought_id = ?",
+                (thought_id,),
+            )
+            # The release lives INSIDE this guarded region, deliberately —
+            # not after it. With aiosqlite, cancelling the awaiting future
+            # does not cancel a statement already queued on the worker
+            # thread: a cancellation delivered while awaiting this specific
+            # call can still see the RELEASE complete on the connection. A
+            # cancellation landing here is exactly the shape the unwind
+            # below has to be able to recognise as "already released", not
+            # just "the deletes never happened".
+            await self._db.execute("RELEASE delete_thought_children")
+        # ``except BaseException`` (not ``Exception``) so a cancellation
+        # landing anywhere in the block above — mid-delete or during the
+        # release itself — also reaches the unwind below before it
+        # propagates.
+        except BaseException as exc:
+            if not self._db.in_transaction:
+                # A RAISE(ROLLBACK) trigger already ended the whole
+                # transaction (savepoint included) — see the docstring.
+                # Nothing is left open for a later write to inherit, so
+                # there is nothing to unwind and nothing to quarantine.
+                raise
+            try:
+                await self._db.execute("ROLLBACK TO delete_thought_children")
+                await self._db.execute("RELEASE delete_thought_children")
+                if opened_transaction:
+                    await self._db.rollback()
+            except BaseException as unwind_exc:
+                # The unwind itself failed: recovery cannot be proven, so
+                # this connection is no longer trusted to decide anything
+                # about the transaction it might still be holding open —
+                # quarantine it rather than guess. `_quarantine_connection`
+                # awaits nothing internally (every step is synchronous), so
+                # this call itself cannot be interrupted partway.
+                await self._quarantine_connection(
+                    f"delete_thought_children could not unwind its savepoint "
+                    f"after {exc!r}: {unwind_exc!r}"
+                )
+                if isinstance(unwind_exc, asyncio.CancelledError):
+                    # A cancellation arriving during the unwind always wins
+                    # over the error the unwind was trying to recover from —
+                    # never swallowed, or shutdown/timeout stop working.
+                    raise
+                # Any other unwind failure: the caller still sees the
+                # original error, not this one. `unwind_exc` is chained as
+                # the cause for diagnosis, never as the raised type.
+                raise exc from unwind_exc
+            raise
+        # No ``else`` branch: the release is the last statement inside the
+        # ``try`` above, and reaching here means it already succeeded. Never
+        # a commit on any path — the caller (delete_thought / cleanup_expired
+        # / hygiene GC) has more to write in this same transaction (the
+        # parent delete, the vector purge, the journal entry) before its own
+        # ``_maybe_commit()`` decides when any of it becomes durable.
+
     async def _embedding_rowid_for_thought(self, thought_id: str) -> int | None:
         """Resolve the ``embedding`` rowid backing a thought's vector, if any.
 
@@ -7660,26 +8013,32 @@ class SqliteEngravaCore:
         *,
         include_archived: bool = False,
     ) -> list[tuple[str, float]]:
-        """Remove expired thoughts, retired REFLECTIONs, and archived rows.
+        """Keep only results that positively resolve to a live, eligible thought.
 
-        Used as a post-filter for search backends (e.g. sqlite-vec)
-        that cannot natively exclude expired rows in their queries. It also
-        applies the REFLECTION freshness floor: a retired REFLECTION (an
-        orphan archived once its cluster left the active set) must not
-        over-recall on its now-stale centroid, so any REFLECTION whose
-        ``lifecycle_status`` is not ``ACTIVE`` is dropped. Other thought
-        types are gated on expiry — and, unless ``include_archived`` is set,
-        on the archived-exclusion rule.
+        Used as a post-filter for search backends (e.g. sqlite-vec) that
+        cannot natively exclude ineligible rows in their queries. Under the
+        rule that a vector is owned by a live thought, a vec0 hit is only
+        ever as trustworthy as the ``embedding`` row it was resolved through,
+        and that row can outlive its thought on a schema predating the
+        core-12 cascade — so this filter does not compute what to *remove*
+        from an otherwise-trusted list. It computes what it can **positively
+        confirm** — a ``thought`` row that exists, is not expired, is not a
+        retired REFLECTION, and (unless ``include_archived``) is not
+        archived — and keeps only that. An id absent from ``thought``
+        entirely, including a deleted thought whose ``embedding`` row was
+        never cleaned up, resolves no confirming row and is dropped by
+        construction rather than by a case this filter has to remember to
+        add: **absence is a positive exclusion, not an incidental miss.**
 
         Args:
             results: List of ``(thought_id, similarity_score)`` pairs.
-            include_archived: When ``False`` (the default) archived thoughts are
-                added to the excluded set; when ``True`` they are retained (the
-                retired-REFLECTION and expiry gates still apply).
+            include_archived: When ``False`` (the default) archived thoughts
+                are never confirmed eligible; when ``True`` they may be (the
+                retired-REFLECTION, expiry, and existence gates still apply).
 
         Returns:
-            Filtered list with expired thoughts, retired REFLECTIONs, and — when
-            ``include_archived`` is ``False`` — archived rows removed.
+            The subset of ``results`` whose thought positively confirms as
+            live and eligible under the current gates.
 
         """
         if not results:
@@ -7687,24 +8046,24 @@ class SqliteEngravaCore:
         now = datetime.datetime.now(datetime.UTC).isoformat()
         ids = [r[0] for r in results]
         placeholders = ",".join("?" * len(ids))
-        # Inverted form: this SELECT collects the rows to *exclude*, so the
-        # archived rule is an ``OR`` here (drop where status IS archived), not
-        # the ``!= 'ARCHIVED'`` keep-form used in the arm WHERE clauses.
-        archived_exclusion = (
-            "" if include_archived else f" OR lifecycle_status = '{LifecycleStatus.ARCHIVED.value}'"
+        # Positive form: keep-form archived gate (``!= 'ARCHIVED'``), matching
+        # the arm WHERE clauses — the opposite polarity of the old
+        # exclusion-form query this replaces.
+        archived_clause = (
+            "" if include_archived else f" AND lifecycle_status != '{LifecycleStatus.ARCHIVED.value}'"
         )
         cursor = await self._db.execute(
             f"SELECT thought_id FROM thought "  # noqa: S608
             f"WHERE thought_id IN ({placeholders}) "
-            f"AND ((expires_at IS NOT NULL AND expires_at <= ?) "
-            f"OR (thought_type = 'REFLECTION' AND lifecycle_status != 'ACTIVE')"
-            f"{archived_exclusion})",
+            f"AND (expires_at IS NULL OR expires_at > ?) "
+            f"AND NOT (thought_type = 'REFLECTION' AND lifecycle_status != 'ACTIVE')"
+            f"{archived_clause}",
             [*ids, now],
         )
-        excluded_ids = {row["thought_id"] for row in await cursor.fetchall()}
-        if not excluded_ids:
-            return results
-        return [(tid, score) for tid, score in results if tid not in excluded_ids]
+        eligible_ids = {row["thought_id"] for row in await cursor.fetchall()}
+        if not eligible_ids:
+            return []
+        return [(tid, score) for tid, score in results if tid in eligible_ids]
 
     async def _search_similar_numpy(
         self,
@@ -10344,6 +10703,9 @@ class SqliteEngravaCore:
             if before_row is None:
                 continue
             vec_rowid = await self._embedding_rowid_for_thought(thought.thought_id)
+            # Explicit child deletes rather than a relied-upon cascade
+            # — see _delete_thought_children_explicit for why.
+            await self._delete_thought_children_explicit(thought.thought_id)
             cursor = await self._db.execute(
                 "DELETE FROM thought WHERE thought_id = ?",
                 (thought.thought_id,),

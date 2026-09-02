@@ -1066,60 +1066,68 @@ class TestGcArchivedBlastRadius:
             for aid, before in snapshots.items():
                 assert _sync_row(conn, _ACTION_BY_ID, aid) == before, f"action {aid} was modified"
 
-    def test_gc_collects_the_archived_subtree_without_a_cascade(
+    def test_gc_refuses_on_a_pre_cascade_schema_instead_of_collecting(
         self,
         runner: CliRunner,
         pre_cascade_mixed_lifecycle_db: Path,
     ) -> None:
-        """On a pre-cascade schema the child deletes are the only thing that runs.
+        """``gc`` refuses a pre-cascade schema outright rather than collecting on it.
 
-        ``gc`` never migrates, so a database written before the ``v11 -> v12``
-        foreign keys existed is a shape it can be pointed at. There the parent
-        delete cannot cascade, and the three child statements in
-        ``_gc_archived`` are solely responsible for removing an archived
-        thought's edges, embeddings and actions — the same statements whose
-        effect is entirely masked on a head schema.
-
-        The blast radius is asserted in both directions on all three child
-        tables, exactly as on a head schema.
+        A destructive operation now refuses on a schema below head, applied
+        to every built-in command that deletes user data, ``gc`` included.
+        Before this decision ``gc`` would run its collection anyway — the
+        three explicit child-delete statements in ``_gc_archived`` made that
+        collection *correct* even without a foreign-key cascade (see
+        ``test_gc_archived_helper_still_deletes_children_explicitly_on_pre_cascade``
+        below for that coverage, exercised directly against the helper), but
+        "correct collection" is not the same question as "should this ever run against
+        a database this build has never brought current." The answer here is
+        no: the command exits non-zero, names ``engrava migrate``, and the
+        entire corpus — collectible thoughts included — is untouched.
         """
         with _reopen(pre_cascade_mixed_lifecycle_db) as conn:
-            # Corpus precondition: this really is a pre-cascade schema, so a
-            # cascade cannot be doing the work the child deletes are credited
-            # with. Without it the fixture could silently become a second head
-            # -schema test and prove nothing new.
+            # Corpus precondition: this really is a pre-cascade schema, so the
+            # refusal below is exercising the schema-version gate and not
+            # some other, unrelated failure.
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             assert version == _PRE_CASCADE_VERSION
             for table in ("edge", "embedding", "action"):
                 foreign_keys = conn.execute(f"PRAGMA foreign_key_list({table})").fetchall()
                 assert foreign_keys == [], f"{table} already carries a cascade at v{version}"
 
-            for doomed, query in (
-                *((eid, _EDGE_BY_ID) for eid in self._DOOMED_EDGES),
-                *((tid, _EMBEDDING_BY_OWNER) for tid in self._DOOMED),
-                *((aid, _ACTION_BY_ID) for aid in self._DOOMED_ACTIONS),
-            ):
-                _require(_sync_row(conn, query, doomed), doomed)
+            all_thought_ids = {tid for tid, _status in _GC_THOUGHTS}
+            all_edge_ids = {eid for eid, *_rest in _GC_EDGES}
+            all_embedding_owners = {tid for tid, _vector in _GC_EMBEDDINGS}
+            all_action_ids = {aid for aid, _src in _GC_ACTIONS}
+            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == all_thought_ids
+            thoughts_before = {
+                tid: _require(_sync_row(conn, _THOUGHT_BY_ID, tid), tid) for tid in all_thought_ids
+            }
             edges_before = {
-                eid: _require(_sync_row(conn, _EDGE_BY_ID, eid), eid)
-                for eid in self._SURVIVING_EDGES
+                eid: _require(_sync_row(conn, _EDGE_BY_ID, eid), eid) for eid in all_edge_ids
             }
             embeddings_before = {
                 tid: _require(_sync_row(conn, _EMBEDDING_BY_OWNER, tid), tid)
-                for tid in self._SURVIVORS
+                for tid in all_embedding_owners
             }
             actions_before = {
-                aid: _require(_sync_row(conn, _ACTION_BY_ID, aid), aid)
-                for aid in self._SURVIVING_ACTIONS
+                aid: _require(_sync_row(conn, _ACTION_BY_ID, aid), aid) for aid in all_action_ids
             }
 
-        self._collect(runner, pre_cascade_mixed_lifecycle_db)
+        result = runner.invoke(cli, ["--db", str(pre_cascade_mixed_lifecycle_db), "gc"])
+
+        assert result.exit_code != 0, result.output
+        assert "migrate" in result.output.lower(), result.output
 
         with _reopen(pre_cascade_mixed_lifecycle_db) as conn:
-            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == set(self._SURVIVORS)
-            assert _sync_id_set(conn, _ALL_EDGE_IDS) == set(self._SURVIVING_EDGES)
-            assert _sync_id_set(conn, _ALL_EMBEDDING_OWNERS) == set(self._SURVIVORS)
-            assert _sync_id_set(conn, _ALL_ACTION_IDS) == set(self._SURVIVING_ACTIONS)
+            version_after = conn.execute("PRAGMA user_version").fetchone()[0]
+            assert version_after == _PRE_CASCADE_VERSION, "a refusal must not migrate the schema"
+            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == all_thought_ids
+            assert _sync_id_set(conn, _ALL_EDGE_IDS) == all_edge_ids
+            assert _sync_id_set(conn, _ALL_EMBEDDING_OWNERS) == all_embedding_owners
+            assert _sync_id_set(conn, _ALL_ACTION_IDS) == all_action_ids
+            for tid, before in thoughts_before.items():
+                assert _sync_row(conn, _THOUGHT_BY_ID, tid) == before, f"thought {tid} was modified"
             for eid, before in edges_before.items():
                 assert _sync_row(conn, _EDGE_BY_ID, eid) == before, f"edge {eid} was modified"
             for tid, before in embeddings_before.items():
@@ -1127,6 +1135,41 @@ class TestGcArchivedBlastRadius:
                 assert after == before, f"embedding of {tid} was modified"
             for aid, before in actions_before.items():
                 assert _sync_row(conn, _ACTION_BY_ID, aid) == before, f"action {aid} was modified"
+
+    async def test_gc_archived_helper_still_deletes_children_explicitly_on_pre_cascade(
+        self,
+        pre_cascade_mixed_lifecycle_db: Path,
+    ) -> None:
+        """``_gc_archived`` itself still needs no cascade — exercised directly.
+
+        The CLI-level refusal above means ``gc`` never reaches
+        ``_gc_archived`` on a pre-cascade schema in practice, but the helper's
+        own explicit child deletes (``cli/main.py``'s ``_gc_archived``) are
+        exactly the pattern every physical thought-delete path now follows —
+        deleting the children explicitly rather than relying on a cascade the
+        database may not have — and calling it directly (bypassing the CLI's
+        schema-version gate, the same way a future caller reached only
+        through the library could) is what keeps that coverage rather than
+        losing it entirely alongside the CLI-level test above.
+        """
+        import aiosqlite as _aiosqlite
+
+        from engrava.cli.main import _gc_archived
+
+        conn = await _aiosqlite.connect(str(pre_cascade_mixed_lifecycle_db))
+        conn.row_factory = _aiosqlite.Row
+        try:
+            version = (await (await conn.execute("PRAGMA user_version")).fetchone())[0]
+            assert version == _PRE_CASCADE_VERSION
+            await _gc_archived(conn, dry_run=False, quiet=False)
+        finally:
+            await conn.close()
+
+        with _reopen(pre_cascade_mixed_lifecycle_db) as conn:
+            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == set(self._SURVIVORS)
+            assert _sync_id_set(conn, _ALL_EDGE_IDS) == set(self._SURVIVING_EDGES)
+            assert _sync_id_set(conn, _ALL_EMBEDDING_OWNERS) == set(self._SURVIVORS)
+            assert _sync_id_set(conn, _ALL_ACTION_IDS) == set(self._SURVIVING_ACTIONS)
 
     @sqlite_vec_required
     def test_gc_purges_only_the_collected_thoughts_vectors(

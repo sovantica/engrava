@@ -891,6 +891,152 @@ class TestVec0DeleteRemovesVector(TestSqliteVecRealConnection):
             await store.close()
 
 
+@sqlite_vec_required
+class TestVectorOwnershipIsTheThoughtNotTheEmbeddingRow(TestSqliteVecRealConnection):
+    """A vector is owned by a live thought — one test per enforcement place.
+
+    Each test manufactures the same underlying shape — an ``embedding`` row
+    whose owning ``thought`` row is gone, but which itself was never
+    removed — directly via SQL, bypassing ``delete_thought`` entirely. That
+    shape is what a pre-core-12 delete leaves behind (see
+    ``test_referential_integrity.py``'s ``TestDeletionOnAPreCascadeSchema``
+    for the real-schema reproduction); constructing it directly here isolates
+    each of the three places the ownership rule must hold — reconciliation,
+    purge, and search — independent of which delete path or schema version
+    produced it.
+    """
+
+    async def test_reconciliation_does_not_backfill_a_vector_whose_thought_is_gone(
+        self, tmp_path: Path
+    ) -> None:
+        """``sync_embeddings`` must not treat a dangling ``embedding`` row as live."""
+        store = await self._build_store(tmp_path, backend="sqlite-vec", dimension=3)
+        try:
+            await _make_thought(store, "t-live")
+            await _make_thought(store, "t-orphaned")
+            await store.store_embedding(
+                thought_id="t-live", vector=[1.0, 0.0, 0.0], model_name=_PARITY_MODEL
+            )
+            await store.store_embedding(
+                thought_id="t-orphaned", vector=[0.0, 1.0, 0.0], model_name=_PARITY_MODEL
+            )
+            orphaned_rowid = await _embedding_rowid(store, "t-orphaned")
+            assert orphaned_rowid is not None
+
+            # Remove the vec0 row and the thought row, but deliberately leave
+            # the embedding row behind -- exactly what a pre-core-12 parent
+            # delete does when nothing cascades it away. This store is on a
+            # head schema, whose FK *would* cascade the embedding row too, so
+            # the cascade is disabled for this one manual delete to
+            # manufacture that pre-cascade shape directly.
+            await store._db.execute("PRAGMA foreign_keys=OFF")
+            await store._db.execute(
+                "DELETE FROM embedding_vec WHERE rowid = ?", (orphaned_rowid,)
+            )
+            await store._db.execute(
+                "DELETE FROM thought WHERE thought_id = ?", ("t-orphaned",)
+            )
+            await store._db.commit()
+            await store._db.execute("PRAGMA foreign_keys=ON")
+            assert orphaned_rowid not in await _vec_rowids(store)
+            embedding_still_present = await store._db.execute(
+                "SELECT 1 FROM embedding WHERE rowid = ?", (orphaned_rowid,)
+            )
+            assert (await embedding_still_present.fetchone()) is not None, (
+                "fixture precondition failed: the embedding row must survive"
+            )
+
+            assert store._vector_backend is not None
+            backfilled = await store._vector_backend.sync_embeddings(store._db)
+
+            assert orphaned_rowid not in await _vec_rowids(store)
+            assert backfilled == 0
+        finally:
+            await store.close()
+
+    async def test_purge_removes_a_vector_whose_thought_is_gone_even_though_the_embedding_row_survives(
+        self, tmp_path: Path
+    ) -> None:
+        """``purge_orphan_vectors`` must key off the thought, not just the embedding row."""
+        from engrava.extensions.vector_sqlite_vec import purge_orphan_vectors
+
+        store = await self._build_store(tmp_path, backend="sqlite-vec", dimension=3)
+        try:
+            await _make_thought(store, "t-live")
+            await _make_thought(store, "t-orphaned")
+            await store.store_embedding(
+                thought_id="t-live", vector=[1.0, 0.0, 0.0], model_name=_PARITY_MODEL
+            )
+            await store.store_embedding(
+                thought_id="t-orphaned", vector=[0.0, 1.0, 0.0], model_name=_PARITY_MODEL
+            )
+            orphaned_rowid = await _embedding_rowid(store, "t-orphaned")
+            assert orphaned_rowid is not None
+
+            # The embedding row is left in place; only its owning thought is
+            # removed. The old, embedding-row-only orphan predicate would see
+            # nothing wrong here at all. This store is on a head schema, whose
+            # FK would otherwise cascade the embedding row away too, so the
+            # cascade is disabled for this one manual delete.
+            await store._db.execute("PRAGMA foreign_keys=OFF")
+            await store._db.execute(
+                "DELETE FROM thought WHERE thought_id = ?", ("t-orphaned",)
+            )
+            await store._db.commit()
+            await store._db.execute("PRAGMA foreign_keys=ON")
+            assert orphaned_rowid in await _vec_rowids(store)
+
+            removed = await purge_orphan_vectors(store._db)
+            await store._db.commit()
+
+            assert orphaned_rowid not in await _vec_rowids(store)
+            assert removed == 1
+            live_rowid = await _embedding_rowid(store, "t-live")
+            assert live_rowid in await _vec_rowids(store)
+        finally:
+            await store.close()
+
+    async def test_search_does_not_resolve_a_vector_whose_thought_is_gone(
+        self, tmp_path: Path
+    ) -> None:
+        """The vec0 search arm must not resolve a rowid back to a deleted thought's id."""
+        store = await self._build_store(tmp_path, backend="sqlite-vec", dimension=3)
+        try:
+            await _make_thought(store, "t-live")
+            await _make_thought(store, "t-orphaned")
+            await store.store_embedding(
+                thought_id="t-live", vector=[1.0, 0.0, 0.0], model_name=_PARITY_MODEL
+            )
+            await store.store_embedding(
+                thought_id="t-orphaned", vector=[0.9, 0.1, 0.0], model_name=_PARITY_MODEL
+            )
+
+            # Leave the vec0 row and the embedding row both in place -- only
+            # the thought is gone -- so a hit for "t-orphaned" is exactly as
+            # findable by MATCH as it was before the delete, and only the
+            # ownership join stands between it and the returned id. This
+            # store is on a head schema, whose FK would otherwise cascade the
+            # embedding row away too, so the cascade is disabled for this one
+            # manual delete.
+            await store._db.execute("PRAGMA foreign_keys=OFF")
+            await store._db.execute(
+                "DELETE FROM thought WHERE thought_id = ?", ("t-orphaned",)
+            )
+            await store._db.commit()
+            await store._db.execute("PRAGMA foreign_keys=ON")
+
+            assert isinstance(store._vector_backend, SqliteVecSearchBackend)
+            results = await store._vector_backend.search(
+                store._db, [0.9, 0.1, 0.0], top_k=5
+            )
+
+            ids = [r[0] for r in results]
+            assert "t-orphaned" not in ids
+            assert "t-live" in ids
+        finally:
+            await store.close()
+
+
 # ------------------------------------------------------------------
 # R3 — vec0 over-fetch fills the top-k live window
 # ------------------------------------------------------------------

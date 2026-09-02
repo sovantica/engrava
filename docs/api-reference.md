@@ -82,7 +82,7 @@ keyword arguments and does **not** return a UUID string.
 | `await restore_thought(thought_id, *, current_cycle=None)` | `ThoughtRecord` | Un-archive: transition an `ARCHIVED` thought back to `ACTIVE`, clearing both hygiene markers (`archived_at_cycle` and `archived_at`) so an archive round-trips with no data loss. The reversible counterpart to the memory-hygiene / TTL / manual archive paths, journaled as an `UPDATE_THOUGHT`. Raises `ThoughtNotFoundError` if missing, `InvalidTransitionError` if the thought is not currently `ARCHIVED`, `StaleDataError` if the guarded write matches no row — a competing cycle stamp or a delete (see `update_thought` for what that guard does and does not catch). This is the **canonical** un-archive path; a raw `update_thought(lifecycle_status=...)` back to `ACTIVE` does not manage those markers. |
 | `await list_thoughts(...)` | `list[ThoughtRecord]` | List with filters (keyword-only) |
 | `await count_thoughts(...)` | `int` | Count with filters (keyword-only) |
-| `await delete_thought(thought_id)` | `bool` | Hard delete; `True` if a row was removed. Deleting a thought also deletes every edge for which it is either endpoint, its embedding, and its linked actions. This is a physical cascade, unlike valid-time invalidation. **Below core schema 12 this cascade does not happen.** The `ON DELETE CASCADE` on `edge`, `embedding` and `action` arrives with the core-12 migration, so on a database carried forward from an older engrava and never migrated the thought's `embedding` row outlives the delete. The delete does still purge that thought's own `vec0` vector, so the identifier is **not** reachable straight afterwards; it returns once the reconcile that runs on the next sqlite-vec-enabled open backfills the index from the surviving `embedding` row. From then on it is an ordinary candidate on that arm whenever a sqlite-vec backend is **active** on the store and the query carries no effective metadata predicate — the arm *can* return it, subject to the same similarity threshold and `top_k` window as any live row. Run `engrava migrate`. See [Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated). |
+| `await delete_thought(thought_id)` | `bool` | Hard delete; `True` if a row was removed. Deleting a thought also deletes every edge for which it is either endpoint, its embedding, and its linked actions — deleted explicitly, on every schema version, not only via the `ON DELETE CASCADE` the core-12 migration adds to `edge`, `embedding` and `action`. A vector is owned by the thought it belongs to, enforced the same way in reconciliation, the vector-index purge, and search, so the deleted identifier cannot be returned by a later vector query even on a database still below core-12. See [Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated) for a database that already accumulated damage under an older engrava build. |
 | `await invalidate_thought(thought_id, valid_until)` | `ThoughtRecord` | Close the thought's *valid-time* interval at the given ISO-8601 instant — deterministic, idempotent, non-cascading, and **not a delete** (the row stays on file and remains retrievable for instants before `valid_until`). Raises `ThoughtNotFoundError` if missing. See [Bi-temporal Model](bitemporal.md#invalidate-vs-delete) |
 | `await record_access(thought_id)` | `None` | Mark a thought as accessed — bumps `access_count` and sets `last_accessed_at`; raises `ThoughtNotFoundError` if missing. Drives the access-frequency dreaming signal. |
 
@@ -219,17 +219,17 @@ delete cascades to edges where
 the thought is either endpoint; `invalidate_thought()` does not remove or
 invalidate any edge.
 
-**Below core schema 12 this cascade does not happen.** The `ON DELETE CASCADE` on
-`edge`, `embedding` and `action` arrives with the core-12 migration, so on a database
-carried forward from an older engrava and never migrated the thought's `embedding` row
-outlives the delete. The delete does still purge that thought's own `vec0` vector, so
-the identifier is **not** reachable straight afterwards; it returns once the reconcile
-that runs on the next sqlite-vec-enabled open backfills the index from the surviving
-`embedding` row. From then on it is an ordinary candidate on that arm whenever a
-sqlite-vec backend is **active** on the store and the query carries no effective
-metadata predicate — the arm *can* return it, subject to the same similarity threshold
-and `top_k` window as any live row. Run `engrava migrate`. See
-[Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated).
+**Below core schema 12 this cascade used to not happen — it now does not need to.**
+The `ON DELETE CASCADE` on `edge`, `embedding` and `action` arrives with the core-12
+migration, but `delete_thought` no longer depends on it: it deletes those three rows
+explicitly before deleting the thought, on every schema version. A vector is owned by
+the thought it belongs to, not by the presence of an `embedding` row, and that rule is
+also enforced in reconciliation, in the vector-index purge, and in search itself, so a
+database still below core-12 can no longer make a deleted thought's identifier
+reachable again. See
+[Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated)
+for the full mechanism and for what a database that already accumulated damage under
+an older engrava build still needs `engrava migrate` to clean up.
 
 ```python
 import uuid
@@ -439,7 +439,8 @@ letter, then use lowercase letters, digits, `_`, or `-`, up to 63 characters.
 
 | Method | Description |
 |--------|-------------|
-| `await get_store(service_name)` | Lazily create/open and initialize a service store on first access. The manager caches the store, so later calls for the same name return the same live instance until `close_all()` or deletion. |
+| `await get_store(service_name, *, migrate=True)` | Lazily create/open and initialize a service store on first access. The manager caches the store, so later calls for the same name return the same live instance until `close_all()` or deletion (`migrate` is ignored on a cache hit — the schema state was already decided by whichever call created the cached instance). With the default `migrate=True`, construction calls `ensure_schema()`: a fresh service is bootstrapped and an existing behind one is brought current — this can raise `SchemaVersionError`. Pass `migrate=False` to open the database exactly as stored, with no schema write at all; for a service that does not exist yet this leaves it with no schema (pair it with a version check first, e.g. via `peek_schema_version()`). |
+| `await peek_schema_version(service_name)` | Read a service database's stamped `user_version` without opening it through `ensure_schema()` — a plain `PRAGMA` on a throwaway connection, so this call itself can never migrate or refuse anything. Returns `None` when the service has no database file yet. Raises `ConfigError` for an invalid name. Meant to be checked before `get_store(..., migrate=False)`, so a caller can warn, refuse, or proceed on its own terms first. |
 | `service_exists(service_name)` | Validate the service name, then check whether its `.db` file exists without opening or creating it. Raises `ConfigError` for an invalid name. |
 | `await list_services()` | Scan `data_dir` for `.db` files and return their stems in sorted order; returns `[]` when the directory does not exist. |
 | `await delete_service(service_name)` | Close and evict a cached store, then delete its `.db`, `.db-wal`, and `.db-shm` files. Raises `FileNotFoundError` when the main database file does not exist. This permanently deletes that service's data. |
@@ -795,6 +796,7 @@ store-replacement guidance, see [Error handling and recovery](error-handling.md)
 | `InvalidRecencyArgumentError` | `EngravaError` | `recency_now` is malformed or `recency_now_half_life` is not positive |
 | `ConnectionQuarantinedError` | `EngravaError` | A failed derived-record compensation left the connection potentially indeterminate; the store instance is terminal and must be replaced |
 | `WriteLockTimeoutError` | `EngravaError` | A task could not acquire the store's in-process write lock within `write_lock_acquire_timeout_seconds`. Usually a task spawned and awaited from inside another task's own `suspend_auto_commit()` window (an out-of-contract deadlock this store ends by raising, rather than hanging); can also mean that bound is configured too small for a legitimately slow embedding provider — see [Concurrency](concurrency.md#a-deadlock-this-store-cannot-resolve-raises-it-does-not-hang) |
+| `SchemaVersionError` | `EngravaError` | `ensure_schema()` refused the database: either a populated sub-floor schema (below the bootstrap floor, but already carrying a row — not safe to silently stamp current) or one stamped above this build's head version (nothing to migrate; opening it would understand less than it claims to). Carries `current_version` and `reason` (`"populated_sub_floor"` or `"newer_than_head"`). Reachable from `from_config()`, `EngravaManager.get_store()`, and the CLI's `migrate` command; the CLI's other destructive/read commands apply their own schema-version gate first and refuse or warn before reaching this. See [Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated) |
 | `ConfigError` | `ValueError` | YAML or direct config construction violates a documented configuration invariant |
 
 > `create_edge` raises `ReferentialIntegrityError` when an endpoint thought

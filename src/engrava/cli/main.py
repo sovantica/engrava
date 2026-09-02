@@ -44,7 +44,10 @@ from engrava.config import (
 )
 from engrava.config_validation import ConfigError
 from engrava.domain.protocols.hooks import MindQLExtension
-from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
+from engrava.infrastructure.sqlite.engrava_core import (
+    CORE_SCHEMA_HEAD_VERSION,
+    SqliteEngravaCore,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
@@ -105,6 +108,121 @@ async def _open_db(cfg: EngravaCLIConfig) -> Any:  # noqa: ANN401
     await conn.execute("PRAGMA journal_mode = WAL")
     await conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+# ------------------------------------------------------------------
+# Schema-version gate
+# ------------------------------------------------------------------
+#
+# ``ensure_schema`` is reached from only three built-in command names —
+# ``migrate``, ``restore``, and ``snapshot`` in service mode — so every other
+# built-in (``info``, ``verify``, ``query``, ``export``, plain ``snapshot``,
+# and ``gc``) opens through ``_open_db`` and never learns whether the
+# database it is about to act on is even at the version it understands. This
+# gate classifies every built-in command as destructive or read and checks it
+# against the database's stamped ``user_version`` accordingly: a destructive
+# command refuses on anything but a head schema, a read command warns and
+# proceeds on a behind schema but still refuses above head, and ``query``
+# classifies by its parsed command rather than by the CLI command name.
+
+
+async def _read_schema_version(conn: Any) -> int:  # noqa: ANN401
+    """Read a connection's stamped ``user_version`` (0 if never set).
+
+    A plain ``PRAGMA`` read — it never migrates the database, which is the
+    point: the gate's own check must not itself be the implicit migration no
+    command is meant to perform.
+
+    Args:
+        conn: An open connection (aiosqlite or the ``sqlite3`` it wraps).
+
+    Returns:
+        The stamped ``user_version``.
+
+    """
+    cursor = await conn.execute("PRAGMA user_version")
+    row = await cursor.fetchone()
+    return int(row[0]) if row else 0
+
+
+def _behind_schema_warning(version: int, *, command: str) -> str:
+    """Build the stderr warning for a read-classified command on a behind schema."""
+    return (
+        f"Warning: database schema is at version {version}, behind this "
+        f"engrava build's head version ({CORE_SCHEMA_HEAD_VERSION}). "
+        f"'{command}' will run against the schema as stored — run "
+        "'engrava migrate' to bring it current."
+    )
+
+
+def _behind_schema_refusal(version: int, *, command: str) -> str:
+    """Build the refusal message for a destructive command on a behind schema."""
+    return (
+        f"Database schema is at version {version}; this engrava build's head "
+        f"version is {CORE_SCHEMA_HEAD_VERSION}. Run 'engrava migrate' before "
+        f"running '{command}' on it."
+    )
+
+
+def _ahead_schema_refusal(version: int, *, command: str) -> str:
+    """Build the refusal message for any command on a newer-than-head schema."""
+    return (
+        f"Database schema is at version {version}, newer than this engrava "
+        f"build's head version ({CORE_SCHEMA_HEAD_VERSION}). Refusing to run "
+        f"'{command}' — upgrade engrava before opening this database."
+    )
+
+
+def _apply_read_schema_gate_for_version(version: int, *, command: str) -> None:
+    """Apply the schema-version gate for a read-classified built-in command.
+
+    Warns and proceeds on a behind schema (refusing would trade this defect
+    for a worse one — a pending migration blocking an ordinary read); refuses
+    unconditionally on a schema newer than this build's head, which it cannot
+    understand at all.
+
+    Args:
+        version: The database's stamped ``user_version``.
+        command: The command name, named in the message.
+
+    """
+    if version > CORE_SCHEMA_HEAD_VERSION:
+        click.echo(_ahead_schema_refusal(version, command=command), err=True)
+        sys.exit(1)
+    if version < CORE_SCHEMA_HEAD_VERSION:
+        click.echo(_behind_schema_warning(version, command=command), err=True)
+
+
+def _apply_destructive_schema_gate_for_version(version: int, *, command: str) -> None:
+    """Apply the schema-version gate for a destructive built-in command.
+
+    Refuses on any schema that is not exactly head — below head because a
+    destructive operation must not delete rows through an engine that does
+    not understand the schema it is deleting from (the "gc never migrates"
+    defect reached a user through exactly this gap), and above head because
+    this build cannot understand it either.
+
+    Args:
+        version: The database's stamped ``user_version``.
+        command: The command name, named in the message.
+
+    """
+    if version > CORE_SCHEMA_HEAD_VERSION:
+        click.echo(_ahead_schema_refusal(version, command=command), err=True)
+        sys.exit(1)
+    if version < CORE_SCHEMA_HEAD_VERSION:
+        click.echo(_behind_schema_refusal(version, command=command), err=True)
+        sys.exit(1)
+
+
+async def _apply_read_schema_gate(conn: Any, *, command: str) -> None:  # noqa: ANN401
+    """Read-then-gate convenience wrapper — see :func:`_apply_read_schema_gate_for_version`."""
+    _apply_read_schema_gate_for_version(await _read_schema_version(conn), command=command)
+
+
+async def _apply_destructive_schema_gate(conn: Any, *, command: str) -> None:  # noqa: ANN401
+    """Read-then-gate convenience wrapper — see :func:`_apply_destructive_schema_gate_for_version`."""
+    _apply_destructive_schema_gate_for_version(await _read_schema_version(conn), command=command)
 
 
 def _run(coro: Any) -> Any:  # noqa: ANN401
@@ -418,6 +536,7 @@ def info(ctx: click.Context) -> None:
 
         conn = await _open_db(cfg)
         try:
+            await _apply_read_schema_gate(conn, command="info")
             store = SqliteEngravaCore(conn)
             metrics = await store.metrics()
             stats: dict[str, Any] = {
@@ -475,6 +594,7 @@ def verify(ctx: click.Context) -> None:
 
         conn = await _open_db(cfg)
         try:
+            await _apply_read_schema_gate(conn, command="verify")
             store = SqliteEngravaCore(conn)
             result = await store.verify_journal()
 
@@ -526,7 +646,11 @@ def query(ctx: click.Context, mql: str) -> None:
         conn = await _open_db(cfg)
         try:
             from engrava.mindql.executor import MindQLExecutor  # noqa: PLC0415
-            from engrava.mindql.parser import MindQLParseError, parse  # noqa: PLC0415
+            from engrava.mindql.parser import (  # noqa: PLC0415
+                MindQLCommand,
+                MindQLParseError,
+                parse,
+            )
 
             # Gather extension commands from loaded extensions
             extensions = _load_mindql_extensions() if cfg.extensions_enabled else {}
@@ -537,6 +661,19 @@ def query(ctx: click.Context, mql: str) -> None:
             except MindQLParseError as exc:
                 click.echo(f"Parse error: {exc}", err=True)
                 sys.exit(1)
+
+            # The schema-version gate classifies the *parsed* command, not the
+            # CLI command name — FIND/COUNT/SELECT are reads (warn and attempt
+            # on a behind schema); EXTENSION can write (there is today no
+            # read-only accessor for an extension handler to run under, so it
+            # is refused on a behind schema like any other destructive
+            # operation). Every classification also refuses a newer-than-head
+            # schema outright.
+            schema_version = await _read_schema_version(conn)
+            if parsed.command is MindQLCommand.EXTENSION:
+                _apply_destructive_schema_gate_for_version(schema_version, command="query")
+            else:
+                _apply_read_schema_gate_for_version(schema_version, command="query")
 
             executor = MindQLExecutor(conn, extensions=extensions)
             result = await executor.execute(parsed)
@@ -684,7 +821,18 @@ def snapshot(ctx: click.Context, output_path: str | None, service_name: str | No
                 )
                 sys.exit(1)
             try:
-                store = await manager.get_store(effective_service)
+                # snapshot is read-classified, so a behind target is warned
+                # about and attempted rather than refused — but attempting
+                # must not itself migrate the service database, which calling
+                # manager.get_store() on a behind target would. peek_schema_version()
+                # reads the stamped version without migrating it.
+                existing_version = await manager.peek_schema_version(effective_service)
+                if existing_version is not None:
+                    _apply_read_schema_gate_for_version(existing_version, command="snapshot")
+                # service_exists() above already confirmed this service has a
+                # database, so migrate=False opens it exactly as stored —
+                # never a silent implicit migration on a behind target.
+                store = await manager.get_store(effective_service, migrate=False)
                 db = store._db  # noqa: SLF001
                 out = (
                     Path(output_path)
@@ -702,6 +850,7 @@ def snapshot(ctx: click.Context, output_path: str | None, service_name: str | No
 
             conn = await _open_db(cfg)
             try:
+                await _apply_read_schema_gate(conn, command="snapshot")
                 out = (
                     Path(output_path) if output_path else cfg.db_path.with_suffix(".snapshot.jsonl")
                 )
@@ -1255,6 +1404,14 @@ async def _restore_service_snapshot(
         services_config=services_cfg,
     )
     try:
+        # restore is destructive (an existing target can be cleared, and is
+        # always rewritten), and no CLI command migrates a database
+        # implicitly. An existing service target must already be at head; a
+        # target that does not exist yet is a fresh service, which
+        # get_store() below still bootstraps to head as it always has.
+        existing_version = await manager.peek_schema_version(effective_service)
+        if existing_version is not None:
+            _apply_destructive_schema_gate_for_version(existing_version, command="restore")
         try:
             store = await manager.get_store(effective_service)
         except ConfigError as exc:
@@ -1322,13 +1479,29 @@ async def _restore_single_db(
             )
             raise click.ClickException(msg)
 
+    # restore is destructive, and no CLI command migrates a database
+    # implicitly. Checked *before* connecting opens (and therefore creates)
+    # the file, so a target that does not exist yet is unambiguously a fresh
+    # restore rather than "behind" — there is nothing to be behind.
+    pre_existing = cfg.db_path.exists()
+
     conn = await _aiosqlite.connect(str(cfg.db_path))
     conn.row_factory = _aiosqlite.Row
     await conn.execute("PRAGMA journal_mode = WAL")
     await conn.execute("PRAGMA foreign_keys = ON")
 
     store = SqliteEngravaCore(conn)
-    await store.ensure_schema()
+    if pre_existing:
+        try:
+            await _apply_destructive_schema_gate(conn, command="restore")
+        except SystemExit:
+            await conn.close()
+            raise
+        # Schema confirmed at head above; ensure_schema() here would be a
+        # no-op, so it is skipped entirely rather than called for its side
+        # effect of none — no command migrates implicitly.
+    else:
+        await store.ensure_schema()
 
     try:
         total = await _import_records_to_db(
@@ -1631,6 +1804,14 @@ def gc(ctx: click.Context, *, dry_run: bool, expired: bool) -> None:
 
         conn = await _open_db(cfg)
         try:
+            # gc is destructive and never migrates the schema itself (see
+            # _gc_archived's own docstring below on the explicit child
+            # deletes that limit today's damage) — so it refuses outright on
+            # anything but a head schema rather than deleting rows through an
+            # engine that does not understand the schema it is deleting from.
+            # A database maintained only through gc never migrates, so it
+            # must never be allowed to run destructive deletes there either.
+            await _apply_destructive_schema_gate(conn, command="gc")
             if expired:
                 skip_archived_gc = await _gc_expired(conn, cfg, dry_run=dry_run)
                 if skip_archived_gc:
@@ -1655,6 +1836,7 @@ def migrate(ctx: click.Context) -> None:
 
     async def _migrate() -> None:
         import aiosqlite  # noqa: PLC0415, I001
+        from engrava.domain.exceptions import SchemaVersionError  # noqa: PLC0415
         from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore  # noqa: PLC0415
 
         conn = await aiosqlite.connect(str(cfg.db_path))
@@ -1663,9 +1845,21 @@ def migrate(ctx: click.Context) -> None:
         await conn.execute("PRAGMA foreign_keys = ON")
 
         store = SqliteEngravaCore(conn)
-        await store.ensure_schema()
-        await conn.commit()
-        await conn.close()
+        try:
+            # migrate is the one built-in that calls ensure_schema()
+            # unconditionally rather than through the schema-version gate —
+            # that is its entire job. ensure_schema() itself still refuses a
+            # populated sub-floor database or one stamped above this build's
+            # head version (SchemaVersionError) rather than mislabelling or
+            # silently opening either; caught here so that refusal reads as
+            # a clean message, not a traceback.
+            await store.ensure_schema()
+            await conn.commit()
+        except SchemaVersionError as exc:
+            click.echo(str(exc), err=True)
+            sys.exit(1)
+        finally:
+            await conn.close()
         click.echo(f"Schema up to date: {cfg.db_path}")
 
     _run(_migrate())
@@ -1691,6 +1885,7 @@ def export_cmd(ctx: click.Context, output_path: str | None, status_filter: str |
 
         conn = await _open_db(cfg)
         try:
+            await _apply_read_schema_gate(conn, command="export")
             # Fetch thoughts
             if status_filter:
                 cursor = await conn.execute(

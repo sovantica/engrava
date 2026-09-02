@@ -65,7 +65,7 @@ from engrava import (
     ThoughtRecord,
     ThoughtType,
 )
-from engrava.domain.exceptions import CoreMigrationError
+from engrava.domain.exceptions import CoreMigrationError, SchemaVersionError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -1540,3 +1540,96 @@ def test_stamp_count_scan_detects_a_duplicate_stamp(early_stamp: str) -> None:
 
     assert _stamped_version(fragments[-1]) == _HEAD_VERSION
     assert _count_user_version_mentions(fragments) == 2
+
+
+# ---------------------------------------------------------------------------
+# ensure_schema refuses what it cannot safely open
+# ---------------------------------------------------------------------------
+
+
+async def test_populated_sub_floor_database_refuses_instead_of_silent_bootstrap(
+    fresh_db: aiosqlite.Connection,
+) -> None:
+    """A sub-floor database that already carries a row refuses to bootstrap.
+
+    ``ensure_schema``'s bootstrap path is built entirely of
+    ``CREATE ... IF NOT EXISTS`` statements ending in an unconditional
+    ``PRAGMA user_version`` stamp — safe only against a genuinely empty file.
+    A database with a real ``thought`` row already in it, stamped below the
+    bootstrap floor, is not empty: silently stamping it current would
+    mislabel whatever the file actually contains rather than confirm it.
+
+    Distinguished from the (also below-floor, also table-carrying, but
+    row-*free*) interrupted-bootstrap-retry case covered by
+    ``TestBootstrapAtomicity`` in ``test_referential_integrity.py`` and by
+    ``test_has_any_core_table_distinguishes_empty_tables_from_real_rows``
+    below — row presence, not table presence, is the line.
+    """
+    # A minimal, deliberately non-current shape: this is not what any
+    # version of schema_core.sql ever created, which is the point — a real
+    # legacy database predates this migration ladder's public history and
+    # its exact shape is unknown.
+    await fresh_db.execute("CREATE TABLE thought (thought_id TEXT PRIMARY KEY, essence TEXT)")
+    await fresh_db.execute(
+        "INSERT INTO thought (thought_id, essence) VALUES ('legacy-1', 'predates the ladder')"
+    )
+    await fresh_db.commit()
+    assert await _user_version(fresh_db) == 0
+
+    store = SqliteEngravaCore(fresh_db)
+    with pytest.raises(SchemaVersionError) as exc_info:
+        await store.ensure_schema()
+
+    assert exc_info.value.reason == "populated_sub_floor"
+    assert exc_info.value.current_version == 0
+    assert await _user_version(fresh_db) == 0, "a refusal must not stamp any version"
+
+
+async def test_has_any_core_table_distinguishes_empty_tables_from_real_rows(
+    fresh_db: aiosqlite.Connection,
+) -> None:
+    """Row presence, not table presence, is what ``_has_any_core_table`` checks.
+
+    Directly exercises the private helper ``ensure_schema`` uses to draw that
+    line, independent of what ``schema_core.sql`` happens to contain: an
+    empty table — the shape a bootstrap interrupted partway through can
+    leave behind, since the bootstrap script is pure DDL and writes no rows —
+    must not read as populated, or a legitimate retry would be refused
+    alongside a genuine legacy database.
+    """
+    store = SqliteEngravaCore(fresh_db)
+    assert await store._has_any_core_table() is False
+
+    await fresh_db.execute("CREATE TABLE thought (thought_id TEXT PRIMARY KEY)")
+    await fresh_db.commit()
+    assert await store._has_any_core_table() is False, (
+        "an empty table (e.g. left by an interrupted bootstrap) must not count as populated"
+    )
+
+    await fresh_db.execute("INSERT INTO thought (thought_id) VALUES ('legacy-1')")
+    await fresh_db.commit()
+    assert await store._has_any_core_table() is True
+
+
+async def test_newer_than_head_database_refuses_to_open(
+    fresh_db: aiosqlite.Connection,
+) -> None:
+    """A database stamped above this build's head version refuses to open.
+
+    The migration registry has no step targeting a version this high, so the
+    incremental loop would silently skip every entry and leave the database
+    open as though its (unknown, newer) schema were understood. Refusing
+    replaces a version stamped by a future engrava passing unnoticed.
+    """
+    await fresh_db.execute(f"PRAGMA user_version = {_HEAD_VERSION + 1}")
+    await fresh_db.commit()
+
+    store = SqliteEngravaCore(fresh_db)
+    with pytest.raises(SchemaVersionError) as exc_info:
+        await store.ensure_schema()
+
+    assert exc_info.value.reason == "newer_than_head"
+    assert exc_info.value.current_version == _HEAD_VERSION + 1
+    assert await _user_version(fresh_db) == _HEAD_VERSION + 1, (
+        "a refusal must not alter the stamped version"
+    )

@@ -124,7 +124,7 @@ class EngravaManager:
     # Public API
     # ------------------------------------------------------------------
 
-    async def get_store(self, service_name: str) -> SqliteEngravaCore:
+    async def get_store(self, service_name: str, *, migrate: bool = True) -> SqliteEngravaCore:
         """Get or create the store for a named service.
 
         The store is lazily initialized: the database file and schema are
@@ -134,6 +134,17 @@ class EngravaManager:
         Args:
             service_name: Unique service identifier.  Must match
                 ``^[a-z][a-z0-9_-]{0,62}$``.
+            migrate: When ``True`` (the default), a new store calls
+                ``ensure_schema()`` as part of construction — a fresh service
+                is bootstrapped and an existing behind one is brought
+                current. Pass ``False`` to skip that call and open the
+                database exactly as stored; used by a CLI command's
+                schema-version gate for a read against an existing,
+                previously-initialized service, where a warn-and-attempt on a
+                behind schema must not itself perform an implicit migration.
+                Ignored for a service whose store is already cached — the
+                cached instance's schema state was decided by whichever call
+                created it, not by this one.
 
         Returns:
             A fully initialized ``SqliteEngravaCore`` instance
@@ -157,9 +168,45 @@ class EngravaManager:
             # Double-check after acquiring the lock.
             if name in self._stores:
                 return self._stores[name]
-            store = await self._create_store(name)
+            store = await self._create_store(name, migrate=migrate)
             self._stores[name] = store
             return store
+
+    async def peek_schema_version(self, service_name: str) -> int | None:
+        """Read a service database's stamped ``user_version`` without migrating it.
+
+        Returns ``None`` when the service has no database file yet — there is
+        nothing to peek, and a fresh service is always bootstrapped to head by
+        the ordinary :meth:`get_store` path. A plain ``PRAGMA`` read on a
+        throwaway connection, never routed through ``ensure_schema``, so a
+        caller applying its own schema-version gate can decide whether to
+        warn, refuse, or proceed *before* anything about the database's schema
+        changes.
+
+        Args:
+            service_name: Service identifier.
+
+        Returns:
+            The stamped ``user_version``, or ``None`` if the service database
+            does not exist.
+
+        Raises:
+            ConfigError: If the service name is invalid.
+
+        """
+        from engrava.config import _validate_service_name  # noqa: PLC0415
+
+        name = _validate_service_name(service_name)
+        db_path = self._service_db_path(name)
+        if not db_path.exists():
+            return None
+        conn = await aiosqlite.connect(str(db_path))
+        try:
+            cursor = await conn.execute("PRAGMA user_version")
+            row = await cursor.fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            await conn.close()
 
     def service_exists(self, service_name: str) -> bool:
         """Check whether a service database file exists on disk.
@@ -315,14 +362,18 @@ class EngravaManager:
                 return svc_cfg.embeddings
         return self._default_embeddings
 
-    async def _create_store(self, service_name: str) -> SqliteEngravaCore:
+    async def _create_store(
+        self, service_name: str, *, migrate: bool = True
+    ) -> SqliteEngravaCore:
         """Create and initialize a new store for a service.
 
-        Creates the data directory and database file if needed,
-        applies the schema, and configures the embedding provider.
+        Creates the data directory and database file if needed, applies the
+        schema (unless ``migrate`` is ``False``), and configures the
+        embedding provider.
 
         Args:
             service_name: Service identifier.
+            migrate: Forwarded from :meth:`get_store` — see its docstring.
 
         Returns:
             Fully initialized ``SqliteEngravaCore``.
@@ -357,7 +408,8 @@ class EngravaManager:
                 search_config=self._default_search,
             )
             store._owns_connection = True  # noqa: SLF001
-            await store.ensure_schema()
+            if migrate:
+                await store.ensure_schema()
 
             await store._configure_vector_backend(  # noqa: SLF001
                 backend_name=self._vector_backend,

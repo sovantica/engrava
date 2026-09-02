@@ -91,6 +91,13 @@ class SqliteVecSearchBackend:
         present in ``embedding_vec``.  Uses ``INSERT OR IGNORE`` to
         be idempotent.
 
+        Only backfills a row whose owning ``thought`` still exists. An
+        ``embedding`` row is a carrier, not an owner: on a schema predating
+        the core-12 ``ON DELETE CASCADE``, a thought delete can leave its
+        ``embedding`` row behind, and without this join this method would
+        read that dangling row as proof the thought was still live and put
+        its vector straight back into the index on every open.
+
         Args:
             db: Active database connection with sqlite-vec loaded.
 
@@ -101,6 +108,7 @@ class SqliteVecSearchBackend:
         cursor = await db.execute(
             "SELECT e.rowid, e.dimension, e.vector_blob "
             "FROM embedding e "
+            "JOIN thought t ON t.thought_id = e.owner_id "
             "WHERE e.owner_type = 'THOUGHT' "
             "  AND e.rowid NOT IN (SELECT rowid FROM embedding_vec)"
         )
@@ -134,6 +142,17 @@ class SqliteVecSearchBackend:
         Results are converted to cosine similarity via ``1 - distance``
         so higher is better, consistent with the numpy backend.
 
+        The rowid-to-owner resolution below **requires** the owning
+        ``thought`` row to exist: a vec0 hit is only resolved through an
+        ``embedding`` row whose ``owner_id`` still
+        joins to a live thought, so a dangling ``embedding`` row left behind
+        by a pre-core-12 delete (no cascade to remove it) can no longer be
+        resolved to an id this method returns. This is defense in depth
+        alongside the reconciliation join in :meth:`sync_embeddings` and the
+        post-filter in ``SqliteEngravaCore._filter_expired_results`` — any
+        one of the three, on its own, still lets a stale vector already in
+        the index be returned.
+
         Args:
             db: Active database connection with sqlite-vec loaded.
             query_vector: Query embedding vector.
@@ -158,13 +177,16 @@ class SqliteVecSearchBackend:
         if not vec_rows:
             return []
 
-        # Map vec rowids back to thought_ids via the embedding table.
+        # Map vec rowids back to thought_ids via the embedding table, joined
+        # to thought so a dangling embedding row (owning thought already
+        # deleted) resolves no id at all.
         rowids = [row["rowid"] for row in vec_rows]
         distances = {row["rowid"]: float(row["distance"]) for row in vec_rows}
         placeholders = ",".join("?" * len(rowids))
         cursor2 = await db.execute(
-            f"SELECT rowid, owner_id FROM embedding "  # noqa: S608
-            f"WHERE owner_type = 'THOUGHT' AND rowid IN ({placeholders})",
+            f"SELECT e.rowid, e.owner_id FROM embedding e "  # noqa: S608
+            f"JOIN thought t ON t.thought_id = e.owner_id "
+            f"WHERE e.owner_type = 'THOUGHT' AND e.rowid IN ({placeholders})",
             rowids,
         )
         id_rows = await cursor2.fetchall()
@@ -237,7 +259,7 @@ class SqliteVecSearchBackend:
 
 
 async def purge_orphan_vectors(db: aiosqlite.Connection) -> int:
-    """Delete ``embedding_vec`` rows whose rowid is absent from ``embedding``.
+    """Delete ``embedding_vec`` rows whose owning thought no longer exists.
 
     The ``embedding_vec`` virtual table is not reachable by the ``embedding``
     table's ``ON DELETE CASCADE`` foreign key, so a thought delete (or any
@@ -250,20 +272,22 @@ async def purge_orphan_vectors(db: aiosqlite.Connection) -> int:
     an orphan is.
 
     Idempotent and additive — a clean store deletes nothing — and it can never
-    remove the vector of an embedding that is still stored, whatever the caller
-    believes it deleted.
+    remove the vector of an embedding whose thought is still live, whatever
+    the caller believes it deleted.
 
-    Ownership here is the ``embedding`` row, not the thought behind it. On a
-    schema whose foreign keys cascade — every schema at or above the version
-    that introduced them — the two are the same question, because deleting a
-    thought takes its embedding with it. On an older one they are not: a
-    delete leaves the embedding row behind, so its vector is still owned and
-    stays. Nor would removing that vector by rowid help while
-    :meth:`SqliteVecSearchBackend.sync_embeddings` treats a dangling embedding
-    row as a valid source to backfill from: the same row puts the vector back
-    at the next open. Both halves read ownership as the embedding row rather
-    than the thought behind it, and changing that is a decision about the
-    backend's semantics, not about any one caller.
+    **Ownership here is the thought, not the ``embedding`` row** — a
+    correction to this function's own earlier reasoning. A row is
+    kept only when its ``embedding`` row exists *and* joins to a ``thought``
+    row that still exists; either one missing makes the vector an orphan.
+    On a schema whose foreign keys cascade — every schema at or above the
+    version that introduced them — deleting a thought takes its ``embedding``
+    row with it, so the two failure modes coincide and this predicate
+    behaves exactly as the embedding-row-only form used to. On an older
+    schema they do not: a delete can leave the ``embedding`` row behind, and
+    without the join to ``thought`` this function would leave that vector in
+    place — the same dangling row :meth:`SqliteVecSearchBackend.sync_embeddings`
+    would then read as proof the thought was still live and use to put the
+    vector straight back in on the next open.
 
     Args:
         db: Active database connection with sqlite-vec loaded.
@@ -273,7 +297,11 @@ async def purge_orphan_vectors(db: aiosqlite.Connection) -> int:
 
     """
     cursor = await db.execute(
-        "DELETE FROM embedding_vec WHERE rowid NOT IN (SELECT rowid FROM embedding)"
+        "DELETE FROM embedding_vec WHERE rowid NOT IN ("
+        "  SELECT e.rowid FROM embedding e "
+        "  JOIN thought t ON t.thought_id = e.owner_id "
+        "  WHERE e.owner_type = 'THOUGHT'"
+        ")"
     )
     return cursor.rowcount if cursor.rowcount is not None and cursor.rowcount > 0 else 0
 

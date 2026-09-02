@@ -373,6 +373,15 @@ class TestOffOnPair:
 # suspend_auto_commit() window (an out-of-contract deadlock this store cannot
 # otherwise resolve) or when that bound is configured too small for a
 # legitimately slow embedding provider.
+# Later extended with SchemaVersionError, raised by ensure_schema() when a
+# database is a populated sub-floor schema (below the bootstrap floor but
+# already carrying a row, rather than genuinely empty) or is stamped above
+# this build's head version — cases that were previously either silently
+# mislabelled current or silently opened with every migration step skipped.
+# An additive public-API addition, unreachable for any database that is
+# either genuinely empty or already at or below this build's head version;
+# reachable through EngravaManager.get_store() and any other caller of
+# ensure_schema() / from_config(), not only the CLI.
 _PRE_WS_ALL_BASELINE = frozenset(
     {
         "ActionNotFoundError",
@@ -469,6 +478,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "RecencyModeConflictError",
         "RecencySignal",
         "RoleAwareEmbeddingProvider",
+        "SchemaVersionError",
         "ScoringContext",
         "SearchConfig",
         "SentenceTransformerProvider",

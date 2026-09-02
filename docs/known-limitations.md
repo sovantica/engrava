@@ -244,85 +244,61 @@ a forgotten (archived) thought stops surfacing without being deleted.
 
 ## Deletion on a database that has not been migrated
 
-Foreign-key `ON DELETE CASCADE` on the child tables (`edge`, `embedding`,
-`action`) arrives with the **core-12** schema migration. A database carried
-forward from an older engrava and never migrated is still below that version, so
-nothing cascades. On such a database a deleted thought's **identifier** becomes
-reachable again through the `vec0` vector arm — not immediately. The delete does
-purge that thought's own vector from the index; what it cannot remove is the
-`embedding` row behind it, and the reconcile that runs on the next
-sqlite-vec-enabled open puts the vector back from that row. Everything below
-describes the state **after** that reconcile.
+**This used to be a documented non-guarantee: a deleted thought's identifier
+could become reachable again through the `vec0` vector arm on a database
+below the core-12 schema (the migration that adds `ON DELETE CASCADE` to
+`edge`, `embedding`, and `action`). It no longer can.** A vector is now
+treated as owned by a *live thought*, not by the presence of an `embedding`
+row, and that rule is enforced in every place that could otherwise
+resurrect one:
 
-**Three conditions must all hold.**
+- **Deletion no longer depends on the cascade.** `delete_thought`, the TTL
+  `delete` strategy, and hygiene GC each delete a thought's `edge`,
+  `embedding`, and `action` rows explicitly before deleting the thought
+  itself — durable on every schema version, not only from core-12 onward.
+- **Reconciliation only backfills a vector whose thought still exists.**
+  `sync_embeddings` (the pass that runs on every sqlite-vec-enabled open)
+  joins to `thought` before treating an `embedding` row as a valid backfill
+  source, so a dangling row left behind by something older than this fix can
+  no longer put a vector back.
+- **The purge is the same join.** The sweep that removes orphaned
+  `embedding_vec` rows (on reconcile, and in `engrava gc`) now considers a
+  vector orphaned when its owning *thought* is gone, not only when its
+  `embedding` row is gone.
+- **Search resolves through a join that requires the thought row.** Both the
+  `vec0` rowid-to-id resolution and the post-search eligibility check now
+  positively confirm the thought exists (and is otherwise eligible) rather
+  than only checking that it isn't *excluded* — an id that resolves to no
+  thought row at all is dropped, not passed through by default.
 
-1. The database is **below core-12**. A freshly created store is not affected: a
-   new database is bootstrapped at the head schema version, cascades included.
-2. **A sqlite-vec backend is actually active on the store** — `vector_backend:
-   sqlite-vec` *and* the extension loaded. If the load fails the store logs a
-   warning and falls back to NumPy, which closes the gap; so does the default
-   `vector_backend: numpy`. Either way the NumPy candidate query joins
-   `thought`, and a row that is gone cannot be scored.
-3. **The query reaches the `vec0` arm**, which it does whenever no *effective*
-   metadata predicate applies. `search_similar()` takes no filter argument, so
-   it is always on that arm. For `search_hybrid()` / `recall()`, `filters` and
-   `visibility` are compiled together into one predicate, and a query carrying
-   one is routed to the NumPy path even under sqlite-vec (the `vec0` table
-   declares no metadata columns, so the predicate could only run as a
-   post-`MATCH` join). What matters is whether that compilation produces
-   anything:
-   - `filters=None`, **an empty `MetadataFilter`**, and `visibility=None`
-     compile to nothing. The query stays on the `vec0` arm and **is** affected —
-     passing an empty filter is not protection.
-   - a `MetadataFilter` holding at least one predicate, or **any**
-     `VisibilityQueryFilter` at all, compiles to a predicate. That query takes
-     the NumPy path, which joins `thought` and excludes the orphan on any schema
-     version.
+**What deletion does, on any schema version.** The `thought` row is removed
+and its `content` with it. Resolving the identifier — `get_thought()`, or
+any read that hydrates an id into a record — returns `None`. The content
+does not come back, and neither, now, does the identifier.
 
-**What deletion does regardless of schema version.** The `thought` row is
-removed and its `content` with it. Resolving the identifier — `get_thought()`,
-or any read that hydrates an id into a record — returns `None`. The content does
-not come back.
-
-**What survives below core-12.** Nothing removes the thought's `embedding` row,
-so it stays. Two lookups then read ownership as that row rather than as the
-thought behind it:
-
-- `sync_embeddings`, the reconcile that runs when a sqlite-vec-enabled
-  connection opens, picks backfill candidates from the `embedding` table alone.
-  The leftover row qualifies, so its vector is re-inserted into `embedding_vec`
-  — including the vector that `delete_thought` had explicitly removed moments
-  earlier.
-- Vector search maps `embedding_vec` rowids back to ids through that same
-  `embedding` table, and the post-search eligibility filter is an *exclusion*
-  query over `thought`: a thought row that no longer exists produces no
-  exclusion, so the id passes through.
-
-So on such a database, after a delete that reported success **and after that
-reconcile has run** — the delete itself leaves the index clean:
-
-- the `vec0` arm returns the **deleted identifier** with a similarity score.
-  From `search_similar()` that arm's output *is* the result; in
-  `search_hybrid()` / `recall()` it is one input to fusion;
-- a caller therefore learns that **a thought matching this query exists** in the
-  index. Where the deletion answered an erasure request rather than being
-  routine housekeeping, that existence signal is the disclosure that matters;
-- **if the phantom reaches the returned window** it consumes one of the `top_k`
-  slots. It need not: on a hybrid query, fusion and the final truncation to
-  `top_k` can leave it outside the window altogether. And when it does land
-  there, it costs you a live result only if at least one further live candidate
-  would otherwise have qualified — the window is a truncation of whatever
-  ranked, not a fixed-size budget the phantom takes a share of.
-
-**What to do: migrate.** Run `engrava migrate` (or open the store through
-`from_config()`, which calls `ensure_schema()`). The core-12 step recreates the
-three child tables with `ON DELETE CASCADE` and purges any orphan rows that had
-already accumulated. After it, deleting a thought takes its `embedding` row with
-it and the reconcile has nothing left to backfill.
+**Historical residue is not retroactively repaired.** If a database
+accumulated dangling `embedding` rows *before* upgrading to this fix — every
+delete made on a pre-core-12 schema by an older engrava build did, since
+nothing removed them — those rows are still sitting there. They can no
+longer be resurrected into a search result, but they are not cleaned up
+until you migrate: `engrava migrate` runs the core-12 step, which recreates
+the three child tables with `ON DELETE CASCADE` and purges the orphan rows
+that had already accumulated.
 
 ```bash
 engrava --db engrava.db migrate
 ```
+
+**`engrava gc` refuses instead of running on a database below head.**
+Physically deleting rows through an engine that does not understand the
+schema it is deleting from is how this defect reached a user in the first
+place, so `gc` — and every other built-in command that deletes user data —
+now exits non-zero and names `engrava migrate` rather than proceeding on an
+unmigrated database. A read-only command (`info`, `verify`, `export`,
+`snapshot`, and a `query` that parses as `FIND`/`COUNT`/`SELECT`) is still
+allowed to run against a behind schema — refusing an ordinary read because a
+migration is pending would trade this defect for a worse one — but it warns
+on stderr that the schema is behind rather than staying silent about it.
 
 ## Maximum Database Size
 

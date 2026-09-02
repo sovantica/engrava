@@ -1791,6 +1791,187 @@ async def test_quarantine_survives_self_cancelled_close(
     await _drain_quarantine_close(store)
 
 
+async def test_close_cancellation_does_not_corpse_the_physical_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation of close()'s own caller must not corpse the physical close.
+
+    The branch that *creates* the close task (no prior quarantine -- this is
+    an ordinary close with nothing else in the picture) used to await it with
+    a bare ``await``, which forwards this call's own cancellation into the
+    task. A single cancellation could then cancel the physical close before
+    ``_db.close()`` had meaningfully run at all, yet leave a ``done()``
+    (cancelled) task sitting in the shared slot -- every later ``close()`` or
+    quarantine drain would see a completed task and report success without
+    the real connection ever having closed.
+
+    Draining under ``_drain_shielded`` closes this off structurally rather
+    than papering over it: it re-shields on every repeated cancellation and
+    never returns until the task is genuinely done, so the physical close
+    always runs to real completion. This mirrors the already-proven pattern
+    for the compensating-rollback flow
+    (``test_repeated_cancellation_during_rollback_still_completes_it``),
+    reused here for the same reason: a single cancellation is easy for a
+    coroutine to absorb by accident; a *repeated* one is what actually
+    exercises whether the shield holds.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(conn)
+    store._owns_connection = True
+    await store.ensure_schema()
+
+    close_calls = {"n": 0}
+    real_close = conn.close
+    started = asyncio.Event()
+    release = asyncio.Event()
+    completed = {"done": False}
+
+    async def _slow_close() -> None:
+        close_calls["n"] += 1
+        started.set()
+        await release.wait()
+        await real_close()
+        completed["done"] = True
+
+    monkeypatch.setattr(conn, "close", _slow_close)
+
+    task = asyncio.ensure_future(store.close())
+    await started.wait()  # the physical close has started (and is now gated)
+    task.cancel()  # cancel the caller while it awaits the physical close
+    await asyncio.sleep(0)
+    task.cancel()  # a repeated cancellation must not abort the shielded close either
+    await asyncio.sleep(0)
+    release.set()  # let the physical close finish
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert completed["done"] is True, (
+        "the physical close must run to real completion despite the caller's cancellation"
+    )
+    assert close_calls["n"] == 1
+    assert store._quarantine_close_task is not None
+    assert not store._quarantine_close_task.cancelled(), (
+        "the close task itself must not be cancelled -- only this caller's await was"
+    )
+
+
+async def test_close_after_quarantine_shares_the_close_task_and_returns_promptly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """close() after quarantine joins the same physical close, exactly once.
+
+    Builds its own connection rather than using the shared ``db`` fixture:
+    that fixture's own teardown does a bare ``await conn.close()`` on the
+    real connection, which is a *third*, uncoordinated close attempt this
+    test does not want in the picture.
+
+    Quarantine schedules its own detached close of the real connection
+    first. Before the fix, ``close()`` would then hit the quarantine proxy's
+    own no-op ``close()`` — harmless here, but only because this ordering
+    happens to route around the real connection entirely, not because the
+    two were coordinated. The fix makes ``close()`` explicitly await
+    quarantine's own close task instead, so ``close()`` must not return
+    before the physical close is actually finished.
+
+    Asserted by **gating the physical close and checking that ``close()``
+    is still pending**, not by counting how many times it ran: a counter
+    can be satisfied by quarantine's own detached task completing on its
+    own schedule, regardless of whether ``close()`` ever joined it — which
+    is exactly the scheduling-dependent false pass this test used to be
+    exposed to (green on a schedule where quarantine's task happened to run
+    before the assertion, independent of whether ``close()`` itself waited
+    for anything). Checking that ``close()`` remains pending until the gate
+    is explicitly released tests the property directly.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(conn)
+    store._owns_connection = True
+    await store.ensure_schema()
+
+    close_calls = {"n": 0}
+    real_close = conn.close
+    close_started = asyncio.Event()
+    close_may_finish = asyncio.Event()
+
+    async def _gated_close() -> None:
+        close_calls["n"] += 1
+        close_started.set()
+        await close_may_finish.wait()
+        await real_close()
+
+    monkeypatch.setattr(conn, "close", _gated_close)
+
+    await store._quarantine_connection("indeterminate")
+    assert store._connection_quarantined is True
+
+    close_task = asyncio.ensure_future(store.close())
+    await asyncio.wait_for(close_started.wait(), timeout=5.0)
+    assert not close_task.done(), (
+        "close() must wait for the physical close to finish, not return once it has merely started"
+    )
+
+    close_may_finish.set()
+    await asyncio.wait_for(close_task, timeout=5.0)
+
+    assert close_calls["n"] == 1, "the real connection must be physically closed exactly once"
+
+
+async def test_quarantine_during_an_in_flight_close_does_not_double_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A quarantine racing an in-flight close() must not enter the real close twice.
+
+    Reproduces the exact shape confirmed on a real database: ``close()`` has
+    already entered the real connection's close (published as the shared
+    ``_quarantine_close_task`` before awaiting it), and quarantine runs while
+    that is still in flight. On the pinned aiosqlite version two concurrent
+    physical closes on the same connection each enqueue their own stop
+    sentinel to the worker thread, which exits on the first and can leave
+    the other caller's future unresolved forever -- a hang. The final await
+    is timeout-guarded so a regression here fails this test instead of
+    stalling the suite.
+
+    Builds its own connection rather than using the shared ``db`` fixture —
+    see the previous test's docstring for why.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(conn)
+    store._owns_connection = True
+    await store.ensure_schema()
+
+    close_calls = {"n": 0}
+    real_close = conn.close
+    close_started = asyncio.Event()
+    close_may_finish = asyncio.Event()
+
+    async def _gated_close() -> None:
+        close_calls["n"] += 1
+        close_started.set()
+        await close_may_finish.wait()
+        await real_close()
+
+    monkeypatch.setattr(conn, "close", _gated_close)
+
+    close_task = asyncio.ensure_future(store.close())
+    await asyncio.wait_for(close_started.wait(), timeout=5.0)
+    assert store._quarantine_close_task is not None, (
+        "close() must publish the shared close task before awaiting the physical close"
+    )
+
+    # Quarantine runs while close() is still mid-flight, gated on the same
+    # real close -- it must not start a second one.
+    await asyncio.wait_for(store._quarantine_connection("indeterminate"), timeout=5.0)
+    assert store._connection_quarantined is True
+
+    close_may_finish.set()
+    await asyncio.wait_for(close_task, timeout=5.0)
+
+    assert close_calls["n"] == 1, "the real connection must be physically closed exactly once"
+
+
 async def test_cancelled_rollback_task_quarantines_and_propagates_cancelled(
     db: aiosqlite.Connection,
     monkeypatch: pytest.MonkeyPatch,

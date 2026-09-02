@@ -247,17 +247,16 @@ snapshots and physical backups, replicas or exports, and the retention policy of
 any remote provider that received the text. Purging journal entries breaks the
 chain and requires an explicit re-baseline if journal verification is retained.
 
-One residue is version-dependent and easy to miss: **on a database still below
-core schema 12 a hard delete leaves the thought's `embedding` row behind**. The
-delete does purge that thought's own `vec0` vector, so the index is clean
-immediately afterwards — but the reconcile on the next sqlite-vec-enabled open
-backfills it from the surviving `embedding` row, and from then on the deleted
-**identifier** — not its content, which is gone — is returned by a vector query
-that carries no effective metadata predicate on an active sqlite-vec backend.
-That is an existence signal about a record an erasure request asked you to
-remove, and checking the index straight after the delete will not reveal it.
-`engrava migrate` closes it and purges the orphans that had already accumulated.
-See
+A hard delete no longer leaves a version-dependent residue: **`delete_thought`
+deletes the thought's `edge`, `embedding`, and `action` rows explicitly, on every
+schema version**, rather than depending on the `ON DELETE CASCADE` that only exists
+from core schema 12 onward. A vector is owned by the thought it belongs to, and that
+rule also holds in reconciliation, in the vector-index purge, and in search itself,
+so a deleted identifier cannot be returned by a later vector query even on a
+database still below core-12. A database that already accumulated dangling
+`embedding` rows under an older engrava build still needs `engrava migrate` to purge
+them — they cannot be resurfaced by a query any more, but they are not physically
+removed until then. See
 [Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated).
 
 See [Data Lifecycle](data-lifecycle.md) for the complete retention and erasure

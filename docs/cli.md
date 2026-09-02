@@ -94,6 +94,39 @@ In short: an explicit `--service` works even without a services config (using
 `--db`'s directory as the data directory), while omitting it only enters
 multi-service mode when a services config is present.
 
+## Schema-version checks
+
+Every built-in command now checks the database's schema version before it
+acts, and the two kinds of command are held to different rules:
+
+| Kind | Commands | On a schema below head | On a schema above head |
+|---|---|---|---|
+| Destructive | `gc`, `restore` | **Refuses**, exit `1`, names `engrava migrate` | **Refuses**, exit `1` |
+| Read | `info`, `verify`, `export`, `snapshot`, a `query` that parses as `FIND`/`COUNT`/`SELECT` | Warns on stderr and runs anyway | **Refuses**, exit `1` |
+
+A destructive command never deletes rows through an engine that does not
+understand the schema it is deleting from — that gap is how a deleted thought
+could come back on an unmigrated database (see
+[Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated)).
+A read command is allowed to attempt anyway, because refusing an ordinary read
+over a pending migration would be a worse failure than the one this replaces —
+but it is never silent about the gap. `query` classifies by the **parsed**
+command, not by the fact that you typed `query`: a registered extension
+command can write, so it is refused like a destructive one whenever the
+schema is behind.
+
+`migrate` is not in either row — running the pending migrations (or refusing
+to, when the database is a populated pre-history schema `ensure_schema()`
+cannot safely bootstrap, or is stamped above this build's head version) is
+its entire job.
+
+```bash
+$ engrava --db old.db gc
+Database schema is at version 11; this engrava build's head version is 20. Run 'engrava migrate' before running 'gc' on it.
+$ echo $?
+1
+```
+
 ### `info`
 
 Shows a metrics snapshot (counts, etc.) for the current database. Takes no
@@ -264,6 +297,13 @@ either end — including edges whose other end is still live — their embedding
 the actions sourced from them, then reconciles the vector index by removing every
 `vec0` row no `embedding` row owns. With `--expired` it also runs the TTL expiry
 cleanup first.
+
+> **`gc` now refuses on a database that is not on the current schema.** If
+> `--db` (or the resolved service database) is below or above this build's
+> head schema version, `gc` deletes nothing and exits `1` naming
+> `engrava migrate` — see [Schema-version checks](#schema-version-checks)
+> above. If a `gc` that used to run cleanly now exits non-zero, that is this
+> refusal, not a regression in what it collects: run `engrava migrate` first.
 
 | Option | Type | Default | Description |
 |---|---|---|---|

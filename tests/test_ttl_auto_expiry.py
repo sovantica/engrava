@@ -950,6 +950,44 @@ class TestSqliteVecExpiredFilter:
         filtered = await store._filter_expired_results(results)
         assert len(filtered) == 2
 
+    async def test_filter_drops_an_id_with_no_thought_row_at_all(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """Absence from ``thought`` is a positive exclusion, not an incidental miss.
+
+        A hit that does not resolve to *any* ``thought`` row — the shape a
+        stale ``embedding_vec`` entry for an already-deleted thought takes —
+        must be dropped exactly like an ordinarily-ineligible (expired /
+        archived / retired-REFLECTION) one, not passed through because this
+        filter only ever learned to recognise the other cases. The id here
+        was never created, so there is nothing in ``thought`` to resolve it
+        against.
+        """
+        await store.create_thought(_make_thought(thought_id="t-ok"))
+
+        results = [("t-never-existed", 0.95), ("t-ok", 0.8)]
+        filtered = await store._filter_expired_results(results)
+
+        ids = [r[0] for r in filtered]
+        assert "t-never-existed" not in ids
+        assert "t-ok" in ids
+
+    async def test_filter_drops_everything_when_nothing_resolves(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """The all-unresolvable case: dropping every id must not fall back to keeping them.
+
+        A degenerate empty-eligible-set result must not be read as "nothing
+        to exclude, return the input unchanged" — the pre-D3 exclusion-form
+        query had exactly that shortcut, and inverting the polarity without
+        also dropping it would silently keep every phantom hit whenever none
+        of them happened to resolve.
+        """
+        filtered = await store._filter_expired_results([("t-a", 0.9), ("t-b", 0.5)])
+        assert filtered == []
+
 
 # ---------------------------------------------------------------------------
 # The cleanup strategy that was validated is the strategy that runs

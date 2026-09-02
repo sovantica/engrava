@@ -26,6 +26,7 @@ masks them.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import importlib.util
 import uuid
@@ -50,6 +51,7 @@ from engrava.domain.enums import (
     VerificationStatus,
 )
 from engrava.domain.exceptions import (
+    ConnectionQuarantinedError,
     CoreMigrationError,
     DuplicateEdgeError,
     ReferentialIntegrityError,
@@ -334,6 +336,233 @@ class TestCascadeOnDelete:
         row = await cursor.fetchone()
         assert row is not None
         assert row[0] == 0
+
+
+class TestDeleteThoughtChildrenAtomicity:
+    """The three explicit child deletes are one indivisible unit.
+
+    ``_delete_thought_children_explicit`` issues three sequential
+    ``DELETE`` statements (edge, embedding, action) rather than relying on
+    ``ON DELETE CASCADE``. A cascade is atomic by construction; three bare
+    statements are not, unless something brackets them. Without that
+    bracket, a rejection on the *third* statement — a trigger vetoing the
+    ``action`` delete is the concrete case — leaves the first two sitting in
+    an open transaction, ``delete_thought`` raises, the thought survives,
+    and the partial child loss becomes durable the moment *any later,
+    unrelated write* on the same connection commits.
+    """
+
+    async def test_action_delete_rejection_rolls_back_the_edge_and_embedding_deletes_too(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        await store.create_thought(_make_thought("t1"))
+        await store.create_thought(_make_thought("t2"))
+        await store.create_edge(_make_edge("e-out", "t1", "t2"))
+        await store.create_edge(_make_edge("e-in", "t2", "t1"))
+        await store._db.execute(
+            "INSERT INTO embedding "
+            "(embedding_id, owner_type, owner_id, model_name, dimension, "
+            " vector_blob, created_at) "
+            "VALUES (?, 'THOUGHT', ?, 'test', 3, ?, ?)",
+            (
+                f"emb-{uuid.uuid4().hex}",
+                "t1",
+                b"\x00\x01\x02",
+                datetime.datetime.now(tz=datetime.UTC).isoformat(),
+            ),
+        )
+        await store.create_action(_make_action("a1", "t1"))
+
+        # Rejects the *third* of the three child deletes -- after the edge
+        # and embedding deletes have already run, inside the same
+        # still-open transaction _delete_thought_children_explicit uses.
+        await store._db.execute(
+            "CREATE TRIGGER reject_action_delete BEFORE DELETE ON action "
+            "BEGIN SELECT RAISE(ABORT, 'policy: action rows are retained'); END"
+        )
+
+        with pytest.raises(aiosqlite.IntegrityError):
+            await store.delete_thought("t1")
+
+        # The discriminating step. A half-applied delete sitting in an open,
+        # uncommitted transaction is invisible until something commits --
+        # this unrelated write's own commit is exactly the "later ordinary
+        # store write" the defect described, and it must not durably apply
+        # the two deletes the failed call above left behind.
+        await store.create_thought(_make_thought("unrelated-write"))
+
+        assert await store.get_thought("t1") is not None
+        cursor = await store._db.execute(
+            "SELECT edge_id FROM edge WHERE edge_id IN ('e-out', 'e-in')"
+        )
+        surviving_edges = {row["edge_id"] for row in await cursor.fetchall()}
+        assert surviving_edges == {"e-out", "e-in"}, "the edge deletes must have been rolled back"
+        cursor = await store._db.execute("SELECT COUNT(*) FROM embedding WHERE owner_id = 't1'")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 1, "the embedding delete must have been rolled back"
+        cursor = await store._db.execute(
+            "SELECT COUNT(*) FROM action WHERE source_thought_id = 't1'"
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 1, "the rejected action row itself must still be there too"
+
+    async def test_action_delete_rollback_trigger_surfaces_its_own_error(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """A ``RAISE(ROLLBACK, ...)`` trigger: the caller sees it, not a savepoint error.
+
+        Unlike ``RAISE(ABORT, ...)`` (the previous test), ``RAISE(ROLLBACK,
+        ...)`` ends the *entire* transaction, taking the savepoint down with
+        it. Naively retrying ``ROLLBACK TO`` against a savepoint that is
+        already gone raises ``"no such savepoint"`` and replaces the real
+        failure — this pins that the caller sees the trigger's own message
+        instead. Each earlier ``create_*`` call commits on its own, so by the
+        time ``delete_thought`` opens its own transaction there is nothing
+        else pending for the trigger's rollback to take down except that
+        call's own (otherwise-uncommitted) work.
+        """
+        await store.create_thought(_make_thought("t1"))
+        await store.create_action(_make_action("a1", "t1"))
+        await store._db.execute(
+            "CREATE TRIGGER reject_action_delete_rollback BEFORE DELETE ON action "
+            "BEGIN SELECT RAISE(ROLLBACK, 'policy: rollback rejection'); END"
+        )
+
+        with pytest.raises(aiosqlite.IntegrityError, match="policy: rollback rejection"):
+            await store.delete_thought("t1")
+
+        assert not store._db.in_transaction, (
+            "a RAISE(ROLLBACK) trigger already closes the transaction; nothing should be left open"
+        )
+        assert await store.get_thought("t1") is not None
+        cursor = await store._db.execute(
+            "SELECT COUNT(*) FROM action WHERE source_thought_id = 't1'"
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 1
+
+    async def test_cancellation_after_release_with_a_caller_transaction_quarantines(
+        self,
+    ) -> None:
+        """A cancellation racing a completed RELEASE quarantines instead of guessing.
+
+        Simulates the exact race a real database was confirmed to hit: the
+        ``RELEASE`` genuinely executes (its SQL runs against the connection
+        below), but this coroutine observes ``CancelledError`` instead of
+        that success — aiosqlite does not cancel a statement already queued
+        on its worker thread. With a transaction already open *before*
+        ``delete_thought`` is ever called (``suspend_auto_commit`` gives one
+        exactly like TTL cleanup or hygiene GC batching several deletes
+        would), ``opened_transaction`` is ``False``, so this method cannot
+        fall back to a full ``rollback()`` of its own — the savepoint is
+        gone (``RELEASE`` already consumed it) but the transaction is not,
+        and a bare retried ``ROLLBACK TO`` fails. The only safe move left is
+        to quarantine: a later, unrelated write must be refused, never
+        allowed to commit the three already-applied child deletes as a
+        side effect.
+
+        Builds its own connection rather than using the shared ``store``
+        fixture: quarantine detaches the real connection and schedules its
+        own close as an independent, un-awaited task (by design — see
+        ``_quarantine_connection``), and racing that against the fixture's
+        own ``async with aiosqlite.connect(...)`` teardown closing the same
+        connection a second time is a test-harness hazard, not something
+        this test is about.
+        """
+        db = await aiosqlite.connect(":memory:")
+        db.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(db, embedding_provider=None, auto_embed=False)
+        await store.ensure_schema()
+
+        await store.create_thought(_make_thought("t1"))
+        await store.create_thought(_make_thought("t2"))
+        await store.create_edge(_make_edge("e1", "t1", "t2"))
+
+        real_execute = db.execute
+        released = {"count": 0}
+
+        async def _execute_and_cancel_after_release(sql, *args, **kwargs):
+            cursor = await real_execute(sql, *args, **kwargs)
+            if sql == "RELEASE delete_thought_children" and released["count"] == 0:
+                released["count"] += 1
+                raise asyncio.CancelledError
+            return cursor
+
+        async def _delete_inside_the_callers_transaction() -> None:
+            async with store.suspend_auto_commit():
+                # A transaction the caller already holds, open before
+                # delete_thought is ever called -- opened_transaction is
+                # False inside the helper for this call.
+                await store.create_thought(_make_thought("t3"))
+                assert db.in_transaction
+
+                db.execute = _execute_and_cancel_after_release
+                with pytest.raises(asyncio.CancelledError):
+                    await store.delete_thought("t1")
+                # Falling through to let this ``async with`` block exit:
+                # suspend_auto_commit's own exit touches the connection
+                # (checking whether to commit), and the connection is
+                # already quarantined by this point -- that exit is
+                # expected to raise too, which is exactly the point: every
+                # subsequent touch of this connection fails, not only a
+                # fresh, unrelated write.
+
+        with pytest.raises(ConnectionQuarantinedError):
+            await _delete_inside_the_callers_transaction()
+
+        assert store._connection_quarantined is True
+        with pytest.raises(ConnectionQuarantinedError):
+            await store.create_thought(_make_thought("unrelated-after-quarantine"))
+
+    async def test_cancellation_during_unwind_wins_over_the_original_error(
+        self,
+    ) -> None:
+        """A cancellation that interrupts the unwind itself must not be swallowed.
+
+        The original failure here is an ordinary ``RAISE(ABORT, ...)``
+        trigger veto — ``delete_thought`` should recover from that cleanly
+        (see the first test in this class). But if the recovery attempt
+        (``ROLLBACK TO``) is itself cancelled, the cancellation must win:
+        the caller sees ``CancelledError``, not the trigger's error, because
+        a cleanup path that can defeat a cancellation makes shutdown and
+        timeout both unreliable.
+
+        Builds its own connection rather than using the shared ``store``
+        fixture — see the previous test's docstring for why.
+        """
+        db = await aiosqlite.connect(":memory:")
+        db.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(db, embedding_provider=None, auto_embed=False)
+        await store.ensure_schema()
+
+        await store.create_thought(_make_thought("t1"))
+        await store.create_action(_make_action("a1", "t1"))
+        await db.execute(
+            "CREATE TRIGGER reject_action_delete_for_cancel BEFORE DELETE ON action "
+            "BEGIN SELECT RAISE(ABORT, 'policy: action rows are retained'); END"
+        )
+
+        real_execute = db.execute
+        rollback_to_attempts = {"count": 0}
+
+        async def _cancel_the_rollback_to(sql, *args, **kwargs):
+            if sql == "ROLLBACK TO delete_thought_children" and rollback_to_attempts["count"] == 0:
+                rollback_to_attempts["count"] += 1
+                raise asyncio.CancelledError
+            return await real_execute(sql, *args, **kwargs)
+
+        db.execute = _cancel_the_rollback_to
+        with pytest.raises(asyncio.CancelledError):
+            await store.delete_thought("t1")
+
+        assert store._connection_quarantined is True
+        with pytest.raises(ConnectionQuarantinedError):
+            await store.create_thought(_make_thought("unrelated-after-quarantine"))
 
 
 class TestCleanupExpiredStrategies:
@@ -1366,25 +1595,33 @@ async def _delete_then_reconcile(
     reason="sqlite-vec package not installed",
 )
 class TestDeletionOnAPreCascadeSchema:
-    """Deleting on a database below core-12 leaves the identifier reachable.
+    """Deleting on a database below core-12 no longer leaves the identifier reachable.
 
-    This pins a **documented non-guarantee**, not a wanted behaviour: see
-    ``docs/known-limitations.md`` ("Deletion on a database that has not been
-    migrated") and ``docs/data-lifecycle.md``. A durable fix would make the
-    first test below fail, which is the point of pinning it.
+    This fixes what this class used to pin as a **documented
+    non-guarantee** (see ``docs/known-limitations.md`` — "Deletion on a
+    database that has not been migrated" — and ``docs/data-lifecycle.md``,
+    both updated alongside this test): a vector is now owned by a *live*
+    thought rather than by the presence of an ``embedding`` row, enforced in
+    ``delete_thought``'s own explicit child delete (no cascade required),
+    ``sync_embeddings``'s reconciliation join, and the ``vec0`` search
+    resolution. The first test below used to demonstrate the resurrection;
+    it now demonstrates that it no longer happens — red on the pre-fix tree,
+    green here.
     """
 
-    async def test_pre_cascade_delete_leaves_the_identifier_in_vector_results(
+    async def test_pre_cascade_delete_does_not_resurrect_the_identifier(
         self,
         tmp_path: Path,
     ) -> None:
-        """Core-11: the embedding row survives, so the deleted id comes back.
+        """Core-11: no cascade exists, and the deleted id still does not come back.
 
-        Chain, each link asserted here: no FK cascade leaves the ``embedding``
-        row → ``sync_embeddings`` treats it as a valid backfill source →
-        ``search`` maps the restored vec rowid back through ``embedding`` →
-        ``search_similar`` returns the deleted identifier. The content does
-        **not** come back: hydrating the id yields ``None``.
+        Chain, each link asserted here: ``delete_thought`` removes the
+        ``embedding`` row itself rather than relying on a cascade that does
+        not exist at this schema version, so ``sync_embeddings`` has no
+        dangling row to treat as a valid backfill source, and
+        ``search_similar`` never sees the deleted identifier again. The
+        content was already gone before this fix and still is: hydrating the
+        id yields ``None``.
         """
         observed = await _delete_then_reconcile(
             tmp_path / "pre-cascade.db",
@@ -1392,18 +1629,87 @@ class TestDeletionOnAPreCascadeSchema:
         )
 
         assert observed.core_version < _FIRST_CASCADING_CORE_VERSION
-        # The mechanism: nothing cascaded the embedding row away.
-        assert sorted(observed.embedding_owner_ids) == [_DELETED_ID, _SURVIVOR_ID]
-        assert observed.backfilled == 1
-        # The disclosure: the deleted identifier is back in the ranked window.
-        assert _DELETED_ID in observed.search_similar_ids
+        # The mechanism: delete_thought's own explicit child delete removed
+        # the embedding row without needing a cascade this schema lacks.
+        assert observed.embedding_owner_ids == [_SURVIVOR_ID]
+        assert observed.backfilled == 0
+        # The fix: the deleted identifier does not return.
+        assert _DELETED_ID not in observed.search_similar_ids
         # Second control — the un-deleted sibling is still returned, so this
-        # cannot pass against a search path that returns everything or nothing.
+        # cannot pass against a search path that returns nothing at all.
         assert _SURVIVOR_ID in observed.search_similar_ids
-        # ...and the content really is gone. The caveat is identifier
-        # reachability, never resurfaced content.
         assert observed.hydrated_deleted is None
         assert observed.delete_reported is True
+
+    async def test_pre_cascade_reconcile_does_not_resurrect_a_pre_existing_dangling_row(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A dangling row from *before* this fix still cannot come back.
+
+        ``delete_thought``'s explicit child delete (proven above) stops *new*
+        dangling rows, but a database that already accumulated one under the
+        pre-fix engine needs the other half of the invariant:
+        ``sync_embeddings`` itself must not treat a dangling ``embedding`` row
+        as proof its thought is live, however that row came to exist. Bypasses
+        ``delete_thought`` entirely — a raw ``DELETE FROM thought`` simulates
+        exactly the historical damage — so this exercises the reconciliation
+        join on its own, independent of the delete-path fix.
+        """
+        db_path = tmp_path / "pre-existing-dangling.db"
+        db = await aiosqlite.connect(str(db_path))
+        db.row_factory = aiosqlite.Row
+        try:
+            await TestMigrationV11ToV12._bootstrap_v11_schema(db)
+            store = SqliteEngravaCore(db, embedding_provider=None, auto_embed=False)
+            await store._configure_vector_backend(
+                backend_name="sqlite-vec",
+                embedding_dimension=_PRE_CASCADE_DIMENSION,
+            )
+            backend = store._vector_backend
+            assert isinstance(backend, SqliteVecSearchBackend)
+
+            for tid in (_SURVIVOR_ID, _DELETED_ID):
+                await db.execute(
+                    "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+                    "VALUES (?, 'OBSERVATION', ?, ?, 'P3')",
+                    (tid, tid, tid),
+                )
+            await db.commit()
+            await store.store_embedding(
+                thought_id=_SURVIVOR_ID, vector=[1.0, 0.0, 0.0], model_name=_PRE_CASCADE_MODEL
+            )
+            await store.store_embedding(
+                thought_id=_DELETED_ID, vector=list(_QUERY_VECTOR), model_name=_PRE_CASCADE_MODEL
+            )
+
+            # Simulate pre-fix damage directly: a bare parent delete, with no
+            # cascade at this schema version and no explicit child delete
+            # (this is deliberately *not* a call to delete_thought), leaving
+            # the embedding row dangling exactly as an old engrava build
+            # would have.
+            await db.execute("DELETE FROM thought WHERE thought_id = ?", (_DELETED_ID,))
+            await db.commit()
+            dangling = [
+                str(row["owner_id"])
+                for row in await (
+                    await db.execute(
+                        "SELECT owner_id FROM embedding WHERE owner_type = 'THOUGHT'"
+                    )
+                ).fetchall()
+            ]
+            assert sorted(dangling) == [_DELETED_ID, _SURVIVOR_ID], (
+                "fixture precondition failed: no dangling embedding row to reconcile against"
+            )
+
+            backfilled = await backend.sync_embeddings(db)
+            search_similar_ids = [r[0] for r in await store.search_similar(_QUERY_VECTOR, top_k=5)]
+        finally:
+            await store.close()
+
+        assert backfilled == 0, "the dangling row's owner is gone; it must not be backfilled"
+        assert _DELETED_ID not in search_similar_ids
+        assert _SURVIVOR_ID in search_similar_ids
 
     async def test_head_schema_delete_removes_the_identifier(
         self,
