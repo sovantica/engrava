@@ -31,13 +31,20 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from engrava import SqliteEngravaCore
 from engrava.infrastructure.sqlite import engrava_core
 from engrava.infrastructure.sqlite.engrava_core import (
     _normalize_fts_query,
     _query_is_expert_syntax,
 )
+from tests.search_contract.conftest import make_embedding_provider, populate_corpus
 from tests.search_contract.golden_fixtures import (
+    FROM_CONFIG_ASSET_PATH,
+    HYBRID_CURRENT_CYCLE,
+    HYBRID_GRAPH_WEIGHT,
+    HYBRID_RANKED_FROM_CONFIG_GOLDEN_PATH,
     HYBRID_RANKED_GOLDEN_PATH,
+    HYBRID_RECENCY_WEIGHT,
     HYBRID_SCORE_NDIGITS,
     HYBRID_TOP_K,
     LEGACY_EXPERT_PARITY_QUERIES,
@@ -48,13 +55,68 @@ from tests.search_contract.golden_fixtures import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
-    from engrava import SqliteEngravaCore
+    from collections.abc import AsyncIterator, Callable
 
 # Loaded at collection time so the byte-identity check can parametrize per case.
 _EXPERT_CASES: dict[str, str] = load_expert_normalization_cases()
 _HYBRID_CASES: dict[str, list[list[str | float]]] = load_hybrid_ranked_cases()
+_HYBRID_FROM_CONFIG_CASES: dict[str, list[list[str | float]]] = load_hybrid_ranked_cases(
+    HYBRID_RANKED_FROM_CONFIG_GOLDEN_PATH
+)
+
+async def _search_direct_golden(store: SqliteEngravaCore, query: str) -> list[list[str | float]]:
+    """Run one query the same way the directly-constructed golden was built.
+
+    A directly-constructed store needs explicit ``current_cycle`` /
+    ``recency_weight`` / ``graph_weight`` to give the recency and graph
+    signals a baseline at all — see the comment above ``HYBRID_CURRENT_CYCLE``
+    in golden_fixtures.py. Every live re-query against the
+    ``HYBRID_RANKED_GOLDEN_PATH`` golden must reproduce them exactly, or a
+    live call that silently drifted from how the golden was generated would
+    "pass" by comparing two different queries rather than catching a
+    regression.
+
+    Args:
+        store: A hybrid-search-ready store built via direct construction.
+        query: The query to run.
+
+    Returns:
+        The rounded ``[thought_id, score]`` pairs, in ranked order.
+    """
+    result = await store.search_hybrid(
+        query,
+        top_k=HYBRID_TOP_K,
+        current_cycle=HYBRID_CURRENT_CYCLE,
+        recency_weight=HYBRID_RECENCY_WEIGHT,
+        graph_weight=HYBRID_GRAPH_WEIGHT,
+    )
+    return [
+        [thought_id, round(score, HYBRID_SCORE_NDIGITS)] for thought_id, score in result.results
+    ]
+
+
+@pytest.fixture
+async def hybrid_store_from_config() -> AsyncIterator[SqliteEngravaCore]:
+    """Return a store built through ``from_config``, populated with the corpus.
+
+    Mirrors ``conftest.hybrid_store`` but for the config-file construction
+    path: loads ``goldens/from_config_search.yaml`` (in-memory database, one
+    explicit search weight), then swaps in the same deterministic
+    bag-of-words provider the direct-construction fixtures use — ``from_config``
+    has no network-free, deterministic built-in embedding provider — before
+    writing the corpus, so the vector arm stays comparable between the two
+    goldens.
+
+    Yields:
+        A :class:`SqliteEngravaCore` built via ``from_config`` with both the
+        FTS and vector arms live.
+    """
+    store = await SqliteEngravaCore.from_config(FROM_CONFIG_ASSET_PATH)
+    store._embedding_provider = make_embedding_provider()
+    store._auto_embed = True
+    await populate_corpus(store)
+    yield store
+    await store.close()
 
 # A column-filter query whose scope drop the WS calls out and whose ranked list
 # visibly reshuffles end-to-end — the discriminating hybrid case.
@@ -164,11 +226,7 @@ class TestHybridRankedGolden:
         """Every hybrid query reproduces its frozen ordered ranked result."""
         mismatches: list[str] = []
         for query, expected in _HYBRID_CASES.items():
-            result = await hybrid_store.search_hybrid(query, top_k=HYBRID_TOP_K)
-            actual = [
-                [thought_id, round(score, HYBRID_SCORE_NDIGITS)]
-                for thought_id, score in result.results
-            ]
+            actual = await _search_direct_golden(hybrid_store, query)
             if actual != expected:
                 mismatches.append(query)
         assert mismatches == [], f"hybrid ranking drifted from golden for: {mismatches}"
@@ -183,6 +241,74 @@ class TestHybridRankedGolden:
         """The end-to-end discriminator (a column-filter phrase) is frozen here."""
         assert _HYBRID_DISCRIMINATOR_QUERY in _HYBRID_CASES
         assert _COLUMN_FILTER_PHRASE_RE.search(_HYBRID_DISCRIMINATOR_QUERY) is not None
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "lighthouse keeper aurora Kelso Sound",
+            "quail migration route survey near the delta",
+            "apprentice welder night shift inspection fire drill",
+        ],
+    )
+    def test_golden_includes_the_signal_discriminator_pairs(self, query: str) -> None:
+        """The three dedicated priority/cycle/graph pairs are frozen here.
+
+        Each carries the two control/target ids the mutation-testing
+        procedure reorders; a corpus edit that dropped one silently would
+        otherwise slip past the byte-identity check above (which would just
+        freeze new, still-vacuous scores on the next regeneration).
+        """
+        assert query in _HYBRID_CASES
+        ids = {str(thought_id) for thought_id, _ in _HYBRID_CASES[query]}
+        control_and_target = {tid for tid in ids if tid.endswith(("-control", "-target"))}
+        assert len(control_and_target) == 2, (
+            f"query {query!r} must freeze both the control and target id: got {ids}"
+        )
+
+
+class TestHybridRankedFromConfigGolden:
+    """The ``from_config``-built hybrid ranked list has its own frozen golden.
+
+    Mirrors :class:`TestHybridRankedGolden` exactly, but against a store built
+    through ``SqliteEngravaCore.from_config`` — see
+    ``golden_fixtures.compute_hybrid_rankings_from_config`` for why that
+    construction path needs an independent baseline rather than inheriting
+    the directly-constructed golden's assumption that the two never diverge.
+    """
+
+    async def test_ranked_results_match_golden(
+        self,
+        hybrid_store_from_config: SqliteEngravaCore,
+    ) -> None:
+        """Every hybrid query reproduces its frozen ordered ranked result."""
+        mismatches: list[str] = []
+        for query, expected in _HYBRID_FROM_CONFIG_CASES.items():
+            result = await hybrid_store_from_config.search_hybrid(
+                query, top_k=HYBRID_TOP_K, current_cycle=HYBRID_CURRENT_CYCLE
+            )
+            actual = [
+                [thought_id, round(score, HYBRID_SCORE_NDIGITS)]
+                for thought_id, score in result.results
+            ]
+            if actual != expected:
+                mismatches.append(query)
+        assert mismatches == [], f"hybrid ranking drifted from golden for: {mismatches}"
+
+    def test_golden_declares_the_precision_it_was_generated_with(self) -> None:
+        """The on-disk golden pins the same precision and depth the test asserts."""
+        document = load_golden(HYBRID_RANKED_FROM_CONFIG_GOLDEN_PATH)
+        assert document["score_ndigits"] == HYBRID_SCORE_NDIGITS
+        assert document["top_k"] == HYBRID_TOP_K
+
+    def test_golden_covers_the_same_queries_as_the_direct_golden(self) -> None:
+        """The two goldens are generated from the same query set.
+
+        Not an assertion that the *scores* agree (a genuine, intended
+        divergence between the two construction paths is a legitimate
+        outcome) — only that neither golden silently dropped a query the
+        other still carries.
+        """
+        assert set(_HYBRID_FROM_CONFIG_CASES) == set(_HYBRID_CASES)
 
 
 class TestGoldenDiscriminatingPower:
@@ -253,11 +379,7 @@ class TestGoldenDiscriminatingPower:
 
         unchanged: list[str] = []
         for query in column_filter_queries:
-            result = await hybrid_store.search_hybrid(query, top_k=HYBRID_TOP_K)
-            actual = [
-                [thought_id, round(score, HYBRID_SCORE_NDIGITS)]
-                for thought_id, score in result.results
-            ]
+            actual = await _search_direct_golden(hybrid_store, query)
             if actual == _HYBRID_CASES[query]:
                 unchanged.append(query)
         assert unchanged == [], (

@@ -23,8 +23,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from engrava import SqliteEngravaCore
 from engrava.infrastructure.sqlite.engrava_core import _normalize_fts_query
-from tests.search_contract.conftest import make_embedding_provider, open_populated_store
+from tests.search_contract.conftest import (
+    make_embedding_provider,
+    open_populated_store,
+    populate_corpus,
+)
 
 # ---------------------------------------------------------------------------
 # On-disk golden layout
@@ -33,6 +38,11 @@ from tests.search_contract.conftest import make_embedding_provider, open_populat
 GOLDENS_DIR = Path(__file__).parent / "goldens"
 EXPERT_NORMALIZATION_GOLDEN_PATH = GOLDENS_DIR / "fts_expert_normalization.json"
 HYBRID_RANKED_GOLDEN_PATH = GOLDENS_DIR / "hybrid_ranked_results.json"
+HYBRID_RANKED_FROM_CONFIG_GOLDEN_PATH = GOLDENS_DIR / "hybrid_ranked_results_from_config.json"
+#: The YAML asset the ``from_config``-built golden loads. Ships a database
+#: path of ``:memory:`` and only the one search weight that needs an explicit
+#: value (see the file's own header comment for why).
+FROM_CONFIG_ASSET_PATH = GOLDENS_DIR / "from_config_search.yaml"
 
 #: Command a maintainer runs to regenerate the goldens after an *intended*
 #: retrieval-semantics change (recorded inside each golden file for provenance).
@@ -143,7 +153,35 @@ HYBRID_RANKING_QUERIES: tuple[str, ...] = (
     "office fiddle leaf fig",
     # Both-arms-fire distinctive phrase.
     "the hazelnut coffee creamer coupon",
+    # Priority-signal discriminator (see conftest._CORPUS): isolated
+    # vocabulary shared by exactly two byte-identical-content turns that
+    # differ only in priority.
+    "lighthouse keeper aurora Kelso Sound",
+    # Cycle-signal discriminator: isolated vocabulary shared by two
+    # byte-identical-content turns that differ in cycle x priority.
+    "quail migration route survey near the delta",
+    # Graph-signal discriminator: isolated vocabulary shared by the
+    # control/target twins plus their connected neighbour.
+    "apprentice welder night shift inspection fire drill",
 )
+
+# ---------------------------------------------------------------------------
+# Hybrid query-time overrides
+# ---------------------------------------------------------------------------
+# A directly-constructed store (no ``SearchConfig``) resolves an unspecified
+# ``recency_weight`` to ``0.0`` (see
+# ``SqliteEngravaCore._resolve_hybrid_defaults``) — NOT the ``0.10`` documented
+# default, which only applies once a ``SearchConfig`` exists. And every
+# construction path resolves an unspecified ``graph_weight`` to ``0.0`` (the
+# graph signal is opt-in). Without these two explicit overrides, the recency
+# and graph signals would be structurally silent in this golden regardless of
+# what the corpus contains — corpus variety alone does not activate them. The
+# values chosen (0.10 recency weight, half-life left at its 50-cycle default,
+# 0.1 graph weight, edge decay left at its 0.5 default) match the product's
+# own documented defaults.
+HYBRID_CURRENT_CYCLE = 100
+HYBRID_RECENCY_WEIGHT = 0.10
+HYBRID_GRAPH_WEIGHT = 0.1
 
 
 # ---------------------------------------------------------------------------
@@ -161,12 +199,62 @@ def compute_expert_normalizations() -> dict[str, str]:
     return {query: _normalize_fts_query(query) for query in EXPERT_NORMALIZATION_QUERIES}
 
 
+async def _rank_queries(
+    store: SqliteEngravaCore,
+    *,
+    pass_recency_and_graph_overrides: bool,
+) -> dict[str, list[RankedEntry]]:
+    """Run every query in :data:`HYBRID_RANKING_QUERIES` against a store.
+
+    Shared by both golden-generation paths so the only difference between
+    them is how the store itself was built (direct construction vs.
+    ``from_config``) — never a difference in how the queries are issued.
+
+    Args:
+        store: A store already populated with the shared corpus.
+        pass_recency_and_graph_overrides: When ``True``, pass explicit
+            ``recency_weight`` / ``graph_weight`` per-call overrides (the
+            directly-constructed store has no ``SearchConfig``, so these
+            signals would otherwise be silent — see the module-level
+            comment above :data:`HYBRID_CURRENT_CYCLE`). When ``False``,
+            leave them unset so they resolve from the store's own
+            ``SearchConfig`` (the ``from_config`` path already activates
+            them through the loaded YAML). ``current_cycle`` is always
+            passed explicitly either way — it is a per-call argument on
+            every construction path, never config-driven.
+
+    Returns:
+        An insertion-ordered mapping ``query -> [[thought_id, score], ...]``.
+    """
+    rankings: dict[str, list[RankedEntry]] = {}
+    for query in HYBRID_RANKING_QUERIES:
+        if pass_recency_and_graph_overrides:
+            result = await store.search_hybrid(
+                query,
+                top_k=HYBRID_TOP_K,
+                current_cycle=HYBRID_CURRENT_CYCLE,
+                recency_weight=HYBRID_RECENCY_WEIGHT,
+                graph_weight=HYBRID_GRAPH_WEIGHT,
+            )
+        else:
+            result = await store.search_hybrid(
+                query,
+                top_k=HYBRID_TOP_K,
+                current_cycle=HYBRID_CURRENT_CYCLE,
+            )
+        rankings[query] = [
+            [thought_id, round(score, HYBRID_SCORE_NDIGITS)] for thought_id, score in result.results
+        ]
+    return rankings
+
+
 async def compute_hybrid_rankings() -> dict[str, list[RankedEntry]]:
     """Return each hybrid query mapped to its frozen ranked result.
 
-    Builds the deterministic hybrid store, runs every query in
-    :data:`HYBRID_RANKING_QUERIES`, and rounds each score to
-    :data:`HYBRID_SCORE_NDIGITS`.
+    Builds the deterministic hybrid store (direct construction, no
+    ``SearchConfig``), runs every query in :data:`HYBRID_RANKING_QUERIES` with
+    the explicit recency/graph overrides those signals need on this
+    construction path, and rounds each score to :data:`HYBRID_SCORE_NDIGITS`.
 
     Returns:
         An insertion-ordered mapping ``query -> [[thought_id, score], ...]``.
@@ -176,16 +264,37 @@ async def compute_hybrid_rankings() -> dict[str, list[RankedEntry]]:
         auto_embed=True,
     )
     try:
-        rankings: dict[str, list[RankedEntry]] = {}
-        for query in HYBRID_RANKING_QUERIES:
-            result = await store.search_hybrid(query, top_k=HYBRID_TOP_K)
-            rankings[query] = [
-                [thought_id, round(score, HYBRID_SCORE_NDIGITS)]
-                for thought_id, score in result.results
-            ]
-        return rankings
+        return await _rank_queries(store, pass_recency_and_graph_overrides=True)
     finally:
         await conn.close()
+
+
+async def compute_hybrid_rankings_from_config() -> dict[str, list[RankedEntry]]:
+    """Return each hybrid query's ranked result, built through ``from_config``.
+
+    Exercises the config-file construction path (:meth:`SqliteEngravaCore.
+    from_config`) end to end — YAML parsing, ``SearchConfig`` resolution, an
+    in-memory database — rather than the direct constructor the other golden
+    uses, so a wiring bug specific to that path (e.g. a ``_parse_search``
+    field silently mapped wrong) has a baseline that can catch it. The only
+    piece ``from_config`` cannot resolve deterministically and network-free is
+    the embedding provider (its built-in providers all call out to a real
+    model or API), so this swaps in the same deterministic bag-of-words
+    provider immediately after construction, before any thought is written —
+    the same provider the direct-construction golden uses, so the vector arm
+    stays comparable between the two.
+
+    Returns:
+        An insertion-ordered mapping ``query -> [[thought_id, score], ...]``.
+    """
+    store = await SqliteEngravaCore.from_config(FROM_CONFIG_ASSET_PATH)
+    try:
+        store._embedding_provider = make_embedding_provider()
+        store._auto_embed = True
+        await populate_corpus(store)
+        return await _rank_queries(store, pass_recency_and_graph_overrides=False)
+    finally:
+        await store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -233,14 +342,21 @@ def load_expert_normalization_cases() -> dict[str, str]:
     return {str(query): str(match) for query, match in cases.items()}
 
 
-def load_hybrid_ranked_cases() -> dict[str, list[RankedEntry]]:
-    """Return the hybrid golden as a ``query -> [[thought_id, score], ...]`` map.
+def load_hybrid_ranked_cases(
+    path: Path = HYBRID_RANKED_GOLDEN_PATH,
+) -> dict[str, list[RankedEntry]]:
+    """Return a hybrid golden as a ``query -> [[thought_id, score], ...]`` map.
+
+    Args:
+        path: Which hybrid golden to load. Defaults to the directly-constructed
+            golden; pass :data:`HYBRID_RANKED_FROM_CONFIG_GOLDEN_PATH` for the
+            ``from_config``-built one.
 
     Raises:
         TypeError: If any ranked entry is not a ``[thought_id, score]`` pair.
     """
     parsed: dict[str, list[RankedEntry]] = {}
-    for query, entries in _cases(HYBRID_RANKED_GOLDEN_PATH).items():
+    for query, entries in _cases(path).items():
         if not isinstance(entries, list):
             msg = f"hybrid golden case {query!r} must be a list of ranked entries"
             raise TypeError(msg)
@@ -296,5 +412,32 @@ async def render_hybrid_ranked_golden() -> str:
         "score_ndigits": HYBRID_SCORE_NDIGITS,
         "top_k": HYBRID_TOP_K,
         "cases": await compute_hybrid_rankings(),
+    }
+    return _render(document)
+
+
+async def render_hybrid_ranked_from_config_golden() -> str:
+    """Render the ``from_config``-built hybrid ranked-result golden.
+
+    Same corpus and query set as :func:`render_hybrid_ranked_golden`, but the
+    store is built through ``SqliteEngravaCore.from_config`` instead of the
+    direct constructor — see :func:`compute_hybrid_rankings_from_config` for
+    why that path needs its own frozen baseline rather than inheriting the
+    directly-constructed golden's assumption that the two are equivalent.
+    """
+    document: dict[str, object] = {
+        "description": (
+            "Frozen hybrid ranked results over the same deterministic "
+            "search-contract corpus as hybrid_ranked_results.json, but built "
+            "through SqliteEngravaCore.from_config (YAML config parsing + "
+            "SearchConfig resolution) instead of direct construction — see "
+            "goldens/from_config_search.yaml. Exercises the config-file wiring "
+            "path independently; regenerate only when a ranking change is "
+            "intended."
+        ),
+        "regenerate": REGEN_COMMAND,
+        "score_ndigits": HYBRID_SCORE_NDIGITS,
+        "top_k": HYBRID_TOP_K,
+        "cases": await compute_hybrid_rankings_from_config(),
     }
     return _render(document)

@@ -1,5 +1,5 @@
 {
-  "description": "Frozen hybrid ranked results over the deterministic search-contract corpus (bag-of-words vector arm; no model, no network). Maps each query to its ordered [thought_id, rounded_score] list. Discriminates 'different ranked answer' from 'an answer'; regenerate only when a ranking change is intended.",
+  "description": "Frozen hybrid ranked results over the same deterministic search-contract corpus as hybrid_ranked_results.json, but built through SqliteEngravaCore.from_config (YAML config parsing + SearchConfig resolution) instead of direct construction \u2014 see goldens/from_config_search.yaml. Exercises the config-file wiring path independently; regenerate only when a ranking change is intended.",
   "regenerate": "python scripts/regenerate_search_goldens.py",
   "score_ndigits": 6,
   "top_k": 10,

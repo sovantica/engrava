@@ -27,8 +27,10 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from tests.search_contract.golden_fixtures import (
     EXPERT_NORMALIZATION_GOLDEN_PATH,
+    HYBRID_RANKED_FROM_CONFIG_GOLDEN_PATH,
     HYBRID_RANKED_GOLDEN_PATH,
     render_expert_normalization_golden,
+    render_hybrid_ranked_from_config_golden,
     render_hybrid_ranked_golden,
 )
 
@@ -49,6 +51,10 @@ def _render_all() -> list[tuple[Path, str]]:
     return [
         (EXPERT_NORMALIZATION_GOLDEN_PATH, render_expert_normalization_golden()),
         (HYBRID_RANKED_GOLDEN_PATH, asyncio.run(render_hybrid_ranked_golden())),
+        (
+            HYBRID_RANKED_FROM_CONFIG_GOLDEN_PATH,
+            asyncio.run(render_hybrid_ranked_from_config_golden()),
+        ),
     ]
 
 
