@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import sys
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -50,7 +51,7 @@ from engrava.infrastructure.sqlite.engrava_core import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping, Sequence
+    from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
     from typing import TextIO
 
     import aiosqlite
@@ -88,8 +89,50 @@ _CORE_TABLES_DELETE_ORDER: tuple[CoreTable, ...] = (
 # ------------------------------------------------------------------
 
 
+async def _close_quietly(conn: Any) -> None:  # noqa: ANN401
+    """Close *conn*, logging rather than raising if the close itself fails.
+
+    Cleanup code that closes a connection while another exception -- or a
+    cancellation -- is already propagating must not let a failure in the
+    close itself replace what the caller actually needs to see: a bare
+    ``raise`` after an unconditional ``await conn.close()`` only re-raises
+    the original error when that close *succeeds*. If the close itself
+    raises, its exception becomes the one that propagates and the original
+    -- a ``sqlite3.DatabaseError``, a ``ClickException``, an
+    ``asyncio.CancelledError`` -- is lost. A close failure is real
+    information, but it belongs logged underneath the original error, not
+    raised in front of it. Every place in this module that closes a
+    connection during cleanup (as opposed to on the ordinary success path,
+    where a close failure is the only thing to report) goes through this
+    rather than re-deriving the same try/except. The infrastructure layer
+    has the same rule under the same name in
+    :mod:`engrava.infrastructure.sqlite.engrava_core` -- not shared as one
+    function across the CLI/infrastructure boundary, but copied rather
+    than re-derived.
+
+    Args:
+        conn: The aiosqlite connection to close.
+
+    """
+    try:
+        await conn.close()
+    except Exception:  # noqa: BLE001
+        logger.warning("Error closing connection during cleanup", exc_info=True)
+
+
 async def _open_db(cfg: EngravaCLIConfig) -> Any:  # noqa: ANN401
     """Open an aiosqlite connection with WAL + row_factory.
+
+    ``aiosqlite.connect()`` succeeding only means the background worker
+    thread started — a corrupt or truncated file is not discovered until
+    the first ``PRAGMA`` actually runs against it, below. If that fails,
+    the connection is closed before the error propagates: aiosqlite's
+    connection worker thread is not a daemon and only stops when
+    ``close()`` sends it the shutdown sentinel, so an open-but-never-closed
+    connection left behind by a raised exception here would hang interpreter
+    shutdown indefinitely instead of exiting on the error. Every command
+    reaches this through :func:`_opened_db` rather than calling it directly,
+    so this is the one place that has to get the connect-time failure right.
 
     Args:
         cfg: Resolved CLI config with db_path.
@@ -98,16 +141,70 @@ async def _open_db(cfg: EngravaCLIConfig) -> Any:  # noqa: ANN401
         An open aiosqlite Connection.
 
     Raises:
-        click.ClickException: If the database file does not exist (for read commands).
+        sqlite3.DatabaseError: If the file is not a valid SQLite database
+            (connection is closed first).
 
     """
     import aiosqlite  # noqa: PLC0415
 
     conn = await aiosqlite.connect(str(cfg.db_path))
-    conn.row_factory = aiosqlite.Row
-    await conn.execute("PRAGMA journal_mode = WAL")
-    await conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA journal_mode = WAL")
+        await conn.execute("PRAGMA foreign_keys = ON")
+    except BaseException:
+        await _close_quietly(conn)
+        raise
     return conn
+
+
+@asynccontextmanager
+async def _opened_db(cfg: EngravaCLIConfig) -> AsyncIterator[Any]:
+    """Open a connection and guarantee it closes, however the block exits.
+
+    Acquiring the connection and entering the protected block are one
+    syntactic step at the call site (``async with _opened_db(cfg) as conn:``),
+    so no statement — a store constructor, a schema-version-gate check,
+    ``ensure_schema()`` — can sit between a successful open and the
+    guarantee that closes it. A hand-written ``try/finally`` at the call
+    site cannot make that promise: it only protects what is written after
+    it, and a failure in a statement placed before it (by oversight, or by
+    a later edit) leaks the connection exactly as an absent ``finally``
+    would. This closes on normal return, on any raised exception — a
+    ``sqlite3.DatabaseError`` from a corrupt file, a ``ClickException``, a
+    ``SystemExit`` from ``sys.exit()`` — and on cancellation.
+
+    **What a close failure itself does differs by which of those it is.**
+    If the command body already raised (or was cancelled), that is what
+    the caller needs to see, so a failure in this closing call is logged
+    and swallowed rather than replacing it. If the body succeeded, a
+    close failure is not secondary to anything — it is the only error
+    there is, so it propagates normally. A single unconditional
+    ``finally: await conn.close()`` cannot draw that distinction: it
+    would let a genuine close failure on the success path be silently
+    swallowed, so the command would print success and exit ``0``.
+
+    Yields:
+        The open aiosqlite connection from :func:`_open_db`.
+
+    """
+    conn = await _open_db(cfg)
+    try:
+        yield conn
+    except BaseException:
+        # The command body raised (or was cancelled) -- that is what the
+        # caller needs to see, so a close failure here is secondary and
+        # goes through ``_close_quietly`` rather than replacing it.
+        await _close_quietly(conn)
+        raise
+    else:
+        # The command body succeeded. A close failure here is not secondary
+        # to anything -- it is the *only* error there is, so it must
+        # propagate normally rather than being logged and swallowed by
+        # ``_close_quietly``. An unconditional ``finally: await
+        # _close_quietly(conn)`` would silently turn a genuine close
+        # failure into a command that prints success and exits 0.
+        await conn.close()
 
 
 # ------------------------------------------------------------------
@@ -534,8 +631,7 @@ def info(ctx: click.Context) -> None:
             click.echo(f"Database not found: {cfg.db_path}")
             sys.exit(1)
 
-        conn = await _open_db(cfg)
-        try:
+        async with _opened_db(cfg) as conn:
             await _apply_read_schema_gate(conn, command="info")
             store = SqliteEngravaCore(conn)
             metrics = await store.metrics()
@@ -561,8 +657,6 @@ def info(ctx: click.Context) -> None:
                     f"p95={stats['search_latency']['p95_ms']:.1f}ms "
                     f"p99={stats['search_latency']['p99_ms']:.1f}ms"
                 )
-        finally:
-            await conn.close()
 
     _run(_info())
 
@@ -592,8 +686,7 @@ def verify(ctx: click.Context) -> None:
             click.echo(f"Database not found: {cfg.db_path}")
             sys.exit(1)
 
-        conn = await _open_db(cfg)
-        try:
+        async with _opened_db(cfg) as conn:
             await _apply_read_schema_gate(conn, command="verify")
             store = SqliteEngravaCore(conn)
             result = await store.verify_journal()
@@ -611,8 +704,6 @@ def verify(ctx: click.Context) -> None:
 
             if not result.valid:
                 sys.exit(1)
-        finally:
-            await conn.close()
 
     _run(_verify())
 
@@ -643,46 +734,44 @@ def query(ctx: click.Context, mql: str) -> None:
             click.echo(f"Database not found: {cfg.db_path}")
             sys.exit(1)
 
-        conn = await _open_db(cfg)
-        try:
-            from engrava.mindql.executor import MindQLExecutor  # noqa: PLC0415
-            from engrava.mindql.parser import (  # noqa: PLC0415
-                MindQLCommand,
-                MindQLParseError,
-                parse,
-            )
+        from engrava.mindql.executor import MindQLExecutor  # noqa: PLC0415
+        from engrava.mindql.parser import (  # noqa: PLC0415
+            MindQLCommand,
+            MindQLParseError,
+            parse,
+        )
 
-            # Gather extension commands from loaded extensions
-            extensions = _load_mindql_extensions() if cfg.extensions_enabled else {}
-            known_names = set(extensions.keys())
-
+        async with _opened_db(cfg) as conn:
             try:
-                parsed = parse(mql, known_extensions=known_names)
+                # Gather extension commands from loaded extensions
+                extensions = _load_mindql_extensions() if cfg.extensions_enabled else {}
+                known_names = set(extensions.keys())
+
+                try:
+                    parsed = parse(mql, known_extensions=known_names)
+                except MindQLParseError as exc:
+                    click.echo(f"Parse error: {exc}", err=True)
+                    sys.exit(1)
+
+                # The schema-version gate classifies the *parsed* command, not
+                # the CLI command name — FIND/COUNT/SELECT are reads (warn and
+                # attempt on a behind schema); EXTENSION can write (there is
+                # today no read-only accessor for an extension handler to run
+                # under, so it is refused on a behind schema like any other
+                # destructive operation). Every classification also refuses a
+                # newer-than-head schema outright.
+                schema_version = await _read_schema_version(conn)
+                if parsed.command is MindQLCommand.EXTENSION:
+                    _apply_destructive_schema_gate_for_version(schema_version, command="query")
+                else:
+                    _apply_read_schema_gate_for_version(schema_version, command="query")
+
+                executor = MindQLExecutor(conn, extensions=extensions)
+                result = await executor.execute(parsed)
+                click.echo(_format_rows(result.rows, cfg.output_format, columns=result.columns))
             except MindQLParseError as exc:
-                click.echo(f"Parse error: {exc}", err=True)
+                click.echo(f"Query error: {exc}", err=True)
                 sys.exit(1)
-
-            # The schema-version gate classifies the *parsed* command, not the
-            # CLI command name — FIND/COUNT/SELECT are reads (warn and attempt
-            # on a behind schema); EXTENSION can write (there is today no
-            # read-only accessor for an extension handler to run under, so it
-            # is refused on a behind schema like any other destructive
-            # operation). Every classification also refuses a newer-than-head
-            # schema outright.
-            schema_version = await _read_schema_version(conn)
-            if parsed.command is MindQLCommand.EXTENSION:
-                _apply_destructive_schema_gate_for_version(schema_version, command="query")
-            else:
-                _apply_read_schema_gate_for_version(schema_version, command="query")
-
-            executor = MindQLExecutor(conn, extensions=extensions)
-            result = await executor.execute(parsed)
-            click.echo(_format_rows(result.rows, cfg.output_format, columns=result.columns))
-        except MindQLParseError as exc:
-            click.echo(f"Query error: {exc}", err=True)
-            sys.exit(1)
-        finally:
-            await conn.close()
 
     _run(_query())
 
@@ -848,16 +937,13 @@ def snapshot(ctx: click.Context, output_path: str | None, service_name: str | No
                 click.echo(f"Database not found: {cfg.db_path}")
                 sys.exit(1)
 
-            conn = await _open_db(cfg)
-            try:
+            async with _opened_db(cfg) as conn:
                 await _apply_read_schema_gate(conn, command="snapshot")
                 out = (
                     Path(output_path) if output_path else cfg.db_path.with_suffix(".snapshot.jsonl")
                 )
                 total = await _export_db_to_jsonl(conn, out)
                 click.echo(f"Exported {total} records to {out}")
-            finally:
-                await conn.close()
 
     _run(_snapshot())
 
@@ -1460,8 +1546,6 @@ async def _restore_single_db(
             a missing ``--re-embed`` provider.
 
     """
-    import aiosqlite as _aiosqlite  # noqa: PLC0415
-
     from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore  # noqa: PLC0415
 
     emb_provider = None
@@ -1485,25 +1569,22 @@ async def _restore_single_db(
     # restore rather than "behind" — there is nothing to be behind.
     pre_existing = cfg.db_path.exists()
 
-    conn = await _aiosqlite.connect(str(cfg.db_path))
-    conn.row_factory = _aiosqlite.Row
-    await conn.execute("PRAGMA journal_mode = WAL")
-    await conn.execute("PRAGMA foreign_keys = ON")
-
-    store = SqliteEngravaCore(conn)
-    if pre_existing:
-        try:
+    # _opened_db closes the connection on any exit from this block — a
+    # corrupt existing target, a schema-gate refusal, or a failure inside
+    # ensure_schema() while bootstrapping a fresh one — because opening the
+    # connection and entering the protected block are the same step. Neither
+    # the constructor below nor ensure_schema() can leak by sitting in front
+    # of a try that starts later.
+    async with _opened_db(cfg) as conn:
+        store = SqliteEngravaCore(conn)
+        if pre_existing:
             await _apply_destructive_schema_gate(conn, command="restore")
-        except SystemExit:
-            await conn.close()
-            raise
-        # Schema confirmed at head above; ensure_schema() here would be a
-        # no-op, so it is skipped entirely rather than called for its side
-        # effect of none — no command migrates implicitly.
-    else:
-        await store.ensure_schema()
+            # Schema confirmed at head above; ensure_schema() here would be a
+            # no-op, so it is skipped entirely rather than called for its side
+            # effect of none — no command migrates implicitly.
+        else:
+            await store.ensure_schema()
 
-    try:
         total = await _import_records_to_db(
             conn,
             Path(input_path),
@@ -1513,8 +1594,6 @@ async def _restore_single_db(
             embedding_provider=emb_provider,
         )
         click.echo(f"Restored {total} records from {input_path}")
-    finally:
-        await conn.close()
 
 
 @cli.command()
@@ -1805,8 +1884,7 @@ def gc(ctx: click.Context, *, dry_run: bool, expired: bool) -> None:
             click.echo(f"Database not found: {cfg.db_path}")
             sys.exit(1)
 
-        conn = await _open_db(cfg)
-        try:
+        async with _opened_db(cfg) as conn:
             # gc is destructive and never migrates the schema itself (see
             # _gc_archived's own docstring below on the explicit child
             # deletes that limit today's damage) — so it refuses outright on
@@ -1820,8 +1898,6 @@ def gc(ctx: click.Context, *, dry_run: bool, expired: bool) -> None:
                 if skip_archived_gc:
                     return
             await _gc_archived(conn, dry_run=dry_run, quiet=expired)
-        finally:
-            await conn.close()
 
     _run(_gc())
 
@@ -1838,31 +1914,32 @@ def migrate(ctx: click.Context) -> None:
     cfg: EngravaCLIConfig = ctx.obj["config"]
 
     async def _migrate() -> None:
-        import aiosqlite  # noqa: PLC0415, I001
         from engrava.domain.exceptions import SchemaVersionError  # noqa: PLC0415
         from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore  # noqa: PLC0415
 
-        conn = await aiosqlite.connect(str(cfg.db_path))
-        conn.row_factory = aiosqlite.Row
-        await conn.execute("PRAGMA journal_mode = WAL")
-        await conn.execute("PRAGMA foreign_keys = ON")
-
-        store = SqliteEngravaCore(conn)
-        try:
-            # migrate is the one built-in that calls ensure_schema()
-            # unconditionally rather than through the schema-version gate —
-            # that is its entire job. ensure_schema() itself still refuses a
-            # populated sub-floor database or one stamped above this build's
-            # head version (SchemaVersionError) rather than mislabelling or
-            # silently opening either; caught here so that refusal reads as
-            # a clean message, not a traceback.
-            await store.ensure_schema()
-            await conn.commit()
-        except SchemaVersionError as exc:
-            click.echo(str(exc), err=True)
-            sys.exit(1)
-        finally:
-            await conn.close()
+        # _opened_db closes the connection on any exit from this block —
+        # a corrupt existing target, a store-construction failure, or a
+        # failure inside ensure_schema() alike — because opening the
+        # connection and entering the protected block are the same step.
+        # migrate is the one built-in whose target may not exist yet —
+        # aiosqlite.connect() creates the file, matching today's behaviour
+        # of bootstrapping a fresh database.
+        async with _opened_db(cfg) as conn:
+            store = SqliteEngravaCore(conn)
+            try:
+                # migrate is the one built-in that calls ensure_schema()
+                # unconditionally rather than through the schema-version
+                # gate — that is its entire job. ensure_schema() itself
+                # still refuses a populated sub-floor database or one
+                # stamped above this build's head version
+                # (SchemaVersionError) rather than mislabelling or silently
+                # opening either; caught here so that refusal reads as a
+                # clean message, not a traceback.
+                await store.ensure_schema()
+                await conn.commit()
+            except SchemaVersionError as exc:
+                click.echo(str(exc), err=True)
+                sys.exit(1)
         click.echo(f"Schema up to date: {cfg.db_path}")
 
     _run(_migrate())
@@ -1886,8 +1963,7 @@ def export_cmd(ctx: click.Context, output_path: str | None, status_filter: str |
             click.echo(f"Database not found: {cfg.db_path}")
             sys.exit(1)
 
-        conn = await _open_db(cfg)
-        try:
+        async with _opened_db(cfg) as conn:
             await _apply_read_schema_gate(conn, command="export")
             # Fetch thoughts
             if status_filter:
@@ -1921,8 +1997,6 @@ def export_cmd(ctx: click.Context, output_path: str | None, status_filter: str |
                 encoding="utf-8",
             )
             click.echo(f"Exported {len(thoughts)} thoughts, {len(edges)} edges to {out}")
-        finally:
-            await conn.close()
 
     _run(_export())
 

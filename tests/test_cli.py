@@ -7,7 +7,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import click
@@ -15,7 +20,6 @@ import pytest
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
 from click.testing import CliRunner
 
 from engrava.cli.config import EngravaCLIConfig
@@ -750,6 +754,338 @@ class TestExport:
         assert result.exit_code == 0
         default_out = populated_db.with_suffix(".export.json")
         assert default_out.exists()
+
+
+# ------------------------------------------------------------------
+# Corrupt-database hang guard
+# ------------------------------------------------------------------
+#
+# ``sqlite3.DatabaseError: file is not a database`` raised from the first
+# ``PRAGMA`` against a corrupt/truncated file used to leave the aiosqlite
+# connection open. aiosqlite's connection worker thread is not a daemon and
+# stops only when ``Connection.close()`` sends it the shutdown sentinel, so a
+# leaked connection blocks ``threading._shutdown`` and the process never
+# exits — it prints a traceback (or nothing, depending on buffering) and then
+# hangs forever rather than returning any exit code.
+#
+# The hang happens at interpreter shutdown, which an in-process
+# ``CliRunner`` invocation never reaches, so these run the real CLI as a
+# subprocess with a hard wall-clock timeout: a regression here fails these
+# tests promptly instead of wedging the whole suite.
+
+# Long enough that a fixed, promptly-erroring command never gets close on a
+# loaded CI host; far short of "wedge the test worker" if the fix regresses.
+_CLI_SUBPROCESS_TIMEOUT_S = 20.0
+
+# A command that returns fast enough for a live process to still be a
+# meaningful "promptly" — as opposed to merely "before the hard cap fired".
+_PROMPT_CEILING_S = 10.0
+
+
+def _run_python_subprocess(argv: list[str]) -> tuple[subprocess.CompletedProcess[str], float]:
+    """Run ``python *argv*`` as a real, separate process with a hard timeout.
+
+    Uses this test file's own ``src`` on ``PYTHONPATH`` rather than whatever
+    ``sys.path`` the test runner happened to start with, so the subprocess
+    always exercises the same worktree's code the test itself was collected
+    from — a shared, editable-installed ``engrava`` elsewhere on the host
+    must not shadow it.
+
+    Args:
+        argv: Full argv after the interpreter, e.g.
+            ``["-m", "engrava.cli.main", "--db", str(db_path), "info"]`` or
+            ``["-c", some_source, "--db", str(db_path), "info"]``.
+
+    Returns:
+        The completed process and the wall-clock seconds it took.
+
+    Raises:
+        Failed test: via ``pytest.fail``, if the process does not exit
+            within :data:`_CLI_SUBPROCESS_TIMEOUT_S` — the hang this guards
+            against — instead of letting ``subprocess.TimeoutExpired``
+            propagate as an error or, worse, blocking forever.
+
+    """
+    repo_src = str(Path(__file__).resolve().parent.parent / "src")
+    env = {**os.environ, "PYTHONPATH": repo_src}
+    start = time.monotonic()
+    try:
+        completed = subprocess.run(  # noqa: S603 -- fixed argv, no shell, our own source
+            [sys.executable, *argv],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            timeout=_CLI_SUBPROCESS_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            f"`python {' '.join(argv)}` did not exit within "
+            f"{_CLI_SUBPROCESS_TIMEOUT_S:.0f}s — this is the hang this test "
+            "guards against, not a slow environment."
+        )
+    return completed, time.monotonic() - start
+
+
+def _run_engrava_subprocess(args: list[str]) -> tuple[subprocess.CompletedProcess[str], float]:
+    """Run ``python -m engrava.cli.main *args*`` as a real, separate process.
+
+    Args:
+        args: Full CLI argv after the interpreter and ``-m`` module name,
+            e.g. ``["--db", str(db_path), "info"]``.
+
+    Returns:
+        The completed process and the wall-clock seconds it took.
+
+    """
+    return _run_python_subprocess(["-m", "engrava.cli.main", *args])
+
+
+def _assert_completed_fails_fast(
+    completed: subprocess.CompletedProcess[str], elapsed: float
+) -> None:
+    """Assert a completed subprocess exited non-zero, promptly, not via the hang."""
+    assert completed.returncode != 0, (
+        f"expected a non-zero exit, got {completed.returncode}\n"
+        f"stdout={completed.stdout!r}\nstderr={completed.stderr!r}"
+    )
+    assert completed.returncode != 124, "124 is the timeout(1) sentinel — this hung"
+    assert elapsed < _PROMPT_CEILING_S, (
+        f"took {elapsed:.1f}s — expected a prompt failure, not one that only "
+        "beat the hard subprocess timeout"
+    )
+
+
+def _assert_fails_fast_and_names_the_problem(args: list[str]) -> None:
+    """Assert *args* exits non-zero, promptly, with the failure named."""
+    completed, elapsed = _run_engrava_subprocess(args)
+    _assert_completed_fails_fast(completed, elapsed)
+    combined = (completed.stdout + completed.stderr).lower()
+    assert "database" in combined, (
+        f"expected the failure to name the database problem\nstdout={completed.stdout!r}\n"
+        f"stderr={completed.stderr!r}"
+    )
+
+
+def _assert_succeeds(args: list[str]) -> None:
+    """Known-good control: the same command against a valid database still works."""
+    completed, _elapsed = _run_engrava_subprocess(args)
+    assert completed.returncode == 0, (
+        f"expected exit 0, got {completed.returncode}\n"
+        f"stdout={completed.stdout!r}\nstderr={completed.stderr!r}"
+    )
+
+
+@pytest.fixture
+def corrupt_db(tmp_path: Path) -> Path:
+    """A file named like a database that is not one — text, truncated, whatever.
+
+    Reproduces the reported shape: a plain text file where a SQLite database
+    is expected, which opens fine (the file exists) but fails the first real
+    read against it.
+    """
+    path = tmp_path / "corrupt.sqlite"
+    path.write_text("this is not a sqlite database, just some text\n", encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def valid_snapshot(runner: CliRunner, populated_db: Path, tmp_path: Path) -> Path:
+    """A real JSONL snapshot of ``populated_db`` — a valid ``restore`` input."""
+    snap = tmp_path / "valid-snapshot.jsonl"
+    result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(snap)])
+    assert result.exit_code == 0
+    return snap
+
+
+class TestCorruptDatabaseExitsInsteadOfHanging:
+    """Every built-in command that opens the database file must fail fast.
+
+    One test per affected command, each with the known-good control the
+    acceptance criteria require: the same command against ``populated_db``
+    (or an equivalent valid target) still works. Covers all eight built-in
+    commands found to route through a connection-opening call in
+    ``cli/main.py`` — the originally reported four (``info``, ``gc``,
+    ``migrate``, ``snapshot``) plus ``verify``, ``query``, ``export``, and
+    the single-database branch of ``restore``, which shared the exact same
+    unclosed-connection mechanism. The two commands that only ever go
+    through :class:`~engrava.infrastructure.service_manager.EngravaManager`
+    (the ``--service`` branch of ``snapshot``/``restore``) are not covered
+    here — that path already closes on its own error, independently of this
+    fix.
+    """
+
+    def test_info(self, corrupt_db: Path, populated_db: Path) -> None:
+        _assert_fails_fast_and_names_the_problem(["--db", str(corrupt_db), "info"])
+        _assert_succeeds(["--db", str(populated_db), "info"])
+
+    def test_verify(self, corrupt_db: Path, populated_db: Path) -> None:
+        _assert_fails_fast_and_names_the_problem(["--db", str(corrupt_db), "verify"])
+        _assert_succeeds(["--db", str(populated_db), "verify"])
+
+    def test_query(self, corrupt_db: Path, populated_db: Path) -> None:
+        _assert_fails_fast_and_names_the_problem(
+            ["--db", str(corrupt_db), "query", "COUNT thoughts"]
+        )
+        _assert_succeeds(["--db", str(populated_db), "query", "COUNT thoughts"])
+
+    def test_gc(self, corrupt_db: Path, populated_db: Path) -> None:
+        _assert_fails_fast_and_names_the_problem(["--db", str(corrupt_db), "gc", "--dry-run"])
+        _assert_succeeds(["--db", str(populated_db), "gc", "--dry-run"])
+
+    def test_migrate(self, corrupt_db: Path, tmp_path: Path) -> None:
+        _assert_fails_fast_and_names_the_problem(["--db", str(corrupt_db), "migrate"])
+        # migrate is the one built-in whose target need not exist yet — a
+        # fresh path is its own "known good" control (see
+        # TestMigrate.test_migrate_creates_schema above).
+        _assert_succeeds(["--db", str(tmp_path / "fresh-for-migrate.db"), "migrate"])
+
+    def test_snapshot(self, corrupt_db: Path, populated_db: Path, tmp_path: Path) -> None:
+        bad_out = tmp_path / "bad.snapshot.jsonl"
+        good_out = tmp_path / "good.snapshot.jsonl"
+        _assert_fails_fast_and_names_the_problem(
+            ["--db", str(corrupt_db), "snapshot", "-o", str(bad_out)]
+        )
+        _assert_succeeds(["--db", str(populated_db), "snapshot", "-o", str(good_out)])
+
+    def test_export(self, corrupt_db: Path, populated_db: Path, tmp_path: Path) -> None:
+        bad_out = tmp_path / "bad.export.json"
+        good_out = tmp_path / "good.export.json"
+        _assert_fails_fast_and_names_the_problem(
+            ["--db", str(corrupt_db), "export", "-o", str(bad_out)]
+        )
+        _assert_succeeds(["--db", str(populated_db), "export", "-o", str(good_out)])
+
+    def test_restore(self, corrupt_db: Path, valid_snapshot: Path, tmp_path: Path) -> None:
+        _assert_fails_fast_and_names_the_problem(
+            ["--db", str(corrupt_db), "restore", "-i", str(valid_snapshot)]
+        )
+        good_target = tmp_path / "restored-for-control.db"
+        _assert_succeeds(["--db", str(good_target), "restore", "-i", str(valid_snapshot)])
+
+
+# A failure injected into ``SqliteEngravaCore.ensure_schema`` before ``cli()``
+# ever runs. Unlike ``corrupt_db``, this never touches ``_open_db`` at all —
+# ``aiosqlite.connect()`` against a target that does not exist yet always
+# succeeds, and the file it creates is a valid, empty SQLite database, so
+# every ``PRAGMA`` in ``_open_db`` passes. The only way to fail *after* the
+# connection is open and *before* the block that is supposed to protect it
+# is to fail inside whatever runs in between — here, ``ensure_schema()``.
+_ENSURE_SCHEMA_FAULT_INJECTION = """
+from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
+
+
+async def _boom(self, *args, **kwargs):
+    raise RuntimeError("injected ensure_schema failure for a bootstrap-window test")
+
+
+SqliteEngravaCore.ensure_schema = _boom
+
+from engrava.cli.main import cli
+
+cli()
+"""
+
+
+class TestRestoreBootstrapWindowClosesOnFailure:
+    """A failure inside ``ensure_schema()`` -- not inside ``_open_db`` -- must
+    also close the connection promptly.
+
+    ``restore`` against a target that does not pre-exist calls
+    ``store = SqliteEngravaCore(conn)`` and then ``await
+    store.ensure_schema()`` to bootstrap it. Before ``_opened_db`` wrapped
+    the whole body in one step, both of those ran ahead of the ``try`` that
+    was supposed to guarantee the close, so a failure there leaked the
+    connection exactly like the corrupt-file case -- just through a
+    different call, with a target file that is itself perfectly valid. The
+    ``corrupt_db`` tests above are blind to this: they all fail inside
+    ``_open_db``, which was already closing correctly before this round of
+    fixes even started.
+    """
+
+    def test_restore_bootstrap_failure_is_not_a_hang(self, tmp_path: Path) -> None:
+        target = tmp_path / "fresh-target-that-fails-to-bootstrap.db"
+        assert not target.exists()  # pre_existing must be False to reach ensure_schema()
+        missing_input = tmp_path / "never-read.jsonl"  # ensure_schema() fails first
+
+        completed, elapsed = _run_python_subprocess(
+            [
+                "-c",
+                _ENSURE_SCHEMA_FAULT_INJECTION,
+                "--db",
+                str(target),
+                "restore",
+                "-i",
+                str(missing_input),
+            ]
+        )
+        _assert_completed_fails_fast(completed, elapsed)
+        combined = completed.stdout + completed.stderr
+        assert "injected ensure_schema failure" in combined, (
+            f"expected the injected failure to surface, not something else\n"
+            f"stdout={completed.stdout!r}\nstderr={completed.stderr!r}"
+        )
+
+
+# A failure injected into ``aiosqlite.Connection.close()`` itself, on a
+# command that otherwise succeeds against a perfectly valid database. Proves
+# ``_opened_db``'s success path does not route a close failure through
+# ``_close_quietly`` -- which logs and swallows by design, correct only when
+# an exception is already in flight.
+_CLOSE_FAILS_ON_SUCCESS_INJECTION = """
+import aiosqlite
+
+_real_close = aiosqlite.Connection.close
+
+
+async def _close_blows_up(self):
+    await _real_close(self)
+    raise RuntimeError("injected close failure on the success path")
+
+
+aiosqlite.Connection.close = _close_blows_up
+
+from engrava.cli.main import cli
+
+cli()
+"""
+
+
+class TestSuccessPathCloseFailureIsNotSwallowed:
+    """A close() failure on an otherwise-successful command must surface.
+
+    ``_opened_db``'s cleanup used to be an unconditional
+    ``finally: await _close_quietly(conn)`` -- including on the success
+    path, where a close failure is not secondary to anything, it is the
+    only error there is. ``_close_quietly`` logs and swallows by design
+    (correct for the exception-in-flight case), so the unconditional call
+    turned a genuine close failure into a command that printed its normal
+    success output and exited 0 -- a worse outcome than the original hang,
+    which was at least visible.
+    """
+
+    def test_close_failure_after_a_successful_command_is_not_silent(
+        self, populated_db: Path
+    ) -> None:
+        completed, elapsed = _run_python_subprocess(
+            [
+                "-c",
+                _CLOSE_FAILS_ON_SUCCESS_INJECTION,
+                "--db",
+                str(populated_db),
+                "info",
+            ]
+        )
+        _assert_completed_fails_fast(completed, elapsed)
+        combined = completed.stdout + completed.stderr
+        assert "injected close failure" in combined, (
+            f"expected the close failure to surface, not be swallowed\n"
+            f"stdout={completed.stdout!r}\nstderr={completed.stderr!r}"
+        )
+
+    def test_close_success_control_still_exits_zero(self, populated_db: Path) -> None:
+        """Known-good control: an ordinary close on the success path still exits 0."""
+        _assert_succeeds(["--db", str(populated_db), "info"])
 
 
 class _FormatThatComparesAsAnother(str):

@@ -1046,6 +1046,34 @@ class _AccessBuffer:
         return drained
 
 
+async def _close_quietly(conn: aiosqlite.Connection) -> None:
+    """Close *conn*, logging rather than raising if the close itself fails.
+
+    Cleanup code that closes a connection while another exception -- or a
+    cancellation -- is already propagating must not let a failure in the
+    close itself replace what the caller actually needs to see: a bare
+    ``raise`` after an unconditional ``await conn.close()`` only re-raises
+    the original error when that close *succeeds*. If the close itself
+    raises, its exception becomes the one that propagates and the original
+    -- a ``ConfigError``, a ``JournalIntegrityError``, an
+    ``asyncio.CancelledError`` -- is lost. A close failure is real
+    information, but it belongs logged underneath the original error, not
+    raised in front of it. Every place in this codebase that closes a
+    connection during cleanup (as opposed to on the ordinary success path,
+    where a close failure is the only thing to report) goes through this
+    rather than re-deriving the same try/except -- ``service_manager.py``
+    imports this same function rather than defining its own.
+
+    Args:
+        conn: The aiosqlite connection to close.
+
+    """
+    try:
+        await conn.close()
+    except Exception:  # noqa: BLE001
+        logger.warning("Error closing connection during cleanup", exc_info=True)
+
+
 def _validate_provider_cycle(value: object) -> int:
     """Validate a value pulled from a ``CycleProvider`` at the trust boundary.
 
@@ -1966,8 +1994,16 @@ class SqliteEngravaCore:
                 backend_name=config.vector_backend,
                 embedding_dimension=config.embedding_dimension,
             )
-        except Exception:
-            await db.close()
+        except BaseException:
+            # Not ``except Exception``: ``asyncio.CancelledError`` derives
+            # from ``BaseException``, and a cancellation during any await
+            # above must close ``db`` exactly like an ordinary failure does
+            # — otherwise it leaks aiosqlite's non-daemon connection worker
+            # thread just as an uncaught error during open would. Routed
+            # through ``_close_quietly`` rather than a direct
+            # ``await db.close()`` so a failure in the close itself cannot
+            # replace this exception -- see that function's docstring.
+            await _close_quietly(db)
             raise
 
         return store
@@ -1976,9 +2012,10 @@ class SqliteEngravaCore:
         """Close the database connection if owned by this instance.
 
         Flushes any pending access-buffer events first (best-effort — a flush
-        failure never blocks the close), then closes the connection when this
-        instance owns it. No-op on the connection when it is caller-managed
-        (i.e. created via the manual constructor).
+        failure never blocks the close, and neither does a cancellation
+        arriving while the flush is in flight), then closes the connection
+        when this instance owns it. No-op on the connection when it is
+        caller-managed (i.e. created via the manual constructor).
 
         **Coordinates with a concurrent or prior quarantine.**
         :meth:`_quarantine_connection` schedules its own physical close of
@@ -2027,27 +2064,46 @@ class SqliteEngravaCore:
         regardless, so nothing is left half-closed by letting the
         cancellation through.
         """
+        # A cancellation during the flush must not skip the close below --
+        # that would strand the connection's non-daemon worker exactly like
+        # an uncaught error would, contradicting this method's own "a flush
+        # failure never blocks the close" promise (a cancellation is a kind
+        # of failure too). Caught here and re-raised only once the close
+        # below has actually run, mirroring
+        # :meth:`EngravaManager.close_all`: every required cleanup step
+        # still runs, and the cancellation is deferred, never discarded.
+        pending_cancellation: asyncio.CancelledError | None = None
         if self._access_tracking_enabled:
             try:
                 await self.flush_access_buffer()
+            except asyncio.CancelledError as exc:
+                pending_cancellation = exc
             except Exception:  # noqa: BLE001
                 logger.debug("access-buffer flush on close failed; counts are best-effort")
         if self._owns_connection:
             if self._quarantine_close_task is not None:
                 cancel_error = await self._drain_shielded(self._quarantine_close_task)
                 if cancel_error is not None:
-                    raise cancel_error
+                    pending_cancellation = cancel_error
             else:
                 self._quarantine_close_task = asyncio.ensure_future(self._db.close())
                 cancel_error = await self._drain_shielded(self._quarantine_close_task)
                 if cancel_error is not None:
-                    raise cancel_error
-                # This is the real, non-quarantined close -- unlike the
-                # piggyback branch above, its own outcome is actionable, so
-                # it is surfaced (not discarded): a clean close returns
-                # None, an ordinary failure or an independent cancellation
-                # of the task itself both raise via result().
-                self._quarantine_close_task.result()
+                    pending_cancellation = cancel_error
+                elif pending_cancellation is None:
+                    # This is the real, non-quarantined close -- unlike the
+                    # piggyback branch above, its own outcome is actionable, so
+                    # it is surfaced (not discarded): a clean close returns
+                    # None, an ordinary failure or an independent cancellation
+                    # of the task itself both raise via result().
+                    self._quarantine_close_task.result()
+                else:
+                    # A cancellation was already deferred above (from the
+                    # flush) -- see :meth:`_log_close_failure_over_pending_cancellation`
+                    # for the rule this follows.
+                    self._log_close_failure_over_pending_cancellation(self._quarantine_close_task)
+        if pending_cancellation is not None:
+            raise pending_cancellation
 
     async def __aenter__(self) -> Self:
         """Enter the async context manager.
@@ -3887,6 +3943,34 @@ class SqliteEngravaCore:
         with contextlib.suppress(BaseException):
             waiter.result()
         return cancelled
+
+    @staticmethod
+    def _log_close_failure_over_pending_cancellation(task: asyncio.Task[None]) -> None:
+        """Consume a close task's result when a cancellation already outranks it.
+
+        The rule, stated generally so the next cleanup path here can reuse
+        it rather than re-derive it: **the caller's own cancellation
+        outranks anything the cleanup discovers about itself.** When
+        something earlier in ``close()`` (the access-buffer flush) has
+        already deferred a cancellation, the connection's physical close
+        still runs to completion -- but its own outcome must not replace
+        the cancellation the caller actually needs to see. ``task.result()``
+        is still called so a close failure is never an unretrieved task
+        exception, and a genuine failure is logged with the exception
+        itself -- the only trace of it that will exist -- rather than
+        raised in front of the cancellation.
+
+        Args:
+            task: The completed close task.
+
+        """
+        try:
+            task.result()
+        except BaseException:  # noqa: BLE001
+            logger.warning(
+                "close() failed while a cancellation was already pending",
+                exc_info=True,
+            )
 
     @staticmethod
     def _consume_quarantine_close(task: asyncio.Task[None]) -> None:

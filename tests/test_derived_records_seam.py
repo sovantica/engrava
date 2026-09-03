@@ -27,10 +27,12 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import hashlib
 import logging
 import sqlite3
 import struct
+import time
 import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -1854,6 +1856,138 @@ async def test_close_cancellation_does_not_corpse_the_physical_close(
     assert not store._quarantine_close_task.cancelled(), (
         "the close task itself must not be cancelled -- only this caller's await was"
     )
+
+
+async def test_close_cancellation_during_flush_still_closes_the_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation during the access-buffer flush must not skip the close.
+
+    ``close()``'s cancellation-safety -- the quarantine / ``_drain_shielded``
+    machinery exercised above -- only protects the physical close itself.
+    The access-buffer flush that runs *before* any of that was guarded only
+    by ``except Exception``, which does not catch ``asyncio.CancelledError``.
+    A cancellation landing there used to escape immediately, skipping the
+    close entirely and leaking the connection's non-daemon worker thread --
+    recreating the exact interpreter-shutdown hang this whole fix exists to
+    prevent, despite the docstring's promise that "a flush failure never
+    blocks the close."
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(conn, access_tracking_enabled=True)
+    store._owns_connection = True
+    await store.ensure_schema()
+
+    started = asyncio.Event()
+
+    async def _flush_stalls_forever() -> int:
+        started.set()
+        await asyncio.sleep(10)  # cancelled long before this would return
+        return 0
+
+    monkeypatch.setattr(store, "flush_access_buffer", _flush_stalls_forever)
+
+    task = asyncio.ensure_future(store.close())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    try:
+        # close() awaits the worker's own stop future, so by the time the
+        # physical close completes the thread should already be done; poll
+        # briefly for the rare case where the OS thread's actual exit lags
+        # a hair behind.
+        deadline = time.monotonic() + 2.0
+        while conn._thread.is_alive() and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+
+        assert not conn._thread.is_alive(), (
+            "the connection's non-daemon worker thread survived a "
+            "cancellation during the access-buffer flush -- the close "
+            "below it never ran"
+        )
+    finally:
+        # However the assertion above turns out, never leave a leaked
+        # worker thread running past this test -- it is not a daemon, so
+        # it would otherwise block interpreter shutdown for the entire
+        # suite.
+        if conn._thread.is_alive():
+            stopped = conn.stop()
+            if stopped is not None:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stopped, timeout=5)
+            conn._thread.join(timeout=5)
+
+
+async def test_close_cancellation_during_flush_outranks_a_failing_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deferred cancellation must win over the physical close's own failure.
+
+    The sibling test above shows a cancelled flush still lets the physical
+    close run. But ``self._quarantine_close_task.result()`` used to raise
+    the close's own exception *before* the line that re-raises the
+    deferred cancellation -- so a cancelled flush followed by a close that
+    itself fails surfaced the close's ``RuntimeError``, not the caller's
+    ``CancelledError``, contradicting this method's own documented promise
+    that a cancellation of the caller's await always propagates ahead of
+    whatever the close task resolved to. The rule
+    ``_log_close_failure_over_pending_cancellation`` documents applies
+    here: the caller's own cancellation outranks anything the cleanup
+    discovers about itself.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(conn, access_tracking_enabled=True)
+    store._owns_connection = True
+    await store.ensure_schema()
+
+    started = asyncio.Event()
+
+    async def _flush_stalls_forever() -> int:
+        started.set()
+        await asyncio.sleep(10)  # cancelled long before this would return
+        return 0
+
+    monkeypatch.setattr(store, "flush_access_buffer", _flush_stalls_forever)
+
+    real_close = conn.close
+
+    async def _close_blows_up() -> None:
+        # Still performs the real close -- the point of this test is that
+        # its own failure report afterward must not outrank the
+        # already-pending cancellation.
+        await real_close()
+        msg = "close blew up after a cancellation was already pending"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(conn, "close", _close_blows_up)
+
+    task = asyncio.ensure_future(store.close())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    try:
+        deadline = time.monotonic() + 2.0
+        while conn._thread.is_alive() and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+
+        assert not conn._thread.is_alive(), (
+            "the connection's worker thread survived -- the close must "
+            "still run to completion even when a cancellation is already "
+            "pending"
+        )
+    finally:
+        if conn._thread.is_alive():
+            stopped = conn.stop()
+            if stopped is not None:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stopped, timeout=5)
+            conn._thread.join(timeout=5)
 
 
 async def test_close_after_quarantine_shares_the_close_task_and_returns_promptly(

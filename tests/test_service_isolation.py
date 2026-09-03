@@ -11,9 +11,11 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
 import hashlib
 import json
+import time
 from pathlib import Path
 
 import aiosqlite
@@ -44,6 +46,7 @@ from engrava.config import (
     load_config,
 )
 from engrava.domain.protocols.derived_records import DeriveGates
+from engrava.infrastructure import service_manager as service_manager_module
 from engrava.infrastructure.service_manager import EngravaManager
 
 
@@ -552,6 +555,226 @@ class TestEngravaManager:
             assert store is not None
         finally:
             await mgr.close_all()
+
+    async def test_cancellation_during_init_closes_the_connection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cancelling ``get_store`` mid-init must not leak the aiosqlite worker.
+
+        ``_create_store``'s cleanup used to be ``except Exception``, which
+        does not catch ``asyncio.CancelledError`` (it derives from
+        ``BaseException``, not ``Exception``). A cancellation while an
+        ``await`` inside that block is suspended -- ``ensure_schema()``
+        here, driven by an ``asyncio.Event`` so the cancellation lands
+        deterministically while the connection is still open -- used to skip
+        ``await db.close()`` entirely and strand aiosqlite's connection
+        worker thread. That thread is not a daemon, so a stranded one blocks
+        interpreter shutdown exactly like the corrupt-file hang this whole
+        fix addresses, and it matters most at service shutdown -- exactly
+        when things get cancelled. This asserts the actual invariant -- no
+        surviving worker thread -- rather than a proxy for it.
+        """
+        data_dir = tmp_path / "services"
+
+        opened: list[aiosqlite.Connection] = []
+        real_connect = service_manager_module.aiosqlite.connect
+
+        async def _spy_connect(*args: object, **kwargs: object) -> aiosqlite.Connection:
+            conn = await real_connect(*args, **kwargs)
+            opened.append(conn)
+            return conn
+
+        monkeypatch.setattr(service_manager_module.aiosqlite, "connect", _spy_connect)
+
+        started = asyncio.Event()
+
+        async def _stalls_forever(self: SqliteEngravaCore, *args: object, **kwargs: object) -> None:
+            started.set()
+            await asyncio.sleep(10)  # cancelled long before this would return
+
+        monkeypatch.setattr(SqliteEngravaCore, "ensure_schema", _stalls_forever)
+
+        mgr = EngravaManager(data_dir=data_dir)
+        task = asyncio.create_task(mgr.get_store("cancel-me"))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert opened, "the connect() spy never observed a connection being opened"
+        conn = opened[0]
+
+        try:
+            # close() awaits the worker's own stop future, so by the time it
+            # returns the thread should already be done; poll briefly for
+            # the rare case where the OS thread's actual exit lags a hair
+            # behind. A plain ``threading.Thread`` has no awaitable "done"
+            # signal to bridge into asyncio, so a short busy-wait is the
+            # correct tool here, not an ``asyncio.Event``.
+            deadline = time.monotonic() + 2.0
+            while conn._thread.is_alive() and time.monotonic() < deadline:  # noqa: ASYNC110
+                await asyncio.sleep(0.01)
+
+            assert not conn._thread.is_alive(), (
+                "aiosqlite's non-daemon connection worker thread survived the "
+                "cancellation -- it will block interpreter shutdown exactly "
+                "like the corrupt-file hang this fix addresses"
+            )
+        finally:
+            # However the assertion above turns out, never leave a leaked
+            # worker thread running past this test. It is not a daemon, so
+            # if it survived, it would otherwise block interpreter shutdown
+            # for the entire suite -- turning "this one test fails" into
+            # "the process hangs forever" for every test after it, exactly
+            # the failure mode this whole fix exists to avoid.
+            if conn._thread.is_alive():
+                stopped = conn.stop()
+                if stopped is not None:
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(stopped, timeout=5)
+                conn._thread.join(timeout=5)
+
+    async def test_close_all_continues_past_a_cancelled_store_and_reraises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cancellation while closing one store must not abandon the rest.
+
+        ``close_all()`` used to catch only ``Exception``, so a
+        ``CancelledError`` raised while closing the first cached store
+        aborted the loop early. ``store.close()`` completes the real,
+        physical close before it re-raises a ``CancelledError`` from an
+        in-flight cancellation (see its own docstring), so the first
+        store's connection was never actually the problem -- every store
+        *after* it was, left open and leaking its non-daemon worker thread
+        exactly like the corrupt-file hang. This creates two stores, makes
+        the first one's close perform its real close and then raise
+        ``CancelledError`` (matching what ``store.close()`` really does
+        under cancellation), and asserts BOTH workers are gone -- not just
+        the one that raised -- and that the cancellation still reaches the
+        caller rather than being silently absorbed.
+        """
+        data_dir = tmp_path / "services"
+        mgr = EngravaManager(data_dir=data_dir)
+        store_a = await mgr.get_store("svc-a")
+        store_b = await mgr.get_store("svc-b")
+
+        conn_a = store_a._db
+        conn_b = store_b._db
+
+        real_close_a = store_a.close
+
+        async def _close_a_then_cancel() -> None:
+            await real_close_a()
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(store_a, "close", _close_a_then_cancel)
+
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await mgr.close_all()
+
+            assert not conn_a._thread.is_alive(), (
+                "store A's own worker survived its own close -- unexpected regardless of this fix"
+            )
+            assert not conn_b._thread.is_alive(), (
+                "store B's worker survived -- close_all() abandoned it after "
+                "store A's close raised a cancellation, exactly the defect "
+                "this fix addresses"
+            )
+        finally:
+            for conn in (conn_a, conn_b):
+                if conn._thread.is_alive():
+                    stopped = conn.stop()
+                    if stopped is not None:
+                        with contextlib.suppress(TimeoutError):
+                            await asyncio.wait_for(stopped, timeout=5)
+                    conn._thread.join(timeout=5)
+
+    async def test_create_store_failure_survives_a_failing_cleanup_close(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A close failure during cleanup must not replace the original error.
+
+        ``_create_store``'s cleanup handler used to do
+        ``await db.close(); raise`` unconditionally: the bare ``raise``
+        only re-raises the original failure when the close itself
+        succeeds. If ``db.close()`` also raised, its exception became the
+        one that propagated, and the original -- here, a deliberate
+        ``ensure_schema()`` failure, but in production a ``ConfigError``
+        or a cancellation -- was lost. Now routed through
+        ``_close_quietly``, which logs a close failure instead of letting
+        it take over. This makes both fail at once and asserts the caller
+        still sees the original.
+
+        The original error escaping is necessary but not sufficient: a
+        regression that stops attempting the cleanup close entirely would
+        also make the original error the only thing that propagates, so
+        this also asserts the close was actually attempted and that no
+        worker thread survives -- the same invariant
+        ``test_cancellation_during_init_closes_the_connection`` checks,
+        here for an ordinary (non-cancellation) close failure instead.
+        """
+        data_dir = tmp_path / "services"
+
+        opened: list[aiosqlite.Connection] = []
+        close_calls = {"n": 0}
+        real_connect = service_manager_module.aiosqlite.connect
+
+        async def _spy_connect(*args: object, **kwargs: object) -> aiosqlite.Connection:
+            conn = await real_connect(*args, **kwargs)
+            opened.append(conn)
+            real_close = conn.close
+
+            async def _close_blows_up() -> None:
+                # Still performs the real close -- only its own failure
+                # report afterward is what this test is about.
+                close_calls["n"] += 1
+                await real_close()
+                msg = "close blew up during cleanup"
+                raise RuntimeError(msg)
+
+            conn.close = _close_blows_up
+            return conn
+
+        monkeypatch.setattr(service_manager_module.aiosqlite, "connect", _spy_connect)
+
+        async def _boom(self: SqliteEngravaCore, *args: object, **kwargs: object) -> None:
+            msg = "original ensure_schema failure"
+            raise ValueError(msg)
+
+        monkeypatch.setattr(SqliteEngravaCore, "ensure_schema", _boom)
+
+        mgr = EngravaManager(data_dir=data_dir)
+        try:
+            with pytest.raises(ValueError, match="original ensure_schema failure"):
+                await mgr.get_store("doomed")
+
+            assert close_calls["n"] == 1, (
+                "the cleanup close was never attempted -- a regression that "
+                "drops the close call entirely would also let the original "
+                "ValueError escape untouched, so that alone is not enough"
+            )
+            assert opened, "the connect() spy never observed a connection being opened"
+            conn = opened[0]
+
+            deadline = time.monotonic() + 2.0
+            while conn._thread.is_alive() and time.monotonic() < deadline:  # noqa: ASYNC110
+                await asyncio.sleep(0.01)
+
+            assert not conn._thread.is_alive(), (
+                "the connection's non-daemon worker thread survived a "
+                "failing cleanup close -- a leaked-worker regression here "
+                "would otherwise be left to interpreter shutdown instead "
+                "of failing this test cleanly"
+            )
+        finally:
+            for conn in opened:
+                if conn._thread.is_alive():
+                    stopped = conn.stop()
+                    if stopped is not None:
+                        with contextlib.suppress(TimeoutError):
+                            await asyncio.wait_for(stopped, timeout=5)
+                    conn._thread.join(timeout=5)
 
 
 # ------------------------------------------------------------------

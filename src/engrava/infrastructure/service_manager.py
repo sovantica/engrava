@@ -31,7 +31,7 @@ from engrava.config import (
     ServicesConfig,
     resolve_embedding_provider,
 )
-from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
+from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore, _close_quietly
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -288,14 +288,30 @@ class EngravaManager:
 
         Safe to call multiple times.  After this call, cached stores
         are cleared and ``get_store()`` will create fresh connections.
+
+        A cancellation while closing one store must not abandon the rest:
+        ``store.close()`` completes the real, physical close before it
+        re-raises a ``CancelledError`` from an in-flight cancellation (see
+        its own docstring), so catching that here and continuing to the
+        next store never skips a close that hasn't actually happened yet
+        -- it only avoids abandoning every store *after* the one that was
+        in flight when the cancellation landed. The cancellation itself is
+        never swallowed: it is re-raised once every store has had its
+        close attempt, not discarded and not left to interrupt the loop
+        early.
         """
+        pending_cancellation: asyncio.CancelledError | None = None
         for name, store in self._stores.items():
             try:
                 store._owns_connection = True  # noqa: SLF001
                 await store.close()
+            except asyncio.CancelledError as exc:
+                pending_cancellation = exc
             except Exception:  # noqa: BLE001
                 logger.warning("Error closing store %r", name, exc_info=True)
         self._stores.clear()
+        if pending_cancellation is not None:
+            raise pending_cancellation
 
     # ------------------------------------------------------------------
     # Factory
@@ -415,8 +431,17 @@ class EngravaManager:
                 backend_name=self._vector_backend,
                 embedding_dimension=self._embedding_dimension,
             )
-        except Exception:
-            await db.close()
+        except BaseException:
+            # Not ``except Exception``: ``asyncio.CancelledError`` derives
+            # from ``BaseException``, and a cancellation during any await
+            # above (most likely at shutdown, exactly when things get
+            # cancelled) must close ``db`` exactly like an ordinary failure
+            # does — otherwise it leaks aiosqlite's non-daemon connection
+            # worker thread just as an uncaught ``DatabaseError`` would.
+            # Routed through ``_close_quietly`` rather than a direct
+            # ``await db.close()`` so a failure in the close itself cannot
+            # replace this exception -- see that function's docstring.
+            await _close_quietly(db)
             raise
 
         logger.info("Initialized service %r: %s", service_name, db_path)
