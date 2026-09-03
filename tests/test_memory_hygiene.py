@@ -28,6 +28,7 @@ from __future__ import annotations
 import datetime
 import importlib.util
 import math
+import re
 from typing import TYPE_CHECKING
 from unittest import mock
 
@@ -2963,6 +2964,64 @@ class TestGarbageCollectionWallClockWindow:
             r2 = await s.run_hygiene(current_cycle=5000, now=_NOW + datetime.timedelta(days=90))
             assert r2.gc_count == 0
             assert await s.get_thought("t") is not None
+        finally:
+            await s._db.close()
+
+
+# ---------------------------------------------------------------------------
+# The two GC-eligibility guards are structurally pinned, not just behaviourally
+# ---------------------------------------------------------------------------
+
+
+class TestGcEligibilityGuardsAreStructurallyPinned:
+    """Both ``IS NOT NULL`` guards in the GC eligibility SQL are pinned by text.
+
+    Each guard is mechanically redundant against ordinary data: SQLite already
+    rejects a NULL row at the comparison beside it, so a behavioural test
+    cannot see the difference removing either one makes (that guarantee is
+    covered instead by ``test_gc_only_reaps_hygiene_archived_rows`` and
+    ``test_legacy_null_archived_at_never_gc``, both of which stay untouched).
+    Only a structural assertion on the generated SQL can see a guard being
+    deleted, or moved away from the comparison it protects — which is what
+    this test asserts.
+    """
+
+    async def test_both_guards_present_and_adjacent_to_their_comparison(self) -> None:
+        # Active wall-clock window, so its clause is actually emitted.
+        policy = HygienePolicyConfig(
+            enabled=True,
+            eviction_threshold=0.0,
+            auto_gc_enabled=True,
+            gc_min_archive_age_cycles=0,
+            gc_restore_window_seconds=1,
+        )
+        s = await _make_store(policy)
+        captured: list[str] = []
+        real_execute = s._db.execute
+
+        async def spy_execute(sql: str, *args: object, **kwargs: object) -> object:
+            captured.append(sql)
+            return await real_execute(sql, *args, **kwargs)
+
+        s._db.execute = spy_execute  # type: ignore[method-assign]
+        try:
+            await s._hygiene_gc_eligible(policy=policy, current_cycle=1000, now=_NOW)
+            gc_sql = next(sql for sql in captured if "archived_at_cycle" in sql)
+
+            # Cycle-axis guard: IS NOT NULL immediately precedes its comparison,
+            # with nothing (e.g. another clause) inserted between them.
+            assert re.search(
+                r"archived_at_cycle\s+IS\s+NOT\s+NULL\s+AND\s+archived_at_cycle\s*<=\s*\?",
+                gc_sql,
+            ), gc_sql
+            # Wall-clock-axis guard: same adjacency requirement. ``\b`` after
+            # ``archived_at`` does not match inside ``archived_at_cycle`` (both
+            # neighbouring characters are word characters there), so this
+            # pattern targets only the wall-clock column.
+            assert re.search(
+                r"archived_at\b\s+IS\s+NOT\s+NULL\s+AND\s+archived_at\b\s*<=\s*\?",
+                gc_sql,
+            ), gc_sql
         finally:
             await s._db.close()
 

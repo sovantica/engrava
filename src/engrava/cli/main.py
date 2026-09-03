@@ -1737,7 +1737,7 @@ async def _gc_archived(
     dry_run: bool,
     quiet: bool,
 ) -> None:
-    """Physically delete all ARCHIVED thoughts, their orphaned edges and vectors.
+    """Physically delete all ARCHIVED thoughts, their edges, embeddings, actions and vectors.
 
     Every statement below — the child deletes, the parent delete and the vector
     purge — runs in the one transaction this function's ``commit`` closes, so a
@@ -1754,7 +1754,10 @@ async def _gc_archived(
         return
 
     if dry_run:
-        click.echo(f"Would delete {archived_count} archived thoughts and orphaned edges.")
+        click.echo(
+            f"Would delete {archived_count} archived thoughts, "
+            "plus their edges, embeddings, and actions."
+        )
         return
 
     purge_vectors = await _prepare_vector_index_purge(conn)
@@ -1790,7 +1793,7 @@ async def _gc_archived(
 )
 @click.pass_context
 def gc(ctx: click.Context, *, dry_run: bool, expired: bool) -> None:
-    """Garbage-collect archived thoughts and their orphaned edges.
+    """Garbage-collect archived thoughts, their edges, embeddings, and actions.
 
     With ``--expired``, also clean up expired TTL thoughts first (archived
     or deleted per the configured ``ttl.strategy``).

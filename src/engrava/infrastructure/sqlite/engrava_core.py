@@ -10790,6 +10790,14 @@ class SqliteEngravaCore:
         # cap slot and starve younger eligible rows. The Python re-check below
         # stays as defence-in-depth.
         params: list[object] = [LifecycleStatus.ARCHIVED.value, max_archived_cycle]
+        # Cycle-axis restore window. ``archived_at_cycle`` is set by the hygiene
+        # archive stage only, so ``archived_at_cycle IS NOT NULL`` is redundant
+        # against ordinary data — the comparison beside it already rejects a
+        # NULL row. It stays explicit because it is what keeps a TTL- or
+        # manually-archived row (``archived_at_cycle IS NULL``) excluded if the
+        # comparison is ever rewritten into a NULL-tolerant form (e.g.
+        # ``COALESCE(archived_at_cycle, 0) <= ?``), which the method's contract
+        # forbids reaping.
         # Wall-clock restore window (in addition to the cycle window). When
         # disabled (``gc_restore_window_seconds == 0``) the predicate is omitted,
         # so a hygiene-archived row with ``archived_at IS NULL`` stays cycle-only

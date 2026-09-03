@@ -673,7 +673,12 @@ class TestGc:
     def test_gc_dry_run(self, runner: CliRunner, populated_db: Path) -> None:
         result = runner.invoke(cli, ["--db", str(populated_db), "gc", "--dry-run"])
         assert result.exit_code == 0
-        assert "Would delete 1" in result.output
+        # The dry run is read immediately before the destructive run, so it must
+        # name every row category the real run deletes, not just the thoughts
+        # its count covers.
+        assert "Would delete 1 archived thoughts" in result.output
+        assert "edges, embeddings, and actions" in result.output
+        assert "orphaned edges" not in result.output
 
         # Verify nothing actually deleted
         check = runner.invoke(
@@ -682,6 +687,12 @@ class TestGc:
         )
         data = json.loads(check.output)
         assert data["thoughts"]["total"] == 3
+
+    def test_gc_help_names_full_blast_radius(self, runner: CliRunner) -> None:
+        result = runner.invoke(cli, ["gc", "--help"])
+        assert result.exit_code == 0
+        assert "edges, embeddings, and actions" in result.output
+        assert "orphaned edges" not in result.output
 
     def test_gc_nothing_to_collect(self, runner: CliRunner, populated_db: Path) -> None:
         # First gc removes the archived one
