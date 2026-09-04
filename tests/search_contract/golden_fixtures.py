@@ -180,6 +180,11 @@ HYBRID_RANKING_QUERIES: tuple[str, ...] = (
 # 0.1 graph weight, edge decay left at its 0.5 default) match the product's
 # own documented defaults.
 HYBRID_CURRENT_CYCLE = 100
+# Deliberately always positive: a resolved recency weight of ``0.0`` takes a
+# different code path on the query-less fallback (flat scores instead of
+# cycle decay), so this frozen corpus has no coverage of that configuration.
+# Do not lower this to ``0.0`` to "improve" coverage — add a dedicated,
+# non-golden test for the zero-weight case instead.
 HYBRID_RECENCY_WEIGHT = 0.10
 HYBRID_GRAPH_WEIGHT = 0.1
 

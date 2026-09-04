@@ -9631,14 +9631,15 @@ class SqliteEngravaCore:
         if not fts_active and not vector_active:
             if recency_active:
                 backends_used.add("recency")
-            # Gate the transaction axis on ``recency_active`` so a weight-0
-            # ``recency_now`` stays inert on this query-less path too: passing
-            # ``transaction_now=None`` when recency is inactive falls the fallback
-            # through to its neutral (flat-score, updated_cycle-ordered) branch,
-            # byte-identical to a query with no recency reference.
+            # Gate BOTH recency references on ``recency_active`` so a weight-0
+            # reference stays inert on this query-less path too, on either
+            # axis: passing ``current_cycle=None`` / ``transaction_now=None``
+            # when recency is inactive falls the fallback through to its
+            # neutral (flat-score, updated_cycle-ordered) branch, byte-identical
+            # to a query with no recency reference.
             fallback = await self._fallback_hybrid_results(
                 top_k=top_k,
-                current_cycle=current_cycle,
+                current_cycle=current_cycle if recency_active else None,
                 recency_half_life=resolved_recency_half_life,
                 transaction_now=transaction_now if recency_active else None,
                 transaction_half_life_seconds=resolved_recency_now_half_life,

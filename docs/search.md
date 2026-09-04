@@ -28,13 +28,17 @@ its weight is **redistributed proportionally** across active signals.
 - `graph_weight` is `0.0` → graph skipped, zero overhead.
 - All signals disabled → a dedicated query-less window of `top_k` rows (not a
   `list_thoughts` call), pre-ordered `updated_cycle DESC` so the truncation keeps
-  the freshest rows. With no cycle reference to decay against, every row scores a
-  flat `0.0`; a `current_cycle` supplied at `recency_weight=0.0` still yields
-  cycle-decayed scores rather than flat ones, though the resulting order is the
-  same either way, because the window is already ordered by `updated_cycle` and
-  the decay rises with it. The compiled `filters=` / `visibility=` predicate is
-  applied in-query and archived thoughts stay excluded unless `include_archived`
-  is set, so this path enforces the same eligibility as the FTS and vector arms.
+  the freshest rows. With no cycle reference, every row scores a flat `0.0`. A
+  reference supplied at `recency_weight=0.0` — `current_cycle` or `recency_now`
+  — is **accepted but inert** here too: the weight gates recency on this
+  query-less path the same way it does everywhere else, so the row still scores
+  a flat `0.0` rather than a decayed one. If another signal is active on this
+  same path (`priority_weight` defaults on), zeroing `recency_weight` can
+  change which row ranks first, not just shrink the scores, because the
+  now-flat recency term stops competing with it. The compiled `filters=` /
+  `visibility=` predicate is applied in-query and archived thoughts stay
+  excluded unless `include_archived` is set, so this path enforces the same
+  eligibility as the FTS and vector arms.
 - That same query-less window serves whenever **both** the FTS and vector arms
   are out, even if recency survives — recency stays active only with a reference
   **and** a recency weight above `0.0`. The window is then ordered and scored

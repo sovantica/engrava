@@ -146,6 +146,7 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 | 0.3.x | 0.4.0 | Yes | **Schema-changing** minor upgrade — adds the valid-time columns (additive, zero data loss). Back up first and follow the [rolling-upgrades](#rolling-upgrades-multiple-workers) note |
 | 0.4.x | 0.5.0 | Yes | **Schema-changing** minor upgrade (`user_version` 14 → 18), although the library API is drop-in. **Breaking for MCP-server users only:** the `engrava[mcp]` extra and the in-engrava `engrava-mcp` command are removed — the server moved to the standalone [`engrava-mcp`](https://github.com/sovantica/engrava-mcp) package (see the 0.4 → 0.5 note) |
 | 0.5.0 | 0.6.0 | Yes | **Schema-changing** minor upgrade (`user_version` 18 → 20), with two additive columns. Default retrieval now excludes archived thoughts, and wrong-dimension query vectors raise a typed error. An edge `decay_multiplier` of `0.0` no longer reads back as `1.0`, and a later update no longer rewrites it to `1.0` — values a 0.5.x update already overwrote stay overwritten. Back up, quiesce shared-store workers, migrate once, and review the [0.5 → 0.6 notes](#05---06) |
+| 0.6.x | 0.7.0 | Yes | No schema change from this note's fix. **Behaviour change:** when the resolved recency weight is `0.0` **and** a cognitive-cycle reference (`current_cycle`, explicit or via `cycle_provider`) is present, the query-less fallback path now treats recency as fully off instead of still decaying by cycle — which can change result order for stores with heterogeneous thought priorities. `recency_now` (transaction-time) callers are unaffected; that axis was already correct. Review the [0.6 → 0.7 notes](#06---07) |
 
 For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 `0.x.*` line do not change the schema and are low-risk; **minor** upgrades
@@ -153,6 +154,72 @@ For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 [rolling-upgrades](#rolling-upgrades-multiple-workers) note below.
 
 ## Version Notes
+
+### 0.6 -> 0.7
+
+**Breaking behaviour change: a resolved recency weight of zero now fully
+disables cognitive-cycle recency, including on the query-less fallback path.**
+No schema migration is involved.
+
+**Who is affected.** Two conditions, both required: the resolved
+`recency_weight` is `0.0`, **and** a cognitive-cycle reference is present — an
+explicit `current_cycle`, or one resolved through a configured
+`cycle_provider`. The resolved weight is `0.0` in three cases: an explicit
+`recency_weight=0.0`; a directly constructed `SqliteEngravaCore` with no
+`SearchConfig` at all, which resolves an *omitted* `recency_weight` to `0.0` —
+those callers are affected without ever passing the argument, so do not rule
+yourself out just because your code never mentions `recency_weight`; or a
+supplied `SearchConfig` whose `default_recency_weight` is `0.0`. (A default
+`SearchConfig()` and `from_config` with no override both resolve to `0.1`, not
+`0.0` — only construction with no `SearchConfig` object at all defaults to
+`0.0`, which is exactly why an omitted argument can mean "off" on one
+construction path and "on" on another.) Within that population, the change
+only shows up on the *fallback* path — FTS inactive or skipped, and vector
+search inactive, for that particular query — on a store where another signal
+is still active (commonly `priority_weight`, which defaults to `0.05`).
+
+**Who is not affected.** If you use `recency_now` (transaction-time recency)
+instead of `current_cycle`, this change does not apply to you at all — that
+axis already turned itself off correctly at a resolved weight of `0.0`, on
+0.6.x and on 0.7 alike. A resolved weight of `0.0` with no cognitive-cycle
+reference present (no explicit `current_cycle` and no configured
+`cycle_provider`) was likewise already a no-op and stays one.
+
+**What changed.** On 0.6.x, a resolved `recency_weight` of `0.0` correctly
+kept `'recency'` out of `HybridSearchResult.backends_used`, but the fallback
+path still computed a cycle-decayed score for each row — when a cognitive-cycle
+reference was present — and added it in ahead of the sort: the weight gated
+the label, not the number. On 0.7, the cognitive-cycle axis is genuinely inert
+whenever the resolved weight is `0.0`: every row on this path gets a flat
+`0.0` recency contribution, matching the transaction-time axis, which was
+already correct on 0.6.x.
+
+**Why this can reorder results, not just shrink a score.** The fallback path
+adds every active signal's contribution and re-sorts. With the recency term no
+longer contributing anything, whichever row has the higher priority boost can
+now win outright — previously, a fresh-but-low-priority row could still beat a
+stale-but-high-priority one on the strength of an undecayed recency score that
+a resolved weight of `0.0` was supposed to have turned off.
+
+Concrete example, on defaults (`current_cycle=100`, `recency_half_life=50`,
+`priority_weight=0.05`), with the recency weight resolved to `0.0`:
+
+| Row | 0.6.x score (leaked recency) | 0.7 score (fixed) |
+|---|---|---|
+| fresh, `Priority.P4` (`updated_cycle=100`) | `1.0` — **won** | `0.0` |
+| stale, `Priority.P2` (`updated_cycle=0`) | `0.85` | `0.6` — **wins now** |
+
+**What to do.** If your recency weight resolves to `0.0` — by omitting
+`recency_weight` on a directly constructed store, by passing it explicitly, or
+through a zero `SearchConfig.default_recency_weight` — **and** you also supply
+a cognitive-cycle reference (an explicit `current_cycle`, or a configured
+`cycle_provider`), re-check result order after upgrading on any query that has
+heterogeneous thought priorities and falls through to the
+FTS-inactive/vector-inactive fallback path: it may now favor priority where it
+previously favored an unintended recency leak. If you actually want
+cycle-decayed ranking, give the resolved `recency_weight` a positive value
+instead of relying on the previous behavior. If you use `recency_now` instead
+of `current_cycle`, none of this applies to you.
 
 ### 0.5 -> 0.6
 
