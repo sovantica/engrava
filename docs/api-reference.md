@@ -777,6 +777,7 @@ store-replacement guidance, see [Error handling and recovery](error-handling.md)
 | `ThoughtNotFoundError` | `EngravaError` | Thought ID not found |
 | `StaleDataError` | `EngravaError` | The guarded update matched no row: a competing writer stamped a new `updated_cycle`, or deleted the row, before this write. Nothing of the update was applied. Not a general staleness check — see [Concurrency](concurrency.md#optimistic-concurrency-and-staledataerror) |
 | `InvalidTransitionError` | `EngravaError` | Invalid lifecycle state transition |
+| `ReferentialIntegrityError` | `EngravaError` | `create_edge` named an endpoint (`from_thought_id` or `to_thought_id`) that is not an existing thought |
 | `DuplicateEdgeError` | `EngravaError` | The directed `(from_thought_id, to_thought_id, edge_type)` relationship already exists |
 | `ReadOnlyViolationError` | `EngravaError` | Write attempt on read-only store |
 | `EmbeddingModelMismatchError` | `EngravaError` | Embedding model mismatch on restore |
@@ -797,12 +798,14 @@ store-replacement guidance, see [Error handling and recovery](error-handling.md)
 | `ConnectionQuarantinedError` | `EngravaError` | A failed derived-record compensation left the connection potentially indeterminate; the store instance is terminal and must be replaced |
 | `WriteLockTimeoutError` | `EngravaError` | A task could not acquire the store's in-process write lock within `write_lock_acquire_timeout_seconds`. Usually a task spawned and awaited from inside another task's own `suspend_auto_commit()` window (an out-of-contract deadlock this store ends by raising, rather than hanging); can also mean that bound is configured too small for a legitimately slow embedding provider — see [Concurrency](concurrency.md#a-deadlock-this-store-cannot-resolve-raises-it-does-not-hang) |
 | `SchemaVersionError` | `EngravaError` | `ensure_schema()` refused the database: either a populated sub-floor schema (below the bootstrap floor, but already carrying a row — not safe to silently stamp current) or one stamped above this build's head version (nothing to migrate; opening it would understand less than it claims to). Carries `current_version` and `reason` (`"populated_sub_floor"` or `"newer_than_head"`). Reachable from `from_config()`, `EngravaManager.get_store()`, and the CLI's `migrate` command; the CLI's other destructive/read commands apply their own schema-version gate first and refuse or warn before reaching this. See [Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated) |
+| `CoreMigrationError` | `EngravaError` | `ensure_schema()` upgraded the on-disk schema but a migration step's own postcondition (a required column, table, index, foreign key, or trigger) did not hold afterward. Carries the target schema version and what was missing. The version is **not** stamped past the last fully-applied step, so the next call to `ensure_schema()` retries the remaining steps rather than silently treating a half-migrated database as current. In practice this means the on-disk file or the running build is not one this version of engrava can safely bring current — replace the database from a backup, or use a build that matches its schema history. Reachable anywhere `ensure_schema()` runs: `from_config()`, `EngravaManager.get_store()`, and the CLI's `migrate` command |
 | `ConfigError` | `ValueError` | YAML or direct config construction violates a documented configuration invariant |
 
 > `create_edge` raises `ReferentialIntegrityError` when an endpoint thought
 > does not exist and `DuplicateEdgeError` when the relationship already exists.
-> These exceptions are **not** re-exported from the top-level `engrava` package;
-> import them from `engrava.domain.exceptions`.
+> All three of `ReferentialIntegrityError`, `DuplicateEdgeError`, and
+> `CoreMigrationError` are importable directly from `engrava`, the same as
+> every other exception in the table above.
 
 ## Protocols
 

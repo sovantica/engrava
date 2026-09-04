@@ -227,7 +227,7 @@ model/dimension/prefix identity.
 
 See [Known Limitations → Embedding Dimension Consistency](known-limitations.md#embedding-dimension-consistency).
 
-## `ReferentialIntegrityError` — and you can't import it from `engrava`
+## `ReferentialIntegrityError` when creating an edge
 
 **Symptom.** Creating an edge to a thought that doesn't exist raises:
 
@@ -235,36 +235,19 @@ See [Known Limitations → Embedding Dimension Consistency](known-limitations.md
 referential integrity violation: edge.to_thought_id='...' does not reference an existing thought
 ```
 
-…and the obvious import fails:
+**Cause.** One endpoint of the edge (`from_thought_id` or `to_thought_id`) is
+not a real thought id. Create both thoughts before the edge that links them.
+
+**Fix.**
 
 ```python
-from engrava import ReferentialIntegrityError  # ImportError!
-```
-
-**Cause (two parts).**
-
-1. **The error itself** means one endpoint of an edge (`from_thought_id` or
-   `to_thought_id`) is not a real thought id. Create both thoughts before the
-   edge that links them.
-2. **The import:** `ReferentialIntegrityError` is **not** re-exported from the
-   top-level `engrava` package. It lives in `engrava.domain.exceptions`.
-
-**Fix.** Import it from its real module, and ensure both endpoints exist first:
-
-```python
-from engrava.domain.exceptions import ReferentialIntegrityError
+from engrava import ReferentialIntegrityError
 
 try:
     await store.create_edge(edge)
 except ReferentialIntegrityError:
     ...  # one endpoint is missing — create the thought, then retry
 ```
-
-The exceptions that *are* re-exported at the top level are `EngravaError` (the
-base), `ConfigError`, `EmbeddingModelMismatchError`, `ExtensionMigrationError`,
-`InvalidTransitionError`, `MindQLParseError`, `ReadOnlyViolationError`,
-`StaleDataError`, and `ThoughtNotFoundError`. Anything else lives under
-`engrava.domain.exceptions`.
 
 ## Still stuck?
 

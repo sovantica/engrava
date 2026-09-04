@@ -382,6 +382,17 @@ class TestOffOnPair:
 # either genuinely empty or already at or below this build's head version;
 # reachable through EngravaManager.get_store() and any other caller of
 # ensure_schema() / from_config(), not only the CLI.
+# Later extended with ReferentialIntegrityError and DuplicateEdgeError, raised
+# by the existing public create_edge() on a missing endpoint and on an
+# existing (from_thought_id, to_thought_id, edge_type) relationship
+# respectively. Unlike the entries above, neither is new behaviour: both were
+# already reachable through a documented public method and named in the
+# documentation as the thing to catch — only the export from __all__ was
+# missing. Also extended with CoreMigrationError, raised from the existing
+# public ensure_schema() when a migration step's postcondition (a required
+# column, table, index, foreign key, or trigger) is not met after running —
+# likewise a pre-existing gap: the method was already public and the error
+# already reachable, just unexported and, until now, undocumented.
 _PRE_WS_ALL_BASELINE = frozenset(
     {
         "ActionNotFoundError",
@@ -398,6 +409,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "ConfirmationSignal",
         "ConnectionQuarantinedError",
         "ConsolidationResult",
+        "CoreMigrationError",
         "CoreThoughtRecord",
         "CycleProvider",
         "CycleProviderError",
@@ -414,6 +426,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "DreamingExtension",
         "DreamingGates",
         "DreamingSignalProtocol",
+        "DuplicateEdgeError",
         "EdgeCounts",
         "EdgeRecord",
         "EdgeType",
@@ -477,6 +490,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "ReadOnlyViolationError",
         "RecencyModeConflictError",
         "RecencySignal",
+        "ReferentialIntegrityError",
         "RoleAwareEmbeddingProvider",
         "SchemaVersionError",
         "ScoringContext",

@@ -732,11 +732,6 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
         "lower it if nothing clears the bar",
         "fragment assuming a store; run_consolidation asserted in the dreaming tests",
     ),
-    (
-        "docs/troubleshooting.md",
-        "ReferentialIntegrityError  # ImportError!",
-        "intentionally-invalid import anti-pattern; must NOT be executed",
-    ),
 )
 
 

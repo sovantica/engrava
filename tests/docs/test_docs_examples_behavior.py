@@ -826,10 +826,10 @@ async def test_troubleshooting_thought_type_member_access() -> None:
 async def test_troubleshooting_referential_integrity_error() -> None:
     """troubleshooting.md ReferentialIntegrityError import + raise.
 
-    The exception imports from ``engrava.domain.exceptions`` (not the top-level
-    package) and ``create_edge`` raises it when an endpoint is missing.
+    The exception imports directly from the top-level ``engrava`` package, and
+    ``create_edge`` raises it when an endpoint is missing.
     """
-    from engrava.domain.exceptions import ReferentialIntegrityError
+    from engrava import ReferentialIntegrityError
 
     async with aiosqlite.connect(":memory:") as conn:
         store = await _fresh_store(conn)
