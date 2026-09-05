@@ -146,7 +146,7 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 | 0.3.x | 0.4.0 | Yes | **Schema-changing** minor upgrade — adds the valid-time columns (additive, zero data loss). Back up first and follow the [rolling-upgrades](#rolling-upgrades-multiple-workers) note |
 | 0.4.x | 0.5.0 | Yes | **Schema-changing** minor upgrade (`user_version` 14 → 18), although the library API is drop-in. **Breaking for MCP-server users only:** the `engrava[mcp]` extra and the in-engrava `engrava-mcp` command are removed — the server moved to the standalone [`engrava-mcp`](https://github.com/sovantica/engrava-mcp) package (see the 0.4 → 0.5 note) |
 | 0.5.0 | 0.6.0 | Yes | **Schema-changing** minor upgrade (`user_version` 18 → 20), with two additive columns. Default retrieval now excludes archived thoughts, and wrong-dimension query vectors raise a typed error. An edge `decay_multiplier` of `0.0` no longer reads back as `1.0`, and a later update no longer rewrites it to `1.0` — values a 0.5.x update already overwrote stay overwritten. Back up, quiesce shared-store workers, migrate once, and review the [0.5 → 0.6 notes](#05---06) |
-| 0.6.x | 0.7.0 | Yes | No schema change from this note's fix. **Behaviour change:** when the resolved recency weight is `0.0` **and** a cognitive-cycle reference (`current_cycle`, explicit or via `cycle_provider`) is present, the query-less fallback path now treats recency as fully off instead of still decaying by cycle — which can change result order for stores with heterogeneous thought priorities. `recency_now` (transaction-time) callers are unaffected; that axis was already correct. Review the [0.6 → 0.7 notes](#06---07) |
+| 0.6.x | 0.7.0 | Yes | No *database* schema change from this note's fix, but `EngravaMetrics.schema_version` moves `1 → 2` (see below). **Behaviour change:** when the resolved recency weight is `0.0` **and** a cognitive-cycle reference (`current_cycle`, explicit or via `cycle_provider`) is present, the query-less fallback path now treats recency as fully off instead of still decaying by cycle — which can change result order for stores with heterogeneous thought priorities. `recency_now` (transaction-time) callers are unaffected; that axis was already correct. Review the [0.6 → 0.7 notes](#06---07) |
 
 For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 `0.x.*` line do not change the schema and are low-risk; **minor** upgrades
@@ -220,6 +220,74 @@ previously favored an unintended recency leak. If you actually want
 cycle-decayed ranking, give the resolved `recency_weight` a positive value
 instead of relying on the previous behavior. If you use `recency_now` instead
 of `current_cycle`, none of this applies to you.
+
+**Typed break: `EngravaMetrics.schema_version` moves from `Literal[1]` to
+`Literal[2]`.** No *database* migration is involved — this is the metrics
+snapshot value-object returned by `await store.metrics()`, not the SQLite
+core schema (`PRAGMA user_version`), which is unaffected by this change.
+
+**Why the version moved.** `EngravaMetrics` gained a new field, `measured:
+bool`, so a caller can tell a genuinely empty, measured store apart from the
+zero-filled placeholder `metrics()` returns when `MetricsConfig.enabled` is
+`False`. Nothing else in the snapshot stated that either way: `storage.db_bytes`
+reads `0` for a disabled store and for a measured in-memory one, and
+`search_latency.sample_count` reads `0` for a disabled store and for a
+measured store that has served no searches — see
+[Observability → Configuration](observability.md#configuration) for the
+measured numbers behind both. Adding a field is a shape change, so the version
+moves with it.
+
+**Who is affected.** This reaches more callers than the `Literal` type alone
+suggests:
+
+- Code that pattern-matches or asserts on `schema_version == 1` (or the
+  `Literal[1]` annotation itself) breaks at type-check time or at runtime,
+  whichever it does.
+- Code that **persists** a serialized `EngravaMetrics` snapshot — to a file,
+  a message queue, a metrics store's own history — and later deserializes it
+  expecting exactly the old field set is affected too, even though it never
+  wrote or checked `schema_version` itself: a snapshot written before this
+  upgrade has no `measured` key, and a snapshot written after does.
+- A script that only shells out to `engrava info` (or `engrava --format json
+  info`) and parses its output is affected too, even though it never imports
+  `engrava` or the `EngravaMetrics` type at all: the CLI builds that output
+  from `asdict(metrics)`, so its JSON gains the `measured` key and its
+  `schema_version` value moves to `2` right along with the library object.
+- Code that only reads individual fields (`m.thoughts.total`, `m.storage.db_bytes`,
+  etc.) without inspecting `schema_version` is unaffected.
+- A **subclass of `EngravaMetrics`** that appends its own field (nothing in
+  the public API prevents this — the class is not sealed) shifts that field
+  one slot further out in its own positional order. A positional call built
+  against the subclass's previous field count now silently binds its last
+  argument to the new `measured` instead of the subclass's own field, with no
+  error either way.
+- A **keyword-based reconstructor or copy adapter** — code that rebuilds an
+  `EngravaMetrics` from the six previously-named fields it knows about
+  (`EngravaMetrics(schema_version=..., snapshot_timestamp=..., thoughts=...,
+  edges=..., storage=..., search_latency=...)`) now silently produces
+  `measured=False` on every rebuilt copy, including one built from a snapshot
+  that was itself genuinely measured. Any such adapter that is meant to
+  preserve a real measurement must be updated to carry `measured` through
+  explicitly.
+- A **whole-object validator** that checks `asdict(snapshot)` against an
+  expected key set (e.g. `assert set(asdict(m)) == {...}`) now rejects every
+  snapshot over the unexpected `measured` key — without persisting anything,
+  constructing positionally, checking `schema_version`, or going through the
+  CLI, so this is not the same population as any bullet above or below.
+
+**What to do.** Update any `Literal[1]` annotation or `schema_version == 1`
+check to `2`. If you persist snapshots, branch on `schema_version` (or on the
+presence of the `measured` key) when reading old records back, and prefer
+checking `measured` over trusting an all-zero snapshot as a real reading —
+see [Observability → Configuration](observability.md#configuration). If you
+parse `engrava --format json info` output in a script, update it the same
+way: expect the new `measured` key and the `schema_version` value `2`. Also
+review any consumer that constructs `EngravaMetrics` positionally (directly
+or through a subclass), depends on its field order, rebuilds one from named
+keywords, validates its key set, or unpacks `**asdict(snapshot)` into a
+function typed for the old field set — that last case raises an
+unexpected-keyword error immediately rather than persisting or silently
+accepting anything, so it is not the same population as the bullets above.
 
 ### 0.5 -> 0.6
 

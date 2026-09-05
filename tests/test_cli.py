@@ -270,7 +270,7 @@ class TestInfo:
         data = json.loads(result.output)
         assert data["thoughts"]["total"] == 3
         assert data["edges"]["total"] == 1
-        assert data["schema_version"] == 1
+        assert data["schema_version"] == 2
         assert data["search_latency"]["sample_count"] == 0
 
     def test_info_missing_db(self, runner: CliRunner, tmp_path: Path) -> None:

@@ -1738,6 +1738,7 @@ class SqliteEngravaCore:
 
         return EngravaMetrics(
             snapshot_timestamp=snapshot_ts,
+            measured=True,
             thoughts=ThoughtCounts(
                 by_type=thought_by_type,
                 by_status=thought_by_status,
