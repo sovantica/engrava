@@ -64,6 +64,7 @@ from engrava.domain.exceptions import (
     ConnectionQuarantinedError,
     CoreMigrationError,
     CycleProviderError,
+    DedupLockReentryError,
     DerivedRecordError,
     DuplicateEdgeError,
     EmbeddingGenerationError,
@@ -1186,8 +1187,11 @@ class _TaskReentrantLock:
     still serialise against each other (the second call to ``acquire`` blocks
     until the first task's matching, outermost ``release``), which is exactly
     what makes a read-modify-write critical section atomic across tasks. This
-    mirrors the shape of :attr:`SqliteEngravaCore._dedup_lock` (an
-    ``asyncio.Lock`` guarding one instance-wide critical section) plus the
+    mirrors the shape of :attr:`SqliteEngravaCore._dedup_lock` (:class:`_DedupLock`,
+    itself wrapping an ``asyncio.Lock`` to guard one instance-wide critical
+    section — see that class for why a *same-task* second acquisition raises
+    there instead of blocking, unlike this lock's free same-task recursion)
+    plus the
     task-local ``ContextVar``s already in this file
     (:attr:`SqliteEngravaCore._suppress_access_tracking`) rather than inventing
     a new primitive: an ``asyncio.Lock`` for the store-wide serialisation, task
@@ -1278,6 +1282,71 @@ class _TaskReentrantLock:
         self.release()
 
 
+class _DedupLock:
+    """A dedup-window lock that raises on same-task re-entry instead of hanging.
+
+    ``_dedup_lock`` guards the dedup probe-and-insert window
+    (``create_thought(deduplicate=True)``, ``get_or_create``,
+    ``upsert_by_hash``) and, unlike :class:`_TaskReentrantLock`, has no
+    legitimate reentrant use: nothing this store does needs the *same* task
+    to hold it twice. A second acquisition by the same task is always a bug
+    — the concrete shape is ``upsert_by_hash``'s hit branch calling the
+    overridable ``update_thought`` while still holding this lock (see
+    ``docs/extension-hooks.md`` §1B.3); an ``update_thought`` override that
+    calls back into ``create_thought(deduplicate=True)`` / ``get_or_create``
+    / ``upsert_by_hash`` / ``bulk_store(deduplicate=True)`` on that same
+    task tries to acquire this lock again while its own outer acquisition
+    has not yet released it.
+
+    A plain :class:`asyncio.Lock` blocks that second acquisition on itself
+    forever, with nothing in any log to point at why — exactly the silent,
+    unattributable hang ``docs/concurrency.md`` ("A deadlock this store
+    cannot resolve raises, it does not hang") forbids for the write lock's
+    own different-task case. This wrapper extends that same policy here:
+    whether the current task already owns the lock is known synchronously,
+    with no race to bound, so the second acquisition raises
+    :class:`~engrava.domain.exceptions.DedupLockReentryError` immediately
+    instead of awaiting the underlying lock at all.
+
+    A *different* task still waits on the underlying :class:`asyncio.Lock`
+    exactly as it would with no wrapper at all — only a same-task second
+    acquisition changes behaviour.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: asyncio.Task[object] | None = None
+
+    async def acquire(self) -> None:
+        """Acquire the lock, or raise if this task already holds it.
+
+        Raises:
+            DedupLockReentryError: When the current task already holds this
+                lock — waiting for the underlying :class:`asyncio.Lock` would
+                block on itself forever, since only this same task's own
+                matching :meth:`release` can ever free it.
+
+        """
+        current = asyncio.current_task()
+        if current is not None and current is self._owner:
+            raise DedupLockReentryError
+        await self._lock.acquire()
+        self._owner = current
+
+    def release(self) -> None:
+        """Release the lock so a waiting task (or a later call) can acquire it."""
+        self._owner = None
+        self._lock.release()
+
+    async def __aenter__(self) -> None:
+        """Support ``async with self._dedup_lock:``, matching ``asyncio.Lock``."""
+        await self.acquire()
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        """Release on block exit, including on exception."""
+        self.release()
+
+
 class SqliteEngravaCore:
     """Core SQLite persistence backend for thought-graph CRUD.
 
@@ -1288,7 +1357,17 @@ class SqliteEngravaCore:
     skip ``db.commit()`` so the caller manages the commit boundary.
 
     Subclasses can override ``_row_to_thought`` to produce extended model
-    types (template method pattern).
+    types (template method pattern), and ``prepare_thought_for_insert`` to
+    validate or enrich a candidate thought before the decisive probe for a
+    duplicate, or — when ``deduplicate=False`` skips that probe — before the
+    unconditional write instead; that choice hinges on ``deduplicate``, not on
+    which entry point was called, since ``create_thought``, ``bulk_store``,
+    and ``remember`` each default to ``deduplicate=False`` — the pre-insert
+    seam every path that can create a new row (``create_thought``,
+    ``get_or_create``, ``upsert_by_hash``, ``bulk_store``, ``remember``) calls
+    through, when it runs at all (two of those skip it entirely on a stable
+    hit); see that method's docstring for its exact invocation-count and
+    locking contract per entry point.
 
     Args:
         db: An open aiosqlite connection (WAL mode, FK enabled).
@@ -1300,9 +1379,14 @@ class SqliteEngravaCore:
             provider's own exception (byte-identical to prior behaviour). When
             ``True``, that failure is normalised into a typed
             :class:`~engrava.domain.exceptions.EmbeddingGenerationError` — the
-            opt-in fail-fast. The thought is already committed either way, so
-            this governs how loudly the missing embedding is surfaced, not
-            whether the row is persisted. No effect unless ``auto_embed`` is on.
+            opt-in fail-fast. At the top level the thought is already
+            committed either way, so this governs how loudly the missing
+            embedding is surfaced, not whether the row is persisted. Nested
+            inside the caller's own :meth:`suspend_auto_commit` window the
+            row is not yet durable when auto-embed runs, so this still only
+            governs how loudly the failure is surfaced, not whether the
+            pending row survives the outer commit. No effect unless
+            ``auto_embed`` is on.
         search_config: Optional default hybrid-search weights from config.
         journal_enabled: Whether to record mutations in the hash-chain
             journal.  Defaults to ``False``.
@@ -1490,20 +1574,29 @@ class SqliteEngravaCore:
         # converge on a single row even though aiosqlite does not expose
         # row-level locking.  Acquired only on the dedup branch — the
         # legacy ``deduplicate=False`` path stays lock-free.
-        self._dedup_lock: asyncio.Lock = asyncio.Lock()
+        self._dedup_lock: _DedupLock = _DedupLock()
         # Task-reentrant lock around every write path on the instance. Held
         # for the duration of each read-validate-write critical section —
-        # for a single-item call (create_thought, update_thought, ...) never
+        # for a single-item call (create_thought, update_thought, ...) not
+        # nested in the same task's own suspend_auto_commit() window, never
         # across a slow/arbitrary step such as an embedding provider
         # request, an `on_store` hook, or a derived-records producer,
         # matching the discipline `_serialize_dedup_probe` already
-        # established (see its own docstring). `bulk_store` is the one
-        # exception: its batch embedding call runs *inside*
-        # `suspend_auto_commit`'s window by design (the batch's atomicity
-        # spans insert + embed + commit as one unit), so this lock is held
-        # for that whole, genuinely network-bound round trip too — see
-        # `_TaskReentrantLock` and `_WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS` for
-        # what that means for the acquisition bound. Blocks a *different*
+        # established (see its own docstring). `bulk_store` is one
+        # exception, by design: its batch embedding call runs *inside*
+        # `suspend_auto_commit`'s window (the batch's atomicity spans
+        # insert + embed + commit as one unit), so this lock is held
+        # for that whole, genuinely network-bound round trip too. A
+        # single-item call nested in an outer, already-open
+        # suspend_auto_commit() window on the same task is a second
+        # exception, incidentally rather than by design: this lock is
+        # task-reentrant, so the outer window's hold never actually drops
+        # while this call's own follow-up work (auto-embed, on_store,
+        # derivation) runs — see `_finish_create_thought` — and a
+        # *different* task's write still waits behind it for the whole
+        # window, same as `bulk_store`'s case. See `_TaskReentrantLock` and
+        # `_WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS` for what that means for the
+        # acquisition bound. Blocks a *different*
         # task's write for the duration; the *same* task re-enters for free
         # (see `_TaskReentrantLock`), which is what lets a write issued from
         # inside `suspend_auto_commit` complete instead of deadlocking on
@@ -4711,56 +4804,54 @@ class SqliteEngravaCore:
             raise
 
     async def _end_exploratory_probe(self, *, opened_transaction: bool) -> None:
-        """Close a no-op probe's own transaction without touching a caller's.
+        """Close a probe's own transaction without touching a caller's.
 
-        Called from :meth:`upsert_by_hash`'s no-change branch: a matched row
-        whose mutable fields already equal the incoming record's writes
-        nothing at all — no ``UPDATE``, no journal entry — so the
-        ``BEGIN IMMEDIATE`` :meth:`_serialize_dedup_probe` opened for the
-        probe (it cannot know in advance that the match will need no change)
-        is never closed by the "whoever writes, commits" rule that ends the
-        window on every other path — this branch's probe only read.
+        Two callers reach this, and both leave a read-only ``BEGIN IMMEDIATE``
+        that nothing else would close:
 
-        **Ownership test, mirrored from :meth:`_serialize_dedup_probe`'s own
-        exception path — minus the ``_skip_auto_commit`` check that path also
-        has.** That path rolls back only when ``took_lock``: this call's own
-        probe opened the transaction, i.e. ``self._db.in_transaction`` was
-        ``False`` when the probe's window began. This method applies that
-        same, single-condition test on the *clean*-exit path, which
-        :meth:`_serialize_dedup_probe` itself deliberately leaves alone (see
-        its docstring: "this method commits nothing, on any path").
+        * the miss branch of :meth:`get_or_create` / :meth:`upsert_by_hash`'s
+          **exploratory** probe — the first of their two-phase miss path (see
+          either method's docstring) — before the preparation seam runs; and
+        * :meth:`upsert_by_hash`'s no-change branch, where a matched row whose
+          mutable fields already equal the incoming record's writes nothing at
+          all: no ``UPDATE``, no journal entry.
 
-        A first version of this method additionally required
-        ``not self._skip_auto_commit``, on the theory that a caller's own
-        ``suspend_auto_commit()`` window should also suppress the rollback.
-        That check is wrong, not merely redundant: ``suspend_auto_commit()``
-        itself opens no transaction — one is opened lazily by whichever write
-        happens first inside the window — so ``opened_transaction`` can
-        genuinely be ``True`` *while* ``_skip_auto_commit`` is also ``True``,
-        whenever this no-op call is that first write. In that case this
-        call's own probe is still the sole thing holding the transaction open
-        (the window itself has contributed nothing to it yet), so rolling it
-        back is exactly as safe as it is outside any window — there is
-        nothing of the window's own to discard. Gating on
-        ``not self._skip_auto_commit`` instead left that reservation held for
-        the *entire remaining duration of the window*, not merely until the
-        next write, since the flag stays ``True`` for the window's whole span
-        regardless of which call opened the transaction.
-        ``opened_transaction`` alone is the ownership test.
+        Both call it from *inside* the ``async with self._write_lock,
+        self._dedup_lock:`` block, so both locks are still held while this
+        runs; they release only afterward, when that block exits following
+        this call's return. What this closes is the cross-connection
+        ``BEGIN IMMEDIATE`` :meth:`_serialize_dedup_probe` may have opened,
+        which nothing else would ever close — those paths only read, so the
+        "whoever writes, commits" rule that normally ends this window (see
+        :meth:`_serialize_dedup_probe`) never fires on them.
 
-        Skipping the test entirely — closing the transaction unconditionally
-        — is the opposite trap, and the one a caller's own *already-open*
-        transaction sets: inside a caller's own window (a
-        ``suspend_auto_commit()`` call that had already written something
-        before this one ran, a batched ``bulk_store`` row, or an explicit
-        ``BEGIN`` issued directly against the connection), the still-open
-        transaction is the *caller's*, holding writes this call knows nothing
-        about; rolling it back would discard them. ``opened_transaction`` is
-        ``False`` in every one of those cases (``self._db.in_transaction`` was
-        already ``True`` when this call's probe began), so this method takes
-        no action at all — exactly the same "leave it alone" outcome
-        :meth:`_serialize_dedup_probe` already gives a caller-owned
-        transaction on its own exception path.
+        **Ownership test: `opened_transaction` alone.** It is computed by the
+        caller as ``not self._db.in_transaction``, read *before* this probe's
+        own window began — so when it is ``True``, no transaction of any
+        kind, the caller's or anyone else's, was open at that point, and the
+        ``BEGIN IMMEDIATE`` that may now be open can only be the one this
+        probe itself opened. There is nothing ambiguous left to protect: an
+        additional test on ``self._skip_auto_commit`` (whether this call
+        happens to be nested inside a caller's own
+        :meth:`suspend_auto_commit` window) used to gate the rollback here
+        too, on the theory that "nested" implies "someone else's
+        transaction". It does not — a caller's window can be open with
+        *nothing yet written to it* (e.g. before its first guarded write), in
+        which case ``opened_transaction`` is still ``True`` and the
+        transaction is still this probe's own. Requiring
+        ``not self._skip_auto_commit`` on top of that left this probe's
+        read-only ``BEGIN IMMEDIATE`` — a cross-connection write reservation —
+        open across the seam call in exactly that case: a second connection's
+        own write blocks, and a same-call callback that writes can deadlock
+        or time out on it. When ``opened_transaction`` is ``False`` instead
+        (a transaction was already open before this probe began — e.g. this
+        call is itself nested inside the *same* task's own
+        :meth:`suspend_auto_commit` window, where an earlier guarded write
+        already opened one), the still-open transaction is
+        unambiguously the *caller's*: rolling it back would discard writes
+        this call knows nothing about, and committing it early would end the
+        batch's atomicity mid-flight — that case is excluded by
+        ``opened_transaction`` on its own, with no need for a second test.
 
         Always a rollback, never a commit, when it does act: the probe only
         read, so there is nothing of its own to make durable — rollback is
@@ -4780,6 +4871,139 @@ class SqliteEngravaCore:
         if opened_transaction and self._db.in_transaction:
             await self._db.rollback()
 
+    async def prepare_thought_for_insert(self, thought: ThoughtRecord) -> ThoughtRecord:
+        """Override point: prepare or validate a candidate before it is stored.
+
+        **The pre-insert seam**: override this in a subclass to run
+        validation or persisted enrichment on every candidate that might
+        become a new row, before this store commits to inserting it or treats
+        it as a duplicate sighting. The default implementation is a
+        pass-through that returns ``thought`` unchanged.
+
+        This exists because ``on_store`` cannot fill this role — it runs
+        *after* the row is (usually) durable, so a rejection there cannot
+        stop the write, and an enrichment there reaches the caller's returned
+        record but never the stored one (see ``docs/upgrade.md``, "0.6 -> 0.7",
+        for the measured failure modes). Overriding ``create_thought`` itself
+        used to be the only way to run code before every insert; it silently
+        stopped covering ``get_or_create`` / ``upsert_by_hash`` once their miss
+        branch was rewritten to call the internal insertion step directly
+        instead of the public, overridable method. This seam is the
+        restored, and now uniform, replacement for that override point.
+
+        **Invocation count — pinned per entry point, not "once per row":**
+
+        * :meth:`create_thought` — exactly once per call, *before* the dedup
+          branch, unconditionally: whether the call goes on to insert, to bump
+          an existing row's ``confirmation_count`` (``deduplicate=True`` hit),
+          or (``deduplicate=False``) always inserts. A direct call has no way
+          to know in advance which of those it will be, so — matching what a
+          subclass override of the whole method could always do before this
+          seam existed — it always runs, exactly once.
+        * :meth:`get_or_create` / :meth:`upsert_by_hash` — **zero** times on a
+          stable, pre-existing hit (their exploratory probe resolves the call
+          before this method is ever reached — an idempotent "ensure it
+          exists" call that turns out to be a hit costs nothing extra), and
+          exactly **once** after an observed miss. That includes the race
+          where a second writer wins between the exploratory probe and the
+          mandatory decisive re-probe, turning the miss into a hit: the seam
+          already ran once for this call and does not run again just because
+          the outcome changed underneath it.
+        * :meth:`bulk_store` — once per item, run for the *whole batch*,
+          holding no lock this call itself acquires, before ``bulk_store``
+          takes any lock for its insert
+          transaction — not "through" a per-item :meth:`create_thought` call
+          the way the other counts might suggest. A dedup hit inside the
+          batch still costs one seam call, the same "still runs once" rule
+          a direct call follows.
+        * :meth:`remember` — once, through its own :meth:`create_thought` call.
+
+        **Never one this call itself acquires — on any entry point — but not
+        "never any lock at all".** Neither ``_dedup_lock`` nor ``_write_lock``
+        nor a ``BEGIN IMMEDIATE`` this call's own dedup machinery opened is
+        held while this method is awaited. :meth:`create_thought` calls this
+        before taking any lock at all; :meth:`get_or_create` /
+        :meth:`upsert_by_hash` release ``_write_lock``, ``_dedup_lock``, and
+        (via :meth:`_end_exploratory_probe`) their own ``BEGIN IMMEDIATE``
+        *before* calling this, and only reacquire everything afterward, from
+        scratch, for the decisive probe. This is deliberate: restoring a call
+        to the public ``create_thought()`` from *inside* an already-locked
+        dedup window (a naive, rejected shape for this fix) runs auto-embed,
+        cleanup, ``on_store`` and derivation while still holding
+        ``_dedup_lock`` — a plain lock with no legitimate reentrant use — so a
+        hook that calls back into a dedup entry point on the *same task*
+        raises :class:`~engrava.domain.exceptions.DedupLockReentryError`
+        rather than blocking on it. Because this seam never runs with
+        ``_dedup_lock`` held, on any entry point, regardless of nesting, a
+        recursive call *from inside this method* never contends for it in the
+        first place — the same lock's reentry guard exists for a different
+        call site entirely: ``upsert_by_hash``'s hit branch, which never
+        reaches this method at all (see ``docs/extension-hooks.md`` §1B.3),
+        calls the separately overridable ``update_thought`` while still
+        holding ``_dedup_lock``, and it is *that* call, if overridden to
+        recurse on the same task, the reentry guard protects.
+
+        **That is a statement about locks this call itself takes, not about
+        every lock that can be held while it runs.** If you call
+        :meth:`create_thought` / :meth:`get_or_create` / :meth:`upsert_by_hash`
+        / :meth:`bulk_store` from *inside your own*
+        :meth:`suspend_auto_commit` window, that window's ``_write_lock`` is
+        still held while this seam runs underneath it — it is *your* lock,
+        acquired before you ever reached this call, not one this call took
+        for itself. A plain in-process ``asyncio.Lock`` cannot distinguish
+        "the caller's own reentrant hold" from "a lock this call should
+        release", so a pre-insert override cannot close this on its own; it
+        is not new either — it applies identically to a raw
+        :meth:`create_thought` call inside your own
+        :meth:`suspend_auto_commit` block, seam or no seam.
+
+        **One residual exposure this does not close, because it is out of
+        this seam's scope: a *different, spawned* task calling back in from
+        inside a caller's own** :meth:`suspend_auto_commit` **window** (for
+        example, from inside an override invoked by ``bulk_store``'s insert
+        loop). That window's pre-existing contract already requires every
+        guarded write on the instance to come from the one task that opened
+        it; a spawned task's write times out on ``_write_lock`` there exactly
+        as it would for any other code violating that same contract — not a
+        new gap this seam introduces, and not one a pre-insert hook could
+        close without breaking that contract's own atomicity guarantee.
+
+        **The returned record is revalidated, and its content is decisive.**
+        The caller re-runs metadata and provenance validation on whatever this
+        method returns (not just the original candidate) — so an override that
+        introduces invalid ``metadata`` or ``provenance`` makes the call raise
+        here, before the decisive probe or any row write (for
+        :meth:`get_or_create` / :meth:`upsert_by_hash`, this revalidation runs
+        *after* their own exploratory probe already came up empty, not before
+        any probe at all). For :meth:`get_or_create`
+        and :meth:`upsert_by_hash`, the *returned* record's ``content`` — not
+        the original candidate's — supplies the hash for the decisive probe
+        that follows, so an override that changes ``content`` changes what
+        counts as a duplicate for this call.
+
+        **Raising aborts the create.** No row is inserted, and — on every path
+        this seam covers — no journal entry is appended either: a rejection
+        here leaves no trace.
+
+        Args:
+            thought: The candidate record, already validated (metadata,
+                provenance) in its pre-seam form — on every entry point
+                *except* :meth:`bulk_store`, which runs this call, batch-wide,
+                before its own per-item validation (see
+                :meth:`_bulk_store_inner`'s docstring for why); a
+                ``bulk_store`` override sees whatever was passed to it,
+                unvalidated. Its ``created_at`` / ``updated_at`` /
+                ``expires_at`` are not yet resolved — that happens
+                afterward, in :meth:`_insert_new_thought_row`, only if this
+                call ends up inserting.
+
+        Returns:
+            The record to use from here on for the probe and (on a miss) the
+            insert. The default implementation returns ``thought`` unchanged.
+
+        """
+        return thought
+
     async def _create_thought_with_dedup(
         self,
         thought: ThoughtRecord,
@@ -4788,6 +5012,15 @@ class SqliteEngravaCore:
     ) -> ThoughtRecord:
         """Lock-protected dedup branch of ``create_thought``.
 
+        Called only after the pre-insert seam has already run on ``thought``
+        — via :meth:`_prepare_for_create` for a direct :meth:`create_thought`
+        call, or via :meth:`_bulk_store_inner`'s own batch-wide phase 1 for a
+        ``bulk_store(deduplicate=True)`` item reaching this through
+        :meth:`_create_thought_from_prepared` — unlike :meth:`get_or_create` /
+        :meth:`upsert_by_hash`, this branch takes no two-phase detour of its
+        own: the seam already ran, exactly once, before this method was ever
+        entered, whichever of the hit/miss branches below it resolves to.
+
         Acquires ``self._dedup_lock`` for the entire ``check existing
         → INSERT or UPDATE`` window so concurrent calls **on this store
         instance** with identical ``content`` never race past the existence
@@ -4795,28 +5028,43 @@ class SqliteEngravaCore:
         *connections* with :meth:`_serialize_dedup_probe` (``BEGIN
         IMMEDIATE``), so a second store on the same database file can no
         longer insert between this call's probe and its insert — see that
-        method's docstring for its residual gaps (a caller holding a raw,
-        unmediated transaction on the connection; a genuinely concurrent,
-        unrelated task's write riding along with this call's own commit).
-        On a miss, the row is inserted directly via
+        method's docstring for its one remaining residual gap (a caller
+        holding a raw, unmediated transaction on the connection). The other
+        gap that docstring documents — a genuinely concurrent, unrelated
+        task's write riding along with this call's own commit — is closed
+        here by :attr:`_write_lock` (below). On a miss, the row is inserted
+        directly via
         :meth:`_insert_new_thought_row` (not by recursing into
         ``create_thought``) so only the probe and the insert run inside the
         window; when the content has been seen, ``confirmation_count`` is
         bumped and the existing record returned without any additional
         INSERT.
 
-        **The write lock is released before auto-embed / ``on_store`` run.**
-        On a miss, only the probe and the row insert happen inside
+        **The write lock is released, and the row made durable, before
+        auto-embed / ``on_store`` run — unless this call is itself nested in
+        the caller's own** :meth:`suspend_auto_commit` **window.** On a miss,
+        only the probe and the row insert happen inside
         :meth:`_serialize_dedup_probe`'s window; :meth:`_insert_new_thought_row`
-        commits as soon as the row is written, which ends the ``BEGIN
-        IMMEDIATE`` transaction there and then. :meth:`_finish_create_thought`
-        (auto-embed, hygiene cleanup, ``on_store``, derivation dispatch) runs
-        *after* the ``async with`` block has already exited — never while the
-        cross-connection write lock is held — so a slow or hanging embedding
-        call cannot stall every other writer on the file.
+        calls :meth:`_maybe_commit`, which — at the top level — ends the
+        ``BEGIN IMMEDIATE`` transaction there and then, so
+        :meth:`_finish_create_thought` (auto-embed, hygiene cleanup,
+        ``on_store``, derivation dispatch) runs *after* the ``async with``
+        block has already exited, with the row already durable and no
+        transaction or write lock left open — so a slow or hanging embedding
+        call cannot stall every other writer on the file. Nested inside the
+        caller's own :meth:`suspend_auto_commit` window, :meth:`_maybe_commit`
+        is a no-op by design (the caller owns the commit boundary), so the
+        row is *not yet durable* and :meth:`_finish_create_thought` runs
+        while the outer transaction — and, below, the outer ``_write_lock``
+        hold — are still open: an ``on_store`` override reached this way must
+        not assume the row survives a crash yet, and a slow follow-up step
+        can block other writers for that whole extra span (see
+        ``docs/concurrency.md``'s nesting note for the general rule this is
+        an instance of).
 
-        **Also under the in-process task-reentrant write lock:**
-        the probe-then-insert/bump window is held under :attr:`_write_lock` in
+        **Also under the in-process task-reentrant write lock, at the top
+        level:** the probe-then-insert/bump window is held under
+        :attr:`_write_lock` in
         addition to ``_dedup_lock`` — the latter blocks a *second* call to one
         of the three dedup methods, the former now blocks *every* other
         guarded write on this instance, closing the gap
@@ -4824,7 +5072,11 @@ class SqliteEngravaCore:
         unrelated task's write riding along with this call's own commit"): that
         other task's write cannot even start until this window's lock is
         released, so it can no longer join this window's transaction. Released
-        at the same point as before — before :meth:`_finish_create_thought`.
+        at the same point as before — before :meth:`_finish_create_thought` —
+        except when this call is nested in the caller's own
+        :meth:`suspend_auto_commit` window, where ``_write_lock`` is
+        task-reentrant and the outer hold never actually drops, so it stays
+        held through :meth:`_finish_create_thought` too.
         """
         async with (
             self._write_lock,
@@ -4917,10 +5169,91 @@ class SqliteEngravaCore:
             ConnectionQuarantinedError: When the connection has been quarantined.
 
         """
+        # Pre-insert seam, then insert/dedup -- split into two helpers so
+        # bulk_store can run every item's seam call holding no lock this
+        # call itself acquires, for the whole batch, before taking
+        # _write_lock for its one insert transaction
+        # (see _prepare_for_create / _create_thought_from_prepared). A direct
+        # call here just runs both halves back to back, in the same order as
+        # before that split.
+        thought = await self._prepare_for_create(thought)
+        return await self._create_thought_from_prepared(
+            thought,
+            expires_after_seconds=expires_after_seconds,
+            deduplicate=deduplicate,
+        )
+
+    async def _prepare_for_create(self, thought: ThoughtRecord) -> ThoughtRecord:
+        """Pre-seam validation, the seam itself, and its revalidation.
+
+        The first of :meth:`create_thought`'s two halves (see
+        :meth:`_create_thought_from_prepared` for the second): validates the
+        candidate, runs :meth:`prepare_thought_for_insert` on it — exactly
+        once per call, before the dedup branch, unconditionally, since a
+        direct call cannot know in advance whether it will hit or miss — and
+        revalidates whatever the seam returns. **Not called by**
+        :meth:`_bulk_store_inner`: that method calls
+        :meth:`prepare_thought_for_insert` directly, batch-wide, holding no
+        lock this call itself acquires, and runs ordinary validation
+        separately, per item, in its own insert phase — see its docstring for
+        why bundling this helper's validate-seam-revalidate sequence across
+        the whole batch would let a later item's validation failure pre-empt
+        an earlier item's own outcome. A direct :meth:`create_thought` call
+        runs this helper exactly as before that split existed. See
+        :meth:`prepare_thought_for_insert`'s docstring for the full
+        per-entry-point invocation-count contract.
+
+        Args:
+            thought: The candidate record to validate and run through the
+                seam.
+
+        Returns:
+            The prepared, revalidated record — ready for
+            :meth:`_create_thought_from_prepared`.
+
+        """
         self._ensure_connection_usable()
         _validate_metadata(thought.metadata)
         _validate_provenance(thought.provenance)
 
+        thought = await self.prepare_thought_for_insert(thought)
+        _validate_metadata(thought.metadata)
+        _validate_provenance(thought.provenance)
+        return thought
+
+    async def _create_thought_from_prepared(
+        self,
+        thought: ThoughtRecord,
+        *,
+        expires_after_seconds: int | None,
+        deduplicate: bool,
+    ) -> ThoughtRecord:
+        """Insert (or dedup-resolve) a record the seam has already run on.
+
+        The second of :meth:`create_thought`'s two halves (see
+        :meth:`_prepare_for_create` for the first). Must never call
+        :meth:`prepare_thought_for_insert` itself: :meth:`_bulk_store_inner`
+        also calls this method directly, per item, once its own per-item
+        validation has run — not through :meth:`_prepare_for_create`, which
+        it never calls (see that method's docstring); the seam already ran,
+        holding no lock this call itself acquires, over the whole batch in
+        :meth:`_bulk_store_inner`'s own
+        phase 1. Either caller relies on this method not running the seam a
+        second time for an already-prepared item.
+
+        Args:
+            thought: An already-prepared, already-(re)validated record — for
+                a direct :meth:`create_thought` call, the value
+                :meth:`_prepare_for_create` returned; for a
+                :meth:`_bulk_store_inner` item, the seam's output, validated
+                inline by that method's own per-item loop instead.
+            expires_after_seconds: Forwarded to :meth:`_insert_new_thought_row`.
+            deduplicate: Forwarded to :meth:`_create_thought_with_dedup`.
+
+        Returns:
+            The persisted record, or the existing record on a dedup hit.
+
+        """
         if deduplicate:
             return await self._create_thought_with_dedup(
                 thought,
@@ -5016,17 +5349,38 @@ class SqliteEngravaCore:
         return thought
 
     async def _finish_create_thought(self, thought: ThoughtRecord) -> ThoughtRecord:
-        """Post-commit half of ``create_thought``: auto-embed through derivation.
+        """Follow-up half of ``create_thought``: auto-embed through derivation.
 
-        Runs everything ``create_thought`` does *after* the row is durable:
+        Runs everything ``create_thought`` does *after* the row is inserted:
         auto-embed, hygiene cleanup, the ``on_store`` hook and derived-record
         dispatch. Split out so the dedup entry points can call it once
         :meth:`_serialize_dedup_probe`'s window has already closed — see
         :meth:`_insert_new_thought_row`.
 
+        **"Post-commit" only at the top level.** :meth:`_insert_new_thought_row`
+        calls :meth:`_maybe_commit`, which actually commits — making
+        ``thought`` durable before this method ever runs — only when this
+        call is not itself nested inside the caller's own
+        :meth:`suspend_auto_commit` window. Nested, ``_maybe_commit`` is a
+        no-op by design (the caller owns the commit boundary), so this
+        method runs on a row that is inserted but not yet durable, inside
+        the outer transaction, and — because ``_write_lock`` is
+        task-reentrant — still under the outer window's hold of it too. Two
+        consequences follow for an override reached from here: an
+        ``on_store`` implementation must not assume the row survives a
+        crash yet in that case, and a slow or hanging step (an embedding
+        provider call, a derived-records producer) can block a *different*
+        task's guarded write for this whole extra span, not just for the
+        insert itself. :meth:`bulk_store` is a second, by-design instance of
+        the same shape: it calls this method from *inside* its own batch
+        transaction deliberately, so its auto-embed and derivation dispatch
+        also run before that batch commits (see its own docstring). See
+        ``docs/concurrency.md``'s nesting note for the general rule this is
+        one instance of.
+
         Args:
-            thought: The just-persisted thought record, as returned by
-                :meth:`_insert_new_thought_row`.
+            thought: The just-inserted, but not necessarily yet durable,
+                thought record, as returned by :meth:`_insert_new_thought_row`.
 
         Returns:
             The enriched record returned by the ``on_store`` hook.
@@ -5074,11 +5428,18 @@ class SqliteEngravaCore:
         lock, and additionally against a second store on the same database
         file by ``BEGIN IMMEDIATE`` around the probe and the row insert (see
         :meth:`_serialize_dedup_probe`) — see that method's docstring for its
-        residual gaps (a caller holding a raw, unmediated transaction on this
-        connection; a genuinely concurrent, unrelated task's write riding
-        along with this call's own commit). The write lock is released as
+        one remaining residual gap (a caller holding a raw, unmediated
+        transaction on this connection). The other gap that docstring
+        documents — a genuinely concurrent, unrelated task's write riding
+        along with this call's own commit — cannot happen here either: this
+        call holds ``_write_lock`` for the same probe-and-row window (see
+        :meth:`_create_thought_with_dedup`'s docstring for why that closes
+        it). At the top level, the write lock is released as
         soon as the row is written, before auto-embed or the ``on_store`` hook
-        run — see :meth:`_insert_new_thought_row` / :meth:`_finish_create_thought`.
+        run; nested in the caller's own :meth:`suspend_auto_commit` window,
+        that hold stays through the follow-up work instead — see
+        :meth:`_insert_new_thought_row` / :meth:`_finish_create_thought`'s
+        docstring for both cases.
         The content hash is the same byte-exact SHA-256 of ``content`` used by
         ``create_thought(deduplicate=True)``:
 
@@ -5086,10 +5447,25 @@ class SqliteEngravaCore:
           with ``created=False``. No new row is inserted; its
           ``confirmation_count`` is bumped and ``updated_at`` refreshed,
           identical to ``create_thought(deduplicate=True)`` so the two APIs
-          stay consistent.
-        * **Miss** — no such thought exists: it is inserted (running the
-          regular journal / auto-embed / cleanup pipeline) and returned with
-          ``created=True``.
+          stay consistent. **The pre-insert seam
+          (:meth:`prepare_thought_for_insert`) does not run on this branch**
+          — a stable hit costs zero seam calls.
+        * **Miss** — no such thought exists: a **two-phase** path runs from
+          here. The exploratory probe above found nothing, so this call
+          releases ``_write_lock``, ``_dedup_lock`` and any ``BEGIN IMMEDIATE``
+          it opened for that probe, then calls
+          :meth:`prepare_thought_for_insert` — holding no lock this call
+          itself acquires (a lock an *enclosing* caller took is a different
+          matter; see :meth:`prepare_thought_for_insert`'s own docstring) —
+          and
+          revalidates what it returns. It then **reacquires** everything for a
+          **decisive** probe keyed on the *prepared* record's content: if that
+          still misses, the row is inserted (running the regular journal /
+          auto-embed / cleanup pipeline) and returned with ``created=True``;
+          if a second writer won the race in between, this call takes the hit
+          branch instead — the seam still ran exactly once. See
+          :meth:`prepare_thought_for_insert` for why the seam runs holding no
+          lock this call itself acquires, on either probe.
 
         The returned boolean is the value ``create_thought(deduplicate=True)``
         cannot give back: it tells the caller *whether it created*, so an
@@ -5101,9 +5477,10 @@ class SqliteEngravaCore:
         when a match should adopt the incoming record's fields.
 
         Args:
-            thought: The candidate thought. On a miss it is inserted verbatim
-                (with timestamps populated); on a hit only its ``content`` was
-                used, via the hash.
+            thought: The candidate thought. On a miss it is passed through
+                :meth:`prepare_thought_for_insert` and inserted verbatim (with
+                timestamps populated); on a hit only its ``content`` was used,
+                via the hash.
             expires_after_seconds: Optional relative TTL applied only when the
                 thought is created (a hit never re-arms TTL). Mirrors
                 ``create_thought``'s parameter.
@@ -5116,7 +5493,9 @@ class SqliteEngravaCore:
             ValueError: If ``thought.metadata`` violates the metadata-shape or
                 size invariants (validated up front on both the hit and miss
                 paths, matching ``create_thought(deduplicate=True)`` which
-                validates before it branches).
+                validates before it branches) — or if
+                :meth:`prepare_thought_for_insert` returns a record that
+                fails that same revalidation on a miss.
             ThoughtNotFoundError: If a matched thought was deleted before its
                 ``confirmation_count`` could be bumped — the sighting was not
                 recorded, so no record is returned for it.
@@ -5132,6 +5511,29 @@ class SqliteEngravaCore:
         # re-validates on the miss/insert path; that is cheap and harmless.
         _validate_metadata(thought.metadata)
         _validate_provenance(thought.provenance)
+
+        # Phase 1 -- exploratory probe: a stable hit resolves right here, at
+        # zero seam calls, and never reaches phase 2 below.
+        async with self._write_lock, self._dedup_lock:
+            opened_transaction = not self._db.in_transaction
+            async with self._serialize_dedup_probe(operation="get_or_create"):
+                existing = await self._get_thought_by_content_hash(
+                    _compute_content_hash(thought.content),
+                )
+                if existing is not None:
+                    return await self._increment_confirmation(existing), False
+                await self._end_exploratory_probe(opened_transaction=opened_transaction)
+        # _write_lock, _dedup_lock and any BEGIN IMMEDIATE this call's own
+        # probe opened are all released above -- the seam below runs holding
+        # no lock this call itself acquires (an enclosing caller's own lock
+        # is a different matter -- see prepare_thought_for_insert's docstring).
+
+        thought = await self.prepare_thought_for_insert(thought)
+        _validate_metadata(thought.metadata)
+        _validate_provenance(thought.provenance)
+
+        # Phase 2 -- decisive probe: reacquired from scratch, keyed on the
+        # prepared record's content. Insert only if this still misses.
         async with (
             self._write_lock,
             self._dedup_lock,
@@ -5141,13 +5543,19 @@ class SqliteEngravaCore:
                 _compute_content_hash(thought.content),
             )
             if existing is not None:
+                # Another writer won the race between the two probes -- the
+                # seam already ran once for this call; take the hit branch
+                # instead of inserting.
                 return await self._increment_confirmation(existing), False
             persisted = await self._insert_new_thought_row(
                 thought,
                 expires_after_seconds=expires_after_seconds,
             )
-        # Write lock already released above — auto-embed / on_store / derivation
-        # run outside the cross-connection window (see _finish_create_thought).
+        # Write lock released above, at the top level; nested in the
+        # caller's own suspend_auto_commit() window, the outer hold stays
+        # through auto-embed / on_store / derivation below too -- see
+        # _finish_create_thought's docstring for the durability and
+        # lock-hold implications of that case.
         origin_token = _DERIVATION_ORIGIN.set("get_or_create")
         try:
             created = await self._finish_create_thought(persisted)
@@ -5206,13 +5614,25 @@ class SqliteEngravaCore:
         update reuses :meth:`update_thought`, so it carries the same
         ``updated_cycle`` guard — and the same limits on what that guard catches
         — and re-embeds when ``essence`` changed, exactly like any other edit.
-        A miss inserts the row (regular journal pipeline, via
-        :meth:`_insert_new_thought_row`) and runs auto-embed / ``on_store`` /
-        derivation afterwards, once the write lock is released (see
-        :meth:`_finish_create_thought`). The hash probe and the miss/hit branch
-        it selects are serialised across connections the same way as
-        ``create_thought(deduplicate=True)`` — see
-        :meth:`_serialize_dedup_probe`.
+        A miss runs the same **two-phase** path as :meth:`get_or_create`: the
+        exploratory probe above found nothing, so this call releases
+        ``_write_lock``, ``_dedup_lock`` and any ``BEGIN IMMEDIATE`` it opened,
+        calls :meth:`prepare_thought_for_insert` holding no lock this call
+        itself acquires,
+        revalidates what it returns, then reacquires everything for a
+        decisive probe keyed on the *prepared* record's content. If that
+        still misses, the row is inserted (regular journal pipeline, via
+        :meth:`_insert_new_thought_row`) and auto-embed / ``on_store`` /
+        derivation run afterwards — at the top level, once the write lock is
+        released; nested in the caller's own :meth:`suspend_auto_commit`
+        window, while that outer hold stays in place instead (see
+        :meth:`_finish_create_thought`'s docstring for both cases); if a
+        second writer won the race in
+        between, this call takes the hit (update-on-match) branch instead —
+        the seam still ran exactly once. **A stable hit costs zero seam
+        calls**, exactly like :meth:`get_or_create`. See
+        :meth:`prepare_thought_for_insert` for why the seam runs holding no
+        lock this call itself acquires, on either probe.
 
         Choose :meth:`get_or_create` for "ensure it exists, don't touch it if it
         does"; choose ``upsert_by_hash`` for "make the stored thought match this
@@ -5220,9 +5640,10 @@ class SqliteEngravaCore:
         confirmation-counting of repeated sightings.
 
         Args:
-            thought: The desired thought state. On a miss it is inserted
-                verbatim; on a hit its mutable fields are copied onto the
-                existing row (keyed by ``content``).
+            thought: The desired thought state. On a miss it is passed through
+                :meth:`prepare_thought_for_insert` and inserted verbatim; on a
+                hit its mutable fields are copied onto the existing row (keyed
+                by ``content``).
             expires_after_seconds: Optional relative TTL applied only when the
                 thought is created. A hit does not re-arm TTL (``expires_at`` is
                 a system-managed field left untouched), matching
@@ -5235,7 +5656,8 @@ class SqliteEngravaCore:
         Raises:
             ValueError: If ``thought.metadata`` violates the metadata-shape or
                 size invariants (validated up front on both the hit and miss
-                paths).
+                paths) — or if :meth:`prepare_thought_for_insert` returns a
+                record that fails that same revalidation on a miss.
             StaleDataError: If the matched row's guarded update writes no row —
                 another writer stamped a new ``updated_cycle`` between the hash
                 probe and the in-place update, or deleted the row. The probe and
@@ -5253,73 +5675,115 @@ class SqliteEngravaCore:
         # on both the hit (update) and miss (insert) branches.
         _validate_metadata(thought.metadata)
         _validate_provenance(thought.provenance)
+
+        # Phase 1 -- exploratory probe: a stable hit resolves right here, at
+        # zero seam calls, and never reaches phase 2 below.
         async with self._write_lock, self._dedup_lock:
-            # Read at the same point _serialize_dedup_probe reads it for its
-            # own `took_lock` -- immediately after acquiring _write_lock and
-            # _dedup_lock, before entering that guard -- so the two can never
-            # disagree about whether *this* call's probe is the one that
-            # opened the BEGIN IMMEDIATE below.
             opened_transaction = not self._db.in_transaction
             async with self._serialize_dedup_probe(operation="upsert_by_hash"):
                 existing = await self._get_thought_by_content_hash(
                     _compute_content_hash(thought.content),
                 )
-                if existing is None:
-                    # Insert-only, inside the window; auto-embed / on_store /
-                    # derivation run afterwards, once the write lock is released
-                    # (see _insert_new_thought_row / _finish_create_thought below).
-                    persisted = await self._insert_new_thought_row(
-                        thought,
-                        expires_after_seconds=expires_after_seconds,
-                    )
-                else:
-                    # Only the fields that actually differ are forwarded to
-                    # ``update_thought``. This keeps the update minimal (no spurious
-                    # OCC churn or re-embed when a field is unchanged) and,
-                    # critically, never re-asserts an identical ``lifecycle_status``
-                    # — ``evolve`` rejects same-state lifecycle transitions, so
-                    # passing the stored value back verbatim would raise
-                    # ``InvalidTransitionError``. ``update_thought`` commits its own
-                    # write (after its own journal append), the same "whoever
-                    # writes, commits" rule :meth:`_insert_new_thought_row` and
-                    # :meth:`_increment_confirmation` follow — this branch needs no
-                    # special handling for that case.
-                    changes = {
-                        field: getattr(thought, field)
-                        for field in self._UPSERT_MUTABLE_FIELDS
-                        if getattr(thought, field) != getattr(existing, field)
-                    }
-                    if not changes:
-                        # No write happens on this branch at all — no UPDATE, no
-                        # journal entry — so, matching update_action's no-op rule
-                        # (see its docstring), it commits nothing either. The
-                        # window above still opened `BEGIN IMMEDIATE` before the
-                        # probe ran (it cannot know in advance that the match
-                        # needs no change), but a call that writes nothing has
-                        # nothing of its own to make durable, and committing here
-                        # would also flush whatever *unrelated* pending work a
-                        # caller outside `suspend_auto_commit()` still has open on
-                        # this connection — exactly the caller's-own-work commit
-                        # this method must not make. Unlike leaving the window
-                        # open, this also releases the cross-connection write
-                        # reservation it took: _end_exploratory_probe() rolls
-                        # back *this call's own* BEGIN IMMEDIATE (there is
-                        # nothing of its own to preserve, since it wrote
-                        # nothing) but only when this call's own probe is the
-                        # one that opened it -- a caller's own
-                        # `suspend_auto_commit()` window, a batched
-                        # `bulk_store` row, or an explicit `BEGIN` already on
-                        # the connection is left completely alone.
-                        await self._end_exploratory_probe(
-                            opened_transaction=opened_transaction,
-                        )
-                        return existing
-                    return await self.update_thought(existing.thought_id, **changes)
+                if existing is not None:
+                    return await self._upsert_matched_row(thought, existing)
+                await self._end_exploratory_probe(opened_transaction=opened_transaction)
+        # _write_lock, _dedup_lock and any BEGIN IMMEDIATE this call's own
+        # probe opened are all released above -- the seam below runs holding
+        # no lock this call itself acquires (an enclosing caller's own lock
+        # is a different matter -- see prepare_thought_for_insert's docstring).
+
+        thought = await self.prepare_thought_for_insert(thought)
+        _validate_metadata(thought.metadata)
+        _validate_provenance(thought.provenance)
+
+        # Phase 2 -- decisive probe: reacquired from scratch, keyed on the
+        # prepared record's content. Insert only if this still misses.
+        async with (
+            self._write_lock,
+            self._dedup_lock,
+            self._serialize_dedup_probe(operation="upsert_by_hash"),
+        ):
+            existing = await self._get_thought_by_content_hash(
+                _compute_content_hash(thought.content),
+            )
+            if existing is None:
+                # Insert-only, inside the window; auto-embed / on_store /
+                # derivation run afterwards -- at the top level, once the
+                # write lock is released; nested in the caller's own
+                # suspend_auto_commit() window, while that outer hold stays
+                # in place instead (see _insert_new_thought_row /
+                # _finish_create_thought's docstring for both cases).
+                persisted = await self._insert_new_thought_row(
+                    thought,
+                    expires_after_seconds=expires_after_seconds,
+                )
+            else:
+                # Another writer won the race between the two probes -- the
+                # seam already ran once for this call; take the hit branch
+                # instead of inserting.
+                return await self._upsert_matched_row(thought, existing)
         origin_token = _DERIVATION_ORIGIN.set("upsert_by_hash")
         try:
             return await self._finish_create_thought(persisted)
         finally:
             _DERIVATION_ORIGIN.reset(origin_token)
+
+    async def _upsert_matched_row(
+        self,
+        thought: ThoughtRecord,
+        existing: ThoughtRecord,
+    ) -> ThoughtRecord:
+        """Hit branch shared by both of ``upsert_by_hash``'s probes.
+
+        Applies whichever of ``thought``'s :attr:`_UPSERT_MUTABLE_FIELDS`
+        differ from ``existing`` onto the stored row, or leaves the row
+        untouched if none differ. Used identically whether the match was found
+        on the first (exploratory) probe or the second (decisive) probe of
+        :meth:`upsert_by_hash`'s two-phase miss path — the two probes share
+        this one implementation so they cannot drift.
+
+        Only the fields that actually differ are forwarded to
+        :meth:`update_thought`. This keeps the update minimal (no spurious OCC
+        churn or re-embed when a field is unchanged) and, critically, never
+        re-asserts an identical ``lifecycle_status`` — ``evolve`` rejects
+        same-state lifecycle transitions, so passing the stored value back
+        verbatim would raise ``InvalidTransitionError``. ``update_thought``
+        commits its own write (after its own journal append), the same
+        "whoever writes, commits" rule :meth:`_insert_new_thought_row` and
+        :meth:`_increment_confirmation` follow — this method needs no special
+        handling for that case.
+
+        Args:
+            thought: The candidate whose mutable fields may overwrite ``existing``.
+            existing: The stored row the content-hash probe matched.
+
+        Returns:
+            ``existing`` unchanged when no field differs, or the record
+            :meth:`update_thought` returns otherwise.
+
+        """
+        changes = {
+            field: getattr(thought, field)
+            for field in self._UPSERT_MUTABLE_FIELDS
+            if getattr(thought, field) != getattr(existing, field)
+        }
+        if not changes:
+            # No write happens on this branch at all, but the window that
+            # found this match still holds the transaction that was open
+            # before the probe ran -- its own `BEGIN IMMEDIATE` when this
+            # call opened one, or an already-open outer transaction when it
+            # reused one instead (it cannot know in advance that the match
+            # needs no change) -- and the guard itself no longer commits on a
+            # clean exit. Closing
+            # what nothing else here will: a plain `_maybe_commit()` is a
+            # no-op if this call is nested in a caller's own
+            # `suspend_auto_commit` (matching every other commit in this
+            # window), and otherwise ends the otherwise-abandoned transaction
+            # so the write lock is not held until some unrelated later write
+            # happens to commit it.
+            await self._maybe_commit()
+            return existing
+        return await self.update_thought(existing.thought_id, **changes)
 
     async def bulk_store(
         self,
@@ -5368,10 +5832,15 @@ class SqliteEngravaCore:
 
         Like :meth:`suspend_auto_commit`, this call briefly toggles
         store-instance state (the deferred-commit flag, and a flag that defers
-        per-thought embedding to the batch). The store owns a single connection
-        and is not built for a *second* writer to run on the same instance
-        concurrently with a batch; issue ``bulk_store`` from one task at a time
-        (matching the existing bulk-write contract).
+        per-thought embedding to the batch). The store owns a single
+        connection, but a *second* writer no longer needs to be kept off it
+        by convention: :attr:`_write_lock` covers this whole call the same
+        way it covers :meth:`suspend_auto_commit`, so a concurrent task's
+        guarded write on this instance simply waits for the batch to finish
+        (or times out, per :attr:`_WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS`)
+        instead of racing its toggled state. Submitting ``bulk_store`` from
+        one task at a time is still the simplest mental model, not a
+        requirement for correctness.
 
         Args:
             thoughts: The thoughts to persist, in order. An empty list is a
@@ -5437,14 +5906,62 @@ class SqliteEngravaCore:
         Extracted so the ``bulk_store`` public method stays a thin wrapper that
         sets the informational ``DeriveContext.origin`` for the batch.
 
-        The insert loop runs under ``suspend_auto_commit`` (one transaction). Only
-        genuinely-inserted records — those whose id was absent before the batch
-        and not inserted earlier in it, i.e. dedup / hash hits excluded (D5) — are
-        collected as ``newly_created``. **After** the batch commits and is durable
-        (the ``async with`` has exited), derivation is dispatched locally, per
-        newly-created record, off the batch transaction, each child its own
-        guarded durable unit; a producer/child failure there can never roll back a
-        committed source or child (D3/D10). There is no shared instance buffer —
+        **Two phases: only the seam runs holding no lock this call itself
+        acquires, and batch-wide; ordinary
+        validation stays per-item, in the insert phase.** A batch has every
+        one of its records up front, so phase 1 runs :meth:`prepare_thought_for_insert`
+        — the seam itself, nothing else — over the *whole* batch before
+        phase 2 ever takes ``_write_lock``. Phase 2 then runs under
+        ``suspend_auto_commit`` (one transaction) and, for each
+        already-seamed record in order, revalidates it (metadata,
+        provenance) and inserts it (or dedup-resolves it) via
+        :meth:`_create_thought_from_prepared`, which does not call the seam
+        again.
+
+        **Why the split is this narrow.** An earlier version of this method
+        ran :meth:`_prepare_for_create` — validate, seam, revalidate — for
+        the whole batch in phase 1, matching how :meth:`create_thought` does
+        it for one item. That satisfied constraint 1 (the seam never runs
+        under ``_write_lock``) but over-corrected the caller-visible failure
+        ordering: because *every* item's validation, not only its seam call,
+        ran before *any* item's insert, a later item's ordinary
+        (non-seam) validation error — invalid ``metadata`` or ``provenance``,
+        either on the original candidate or on what the seam returned —
+        could raise *before* an earlier item's own duplicate-id failure or
+        ``on_store`` call was ever reached, silently replacing that earlier
+        outcome and suppressing that earlier ``on_store``. A bare loop of
+        :meth:`create_thought` calls never did this: item *n* is fully
+        finished — validated, seamed, inserted, ``on_store`` dispatched —
+        before item *n + 1* is even looked at. Moving *only* the seam call to
+        phase 1 and revalidating in phase 2, per item, immediately before
+        that item's own insert, restores that exact ordering: item *n*'s
+        ordinary validation, insert, and ``on_store`` all happen within the
+        same iteration of phase 2's loop, before item *n + 1*'s iteration
+        begins, and a later item's validation failure can no longer pre-empt
+        an earlier one's insert-time or ``on_store`` outcome.
+
+        **The one thing this does not restore: the seam itself, in phase 1,
+        no longer receives pre-validated input for the bulk path.** Every
+        other entry point (:meth:`create_thought`, :meth:`get_or_create`,
+        :meth:`upsert_by_hash`) validates the candidate's ``metadata`` /
+        ``provenance`` immediately before calling the seam, so an override
+        can rely on that precondition — see :meth:`prepare_thought_for_insert`'s
+        ``Args`` — but here the seam call in phase 1 runs before phase 2's
+        revalidation, on whatever ``thoughts`` was given, unvalidated. A
+        seam call for item *m* raising anywhere in phase 1 (a validated
+        precondition or not) still stops the whole batch there, with no lock
+        taken and no transaction opened, so nothing is persisted — the same
+        all-or-nothing outcome the batch has always produced when an item
+        fails (see :meth:`bulk_store`'s docstring), reached without ever
+        opening a transaction that was never going to complete. Only
+        genuinely-inserted records — those whose id was absent before the
+        batch and not inserted earlier in it, i.e. dedup / hash hits excluded
+        (D5) — are collected as ``newly_created``. **After** the batch
+        commits and is durable (the ``async with`` has exited), derivation is
+        dispatched locally, per newly-created record, off the batch
+        transaction, each child its own guarded durable unit; a
+        producer/child failure there can never roll back a committed source
+        or child (D3/D10). There is no shared instance buffer —
         ``newly_created`` is a local variable of this call.
 
         Args:
@@ -5458,23 +5975,38 @@ class SqliteEngravaCore:
             The persisted records in input order.
 
         """
+        # Phase 1 -- *only* the pre-insert seam itself, over the whole batch,
+        # holding no lock this call itself acquires. Deliberately not
+        # _prepare_for_create: that helper
+        # also validates (before and after the seam), and running validation
+        # here, batched across the whole input ahead of phase 2, is exactly
+        # what let a later item's ordinary validation error pre-empt an
+        # earlier item's duplicate-id or on_store outcome (see this method's
+        # docstring). Only the seam -- the one piece of overridable code
+        # constraint 1 requires out from under the lock -- runs here; ordinary
+        # validation now runs in phase 2, per item, at the point the base
+        # loop of create_thought() calls would have run it.
+        prepared_thoughts = [
+            await self.prepare_thought_for_insert(thought) for thought in thoughts
+        ]
+
         newly_created: list[ThoughtRecord] = []
         async with self.suspend_auto_commit():
-            # Snapshot the ids that already exist so genuine inserts can be
-            # told apart from dedup hits deterministically — by *row
-            # existence*, never by instance identity. (Instance identity is
-            # unreliable: ``create_thought`` rebuilds the record to populate
-            # timestamps, and a dedup hit can return a row whose id
-            # coincides with the submitted one.) Taken here, inside this
-            # ``suspend_auto_commit`` window — which holds ``_write_lock``
-            # for its whole duration — so no concurrent task's insert can
-            # land between this read and the loop below that relies on it.
-            # Only rows whose id is absent here — and not yet inserted
-            # earlier in this same batch — are freshly inserted, and thus
-            # the ones that need embedding and are eligible for derivation.
-            # Taken whenever embedding OR the derived-records seam is
-            # active, so a dedup hit never derives even with auto-embed off
-            # (D5).
+            # Phase 2 -- ``_write_lock`` held for this whole window. Snapshot
+            # the ids that already exist so genuine inserts can be told apart
+            # from dedup hits deterministically — by *row existence*, never
+            # by instance identity. (Instance identity is unreliable:
+            # ``create_thought`` rebuilds the record to populate timestamps,
+            # and a dedup hit can return a row whose id coincides with the
+            # submitted one.) Taken here, inside this ``suspend_auto_commit``
+            # window — which holds ``_write_lock`` for its whole duration —
+            # so no concurrent task's insert can land between this read and
+            # the loop below that relies on it. Only rows whose id is absent
+            # here — and not yet inserted earlier in this same batch — are
+            # freshly inserted, and thus the ones that need embedding and are
+            # eligible for derivation. Taken whenever embedding OR the
+            # derived-records seam is active, so a dedup hit never derives
+            # even with auto-embed off (D5).
             pre_existing_ids: set[str] = set()
             if embed_active or derivation_active:
                 pre_existing_ids = await self._existing_thought_ids()
@@ -5483,8 +6015,21 @@ class SqliteEngravaCore:
                 persisted: list[ThoughtRecord] = []
                 inserted: list[ThoughtRecord] = []
                 seen_before: set[str] = set(pre_existing_ids)
-                for thought in thoughts:
-                    record = await self.create_thought(thought, deduplicate=deduplicate)
+                for thought in prepared_thoughts:
+                    # Ordinary validation, per item, at the point the base
+                    # per-item create_thought() loop would have run it --
+                    # right before *this* item's own insert, not batched
+                    # ahead of the whole loop (see this method's docstring).
+                    # Validates what the seam returned; the seam already ran,
+                    # holding no lock this call itself acquires, in phase 1
+                    # above.
+                    _validate_metadata(thought.metadata)
+                    _validate_provenance(thought.provenance)
+                    record = await self._create_thought_from_prepared(
+                        thought,
+                        expires_after_seconds=None,
+                        deduplicate=deduplicate,
+                    )
                     persisted.append(record)
                     if record.thought_id not in seen_before:
                         if embed_active:

@@ -39,7 +39,7 @@ from engrava import (
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-    from engrava import ThoughtRecord
+    from engrava.domain.models.thought import ThoughtRecord
 
 
 # ---------------------------------------------------------------------------
@@ -767,6 +767,73 @@ async def test_bulk_store_rolls_back_on_mid_batch_failure(
         await store.bulk_store(thoughts)
 
     # All-or-nothing: not even the rows before the failure survive.
+    assert await _count(db, "SELECT COUNT(*) FROM thought") == 0
+
+
+async def test_bulk_store_earlier_duplicate_id_outranks_a_later_ordinary_validation_error(
+    store: SqliteEngravaCore,
+    db: aiosqlite.Connection,
+) -> None:
+    """A later item's ordinary validation error must not pre-empt an earlier
+    item's duplicate-id failure.
+
+    A bare loop of ``create_thought()`` calls finishes item *n* -- including
+    any insert-time failure -- before item *n + 1* is even looked at, so the
+    duplicate id here (item 3) must be what raises, never the oversized
+    metadata on item 4 that comes after it. This pins the two-phase
+    ``bulk_store`` restructuring's failure-ordering fix: an earlier version
+    validated every item, batch-wide, before any insert, which let a later
+    item's ordinary (non-seam) validation error raise first instead.
+    """
+    oversized_metadata = {"blob": "x" * 70_000}  # exceeds the 64 KiB metadata cap
+    thoughts = [
+        _thought("t-rb-1", content="first"),
+        _thought("dup", content="second"),
+        _thought("dup", content="third"),  # duplicate id -> raises at insert time
+        _thought("t-rb-4", content="fourth", metadata=oversized_metadata),
+    ]
+
+    with pytest.raises(ValueError, match="already exists"):
+        await store.bulk_store(thoughts)
+
+    # All-or-nothing either way: not even the rows before the failure survive.
+    assert await _count(db, "SELECT COUNT(*) FROM thought") == 0
+
+
+async def test_bulk_store_on_store_ordering_survives_a_later_ordinary_validation_error(
+    db: aiosqlite.Connection,
+) -> None:
+    """A later item's ordinary validation error must not suppress an earlier
+    item's ``on_store`` call.
+
+    Matches the same base-ordering guarantee as the duplicate-id case above:
+    item *n*'s ``on_store`` already ran -- item *n* is fully finished -- by
+    the time item *n + 1* is even looked at, whether or not the whole batch
+    later rolls back for being all-or-nothing.
+    """
+    on_store_calls: list[str] = []
+
+    class _RecordingHooks(DefaultEngravaHooks):
+        async def on_store(self, thought: ThoughtRecord) -> ThoughtRecord:
+            on_store_calls.append(thought.thought_id)
+            return thought
+
+    store = SqliteEngravaCore(db, hooks=_RecordingHooks())
+    await store._probe_fts()
+
+    oversized_metadata = {"blob": "x" * 70_000}  # exceeds the 64 KiB metadata cap
+    thoughts = [
+        _thought("ok-1", content="first, valid"),
+        _thought("ok-2", content="second, valid"),
+        _thought("bad-3", content="third, invalid metadata", metadata=oversized_metadata),
+    ]
+
+    with pytest.raises(ValueError, match="metadata"):
+        await store.bulk_store(thoughts)
+
+    # ok-1 and ok-2's on_store already ran before bad-3's validation failed.
+    assert on_store_calls == ["ok-1", "ok-2"]
+    # All-or-nothing: the whole batch, including ok-1 / ok-2, still rolls back.
     assert await _count(db, "SELECT COUNT(*) FROM thought") == 0
 
 

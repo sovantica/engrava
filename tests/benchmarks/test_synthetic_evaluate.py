@@ -393,6 +393,15 @@ class TestOffOnPair:
 # column, table, index, foreign key, or trigger) is not met after running —
 # likewise a pre-existing gap: the method was already public and the error
 # already reachable, just unexported and, until now, undocumented.
+#
+# Extended again with DedupLockReentryError. This one *is* new behaviour,
+# and the update is deliberate rather than an accommodation: the
+# dedup lock used to hang forever on a same-task second acquisition, which
+# `concurrency.md` already forbade ("what it must not become is a silent,
+# unattributable hang"), so the store now raises instead. This guard exists to
+# stop *benchmark* code leaking into `__all__`; a core exception added by a
+# reviewed workstream is not that, and the correct response to it firing here
+# is a recorded decision, not a silenced test.
 _PRE_WS_ALL_BASELINE = frozenset(
     {
         "ActionNotFoundError",
@@ -413,6 +422,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "CoreThoughtRecord",
         "CycleProvider",
         "CycleProviderError",
+        "DedupLockReentryError",
         "DefaultEngravaHooks",
         "DefaultMindStoreHooks",
         "DeriveContext",

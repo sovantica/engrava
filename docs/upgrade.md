@@ -347,9 +347,11 @@ are not interchangeable:
 
 - `WriteContentionError` comes only from the dedup probe-and-insert window:
   `create_thought(deduplicate=True)`, `get_or_create`, `upsert_by_hash`, and
-  `bulk_store(deduplicate=True)` through an internal `create_thought` call —
-  a caller branching on the error's `operation` field sees `"create_thought"`
-  from `bulk_store` too, never `"bulk_store"`. `bulk_store`'s whole batch runs
+  `bulk_store(deduplicate=True)` per row — sharing the same internal
+  dedup-insert path `create_thought(deduplicate=True)` uses, not a call to
+  the public `create_thought()` itself — a caller branching on the error's
+  `operation` field sees `"create_thought"` from `bulk_store` too (that
+  shared path's fixed label), never `"bulk_store"`. `bulk_store`'s whole batch runs
   inside one transaction, so only its *first* row opens this window; every
   later row in the same batch shares the window the first row already holds
   rather than opening its own. It is raised only after `PRAGMA busy_timeout`
@@ -437,110 +439,76 @@ checking for a task spawned and awaited from inside a `suspend_auto_commit()`
 window on the same store instance — see
 [Concurrency](concurrency.md#a-deadlock-this-store-cannot-resolve-raises-it-does-not-hang).
 
-**`get_or_create()` and `upsert_by_hash()` no longer call `create_thought()`
-on a miss — an override of it silently stops running on those two paths.**
-No schema change. This is `47bd68e`, the same commit that added
-`WriteContentionError` above — not `f2d2348`, which added
-`WriteLockTimeoutError` and is unrelated to this change.
+**Overriding `create_thought()` no longer covers every insert path — override
+`prepare_thought_for_insert()` for that instead.** No schema change. This
+consolidates two commits from the same release, `47bd68e` (routed
+`get_or_create()` / `upsert_by_hash()`'s miss branch off the public method)
+and the later commits that added `prepare_thought_for_insert` — not
+`f2d2348`, which added `WriteLockTimeoutError` and is unrelated to either.
+Both landed before `0.7.0` shipped, so a `0.6.x` user upgrading straight to
+the released `0.7.0` sees only the final result below, never an intermediate
+state where the bypass existed with nothing to replace it.
 
-**Who is affected.** Anyone who subclasses `SqliteEngravaCore` and overrides
-`create_thought()` — for validation, enrichment, or observability — and
-calls `get_or_create()` or `upsert_by_hash()` on a subclass instance,
-expecting the override to run on the insert (miss) branch of either. Before
-this commit, both methods' miss branch called `self.create_thought(...)`, an
-ordinary virtual call that reached an override on `self`. This commit
-routes that branch through the same new internal insertion primitive
-`create_thought()` itself now uses internally, called directly rather than
-through `self.create_thought(...)`, so an override sitting on top of the
-public method is no longer in the call path at all.
+**What a 0.6 user gets.** On `0.6.x`, overriding `create_thought()` reached
+every path in this store able to insert a new row: `get_or_create()`'s and
+`upsert_by_hash()`'s miss branch, and each item in `bulk_store()`'s insert
+loop, all called the virtual `self.create_thought(...)`, so an override
+sitting on top of the public method ran on all of them. On the released
+`0.7.0`, none of the three do — `get_or_create()` / `upsert_by_hash()`'s miss
+branch and `bulk_store()`'s per-item insert all reach internal primitives
+directly, never the public `create_thought()` method, so a `create_thought()`
+override now runs **only** on a direct `create_thought()` call (or through
+`remember()`, which makes one). This is permanent, not a transient defect
+visible only mid-development: `get_or_create()` / `upsert_by_hash()` have
+never called the public method on any `0.7` commit, and `bulk_store()` stopped
+doing so as part of adding the seam described next. A hit on `get_or_create()`
+was already routed through `_increment_confirmation()`, not `create_thought()`,
+on every revision, so it was never in scope here either way;
+`upsert_by_hash()`'s hit branch calls the separately-overridable
+`update_thought()` instead, under locks that override can't safely nest into
+— see [Concurrency](concurrency.md#busy-timeout) and
+[Extension hooks §1B.3](extension-hooks.md#1b3-a-pre-existing-restriction-update_thought-on-upsert_by_hashs-hit-branch)
+for what that means for an `update_thought` override.
 
-**Executed directly, with a subclass whose `create_thought()` override stamps
-an extra metadata key on every thought before delegating to `super()`:**
-calling the override directly, and calling it through `get_or_create()` /
-`upsert_by_hash()` on a miss, all three stamped the key on `v0.6.0` and on
-the commit immediately before this one. On this commit and the current
-tree, the direct call still stamps it; the row inserted by `get_or_create()`
-and the row inserted by `upsert_by_hash()` do not carry it — no error,
-no warning, the call simply returns a record the override never touched.
+**What to do.** Move validation or persisted enrichment out of a
+`create_thought()` override and into `prepare_thought_for_insert()` — the one
+override point that covers `create_thought`, `get_or_create`, `upsert_by_hash`,
+`bulk_store` and `remember` uniformly, running before the decisive duplicate
+probe and any row write (not before *any* probe — `get_or_create()` /
+`upsert_by_hash()` run their own exploratory probe first), with no lock this
+call itself holds. See
+[Extension hooks §1B](extension-hooks.md#1b-pre-insert-preparation-seam) for
+the full contract, including its exact invocation count per entry point (a
+stable `get_or_create()` / `upsert_by_hash()` hit costs zero seam calls,
+consistent with it never having called `create_thought()` on `0.6.x` either).
+Keep only one canonical implementation — retaining both an old
+`create_thought()` override and the new seam risks running your logic twice
+on a direct `create_thought()` call.
 
 **A direct `create_thought(deduplicate=True)` call is not simply unaffected
 either — a miss there used to run the override twice, and now runs it
-once.** Before this commit, `create_thought(deduplicate=True)`'s own miss
+once.** Before `47bd68e`, `create_thought(deduplicate=True)`'s own miss
 branch re-entered `self.create_thought(thought, deduplicate=False)` — the
 same virtual call an override sits on top of — so a call arriving with
 `deduplicate=True` reached the override once for the original call and once
-more for that internal recursive re-dispatch. Executed directly, with the
-same metadata-stamping override, recording each call's own `deduplicate`
-argument: a single `create_thought(deduplicate=True)` miss produced
-`[True, False]` on `v0.6.0` and on the commit immediately before this one —
-the override ran twice, each time appending to a persisted counter reached
-`2`. On this commit and the current tree it produced `[True]` — the override
+more for that internal recursive re-dispatch. Executed directly, with a
+metadata-stamping override recording each call's own `deduplicate` argument:
+a single `create_thought(deduplicate=True)` miss produced `[True, False]` on
+`v0.6.0` — the override ran twice, each time appending to a persisted counter
+that reached `2`. On the released `0.7.0` it produces `[True]` — the override
 runs once, and the same counter reaches `1`. Anyone whose override is not
-idempotent (increments a counter, appends to a log, emits a metric) sees
-that effect halve on this specific call shape; anyone whose override is
-idempotent (sets a fixed value) sees no observable difference here, only on
-the `get_or_create()` / `upsert_by_hash()` miss paths above.
+idempotent (increments a counter, appends to a log, emits a metric) sees that
+effect halve on this specific call shape; anyone whose override is idempotent
+(sets a fixed value) sees no observable difference here, only on the
+`get_or_create()` / `upsert_by_hash()` / `bulk_store()` paths above.
 
 **Who is not affected.** Anyone calling plain `create_thought()` — with
 `deduplicate` omitted, `False`, or a hit under `deduplicate=True` — sees no
 change: those paths call the override exactly as many times as before. A
-subclass that does not override `create_thought()` has nothing to lose on
-any path. A hit on `get_or_create()` was already routed through
-`_increment_confirmation()`, not `create_thought()`, on every revision, so it
-is unaffected by this change specifically — `upsert_by_hash()`'s hit branch
-was never routed through `_increment_confirmation()` at all, on any
-revision, and is covered separately below.
-
-**What changed.** Serialising the dedup probe-and-insert window (the fix
-this section documents) restructured `get_or_create()` and `upsert_by_hash()`
-to hold the new cross-connection lock across the probe and the insert as one
-span; the miss branch of both, and of `create_thought(deduplicate=True)`
-itself, was rewritten to call the row-insertion step directly instead of
-re-entering the public `create_thought()`, which has its own validation and
-its own (differently scoped) locking. Nothing about this was aimed at
-overrides — it is a consequence of which internal method each miss branch
-now calls, not a documented design change to virtual dispatch.
-
-**What to do — there is no public seam left that reaches these paths before
-insertion; do not reach for `on_store` as one.** `on_store` looks like the
-obvious replacement and is not one, though not for the simple reason it
-looks like: it does **not** always run strictly after a durable commit.
-`_insert_new_thought_row()` inserts the row and calls `self._maybe_commit()`
-before `_finish_create_thought()` — which calls `on_store` — ever runs; that
-`_maybe_commit()` is a real, immediate commit when nothing suspends it, but
-a no-op inside a caller's own `suspend_auto_commit()` window, where it
-defers to that window's own eventual commit or rollback. Executed directly,
-on both miss paths, with a hook that raises: called with no surrounding
-window, the row was committed and present (`stored=1`) despite the raise —
-the simple "after commit" story holds there. Called inside
-`suspend_auto_commit()`, with the hook's exception left to propagate all the
-way out of the window uncaught, the window's own rollback undid the insert
-along with everything else written in it, leaving **zero** stored thoughts
-— not because `on_store` rejected anything itself, but because escaping the
-window rolled back the whole window. Caught inside the window instead (so
-the window's own body still exits cleanly), the row is committed exactly as
-in the no-window case. **None of this makes `on_store` a working replacement
-for a rejecting override**, because it cannot single out its own thought:
-the only way it "prevents" a commit is by taking an entire caller-owned
-transaction down with it, discarding whatever else that transaction held —
-not a targeted rejection of one insert. Separately, and true regardless of
-any window: an `on_store` hook that adds a metadata key returns a record
-carrying that key, while the raw stored row never does — the enrichment
-reached the caller, never the database, on either miss path, with or
-without a window, because the row's own column values are already fixed by
-`_insert_new_thought_row()` before `on_store` is ever called. **The one seam
-that still runs before insertion, and is verified to work, is the argument
-itself:** `get_or_create()` and `upsert_by_hash()` both take the candidate
-`ThoughtRecord` as a plain input, the same object `create_thought()` would
-otherwise have received — enrich it with `.evolve(...)` or validate and
-raise on it in your own calling code *before* passing it to either method,
-rather than inside an override on the store or inside `on_store`. Executed
-directly: a `ThoughtRecord` enriched this way before the call carried that
-enrichment in the raw stored row on both methods' miss branch, and raising
-there prevents that one insert without touching anything else a surrounding
-window might hold. This does not restore a single override point that
-covers every insert path uniformly — it moves the responsibility to each
-call site.
+subclass that does not override `create_thought()` has nothing to lose on any
+path; migrating straight to `prepare_thought_for_insert()` (rather than first
+adopting, then abandoning, a `create_thought()` override) has nothing to
+migrate away from either.
 
 **A `upsert_by_hash()` no-op-commit defect from `47bd68e` was caught and
 fixed before this release shipped.** No schema change. `47bd68e` added an

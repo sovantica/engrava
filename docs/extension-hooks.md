@@ -260,6 +260,122 @@ the same `X.Y.x` stability guarantee.
 
 ---
 
+## 1B. Pre-insert preparation seam
+
+`on_store` (§1) runs *after* a thought is (usually) durable, so it cannot
+reject an insert, and any enrichment it returns lands in the caller's copy of
+the record, never in the stored row. For validation or persisted enrichment
+that must run *before the decisive probe* for a duplicate and before any row
+write, override `prepare_thought_for_insert` on your `SqliteEngravaCore` subclass —
+a template method, like `_row_to_thought`, not a method on the hooks object.
+It has no leading underscore: unlike `_row_to_thought`, this one is a public
+override point, and a subclass's override makes the name part of that
+subclass's own public surface — hence the public name.
+
+### 1B.1 Contract
+
+| Aspect | Behaviour |
+|---|---|
+| Default | Pass-through — returns the candidate unchanged |
+| Signature | `async def prepare_thought_for_insert(self, thought: ThoughtRecord) -> ThoughtRecord` |
+| Runs before | The **decisive** duplicate probe and any row write. `get_or_create` / `upsert_by_hash` run their own **exploratory** probe *before* this — see below; a stable hit there resolves the call and this seam never runs at all. |
+| Store lock held while it runs | Never one **this call itself** acquires, on any entry point — `create_thought`, `get_or_create`, `upsert_by_hash` and `bulk_store` all release every lock and transaction they opened before calling this, and reacquire from scratch afterward. See the nesting note below for the one case this does not cover. |
+| Raising | Aborts the create — no row, no journal entry |
+
+**Nesting note.** "Never one this call itself acquires" is not "never any
+lock at all". If you call `create_thought` / `get_or_create` / `upsert_by_hash`
+/ `bulk_store` from *inside your own* `suspend_auto_commit()` window, that
+window's `_write_lock` is still held while this seam runs — it is *your*
+lock, acquired before you ever reached this call, not one the call took for
+itself. This is not something a pre-insert override can close (a plain
+in-process `asyncio.Lock` cannot distinguish "the caller's own reentrant
+hold" from "a lock this call should release"), and it is not new: it applies
+identically to a raw `create_thought` call inside your own
+`suspend_auto_commit()` block, seam or no seam.
+
+**Invocation count, by entry point:**
+
+| Caller | Count |
+|---|---|
+| `create_thought` (either `deduplicate` value) | Exactly once per call — including a dedup hit |
+| `get_or_create` | Zero on a stable pre-existing hit; once on a miss (a race that turns the miss into a hit still counts once) |
+| `upsert_by_hash` | Same as `get_or_create` |
+| `bulk_store` | Once per item — run for the *whole batch*, holding no lock this call itself acquires (see the nesting note above), before `bulk_store` takes any lock for its insert transaction; not "through" a per-item `create_thought` call the way the other counts might suggest |
+| `remember` | Once, via its own `create_thought` call |
+
+The returned record is revalidated (metadata, provenance) before the decisive
+probe or any row write — for `get_or_create` / `upsert_by_hash`, this
+revalidation runs *after* their own exploratory probe already found nothing,
+not before any probe at all — and — for those two — its
+`content` supplies the hash used for the decisive probe that follows: an
+override that changes `content` changes what counts as a duplicate for that
+call.
+
+**`bulk_store` is the one entry point where this seam does not see
+pre-validated input.** Everywhere else, the candidate's `metadata` /
+`provenance` are validated immediately before this call runs, so an override
+can rely on that precondition. `bulk_store` runs this seam, batch-wide,
+holding no lock this call itself acquires, over every item *before* its own
+per-item validation — moving validation itself into that same batch-wide
+pre-phase would have let a later item's ordinary (non-seam) validation
+failure pre-empt an
+earlier item's duplicate-id error or `on_store` call, which a bare loop of
+`create_thought` calls never does (see `_bulk_store_inner`'s docstring for
+the full reasoning). Restoring that per-item failure ordering means
+`bulk_store`'s per-item validation now runs in its insert phase, after this
+seam already ran for the whole batch — so an override reached through
+`bulk_store` sees whatever was passed to `bulk_store`, unvalidated, and must
+not assume otherwise.
+
+### 1B.2 Migrating from a `create_thought` override
+
+If your subclass currently overrides `create_thought` for validation or
+persisted enrichment, move that logic into `prepare_thought_for_insert` and
+let the inherited `create_thought` / `get_or_create` / `upsert_by_hash` /
+`bulk_store` orchestration call it for you — it is the only override point
+that covers every path able to insert a new row, uniformly. Keep only one
+canonical implementation: retaining both the old override and the new seam
+risks running your logic twice on a direct `create_thought` call.
+
+### 1B.3 A pre-existing restriction: `update_thought` on `upsert_by_hash`'s hit branch
+
+`upsert_by_hash`'s hit branch — when the content-hash probe matches an
+existing row — updates it by calling the public, overridable `update_thought`
+while still holding `_write_lock`, `_dedup_lock`, and the transaction the
+probe opened, when it opened one (an already-open outer transaction
+otherwise — see the nesting note in §1B.1). **The locked `update_thought`
+shape predates the
+pre-insert seam; the decisive-probe hit route does not.** Before the seam
+was wired into `upsert_by_hash`, the method had a single probe — what is
+now called the exploratory probe — whose hit branch already called
+`update_thought` under all three of those guards; that part is unchanged
+behaviour. The decisive probe exists only because wiring in the seam split
+the miss path into two phases, so that route is new; its hit branch reuses
+the same `_upsert_matched_row` implementation as the exploratory probe's,
+so it inherits the identical restriction on a route this seam introduced.
+Either way, the hit branch never reaches `prepare_thought_for_insert` at
+all (see the invocation-count table above:
+zero seam calls on a hit). If you override `update_thought`, know that your
+override can run under all three of those guards when it is reached this
+way: do not call back into `create_thought(deduplicate=True)` /
+`get_or_create` / `upsert_by_hash` / `bulk_store(deduplicate=True)` from
+inside it on the same task (see the nesting note in
+§1B.1 — `_write_lock` is task-reentrant, so re-entering it is free, but
+`_dedup_lock` has no legitimate reentrant use, and a same-task second
+acquisition raises `DedupLockReentryError` — a "raise, don't hang" backstop
+identical in spirit to `WriteLockTimeoutError`'s for a *different* task's
+wait, converting what would otherwise be a silent hang on a lock this same
+task already holds into an attributable error instead), and do not assume
+you can read-your-own-write on a second connection to the same file (the
+transaction is not yet committed).
+
+This restriction is unconditional on **both** hit routes — the exploratory
+probe's hit and the decisive probe's hit alike, since both resolve through
+this same `update_thought` call while `_write_lock`, `_dedup_lock`, and the
+transaction the probe opened, when it opened one, are all three still held.
+
+---
+
 ## 2. Write your own hook in 20 lines
 
 ```python
