@@ -5685,7 +5685,9 @@ class SqliteEngravaCore:
                     _compute_content_hash(thought.content),
                 )
                 if existing is not None:
-                    return await self._upsert_matched_row(thought, existing)
+                    return await self._upsert_matched_row(
+                        thought, existing, opened_transaction=opened_transaction
+                    )
                 await self._end_exploratory_probe(opened_transaction=opened_transaction)
         # _write_lock, _dedup_lock and any BEGIN IMMEDIATE this call's own
         # probe opened are all released above -- the seam below runs holding
@@ -5721,7 +5723,9 @@ class SqliteEngravaCore:
                 # Another writer won the race between the two probes -- the
                 # seam already ran once for this call; take the hit branch
                 # instead of inserting.
-                return await self._upsert_matched_row(thought, existing)
+                return await self._upsert_matched_row(
+                        thought, existing, opened_transaction=opened_transaction
+                    )
         origin_token = _DERIVATION_ORIGIN.set("upsert_by_hash")
         try:
             return await self._finish_create_thought(persisted)
@@ -5732,6 +5736,8 @@ class SqliteEngravaCore:
         self,
         thought: ThoughtRecord,
         existing: ThoughtRecord,
+        *,
+        opened_transaction: bool,
     ) -> ThoughtRecord:
         """Hit branch shared by both of ``upsert_by_hash``'s probes.
 
@@ -5756,6 +5762,11 @@ class SqliteEngravaCore:
         Args:
             thought: The candidate whose mutable fields may overwrite ``existing``.
             existing: The stored row the content-hash probe matched.
+            opened_transaction: Whether *this* call's own window opened the
+                ``BEGIN IMMEDIATE`` that may still be open, forwarded from the
+                caller so the no-change branch can end its own transaction
+                without touching a caller's. See
+                :meth:`_end_exploratory_probe`.
 
         Returns:
             ``existing`` unchanged when no field differs, or the record
@@ -5775,13 +5786,14 @@ class SqliteEngravaCore:
             # reused one instead (it cannot know in advance that the match
             # needs no change) -- and the guard itself no longer commits on a
             # clean exit. Closing
-            # what nothing else here will: a plain `_maybe_commit()` is a
-            # no-op if this call is nested in a caller's own
-            # `suspend_auto_commit` (matching every other commit in this
-            # window), and otherwise ends the otherwise-abandoned transaction
-            # so the write lock is not held until some unrelated later write
-            # happens to commit it.
-            await self._maybe_commit()
+            # what nothing else here will, *without committing*: a
+            # `_maybe_commit()` here would commit whatever the caller already
+            # had pending, so their own later `rollback()` would find nothing
+            # to undo -- a call that writes nothing must not commit somebody
+            # else's work. `_end_exploratory_probe` rolls back instead, and
+            # only the transaction this call itself opened, so the write
+            # reservation is released without touching a caller's.
+            await self._end_exploratory_probe(opened_transaction=opened_transaction)
             return existing
         return await self.update_thought(existing.thought_id, **changes)
 
