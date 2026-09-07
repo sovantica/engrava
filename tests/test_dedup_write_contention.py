@@ -382,17 +382,24 @@ async def test_hit_path_journal_entry_is_committed_with_the_confirmation_bump(
 
 
 async def test_upsert_by_hash_no_op_match_releases_the_write_lock(db_path: str) -> None:
-    """A matched row with no differing fields still closes the lock it opened.
+    """A matched row with no differing fields releases its opened lock.
 
     ``upsert_by_hash`` opens ``BEGIN IMMEDIATE`` *before* the probe runs, so it
     cannot yet know the match will turn out to need no change. When it does
     turn out that way (``changes`` computes empty), nothing is written on that
-    branch at all -- and since the guard itself commits nothing on any path
-    (see ``_serialize_dedup_probe``), nothing would ever close this
-    otherwise-empty transaction without an explicit commit on this branch
-    specifically. Decisive check: a **second, independent connection** can
-    immediately open its own ``BEGIN IMMEDIATE`` afterward, which is only
-    possible if the lock was actually released rather than merely quiescent.
+    branch at all -- no ``UPDATE``, no journal entry -- so it
+    commits nothing (committing here would flush whatever *unrelated*,
+    still-pending work the caller already had open on this connection -- see
+    :meth:`SqliteEngravaCore.upsert_by_hash`'s no-op branch). But a branch that
+    writes nothing has nothing of its own to preserve either, so it does not
+    leave the window open: :meth:`SqliteEngravaCore._end_exploratory_probe`
+    rolls back this call's own, still-empty ``BEGIN IMMEDIATE`` before
+    returning -- never a caller's, since it only acts when this call's own
+    probe is the one that opened the transaction (see that method's
+    docstring for the ownership test). Decisive check: a **second,
+    independent connection** *can* open its own ``BEGIN IMMEDIATE``
+    immediately afterward, because the lock genuinely has been released, not
+    merely because this connection happens to be quiescent.
     """
     conn = await aiosqlite.connect(db_path)
     conn.row_factory = aiosqlite.Row
@@ -412,15 +419,75 @@ async def test_upsert_by_hash_no_op_match_releases_the_write_lock(db_path: str) 
             await checker_conn.execute("PRAGMA busy_timeout=0")
             try:
                 await checker_conn.execute("BEGIN IMMEDIATE")
-            except sqlite3.OperationalError as exc:
+            except sqlite3.OperationalError:
                 pytest.fail(
-                    "write lock still held after a no-op upsert_by_hash match -- "
-                    f"a second, independent connection could not open BEGIN IMMEDIATE: {exc}",
+                    "write lock was still held after a no-op upsert_by_hash match -- "
+                    "a second, independent connection could not open its own "
+                    "BEGIN IMMEDIATE, which means this call left its own, empty "
+                    "transaction open instead of releasing the reservation it took.",
                 )
             else:
                 await checker_conn.rollback()
         finally:
             await checker_conn.close()
+    finally:
+        await conn.close()
+
+
+async def test_upsert_by_hash_noop_first_in_suspend_window_releases_the_lock(
+    db_path: str,
+) -> None:
+    """A no-op match as the *first* action in a suspend window still releases the lock.
+
+    ``suspend_auto_commit()`` itself opens no transaction -- one is opened
+    lazily by whichever write happens first inside the window. When that
+    first action is a no-op ``upsert_by_hash()`` match, *this call's own*
+    probe is the one that opens the ``BEGIN IMMEDIATE`` (nothing else in the
+    window has touched the connection yet), so ``opened_transaction`` is
+    ``True`` and :meth:`SqliteEngravaCore._end_exploratory_probe` must roll
+    it back -- even though a ``suspend_auto_commit()`` window is nominally
+    still open around it. This is the exact case an earlier, rejected version
+    of that method got wrong (gating the rollback on
+    ``not self._skip_auto_commit`` in addition to ``opened_transaction``): it
+    would hold this reservation for the *entire remaining duration of the
+    window*, not merely until the next write, because ``_skip_auto_commit``
+    is ``True`` for the window's whole span regardless of which call opened
+    the transaction. Decisive check: a **second, independent connection**
+    can take the write lock immediately, while the ``suspend_auto_commit()``
+    window is still open around the no-op call, proving the reservation was
+    released rather than held for the window's remaining lifetime.
+    """
+    conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
+    await conn.execute("PRAGMA journal_mode=WAL")
+    await conn.execute("PRAGMA foreign_keys=ON")
+    store = SqliteEngravaCore(conn)
+    await store._probe_fts()
+    try:
+        await store.create_thought(_thought("t-window-seed", content="identical fields"))
+
+        async with store.suspend_auto_commit():
+            result = await store.upsert_by_hash(
+                _thought("t-window-other", content="identical fields"),
+            )
+            assert result.thought_id == "t-window-seed"
+
+            checker_conn = await aiosqlite.connect(db_path)
+            try:
+                await checker_conn.execute("PRAGMA busy_timeout=0")
+                try:
+                    await checker_conn.execute("BEGIN IMMEDIATE")
+                except sqlite3.OperationalError:
+                    pytest.fail(
+                        "write lock was still held after a no-op upsert_by_hash match "
+                        "that was the first action inside a suspend_auto_commit() "
+                        "window -- the reservation this call's own probe opened was "
+                        "held for the rest of the window instead of being released.",
+                    )
+                else:
+                    await checker_conn.rollback()
+            finally:
+                await checker_conn.close()
     finally:
         await conn.close()
 

@@ -4129,8 +4129,11 @@ class SqliteEngravaCore:
         ``update_action``, ``cleanup_expired``, ``_insert_derived_row``,
         ``_insert_derived_edge``, ``_ensure_embedding_model_lock``) or a named
         caller's (``_increment_confirmation`` via ``_create_thought_with_dedup``
-        / ``get_or_create``; ``upsert_by_hash`` and ``run_hygiene`` hold it
-        directly). This method never acquires it itself.
+        / ``get_or_create``; ``run_hygiene`` holds it directly). ``upsert_by_hash``
+        reaches this method only via ``update_thought``'s own call on its
+        matched-and-changed branch — its unchanged-match branch writes nothing
+        and does not call this method at all. This method never acquires the
+        write lock itself.
 
         Raises:
             ConnectionQuarantinedError: When the connection has been quarantined.
@@ -4622,12 +4625,15 @@ class SqliteEngravaCore:
         which open transaction is "ours". The fix is to stop asking. Whoever
         actually does the write — :meth:`_insert_new_thought_row`,
         :meth:`_increment_confirmation`, :meth:`update_thought` (via
-        ``upsert_by_hash``'s matched-row path), or the no-op branch of
-        ``upsert_by_hash`` that writes nothing but still opened this lock —
-        commits its own work, in the same call, after everything that call
-        itself needs durable (including its own journal append — see each of
-        those methods for why the ordering matters there). This method never
-        decides that on their behalf.
+        ``upsert_by_hash``'s matched-row path) — commits its own work, in the
+        same call, after everything that call itself needs durable (including
+        its own journal append — see each of those methods for why the
+        ordering matters there). This method never decides that on their
+        behalf. The no-op branch of ``upsert_by_hash`` writes nothing despite
+        having opened this lock, and correspondingly commits nothing — but it
+        does not leave the window open either: see
+        :meth:`_end_exploratory_probe`, which that branch calls to roll back
+        its own, still-empty transaction (never a caller's) before returning.
 
         **A rollback is kept, for the exception path only**, gated on having
         taken the lock, on ``self._db.in_transaction`` being ``True`` at that
@@ -4703,6 +4709,76 @@ class SqliteEngravaCore:
             if took_lock and not self._skip_auto_commit and self._db.in_transaction:
                 await self._db.rollback()
             raise
+
+    async def _end_exploratory_probe(self, *, opened_transaction: bool) -> None:
+        """Close a no-op probe's own transaction without touching a caller's.
+
+        Called from :meth:`upsert_by_hash`'s no-change branch: a matched row
+        whose mutable fields already equal the incoming record's writes
+        nothing at all — no ``UPDATE``, no journal entry — so the
+        ``BEGIN IMMEDIATE`` :meth:`_serialize_dedup_probe` opened for the
+        probe (it cannot know in advance that the match will need no change)
+        is never closed by the "whoever writes, commits" rule that ends the
+        window on every other path — this branch's probe only read.
+
+        **Ownership test, mirrored from :meth:`_serialize_dedup_probe`'s own
+        exception path — minus the ``_skip_auto_commit`` check that path also
+        has.** That path rolls back only when ``took_lock``: this call's own
+        probe opened the transaction, i.e. ``self._db.in_transaction`` was
+        ``False`` when the probe's window began. This method applies that
+        same, single-condition test on the *clean*-exit path, which
+        :meth:`_serialize_dedup_probe` itself deliberately leaves alone (see
+        its docstring: "this method commits nothing, on any path").
+
+        A first version of this method additionally required
+        ``not self._skip_auto_commit``, on the theory that a caller's own
+        ``suspend_auto_commit()`` window should also suppress the rollback.
+        That check is wrong, not merely redundant: ``suspend_auto_commit()``
+        itself opens no transaction — one is opened lazily by whichever write
+        happens first inside the window — so ``opened_transaction`` can
+        genuinely be ``True`` *while* ``_skip_auto_commit`` is also ``True``,
+        whenever this no-op call is that first write. In that case this
+        call's own probe is still the sole thing holding the transaction open
+        (the window itself has contributed nothing to it yet), so rolling it
+        back is exactly as safe as it is outside any window — there is
+        nothing of the window's own to discard. Gating on
+        ``not self._skip_auto_commit`` instead left that reservation held for
+        the *entire remaining duration of the window*, not merely until the
+        next write, since the flag stays ``True`` for the window's whole span
+        regardless of which call opened the transaction.
+        ``opened_transaction`` alone is the ownership test.
+
+        Skipping the test entirely — closing the transaction unconditionally
+        — is the opposite trap, and the one a caller's own *already-open*
+        transaction sets: inside a caller's own window (a
+        ``suspend_auto_commit()`` call that had already written something
+        before this one ran, a batched ``bulk_store`` row, or an explicit
+        ``BEGIN`` issued directly against the connection), the still-open
+        transaction is the *caller's*, holding writes this call knows nothing
+        about; rolling it back would discard them. ``opened_transaction`` is
+        ``False`` in every one of those cases (``self._db.in_transaction`` was
+        already ``True`` when this call's probe began), so this method takes
+        no action at all — exactly the same "leave it alone" outcome
+        :meth:`_serialize_dedup_probe` already gives a caller-owned
+        transaction on its own exception path.
+
+        Always a rollback, never a commit, when it does act: the probe only
+        read, so there is nothing of its own to make durable — rollback is
+        also what :meth:`_serialize_dedup_probe`'s own exception path uses to
+        end an aborted probe.
+
+        Args:
+            opened_transaction: Whether *this* call's own window opened the
+                ``BEGIN IMMEDIATE`` that may still be open. Computed by the
+                caller as ``not self._db.in_transaction``, read at the same
+                point in the call — immediately after acquiring
+                ``_write_lock`` and ``_dedup_lock``, before entering
+                :meth:`_serialize_dedup_probe` — that method reads it for its
+                own ``took_lock``, so the two can never disagree.
+
+        """
+        if opened_transaction and self._db.in_transaction:
+            await self._db.rollback()
 
     async def _create_thought_with_dedup(
         self,
@@ -5177,54 +5253,68 @@ class SqliteEngravaCore:
         # on both the hit (update) and miss (insert) branches.
         _validate_metadata(thought.metadata)
         _validate_provenance(thought.provenance)
-        async with (
-            self._write_lock,
-            self._dedup_lock,
-            self._serialize_dedup_probe(operation="upsert_by_hash"),
-        ):
-            existing = await self._get_thought_by_content_hash(
-                _compute_content_hash(thought.content),
-            )
-            if existing is None:
-                # Insert-only, inside the window; auto-embed / on_store /
-                # derivation run afterwards, once the write lock is released
-                # (see _insert_new_thought_row / _finish_create_thought below).
-                persisted = await self._insert_new_thought_row(
-                    thought,
-                    expires_after_seconds=expires_after_seconds,
+        async with self._write_lock, self._dedup_lock:
+            # Read at the same point _serialize_dedup_probe reads it for its
+            # own `took_lock` -- immediately after acquiring _write_lock and
+            # _dedup_lock, before entering that guard -- so the two can never
+            # disagree about whether *this* call's probe is the one that
+            # opened the BEGIN IMMEDIATE below.
+            opened_transaction = not self._db.in_transaction
+            async with self._serialize_dedup_probe(operation="upsert_by_hash"):
+                existing = await self._get_thought_by_content_hash(
+                    _compute_content_hash(thought.content),
                 )
-            else:
-                # Only the fields that actually differ are forwarded to
-                # ``update_thought``. This keeps the update minimal (no spurious
-                # OCC churn or re-embed when a field is unchanged) and,
-                # critically, never re-asserts an identical ``lifecycle_status``
-                # — ``evolve`` rejects same-state lifecycle transitions, so
-                # passing the stored value back verbatim would raise
-                # ``InvalidTransitionError``. ``update_thought`` commits its own
-                # write (after its own journal append), the same "whoever
-                # writes, commits" rule :meth:`_insert_new_thought_row` and
-                # :meth:`_increment_confirmation` follow — this branch needs no
-                # special handling for that case.
-                changes = {
-                    field: getattr(thought, field)
-                    for field in self._UPSERT_MUTABLE_FIELDS
-                    if getattr(thought, field) != getattr(existing, field)
-                }
-                if not changes:
-                    # No write happens on this branch at all, but the window
-                    # above still opened `BEGIN IMMEDIATE` before the probe ran
-                    # (it cannot know in advance that the match needs no
-                    # change) and the guard itself no longer commits on a
-                    # clean exit. Closing what nothing else here will: a plain
-                    # `_maybe_commit()` is a no-op if this call is nested in a
-                    # caller's own `suspend_auto_commit` (matching every other
-                    # commit in this window), and otherwise ends the
-                    # otherwise-abandoned transaction so the write lock is not
-                    # held until some unrelated later write happens to commit
-                    # it.
-                    await self._maybe_commit()
-                    return existing
-                return await self.update_thought(existing.thought_id, **changes)
+                if existing is None:
+                    # Insert-only, inside the window; auto-embed / on_store /
+                    # derivation run afterwards, once the write lock is released
+                    # (see _insert_new_thought_row / _finish_create_thought below).
+                    persisted = await self._insert_new_thought_row(
+                        thought,
+                        expires_after_seconds=expires_after_seconds,
+                    )
+                else:
+                    # Only the fields that actually differ are forwarded to
+                    # ``update_thought``. This keeps the update minimal (no spurious
+                    # OCC churn or re-embed when a field is unchanged) and,
+                    # critically, never re-asserts an identical ``lifecycle_status``
+                    # — ``evolve`` rejects same-state lifecycle transitions, so
+                    # passing the stored value back verbatim would raise
+                    # ``InvalidTransitionError``. ``update_thought`` commits its own
+                    # write (after its own journal append), the same "whoever
+                    # writes, commits" rule :meth:`_insert_new_thought_row` and
+                    # :meth:`_increment_confirmation` follow — this branch needs no
+                    # special handling for that case.
+                    changes = {
+                        field: getattr(thought, field)
+                        for field in self._UPSERT_MUTABLE_FIELDS
+                        if getattr(thought, field) != getattr(existing, field)
+                    }
+                    if not changes:
+                        # No write happens on this branch at all — no UPDATE, no
+                        # journal entry — so, matching update_action's no-op rule
+                        # (see its docstring), it commits nothing either. The
+                        # window above still opened `BEGIN IMMEDIATE` before the
+                        # probe ran (it cannot know in advance that the match
+                        # needs no change), but a call that writes nothing has
+                        # nothing of its own to make durable, and committing here
+                        # would also flush whatever *unrelated* pending work a
+                        # caller outside `suspend_auto_commit()` still has open on
+                        # this connection — exactly the caller's-own-work commit
+                        # this method must not make. Unlike leaving the window
+                        # open, this also releases the cross-connection write
+                        # reservation it took: _end_exploratory_probe() rolls
+                        # back *this call's own* BEGIN IMMEDIATE (there is
+                        # nothing of its own to preserve, since it wrote
+                        # nothing) but only when this call's own probe is the
+                        # one that opened it -- a caller's own
+                        # `suspend_auto_commit()` window, a batched
+                        # `bulk_store` row, or an explicit `BEGIN` already on
+                        # the connection is left completely alone.
+                        await self._end_exploratory_probe(
+                            opened_transaction=opened_transaction,
+                        )
+                        return existing
+                    return await self.update_thought(existing.thought_id, **changes)
         origin_token = _DERIVATION_ORIGIN.set("upsert_by_hash")
         try:
             return await self._finish_create_thought(persisted)

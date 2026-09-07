@@ -26,6 +26,7 @@ import pytest
 
 from engrava import (
     CoreThoughtRecord,
+    DefaultEngravaHooks,
     EmbeddingGenerationError,
     KnowledgeSource,
     LifecycleStatus,
@@ -37,6 +38,8 @@ from engrava import (
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+
+    from engrava import ThoughtRecord
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +473,235 @@ async def test_upsert_by_hash_applies_valid_lifecycle_transition(
     )
     assert second.thought_id == first.thought_id
     assert second.lifecycle_status is LifecycleStatus.ARCHIVED
+
+
+async def test_upsert_by_hash_noop_does_not_commit_callers_pending_work(
+    store: SqliteEngravaCore,
+    db: aiosqlite.Connection,
+) -> None:
+    """A no-op ``upsert_by_hash()`` must not commit the caller's own pending write.
+
+    The unchanged-record branch writes nothing of its own -- no
+    ``UPDATE``, no journal entry -- so it must not call ``_maybe_commit()``
+    either. Regressed to calling it unconditionally, which committed whatever
+    *unrelated* work the caller already had open on the same connection (a
+    rejected journal insert is the motivating case), leaving a later
+    ``rollback()`` with nothing left to undo.
+
+    Reproduced here without any journal/rejection machinery: a raw pending
+    ``INSERT`` left uncommitted on the shared connection stands in for "the
+    caller's pending work", exactly the way the residual gap documented on
+    :meth:`SqliteEngravaCore._serialize_dedup_probe` describes a transaction
+    already open when this store's own guard is entered.
+    """
+    content = "Content re-upserted with byte-identical mutable fields."
+    seeded = await store.upsert_by_hash(_thought("t-rb-noop-1", content=content))
+
+    # The caller's own pending, uncommitted write on the same connection.
+    await db.execute(
+        "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+        "VALUES ('pending-row', 'OBSERVATION', 'e', 'pending content', 'P2')",
+    )
+    assert db.in_transaction
+
+    # A no-op hit: same mutable fields as the seeded row, so nothing to write.
+    result = await store.upsert_by_hash(_thought("t-rb-noop-2", content=content))
+    assert result.thought_id == seeded.thought_id
+
+    await db.rollback()
+
+    assert await _count(db, "SELECT COUNT(*) FROM thought WHERE thought_id = 'pending-row'") == 0
+
+
+async def test_upsert_by_hash_update_branch_still_commits_pending_work(
+    store: SqliteEngravaCore,
+    db: aiosqlite.Connection,
+) -> None:
+    """Control: the mutable-field-update branch keeps committing, unchanged.
+
+    Unlike the no-op branch (see the sibling test above), this branch does
+    write: it delegates to :meth:`SqliteEngravaCore.update_thought`, which
+    calls ``_maybe_commit()`` itself after its own journal append -- the
+    "whoever writes, commits" rule applied correctly. That commit is on the
+    one shared connection, so it also makes durable whatever unrelated
+    pending write the caller already had open; a later ``rollback()`` finds
+    nothing left to undo. This must hold both before and after the no-op branch fix,
+    since the fix only removes the no-op branch's own, separate commit call.
+    """
+    content = "Content that receives a genuine mutable-field update."
+    seeded = await store.upsert_by_hash(
+        _thought("t-rb-upd-1", content=content, priority=Priority.P3),
+    )
+
+    await db.execute(
+        "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+        "VALUES ('pending-row-ctrl', 'OBSERVATION', 'e', 'pending content 2', 'P2')",
+    )
+    assert db.in_transaction
+
+    updated = await store.upsert_by_hash(
+        _thought("t-rb-upd-2", content=content, priority=Priority.P1),
+    )
+    assert updated.thought_id == seeded.thought_id
+    assert updated.priority is Priority.P1
+
+    # update_thought already committed everything on this connection --
+    # rollback() has nothing left to discard.
+    await db.rollback()
+
+    assert (
+        await _count(db, "SELECT COUNT(*) FROM thought WHERE thought_id = 'pending-row-ctrl'")
+        == 1
+    )
+
+
+async def test_upsert_by_hash_noop_inside_suspend_auto_commit_unaffected(
+    store: SqliteEngravaCore,
+    db: aiosqlite.Connection,
+) -> None:
+    """``suspend_auto_commit()`` already made ``_maybe_commit()`` a no-op there.
+
+    Confirms the no-op branch fix changes nothing observable inside a caller's
+    own ``suspend_auto_commit()`` window: a no-op ``upsert_by_hash()`` call
+    was, and remains, side-effect-free there, because ``_skip_auto_commit``
+    already suppressed the branch's ``_maybe_commit()`` call before this fix
+    removed the call outright. An outer rollback still discards every write
+    made inside the window, exactly as before.
+    """
+    content = "Content re-upserted with byte-identical mutable fields, nested."
+
+    async def _run() -> None:
+        async with store.suspend_auto_commit():
+            await store.upsert_by_hash(_thought("t-nest-1", content=content))
+            # A no-op hit, still inside the same suspended window.
+            await store.upsert_by_hash(_thought("t-nest-2", content=content))
+            msg = "abort the whole window"
+            raise RuntimeError(msg)
+
+    with pytest.raises(RuntimeError, match="abort the whole window"):
+        await _run()
+
+    assert await _count(db, "SELECT COUNT(*) FROM thought") == 0
+
+
+async def test_upsert_by_hash_noop_leaves_an_explicit_begin_untouched(
+    store: SqliteEngravaCore,
+    db: aiosqlite.Connection,
+) -> None:
+    """A no-op match must not touch a transaction opened by a raw ``BEGIN``.
+
+    Distinct from the ``suspend_auto_commit()`` and ``bulk_store`` cases
+    (siblings of this test): here nothing in this store's own API opened the
+    transaction at all -- a caller issued ``BEGIN`` directly against the
+    shared connection, exactly the "residual gap" documented on
+    :meth:`SqliteEngravaCore._serialize_dedup_probe` ("a raw ``BEGIN`` issued
+    directly against it, with nothing written yet"). Because
+    ``self._db.in_transaction`` is already ``True`` when ``upsert_by_hash``
+    is entered, ``opened_transaction`` is computed ``False`` and
+    :meth:`SqliteEngravaCore._end_exploratory_probe` must take no action at
+    all: neither committing the caller's pending write nor rolling it back.
+    """
+    seeded = await store.upsert_by_hash(_thought("t-begin-seed", content="explicit begin case"))
+
+    await db.execute("BEGIN")
+    await db.execute(
+        "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+        "VALUES ('pending-explicit-begin', 'OBSERVATION', 'e', 'pending content', 'P2')",
+    )
+    assert db.in_transaction
+
+    result = await store.upsert_by_hash(_thought("t-begin-other", content="explicit begin case"))
+    assert result.thought_id == seeded.thought_id
+
+    # Still open -- neither committed nor rolled back by the no-op call.
+    assert db.in_transaction
+
+    await db.rollback()
+    assert (
+        await _count(
+            db,
+            "SELECT COUNT(*) FROM thought WHERE thought_id = 'pending-explicit-begin'",
+        )
+        == 0
+    )
+
+
+class _ReentrantUpsertHooks(DefaultEngravaHooks):
+    """``on_store`` hook that reenters ``upsert_by_hash`` with a no-op match.
+
+    Models a plugin's ``on_store`` callback calling back into the store on
+    the same task -- the reentrant shape ``_write_lock``/``_dedup_lock``'s
+    task-reentrant design exists to support. ``store`` is wired in after
+    construction since the hooks object must exist before the store that
+    takes it.
+    """
+
+    def __init__(self, *, trigger_id: str, noop_content: str) -> None:
+        super().__init__()
+        self.store: SqliteEngravaCore | None = None
+        self._trigger_id = trigger_id
+        self._noop_content = noop_content
+        self.reentrant_result: ThoughtRecord | None = None
+
+    async def on_store(self, thought: ThoughtRecord) -> ThoughtRecord:
+        """Reenter ``upsert_by_hash`` with a no-op match for the trigger row.
+
+        Args:
+            thought: The just-persisted thought passed to this hook.
+
+        Returns:
+            ``thought`` unchanged.
+
+        """
+        if thought.thought_id == self._trigger_id:
+            assert self.store is not None
+            self.reentrant_result = await self.store.upsert_by_hash(
+                _thought("reentrant-probe", content=self._noop_content),
+            )
+        return thought
+
+
+async def test_upsert_by_hash_noop_inside_bulk_store_batch_untouched(
+    db: aiosqlite.Connection,
+) -> None:
+    """A no-op match reentered from inside a ``bulk_store`` batch touches nothing.
+
+    ``bulk_store`` runs its whole insert loop -- including each row's
+    ``on_store`` dispatch -- under one ``suspend_auto_commit()`` window (see
+    :meth:`SqliteEngravaCore._bulk_store_inner`). If an ``on_store`` hook
+    calls back into ``upsert_by_hash`` on the same task and that call is a
+    no-op match, ``self._db.in_transaction`` is already ``True`` (the
+    batch's own transaction), so ``opened_transaction`` is ``False`` and
+    :meth:`SqliteEngravaCore._end_exploratory_probe` must leave the batch's
+    transaction completely alone. Decisive check: every row the batch
+    inserted -- including the one whose ``on_store`` triggered the reentrant
+    call -- is still present and committed once the batch returns; a wrong
+    implementation that rolled back on ``opened_transaction=False`` would
+    discard the whole in-flight batch instead.
+    """
+    seed_content = "Content the reentrant no-op call matches unchanged."
+    hooks = _ReentrantUpsertHooks(trigger_id="t-bulk-trigger", noop_content=seed_content)
+    store = SqliteEngravaCore(db, hooks)
+    hooks.store = store
+    await store._probe_fts()
+
+    seeded = await store.upsert_by_hash(_thought("t-bulk-seed", content=seed_content))
+
+    persisted = await store.bulk_store(
+        [
+            _thought("t-bulk-other", content="unrelated batch content"),
+            _thought("t-bulk-trigger", content="content distinct from the seed"),
+        ],
+    )
+
+    assert [record.thought_id for record in persisted] == ["t-bulk-other", "t-bulk-trigger"]
+    assert hooks.reentrant_result is not None
+    assert hooks.reentrant_result.thought_id == seeded.thought_id
+    assert not db.in_transaction
+
+    for thought_id in ("t-bulk-seed", "t-bulk-other", "t-bulk-trigger"):
+        count = await _count(db, "SELECT COUNT(*) FROM thought WHERE thought_id = ?", thought_id)
+        assert count == 1
 
 
 # ---------------------------------------------------------------------------

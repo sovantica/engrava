@@ -542,89 +542,44 @@ window might hold. This does not restore a single override point that
 covers every insert path uniformly — it moves the responsibility to each
 call site.
 
-**A `upsert_by_hash()` call that changes nothing can still commit a
-different, unrelated write that was left pending — no concurrency
-required.** No schema change. This is `47bd68e`, the same commit as the
-override-bypass fix documented above.
+**A `upsert_by_hash()` no-op-commit defect from `47bd68e` was caught and
+fixed before this release shipped.** No schema change. `47bd68e` added an
+unconditional `self._maybe_commit()` to `upsert_by_hash()`'s no-change
+branch — the one that returns the existing row without writing to it at
+all — to close the `BEGIN IMMEDIATE` window the probe ahead of it always
+opens. On a shared connection that commit also flushed whatever *unrelated*
+pending work the caller already had open: a rejected journal insert left
+uncommitted, followed by an unrelated no-op `upsert_by_hash()` call on the
+same connection, became durable anyway, and a caller's later `rollback()`
+meant to undo the rejected insert had nothing left to undo. This was found
+and corrected in the same milestone, so anyone upgrading straight from
+`0.6.0` to the released `0.7.0` never observes it: the no-change branch no
+longer calls `_maybe_commit()` at all, matching `0.6.0`'s own behaviour on
+this specific point (and the existing no-op rule already documented on
+`update_action`).
 
-**Who is affected.** Anyone who journals or otherwise leaves a transaction
-open after a caught failure (a rejected journal insert is the concrete
-case, but any write that raises before its own `_maybe_commit()` runs
-qualifies), on a store also used for `upsert_by_hash()` calls that turn out
-to be a match with no field differences from the stored row — **provided
-that call is not itself inside a `suspend_auto_commit()` window; see below
-for what changes there.** `upsert_by_hash()`'s hit branch is **not**
-`_increment_confirmation()` on any revision — that is `get_or_create()`'s
-hit branch. `upsert_by_hash()` either forwards the fields that differ to
-`update_thought()`, or, when nothing differs, does nothing to the row at
-all. This commit added an unconditional `self._maybe_commit()` to that
-no-change branch, and `_maybe_commit()` commits immediately outside any
-suspended-commit window — so a call that touches no row still ends
-whatever transaction is open on the connection, in that case specifically.
+**What genuinely remains different from `0.6.0`, on this specific path: nothing.**
+An earlier draft of this note (revised here in place, in the same milestone
+as the fix it describes) reported a no-op match leaving its `BEGIN IMMEDIATE`
+window open indefinitely, for whichever guarded write next ran on the same
+connection to close. That was also caught before release: the no-op branch
+now ends its own probe's transaction with a rollback whenever it was the one
+that opened it — the branch writes nothing, so a rollback has nothing of its
+own to discard, and (per the no-op-commit fix above) it cannot touch a
+caller's own pending work either, because it acts only when this call's own
+probe opened the transaction, never when a caller's own
+`suspend_auto_commit()` window, a batched `bulk_store` row, or an explicit
+`BEGIN` already owned it. A no-op `upsert_by_hash()` match now releases the
+cross-connection write reservation exactly as promptly as a genuine write
+does. `0.6.0` still never opened a cross-connection lock for this path at
+all, and `0.7.0` still does — that is the general `BEGIN IMMEDIATE` change
+documented above (see the `WriteContentionError` section), true of every
+dedup entry point and not specific to a no-op match — but the *extra*,
+no-op-only residual this note used to describe is gone.
 
-**Executed directly, without any concurrency:** journaling enabled, an
-existing thought stored, then every future journal insert made to fail —
-`create_thought()` on a new, unrelated thought raised, as expected, with its
-row applied but not yet committed (`in_transaction` still `True`). Calling
-`upsert_by_hash()` with a record that exactly matched the existing thought's
-mutable fields (a true no-op) left the connection's transaction still open
-on `v0.6.0` and on the commit immediately before this one; an explicit
-`rollback()` issued afterward then undid the earlier, still-pending insert —
-the unrelated thought was gone. On this commit and the current tree, that
-same no-op `upsert_by_hash()` call closed the transaction on its own
-(`in_transaction` became `False`); the same `rollback()` issued afterward
-had nothing left to undo, and the earlier, previously-uncommitted thought
-was there, committed, to stay.
-
-**That "closes the transaction" result is itself conditional on there being
-no surrounding `suspend_auto_commit()` window — inside one, the same
-no-op call closes nothing.** `_maybe_commit()` is a no-op whenever a
-`suspend_auto_commit()` window is open, on every revision this section
-covers — the no-change branch's own commit is exactly as deferred as any
-other guarded write's. Executed directly, on the current tree, repeating
-the same setup (an unrelated write already raised and caught, its row
-applied but uncommitted) inside `suspend_auto_commit()`: the no-op
-`upsert_by_hash()` call left `in_transaction` still `True` — its own
-`_maybe_commit()` did nothing — and when the surrounding window later
-exited via an unrelated failure of its own, that window's own rollback
-undid the earlier, still-pending insert along with everything else, exactly
-as it would have without the no-op call ever running. Inside a window, the
-no-op branch neither commits the pending insert early nor protects it; the
-insert's fate is decided by however that window itself eventually exits.
-
-**Who is not affected.** A store with no other write left pending on the
-connection when a no-op `upsert_by_hash()` runs sees no behavioral
-difference — its own commit (or no-op, inside a window) leaves nothing
-outstanding either way. A `upsert_by_hash()` call that does change a field
-routes through `update_thought()`, which already commits its own write (or
-defers to the window, inside one) on every revision; this is specifically
-about the branch where nothing changes.
-
-**What changed.** The no-change branch of `upsert_by_hash()` returns the
-existing record without writing to `thought` at all, but the probe ahead of
-it still opens the same `BEGIN IMMEDIATE` window as every other dedup entry
-point (it cannot know in advance that the match will need no change). This
-commit closes that window with `self._maybe_commit()` on the no-change
-branch specifically so the write lock is not held until some unrelated
-later write happens to commit it — the same reasoning documented above for
-`WriteContentionError`, the one exception `47bd68e` added
-(`WriteLockTimeoutError` came from `f2d2348`). It does not check whether
-anything else was already pending on the connection before it commits
-(or, inside a window, before it declines to).
-
-**What to do.** Outside a `suspend_auto_commit()` window: do not rely on a
-caught failure leaving a transaction open for you to `rollback()` later if
-a `upsert_by_hash()` call — even one you expect to be a no-op — can run on
-the same connection in between; roll back (or otherwise resolve) a caught
-failure immediately, before any other guarded call on the same store
-instance has a chance to run. Inside your own `suspend_auto_commit()`
-window, this specific interaction does not apply — a no-op `upsert_by_hash()`
-there cannot commit anything early — but everything else in the window is
-still one all-or-nothing unit: a caught failure you mean to discard must be
-undone with your own `ROLLBACK TO` a caller-owned savepoint (see the
-delete-atomicity section above), not left for the window's own eventual
-exit to sort out, since a clean exit commits it and an unrelated failure
-rolls back more than just the write you caught.
+**What to do.** Nothing. The defect above never reached a release, and the
+residual this section used to warn about — a no-op match holding the write
+reservation open indefinitely — no longer exists either.
 
 **A dedup hit's journal entry can no longer be lost while its confirmation
 bump survives — no concurrency required.** No schema change. This is
