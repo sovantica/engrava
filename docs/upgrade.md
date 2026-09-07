@@ -909,8 +909,9 @@ not by the mere presence of an `embedding` row, and that rule is enforced
 everywhere a vector could otherwise be resurrected: reconciliation, the
 vector-index purge, and search's own eligibility check. `delete_thought` (and
 the TTL and hygiene delete paths) now delete `edge`, `embedding`, and
-`action` rows explicitly before deleting the thought, on every schema
-version, rather than depending on the core-12 `ON DELETE CASCADE`. Schema
+`action` rows explicitly — atomically with the parent delete, which runs
+first — on every schema version, rather than depending on the core-12
+`ON DELETE CASCADE`. Schema
 version checks are also new: destructive commands refuse outside the head
 version, read commands warn below it and refuse above it, and the new
 `SchemaVersionError` (exported from the package root) is what `ensure_schema()`,
@@ -997,215 +998,84 @@ the initial delete, but `ROLLBACK TO` still succeeds unless something else
 `ConnectionQuarantinedError`, replace the store instance — it is terminal
 by design, the same as before this change.
 
-**Child deletion is no longer atomic with the parent delete — anything that
-prevents, diverts, or skips the parent delete after the children are already
-gone commits their loss, or worse, lets the deletion the guard was meant to
-block go through anyway — with one exception, covered later in this
-section: a firing, unconditional `RAISE(ROLLBACK, ...)` trigger unwinds the
-whole transaction instead, and preserves the children.** No schema change.
-This is a further consequence of `6e4ed41`, the same commit as the
-vector-ownership fix and the quarantine change above: splitting the
-previously atomic, cascade-driven delete into an explicit children-delete
-followed by a separate, unguarded parent delete opened a gap between the
-two steps that anything landing in that gap falls into. The condition is
-general along the timing and caller axes — it does not depend on which
-trigger timing or which caller is involved. The conflict-resolution keyword
-does matter: everything below holds for `ABORT`, `FAIL`, and `IGNORE`; a
-firing, unconditional `RAISE(ROLLBACK, ...)` trigger is the one exception,
-covered later in this section. The list below illustrates the keywords that
-do lose the children, not an exhaustive population to check against.
+**Child deletion is atomic with the parent delete again.** No schema change.
+Immediately after the vector-ownership fix above first split the single,
+cascade-driven delete into an explicit children-delete followed by a
+separate, unguarded parent delete, anything that could fail, skip, or
+silently not run the parent `DELETE FROM thought` — a trigger, an
+authorizer, or a silently-suppressing `RAISE(IGNORE)` — could leave the
+children gone with the parent still there, or bypass a `WHEN EXISTS (...)`
+guard that no longer saw them once they were already gone. **That window
+lived only inside `0.7.0`'s own development history and never reached a
+release: anyone upgrading from the published `0.6.0` to the published
+`0.7.0` will not see it and has nothing to handle.**
 
-**Who is affected.** Anyone with a `thought`-table trigger, or any other
-mechanism, that can make the parent `DELETE FROM thought` fail, get skipped,
-or silently not run — other than a firing, unconditional `RAISE(ROLLBACK,
-...)` trigger, which is protected instead (see below) — on a database
-already migrated to head schema, reached through `delete_thought()`, the
-TTL `delete` cleanup strategy
-(`cleanup_expired()`), or hygiene GC (`run_hygiene()` with `auto_gc_enabled`)
-— every one of these calls `_delete_thought_children_explicit()` first,
-which deletes the thought's `edge`, `embedding`, and `action` rows and
-**releases its own savepoint before the parent delete runs at all**, folding
-those three deletes into the still-open outer transaction with no savepoint
-of their own left protecting them. **Executed, as illustrative forms of the
-same general condition, all against a database already at head schema:**
-
-- `BEFORE DELETE ON thought ... RAISE(ABORT, ...)` and `BEFORE DELETE ON
-  thought ... RAISE(FAIL, ...)` both make `delete_thought()` raise
-  `IntegrityError` with the children already gone and the transaction still
-  open; the next ordinary write on the same connection — an unrelated
-  `create_thought()` — commits that loss, and the thought itself survives.
-- `AFTER DELETE ON thought ... RAISE(ABORT, ...)` reproduces the identical
-  outcome: the trigger fires after the row delete but within the same
-  statement, so `IntegrityError` propagates from the same `execute()` call,
-  past the same unwound-nothing point, with the children already gone.
-- `BEFORE DELETE ON thought ... RAISE(IGNORE)` raises nothing: the parent
-  `DELETE` silently affects zero rows, `delete_thought()` returns `False`,
-  and its own `_maybe_commit()` commits the already-applied child deletes
-  immediately — durable before the call even returns, with no exception for
-  any caller to notice.
-- A `BEFORE DELETE ON thought WHEN EXISTS (...)` trigger, guarding against
-  deleting a thought that still has an edge, is a distinct and worse case: by
-  the time the parent delete runs and the trigger's `WHEN` clause is
-  evaluated, `_delete_thought_children_explicit()` has already removed that
-  edge, so the predicate is false and **the trigger never fires at all**.
-  `delete_thought()` returns `True` and the whole delete — thought and all
-  three children — commits normally. The guard is not merely bypassed on the
-  children; it is bypassed on the thought too, silently, with a return value
-  that looks like ordinary success.
-- `cleanup_expired()` under the `delete` TTL strategy loses the same three
-  rows the same way as `delete_thought()`, confirmed against the same
-  `RAISE(IGNORE)` trigger.
-- `run_hygiene()` with `auto_gc_enabled=True` reproduces it too: against a
-  hygiene-archived thought past both restore windows, with the same
-  `RAISE(IGNORE)` trigger installed, the GC pass reported `gc_count=0`
-  (the parent delete affected zero rows) while the thought's edge,
-  embedding, and action were already gone in the still-open transaction —
-  an unrelated `create_thought()` afterward committed that loss.
-
-None of these raise `ConnectionQuarantinedError`: `_delete_thought_children_explicit()`'s
-own savepoint released cleanly in every case above, so the mechanism the
-section above describes never engages, and nothing signals the loss (or the
-bypassed guard) to the caller, the CLI, or a log.
+**Who is affected.** No one, by the window itself. Anyone whose delete-time
+policy is a `thought`-table trigger should still read **What changed** below
+— it describes the guarantees the released `0.7.0` actually provides, which
+differ from `0.6.0` in a few specific, permanent ways even though the net
+protection the two versions give a trigger is the same.
 
 **Who is not affected.** A database with nothing installed on the `thought`
-table that can fail, skip, or no longer match the parent delete never
-reaches any of this — `engrava` installs no such mechanism itself, only an
-operator can. Beyond that, there is no trigger *timing* (`BEFORE` / `AFTER`)
-that is safe by construction, and a `WHEN` predicate that reads a child row
-is not made safe by *any* keyword, `RAISE(ROLLBACK, ...)` included — if the
-predicate no longer matches once the children are gone, the trigger body
-never runs, whichever keyword it names. Executed directly, with `BEFORE
-DELETE ON thought WHEN EXISTS (SELECT 1 FROM edge WHERE ...) BEGIN SELECT
-RAISE(ROLLBACK, ...); END`: on `v0.6.0` the predicate still sees the edge
-(cascade has not run yet), the trigger fires, and everything is preserved;
-on the current tree the edge is already gone by the time the predicate is
-evaluated, the trigger never fires at all regardless of its raise keyword,
-and `delete_thought()` returns `True`, committing the parent and all three
-children.
+table that can fail, skip, or stop matching the parent delete never
+exercises any of this, on `0.6.0` or `0.7.0` alike.
 
-**An *unconditional* `RAISE(ROLLBACK, ...)` trigger — no `WHEN`, or one that
-still matches — is different: it does protect the children when it fires,
-and it is the only keyword that does.** Executed directly, with a plain
-`BEFORE DELETE ON thought BEGIN SELECT RAISE(ROLLBACK, ...); END` and no
-predicate: the edge, embedding, and action rows were all present afterward
-(`edges=1, embeddings=1, actions=1`) and the thought itself survived
-(`thought=1`) — `RAISE(ROLLBACK, ...)` ends the whole transaction rather
-than just the failing statement, and undoing the whole transaction undoes
-the already-applied, already-released child deletes along with it. **The
-cost is exactly "the whole transaction": an unrelated write made earlier in
-the same window did not survive either** (`earlier_write=0`, where the same
-setup with `RAISE(ABORT, ...)` instead left it at `1`), and a caller-owned
-`SAVEPOINT` taken to protect against exactly this — see below — does not
-survive it either: `ROLLBACK TO` that savepoint, attempted after the
-trigger's own rollback had already run, itself raised `OperationalError:
-no such savepoint`. A firing `RAISE(ROLLBACK, ...)` and the caller-owned
-`SAVEPOINT` recipe below are not something to combine — the trigger's own
-rollback removes the savepoint before the caller's `except` block gets to
-use it.
+**What changed, relative to `0.6.0`.**
 
-**The one mechanism confirmed to protect the children on a trigger that
-does *not* end the whole transaction, without losing unrelated work, is a
-caller-owned rollback that encompasses the child deletes before anything
-commits them.** A caller can take its own `SAVEPOINT` immediately before
-calling `delete_thought()` (or triggering the TTL `delete` strategy, or
-running hygiene GC), inside its own `suspend_auto_commit()` window, and
-roll back to it on failure. Executed directly: inside `suspend_auto_commit()`,
-after an unrelated `create_thought()` had already run, a caller-owned
-`SAVEPOINT` taken just before `delete_thought()` on a thought guarded by a
-plain `RAISE(ABORT, ...)` trigger — caught, then `ROLLBACK TO` that
-savepoint — restored all three children and the thought; the outer window's
-own clean exit afterward still committed the earlier, unrelated
-`create_thought()`. The caller's savepoint predates the child helper's own
-nested one, so rolling back to it undoes the child helper's already-released
-deletes too, without touching anything written before the savepoint was
-taken. **This depends on the trigger raising without itself ending the
-whole transaction** — `ABORT` and `FAIL` qualify; a firing `RAISE(ROLLBACK,
-...)` does not, for the reason above. **`RAISE(IGNORE)` does not qualify
-either, and for a different reason: it does not raise at all.**
-`delete_thought()` on an `IGNORE`-guarded thought returns `False` with no
-exception, so the recipe's own `except` block — the only place it issues
-`ROLLBACK TO` — never runs. Executed directly: following the recipe against
-a plain `BEFORE DELETE ON thought BEGIN SELECT RAISE(IGNORE); END` trigger,
-with no `WHEN` predicate involved, still left `edges=0, embeddings=0,
-actions=0` — the savepoint was reached, taken, and then released as a
-no-op success (the `else` branch, not the `except` one) — while the earlier
-unrelated write survived at `1`, same as every case above. **It also only
-helps when something actually raises for the caller to catch, and both
-`IGNORE` and a defeated `WHEN` predicate share that gap even though they
-fail for different reasons** — one because there is nothing to raise about
-by design, the other because the predicate no longer matches. It does
-nothing for the `WHEN`-predicate case above either: `delete_thought()`
-returns `True` with no exception, so there is nothing to trigger a
-`ROLLBACK TO`, and the savepoint is simply released along with the
-deletion it did not know to stop. A caller that must handle `RAISE(IGNORE)`
-correctly has to check the return value itself — `delete_thought()`
-returning `False` is the only reliable signal, and reacting to it means
-rolling back to the same caller-owned savepoint explicitly, from the
-success path, not from a `except` block.
+- **Ordering.** A `BEFORE DELETE ON thought` trigger — including a
+  `WHEN EXISTS (...)` guard that reads a child row — sees the children
+  present when it fires, exactly as on `0.6.0`: the parent delete, and the
+  explicit child deletes that now follow it inside the same savepoint, have
+  not run yet.
+- **The enforcement-off sweep.** `delete_thought` (and the TTL `delete`
+  strategy, and hygiene GC) delete `edge`, `embedding`, and `action` rows
+  explicitly, every time, rather than depending on the core-12
+  `ON DELETE CASCADE` — this is the permanent, intended half of the
+  vector-ownership fix documented above, not new here: on `0.6.0`, a
+  connection without `PRAGMA foreign_keys=ON`, or a database below core-12,
+  left these rows orphaned behind a deleted thought.
+- **What `RAISE(IGNORE)` now does.** A
+  `BEFORE DELETE ON thought BEGIN SELECT RAISE(IGNORE); END` trigger
+  silently suppresses the parent delete — no exception,
+  `delete_thought() == False` — exactly as it would against `0.6.0`'s single
+  cascade-driven statement, and the released `0.7.0` reaches the same
+  outcome for the children: the store checks, inside the same savepoint and
+  immediately before the parent `DELETE`, whether the row existed at all. If
+  it did, a delete that still matched zero rows is not treated as "already
+  gone" — the savepoint is rolled back instead of running the child sweep,
+  so the still-live parent keeps its children. A genuinely nonexistent
+  `thought_id` takes the other branch, unchanged: the sweep still runs,
+  clearing any orphaned children a schema without a cascade could be
+  carrying. Verified against `RAISE(ABORT)`, `RAISE(FAIL)`, `RAISE(IGNORE)`,
+  and a `WHEN EXISTS` guard, with `PRAGMA foreign_keys` both on and off,
+  through `delete_thought()`, `cleanup_expired()`'s `delete` strategy, and
+  hygiene GC.
+- **TTL cleanup and hygiene GC stop acting on a delete that did not
+  happen.** Both now check the parent delete's own outcome before purging
+  the thought's vector or appending a `DELETE_THOUGHT` journal entry, so a
+  suppressed parent delete no longer purges a live vector or records journal
+  history for a thought that is still there. One inaccuracy is unchanged, on
+  every revision: `cleanup_expired()`'s `expired_count` is the number of
+  candidates its own `SELECT` found, not the number of rows actually
+  removed — it does not, and never did, discriminate a suppressed delete
+  from a successful one. Check `delete_thought()`'s own return value, not
+  the TTL count, when that distinction matters.
+- **An unconditional `RAISE(ROLLBACK, ...)` trigger** still ends the whole
+  surrounding transaction rather than just this delete, on every revision —
+  not something this fix changes. It protects the children when it fires,
+  at the same cost as always: an unrelated write earlier in the same
+  transaction does not survive either. Do not wrap the call in your own
+  `SAVEPOINT` expecting to rescue that unrelated work — the trigger's own
+  rollback removes your savepoint before your `except` block can use it.
 
-**The TTL count is not a substitute signal — measured, not assumed.**
-`cleanup_expired()` returns `expired_count=len(expired_ids)`, the count of
-rows its own candidate `SELECT` returned; nothing in the delete loop checks
-`rowcount` against it, and the docstring calls it "Number of thoughts
-processed", not "number deleted". Run directly: one thought made expired,
-behind a plain `BEFORE DELETE ON thought BEGIN SELECT RAISE(IGNORE); END`
-trigger with no `WHEN` predicate, still reported `expired_count == 1` — its
-full expected value — while the thought row itself was still present
-afterward, because the trigger silently discarded the parent delete. **On
-the TTL path this count cannot detect a skipped deletion at all; a reader
-relying on it to notice an `IGNORE`-guarded thought is unprotected.**
-`_hygiene_gc()` is different and genuinely safer: it checks `if
-cursor.rowcount <= 0: continue` before incrementing its own count, so a
-skipped parent delete does make that count come back lower. Even there,
-though, the count is not an early warning — `_delete_thought_children_explicit`
-already ran and committed the edge, embedding, and action deletes inside the
-same open transaction before the guarded parent `DELETE` is attempted, so by
-the time the lower count reveals the skip, the children are already gone.
-
-**What changed.** On `v0.6.0` and the commit immediately before this one,
-`delete_thought()` relied on the core-12 `ON DELETE CASCADE` to remove the
-children: the parent delete and its cascade were one atomic statement, so
-anything that rejected, ignored, or failed to match the parent delete
-rejected, ignored, or failed to match the cascade along with it — executed
-directly against both revisions with the identical `BEFORE`/`AFTER`,
-`ABORT`/`FAIL`/`IGNORE`/`ROLLBACK`, and `WHEN`-predicate forms above, the
-edge, embedding, and action rows were untouched in every case. This commit
-replaced that single atomic statement with the explicit children-then-parent
-sequence, to close the pre-cascade resurrection gap the vector-ownership fix
-above targets, and did not extend the children's savepoint to cover the
-parent delete too — which is what leaves this gap open on exactly the
-schema (head, cascade-capable) that no longer needed the explicit deletes
-for correctness in the first place.
-
-**Migrating does not resolve this.** The databases above were already at
-head schema, with `ensure_schema()` run to completion, before anything on
-the `thought` table ever fired — there is no pending migration step that
-changes this sequencing, because none is needed for the schema to be
-current.
-
-**What to do.** Prefer moving a delete-time policy check to *before* calling
-`delete_thought()` / triggering the TTL `delete` strategy / running hygiene
-GC, instead of inside a `thought`-table trigger — this is the only form that
-is not sensitive to trigger timing, keyword, or a `WHEN` predicate: the
-check runs before any deletion has started at all, so there are no children
-left to falsify a predicate or to be lost. If you already have a policy
-check as an unconditional `thought`-table trigger and cannot move it: an
-unconditional `RAISE(ROLLBACK, ...)` protects the children on its own (at
-the cost of the whole transaction, unrelated work included — do not also
-wrap the call in your own `SAVEPOINT`, since the trigger's own rollback
-removes it before you can use it); `ABORT` and `FAIL` do not protect
-anything by themselves, but wrapping the call in your own
-`suspend_auto_commit()` window with a `SAVEPOINT` taken immediately before
-it, rolled back to it in an `except` block, restores the children without
-discarding unrelated work. **`RAISE(IGNORE)` needs different handling
-again: it never raises, so the same recipe's `except` block never runs and
-the savepoint is released as a no-op.** Check the call's own return value
-(or count) instead, and roll back to the savepoint explicitly from the
-success path when it indicates the delete did not happen. None of these
-shapes rescues a `WHEN`-gated trigger that stops firing because its
-predicate depended on a row the children delete already removed — there is
-no keyword or caller-side rollback that helps when nothing raises in the
-first place; only moving the check earlier closes that case.
+**What to do.** Nothing, to recover from the in-development window above —
+there is nothing to recover from. If delete-time policy is installed as a
+`thought`-table trigger: `RAISE(ABORT)`, `RAISE(FAIL)`, `RAISE(IGNORE)`, and
+a `WHEN EXISTS` guard are all handled correctly by the store and need no
+caller-side workaround. An unconditional `RAISE(ROLLBACK, ...)` still trades
+away the whole transaction when it fires, so prefer one of the other three
+forms, or move the check earlier — before calling `delete_thought()` at all
+— if that cost is not acceptable.
 
 **Connection cleanup on failure and cancellation is fixed — not only in the
 CLI.** No schema change. This reaches every caller of the library, not just

@@ -254,8 +254,9 @@ resurrect one:
 
 - **Deletion no longer depends on the cascade.** `delete_thought`, the TTL
   `delete` strategy, and hygiene GC each delete a thought's `edge`,
-  `embedding`, and `action` rows explicitly before deleting the thought
-  itself — durable on every schema version, not only from core-12 onward.
+  `embedding`, and `action` rows explicitly, atomically with the parent
+  delete that runs first — durable on every schema version, not only from
+  core-12 onward.
 - **Reconciliation only backfills a vector whose thought still exists.**
   `sync_embeddings` (the pass that runs on every sqlite-vec-enabled open)
   joins to `thought` before treating an `embedding` row as a valid backfill

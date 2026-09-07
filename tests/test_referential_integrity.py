@@ -40,6 +40,7 @@ import pytest
 if TYPE_CHECKING:
     from pathlib import Path
 
+from engrava.config import HygienePolicyConfig
 from engrava.domain.enums import (
     ActionStatus,
     ActionType,
@@ -533,12 +534,24 @@ class TestDeleteThoughtChildrenAtomicity:
         timeout both unreliable.
 
         Builds its own connection rather than using the shared ``store``
-        fixture — see the previous test's docstring for why.
+        fixture — see the previous test's docstring for why. Foreign-key
+        enforcement is turned off on it, deliberately: ``delete_thought``
+        now deletes the parent row first, so on an enforcement-on
+        connection the parent statement's own cascade — not the explicit
+        child delete this test targets — is what reaches the ``action``
+        trigger, and the veto is caught by ``_delete_thought_atomic``'s
+        savepoint before ``_delete_thought_children_explicit`` ever runs.
+        With enforcement off there is no cascade to pre-empt it, so the
+        explicit delete is what hits the trigger and the race this test
+        pins — a cancellation landing during *that* method's own
+        ``ROLLBACK TO`` — stays reachable, exactly as it is on a
+        pre-core-12 schema or any other connection with enforcement off.
         """
         db = await aiosqlite.connect(":memory:")
         db.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(db, embedding_provider=None, auto_embed=False)
         await store.ensure_schema()
+        await db.execute("PRAGMA foreign_keys = OFF")
 
         await store.create_thought(_make_thought("t1"))
         await store.create_action(_make_action("a1", "t1"))
@@ -563,6 +576,698 @@ class TestDeleteThoughtChildrenAtomicity:
         assert store._connection_quarantined is True
         with pytest.raises(ConnectionQuarantinedError):
             await store.create_thought(_make_thought("unrelated-after-quarantine"))
+
+
+class TestParentDeleteSeesChildrenBeforeTheyAreGone:
+    """The parent delete must run before the children are gone, not after.
+
+    ``6e4ed41`` deleted the edge / embedding / action rows first and released
+    their savepoint before the ``thought`` row itself was ever touched. Two
+    distinct defects followed from that ordering, both fixed by
+    ``_delete_thought_atomic`` running the parent delete first, inside the
+    savepoint that then covers the explicit child deletes:
+
+    * **Lost atomicity.** Anything that then prevented, diverted or skipped
+      the parent delete -- a ``BEFORE DELETE ON thought`` trigger that always
+      vetoes, the concrete case exercised here -- left the already-deleted
+      children sitting in the open transaction with the parent still
+      present. Nothing in the raised exception said so; the children were
+      simply gone the moment any later, unrelated write on the same
+      connection committed.
+    * **A defeated guard.** A trigger that vetoes only *conditionally* --
+      ``WHEN EXISTS (... the thought still has children ...)`` -- never saw
+      them: the predicate it tests is already false by the time the parent
+      delete runs, so the trigger never fires and the delete the user's own
+      policy meant to block **succeeds**.
+
+    Each test installs its trigger directly on ``thought`` (not on a child
+    table -- ``TestDeleteThoughtChildrenAtomicity`` above already covers a
+    child table's own trigger, which is a different failure this class does
+    not repeat) so the deciding question is what the parent delete itself
+    observes and how its failure is handled.
+    """
+
+    async def test_delete_thought_plain_veto_does_not_lose_the_children(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        await store.create_thought(_make_thought("t1"))
+        await store.create_thought(_make_thought("t2"))
+        await store.create_edge(_make_edge("e1", "t1", "t2"))
+        await store.create_action(_make_action("a1", "t1"))
+        await store._db.execute(
+            "CREATE TRIGGER thought_delete_forbidden BEFORE DELETE ON thought "
+            "BEGIN SELECT RAISE(ABORT, 'policy: thought deletion forbidden'); END"
+        )
+
+        with pytest.raises(aiosqlite.IntegrityError):
+            await store.delete_thought("t1")
+
+        # The discriminating step, exactly like the child-table atomicity
+        # tests above: an unrelated write's own commit must not durably
+        # apply a children-delete the veto above never got to protect.
+        await store.create_thought(_make_thought("unrelated-write"))
+
+        assert await store.get_thought("t1") is not None
+        cursor = await store._db.execute("SELECT COUNT(*) FROM edge WHERE edge_id = 'e1'")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 1, "the edge must survive a vetoed parent delete"
+        cursor = await store._db.execute(
+            "SELECT COUNT(*) FROM action WHERE source_thought_id = 't1'"
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 1, "the action must survive a vetoed parent delete"
+
+    async def test_delete_thought_when_exists_guard_fires_again(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        await store.create_thought(_make_thought("t1"))
+        await store.create_thought(_make_thought("t2"))
+        await store.create_edge(_make_edge("e1", "t1", "t2"))
+        await store._db.execute(
+            "CREATE TRIGGER thought_delete_guard BEFORE DELETE ON thought "
+            "WHEN EXISTS (SELECT 1 FROM edge WHERE from_thought_id = OLD.thought_id "
+            "OR to_thought_id = OLD.thought_id) "
+            "BEGIN SELECT RAISE(ABORT, 'policy: cannot delete a thought with live edges'); END"
+        )
+
+        with pytest.raises(aiosqlite.IntegrityError):
+            await store.delete_thought("t1")
+
+        assert await store.get_thought("t1") is not None, "the guard must block the delete"
+        cursor = await store._db.execute("SELECT COUNT(*) FROM edge WHERE edge_id = 'e1'")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 1, "the edge the guard tests for must survive"
+
+    async def test_ttl_delete_plain_veto_does_not_lose_the_children(
+        self,
+        delete_store: SqliteEngravaCore,
+    ) -> None:
+        past = "2026-01-01T00:00:00+00:00"
+        now = "2026-06-01T00:00:00+00:00"
+        await delete_store.create_thought(_make_thought("t1", expires_at=past))
+        await delete_store.create_thought(_make_thought("t2"))
+        await delete_store.create_edge(_make_edge("e1", "t1", "t2"))
+        await delete_store._db.execute(
+            "CREATE TRIGGER thought_delete_forbidden BEFORE DELETE ON thought "
+            "BEGIN SELECT RAISE(ABORT, 'policy: thought deletion forbidden'); END"
+        )
+
+        with pytest.raises(aiosqlite.IntegrityError):
+            await delete_store.cleanup_expired(now=now)
+
+        assert await delete_store.get_thought("t1") is not None
+        cursor = await delete_store._db.execute("SELECT COUNT(*) FROM edge WHERE edge_id = 'e1'")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 1, "the edge must survive a vetoed parent delete"
+
+    async def test_ttl_delete_when_exists_guard_fires_again(
+        self,
+        delete_store: SqliteEngravaCore,
+    ) -> None:
+        past = "2026-01-01T00:00:00+00:00"
+        now = "2026-06-01T00:00:00+00:00"
+        await delete_store.create_thought(_make_thought("t1", expires_at=past))
+        await delete_store.create_thought(_make_thought("t2"))
+        await delete_store.create_edge(_make_edge("e1", "t1", "t2"))
+        await delete_store._db.execute(
+            "CREATE TRIGGER thought_delete_guard BEFORE DELETE ON thought "
+            "WHEN EXISTS (SELECT 1 FROM edge WHERE from_thought_id = OLD.thought_id "
+            "OR to_thought_id = OLD.thought_id) "
+            "BEGIN SELECT RAISE(ABORT, 'policy: cannot delete a thought with live edges'); END"
+        )
+
+        with pytest.raises(aiosqlite.IntegrityError):
+            await delete_store.cleanup_expired(now=now)
+
+        assert (
+            await delete_store.get_thought("t1") is not None
+        ), "the guard must block the delete"
+        cursor = await delete_store._db.execute("SELECT COUNT(*) FROM edge WHERE edge_id = 'e1'")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 1
+
+    async def test_hygiene_gc_plain_veto_does_not_lose_the_children(self) -> None:
+        policy = HygienePolicyConfig(
+            enabled=True,
+            eviction_threshold=0.0,
+            auto_gc_enabled=True,
+            gc_min_archive_age_cycles=0,
+            gc_restore_window_seconds=0,
+        )
+        async with aiosqlite.connect(":memory:") as db:
+            db.row_factory = aiosqlite.Row
+            hygiene_store = SqliteEngravaCore(
+                db, embedding_provider=None, auto_embed=False, hygiene_policy=policy
+            )
+            await hygiene_store.ensure_schema()
+
+            await hygiene_store.create_thought(_make_thought("t1"))
+            await hygiene_store.create_thought(_make_thought("t2"))
+            await hygiene_store.create_edge(_make_edge("e1", "t1", "t2"))
+            await hygiene_store.update_thought(
+                "t1", lifecycle_status=LifecycleStatus.ARCHIVED, archived_at_cycle=0
+            )
+            await hygiene_store._db.execute(
+                "CREATE TRIGGER thought_delete_forbidden BEFORE DELETE ON thought "
+                "BEGIN SELECT RAISE(ABORT, 'policy: thought deletion forbidden'); END"
+            )
+
+            with pytest.raises(aiosqlite.IntegrityError):
+                await hygiene_store.run_hygiene(current_cycle=1000)
+
+            assert await hygiene_store.get_thought("t1") is not None
+            cursor = await hygiene_store._db.execute(
+                "SELECT COUNT(*) FROM edge WHERE edge_id = 'e1'"
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row[0] == 1, "the edge must survive a vetoed parent delete"
+
+    async def test_hygiene_gc_when_exists_guard_fires_again(self) -> None:
+        policy = HygienePolicyConfig(
+            enabled=True,
+            eviction_threshold=0.0,
+            auto_gc_enabled=True,
+            gc_min_archive_age_cycles=0,
+            gc_restore_window_seconds=0,
+        )
+        async with aiosqlite.connect(":memory:") as db:
+            db.row_factory = aiosqlite.Row
+            hygiene_store = SqliteEngravaCore(
+                db, embedding_provider=None, auto_embed=False, hygiene_policy=policy
+            )
+            await hygiene_store.ensure_schema()
+
+            await hygiene_store.create_thought(_make_thought("t1"))
+            await hygiene_store.create_thought(_make_thought("t2"))
+            await hygiene_store.create_edge(_make_edge("e1", "t1", "t2"))
+            await hygiene_store.update_thought(
+                "t1", lifecycle_status=LifecycleStatus.ARCHIVED, archived_at_cycle=0
+            )
+            await hygiene_store._db.execute(
+                "CREATE TRIGGER thought_delete_guard BEFORE DELETE ON thought "
+                "WHEN EXISTS (SELECT 1 FROM edge WHERE from_thought_id = OLD.thought_id "
+                "OR to_thought_id = OLD.thought_id) "
+                "BEGIN SELECT RAISE(ABORT, 'policy: cannot delete a thought with live edges'); END"
+            )
+
+            with pytest.raises(aiosqlite.IntegrityError):
+                await hygiene_store.run_hygiene(current_cycle=1000)
+
+            assert (
+                await hygiene_store.get_thought("t1") is not None
+            ), "the guard must block the delete"
+            cursor = await hygiene_store._db.execute(
+                "SELECT COUNT(*) FROM edge WHERE edge_id = 'e1'"
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row[0] == 1
+
+
+class TestParentDeleteSuppressedByRaiseIgnore:
+    """``RAISE(IGNORE)`` reproduces the same data loss with a different trigger.
+
+    ``RAISE(ABORT)`` (and a ``WHEN EXISTS`` guard, which uses it too) raises,
+    so ``_delete_thought_atomic``'s own ``except`` branch unwinds the whole
+    savepoint and the caller sees an exception -- covered above by
+    ``TestParentDeleteSeesChildrenBeforeTheyAreGone``. ``RAISE(IGNORE)``
+    instead *silently* reverts just the parent ``DELETE``: no exception, the
+    thought stays, and the delete's own rowcount is zero -- indistinguishable
+    from ``thought_id`` never having existed if rowcount is all that is
+    consulted. Before the fix pinned here, ``_delete_thought_atomic`` ran the
+    explicit child sweep unconditionally on that zero-row outcome, so a
+    still-live parent lost its edges and its actions anyway, and
+    ``delete_thought`` (or TTL cleanup, or hygiene GC) reported ``False``
+    while having actually done the damage. TTL cleanup additionally never
+    checked the return value at all, so it went on to purge the vector and
+    append a ``DELETE_THOUGHT`` journal entry for a parent that was never
+    deleted -- false history on top of the data loss.
+
+    Exercised on both ``PRAGMA foreign_keys`` settings: the veto prevents the
+    parent row from ever actually being removed, so no cascade fires either
+    way, and the two settings are expected to behave identically here --
+    pinning both turns that equivalence into a tested fact instead of an
+    assumption. The last test in this class is the control: a genuinely
+    nonexistent ``thought_id`` must keep sweeping any orphaned children it
+    finds, exactly as before this fix.
+    """
+
+    @staticmethod
+    async def _install_ignore_trigger(db: aiosqlite.Connection) -> None:
+        await db.execute(
+            "CREATE TRIGGER thought_delete_ignore BEFORE DELETE ON thought "
+            "BEGIN SELECT RAISE(IGNORE); END"
+        )
+
+    @pytest.mark.parametrize("foreign_keys_on", [True, False])
+    async def test_delete_thought_ignore_veto_does_not_lose_the_children(
+        self,
+        foreign_keys_on: bool,
+    ) -> None:
+        async with aiosqlite.connect(":memory:") as db:
+            db.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(db, embedding_provider=None, auto_embed=False)
+            await store.ensure_schema()
+            if not foreign_keys_on:
+                await db.execute("PRAGMA foreign_keys = OFF")
+
+            await store.create_thought(_make_thought("t1"))
+            await store.create_thought(_make_thought("t2"))
+            await store.create_edge(_make_edge("e1", "t1", "t2"))
+            await store.create_action(_make_action("a1", "t1"))
+            await self._install_ignore_trigger(db)
+
+            deleted = await store.delete_thought("t1")
+
+            assert deleted is False
+            assert await store.get_thought("t1") is not None, "the parent must survive"
+            cursor = await db.execute("SELECT COUNT(*) FROM edge WHERE edge_id = 'e1'")
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row[0] == 1, "the edge must survive a silently-ignored parent delete"
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM action WHERE source_thought_id = 't1'"
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row[0] == 1, "the action must survive a silently-ignored parent delete"
+
+    @pytest.mark.parametrize("foreign_keys_on", [True, False])
+    async def test_ttl_delete_ignore_veto_does_not_lose_the_children(
+        self,
+        foreign_keys_on: bool,
+    ) -> None:
+        async with aiosqlite.connect(":memory:") as db:
+            db.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(
+                db, embedding_provider=None, auto_embed=False, ttl_strategy="delete"
+            )
+            await store.ensure_schema()
+            if not foreign_keys_on:
+                await db.execute("PRAGMA foreign_keys = OFF")
+
+            past = "2026-01-01T00:00:00+00:00"
+            now = "2026-06-01T00:00:00+00:00"
+            await store.create_thought(_make_thought("t1", expires_at=past))
+            await store.create_thought(_make_thought("t2"))
+            await store.create_edge(_make_edge("e1", "t1", "t2"))
+            await self._install_ignore_trigger(db)
+
+            result = await store.cleanup_expired(now=now)
+
+            assert result.expired_count == 1
+            assert await store.get_thought("t1") is not None, "the parent must survive"
+            cursor = await db.execute("SELECT COUNT(*) FROM edge WHERE edge_id = 'e1'")
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row[0] == 1, "the edge must survive a silently-ignored parent delete"
+
+    @pytest.mark.parametrize("foreign_keys_on", [True, False])
+    async def test_hygiene_gc_ignore_veto_does_not_lose_the_children(
+        self,
+        foreign_keys_on: bool,
+    ) -> None:
+        policy = HygienePolicyConfig(
+            enabled=True,
+            eviction_threshold=0.0,
+            auto_gc_enabled=True,
+            gc_min_archive_age_cycles=0,
+            gc_restore_window_seconds=0,
+        )
+        async with aiosqlite.connect(":memory:") as db:
+            db.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(
+                db, embedding_provider=None, auto_embed=False, hygiene_policy=policy
+            )
+            await store.ensure_schema()
+            if not foreign_keys_on:
+                await db.execute("PRAGMA foreign_keys = OFF")
+
+            await store.create_thought(_make_thought("t1"))
+            await store.create_thought(_make_thought("t2"))
+            await store.create_edge(_make_edge("e1", "t1", "t2"))
+            await store.update_thought(
+                "t1", lifecycle_status=LifecycleStatus.ARCHIVED, archived_at_cycle=0
+            )
+            await self._install_ignore_trigger(db)
+
+            await store.run_hygiene(current_cycle=1000)
+
+            assert await store.get_thought("t1") is not None, "the parent must survive"
+            cursor = await db.execute("SELECT COUNT(*) FROM edge WHERE edge_id = 'e1'")
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row[0] == 1, "the edge must survive a silently-ignored parent delete"
+
+    async def test_nonexistent_id_control_still_sweeps_orphans_and_reports_false(
+        self,
+    ) -> None:
+        """The discrimination must not regress the pre-existing nonexistent-id path.
+
+        With foreign keys off (no cascade to rely on), a schema can be left
+        carrying orphaned child rows for a ``thought_id`` that was never
+        (re)inserted into ``thought`` -- exactly the scenario the
+        unconditional sweep in ``_delete_thought_atomic`` exists to clean up.
+        This must keep working after the fix: ``existed_before`` is False, so
+        the sweep still runs and ``delete_thought`` still reports ``False``,
+        with no ``RAISE(IGNORE)`` trigger involved at all.
+        """
+        async with aiosqlite.connect(":memory:") as db:
+            db.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(db, embedding_provider=None, auto_embed=False)
+            await store.ensure_schema()
+            await db.execute("PRAGMA foreign_keys = OFF")
+
+            await store.create_thought(_make_thought("t2"))
+            # Enforcement is off, so this persists an edge referencing a
+            # `from_thought_id` that was never inserted into `thought` --
+            # the orphan a pre-cascade schema (or a connection with
+            # enforcement off) can carry.
+            await store.create_edge(_make_edge("e1", "ghost", "t2"))
+
+            deleted = await store.delete_thought("ghost")
+
+            assert deleted is False
+            cursor = await db.execute("SELECT COUNT(*) FROM edge WHERE edge_id = 'e1'")
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row[0] == 0, "the orphaned edge must still be swept for a nonexistent id"
+
+
+class TestVetoedDeleteEndsTheTransactionItOpened:
+    """A silently-vetoed delete must not leave the outer transaction open.
+
+    ``_delete_thought_atomic`` samples ``opened_transaction = not
+    self._db.in_transaction`` before touching anything, and already closed a
+    transaction it opened on two of its three exits: the happy path releases
+    the savepoint and leaves the (still-open) transaction for the caller's
+    own ``_maybe_commit`` to close, and a *raising* veto (``RAISE(ABORT)``,
+    ``RAISE(FAIL)``, a ``WHEN EXISTS`` guard) is unwound by the ``except``
+    branch, which already ends a transaction it opened with a rollback. The
+    silent ``RAISE(IGNORE)`` veto was the third exit, and the one this class
+    pins: before the fix, that branch released the savepoint but never ended
+    the outer transaction, so ``self._db.in_transaction`` stayed ``True``
+    indefinitely on the connection that ran it.
+
+    ``delete_thought`` and ``cleanup_expired``'s delete strategy do not
+    reveal this in practice: both call an unconditional-enough
+    ``_maybe_commit()`` immediately afterwards (``delete_thought`` always;
+    ``cleanup_expired`` whenever its batch had any expired candidate at
+    all), with no ``await`` in between that could let a second connection
+    observe the gap, so the leak closes before either method returns.
+    ``run_hygiene`` is different: it only commits ``if archived_count or
+    gc_count``, and both stay zero when every eligible thought in the GC
+    batch is vetoed, so nothing ever closes it -- this is the reproduction
+    the fix targets. The first two tests below still pin the general rule
+    directly on ``self._db.in_transaction`` (not just on the GC path)
+    because relying on an incidental later commit is not the same as the
+    veto branch closing what it opened, and a future reordering of either
+    caller must not silently reintroduce the leak.
+
+    A genuine second connection to the same file is required to observe the
+    lock from outside -- a shared ``:memory:`` database cannot host
+    cross-connection contention (see ``tests/test_dedup_write_contention.py``,
+    which uses the same file-backed pattern to simulate a stuck writer;
+    here a stuck writer is exactly what must *not* be reproduced).
+    """
+
+    @staticmethod
+    async def _install_ignore_trigger(db: aiosqlite.Connection) -> None:
+        await db.execute(
+            "CREATE TRIGGER thought_delete_ignore BEFORE DELETE ON thought "
+            "BEGIN SELECT RAISE(IGNORE); END"
+        )
+
+    @staticmethod
+    async def _assert_second_connection_can_write_immediately(db_path: Path) -> None:
+        """A fresh connection must take a write reservation with no wait.
+
+        ``busy_timeout=0`` makes a reservation still held by the first
+        connection fail instantly instead of after a wait, so this either
+        passes immediately or raises ``sqlite3.OperationalError`` (database
+        is locked) -- there is no flakiness window either way.
+        """
+        second = await aiosqlite.connect(str(db_path))
+        try:
+            await second.execute("PRAGMA busy_timeout=0")
+            await second.execute("BEGIN IMMEDIATE")
+            await second.rollback()
+        finally:
+            await second.close()
+
+    @pytest.mark.parametrize("foreign_keys_on", [True, False])
+    async def test_hygiene_gc_ignore_veto_ends_the_transaction_it_opened(
+        self,
+        tmp_path: Path,
+        foreign_keys_on: bool,
+    ) -> None:
+        policy = HygienePolicyConfig(
+            enabled=True,
+            eviction_threshold=0.0,
+            auto_gc_enabled=True,
+            gc_min_archive_age_cycles=0,
+            gc_restore_window_seconds=0,
+        )
+        db_path = tmp_path / f"hygiene-gc-leak-{foreign_keys_on}.sqlite"
+        db = await aiosqlite.connect(str(db_path))
+        try:
+            db.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(
+                db, embedding_provider=None, auto_embed=False, hygiene_policy=policy
+            )
+            await store.ensure_schema()
+            if not foreign_keys_on:
+                await db.execute("PRAGMA foreign_keys = OFF")
+
+            await store.create_thought(_make_thought("t1"))
+            await store.create_thought(_make_thought("t2"))
+            await store.create_edge(_make_edge("e1", "t1", "t2"))
+            await store.update_thought(
+                "t1", lifecycle_status=LifecycleStatus.ARCHIVED, archived_at_cycle=0
+            )
+            await self._install_ignore_trigger(db)
+
+            result = await store.run_hygiene(current_cycle=1000)
+
+            assert result.gc_count == 0, "the veto must not be counted as a real deletion"
+            assert result.archived_count == 0, (
+                "archiving anything would make run_hygiene's own _maybe_commit "
+                "mask the leak instead of exercising it"
+            )
+            assert db.in_transaction is False, (
+                "the vetoed GC delete opened this transaction itself and must "
+                "end it itself -- run_hygiene's _maybe_commit is unreachable "
+                "when both counts are zero"
+            )
+            await self._assert_second_connection_can_write_immediately(db_path)
+        finally:
+            await db.close()
+
+    @pytest.mark.parametrize("foreign_keys_on", [True, False])
+    async def test_delete_thought_ignore_veto_ends_the_transaction_it_opened(
+        self,
+        tmp_path: Path,
+        foreign_keys_on: bool,
+    ) -> None:
+        db_path = tmp_path / f"delete-thought-leak-{foreign_keys_on}.sqlite"
+        db = await aiosqlite.connect(str(db_path))
+        try:
+            db.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(db, embedding_provider=None, auto_embed=False)
+            await store.ensure_schema()
+            if not foreign_keys_on:
+                await db.execute("PRAGMA foreign_keys = OFF")
+
+            await store.create_thought(_make_thought("t1"))
+            await store.create_thought(_make_thought("t2"))
+            await store.create_edge(_make_edge("e1", "t1", "t2"))
+            await self._install_ignore_trigger(db)
+
+            deleted = await store.delete_thought("t1")
+
+            assert deleted is False
+            assert db.in_transaction is False, (
+                "delete_thought's own _maybe_commit call happens to close this "
+                "transaction anyway (it runs unconditionally right after), but "
+                "the veto branch must not depend on that -- it must close what "
+                "it opened on its own"
+            )
+            await self._assert_second_connection_can_write_immediately(db_path)
+        finally:
+            await db.close()
+
+    @pytest.mark.parametrize("foreign_keys_on", [True, False])
+    async def test_ttl_delete_ignore_veto_ends_the_transaction_it_opened(
+        self,
+        tmp_path: Path,
+        foreign_keys_on: bool,
+    ) -> None:
+        db_path = tmp_path / f"ttl-delete-leak-{foreign_keys_on}.sqlite"
+        db = await aiosqlite.connect(str(db_path))
+        try:
+            db.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(
+                db, embedding_provider=None, auto_embed=False, ttl_strategy="delete"
+            )
+            await store.ensure_schema()
+            if not foreign_keys_on:
+                await db.execute("PRAGMA foreign_keys = OFF")
+
+            past = "2026-01-01T00:00:00+00:00"
+            now = "2026-06-01T00:00:00+00:00"
+            await store.create_thought(_make_thought("t1", expires_at=past))
+            await store.create_thought(_make_thought("t2"))
+            await store.create_edge(_make_edge("e1", "t1", "t2"))
+            await self._install_ignore_trigger(db)
+
+            result = await store.cleanup_expired(now=now)
+
+            assert result.expired_count == 1
+            assert db.in_transaction is False, (
+                "cleanup_expired's own _maybe_commit call happens to close "
+                "this transaction anyway (it runs whenever any candidate was "
+                "found, veto or not), but the veto branch must not depend on "
+                "that -- it must close what it opened on its own"
+            )
+            await self._assert_second_connection_can_write_immediately(db_path)
+        finally:
+            await db.close()
+
+    async def test_suspend_auto_commit_window_survives_a_vetoed_delete(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Ownership case 1: the caller's own ``suspend_auto_commit`` window.
+
+        An earlier write inside the same window opens the transaction before
+        the vetoed delete runs, so ``_delete_thought_atomic`` must see
+        ``opened_transaction`` as ``False`` and leave the window's
+        transaction alone -- both the earlier write and the (unaffected,
+        still-live) vetoed thought must come out the other side once the
+        window itself closes.
+        """
+        db_path = tmp_path / "suspend-window-untouched.sqlite"
+        db = await aiosqlite.connect(str(db_path))
+        try:
+            db.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(db, embedding_provider=None, auto_embed=False)
+            await store.ensure_schema()
+            await store.create_thought(_make_thought("vetoed"))
+            await self._install_ignore_trigger(db)
+
+            async with store.suspend_auto_commit():
+                await store.create_thought(_make_thought("kept"))
+                deleted = await store.delete_thought("vetoed")
+                assert deleted is False
+                assert db.in_transaction is True, (
+                    "the window's own transaction, opened by the earlier "
+                    "create_thought, must still be open here"
+                )
+
+            assert db.in_transaction is False, "the window's own clean exit must commit"
+            assert await store.get_thought("kept") is not None
+            assert await store.get_thought("vetoed") is not None, (
+                "the veto inside the window must not have been undone by "
+                "anything touching the window's transaction"
+            )
+        finally:
+            await db.close()
+
+    async def test_bulk_store_batch_survives_a_vetoed_delete_in_the_same_window(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Ownership case 2: a batched ``bulk_store`` row.
+
+        ``bulk_store`` runs its insert loop inside its own (nested, but
+        task-reentrant and same-transaction) ``suspend_auto_commit`` window.
+        Calling a vetoed ``delete_thought`` in the same outer window, after
+        ``bulk_store`` has already opened it with a real inserted row, must
+        not touch that transaction -- the inserted rows must still commit
+        together with the (unaffected) vetoed thought once the outer window
+        closes.
+        """
+        db_path = tmp_path / "bulk-store-batch-untouched.sqlite"
+        db = await aiosqlite.connect(str(db_path))
+        try:
+            db.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(db, embedding_provider=None, auto_embed=False)
+            await store.ensure_schema()
+            await store.create_thought(_make_thought("vetoed"))
+            await self._install_ignore_trigger(db)
+
+            async with store.suspend_auto_commit():
+                await store.bulk_store([_make_thought("b1"), _make_thought("b2")])
+                deleted = await store.delete_thought("vetoed")
+                assert deleted is False
+                assert db.in_transaction is True, (
+                    "the outer window's transaction, opened by bulk_store's "
+                    "own inserts, must still be open here"
+                )
+
+            assert db.in_transaction is False, "the window's own clean exit must commit"
+            assert await store.get_thought("b1") is not None
+            assert await store.get_thought("b2") is not None
+            assert await store.get_thought("vetoed") is not None
+        finally:
+            await db.close()
+
+    async def test_explicit_begin_survives_a_vetoed_delete(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Ownership case 3: a caller's own explicit ``BEGIN``.
+
+        A caller that issues a raw ``BEGIN`` directly on the connection --
+        bypassing ``suspend_auto_commit`` entirely, with nothing written yet
+        -- owns that transaction. ``_delete_thought_atomic`` must see
+        ``opened_transaction`` as ``False`` here too and leave it for the
+        caller's own commit/rollback to decide.
+
+        This calls ``_delete_thought_atomic`` directly rather than the public
+        ``delete_thought``: the public method always ends its own call with
+        an unconditional ``_maybe_commit()`` (see its docstring), which
+        commits *any* open transaction whenever ``_skip_auto_commit`` is not
+        set -- caller-owned or not. That is ``delete_thought``'s own,
+        separate contract as a guarded write, unrelated to whether the
+        *veto branch inside* ``_delete_thought_atomic`` disturbs a
+        transaction it did not open. Only ``suspend_auto_commit`` suppresses
+        that outer commit (via ``_skip_auto_commit``), which is why cases 1
+        and 2 above route through the public method and this one does not: a
+        raw, unmediated ``BEGIN`` with no ``suspend_auto_commit`` window is
+        exactly the "known residual gap" ``_serialize_dedup_probe`` documents
+        for the sibling dedup path -- outside what any guarded write's own
+        commit step promises to leave alone.
+        """
+        db_path = tmp_path / "explicit-begin-untouched.sqlite"
+        db = await aiosqlite.connect(str(db_path))
+        try:
+            db.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(db, embedding_provider=None, auto_embed=False)
+            await store.ensure_schema()
+            await store.create_thought(_make_thought("vetoed"))
+            await self._install_ignore_trigger(db)
+
+            await db.execute("BEGIN")
+            deleted = await store._delete_thought_atomic("vetoed")
+
+            assert deleted is False
+            assert db.in_transaction is True, (
+                "the caller's own explicit BEGIN, opened before this call and "
+                "with nothing written under it yet, must still be open here"
+            )
+            await db.rollback()
+            assert await store.get_thought("vetoed") is not None
+        finally:
+            await db.close()
 
 
 class TestCleanupExpiredStrategies:

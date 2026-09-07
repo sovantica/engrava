@@ -108,7 +108,8 @@ deleted through a journaled store path, the journal records its
 **Below core schema 12 this cascade used to not happen — it now does not need to.**
 The `ON DELETE CASCADE` on `edge`, `embedding` and `action` arrives with the core-12
 migration, but `delete_thought` no longer depends on it: it deletes those three rows
-explicitly before deleting the thought, on every schema version. A vector is owned by
+explicitly, atomically with the parent delete that runs first, on every schema
+version. A vector is owned by
 the thought it belongs to, not by the presence of an `embedding` row, and that rule is
 also enforced in reconciliation, in the vector-index purge, and in search itself, so a
 database still below core-12 can no longer make a deleted thought's identifier
