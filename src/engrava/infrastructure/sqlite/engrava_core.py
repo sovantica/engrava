@@ -1058,18 +1058,47 @@ async def _close_quietly(conn: aiosqlite.Connection) -> None:
     -- a ``ConfigError``, a ``JournalIntegrityError``, an
     ``asyncio.CancelledError`` -- is lost. A close failure is real
     information, but it belongs logged underneath the original error, not
-    raised in front of it. Every place in this codebase that closes a
-    connection during cleanup (as opposed to on the ordinary success path,
-    where a close failure is the only thing to report) goes through this
-    rather than re-deriving the same try/except -- ``service_manager.py``
-    imports this same function rather than defining its own.
+    raised in front of it. **Use this for cleanup that closes a connection
+    while another exception -- or a cancellation -- is already
+    propagating.** A close on the ordinary success path, where a close
+    failure is the only thing there is to report, should propagate
+    normally instead of coming through here -- routing it through this
+    helper would silently turn a genuine close failure into a
+    successful-looking outcome. ``service_manager.py`` imports this same
+    function rather than defining its own. The CLI layer has the same rule
+    under the same name in :mod:`engrava.cli.main` -- not shared as one
+    function across the CLI/infrastructure boundary, but copied rather
+    than re-derived.
+
+    ``await conn.close()`` is itself a suspension point, so a bare
+    ``try/except Exception`` around it has the identical gap this whole
+    helper exists to close: a cancellation arriving while the close is
+    in flight is a ``BaseException``, skips that handler, and can leave
+    the close abandoned mid-way with aiosqlite's non-daemon worker thread
+    still alive. The close is run as its own task and shielded so that
+    cancelling *this* coroutine does not also cancel the close itself;
+    the shield alone would not be enough, though, since it only stops the
+    cancellation from reaching the close, not from being re-thrown into
+    this coroutine before the close finishes running. So on cancellation
+    this explicitly awaits the same task again -- now cancellation-proof,
+    since a second throw only happens on an explicit second
+    ``cancel()`` -- to hold this coroutine (and so whatever awaits it,
+    keeping the event loop alive) open until the real close has actually
+    completed, before letting the cancellation propagate.
 
     Args:
         conn: The aiosqlite connection to close.
 
     """
     try:
-        await conn.close()
+        close_task = asyncio.ensure_future(conn.close())
+        await asyncio.shield(close_task)
+    except asyncio.CancelledError:
+        try:
+            await close_task
+        except Exception:  # noqa: BLE001
+            logger.warning("Error closing connection during cleanup", exc_info=True)
+        raise
     except Exception:  # noqa: BLE001
         logger.warning("Error closing connection during cleanup", exc_info=True)
 
@@ -2118,11 +2147,35 @@ class SqliteEngravaCore:
     async def __aexit__(self, *exc: object) -> None:
         """Exit the async context manager and close if owned.
 
+        When the ``async with`` body already raised, that is what the
+        caller needs to see, so a failure from :meth:`close` here is
+        secondary: logged rather than allowed to replace it, the same rule
+        :func:`_close_quietly` applies to a bare ``await conn.close()``
+        during cleanup, applied here to :meth:`close` itself since this
+        call has no raw connection of its own to route through that
+        helper. A cancellation reaching this ``__aexit__`` call is a
+        distinct signal, not a mere close failure, and is never swallowed.
+        On a clean exit (no exception from the body), a close failure is
+        not secondary to anything -- it is the only error there is, so it
+        propagates normally.
+
         Args:
             *exc: Exception info (type, value, traceback).
 
         """
-        await self.close()
+        if exc[1] is None:
+            await self.close()
+            return
+        try:
+            await self.close()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Error closing connection in __aexit__ while the context "
+                "body's exception was propagating",
+                exc_info=True,
+            )
 
     async def _configure_vector_backend(
         self,

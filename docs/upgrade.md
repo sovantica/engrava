@@ -1216,11 +1216,12 @@ corrupt-file opens.
 **Who is affected.** The real axis is not "shutdown", and not cancellation
 either — it is **whether a failure during construction or close reaches a
 cleanup that runs to completion and preserves the original error, whether
-or not a cancellation is involved** — with one limit: `_close_quietly`
-itself only catches `Exception`, so a `CancelledError` landing during its
-own `await conn.close()` still escapes and replaces the original error
-(see "What changed" below). The four cases below all involve an ordinary
-`Exception` cleanup failure and are unaffected by that limit:
+or not a cancellation is involved** — with one residual limit: a *second*
+cancellation delivered to `_close_quietly` while it is already draining a
+first one can still abandon the close before it completes (see "What
+changed" below). The four cases below all involve an ordinary `Exception`
+cleanup failure, or at most a single cancellation, and are unaffected by
+that residual:
 
 - Anyone who has pointed (or might point) an engrava CLI command at a
   corrupt or truncated database file. This bug shipped in 0.5.0: `_open_db`
@@ -1285,15 +1286,23 @@ re-raising the cancellation only afterward. Cleanup is also routed through a
 shared `_close_quietly` helper that catches `Exception` and logs it rather
 than raising, so an ordinary close failure during cleanup never replaces
 the original error that triggered the cleanup — on any revision-vs-0.6.x
-construction failure, cancelled or not. **This is not fixed for every
-failure at that point.** `_close_quietly` only catches `Exception`; an
-`asyncio.CancelledError` delivered to its own `await conn.close()` — the
-same suspension point this change is protecting — is a `BaseException`,
-not an `Exception`, so it still escapes, aborts the cleanup, and replaces
-the original construction error. This is the same `except Exception` /
-`BaseException` gap this change closes elsewhere, left open in the one
-helper written to guard against it; the source is tracked separately, not
-in scope for this note.
+construction failure, cancelled or not. **A single cancellation landing
+during `_close_quietly`'s own `await conn.close()` — the same suspension
+point this whole change is protecting — no longer aborts the close.**
+The close now runs as its own task, shielded from that first
+cancellation; on catching it, `_close_quietly` explicitly awaits the same
+task again — unshielded, but a second throw into that await only happens
+on an explicit second `cancel()` — so the close is held open until it has
+actually completed before the cancellation is allowed to propagate. **A
+second cancellation delivered while that second await is in flight is not
+covered**: an unshielded `await` on a task propagates the awaiting
+coroutine's own cancellation into that task, so this one genuinely
+interrupts `conn.close()` mid-flight, abandons the close, and replaces
+whatever error — including a construction failure the cleanup exists to
+protect — is currently propagating with this new `CancelledError`. The
+residual is narrower than before, not gone: it now takes two
+cancellations arriving in that specific window, not one, and it is
+tracked separately, not in scope for this note.
 
 **What to do.** Nothing, unless a script wrapped CLI invocations in its own
 timeout-and-kill logic to work around the old hang — that workaround is no
@@ -1303,12 +1312,27 @@ indefinite hang. A library caller that wraps `from_config()`, `get_store()`,
 or a store's `close()` / `close_all()` in a timeout, or whose surrounding
 task can otherwise be cancelled during any of those calls, no longer needs
 its own workaround for a leaked connection worker in the ordinary case —
-construction and close alike now close the connection before the
-cancellation propagates. **One window survives**: a cancellation delivered
-to the cleanup's own `await conn.close()`, described above, still escapes
-before that close completes, so the worker can leak there. The exposure is
-narrowed, not removed; a caller that must be certain across that window
-still needs its own guard. If your
+construction and close alike now close the connection before a single
+cancellation propagates. **One window survives**: a *second* cancellation
+delivered to the cleanup's own `await conn.close()` while it is already
+draining a first one, described above, still escapes before that close
+completes, so the worker can leak there. The exposure is narrowed to that
+double-cancellation window, not removed; reaching it takes two independent
+cancellation requests landing on the same task, not one. **Neither
+`TaskGroup` nor `asyncio.timeout()` does that on its own** — verified by
+reading both directly: `Timeout._on_timeout()` calls `task.cancel()` from a
+single scheduled callback with no reschedule, and `TaskGroup._abort()`
+cancels each child once and then guards itself on its own `_aborting`
+flag, never calling `cancel()` again on a task it has already aborted. A
+task that swallows that one cancellation and keeps running is left
+running, not cancelled a second time — confirmed directly: made to
+swallow it, a task under either just hangs past the deadline instead of
+being cancelled again. What would actually reach this window is a caller
+that itself issues a second, independent `cancel()` on the same task — a
+manual cancel-then-force-cancel escalation is the shape — but no call
+site in this codebase does that, so no example is given here; verify that
+any caller you have in mind genuinely calls `cancel()` twice before
+assuming it is exposed. If your
 error handling for a `from_config()` failure branches on the *type* of the
 raised exception, re-check it against the original construction error, not
 whatever a coincidentally-failing cleanup used to surface in its place.

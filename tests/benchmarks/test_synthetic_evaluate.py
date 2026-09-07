@@ -898,6 +898,80 @@ async def _make_reflection(
     return persisted.thought_id
 
 
+class TestMeasureSynthesisCoverageCleanupClose:
+    """``measure_synthesis_coverage`` must not let a close failure replace the body's.
+
+    It used a bare ``async with aiosqlite.connect(...) as db:`` --
+    ``aiosqlite.Connection.__aexit__`` is an unconditional ``await
+    close()`` and cannot distinguish a cleanup close (something in the
+    body already raised) from a success-path one, so a failure in that
+    close replaced whatever the body actually raised. Same defect
+    ``_close_quietly`` exists to prevent for a raw ``conn.close()``, one
+    layer down in a third party's context manager -- ``evaluate_run`` and
+    ``_process_question`` (``runner.py``) shared the identical bug and
+    fix.
+    """
+
+    async def test_body_failure_survives_a_failing_cleanup_close(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A close failure during cleanup must not replace the body's own failure.
+
+        Forces ``ensure_schema()`` to raise a ``ValueError`` and the
+        subsequent cleanup close to also raise. Before the fix, the
+        close's ``RuntimeError`` would have replaced the ``ValueError``
+        the caller actually needs to see; after the fix, the
+        ``ValueError`` propagates and the close failure is only logged.
+        """
+        import engrava.benchmarks.synthetic.evaluate as evaluate_module
+
+        close_calls = {"n": 0}
+        real_connect = evaluate_module.aiosqlite.connect
+
+        def _spy_connect(*args: object, **kwargs: object) -> object:
+            # ``aiosqlite.connect()`` itself is synchronous -- it returns
+            # a ``Connection`` proxy immediately without opening anything;
+            # the real connect happens lazily on ``await``/``async with``.
+            # Patching ``close`` here (before either) keeps the returned
+            # object a genuine ``Connection`` that still supports both
+            # calling conventions, so this spy works whether the caller
+            # does ``await aiosqlite.connect(...)`` (the fixed shape) or
+            # ``async with aiosqlite.connect(...) as db:`` (the old one).
+            conn = real_connect(*args, **kwargs)
+            real_close = conn.close
+
+            async def _close_blows_up() -> None:
+                # Still performs the real close -- only its own failure
+                # report afterward is what this test is about.
+                close_calls["n"] += 1
+                await real_close()
+                msg = "close blew up during cleanup"
+                raise RuntimeError(msg)
+
+            conn.close = _close_blows_up
+            return conn
+
+        monkeypatch.setattr(evaluate_module.aiosqlite, "connect", _spy_connect)
+
+        async def _ensure_schema_blows_up(self: SqliteEngravaCore) -> None:
+            msg = "original body failure"
+            raise ValueError(msg)
+
+        monkeypatch.setattr(SqliteEngravaCore, "ensure_schema", _ensure_schema_blows_up)
+
+        with pytest.raises(ValueError, match="original body failure"):
+            await evaluate_module.measure_synthesis_coverage(
+                [object()],  # never inspected -- ensure_schema raises first
+                embedding_provider=object(),  # type: ignore[arg-type]
+            )
+
+        assert close_calls["n"] == 1, (
+            "the cleanup close was never attempted -- a regression that "
+            "drops the close call entirely would also let the original "
+            "ValueError escape untouched, so that alone is not enough"
+        )
+
+
 class TestRunEvaluationWrapper:
     """``run_evaluation`` drives asyncio for synchronous callers."""
 

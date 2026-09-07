@@ -204,9 +204,24 @@ class EngravaManager:
         try:
             cursor = await conn.execute("PRAGMA user_version")
             row = await cursor.fetchone()
-            return int(row[0]) if row else 0
-        finally:
+        except BaseException:
+            # Not ``except Exception``: a cancellation while the read is in
+            # flight must still close ``conn``. The read failed (or was
+            # cancelled) -- that is what the caller needs to see, so a
+            # failure in this closing call is secondary and goes through
+            # ``_close_quietly`` rather than replacing it -- see that
+            # function's docstring.
+            await _close_quietly(conn)
+            raise
+        else:
+            # The read succeeded. A close failure here is not secondary to
+            # anything -- it is the only error there is, so it must
+            # propagate normally rather than being logged and swallowed by
+            # ``_close_quietly``. An unconditional
+            # ``finally: await _close_quietly(conn)`` would silently turn a
+            # genuine close failure into a successful-looking read.
             await conn.close()
+        return int(row[0]) if row else 0
 
     def service_exists(self, service_name: str) -> bool:
         """Check whether a service database file exists on disk.

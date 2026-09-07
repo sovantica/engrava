@@ -5,6 +5,7 @@ Tests all subcommands against an in-memory (temp file) SQLite database.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -23,7 +24,7 @@ if TYPE_CHECKING:
 from click.testing import CliRunner
 
 from engrava.cli.config import EngravaCLIConfig
-from engrava.cli.main import cli
+from engrava.cli.main import _close_quietly, cli
 
 # Literal SQL, never interpolated: a read-back that assembles its own query
 # cannot be trusted to disagree with the schema the command wrote to.
@@ -1086,6 +1087,107 @@ class TestSuccessPathCloseFailureIsNotSwallowed:
     def test_close_success_control_still_exits_zero(self, populated_db: Path) -> None:
         """Known-good control: an ordinary close on the success path still exits 0."""
         _assert_succeeds(["--db", str(populated_db), "info"])
+
+
+class _FakeConnection:
+    """Stand-in connection for testing the CLI's ``_close_quietly`` in isolation.
+
+    ``started`` fires the instant ``close()`` begins running, so a test can
+    wait for the close to genuinely be in flight before delivering a
+    cancellation -- no wall-clock sleep needed to land the race. ``may_finish``
+    then holds the close from completing until the test says so, which is
+    what makes the outcome deterministic rather than sleep-tuned: the
+    cancellation is guaranteed to land strictly before the close resolves,
+    and the close is guaranteed not to resolve on its own before the test
+    permits it.
+    """
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.may_finish = asyncio.Event()
+        self.finished = False
+
+    async def close(self) -> None:
+        self.started.set()
+        await self.may_finish.wait()
+        self.finished = True
+
+
+class _FailingConnection:
+    """A connection whose ``close()`` raises an ordinary exception."""
+
+    async def close(self) -> None:
+        msg = "close blew up"
+        raise RuntimeError(msg)
+
+
+class _SynchronouslyFailingConnection:
+    """A connection whose ``close()`` raises before returning an awaitable.
+
+    Not an ``async def`` -- calling ``conn.close()`` raises immediately,
+    before ``asyncio.ensure_future`` ever gets a coroutine to schedule.
+    Distinct from ``_FailingConnection``, whose exception only surfaces
+    once the resulting coroutine is awaited.
+    """
+
+    def close(self) -> None:
+        msg = "close blew up synchronously"
+        raise RuntimeError(msg)
+
+
+class TestCliCloseQuietlyCancellation:
+    """The CLI's own ``_close_quietly`` copy needs the same cancellation fix.
+
+    This module defines its own ``_close_quietly`` rather than importing the
+    infrastructure layer's (see that function's docstring), so the
+    escaped-``BaseException`` gap in ``await conn.close()`` had to be fixed
+    here independently too. These mirror
+    ``TestCloseQuietlyCancellation`` in ``tests/test_service_isolation.py``,
+    which covers the infrastructure copy.
+    """
+
+    async def test_the_close_still_completes_when_cancelled_mid_close(self) -> None:
+        """A cancellation mid-close must not abandon the close itself."""
+        conn = _FakeConnection()
+        task = asyncio.create_task(_close_quietly(conn))
+        await conn.started.wait()
+        task.cancel()
+        conn.may_finish.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert conn.finished, (
+            "conn.close() never ran to completion under cancellation -- the "
+            "exact leak _close_quietly exists to prevent"
+        )
+
+    async def test_an_ordinary_exception_from_close_is_still_swallowed_and_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Control: the documented, uncancelled behaviour must be unchanged."""
+        conn = _FailingConnection()
+        with caplog.at_level(logging.WARNING):
+            await _close_quietly(conn)
+
+        assert "Error closing connection during cleanup" in caplog.text
+
+    async def test_a_synchronous_close_failure_is_still_swallowed_and_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A close() that raises before returning an awaitable must not escape.
+
+        ``close_task = asyncio.ensure_future(conn.close())`` evaluates
+        ``conn.close()`` before scheduling anything -- if that line ever
+        sits outside the ``try``, a synchronous failure there escapes
+        instead of being logged and swallowed, changing the ordinary,
+        uncancelled contract this helper exists to keep.
+        """
+        conn = _SynchronouslyFailingConnection()
+        with caplog.at_level(logging.WARNING):
+            await _close_quietly(conn)
+
+        assert "Error closing connection during cleanup" in caplog.text
 
 
 class _FormatThatComparesAsAnother(str):

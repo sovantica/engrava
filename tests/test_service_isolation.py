@@ -15,6 +15,7 @@ import contextlib
 import datetime
 import hashlib
 import json
+import logging
 import time
 from pathlib import Path
 
@@ -48,6 +49,7 @@ from engrava.config import (
 from engrava.domain.protocols.derived_records import DeriveGates
 from engrava.infrastructure import service_manager as service_manager_module
 from engrava.infrastructure.service_manager import EngravaManager
+from engrava.infrastructure.sqlite.engrava_core import _close_quietly
 
 
 def _entry_names(directory: Path) -> list[str]:
@@ -775,6 +777,307 @@ class TestEngravaManager:
                         with contextlib.suppress(TimeoutError):
                             await asyncio.wait_for(stopped, timeout=5)
                     conn._thread.join(timeout=5)
+
+    async def test_peek_schema_version_failure_survives_a_failing_cleanup_close(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A close failure while peeking must not replace the read failure that caused it.
+
+        ``peek_schema_version`` used to do
+        ``try: ... finally: await conn.close()`` unconditionally: if the
+        ``PRAGMA`` read failed and the close also failed, the close's
+        exception replaced the read's -- exactly the defect
+        ``_close_quietly`` exists to prevent. Now routed through
+        ``_close_quietly`` on the failure path, mirroring
+        ``test_create_store_failure_survives_a_failing_cleanup_close`` above.
+        """
+        data_dir = tmp_path / "services"
+        async with EngravaManager(data_dir=data_dir) as mgr:
+            await mgr.get_store("peeked")  # creates the db file on disk
+
+        close_calls = {"n": 0}
+        real_connect = service_manager_module.aiosqlite.connect
+
+        async def _spy_connect(*args: object, **kwargs: object) -> aiosqlite.Connection:
+            conn = await real_connect(*args, **kwargs)
+            real_close = conn.close
+
+            async def _close_blows_up() -> None:
+                # Still performs the real close -- only its own failure
+                # report afterward is what this test is about.
+                close_calls["n"] += 1
+                await real_close()
+                msg = "close blew up during cleanup"
+                raise RuntimeError(msg)
+
+            conn.close = _close_blows_up
+
+            async def _execute_blows_up(*args: object, **kwargs: object) -> None:
+                msg = "original pragma-read failure"
+                raise ValueError(msg)
+
+            conn.execute = _execute_blows_up
+            return conn
+
+        monkeypatch.setattr(service_manager_module.aiosqlite, "connect", _spy_connect)
+
+        mgr2 = EngravaManager(data_dir=data_dir)
+        with pytest.raises(ValueError, match="original pragma-read failure"):
+            await mgr2.peek_schema_version("peeked")
+
+        assert close_calls["n"] == 1, (
+            "the cleanup close was never attempted -- a regression that "
+            "drops the close call entirely would also let the original "
+            "ValueError escape untouched, so that alone is not enough"
+        )
+
+    async def test_peek_schema_version_close_failure_on_success_is_not_swallowed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A close failure after a successful read is not secondary to anything.
+
+        Mirrors ``TestSuccessPathCloseFailureIsNotSwallowed`` in
+        ``tests/test_cli.py``: an unconditional
+        ``finally: await _close_quietly(conn)`` would silently turn a
+        genuine close failure into a value that looks like a real schema
+        version.
+        """
+        data_dir = tmp_path / "services"
+        async with EngravaManager(data_dir=data_dir) as mgr:
+            await mgr.get_store("peeked")
+
+        real_connect = service_manager_module.aiosqlite.connect
+
+        async def _spy_connect(*args: object, **kwargs: object) -> aiosqlite.Connection:
+            conn = await real_connect(*args, **kwargs)
+            real_close = conn.close
+
+            async def _close_blows_up() -> None:
+                await real_close()
+                msg = "close blew up on the success path"
+                raise RuntimeError(msg)
+
+            conn.close = _close_blows_up
+            return conn
+
+        monkeypatch.setattr(service_manager_module.aiosqlite, "connect", _spy_connect)
+
+        mgr2 = EngravaManager(data_dir=data_dir)
+        with pytest.raises(RuntimeError, match="close blew up on the success path"):
+            await mgr2.peek_schema_version("peeked")
+
+
+# ------------------------------------------------------------------
+# _close_quietly cancellation handling (infrastructure copy)
+# ------------------------------------------------------------------
+
+
+class _FakeConnection:
+    """Stand-in aiosqlite connection for testing ``_close_quietly`` in isolation.
+
+    ``started`` fires the instant ``close()`` begins running, so a test can
+    wait for the close to genuinely be in flight before delivering a
+    cancellation -- no wall-clock sleep needed to land the race. ``may_finish``
+    then holds the close from completing until the test says so, which is
+    what makes the outcome deterministic rather than sleep-tuned: the
+    cancellation is guaranteed to land strictly before the close resolves,
+    and the close is guaranteed not to resolve on its own before the test
+    permits it.
+    """
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.may_finish = asyncio.Event()
+        self.finished = False
+
+    async def close(self) -> None:
+        self.started.set()
+        await self.may_finish.wait()
+        self.finished = True
+
+
+class _FailingConnection:
+    """A connection whose ``close()`` raises an ordinary exception."""
+
+    async def close(self) -> None:
+        msg = "close blew up"
+        raise RuntimeError(msg)
+
+
+class _SynchronouslyFailingConnection:
+    """A connection whose ``close()`` raises before returning an awaitable.
+
+    Not an ``async def`` -- calling ``conn.close()`` raises immediately,
+    before ``asyncio.ensure_future`` ever gets a coroutine to schedule.
+    Distinct from ``_FailingConnection``, whose exception only surfaces
+    once the resulting coroutine is awaited.
+    """
+
+    def close(self) -> None:
+        msg = "close blew up synchronously"
+        raise RuntimeError(msg)
+
+
+class TestCloseQuietlyCancellation:
+    """``_close_quietly`` must close the connection even under cancellation.
+
+    ``await conn.close()`` is a suspension point, so the original
+    ``try: await conn.close() / except Exception`` body had the identical
+    gap the surrounding commit (d706f88) exists to close: a cancellation
+    landing while the close itself is suspended is a ``BaseException``, not
+    an ``Exception``, escapes uncaught -- correctly, cancellation must
+    propagate -- but leaves the close abandoned mid-flight, stranding
+    aiosqlite's non-daemon connection worker thread exactly like the
+    original corrupt-file hang. These exercise the helper directly, without
+    a real database, since the failure is about the shape of the exception
+    handler rather than anything sqlite-specific.
+    """
+
+    async def test_the_close_still_completes_when_cancelled_mid_close(self) -> None:
+        """A cancellation mid-close must not abandon the close itself.
+
+        The cancellation is delivered only after ``conn.close()`` is
+        observed to have actually started (``started.wait()``), and the
+        close is not permitted to finish until after that cancellation has
+        been requested (``may_finish`` is set afterward) -- so this
+        reliably exercises the exact window the escaped-BaseException gap
+        lived in, without depending on timing. Both outcomes are asserted:
+        the cancellation must still reach the caller, and the close must
+        still have run to completion.
+        """
+        conn = _FakeConnection()
+        task = asyncio.create_task(_close_quietly(conn))
+        await conn.started.wait()
+        task.cancel()
+        conn.may_finish.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert conn.finished, (
+            "conn.close() never ran to completion under cancellation -- the "
+            "exact leak _close_quietly exists to prevent"
+        )
+
+    async def test_an_ordinary_exception_from_close_is_still_swallowed_and_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The documented, uncancelled behaviour must be unchanged.
+
+        This is the control for the cancellation fix above: a close() that
+        raises a plain ``Exception`` -- no cancellation involved at all --
+        must still be logged and swallowed exactly as before, never
+        propagated. If this regresses, the fix for the cancellation gap
+        went too far.
+        """
+        conn = _FailingConnection()
+        with caplog.at_level(logging.WARNING):
+            await _close_quietly(conn)
+
+        assert "Error closing connection during cleanup" in caplog.text
+
+    async def test_a_synchronous_close_failure_is_still_swallowed_and_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A close() that raises before returning an awaitable must not escape.
+
+        ``close_task = asyncio.ensure_future(conn.close())`` evaluates
+        ``conn.close()`` before scheduling anything -- if that line ever
+        sits outside the ``try``, a synchronous failure there escapes
+        instead of being logged and swallowed, changing the ordinary,
+        uncancelled contract this helper exists to keep.
+        """
+        conn = _SynchronouslyFailingConnection()
+        with caplog.at_level(logging.WARNING):
+            await _close_quietly(conn)
+
+        assert "Error closing connection during cleanup" in caplog.text
+
+
+class TestAexitPreservesBodyException:
+    """``SqliteEngravaCore.__aexit__`` must not let a close failure replace the body's.
+
+    ``__aexit__`` used to do a bare ``await self.close()``. If the
+    ``async with`` body already raised and ``close()`` then raised its own
+    ordinary exception, Python's own ``with``-statement semantics make the
+    ``__aexit__`` exception the one the caller sees -- the body's becomes
+    only its ``__context__`` -- exactly the defect ``_close_quietly``
+    exists to prevent for a raw ``conn.close()``, here one layer up at
+    :meth:`SqliteEngravaCore.close` itself, which ``__aexit__`` cannot
+    route through that helper directly since it has no raw connection of
+    its own.
+    """
+
+    async def test_body_exception_survives_a_failing_close(
+        self, tmp_path: Path
+    ) -> None:
+        """The body's exception must win over a close failure during __aexit__.
+
+        Mirrors ``test_create_store_failure_survives_a_failing_cleanup_close``
+        and ``test_peek_schema_version_failure_survives_a_failing_cleanup_close``
+        above, one layer up: the close attempted here is
+        ``SqliteEngravaCore.close()`` itself, not a raw ``conn.close()``.
+        """
+        db_path = tmp_path / "aexit.db"
+        conn = await aiosqlite.connect(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        store._owns_connection = True  # noqa: SLF001
+        await store.ensure_schema()
+
+        close_calls = {"n": 0}
+        real_close = conn.close
+
+        async def _close_blows_up() -> None:
+            # Still performs the real close -- only its own failure report
+            # afterward is what this test is about.
+            close_calls["n"] += 1
+            await real_close()
+            msg = "close blew up during __aexit__"
+            raise RuntimeError(msg)
+
+        conn.close = _close_blows_up
+
+        with pytest.raises(ValueError, match="original body failure"):
+            async with store:
+                msg = "original body failure"
+                raise ValueError(msg)
+
+        assert close_calls["n"] == 1, (
+            "the close on __aexit__ was never attempted -- a regression "
+            "that stops calling close() entirely would also let the "
+            "ValueError escape untouched, so that alone is not enough"
+        )
+
+    async def test_close_failure_on_a_clean_exit_is_not_swallowed(
+        self, tmp_path: Path
+    ) -> None:
+        """When the body does not raise, a close failure is the only error there is.
+
+        Mirrors ``test_peek_schema_version_close_failure_on_success_is_not_swallowed``
+        above: an unconditional swallow-and-log in ``__aexit__`` would
+        silently turn a genuine close failure on a clean exit into a
+        successful-looking ``async with`` block.
+        """
+        db_path = tmp_path / "aexit_clean.db"
+        conn = await aiosqlite.connect(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        store._owns_connection = True  # noqa: SLF001
+        await store.ensure_schema()
+
+        real_close = conn.close
+
+        async def _close_blows_up() -> None:
+            await real_close()
+            msg = "close blew up on a clean exit"
+            raise RuntimeError(msg)
+
+        conn.close = _close_blows_up
+
+        with pytest.raises(RuntimeError, match="close blew up on a clean exit"):
+            async with store:
+                pass
 
 
 # ------------------------------------------------------------------

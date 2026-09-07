@@ -110,12 +110,35 @@ async def _close_quietly(conn: Any) -> None:  # noqa: ANN401
     function across the CLI/infrastructure boundary, but copied rather
     than re-derived.
 
+    ``await conn.close()`` is itself a suspension point, so a bare
+    ``try/except Exception`` around it has the identical gap this whole
+    helper exists to close: a cancellation arriving while the close is
+    in flight is a ``BaseException``, skips that handler, and can leave
+    the close abandoned mid-way with aiosqlite's non-daemon worker thread
+    still alive. The close is run as its own task and shielded so that
+    cancelling *this* coroutine does not also cancel the close itself;
+    the shield alone would not be enough, though, since it only stops the
+    cancellation from reaching the close, not from being re-thrown into
+    this coroutine before the close finishes running. So on cancellation
+    this explicitly awaits the same task again -- now cancellation-proof,
+    since a second throw only happens on an explicit second
+    ``cancel()`` -- to hold this coroutine (and so whatever awaits it,
+    keeping the event loop alive) open until the real close has actually
+    completed, before letting the cancellation propagate.
+
     Args:
         conn: The aiosqlite connection to close.
 
     """
     try:
-        await conn.close()
+        close_task = asyncio.ensure_future(conn.close())
+        await asyncio.shield(close_task)
+    except asyncio.CancelledError:
+        try:
+            await close_task
+        except Exception:  # noqa: BLE001
+            logger.warning("Error closing connection during cleanup", exc_info=True)
+        raise
     except Exception:  # noqa: BLE001
         logger.warning("Error closing connection during cleanup", exc_info=True)
 
