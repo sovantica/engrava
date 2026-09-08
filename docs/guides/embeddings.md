@@ -63,11 +63,16 @@ async with await SqliteEngravaCore.from_config("engrava.yaml") as store:
 
 ### When auto-embed fails (the honest boundary)
 
-`create_thought` commits the thought **before** it auto-embeds. So if the
+`create_thought` runs auto-embed **after** inserting the thought row — but
+whether that row is durable yet depends on whether this call owns the
+outermost transaction. On its own (the common case, no enclosing
+`suspend_auto_commit()` window), the insert has already committed, so if the
 embedding provider fails (network blip, rate limit, a crashing local model), the
 thought is already persisted — it just has no embedding, which means it is
-**invisible to vector search** until re-embedded. This is an existing property,
-not a new one, and it is surfaced two ways:
+**invisible to vector search** until re-embedded. Nested inside the caller's
+own `suspend_auto_commit()` window, nothing is durable yet: the outermost
+window's exit decides — caught and exited cleanly, the row commits; uncaught,
+it rolls back with the rest of that window. This is surfaced two ways:
 
 - The failure is **never silent**: a `WARNING` naming the thought id and the
   provider error is always logged, then the provider's own exception propagates
@@ -75,8 +80,8 @@ not a new one, and it is surfaced two ways:
 - Set `require_embedding: true` (config) or `require_embedding=True` (constructor)
   to turn that failure into a typed `EmbeddingGenerationError` — the explicit
   fail-fast for operators who would rather the write raise loudly than leave an
-  unembedded thought behind. The thought is still committed either way; the flag
-  only governs how loudly the missing embedding is reported.
+  unembedded thought behind. The flag only governs how loudly the missing
+  embedding is reported, not the durability outcome above.
 
 ```python
 import aiosqlite
@@ -101,8 +106,11 @@ async def strict_ingest(provider: object, text: str) -> None:
 
 ### Batch ingest embeds in one call
 
-`bulk_store` persists many thoughts in a single all-or-nothing transaction and,
-when `auto_embed` is on, embeds them all in **one** batch provider call (using
+`bulk_store` persists many thoughts in a single transaction that is
+all-or-nothing when it owns that transaction outright — nested inside a
+caller's own `suspend_auto_commit()`, a caught failure can still commit the
+batch's already-inserted rows (see the [API reference](../api-reference.md))
+— and, when `auto_embed` is on, embeds them all in **one** batch provider call (using
 the role-aware `embed_document_batch` when the provider exposes it, else
 `embed_batch`) instead of one round trip per thought. The stored vectors are
 identical to embedding each thought individually. `get_or_create` and

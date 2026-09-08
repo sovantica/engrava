@@ -344,7 +344,9 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     (
         "docs/dreaming.md",
         "class MySignal:",
-        "undefined config; custom-signal class (wiring asserted in the extensions test)",
+        "self-contained but synchronous — not wrapped in the asyncio.run(main()) "
+        "shape the execute-layer harness requires; wiring asserted in the "
+        "extensions test",
     ),
     (
         "docs/dreaming.md",

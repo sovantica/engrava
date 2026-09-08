@@ -115,7 +115,19 @@ scheme has a window where a scrape reads a value nobody measured. Use a
 [custom collector](https://prometheus.github.io/client_python/collector/custom/)
 instead — it queries the store fresh on every scrape and yields nothing at
 all when `measured` is false, so there is no registration window, no stale
-value between ticks, and no separate setup step to get wrong:
+value between ticks, and no separate setup step to get wrong.
+
+**The pattern below is written for a WSGI-style exposition**
+(`start_http_server()`), where `collect()` runs on a thread with no event loop
+of its own. It is the wrong shape for an ASGI application (e.g. one mounting
+`prometheus_client.make_asgi_app()`): there, `collect()` runs on the app's own
+running loop, and this pattern's internal `asyncio.run()` call raises. For an
+ASGI deployment, do the async store read once in your own request handler and
+register a collector over the already-computed metric families instead — its
+`collect()` then returns that precomputed list synchronously, with nothing
+left for it to await. We do not carry a tested ASGI example here; see the
+comment inside `collect()` below for exactly where and why this shape fails
+under one.
 
 ```python
 import asyncio
@@ -246,11 +258,20 @@ works too and additionally returns the live counts.)
 The library logs through the standard `logging` module under the **`engrava.*`**
 namespace (each module uses `logging.getLogger(__name__)`, e.g.
 `engrava.extensions.dreaming`, `engrava.extensions.vector_sqlite_vec`,
-`engrava.config`). It logs at **`WARNING`** (degraded conditions, e.g. sqlite-vec
-unavailable → numpy fallback), **`INFO`** (dreaming progress), and **`DEBUG`**
-(detailed internals) — it does **not** log at `ERROR`/`CRITICAL`; failures are
-raised as typed exceptions for the caller to handle. Configure it like any
-library logger:
+`engrava.config`). As a general rule it logs at **`WARNING`** (degraded
+conditions, e.g. sqlite-vec unavailable → numpy fallback), **`INFO`**
+(dreaming progress), and **`DEBUG`** (detailed internals), and raises failures
+as typed exceptions for the caller to handle rather than logging them.
+`CRITICAL` is never used.
+
+The one departure: when the derived-records extension is enabled
+(`derive.enabled=True`, off by default, and only reachable with a producer
+capability configured) and a per-child rollback fails after its source has
+already committed, that failure logs at `ERROR` (`derive.on_error="log"`, the
+default for that setting) and the remaining children are abandoned without
+raising — the source is already durable, so under the default policy this must
+not escape as a caller-visible exception. This is the library's only `ERROR`
+call site. Configure it like any library logger:
 
 ```python
 import logging

@@ -262,7 +262,7 @@ own lock, so retrieval is naturally scoped and tenants are physically isolated.
 from engrava import EngravaManager, load_config
 
 config = load_config("engrava.yaml")
-async with EngravaManager.from_config(config.services) as mgr:
+async with await EngravaManager.from_config(config.services) as mgr:
     store_u1 = await mgr.get_store("u1")  # u1.db
     result = await store_u1.search_hybrid("dark mode", top_k=5)
 ```

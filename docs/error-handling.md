@@ -188,11 +188,19 @@ unchanged and assume that doing so re-embeds: an update that no longer changes
 ### Bulk ingest
 
 `bulk_store()` is different. Source rows, journal entries, and batch-generated
-embeddings run inside one `suspend_auto_commit()` transaction. Any `Exception`
-during that phase, including a provider exception, rolls the batch back. The
-`require_embedding` option controls whether that provider failure is wrapped as
-`EmbeddingGenerationError`; it does not change the rollback. Task cancellation
-is the `BaseException` caveat described under transaction contexts below.
+embeddings run inside one `suspend_auto_commit()` transaction. Called on its
+own, any `Exception` during that phase, including a provider exception, rolls
+the batch back and nothing from it is persisted. The `require_embedding` option
+controls whether that provider failure is wrapped as `EmbeddingGenerationError`;
+it does not change the rollback. Task cancellation is the `BaseException`
+caveat described under transaction contexts below.
+
+Nested inside a caller's own `suspend_auto_commit()` window, the batch shares
+that outer transaction: a row error still aborts the batch's own inserts, but
+only the outermost window's exit decides commit or rollback. If the caller
+catches the propagated exception and the outer window then exits cleanly, the
+batch's successful prefix commits along with the rest of the outer block's
+work instead of being rolled back.
 
 Automatic derivation runs only after the batch commits. A derivation failure can
 therefore leave the complete source batch durable and zero or more derived
@@ -385,7 +393,7 @@ Use these contracts narrowly:
 | `create_thought()` | Not idempotent; the same ID raises and a new ID creates another row |
 | `remember()` | Not idempotent; each call creates a fresh ID unless content deduplication is requested |
 | `create_thought(deduplicate=True)` / `get_or_create()` | Prevent duplicate content rows, but each hit increments `confirmation_count`; not observationally idempotent |
-| `bulk_store()` | Atomic through source+embedding commit, but not safe to replay blindly after a post-commit derivation failure |
+| `bulk_store()` | Atomic through source+embedding commit when it owns that transaction outright — nested inside a caller's own `suspend_auto_commit()`, a caught row error can still commit the batch's successful prefix, while a caught embedding failure (see [API reference](api-reference.md#embeddinggenerationerror)) commits every row the batch inserted instead, since that failure only fires after every row is already in — and, either way, not safe to replay blindly after a post-commit derivation failure |
 | Retrieval calls | Do not mutate graph content, but can buffer access-frequency events when access tracking is enabled |
 
 When an API is not listed as idempotent, assume that retry requires an

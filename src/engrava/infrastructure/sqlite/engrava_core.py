@@ -5806,7 +5806,8 @@ class SqliteEngravaCore:
         # Write-lock classification: under _write_lock via _bulk_store_inner's
         # own suspend_auto_commit() window, which holds the lock for its whole
         # duration (own body has no direct SQL).
-        """Persist many thoughts in a single all-or-nothing transaction.
+        """Persist many thoughts in a single transaction, all-or-nothing when
+        this call owns it.
 
         The batch analogue of :meth:`create_thought` for ingest paths that
         would otherwise loop ``create_thought`` (one commit — and, under
@@ -5815,10 +5816,18 @@ class SqliteEngravaCore:
 
         * **One commit** — every row commits together when the batch finishes,
           not once per row.
-        * **All-or-nothing** — if any row raises (duplicate id, metadata
-          violation, an embedding failure under ``require_embedding=True``, …)
-          the entire transaction is rolled back and *nothing* is persisted; the
-          exception propagates. Partial batches never land.
+        * **All-or-nothing when this call owns the transaction** — if any row
+          raises (duplicate id, metadata violation, an embedding failure under
+          ``require_embedding=True``, …) the entire transaction is rolled back
+          and *nothing* is persisted; the exception propagates. Partial
+          batches never land this way — **provided this call's own**
+          :meth:`suspend_auto_commit` **window is the outermost one.** Nested
+          inside a caller's own :meth:`suspend_auto_commit` window, only the
+          outermost window's exit decides commit or rollback (see that
+          method's docstring): this call's own raise does not roll anything
+          back at the inner level, so a caller that catches the error and lets
+          its own window exit cleanly commits the batch's successful prefix
+          along with the rest of its work.
         * **Order preserved** — the returned list is in input order, element
           *i* corresponding to ``thoughts[i]`` (or, under ``deduplicate=True``,
           the existing record that ``thoughts[i]`` collapsed onto).
@@ -5867,9 +5876,14 @@ class SqliteEngravaCore:
 
         Raises:
             ValueError: If any thought has a duplicate id or metadata that
-                violates the shape/size invariants (whole batch rolled back).
+                violates the shape/size invariants. Rolls the whole batch
+                back when this call's own :meth:`suspend_auto_commit` window
+                is the outermost one; nested inside a caller's own window,
+                only that outermost window's exit decides commit or rollback
+                (see above).
             EmbeddingGenerationError: If batch auto-embed fails and
-                ``require_embedding`` is ``True`` (whole batch rolled back).
+                ``require_embedding`` is ``True``. Same outermost-window
+                caveat as above.
             ConnectionQuarantinedError: When the connection has been quarantined.
 
         """
@@ -6848,8 +6862,12 @@ class SqliteEngravaCore:
         (one round trip, role-aware when the provider supports it). A provider
         failure is routed through :meth:`_on_auto_embed_failure` so it is logged
         and either re-raised or converted to :class:`EmbeddingGenerationError`
-        under ``require_embedding=True`` — and, because this runs inside
-        ``suspend_auto_commit``, that raise rolls the whole batch back.
+        under ``require_embedding=True``. Because this runs inside
+        ``suspend_auto_commit``, that raise rolls the whole batch back
+        **provided this call's own window is the outermost one** — nested
+        inside a caller's own ``suspend_auto_commit()`` window, the raise
+        does not roll anything back at this level, and the outer window's
+        clean exit commits the batch's successful prefix instead.
 
         Args:
             inserted: The freshly-inserted records to embed, in input order.
@@ -6865,9 +6883,11 @@ class SqliteEngravaCore:
             vectors = await _embed_documents_batch(provider, texts)
         except Exception as exc:  # noqa: BLE001 -- provider may raise any type; re-raised in handler
             # Attribute the whole-batch failure to the first inserted id — a
-            # representative, valid lookup key (not a silent drop of the others).
-            # The raise rolls the entire batch back under suspend_auto_commit, so
-            # every inserted row is un-done regardless of which id is named.
+            # representative, valid lookup key, not a promise that the row
+            # is gone. The raise rolls the entire batch back only when this
+            # call's own suspend_auto_commit window is outermost; nested in
+            # a caller's own window, that window's clean exit can still
+            # commit every row named here.
             self._on_auto_embed_failure(inserted[0].thought_id, exc)
         for record, vector in zip(inserted, vectors, strict=True):
             await self.store_embedding(
@@ -8188,13 +8208,40 @@ class SqliteEngravaCore:
     def _on_auto_embed_failure(self, thought_id: str, exc: Exception) -> NoReturn:
         """Surface an auto-embed provider failure, never silently.
 
-        Auto-embed runs *after* the thought (or batch) has already committed,
-        so a provider failure leaves the thought persisted but unembedded and
-        invisible to vector search. This handler makes that torn write visible:
-        it always emits a ``WARNING`` naming the thought id and the provider
-        error, then either re-raises the provider's own exception (default,
-        byte-identical to prior behaviour) or, under ``require_embedding=True``,
-        raises a typed :class:`EmbeddingGenerationError` — the opt-in fail-fast.
+        What is certain regardless of caller: the embedding was not
+        produced. Whether the thought row itself survives, and in what
+        state, does not depend on which call reached here — it depends on
+        whether that call owns the outermost transaction:
+
+        * **Owns it** (no enclosing ``suspend_auto_commit()`` window):
+          ``create_thought`` and ``update_thought`` have already
+          committed by the time this runs; called from
+          :meth:`_batch_embed_thoughts` on its own (a standalone
+          ``bulk_store``), the insert loop has already finished, so this
+          failure rolls the *entire* batch back instead — every row in
+          it, this one included — and none of them persist.
+        * **Does not own it** (nested inside a caller's own
+          ``suspend_auto_commit()`` window): nothing is durable yet. The
+          outermost window's exit decides — if the caller catches this
+          and that outer window exits cleanly, the rows commit (for a
+          batch, every row it inserted, see :meth:`bulk_store`);
+          uncaught, they roll back. This holds for every path,
+          single-item and batch alike.
+
+        Two facts stay path-specific regardless of which of the above
+        applies: ``create_thought`` leaves no embedding row at all, while
+        ``update_thought`` (only reached here when ``essence``/``content``
+        changed) leaves the previous embedding in place, now stale
+        against the new content, rather than removed.
+
+        See ``docs/api-reference.md``'s ``bulk_store`` and
+        ``EmbeddingGenerationError`` entries for the fuller treatment. This
+        handler makes the certain half of that outcome visible either way:
+        it always emits a ``WARNING`` naming the thought id and the
+        provider error, then either re-raises the provider's own exception
+        (default, byte-identical to prior behaviour) or, under
+        ``require_embedding=True``, raises a typed
+        :class:`EmbeddingGenerationError` — the opt-in fail-fast.
 
         Args:
             thought_id: UUID of the thought whose embedding failed.
@@ -8206,8 +8253,11 @@ class SqliteEngravaCore:
 
         """
         logger.warning(
-            "Auto-embed failed for thought %s: %s. The thought is persisted "
-            "but has no embedding and is not reachable by vector search.",
+            "Auto-embed failed for thought %s: %s. The embedding was not "
+            "produced. Whether the thought row survives, and in what "
+            "state, depends on the call that raised this and its "
+            "surrounding transaction — see docs/api-reference.md for the "
+            "specific outcomes.",
             thought_id,
             exc,
         )
@@ -11167,7 +11217,9 @@ class SqliteEngravaCore:
             )
             await self._maybe_commit()
         logger.debug(
-            "flushed access buffer: %d thought(s) updated in one batch",
+            "flushed access buffer: %d entries drained in one batch "
+            "(not necessarily the number of rows updated — a deleted "
+            "thought's entry still counts here)",
             len(params),
         )
         return len(params)
@@ -11428,9 +11480,11 @@ class SqliteEngravaCore:
     ) -> dict[str, float]:
         """Resolve the clamped decay multiplier for each candidate.
 
-        The ``decay_function`` hook is the third otherwise-dead hook; the hygiene
-        eviction score is its **only** call-site (it is never wired into search /
-        ranking / promotion). Its return is clamped to ``[0.0, 1.0]`` and a
+        Unlike ``on_store``/``on_retrieve``, which have always had call-sites
+        elsewhere, ``decay_function`` was dead code until this call-site was
+        added: the hygiene eviction score is its **only** call-site (it is
+        never wired into search / ranking / promotion). Its return is clamped
+        to ``[0.0, 1.0]`` and a
         non-finite value (``NaN`` / ``±inf``) is treated as ``1.0`` — the
         fail-safe direction, since decay can then only lower a score toward
         archive, never resurrect one above threshold or over-evict.

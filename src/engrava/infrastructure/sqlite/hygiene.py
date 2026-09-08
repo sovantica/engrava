@@ -8,10 +8,11 @@ two-stage archive then garbage-collect, journaling, and database access) lives
 on :class:`~engrava.infrastructure.sqlite.engrava_core.SqliteEngravaCore`.
 
 The keep-score reuses the inward dreaming signal library
-(:mod:`engrava.domain.dreaming`) and the same active-signal
-redistribution the dreaming scorer uses (a signal whose data source is flat
-across the candidate pool is dropped and its weight renormalised over the active
-set), but carries the hygiene weight vector and threshold so the two loops tune
+(:mod:`engrava.domain.dreaming`) and the same active-signal redistribution
+the dreaming scorer uses (a signal is dropped and its weight renormalised
+over the active set only when none of the candidates carries a value for
+its data at all — not merely when the candidates' values are identical),
+but carries the hygiene weight vector and threshold so the two loops tune
 independently.
 """
 
@@ -113,8 +114,9 @@ class HygieneResult:
             information is in the journal instead). Ordered by the deterministic
             archive selection order.
         flat_signals: Names of configured keep-signals that were inactive this
-            run (their data source was flat across the candidate pool), so their
-            weight was redistributed onto the active signals. Sorted.
+            run (their data source recorded no value at all for any candidate
+            this run, not merely a uniform one), so their weight was
+            redistributed onto the active signals. Sorted.
 
     Examples:
         >>> result = HygieneResult(archived_count=3, gc_count=0)

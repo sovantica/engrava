@@ -132,6 +132,7 @@ import aiosqlite
 from engrava import DeriveGates, SqliteEngravaCore, StructuralSplitProducer
 
 conn = await aiosqlite.connect("engrava.db")
+conn.row_factory = aiosqlite.Row
 store = SqliteEngravaCore(
     conn,
     hooks=StructuralSplitProducer(),

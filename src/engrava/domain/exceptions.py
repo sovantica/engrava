@@ -266,16 +266,39 @@ class EmbeddingQueryPrefixMismatchError(EngravaError):
 class EmbeddingGenerationError(EngravaError):
     """Raised when auto-embedding a thought fails under strict mode.
 
-    Auto-embed runs *after* ``create_thought`` (and the batch path)
-    has already committed the thought, so a provider failure would
-    otherwise leave the thought persisted without an embedding — a
-    silent, torn write invisible to vector search. By default the store
-    logs a ``WARNING`` naming the thought and re-raises the provider's
-    own exception (behaviour is unchanged for existing callers). When
-    the operator opts in via ``embeddings.require_embedding = true`` (or
-    ``require_embedding=True`` on the store), that failure is instead
-    normalised into this typed error — an explicit fail-fast signal that
-    the thought is persisted but unembedded.
+    What is certain regardless of call path: the embedding was not
+    produced, for the reason carried in the message. Whether the
+    *thought row* survives, and in what state, does not depend on which
+    call raised this — it depends on whether that call owns the outermost
+    transaction:
+
+    * **Owns it** (no enclosing ``suspend_auto_commit()`` window):
+      ``create_thought`` and ``update_thought`` have already committed by
+      the time this can be raised; a standalone ``bulk_store`` instead
+      rolls its whole batch back — every row in it, not just this one —
+      and none of them are persisted.
+    * **Does not own it** (nested inside a caller's own
+      ``suspend_auto_commit()`` window): nothing is durable yet. The
+      outermost window's exit decides — caught and that window exits
+      cleanly, the rows commit; uncaught, they roll back. This holds for
+      every path, single-item and batch alike.
+
+    Two facts stay path-specific regardless of which of the above
+    applies: ``create_thought`` leaves no embedding row at all, while
+    ``update_thought`` (only reached here when ``essence``/``content``
+    changed) leaves the previous embedding in place, now stale against
+    the new content — so the row stays findable by vector search against
+    outdated content.
+
+    See ``docs/api-reference.md``'s ``bulk_store`` and
+    ``EmbeddingGenerationError`` entries for the fuller treatment. By
+    default the store logs a ``WARNING`` naming the thought and re-raises
+    the provider's own exception (behaviour is unchanged for existing
+    callers). When the operator opts in via
+    ``embeddings.require_embedding = true`` (or ``require_embedding=True``
+    on the store), that failure is instead normalised into this typed
+    error — an explicit fail-fast signal whose durability outcome depends
+    on transaction ownership, per above.
 
     Args:
         thought_id: UUID of the thought whose embedding failed.
@@ -287,9 +310,11 @@ class EmbeddingGenerationError(EngravaError):
     def __init__(self, thought_id: str, message: str) -> None:
         self.thought_id = thought_id
         super().__init__(
-            f"Failed to auto-embed thought {thought_id}: {message}. "
-            f"The thought is persisted but has no embedding and is not "
-            f"reachable by vector search."
+            f"Failed to auto-embed thought {thought_id}: {message}. The "
+            f"embedding was not produced. Whether the thought row itself "
+            f"survives depends on the call that raised this and its "
+            f"surrounding transaction — see this exception's docstring for "
+            f"the specific outcomes."
         )
 
 

@@ -209,14 +209,19 @@ score and the connecting edge weight.
 ### Algorithm
 
 ```
+candidate_scores = { C: max(fts_score[C], vector_score[C]) for C in fusion pool }  # pool members only
 For each candidate C in the fusion pool:
   neighbours = get_edges(C, direction="BOTH", limit=max_neighbors)
                ordered by edge.weight DESC (deterministic)
   For each (edge, neighbour):
-    neighbour_base = max(fts_score[neighbour], vector_score[neighbour])
+    neighbour_base = candidate_scores.get(neighbour, 0.0)  # 0 if neighbour is off-pool
     boost[C] += edge.weight × neighbour_base × graph_edge_decay
 final_score[C] += graph_weight × boost[C]
 ```
+
+A neighbour outside the fusion pool contributes `0`, not its own fts/vector
+score — only pool members' base scores propagate (see
+[Graph-aware search](dreaming.md#graph-aware-search)).
 
 Key properties:
 

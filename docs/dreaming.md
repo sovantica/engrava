@@ -189,8 +189,10 @@ The remaining caps operate at different stages:
 ## Signals
 
 Signals compute a score in `[0.0, 1.0]` for each candidate thought.
-The weighted sum of all signal scores is compared against
-`promote_threshold`.
+The candidate's promotion score is a weighted sum over the signals
+**active for this run** — an inactive signal's weight is dropped and
+redistributed over the rest (see below) rather than counted at its
+configured weight — and that score is compared against `promote_threshold`.
 
 | Signal | Weight | Description |
 |--------|--------|-------------|
@@ -201,22 +203,35 @@ The weighted sum of all signal scores is compared against
 | `frequency` | 0.20 | Ratio of `access_count` to max (10). |
 | `action_outcome` | 0.15 | Thought's `action_outcome_score` — the mean outcome value over its terminal linked actions (`None` ⇒ contributes `0.0`). |
 
-A signal whose data source is flat across the whole candidate pool carries no
-ranking information, so it is dropped and its weight is redistributed over the
-active signals. `action_outcome` is therefore **inactive** — and its weight
-falls out of the denominator — in any store where no candidate has a recorded
-action outcome, so it never perturbs consolidation until actions are used. The
-default weights sum to more than 1.0 for this reason: they are relative
-priorities renormalised over the active set, not a probability distribution.
+A signal is dropped, and its weight redistributed over the active signals,
+when **none of the candidates in the pool carries a value at all** for its
+underlying data — not when the values happen to be identical across the pool.
+Two candidates that both have an explicit `confidence=0.5`, for example, keep
+the `confidence` signal active, because each carries a non-null value; only a
+pool where every candidate's `confidence` is unset (`None`) would drop it.
+`action_outcome` is therefore **inactive** — and its weight falls out of the
+denominator — in any store where no candidate has a recorded action outcome,
+so it never perturbs consolidation until actions are used. The default
+weights sum to more than 1.0 for this reason: they are relative priorities
+renormalised over the active set, not a probability distribution.
 
-Custom signals can be provided via `DreamingSignalProtocol`:
+Custom signals can be provided via `DreamingSignalProtocol`. `custom_signals` only
+supplies the *callable* for a name — the name itself must also carry a weight in
+`config.signals`, or it is never resolved:
 
 ```python
+from engrava import ThoughtRecord, DreamingContext
+from engrava.config import DreamingConfig
+from engrava.extensions.dreaming import DreamingExtension
+
+
 class MySignal:
     def __call__(self, thought: ThoughtRecord, ctx: DreamingContext) -> float:
         return 0.42
 
 
+config = DreamingConfig(enabled=True)
+config.signals["my_signal"] = 0.30  # required: registers the name and its weight
 ext = DreamingExtension(
     config=config,
     custom_signals={"my_signal": MySignal()},
@@ -320,13 +335,17 @@ proportional to the neighbour's score and the connecting edge weight.
 ### Algorithm
 
 ```
+candidate_scores = { C: max(fts[C], vector[C]) for C in fusion pool }  # pool members only
 For each candidate C in the fusion pool:
   neighbours = get_edges(C, direction="BOTH", limit=max_neighbors)
   For each (edge, neighbour):
-    neighbour_base = max(fts[neighbour], vector[neighbour])
+    neighbour_base = candidate_scores.get(neighbour, 0.0)  # 0 if neighbour is off-pool
     boost[C] += edge.weight × neighbour_base × graph_edge_decay
 final_score[C] += graph_weight × boost[C]
 ```
+
+A neighbour outside the fusion pool contributes `0`, not its own fts/vector
+score — only pool members' base scores propagate.
 
 ### Configuration
 
@@ -526,9 +545,14 @@ clusters (and REFLECTIONs) before any dream edges exist.
 ### Idempotence
 
 Before creating a REFLECTION, the extension derives a 16-hex content-hash
-from the sorted member IDs and checks whether any REFLECTION with
+from the sorted, **eligibility-filtered** member IDs — the same subset the
+metadata-aware eligibility filter above narrows the raw cluster down to, not
+the raw cluster itself — and checks whether any REFLECTION with
 `source = "dreaming:<hash>"` already exists (exact SQL index lookup,
-O(1), scales to any store size).  If found, the cluster is skipped.
+O(1), scales to any store size).  If found, the cluster is skipped. Because
+the hash is over the filtered subset, the same raw cluster scanned under a
+different eligibility configuration can legitimately hash differently and
+yield a new REFLECTION.
 
 Re-running `run_consolidation()` on unchanged data creates zero
 duplicate REFLECTIONs.

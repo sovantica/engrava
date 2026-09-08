@@ -82,11 +82,12 @@ page's own reproduction rule forbids carrying a prior revision's numbers under a
 release heading. Both measurements used:
 
 - Python `3.12.13`;
-- `sentence-transformers 5.6.0`;
-- `sentence-transformers/all-MiniLM-L6-v2` (the harness default); and
-- Engrava v0.5.0 revision `88b535b`.
+- `sentence-transformers 5.6.0`; and
+- `sentence-transformers/all-MiniLM-L6-v2` (the harness default).
 
-The v0.6.0 column now reports the candidate at `2918e38`. The 2026-07-23 run had
+The Engrava revision differs by column: the v0.5.0 column used v0.5.0
+revision `88b535b`, and the v0.6.0 column now reports the candidate at
+`2918e38`. The 2026-07-23 run had
 measured a **provisional** candidate at `1033a2e`, twenty `src/` commits earlier —
 including two in the dreaming path the binding measurements exercise — so those
 numbers were superseded before the tag rather than wrong when taken.

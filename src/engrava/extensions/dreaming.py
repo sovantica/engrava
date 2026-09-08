@@ -63,9 +63,12 @@ class DreamingExtension:
 
     Args:
         config: Parsed ``DreamingConfig`` with weights, gates, and schedule.
-        custom_signals: Optional overrides / additions for signal functions.
-            Keys matching a default signal name replace the default; new
-            keys extend the signal set.
+        custom_signals: Optional overrides for signal functions, keyed by
+            signal name. Only supplies the *callable*: a key here is
+            resolved only if that same name also carries a weight in
+            ``config.signals`` — a name matching a default signal replaces
+            the default callable, and a name absent from ``config.signals``
+            is never resolved, never scored, and raises no error.
 
     Raises:
         ValueError: If a signal name from config is unknown and not
@@ -217,6 +220,16 @@ class DreamingExtension:
         * **Promote-targets filter** — only thought types listed in
           ``config.promote_targets`` are eligible for promotion.
           Default is ``"OBS_ONLY"`` (OBSERVATION thoughts only).
+
+        Beyond promotion, this call also: creates dream edges from each
+        promoted thought to its most-similar prior candidates, when
+        ``config.edges.enabled``; clusters the candidate pool and
+        materialises new REFLECTION thoughts from qualifying clusters, when
+        ``config.gates.enable_reflections``; and — unconditionally, gated by
+        neither of those two flags nor by Memory Hygiene — sweeps orphaned
+        REFLECTIONs, flipping any whose entire ``CONSOLIDATED_FROM`` source
+        set has left ``ACTIVE`` from ``ACTIVE`` to ``ARCHIVED``. The sweep is
+        this method's only data-archiving step.
 
         Args:
             store: A store implementing the Dreaming capability protocol.
@@ -1100,7 +1113,9 @@ class DreamingExtension:
 
         1. Compute centroid embedding (mean of member vectors).
         2. Build structured content (top-N keywords + member IDs).
-        3. Derive an idempotence hash from sorted member IDs.
+        3. Derive an idempotence hash from the sorted, eligibility-filtered
+           member IDs (a cluster member the metadata filter rejects does not
+           feed the hash).
         4. Skip if a REFLECTION with the same hash already exists.
         5. Derive the REFLECTION's valid-time extent from its members
            (see ``derive_reflection_extent``), unless the caller pins an

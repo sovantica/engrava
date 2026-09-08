@@ -513,7 +513,12 @@ end: across every row's insert *and* across the batch embedding call. This is
 not new behaviour. Before `BEGIN IMMEDIATE` existed on this path, the first
 `INSERT` in the loop already took SQLite's RESERVED lock implicitly and held
 it for exactly as long, because `bulk_store` is documented as one
-all-or-nothing transaction per batch. `BEGIN IMMEDIATE` only moves *when* the
+all-or-nothing transaction per batch when it owns that transaction outright
+(see the [API reference](api-reference.md) for the nested-caller case, where
+a caught row error still commits the batch's successful prefix, and a caught
+embedding failure — which only fires after every row is already inserted —
+commits the whole batch instead; the lock is held for the same span either
+way). `BEGIN IMMEDIATE` only moves *when* the
 lock is acquired — to before the first row's probe instead of at the first
 row's insert — it does not change how long the lock is held.
 
@@ -602,7 +607,7 @@ tenant, per worker, per logical partition):
 from engrava import EngravaManager, load_config
 
 config = load_config("engrava.yaml")
-async with EngravaManager.from_config(config.services) as mgr:
+async with await EngravaManager.from_config(config.services) as mgr:
     store_a = await mgr.get_store("tenant_a")  # tenant_a.db
     store_b = await mgr.get_store("tenant_b")  # tenant_b.db
 ```

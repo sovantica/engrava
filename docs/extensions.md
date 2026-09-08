@@ -264,6 +264,7 @@ import aiosqlite
 from engrava import SqliteEngravaCore
 
 async with aiosqlite.connect("my.db") as db:
+    db.row_factory = aiosqlite.Row
     store = SqliteEngravaCore(db, manifests=[manifest])
     await store.ensure_schema()
     # migrations/001_initial.sql and 002_add_tags.sql are now applied

@@ -150,13 +150,12 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 
 | From | To | Supported | Notes |
 |---|---|---|---|
-| 0.2.0 | 0.2.2 | Yes | Patch-level upgrade, no dedicated new extension migration layer |
-| 0.2.2 | 0.3.0 | Yes | Minor upgrade with extension migration tracking and upgrade CI coverage |
+| 0.2.0 | 0.3.0 | Yes | No schema change (`user_version` unchanged). **No `0.2.2` release exists** — `git tag`, `CHANGELOG.md` (whose 0.3.0 entry compares directly against `v0.2.0`), and the upgrade-path CI spec (which pins `engrava==0.5.0`, not `0.2.2`) all agree there is no intermediate release; go directly from `0.2.0` to `0.3.0` |
 | 0.3.0 | 0.3.1 | Yes | Patch-level upgrade; no schema change (`user_version` unchanged) — safe to roll across workers |
 | 0.3.x | 0.4.0 | Yes | **Schema-changing** minor upgrade — adds the valid-time columns (additive, zero data loss). Back up first and follow the [rolling-upgrades](#rolling-upgrades-multiple-workers) note |
 | 0.4.x | 0.5.0 | Yes | **Schema-changing** minor upgrade (`user_version` 14 → 18), although the library API is drop-in. **Breaking for MCP-server users only:** the `engrava[mcp]` extra and the in-engrava `engrava-mcp` command are removed — the server moved to the standalone [`engrava-mcp`](https://github.com/sovantica/engrava-mcp) package (see the 0.4 → 0.5 note) |
 | 0.5.0 | 0.6.0 | Yes | **Schema-changing** minor upgrade (`user_version` 18 → 20), with two additive columns. Default retrieval now excludes archived thoughts, and wrong-dimension query vectors raise a typed error. An edge `decay_multiplier` of `0.0` no longer reads back as `1.0`, and a later update no longer rewrites it to `1.0` — values a 0.5.x update already overwrote stay overwritten. Back up, quiesce shared-store workers, migrate once, and review the [0.5 → 0.6 notes](#05---06) |
-| 0.6.x | 0.7.0 | Yes | No *database* schema change, but `EngravaMetrics.schema_version` moves `1 → 2` (see below). **Behaviour change:** when the resolved recency weight is `0.0` **and** a cognitive-cycle reference (`current_cycle`, explicit or via `cycle_provider`) is present, the query-less fallback path now treats recency as fully off instead of still decaying by cycle — which can change result order for stores with heterogeneous thought priorities. `recency_now` (transaction-time) callers are unaffected; that axis was already correct. Also in this release: two new `EngravaError` subclasses (`WriteContentionError`, `WriteLockTimeoutError`) can now come out of the dedup and guarded-write paths; `gc --dry-run` now names everything the real run deletes (edges, embeddings, and actions, not only orphaned edges); a deleted thought's vector can no longer resurface through search on a database that has not run the core-12 migration; and a corrupt or truncated database file now makes the CLI exit with an error instead of hanging. Review the [0.6 → 0.7 notes](#06---07) |
+| 0.6.x | 0.7.0 | Yes | No *database* schema change, but `EngravaMetrics.schema_version` moves `1 → 2` (see below). **Behaviour change:** when the resolved recency weight is `0.0` **and** a cognitive-cycle reference (`current_cycle`, explicit or via `cycle_provider`) is present, the query-less fallback path now treats recency as fully off instead of still decaying by cycle — which can change result order for stores with heterogeneous thought priorities. `recency_now` (transaction-time) callers are unaffected; that axis was already correct. Also in this release: three new `EngravaError` subclasses (`WriteContentionError`, `WriteLockTimeoutError`, `DedupLockReentryError`) can now come out of the dedup and guarded-write paths; a new public override seam, `prepare_thought_for_insert()`, restores pre-insert customization that `get_or_create()` / `upsert_by_hash()` had silently stopped routing through an overridden `create_thought()`; `gc --dry-run` now names everything the real run deletes (edges, embeddings, and actions, not only orphaned edges); a deleted thought's vector can no longer resurface through search on a database that has not run the core-12 migration; and a corrupt or truncated database file now makes the CLI exit with an error instead of hanging. Review the [0.6 → 0.7 notes](#06---07) |
 
 For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 `0.x.*` line do not change the schema and are low-risk; **minor** upgrades
@@ -1551,10 +1550,13 @@ against one database file.
 - Patch release: **no schema change** (`user_version` stays at its 0.3.0 value),
   so it is safe to roll across multiple workers without a quiesce.
 
-### 0.2.2 -> 0.3.0
+### 0.2.0 -> 0.3.0
 
 - Extension schema migration tracking is now part of the upgrade path.
-- Upgrade-path CI validates the `0.2.2 -> main` flow before release.
+- Upgrade-path CI validates the previous release against the current working
+  tree, not a fixed version pair — `ENGRAVA_UPGRADE_FROM_SPEC` is bumped on
+  every release (currently `engrava==0.5.0`) so the job always exercises
+  last-released -> `HEAD`.
 - Release notes and `CHANGELOG.md` now carry a dedicated `Database Changes`
   section for schema-affecting releases.
 

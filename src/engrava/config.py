@@ -94,11 +94,11 @@ _DEFAULT_DREAMING_SIGNALS: dict[str, float] = {
 
 The six weights intentionally sum to more than 1.0. The scoring path
 renormalises over the signals that are *active* for a given run (an inactive
-signal — one whose data source is flat across the candidate pool — is dropped
-from the denominator), so the configured map is a set of relative priorities,
-not a probability distribution. In particular ``action_outcome`` is inactive in
-an action-free store, so the remaining five renormalise exactly as before this
-signal existed.
+signal — one whose data source recorded no value at all for any candidate this
+run, not merely a uniform one — is dropped from the denominator), so the
+configured map is a set of relative priorities, not a probability distribution.
+In particular ``action_outcome`` is inactive in an action-free store, so the
+remaining five renormalise exactly as before this signal existed.
 """
 
 _DEFAULT_HYGIENE_SIGNALS: dict[str, float] = {
@@ -115,9 +115,10 @@ dreaming promotion weights: hygiene carries its own weight vector and threshold
 so a change to one loop's tuning never silently perturbs the other, even though
 both read the same signal library. The weights are relative priorities, not a
 probability distribution — the keep-score path renormalises over the signals
-that are *active* for a given run (an inactive signal, one whose data source is
-flat across the candidate pool, is dropped from the denominator), mirroring the
-active-signal redistribution the dreaming scorer uses. A high keep-score marks a
+that are *active* for a given run (an inactive signal, one whose data source
+recorded no value at all for any candidate this run, not merely a uniform one,
+is dropped from the denominator), mirroring the active-signal redistribution
+the dreaming scorer uses. A high keep-score marks a
 thought as worth retaining; a low keep-score (times the decay multiplier) is
 what drives an archive.
 """
@@ -1035,9 +1036,14 @@ class EmbeddingConfig:
             provider's own exception — byte-identical to the pre-existing
             behaviour. When ``True``, that failure is normalised into a typed
             :class:`~engrava.domain.exceptions.EmbeddingGenerationError`, the
-            explicit fail-fast an operator opts into (the thought is still
-            persisted, since auto-embed runs after the commit; the error
-            surfaces that it is unembedded). Only takes effect when
+            explicit fail-fast an operator opts into. Whether the thought is
+            already persisted when that happens depends on whether the
+            triggering call owns the outermost transaction: on its own (the
+            common case), ``create_thought``/``update_thought`` have already
+            committed by the time auto-embed runs, so the error surfaces
+            that the row is unembedded; nested inside the caller's own
+            ``suspend_auto_commit()`` window, nothing is durable yet and the
+            outermost window's exit decides. Only takes effect when
             ``auto_embed`` is enabled.
         device: Compute device for local providers (``"cpu"``, ``"cuda"``).
         batch_size: Batch encoding size for local providers.

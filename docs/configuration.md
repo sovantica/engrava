@@ -217,7 +217,7 @@ vector dimension lives under `extensions.vector.dimension`, not here.
 | `provider` | `str` | `null` | Provider type: `"sentence-transformer"`, `"openai-compatible"`, `"ollama"`, `"huggingface"` |
 | `model` | `str` | `null` | Model name or identifier |
 | `auto_embed` | `bool` | `false` | Auto-embed on `create_thought` / `update_thought` |
-| `require_embedding` | `bool` | `false` | Turn an auto-embed provider failure into a hard error. With the default `false`, a failure logs a `WARNING` naming the thought and re-raises the provider's own error; the thought is *already committed*, so it stays persisted without an embedding (invisible to vector search). Set `true` to instead raise a typed `EmbeddingGenerationError`, the explicit fail-fast an operator opts into. No effect unless `auto_embed` is on |
+| `require_embedding` | `bool` | `false` | Turn an auto-embed provider failure into a hard error. With the default `false`, a failure logs a `WARNING` naming the thought and re-raises the provider's own error. Whether the thought is already committed at that point depends on whether the triggering call owns the outermost transaction: owning it (no enclosing `suspend_auto_commit()` window), it is already committed, so it stays persisted without an embedding (invisible to vector search); nested inside the caller's own `suspend_auto_commit()` window, nothing is durable yet — that window's exit decides. Set `true` to instead raise a typed `EmbeddingGenerationError`, the explicit fail-fast an operator opts into. No effect unless `auto_embed` is on |
 | `device` | `str` | `"cpu"` | Compute device for local providers (`"cpu"`, `"cuda"`) |
 | `batch_size` | `int` | `32` | Batch encoding size for local providers |
 | `base_url` | `str` | `null` | Base URL for remote providers |
@@ -248,7 +248,7 @@ operations.
 | `enabled` | `bool` | `false` | Enable dreaming consolidation |
 | `schedule_every_n_cycles` | `int` | `100` | Positive cadence consumed by `DreamingExtension.is_due()` / `run_if_due()`; Engrava does not start a background scheduler. |
 | `promote_threshold` | `float` | `0.7` | Promotion requires a redistributed weighted score strictly greater than this value. |
-| `signals` | `map[str, float]` | see below | Relative promotion-signal weights. A partial YAML map merges onto the defaults. Flat signals are removed and active weights are renormalised per run. |
+| `signals` | `map[str, float]` | see below | Relative promotion-signal weights. A partial YAML map merges onto the defaults. A signal is removed and the active weights renormalised per run only when none of the candidates carries a value for its data at all — not merely when the candidates' values are identical (see [Signals](dreaming.md#signals)). |
 | `candidates_limit` | `int` | `200` | Limit for the ACTIVE promotion pool and each agglomerative type query. The LPA path reads the existing dream-edge graph rather than applying this as a graph-edge cap. |
 | `clustering_backend` | `"numpy" \| "python"` | `"numpy"` | Similarity backend for agglomerative clustering. `numpy` uses vectorised/chunked float32 matrix operations; `python` is the much slower O(n²) debugging fallback. |
 | `top_keyphrases_count` | `int` | `3` | Number of TF-IDF keyphrases written to each v2 REFLECTION payload. |
@@ -540,7 +540,7 @@ from engrava import EngravaManager, load_config
 
 config = load_config("engrava.yaml")
 
-async with EngravaManager.from_config(config.services) as mgr:
+async with await EngravaManager.from_config(config.services) as mgr:
     store = await mgr.get_store("main")
     # Use store normally...
 ```
