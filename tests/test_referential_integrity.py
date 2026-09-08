@@ -707,9 +707,7 @@ class TestParentDeleteSeesChildrenBeforeTheyAreGone:
         with pytest.raises(aiosqlite.IntegrityError):
             await delete_store.cleanup_expired(now=now)
 
-        assert (
-            await delete_store.get_thought("t1") is not None
-        ), "the guard must block the delete"
+        assert await delete_store.get_thought("t1") is not None, "the guard must block the delete"
         cursor = await delete_store._db.execute("SELECT COUNT(*) FROM edge WHERE edge_id = 'e1'")
         row = await cursor.fetchone()
         assert row is not None
@@ -783,9 +781,9 @@ class TestParentDeleteSeesChildrenBeforeTheyAreGone:
             with pytest.raises(aiosqlite.IntegrityError):
                 await hygiene_store.run_hygiene(current_cycle=1000)
 
-            assert (
-                await hygiene_store.get_thought("t1") is not None
-            ), "the guard must block the delete"
+            assert await hygiene_store.get_thought("t1") is not None, (
+                "the guard must block the delete"
+            )
             cursor = await hygiene_store._db.execute(
                 "SELECT COUNT(*) FROM edge WHERE edge_id = 'e1'"
             )
@@ -855,9 +853,7 @@ class TestParentDeleteSuppressedByRaiseIgnore:
             row = await cursor.fetchone()
             assert row is not None
             assert row[0] == 1, "the edge must survive a silently-ignored parent delete"
-            cursor = await db.execute(
-                "SELECT COUNT(*) FROM action WHERE source_thought_id = 't1'"
-            )
+            cursor = await db.execute("SELECT COUNT(*) FROM action WHERE source_thought_id = 't1'")
             row = await cursor.fetchone()
             assert row is not None
             assert row[0] == 1, "the action must survive a silently-ignored parent delete"
@@ -2400,9 +2396,7 @@ class TestDeletionOnAPreCascadeSchema:
             dangling = [
                 str(row["owner_id"])
                 for row in await (
-                    await db.execute(
-                        "SELECT owner_id FROM embedding WHERE owner_type = 'THOUGHT'"
-                    )
+                    await db.execute("SELECT owner_id FROM embedding WHERE owner_type = 'THOUGHT'")
                 ).fetchall()
             ]
             assert sorted(dangling) == [_DELETED_ID, _SURVIVOR_ID], (

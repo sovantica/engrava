@@ -1008,9 +1008,7 @@ class TestAexitPreservesBodyException:
     its own.
     """
 
-    async def test_body_exception_survives_a_failing_close(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_body_exception_survives_a_failing_close(self, tmp_path: Path) -> None:
         """The body's exception must win over a close failure during __aexit__.
 
         Mirrors ``test_create_store_failure_survives_a_failing_cleanup_close``
@@ -1049,9 +1047,7 @@ class TestAexitPreservesBodyException:
             "ValueError escape untouched, so that alone is not enough"
         )
 
-    async def test_close_failure_on_a_clean_exit_is_not_swallowed(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_close_failure_on_a_clean_exit_is_not_swallowed(self, tmp_path: Path) -> None:
         """When the body does not raise, a close failure is the only error there is.
 
         Mirrors ``test_peek_schema_version_close_failure_on_success_is_not_swallowed``

@@ -1552,8 +1552,7 @@ class TestSuspendAutoCommitIsStoreWide:
             await task
 
         assert not db.in_transaction, (
-            "the RESERVED lock was left stranded after cancellation inside "
-            "suspend_auto_commit"
+            "the RESERVED lock was left stranded after cancellation inside suspend_auto_commit"
         )
         # Rolled back, not merely abandoned: the window's own row must not
         # have survived the cancellation either.

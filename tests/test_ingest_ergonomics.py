@@ -550,8 +550,7 @@ async def test_upsert_by_hash_update_branch_still_commits_pending_work(
     await db.rollback()
 
     assert (
-        await _count(db, "SELECT COUNT(*) FROM thought WHERE thought_id = 'pending-row-ctrl'")
-        == 1
+        await _count(db, "SELECT COUNT(*) FROM thought WHERE thought_id = 'pending-row-ctrl'") == 1
     )
 
 

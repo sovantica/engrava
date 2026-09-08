@@ -178,9 +178,7 @@ def test_single_file_snapshot_warns_and_attempts_on_a_behind_schema(
     assert asyncio.run(_stamped_version(db_path)) == _BEHIND_VERSION
 
 
-def test_single_file_snapshot_refuses_on_an_ahead_schema(
-    runner: CliRunner, tmp_path: Path
-) -> None:
+def test_single_file_snapshot_refuses_on_an_ahead_schema(runner: CliRunner, tmp_path: Path) -> None:
     db_path = _ahead_db(tmp_path)
     out = tmp_path / "snap.jsonl"
     result = runner.invoke(cli, ["--db", str(db_path), "snapshot", "-o", str(out)])
@@ -266,9 +264,7 @@ def test_gc_refuses_on_an_ahead_schema(runner: CliRunner, tmp_path: Path) -> Non
 # ---------------------------------------------------------------------------
 
 
-def test_restore_refuses_on_a_pre_existing_behind_target(
-    runner: CliRunner, tmp_path: Path
-) -> None:
+def test_restore_refuses_on_a_pre_existing_behind_target(runner: CliRunner, tmp_path: Path) -> None:
     db_path = _behind_db(tmp_path)
     snap = tmp_path / "snap.jsonl"
     snap.write_text("", encoding="utf-8")
@@ -280,9 +276,7 @@ def test_restore_refuses_on_a_pre_existing_behind_target(
     assert asyncio.run(_stamped_version(db_path)) == _BEHIND_VERSION
 
 
-def test_restore_refuses_on_a_pre_existing_ahead_target(
-    runner: CliRunner, tmp_path: Path
-) -> None:
+def test_restore_refuses_on_a_pre_existing_ahead_target(runner: CliRunner, tmp_path: Path) -> None:
     db_path = _ahead_db(tmp_path)
     snap = tmp_path / "snap.jsonl"
     snap.write_text("", encoding="utf-8")

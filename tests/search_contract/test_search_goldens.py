@@ -64,6 +64,7 @@ _HYBRID_FROM_CONFIG_CASES: dict[str, list[list[str | float]]] = load_hybrid_rank
     HYBRID_RANKED_FROM_CONFIG_GOLDEN_PATH
 )
 
+
 async def _search_direct_golden(store: SqliteEngravaCore, query: str) -> list[list[str | float]]:
     """Run one query the same way the directly-constructed golden was built.
 
@@ -117,6 +118,7 @@ async def hybrid_store_from_config() -> AsyncIterator[SqliteEngravaCore]:
     await populate_corpus(store)
     yield store
     await store.close()
+
 
 # A column-filter query whose scope drop the WS calls out and whose ranked list
 # visibly reshuffles end-to-end — the discriminating hybrid case.

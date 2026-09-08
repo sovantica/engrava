@@ -454,11 +454,7 @@ def test_fence_inside_a_list_inside_a_blockquote_is_recognised(
     monkeypatch.setattr(_md_blocks, "REPO_ROOT", tmp_path)
     md = tmp_path / "listbq.md"
     md.write_text(
-        "> - Some list item.\n"
-        ">\n"
-        ">   ```bash\n"
-        ">   engrava reindex\n"
-        ">   ```\n",
+        "> - Some list item.\n>\n>   ```bash\n>   engrava reindex\n>   ```\n",
         encoding="utf-8",
     )
 

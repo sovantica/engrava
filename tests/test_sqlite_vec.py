@@ -930,12 +930,8 @@ class TestVectorOwnershipIsTheThoughtNotTheEmbeddingRow(TestSqliteVecRealConnect
             # the cascade is disabled for this one manual delete to
             # manufacture that pre-cascade shape directly.
             await store._db.execute("PRAGMA foreign_keys=OFF")
-            await store._db.execute(
-                "DELETE FROM embedding_vec WHERE rowid = ?", (orphaned_rowid,)
-            )
-            await store._db.execute(
-                "DELETE FROM thought WHERE thought_id = ?", ("t-orphaned",)
-            )
+            await store._db.execute("DELETE FROM embedding_vec WHERE rowid = ?", (orphaned_rowid,))
+            await store._db.execute("DELETE FROM thought WHERE thought_id = ?", ("t-orphaned",))
             await store._db.commit()
             await store._db.execute("PRAGMA foreign_keys=ON")
             assert orphaned_rowid not in await _vec_rowids(store)
@@ -979,9 +975,7 @@ class TestVectorOwnershipIsTheThoughtNotTheEmbeddingRow(TestSqliteVecRealConnect
             # FK would otherwise cascade the embedding row away too, so the
             # cascade is disabled for this one manual delete.
             await store._db.execute("PRAGMA foreign_keys=OFF")
-            await store._db.execute(
-                "DELETE FROM thought WHERE thought_id = ?", ("t-orphaned",)
-            )
+            await store._db.execute("DELETE FROM thought WHERE thought_id = ?", ("t-orphaned",))
             await store._db.commit()
             await store._db.execute("PRAGMA foreign_keys=ON")
             assert orphaned_rowid in await _vec_rowids(store)
@@ -1019,16 +1013,12 @@ class TestVectorOwnershipIsTheThoughtNotTheEmbeddingRow(TestSqliteVecRealConnect
             # embedding row away too, so the cascade is disabled for this one
             # manual delete.
             await store._db.execute("PRAGMA foreign_keys=OFF")
-            await store._db.execute(
-                "DELETE FROM thought WHERE thought_id = ?", ("t-orphaned",)
-            )
+            await store._db.execute("DELETE FROM thought WHERE thought_id = ?", ("t-orphaned",))
             await store._db.commit()
             await store._db.execute("PRAGMA foreign_keys=ON")
 
             assert isinstance(store._vector_backend, SqliteVecSearchBackend)
-            results = await store._vector_backend.search(
-                store._db, [0.9, 0.1, 0.0], top_k=5
-            )
+            results = await store._vector_backend.search(store._db, [0.9, 0.1, 0.0], top_k=5)
 
             ids = [r[0] for r in results]
             assert "t-orphaned" not in ids

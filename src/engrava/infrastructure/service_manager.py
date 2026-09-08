@@ -393,9 +393,7 @@ class EngravaManager:
                 return svc_cfg.embeddings
         return self._default_embeddings
 
-    async def _create_store(
-        self, service_name: str, *, migrate: bool = True
-    ) -> SqliteEngravaCore:
+    async def _create_store(self, service_name: str, *, migrate: bool = True) -> SqliteEngravaCore:
         """Create and initialize a new store for a service.
 
         Creates the data directory and database file if needed, applies the

@@ -526,10 +526,7 @@ def test_checker_accepts_a_valid_deeply_nested_key_on_a_non_obvious_class() -> N
     "non-obvious" as this schema gets.
     """
     fragment = (
-        "extensions:\n"
-        "  dreaming:\n"
-        "    gates:\n"
-        "      cluster_quality_persona_threshold: 0.8\n"
+        "extensions:\n  dreaming:\n    gates:\n      cluster_quality_persona_threshold: 0.8\n"
     )
     assert block_config_error(fragment, complete=False) is None
 
@@ -557,13 +554,7 @@ def test_checker_does_not_let_a_column_zero_comment_split_a_mapping() -> None:
 
 def test_checker_accepts_an_anchor_and_alias_spanning_two_sections() -> None:
     """Regression: a YAML anchor defined in one section and used in another works."""
-    fragment = (
-        "database:\n"
-        "  path: &db_path demo.db\n"
-        "\n"
-        "services:\n"
-        "  data_dir: *db_path\n"
-    )
+    fragment = "database:\n  path: &db_path demo.db\n\nservices:\n  data_dir: *db_path\n"
     assert block_config_error(fragment, complete=True) is None
 
 
@@ -757,13 +748,7 @@ def test_checker_still_rejects_a_duplicate_key_inside_a_merged_mapping() -> None
     the mapping doing the merging -- fixing the false positive above must
     not also blind the check to a real duplicate one level down.
     """
-    fragment = (
-        "x: &defaults\n"
-        "  path: a.db\n"
-        "  path: b.db\n"
-        "database:\n"
-        "  <<: *defaults\n"
-    )
+    fragment = "x: &defaults\n  path: a.db\n  path: b.db\ndatabase:\n  <<: *defaults\n"
     error = block_config_error(fragment, complete=True)
     assert error is not None
     assert "duplicate key" in error.message

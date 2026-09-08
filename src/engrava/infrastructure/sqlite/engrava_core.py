@@ -3820,9 +3820,7 @@ class SqliteEngravaCore:
                     or stored_fingerprint != active_fingerprint
                 ):
                     raise EmbeddingModelMismatchError(
-                        stored_model=self._describe_corpus_model(
-                            stored_model, stored_fingerprint
-                        ),
+                        stored_model=self._describe_corpus_model(stored_model, stored_fingerprint),
                         configured_model=self._describe_corpus_model(
                             model_name, active_fingerprint
                         ),
@@ -5724,8 +5722,8 @@ class SqliteEngravaCore:
                 # seam already ran once for this call; take the hit branch
                 # instead of inserting.
                 return await self._upsert_matched_row(
-                        thought, existing, opened_transaction=opened_transaction
-                    )
+                    thought, existing, opened_transaction=opened_transaction
+                )
         origin_token = _DERIVATION_ORIGIN.set("upsert_by_hash")
         try:
             return await self._finish_create_thought(persisted)
@@ -6011,9 +6009,7 @@ class SqliteEngravaCore:
         # constraint 1 requires out from under the lock -- runs here; ordinary
         # validation now runs in phase 2, per item, at the point the base
         # loop of create_thought() calls would have run it.
-        prepared_thoughts = [
-            await self.prepare_thought_for_insert(thought) for thought in thoughts
-        ]
+        prepared_thoughts = [await self.prepare_thought_for_insert(thought) for thought in thoughts]
 
         newly_created: list[ThoughtRecord] = []
         async with self.suspend_auto_commit():
