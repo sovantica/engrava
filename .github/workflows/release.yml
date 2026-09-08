@@ -162,6 +162,26 @@ jobs:
             echo "published=false" >> "$GITHUB_OUTPUT"
             echo "::notice::No release-triggering commits — nothing published."
           fi
+      # The version is now known (steps.detect.outputs.version) and the tag
+      # already exists at HEAD, but the dist/ artifact has not been built or
+      # uploaded yet and PyPI has not been touched — this step still sits on
+      # the gating side, before anything is published. It compares this
+      # release's schema stamps against the last released tag reachable from
+      # HEAD^ (HEAD itself is the commit semantic-release just tagged) and
+      # fails the job if the core schema moved on a patch-only version bump,
+      # per scripts/check_schema_release_gate.py. A failure here fails this
+      # job, so the publish job below — which requires this one to succeed —
+      # never runs.
+      - name: Refuse a patch release that moved the core schema version
+        if: steps.detect.outputs.published == 'true'
+        run: |
+          if old_tag=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null); then
+            python scripts/check_schema_release_gate.py \
+              --old-tag "$old_tag" \
+              --new-version "${{ steps.detect.outputs.version }}"
+          else
+            echo "::notice::No prior release tag reachable from HEAD^ — nothing to compare against, skipping the schema-version release gate."
+          fi
       # dist/ at this point is exactly what scripts/verify_release_artifacts.sh
       # built and gated inside semantic-release's `prepare` step, before the
       # tag and the GitHub Release above were created. The publish job
