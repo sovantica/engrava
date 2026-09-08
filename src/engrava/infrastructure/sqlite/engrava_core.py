@@ -8212,38 +8212,40 @@ class SqliteEngravaCore:
         produced. What happens to the thought row itself is two
         independent questions.
 
-        **Is the row durable yet?** Determined by transaction ownership,
-        not by which call reached here:
+        **Is the row durable yet?** If this call does not own the
+        outermost transaction — nested inside a caller's own
+        ``suspend_auto_commit()`` window — nothing is durable yet, on any
+        path. The outermost window's exit decides — if the caller catches
+        this and that outer window exits cleanly, the rows commit (for a
+        batch, every row it inserted, see :meth:`bulk_store`); uncaught,
+        they roll back. This holds for every path, single-item and batch
+        alike.
 
-        * **Owns it** (no enclosing ``suspend_auto_commit()`` window):
-          ``create_thought`` and ``update_thought`` have already
-          committed by the time this runs. Called from
-          :meth:`_batch_embed_thoughts` on its own (a standalone
-          ``bulk_store``), the insert loop has already finished, but the
-          whole batch (inserts plus the trailing embed call) shares one
-          transaction, so this failure rolls the *entire* batch back
-          instead — every row in it, this one included — and none of
-          them persist.
-        * **Does not own it** (nested inside a caller's own
-          ``suspend_auto_commit()`` window): nothing is durable yet. The
-          outermost window's exit decides — if the caller catches this
-          and that outer window exits cleanly, the rows commit (for a
-          batch, every row it inserted, see :meth:`bulk_store`);
-          uncaught, they roll back. This holds for every path,
-          single-item and batch alike.
+        If this call does own the outermost transaction, the path
+        decides:
+
+        * ``create_thought`` and ``update_thought`` have already
+          committed by the time this runs, so the failure cannot undo
+          them.
+        * Called from :meth:`_batch_embed_thoughts` on its own (a
+          standalone ``bulk_store``), the insert loop has already
+          finished, but the whole batch (inserts plus the trailing embed
+          call) shares one transaction, so this failure rolls the
+          *entire* batch back instead — every row in it, this one
+          included — and none of them persist.
 
         **What is left behind?** Determined by the path, and only
         meaningful for whatever actually committed: ``create_thought``
         leaves no embedding row at all. ``update_thought`` (only reached
-        here when ``essence``/``content`` changed) leaves the previous
-        embedding in place — stale only if the new content committed; if
-        the update instead rolled back, the retained embedding matches
-        the restored content and nothing is inconsistent. A standalone
-        ``bulk_store``'s rollback leaves nothing behind at all.
-
-        The row is findable by vector search against outdated content in
-        exactly one case: a committed ``update_thought``, before that
-        stale embedding is refreshed.
+        here when ``essence``/``content`` changed) leaves any embedding
+        the row already had in place — if the update committed, that
+        embedding is now stale against the new content, and the row is
+        still findable by vector search against that outdated vector; if
+        the row had no embedding before, it still has none, and remains
+        unfindable by vector search. If the update instead rolled back,
+        the retained embedding matches the restored content and nothing
+        is inconsistent. A standalone ``bulk_store``'s rollback leaves
+        nothing behind at all.
 
         See ``docs/api-reference.md``'s ``bulk_store`` and
         ``EmbeddingGenerationError`` entries for the fuller treatment. This
@@ -8287,9 +8289,17 @@ class SqliteEngravaCore:
         :meth:`_on_auto_embed_failure`, which logs a ``WARNING`` naming the
         thought and then re-raises the provider error (default) or a typed
         :class:`EmbeddingGenerationError` (when ``require_embedding=True``).
-        The commit ordering of the caller is unchanged — the thought is already
-        persisted when this runs, so on failure it remains stored but
-        unembedded.
+        Whether the thought row is durable yet depends on whether this
+        call owns the outermost transaction: on its own, the insert or
+        update has already committed by the time this runs, so the
+        failure cannot undo it; nested inside the caller's own
+        ``suspend_auto_commit()`` window, nothing is durable yet — that
+        window's exit decides. What is left behind is path-specific: a
+        fresh ``create_thought`` leaves no embedding row at all, so the
+        row stays unfindable by vector search; an ``update_thought``
+        leaves any embedding the row already had in place — stale and
+        still findable by vector search only if the row had one before
+        and the update committed.
 
         Args:
             thought: The thought to embed.

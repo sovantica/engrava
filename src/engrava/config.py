@@ -1037,19 +1037,26 @@ class EmbeddingConfig:
             behaviour. When ``True``, that failure is normalised into a typed
             :class:`~engrava.domain.exceptions.EmbeddingGenerationError`, the
             explicit fail-fast an operator opts into. What happens to the
-            thought row is two independent questions. Durability depends
-            on transaction ownership, not on which call triggered the
-            failure: on its own (the common case), ``create_thought``/
-            ``update_thought`` have already committed by the time
-            auto-embed runs; nested inside the caller's own
-            ``suspend_auto_commit()`` window, nothing is durable yet and
-            the outermost window's exit decides. What is left behind is
-            path-specific and only applies to whatever committed:
-            ``create_thought`` leaves no embedding row at all;
-            ``update_thought`` leaves the previous embedding in place,
-            stale only if the new content committed, so the row stays
-            findable by vector search against that outdated content.
-            Only takes effect when ``auto_embed`` is enabled.
+            thought row is two independent questions. If the call does
+            not own the outermost transaction — nested inside the
+            caller's own ``suspend_auto_commit()`` window — nothing is
+            durable yet, on any path: the outermost window's exit
+            decides, committing the rows if it is caught and exits
+            cleanly, rolling them back if not. If the call does own it,
+            the path decides: ``create_thought``/``update_thought`` have
+            already committed by the time auto-embed runs, so the
+            failure cannot undo them; a standalone ``bulk_store`` has
+            not — its inserts and the single trailing embed call share
+            one transaction, so the failure rolls the whole batch back.
+            What is left behind is path-specific and only meaningful for
+            whatever actually committed: ``create_thought`` leaves no
+            embedding row at all. ``update_thought`` leaves any
+            embedding the row already had in place — if the update
+            committed, that embedding is now stale against the new
+            content and the row is still findable by vector search
+            against that outdated vector; if the row had no embedding
+            before, it still has none, and remains unfindable by vector
+            search. Only takes effect when ``auto_embed`` is enabled.
         device: Compute device for local providers (``"cpu"``, ``"cuda"``).
         batch_size: Batch encoding size for local providers.
         base_url: Base URL for remote providers.

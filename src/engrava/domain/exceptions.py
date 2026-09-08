@@ -270,34 +270,33 @@ class EmbeddingGenerationError(EngravaError):
     produced, for the reason carried in the message. What happens to the
     *thought row* itself is two independent questions.
 
-    **Is the row durable yet?** Determined by transaction ownership, not
-    by which call raised this:
+    **Is the row durable yet?** If this call does not own the outermost
+    transaction — nested inside the caller's own
+    ``suspend_auto_commit()`` window — nothing is durable yet, on any
+    path: the outermost window's exit decides — caught and that window
+    exits cleanly, the rows commit; uncaught, they roll back. This holds
+    for every path, single-item and batch alike.
 
-    * **Owns it** (no enclosing ``suspend_auto_commit()`` window):
-      ``create_thought`` and ``update_thought`` have already committed by
-      the time this can be raised. A **standalone** ``bulk_store``
-      instead wraps its whole batch's inserts and trailing embed call in
-      one transaction, so this failure rolls the whole batch back
-      regardless — every row in it, not just this one — and none of them
-      persist.
-    * **Does not own it** (nested inside a caller's own
-      ``suspend_auto_commit()`` window): nothing is durable yet. The
-      outermost window's exit decides — caught and that window exits
-      cleanly, the rows commit; uncaught, they roll back. This holds for
-      every path, single-item and batch alike.
+    If this call does own the outermost transaction, the path decides:
+
+    * ``create_thought`` and ``update_thought`` have already committed by
+      the time this can be raised, so the failure cannot undo them.
+    * A **standalone** ``bulk_store`` has not: its inserts and the single
+      trailing embed call share one transaction, so this failure rolls
+      the whole batch back regardless — every row in it, not just this
+      one — and none of them persist.
 
     **What is left behind?** Determined by the path, and only meaningful
     for whatever actually committed: ``create_thought`` leaves no
     embedding row at all. ``update_thought`` (only reached here when
-    ``essence``/``content`` changed) leaves the previous embedding in
-    place — stale only if the new content committed; if the update
-    instead rolled back, the retained embedding matches the restored
-    content and nothing is inconsistent. A standalone ``bulk_store``'s
-    rollback leaves nothing behind at all.
-
-    The row is findable by vector search against outdated content in
-    exactly one case: a committed ``update_thought``, before that stale
-    embedding is refreshed.
+    ``essence``/``content`` changed) leaves any embedding the row already
+    had in place — if the update committed, that embedding is now stale
+    against the new content, and the row is still findable by vector
+    search against that outdated vector; if the row had no embedding
+    before, it still has none, and remains unfindable by vector search.
+    If the update instead rolled back, the retained embedding matches the
+    restored content and nothing is inconsistent. A standalone
+    ``bulk_store``'s rollback leaves nothing behind at all.
 
     See ``docs/api-reference.md``'s ``bulk_store`` and
     ``EmbeddingGenerationError`` entries for the fuller treatment. By
@@ -307,7 +306,7 @@ class EmbeddingGenerationError(EngravaError):
     ``embeddings.require_embedding = true`` (or ``require_embedding=True``
     on the store), that failure is instead normalised into this typed
     error — an explicit fail-fast signal whose durability outcome depends
-    on transaction ownership, per above.
+    on transaction ownership and, when owned, on call path, per above.
 
     Args:
         thought_id: UUID of the thought whose embedding failed.
