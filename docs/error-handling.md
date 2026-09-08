@@ -21,7 +21,7 @@ Engrava does not make every write idempotent.
 | SQLite `OperationalError` containing `locked` or `busy` | The operation did not complete successfully; reconcile durable state when the write boundary is ambiguous | Reduce writer contention or increase `busy_timeout`; retry only an operation known to converge | Only with operation-specific proof |
 | Rising `fts_match_failure_count` | Search retried with sanitized FTS syntax; the vector and other hybrid arms can still contribute | Inspect warning logs and offending queries | Engrava already retries the FTS arm once |
 | Rising `vector_arm_degradation_count` | The vector arm returned no results for an empty, zero, or non-finite query vector | Fix query embedding generation | No; the same vector degrades again |
-| `EmbeddingGenerationError` from single-item create/update | The thought/update is committed; its embedding is missing or, after an update, may be stale | Look up the thought and repair its embedding; do not recreate it | Retry embedding, not creation |
+| `EmbeddingGenerationError` from single-item create/update | If this call owns its outermost transaction, the thought/update is committed; embedding is missing (create), or, only if the row already had one, left in place and now stale (update) — otherwise still none. Nested inside the caller's own `suspend_auto_commit()`, nothing is durable yet: the enclosing window's exit decides | Look up the thought and repair its embedding; do not recreate it | Retry embedding, not creation |
 | `JournalIntegrityError`, `ExtensionMigrationError` | Store opening or migration was rejected | Stop writes, preserve the files, diagnose or restore | No |
 | `ConnectionQuarantinedError` | The store instance is terminally unusable | Close it, create a new store over a fresh connection, then reconcile durable state | Never on the same store |
 
@@ -174,11 +174,17 @@ model lock rejects an incompatible model or dimension.
 ### Thought updates
 
 `update_thought()` commits the updated row and journal entry before re-embedding
-when `essence` or `content` changed. If query generation fails, the row contains
-the new text but:
+when `essence` or `content` changed, provided this call owns its outermost
+transaction. Nested inside the caller's own `suspend_auto_commit()` window,
+nothing is durable yet on any path — the outermost window's exit decides,
+rolling back an uncaught failure and everything it inserted. If the update
+does commit and query generation then fails, the row contains the new text
+but:
 
-- a thought that had no embedding remains unembedded;
-- a thought that had an embedding can retain the old, now stale vector;
+- a thought that had no embedding remains unembedded, and stays unfindable by
+  vector search;
+- a thought that had an embedding retains the old, now stale vector, and
+  stays findable by vector search against that outdated content;
 - dependent REFLECTION centroids may not yet have been rebound.
 
 Re-read the thought and repair/recompute enrichment. Do not replay the update
