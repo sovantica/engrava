@@ -1036,15 +1036,20 @@ class EmbeddingConfig:
             provider's own exception — byte-identical to the pre-existing
             behaviour. When ``True``, that failure is normalised into a typed
             :class:`~engrava.domain.exceptions.EmbeddingGenerationError`, the
-            explicit fail-fast an operator opts into. Whether the thought is
-            already persisted when that happens depends on whether the
-            triggering call owns the outermost transaction: on its own (the
-            common case), ``create_thought``/``update_thought`` have already
-            committed by the time auto-embed runs, so the error surfaces
-            that the row is unembedded; nested inside the caller's own
-            ``suspend_auto_commit()`` window, nothing is durable yet and the
-            outermost window's exit decides. Only takes effect when
-            ``auto_embed`` is enabled.
+            explicit fail-fast an operator opts into. What happens to the
+            thought row is two independent questions. Durability depends
+            on transaction ownership, not on which call triggered the
+            failure: on its own (the common case), ``create_thought``/
+            ``update_thought`` have already committed by the time
+            auto-embed runs; nested inside the caller's own
+            ``suspend_auto_commit()`` window, nothing is durable yet and
+            the outermost window's exit decides. What is left behind is
+            path-specific and only applies to whatever committed:
+            ``create_thought`` leaves no embedding row at all;
+            ``update_thought`` leaves the previous embedding in place,
+            stale only if the new content committed, so the row stays
+            findable by vector search against that outdated content.
+            Only takes effect when ``auto_embed`` is enabled.
         device: Compute device for local providers (``"cpu"``, ``"cuda"``).
         batch_size: Batch encoding size for local providers.
         base_url: Base URL for remote providers.
