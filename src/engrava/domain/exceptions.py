@@ -267,28 +267,37 @@ class EmbeddingGenerationError(EngravaError):
     """Raised when auto-embedding a thought fails under strict mode.
 
     What is certain regardless of call path: the embedding was not
-    produced, for the reason carried in the message. Whether the
-    *thought row* survives, and in what state, does not depend on which
-    call raised this — it depends on whether that call owns the outermost
-    transaction:
+    produced, for the reason carried in the message. What happens to the
+    *thought row* itself is two independent questions.
+
+    **Is the row durable yet?** Determined by transaction ownership, not
+    by which call raised this:
 
     * **Owns it** (no enclosing ``suspend_auto_commit()`` window):
       ``create_thought`` and ``update_thought`` have already committed by
-      the time this can be raised; a standalone ``bulk_store`` instead
-      rolls its whole batch back — every row in it, not just this one —
-      and none of them are persisted.
+      the time this can be raised. A **standalone** ``bulk_store``
+      instead wraps its whole batch's inserts and trailing embed call in
+      one transaction, so this failure rolls the whole batch back
+      regardless — every row in it, not just this one — and none of them
+      persist.
     * **Does not own it** (nested inside a caller's own
       ``suspend_auto_commit()`` window): nothing is durable yet. The
       outermost window's exit decides — caught and that window exits
       cleanly, the rows commit; uncaught, they roll back. This holds for
       every path, single-item and batch alike.
 
-    Two facts stay path-specific regardless of which of the above
-    applies: ``create_thought`` leaves no embedding row at all, while
-    ``update_thought`` (only reached here when ``essence``/``content``
-    changed) leaves the previous embedding in place, now stale against
-    the new content — so the row stays findable by vector search against
-    outdated content.
+    **What is left behind?** Determined by the path, and only meaningful
+    for whatever actually committed: ``create_thought`` leaves no
+    embedding row at all. ``update_thought`` (only reached here when
+    ``essence``/``content`` changed) leaves the previous embedding in
+    place — stale only if the new content committed; if the update
+    instead rolled back, the retained embedding matches the restored
+    content and nothing is inconsistent. A standalone ``bulk_store``'s
+    rollback leaves nothing behind at all.
+
+    The row is findable by vector search against outdated content in
+    exactly one case: a committed ``update_thought``, before that stale
+    embedding is refreshed.
 
     See ``docs/api-reference.md``'s ``bulk_store`` and
     ``EmbeddingGenerationError`` entries for the fuller treatment. By

@@ -8209,17 +8209,21 @@ class SqliteEngravaCore:
         """Surface an auto-embed provider failure, never silently.
 
         What is certain regardless of caller: the embedding was not
-        produced. Whether the thought row itself survives, and in what
-        state, does not depend on which call reached here — it depends on
-        whether that call owns the outermost transaction:
+        produced. What happens to the thought row itself is two
+        independent questions.
+
+        **Is the row durable yet?** Determined by transaction ownership,
+        not by which call reached here:
 
         * **Owns it** (no enclosing ``suspend_auto_commit()`` window):
           ``create_thought`` and ``update_thought`` have already
-          committed by the time this runs; called from
+          committed by the time this runs. Called from
           :meth:`_batch_embed_thoughts` on its own (a standalone
-          ``bulk_store``), the insert loop has already finished, so this
-          failure rolls the *entire* batch back instead — every row in
-          it, this one included — and none of them persist.
+          ``bulk_store``), the insert loop has already finished, but the
+          whole batch (inserts plus the trailing embed call) shares one
+          transaction, so this failure rolls the *entire* batch back
+          instead — every row in it, this one included — and none of
+          them persist.
         * **Does not own it** (nested inside a caller's own
           ``suspend_auto_commit()`` window): nothing is durable yet. The
           outermost window's exit decides — if the caller catches this
@@ -8228,11 +8232,18 @@ class SqliteEngravaCore:
           uncaught, they roll back. This holds for every path,
           single-item and batch alike.
 
-        Two facts stay path-specific regardless of which of the above
-        applies: ``create_thought`` leaves no embedding row at all, while
-        ``update_thought`` (only reached here when ``essence``/``content``
-        changed) leaves the previous embedding in place, now stale
-        against the new content, rather than removed.
+        **What is left behind?** Determined by the path, and only
+        meaningful for whatever actually committed: ``create_thought``
+        leaves no embedding row at all. ``update_thought`` (only reached
+        here when ``essence``/``content`` changed) leaves the previous
+        embedding in place — stale only if the new content committed; if
+        the update instead rolled back, the retained embedding matches
+        the restored content and nothing is inconsistent. A standalone
+        ``bulk_store``'s rollback leaves nothing behind at all.
+
+        The row is findable by vector search against outdated content in
+        exactly one case: a committed ``update_thought``, before that
+        stale embedding is refreshed.
 
         See ``docs/api-reference.md``'s ``bulk_store`` and
         ``EmbeddingGenerationError`` entries for the fuller treatment. This
