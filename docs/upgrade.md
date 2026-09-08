@@ -30,14 +30,19 @@ shape of a table can change across a migration.
 
 What that means for a rolling deploy:
 
-- **Patch upgrades are not supposed to change `user_version`** (e.g. `0.3.0 →
-  0.3.1`). That is a rule this project follows when cutting a release, not a
-  guarantee anything currently checks: no workflow, script, or test ties a
-  schema-version bump to whether the release is a patch or a minor. Old and
-  new workers are expected to run side by side on a patch upgrade on that
-  basis. If you want certainty rather than a policy before rolling workers
-  across a release, compare `PRAGMA user_version` before and after the
-  upgrade yourself — that covers the recorded **core** schema version only.
+- **Patch upgrades do not change `user_version`** (e.g. `0.3.0 → 0.3.1`).
+  From 0.7.0 onward a release gate enforces this: the pipeline compares the
+  core schema stamp against the last released tag and **blocks the PyPI
+  publish** when the schema moved on a patch-only bump. Before 0.7.0 it was a
+  rule the project followed, checked by nothing. Old and new workers are
+  expected to run side by side on a patch upgrade on that basis.
+
+  Two limits worth knowing. The gate blocks the **publish**, not the tag: a
+  release violating the rule can still leave a git tag and a GitHub Release
+  behind, so judge by what is on PyPI. And it covers the recorded **core**
+  schema version only. If you want certainty rather than a policy before
+  rolling workers across a release, compare `PRAGMA user_version` before and
+  after the upgrade yourself.
   `ensure_schema()` also applies any pending **extension** schema migrations,
   tracked separately in `extension_schema_migrations`, which a `user_version`
   comparison does not reveal; check an installed extension's own migration
