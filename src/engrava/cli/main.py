@@ -341,7 +341,10 @@ async def _apply_read_schema_gate(conn: Any, *, command: str) -> None:  # noqa: 
 
 
 async def _apply_destructive_schema_gate(conn: Any, *, command: str) -> None:  # noqa: ANN401
-    """Read-then-gate convenience wrapper — see :func:`_apply_destructive_schema_gate_for_version`."""
+    """Read-then-gate convenience wrapper.
+
+    See :func:`_apply_destructive_schema_gate_for_version`.
+    """
     _apply_destructive_schema_gate_for_version(await _read_schema_version(conn), command=command)
 
 

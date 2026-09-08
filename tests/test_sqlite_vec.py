@@ -954,7 +954,7 @@ class TestVectorOwnershipIsTheThoughtNotTheEmbeddingRow(TestSqliteVecRealConnect
         finally:
             await store.close()
 
-    async def test_purge_removes_a_vector_whose_thought_is_gone_even_though_the_embedding_row_survives(
+    async def test_purge_removes_a_vector_whose_thought_is_gone_even_though_the_embedding_row_survives(  # noqa: E501
         self, tmp_path: Path
     ) -> None:
         """``purge_orphan_vectors`` must key off the thought, not just the embedding row."""

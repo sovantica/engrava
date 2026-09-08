@@ -487,7 +487,9 @@ class TestDeleteThoughtChildrenAtomicity:
         real_execute = db.execute
         released = {"count": 0}
 
-        async def _execute_and_cancel_after_release(sql, *args, **kwargs):
+        async def _execute_and_cancel_after_release(
+            sql: str, *args: object, **kwargs: object
+        ) -> object:
             cursor = await real_execute(sql, *args, **kwargs)
             if sql == "RELEASE delete_thought_children" and released["count"] == 0:
                 released["count"] += 1
@@ -563,7 +565,7 @@ class TestDeleteThoughtChildrenAtomicity:
         real_execute = db.execute
         rollback_to_attempts = {"count": 0}
 
-        async def _cancel_the_rollback_to(sql, *args, **kwargs):
+        async def _cancel_the_rollback_to(sql: str, *args: object, **kwargs: object) -> object:
             if sql == "ROLLBACK TO delete_thought_children" and rollback_to_attempts["count"] == 0:
                 rollback_to_attempts["count"] += 1
                 raise asyncio.CancelledError

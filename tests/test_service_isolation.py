@@ -1022,7 +1022,7 @@ class TestAexitPreservesBodyException:
         conn = await aiosqlite.connect(str(db_path))
         conn.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(conn)
-        store._owns_connection = True  # noqa: SLF001
+        store._owns_connection = True
         await store.ensure_schema()
 
         close_calls = {"n": 0}
@@ -1038,9 +1038,9 @@ class TestAexitPreservesBodyException:
 
         conn.close = _close_blows_up
 
+        msg = "original body failure"
         with pytest.raises(ValueError, match="original body failure"):
             async with store:
-                msg = "original body failure"
                 raise ValueError(msg)
 
         assert close_calls["n"] == 1, (
@@ -1063,7 +1063,7 @@ class TestAexitPreservesBodyException:
         conn = await aiosqlite.connect(str(db_path))
         conn.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(conn)
-        store._owns_connection = True  # noqa: SLF001
+        store._owns_connection = True
         await store.ensure_schema()
 
         real_close = conn.close

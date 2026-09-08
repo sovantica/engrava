@@ -5806,8 +5806,7 @@ class SqliteEngravaCore:
         # Write-lock classification: under _write_lock via _bulk_store_inner's
         # own suspend_auto_commit() window, which holds the lock for its whole
         # duration (own body has no direct SQL).
-        """Persist many thoughts in a single transaction, all-or-nothing when
-        this call owns it.
+        """Persist many thoughts in a single transaction, all-or-nothing when this call owns it.
 
         The batch analogue of :meth:`create_thought` for ingest paths that
         would otherwise loop ``create_thought`` (one commit — and, under
@@ -9145,7 +9144,9 @@ class SqliteEngravaCore:
         # the arm WHERE clauses — the opposite polarity of the old
         # exclusion-form query this replaces.
         archived_clause = (
-            "" if include_archived else f" AND lifecycle_status != '{LifecycleStatus.ARCHIVED.value}'"
+            ""
+            if include_archived
+            else f" AND lifecycle_status != '{LifecycleStatus.ARCHIVED.value}'"
         )
         cursor = await self._db.execute(
             f"SELECT thought_id FROM thought "  # noqa: S608

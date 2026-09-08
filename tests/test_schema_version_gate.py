@@ -97,7 +97,7 @@ def _head_db(tmp_path: Path, name: str = "head.db") -> Path:
         conn = await aiosqlite.connect(str(db_path))
         conn.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(conn, embedding_provider=None, auto_embed=False)
-        store._owns_connection = True  # noqa: SLF001
+        store._owns_connection = True
         await store.ensure_schema()
         await store.create_thought(_make_thought())
         await store.close()

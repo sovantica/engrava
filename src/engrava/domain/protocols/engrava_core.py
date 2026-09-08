@@ -141,8 +141,7 @@ class EngravaCoreProtocol(EngravaReadProtocol, Protocol):
         *,
         deduplicate: bool = False,
     ) -> list[ThoughtRecord]:
-        """Persist many thoughts in one transaction, all-or-nothing when this
-        call owns it.
+        """Persist many thoughts in one transaction, all-or-nothing when this call owns it.
 
         Batch analogue of :meth:`create_thought`: the whole loop commits once
         (not per row) and is transactional — if any row raises, the entire batch
