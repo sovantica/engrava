@@ -1,0 +1,49 @@
+# Standing check: main always carries the newest version tag in this repository.
+#
+# BRANCHING.md states this as an invariant of `main` — after each release,
+# `main` is forward-merged from `dev` so the tagged commit is reachable
+# from both branches. The release pipeline (release.yml) publishes to PyPI
+# from `dev` and never touches `main`; the forward merge is a separate step
+# that happens afterwards. Nothing in the release job enforces that it ever
+# happens, so if it is forgotten, fails, or is deferred, `main` silently
+# falls behind what was already published — and the only way anyone would
+# notice is a human comparing the two by hand.
+#
+# This workflow is deliberately not part of release.yml. It exists to catch
+# the window staying open *after* a release run has already finished, so it
+# runs on a schedule (in case no one pushes to `main` for a while) and on
+# every push to `main` (to confirm a forward merge actually closed the gap
+# it was meant to close). See scripts/check_main_carries_the_released_tag.py
+# for the check itself.
+
+name: Main Carries The Newest Version Tag
+
+on:
+  schedule:
+    # Daily, off-peak. A stale main is not urgent enough to justify a
+    # tighter cadence, but it should never go unnoticed for long.
+    - cron: "17 4 * * *"
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  check-main-carries-the-released-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history and tags, main explicitly)
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Fail if the newest version tag is not on main
+        run: python scripts/check_main_carries_the_released_tag.py --branch refs/heads/main
