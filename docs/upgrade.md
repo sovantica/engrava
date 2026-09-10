@@ -160,7 +160,7 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 | 0.3.x | 0.4.0 | Yes | **Schema-changing** minor upgrade — adds the valid-time columns (additive, zero data loss). Back up first and follow the [rolling-upgrades](#rolling-upgrades-multiple-workers) note |
 | 0.4.x | 0.5.0 | Yes | **Schema-changing** minor upgrade (`user_version` 14 → 18), although the library API is drop-in. **Breaking for MCP-server users only:** the `engrava[mcp]` extra and the in-engrava `engrava-mcp` command are removed — the server moved to the standalone [`engrava-mcp`](https://github.com/sovantica/engrava-mcp) package (see the 0.4 → 0.5 note) |
 | 0.5.0 | 0.6.0 | Yes | **Schema-changing** minor upgrade (`user_version` 18 → 20), with two additive columns. Default retrieval now excludes archived thoughts, and wrong-dimension query vectors raise a typed error. An edge `decay_multiplier` of `0.0` no longer reads back as `1.0`, and a later update no longer rewrites it to `1.0` — values a 0.5.x update already overwrote stay overwritten. Back up, quiesce shared-store workers, migrate once, and review the [0.5 → 0.6 notes](#05---06) |
-| 0.6.x | 0.7.0 | Yes | No *database* schema change, but `EngravaMetrics.schema_version` moves `1 → 2` (see below). **Behaviour change:** when the resolved recency weight is `0.0` **and** a cognitive-cycle reference (`current_cycle`, explicit or via `cycle_provider`) is present, the query-less fallback path now treats recency as fully off instead of still decaying by cycle — which can change result order for stores with heterogeneous thought priorities. `recency_now` (transaction-time) callers are unaffected; that axis was already correct. Also in this release: three new `EngravaError` subclasses (`WriteContentionError`, `WriteLockTimeoutError`, `DedupLockReentryError`) can now come out of the dedup and guarded-write paths; a new public override seam, `prepare_thought_for_insert()`, restores pre-insert customization that `get_or_create()` / `upsert_by_hash()` had silently stopped routing through an overridden `create_thought()`; `gc --dry-run` now names everything the real run deletes (edges, embeddings, and actions, not only orphaned edges); a deleted thought's vector can no longer resurface through search on a database that has not run the core-12 migration; and a corrupt or truncated database file now makes the CLI exit with an error instead of hanging. Review the [0.6 → 0.7 notes](#06---07) |
+| 0.6.x | 0.7.0 | Yes | No *database* schema change, but `EngravaMetrics.schema_version` moves `1 → 2` (see below). **Behaviour change:** when the resolved recency weight is `0.0` **and** a cognitive-cycle reference (`current_cycle`, explicit or via `cycle_provider`) is present, the query-less fallback path now treats recency as fully off instead of still decaying by cycle — which can change result order for stores with heterogeneous thought priorities. `recency_now` (transaction-time) callers are unaffected; that axis was already correct. Also in this release: three new `EngravaError` subclasses (`WriteContentionError`, `WriteLockTimeoutError`, `DedupLockReentryError`) can now come out of the dedup and guarded-write paths; a new public override seam, `prepare_thought_for_insert()`, restores pre-insert customization that `get_or_create()` / `upsert_by_hash()` had silently stopped routing through an overridden `create_thought()`; `gc --dry-run` now names everything the real run deletes (edges, embeddings, and actions, not only orphaned edges); a deleted thought's vector can no longer resurface through search on a database that has not run the core-12 migration; a corrupt or truncated database file now makes the CLI exit with an error instead of hanging; and `restore` now refuses an `embedding` row with an empty `owner_type`/`owner_id`, a non-ISO-8601 `created_at`, or a non-positive `dimension` — every such row was already invalid on every prior release, so this only ever rejects a snapshot that already carried a broken record. Review the [0.6 → 0.7 notes](#06---07) |
 
 For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 `0.x.*` line do not change the schema and are low-risk; **minor** upgrades
@@ -1296,6 +1296,49 @@ beyond that existing tolerance, catch `WriteLockTimeoutError` around
 `flush_access_buffer()` calls, and raise `write_lock_acquire_timeout_seconds`
 if access tracking runs on a store that also holds long
 `suspend_auto_commit()` windows from other tasks.
+
+**`restore` now refuses an `embedding` row that is not a valid domain record —
+not only one whose `model_name`/`dimension` disagree with the target.** No
+schema change.
+
+**Who is affected.** Almost no one. Restore now constructs the same
+`EmbeddingRecord` `store_embedding()` has always built, so it also enforces
+that record's own constraints: a non-empty `owner_type`, a non-empty
+`owner_id`, an ISO-8601 `created_at`, and a `dimension` greater than zero.
+Every one of those constraints already existed in the domain model before
+this change — `store_embedding()` was never able to write a row violating
+them. The only way a snapshot can carry a row that fails one of them is if it
+already came from a database holding one, and the only way a database can
+hold one is if some earlier restore inserted it without validation — which
+is exactly the gap this release closes. Checked directly against every
+tagged release `v0.2.0` through `v0.6.0`: none of them validates an
+`embedding` row's content on restore, only its column types, so any of them
+could have written such a row from a sufficiently adversarial or corrupted
+input snapshot, and `snapshot` re-exports whatever is stored without
+re-validating it — so the defect propagates forward through repeated
+restore/snapshot cycles once introduced. A snapshot produced from a database
+that has only ever been written through `store_embedding()` / `create_thought()`
+never contains such a row, on any released version.
+
+**Who is not affected.** Anyone restoring a snapshot whose `embedding` rows
+came from normal use — the vast majority. This does not reject a valid
+snapshot from an older release; every `embedding` row a supported write path
+can produce already satisfies these constraints today and always has.
+
+**What changed.** Restore validated an incoming `embedding` row's
+`dimension` against its own `vector_blob` length before this release, but
+inserted the rest of the row (`owner_type`, `owner_id`, `created_at`) as
+whatever the snapshot declared, typed but not otherwise checked. It now
+rejects the same four defects `store_embedding()` has always rejected.
+
+**What to do.** If a restore now fails naming an invalid embedding record,
+the flagged row was already invalid — not something this release broke.
+Inspect it with `--skip-embeddings` (import everything else, then re-embed
+the affected thoughts yourself) or `--re-embed` (regenerate every vector
+from the target's own provider) instead of the plain vectors; either avoids
+importing the bad row at all. If you must recover the original vector
+first, edit the offending line in the snapshot file directly — it is plain
+JSONL — before restoring.
 
 **This section covers what four large commits were found, by execution, to
 change — not everything they touched.** `f2d2348`, `6e4ed41`, `47bd68e`, and

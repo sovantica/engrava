@@ -282,10 +282,38 @@ engrava --config engrava.yaml restore -i backup.jsonl --service main --clear --r
 ```
 
 When `services.default_service` names the configured target, `--service main`
-may be omitted. A normal restore into an attached configured service checks the
-snapshot model metadata against the target provider; on mismatch, choose
-`--re-embed` or `--skip-embeddings`. See
-[Troubleshooting → EmbeddingModelMismatchError](troubleshooting.md#embeddingmodelmismatcherror-when-opening-an-existing-database).
+may be omitted. Every restore — regardless of `--re-embed` or
+`--skip-embeddings` — first checks that the target's *own* pre-existing
+`embedding` rows agree with its *stored* embedding model, or with each other
+when it has none: neither flag imports the snapshot's vectors as-is, so
+neither can excuse a target that is already inconsistent going in. A normal
+restore (neither `--re-embed` nor `--skip-embeddings`) additionally checks the
+`model_name` and `dimension` every `embedding` row in the snapshot declares
+against that same reference before inserting it — never against a configured
+provider, which a plain restore never resolves, and never against the
+snapshot's metadata header, which is not proof of anything the rows do not
+already say for themselves. On a mismatch, restore fails before committing
+anything, naming both identities; choose `--re-embed` to regenerate vectors for
+the target's own model, or `--skip-embeddings` to import without vectors — an
+already-inconsistent target itself is not fixed by either flag and needs its
+own repair (or `--clear`) first.
+Restoring embeddings into a target that starts with neither a stored model nor
+any embeddings of its own writes the snapshot's declared identity as the
+target's lock — the same `_metadata` write embedding directly into it would
+make, though restore trusts the snapshot's declaration rather than computing
+and measuring a vector itself.
+
+**This check cannot see the document or query prefix the corpus was built
+with** (see [Embeddings guide → Asymmetric prefixes for instruction-tuned
+models](guides/embeddings.md#asymmetric-prefixes-for-instruction-tuned-models))
+— a snapshot carries neither, only the vectors and a declared model name and
+dimension for each. A target that already had a prefix
+fingerprint locked before this restore keeps it unchanged (restore never
+touches it), but a target that locks fresh from the snapshot's own vectors
+(see above) records no prefix at all, regardless of what the source corpus
+actually used. If the source corpus was built with a non-empty document
+prefix, confirm that out of band before pointing a prefix-aware provider at
+a restored target — restore itself cannot tell you.
 
 > Restore recreates thoughts, edges, embeddings, and actions, **not** the audit
 > journal — a restored database starts with an empty journal.

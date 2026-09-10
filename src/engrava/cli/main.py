@@ -1066,28 +1066,338 @@ def _iter_snapshot_lines(input_path: Path) -> Iterator[tuple[int, str]]:
             raise _unreadable_snapshot_error(input_path, exc) from exc
 
 
-def _assert_embedding_model_match(
-    record: MetadataRecord,
-    embedding_provider: EmbeddingProviderProtocol,
-) -> None:
-    """Reject a snapshot whose embedding model differs from the target's.
+def _format_embedding_identity(identity: tuple[str, int]) -> str:
+    """Render a declared ``(model_name, dimension)`` pair for an error message.
 
     Args:
-        record: The snapshot metadata header.
-        embedding_provider: The target embedding provider.
+        identity: The identity to render.
 
-    Raises:
-        click.ClickException: On model mismatch without an override flag.
+    Returns:
+        A human-readable ``'<model>' at dimension <n>`` fragment.
 
     """
-    source_model = record.embedding_model_name
-    if source_model is not None and source_model != embedding_provider.model_name:
+    model_name, dimension = identity
+    return f"{model_name!r} at dimension {dimension}"
+
+
+def _track_embedding_identity(
+    identity: tuple[str, int],
+    reference: tuple[str, int] | None,
+    reference_label: str,
+    *,
+    subject_label: str,
+) -> tuple[str, int]:
+    """Compare one declared embedding identity against the running reference.
+
+    The reference is whatever every embedding row seen so far in this restore
+    agrees on. The first identity ever seen establishes it silently; every
+    later one must match exactly, or restore fails before committing anything.
+
+    Args:
+        identity: The ``(model_name, dimension)`` pair just observed.
+        reference: The identity established so far, or ``None`` if this is
+            the first one seen.
+        reference_label: A phrase describing where ``reference`` came from
+            (the target's stored model, its existing rows, or an earlier
+            snapshot row), for the mismatch message.
+        subject_label: A phrase describing where ``identity`` came from, for
+            the mismatch message.
+
+    Returns:
+        ``reference`` unchanged when it already matched, or ``identity`` when
+        no reference was established yet.
+
+    Raises:
+        click.ClickException: If ``identity`` differs from an already
+            established ``reference``.
+
+    """
+    if reference is None:
+        return identity
+    if identity == reference:
+        return reference
+    msg = (
+        f"Embedding model mismatch: {reference_label} declares "
+        f"{_format_embedding_identity(reference)}, but {subject_label} declares "
+        f"{_format_embedding_identity(identity)}. Use --re-embed to regenerate "
+        "embeddings for the target's model, or --skip-embeddings to skip "
+        "importing vectors."
+    )
+    raise click.ClickException(msg)
+
+
+async def _read_embedding_lock(conn: aiosqlite.Connection) -> tuple[str, int] | None:
+    """Read the target's stored embedding-model lock, if any.
+
+    Args:
+        conn: Restore connection with an active transaction.
+
+    Returns:
+        The ``(model_name, dimension)`` recorded in ``_metadata``, or ``None``
+        when the target has never locked a model.
+
+    Raises:
+        click.ClickException: If the target has a stored
+            ``embedding_dimension`` that is not a valid integer -- the
+            target's ``_metadata`` is corrupt and restore cannot verify
+            embedding identity against it.
+
+    """
+    cursor = await conn.execute("SELECT value FROM _metadata WHERE key = 'embedding_model_name'")
+    row = await cursor.fetchone()
+    if row is None:
+        return None
+    model_name = str(row[0])
+    dim_cursor = await conn.execute("SELECT value FROM _metadata WHERE key = 'embedding_dimension'")
+    dim_row = await dim_cursor.fetchone()
+    if dim_row is None:
+        return model_name, 0
+    try:
+        dimension = int(dim_row[0])
+    except ValueError as exc:
         msg = (
-            f"Embedding model mismatch: snapshot has '{source_model}', "
-            f"target has '{embedding_provider.model_name}'. "
-            f"Use --re-embed to re-generate or --skip-embeddings to skip."
+            "The target's stored embedding_dimension "
+            f"({dim_row[0]!r}) is not a valid integer; its _metadata is "
+            "corrupt. Repair the target's _metadata directly, or restore "
+            "with --clear to reset it, before restoring again."
         )
+        raise click.ClickException(msg) from exc
+    return model_name, dimension
+
+
+async def _existing_embedding_identities(conn: aiosqlite.Connection) -> list[tuple[str, int]]:
+    """Return every distinct declared identity already in the target's ``embedding`` table.
+
+    Args:
+        conn: Restore connection with an active transaction.
+
+    Returns:
+        Distinct ``(model_name, dimension)`` pairs currently stored, in no
+        particular order.
+
+    """
+    cursor = await conn.execute("SELECT DISTINCT model_name, dimension FROM embedding")
+    rows = await cursor.fetchall()
+    return [(str(row[0]), int(row[1])) for row in rows]
+
+
+async def _write_embedding_lock(conn: aiosqlite.Connection, identity: tuple[str, int]) -> None:
+    """Adopt a restored corpus's declared identity as the target's new lock.
+
+    Used only when the target began this restore with neither a stored model
+    nor any embedding rows of its own. Restore inserts ``embedding`` rows via
+    fixed SQL directly (never through ``store_embedding()``), so nothing else
+    would ever lock a target that starts this way -- it would otherwise end
+    the restore holding vectors under no declared model at all.
+
+    Writes only ``embedding_model_name`` and ``embedding_dimension``. A
+    snapshot carries neither a document-prefix fingerprint nor a query
+    prefix, so this cannot -- and does not -- set them (see the restore
+    entry in ``docs/cli.md`` for that limit).
+
+    Args:
+        conn: Restore connection with an active transaction.
+        identity: The ``(model_name, dimension)`` every embedding row just
+            inserted was checked to declare.
+
+    """
+    model_name, dimension = identity
+    await conn.execute(
+        "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
+        ("embedding_model_name", model_name),
+    )
+    await conn.execute(
+        "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
+        ("embedding_dimension", str(dimension)),
+    )
+
+
+async def _finalize_embedding_identity(
+    conn: aiosqlite.Connection,
+    *,
+    may_adopt_identity: bool,
+    identity_reference: tuple[str, int] | None,
+) -> None:
+    """Adopt the restored corpus's declared identity as the target's lock, if eligible.
+
+    ``may_adopt_identity`` is only ever ``True`` when the target began the
+    restore with neither a stored model nor any embedding rows (see
+    ``_initial_embedding_state``), so this already implies the identity
+    check ran; ``identity_reference`` is ``None`` only when no embedding row
+    was ever inserted, in which case there is nothing to adopt.
+
+    Args:
+        conn: Restore connection with an active transaction.
+        may_adopt_identity: Whether the target started this restore eligible
+            for adoption.
+        identity_reference: The identity every inserted embedding row was
+            checked to declare, or ``None`` if none were inserted.
+
+    """
+    if may_adopt_identity and identity_reference is not None:
+        await _write_embedding_lock(conn, identity_reference)
+
+
+async def _initial_embedding_state(
+    conn: aiosqlite.Connection,
+) -> tuple[tuple[str, int] | None, str, bool]:
+    """Establish the identity every embedding in the target must share, pre-restore.
+
+    Runs unconditionally, regardless of ``--skip-embeddings`` or ``--re-embed``:
+    those flags only decide whether the snapshot's own vectors are imported as
+    incoming rows, never whether the target's pre-existing state is internally
+    consistent. Reads the target's stored embedding-model lock, if any, and
+    every distinct identity already declared by its own ``embedding`` rows,
+    and asserts the two agree before any snapshot row is even parsed -- a
+    merge restore into an already-inconsistent target must not report success
+    (criterion: the check covers rows already in the target, not only
+    incoming ones), no matter which import flags are given.
+
+    A target with a lock and no vectors, and a target with vectors and no
+    lock, are different states: the former's reference is its lock and never
+    changes; the latter's reference comes from its own rows, and neither is
+    later written back as a fresh lock (see ``_stream_insert``) -- only a
+    target that starts with **neither** a lock nor any embeddings gets its
+    incoming identity adopted.
+
+    Args:
+        conn: Restore connection with an active transaction.
+
+    Returns:
+        A ``(reference, reference_label, may_adopt)`` triple. ``reference``
+        is the identity every embedding row -- existing and about to be
+        inserted -- must share, or ``None`` when the target starts with
+        neither a lock nor any embedding rows. ``may_adopt`` is ``True``
+        only for that last case: the target started with neither, so it is
+        eligible to have the snapshot's identity written as its new lock
+        once every row has been checked to agree on it.
+
+    Raises:
+        click.ClickException: If the target's own existing embedding rows
+            disagree with its stored lock, or with each other when there is
+            no lock.
+
+    """
+    stored_lock = await _read_embedding_lock(conn)
+    existing_identities = await _existing_embedding_identities(conn)
+
+    if stored_lock is not None:
+        reference_label = "the target's stored embedding model"
+    elif existing_identities:
+        reference_label = "the target's existing embedding rows"
+    else:
+        reference_label = "an earlier row in this snapshot"
+
+    reference = stored_lock
+    for existing_identity in existing_identities:
+        reference = _track_embedding_identity(
+            existing_identity,
+            reference,
+            reference_label,
+            subject_label="one of the target's existing embedding rows",
+        )
+    may_adopt = stored_lock is None and not existing_identities
+    return reference, reference_label, may_adopt
+
+
+async def _check_embedding_row_before_insert(
+    record: TableRecord,
+    identity_reference: tuple[str, int] | None,
+    identity_reference_label: str,
+) -> tuple[str, int]:
+    """Validate one about-to-be-inserted embedding row and update the reference.
+
+    Called only for an ``embedding``-table record that will actually be
+    inserted (the caller has already excluded ``--skip-embeddings`` /
+    ``--re-embed``), so this is where both the structural check (dimension
+    vs. blob) and the cross-row identity check happen.
+
+    Args:
+        record: A validated ``embedding``-table record about to be inserted.
+        identity_reference: The identity established so far, or ``None``.
+        identity_reference_label: A phrase describing where
+            ``identity_reference`` came from, for a mismatch message.
+
+    Returns:
+        The identity every embedding row must now agree on.
+
+    Raises:
+        click.ClickException: If the row is structurally invalid, or its
+            declared identity differs from ``identity_reference``.
+
+    """
+    row_identity = await _assert_embedding_row_structurally_valid(record)
+    return _track_embedding_identity(
+        row_identity,
+        identity_reference,
+        identity_reference_label,
+        subject_label="a row in the snapshot",
+    )
+
+
+async def _assert_embedding_row_structurally_valid(record: TableRecord) -> tuple[str, int]:
+    """Validate one embedding row's declared identity against its own bytes.
+
+    ``EmbeddingRecord`` already validates that ``dimension`` matches the
+    decoded ``vector_blob`` length; restore had never imported it, so a row
+    claiming, say, dimension 384 backed by 16 bytes was accepted as-is. This
+    reuses that same validator rather than re-implementing it.
+
+    Args:
+        record: A validated ``embedding``-table record about to be inserted.
+
+    Returns:
+        The row's declared ``(model_name, dimension)`` identity.
+
+    Raises:
+        click.ClickException: If the row's ``vector_blob`` is not valid
+            base64 (surfaced by ``to_insert()``), or if the decoded record
+            fails an ``EmbeddingRecord`` constraint -- including a
+            ``dimension`` that does not match the decoded blob length.
+
+    """
+    from pydantic import ValidationError  # noqa: PLC0415
+
+    from engrava.domain.models.embedding import EmbeddingRecord  # noqa: PLC0415
+
+    _sql, values = record.to_insert()
+    (
+        embedding_id,
+        owner_type,
+        owner_id,
+        model_name,
+        dimension,
+        vector_blob,
+        created_at,
+    ) = values
+    if not (
+        isinstance(embedding_id, str)
+        and isinstance(owner_type, str)
+        and isinstance(owner_id, str)
+        and isinstance(model_name, str)
+        and isinstance(dimension, int)
+        and isinstance(vector_blob, bytes)
+        and isinstance(created_at, str)
+    ):
+        # Unreachable in practice: TableSpec.validate() already enforced these
+        # exact types for every required `embedding` column before a
+        # TableRecord could exist.
+        msg = f"Snapshot line {record.line_number} has a malformed embedding record."
         raise click.ClickException(msg)
+    try:
+        embedding = EmbeddingRecord(
+            embedding_id=embedding_id,
+            owner_type=owner_type,
+            owner_id=owner_id,
+            model_name=model_name,
+            dimension=dimension,
+            vector_blob=vector_blob,
+            created_at=created_at,
+        )
+    except ValidationError as exc:
+        msg = f"Snapshot line {record.line_number} has an invalid embedding record: {exc}"
+        raise click.ClickException(msg) from exc
+    return embedding.model_name, embedding.dimension
 
 
 async def _reembed_thoughts(
@@ -1335,6 +1645,24 @@ async def _stream_insert(
     it is inserted, so a bad record raises before its own write. Re-embedding IDs
     are flushed in bounded batches; peak memory is one line plus one batch.
 
+    Every ``embedding`` row already in the target, at the very start of this
+    restore, must declare the same ``model_name``/``dimension`` identity as
+    the target's stored embedding-model lock (or, for a target with no lock,
+    as each other) -- checked unconditionally, regardless of
+    ``skip_embeddings`` or ``re_embed``, because those flags only decide
+    whether *incoming* vectors are imported, never whether the target's own
+    pre-existing rows are internally consistent.
+
+    Unless ``skip_embeddings`` or ``re_embed`` is set, every incoming
+    ``embedding`` row about to be inserted must also declare that same
+    identity. This is checked against the snapshot's ``embedding`` rows and
+    the target's own data, never against ``embedding_provider`` or the
+    snapshot's metadata header: a plain restore never resolves a provider,
+    and the header is not proof of anything the rows do not already say for
+    themselves. A target that starts with neither a lock nor any embeddings
+    adopts the snapshot's declared identity as its new lock once every row
+    has been checked to agree on it.
+
     Args:
         conn: Open aiosqlite connection (inside the caller's transaction).
         input_path: Path to the JSONL snapshot file.
@@ -1346,24 +1674,35 @@ async def _stream_insert(
         Total number of records written (inserts plus re-embeddings).
 
     Raises:
-        click.ClickException: On a malformed record, an invalid value, or an
-            embedding-model mismatch without an override flag.
+        click.ClickException: On a malformed record, an invalid value, an
+            embedding identity mismatch without an override flag, or the
+            target's own existing rows already disagreeing among themselves
+            or with its lock.
 
     """
-    check_model = embedding_provider is not None and not re_embed and not skip_embeddings
+    check_incoming = not re_embed and not skip_embeddings
     total = 0
     reembedded = 0
     reembed_batch: list[str] = []
+
+    (
+        identity_reference,
+        identity_reference_label,
+        may_adopt_identity,
+    ) = await _initial_embedding_state(conn)
+
     for line_number, line in _iter_snapshot_lines(input_path):
         record = parse_snapshot_record(line, line_number=line_number)
         if isinstance(record, MetadataRecord):
-            if check_model and embedding_provider is not None:
-                _assert_embedding_model_match(record, embedding_provider)
             continue
         if not isinstance(record, TableRecord):
             continue
-        if record.spec.table is CoreTable.EMBEDDING and (skip_embeddings or re_embed):
-            continue
+        if record.spec.table is CoreTable.EMBEDDING:
+            if not check_incoming:
+                continue
+            identity_reference = await _check_embedding_row_before_insert(
+                record, identity_reference, identity_reference_label
+            )
 
         await _insert_record(conn, record)
         total += 1
@@ -1386,6 +1725,9 @@ async def _stream_insert(
             conn,
             embedding_provider if reembedded else None,
         )
+    await _finalize_embedding_identity(
+        conn, may_adopt_identity=may_adopt_identity, identity_reference=identity_reference
+    )
     return total
 
 
