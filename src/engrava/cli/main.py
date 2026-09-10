@@ -24,7 +24,7 @@ import logging
 import os
 import sys
 from contextlib import asynccontextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from importlib.metadata import entry_points
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -83,6 +83,18 @@ _CORE_TABLES_DELETE_ORDER: tuple[CoreTable, ...] = (
     CoreTable.EDGE,
     CoreTable.THOUGHT,
 )
+
+# The journal is deliberately not a CoreTable member: that enum is the
+# allow-list of tables a *snapshot* may contain (see
+# ``engrava.cli.snapshot_records.CoreTable``), and a snapshot never carries
+# journal rows. But ``restore --clear`` still has to remove ``journal_entry``
+# alongside the four core tables above -- leaving it in place would let the
+# cleared store's data and its append-only journal describe two different
+# histories, and ``verify_journal()`` would keep reporting that mismatched
+# chain as valid. It is deleted by its own fixed literal below rather than
+# through this enum, since the enum exists to keep every *snapshot-derived*
+# SQL identifier off the trust boundary -- a concern that does not apply to a
+# name that is never read from snapshot input.
 
 # ------------------------------------------------------------------
 # Helpers
@@ -1731,6 +1743,23 @@ async def _stream_insert(
     return total
 
 
+@dataclass(frozen=True, slots=True)
+class RestoreImportResult:
+    """Outcome of importing snapshot records into one database connection.
+
+    Attributes:
+        total_records: Total records inserted from the snapshot (the whole
+            historical return value of :func:`_import_records_to_db`).
+        journal_entries_cleared: Rows removed from ``journal_entry`` by
+            ``--clear``. Always ``0`` when ``clear`` is not set, since a
+            restore without ``--clear`` never touches the journal.
+
+    """
+
+    total_records: int
+    journal_entries_cleared: int
+
+
 async def _import_records_to_db(
     conn: aiosqlite.Connection,
     input_path: Path,
@@ -1739,7 +1768,7 @@ async def _import_records_to_db(
     skip_embeddings: bool = False,
     re_embed: bool = False,
     embedding_provider: EmbeddingProviderProtocol | None = None,
-) -> int:
+) -> RestoreImportResult:
     """Import JSONL records into a database connection atomically.
 
     The whole restore runs in a **single transaction over a single streaming
@@ -1751,6 +1780,19 @@ async def _import_records_to_db(
     persists", including the optional ``clear``. The file is read exactly once
     and peak memory is one line plus one re-embed batch.
 
+    ``clear`` also empties ``journal_entry``. Without that, a cleared store's
+    data and its existing journal would describe two different histories --
+    the journal would keep authenticating thoughts the clear just removed --
+    and ``verify_journal()`` would keep reporting that mismatched chain as
+    valid. A restore without ``--clear`` never writes to ``journal_entry``
+    itself, but that is not the same as leaving the journal *consistent*: each
+    record is still inserted with ``INSERT OR REPLACE``, so an incoming ID that
+    collides with a thought, edge, or action the journal already describes
+    replaces that row -- or, through a cascading foreign-key delete, removes it
+    -- while the journal entries describing its earlier content are left
+    behind unchanged. ``verify_journal()`` still reports that chain as valid.
+    This is a known gap, tracked separately, not a guarantee of this function.
+
     Args:
         conn: Open aiosqlite connection with schema applied.
         input_path: Path to the JSONL snapshot file.
@@ -1760,7 +1802,8 @@ async def _import_records_to_db(
         embedding_provider: ``EmbeddingProviderProtocol`` for re-embedding.
 
     Returns:
-        Total number of records imported.
+        The total records imported and how many journal entries ``--clear``
+        discarded (zero when ``clear`` is not set).
 
     Raises:
         click.ClickException: On a malformed snapshot record, an invalid value,
@@ -1769,6 +1812,7 @@ async def _import_records_to_db(
 
     """
     total = 0
+    journal_entries_cleared = 0
     committed = False
     # Open the transaction explicitly so atomicity holds regardless of the
     # connection's isolation configuration (it does not depend on the driver's
@@ -1782,6 +1826,13 @@ async def _import_records_to_db(
         if clear:
             for table in _CORE_TABLES_DELETE_ORDER:
                 await conn.execute(f"DELETE FROM {table.value}")  # noqa: S608
+            # Fixed literal, never interpolated -- see the module comment
+            # above `_CORE_TABLES_DELETE_ORDER` for why `journal_entry` is
+            # cleared this way instead of through that enum. `rowcount` on a
+            # bare `DELETE FROM` (no `WHERE`) reports the exact number of
+            # rows removed.
+            journal_cursor = await conn.execute("DELETE FROM journal_entry")
+            journal_entries_cleared = journal_cursor.rowcount
         total = await _stream_insert(
             conn,
             input_path,
@@ -1795,7 +1846,10 @@ async def _import_records_to_db(
         if not committed:
             # Any validation or insert failure discards the whole restore.
             await conn.rollback()
-    return total
+    return RestoreImportResult(
+        total_records=total,
+        journal_entries_cleared=journal_entries_cleared,
+    )
 
 
 def _require_valid_cli_service_name(service_name: str) -> None:
@@ -1885,7 +1939,7 @@ async def _restore_service_snapshot(
                     "use --skip-embeddings instead."
                 )
                 raise click.ClickException(msg)
-        total = await _import_records_to_db(
+        result = await _import_records_to_db(
             store._db,  # noqa: SLF001
             Path(input_path),
             clear=clear,
@@ -1893,7 +1947,12 @@ async def _restore_service_snapshot(
             re_embed=re_embed,
             embedding_provider=emb_provider,
         )
-        click.echo(f"Restored {total} records to service {effective_service!r} from {input_path}")
+        click.echo(
+            f"Restored {result.total_records} records to service {effective_service!r} "
+            f"from {input_path}"
+        )
+        if clear:
+            click.echo(f"Discarded {result.journal_entries_cleared} journal entries")
     finally:
         await manager.close_all()
 
@@ -1953,7 +2012,7 @@ async def _restore_single_db(
         else:
             await store.ensure_schema()
 
-        total = await _import_records_to_db(
+        result = await _import_records_to_db(
             conn,
             Path(input_path),
             clear=clear,
@@ -1961,7 +2020,9 @@ async def _restore_single_db(
             re_embed=re_embed,
             embedding_provider=emb_provider,
         )
-        click.echo(f"Restored {total} records from {input_path}")
+        click.echo(f"Restored {result.total_records} records from {input_path}")
+        if clear:
+            click.echo(f"Discarded {result.journal_entries_cleared} journal entries")
 
 
 @cli.command()

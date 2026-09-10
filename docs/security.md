@@ -173,10 +173,19 @@ provider. Review external snapshots as imports, including for instruction-like
 or otherwise adversarial content. Restore only from a completed file that is no
 longer being modified.
 
-A logical snapshot excludes the audit journal, so restoring one starts with an
-empty journal. A physical backup preserves the journal but is tied to the
-database file and must be captured with a WAL-safe method. See [Backup &
-Recovery](backup-and-recovery.md) for the supported boundary and procedures.
+A logical snapshot excludes the audit journal. A fresh restore target
+therefore starts with an empty journal, and `restore --clear` empties an
+existing target's journal along with the data it wipes. A restore without
+`--clear` merges into the target: when none of the snapshot's IDs collide with
+journalled data, the existing journal is left in place and still describes
+that target's own history. **When an incoming ID does collide** with a
+journalled thought, edge, or action, the merge replaces that row — or, through
+a cascading foreign-key delete, removes it — while the journal entries
+describing its earlier content stay behind; `verify` still reports the chain
+as **valid** even though it no longer matches what is stored. A physical
+backup preserves the journal but is tied to the database file and must be
+captured with a WAL-safe method. See [Backup & Recovery](backup-and-recovery.md)
+for the supported boundary and procedures.
 
 ## Audit journal threat model
 

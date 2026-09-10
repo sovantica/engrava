@@ -146,8 +146,16 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 ```
 
 > **Note:** a snapshot exports thoughts, edges, embeddings, and actions, but
-> **not** the audit journal (`journal_entry`). A database restored from a
-> snapshot starts with an empty journal. If you need the audit history preserved,
+> **not** the audit journal (`journal_entry`). `new-old-version.db` above is a
+> fresh target, so it starts with an empty journal regardless. That is
+> specific to a fresh target, though: restoring the same snapshot with
+> `--clear` into an *existing* journalled database empties its journal too.
+> Restoring without `--clear` merges in: when none of the snapshot's IDs
+> collide with journalled data, that database's journal is left untouched.
+> **When an incoming ID does collide**, the merge replaces that row — or,
+> through a cascading foreign-key delete, removes it — while the journal
+> entries describing its earlier content stay behind, and `verify` still
+> reports the chain as **valid**. If you need the audit history preserved,
 > take a physical file backup instead — see
 > [Backup & Recovery](backup-and-recovery.md).
 

@@ -40,7 +40,7 @@ engrava --db other.db info         # flag overrides the env var
 | [`info`](#info) | Show a metrics snapshot for the database. |
 | [`verify`](#verify) | Verify the audit journal's hash chain. |
 | [`query`](#query) | Run a MindQL query. |
-| [`snapshot`](#snapshot) | Export the whole database to a JSONL snapshot. |
+| [`snapshot`](#snapshot) | Export thoughts, edges, embeddings, and actions to a JSONL snapshot (not the audit journal). |
 | [`restore`](#restore) | Restore a database from a JSONL snapshot. |
 | [`gc`](#gc) | Garbage-collect archived thoughts (and optionally expired ones). |
 | [`migrate`](#migrate) | Run pending schema migrations. |
@@ -189,7 +189,8 @@ predicates work here too — see [MindQL](mindql.md) for their full semantics.
 
 ### `snapshot`
 
-Exports the **entire** database to a JSONL snapshot (one record per line).
+Exports thoughts, edges, embeddings, and actions to a JSONL snapshot (one
+record per line) — **not** the audit journal; see below.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
@@ -316,7 +317,17 @@ prefix, confirm that out of band before pointing a prefix-aware provider at
 a restored target — restore itself cannot tell you.
 
 > Restore recreates thoughts, edges, embeddings, and actions, **not** the audit
-> journal — a restored database starts with an empty journal.
+> journal. A **fresh target** therefore starts with an empty journal, and
+> **`--clear`** empties the journal along with the data it wipes. A restore
+> **without `--clear`** merges into the target: when the snapshot's IDs do not
+> collide with anything the target's journal already describes, the existing
+> journal is left untouched. When an incoming ID **does** collide with
+> journalled data, the merge replaces that row — or, through a cascading
+> foreign-key delete, removes it — while the journal entries describing its
+> earlier content stay behind; `verify` still reports the chain as **valid**
+> even though it no longer matches the data. See
+> [Backup & Recovery](backup-and-recovery.md#logical-snapshot-and-restore) for
+> the full breakdown.
 
 ### `gc`
 

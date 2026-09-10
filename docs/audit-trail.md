@@ -439,10 +439,20 @@ cryptographic non-repudiation against a file-level adversary.
 The logical snapshot/restore path (`engrava snapshot` / `engrava restore`)
 covers the thought / edge / embedding / action tables — it does **not** include
 the `journal_entry` table. A snapshot is therefore **not** a backup of the audit
-trail, and restoring from one starts a fresh chain. To preserve the journal,
-back up the database file itself (see the upgrade/backup guidance), and note
-that hard-deleting an audited thought still leaves its content in the journal's
-`before`/`after` delta — relevant when handling erasure requests.
+trail. What restoring from one leaves the target's journal holding depends on
+how it was restored: a fresh target starts with no journal at all, and `restore
+--clear` empties `journal_entry` along with the data it wipes so the chain
+does not outlive the data it described. A restore without `--clear` merges into
+the target: when none of the snapshot's IDs collide with a thought, edge, or
+action the target's journal already describes, the existing journal is left
+exactly as it was. When an incoming ID **does** collide with journalled data,
+the merge replaces that row — or, through a cascading foreign-key delete,
+removes it — while the journal entries describing its earlier content stay in
+place; `verify` still reports the chain as **valid** even though it no longer
+matches what the database holds. To preserve the journal, back up the database
+file itself (see the upgrade/backup guidance), and note that hard-deleting an
+audited thought still leaves its content in the journal's `before`/`after`
+delta — relevant when handling erasure requests.
 
 ## See also
 

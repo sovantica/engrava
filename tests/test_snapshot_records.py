@@ -979,12 +979,13 @@ class TestBatchedReembed:
         async def _run() -> int:
             conn = await _fresh_schema_conn(tmp_path / "target.db")
             try:
-                return await _import_records_to_db(
+                result = await _import_records_to_db(
                     conn,
                     snap,
                     re_embed=True,
                     embedding_provider=_FakeProvider(),  # type: ignore[arg-type]
                 )
+                return result.total_records
             finally:
                 await conn.close()
 
@@ -1026,12 +1027,13 @@ class TestBatchedReembed:
         async def _run() -> int:
             conn = await _fresh_schema_conn(target)
             try:
-                return await _import_records_to_db(
+                result = await _import_records_to_db(
                     conn,
                     snap,
                     re_embed=True,
                     embedding_provider=_FakeProvider(),  # type: ignore[arg-type]
                 )
+                return result.total_records
             finally:
                 await conn.close()
 

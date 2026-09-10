@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import click
 import pytest
@@ -88,6 +88,172 @@ def _stored_core_ids(db_path: Path) -> dict[str, set[str]]:
         conn.close()
 
 
+def _journal_entry_count(db_path: Path) -> int:
+    """Read the number of rows currently in ``journal_entry``.
+
+    A plain, independent connection, for the same reason as
+    :func:`_stored_core_ids`: the CLI owns and closes its own connection, so
+    what it actually left on disk is read back rather than inferred from the
+    command's own report.
+
+    Args:
+        db_path: Path to the database the CLI operated on.
+
+    Returns:
+        The row count of ``journal_entry``.
+
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM journal_entry").fetchone()
+        return int(row[0])
+    finally:
+        conn.close()
+
+
+def _journal_entry_deltas(db_path: Path, target_id: str) -> list[dict[str, object]]:
+    """Read every ``journal_entry.delta`` recorded for one ``target_id``, in order.
+
+    Same rationale as :func:`_journal_entry_count`: an independent connection
+    reads back what the CLI actually left on disk, rather than trusting the
+    command's own report.
+
+    Args:
+        db_path: Path to the database the CLI operated on.
+        target_id: The ``journal_entry.target_id`` to filter on.
+
+    Returns:
+        Each matching entry's ``delta``, parsed from JSON, oldest first.
+
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT delta FROM journal_entry WHERE target_id = ? ORDER BY sequence_number",
+            (target_id,),
+        ).fetchall()
+        return [cast("dict[str, object]", json.loads(row[0])) for row in rows]
+    finally:
+        conn.close()
+
+
+def _write_journalled_thoughts(db_path: Path, thought_ids: list[str]) -> None:
+    """Create a database whose thoughts were each recorded through the journal.
+
+    Unlike ``populated_db``, this builds the store with ``journal_enabled=True``
+    so ``create_thought`` writes one hash-linked ``journal_entry`` row per
+    thought -- the CLI itself never enables journaling (there is no CLI flag
+    for it), so a store that already carries journal history has to be built
+    directly against the domain API, exactly as it would be by an application
+    embedding engrava as a library.
+
+    Args:
+        db_path: Path to create the database at. Must not already exist.
+        thought_ids: The thought ids to create, in order.
+
+    """
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import (
+        LifecycleStatus,
+        Priority,
+        SqliteEngravaCore,
+        ThoughtRecord,
+        ThoughtType,
+    )
+
+    async def _setup() -> None:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = await aiosqlite.connect(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn, journal_enabled=True)
+        await store.ensure_schema()
+        for i, thought_id in enumerate(thought_ids):
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id=thought_id,
+                    essence=f"Essence for {thought_id}",
+                    content=f"Content for {thought_id}",
+                    thought_type=ThoughtType.OBSERVATION,
+                    source="test",
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    priority=Priority.P2,
+                    created_cycle=i + 1,
+                    updated_cycle=i + 1,
+                )
+            )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_setup())
+
+
+def _write_journalled_thought_pair_with_edge(db_path: Path) -> None:
+    """Create two journalled thoughts (``t-old-0``, ``t-old-1``) joined by a journalled edge.
+
+    Same construction rationale as :func:`_write_journalled_thoughts`: the CLI
+    has no flag to enable journaling, so a store that already carries journal
+    history for both a thought mutation and an edge mutation has to be built
+    directly against the domain API. This backs the cascade-collision test,
+    where deleting one endpoint's thought row cascades an ``ON DELETE CASCADE``
+    foreign-key delete onto the edge.
+
+    Args:
+        db_path: Path to create the database at. Must not already exist.
+
+    """
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import (
+        EdgeRecord,
+        EdgeType,
+        LifecycleStatus,
+        Priority,
+        SqliteEngravaCore,
+        ThoughtRecord,
+        ThoughtType,
+    )
+
+    async def _setup() -> None:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = await aiosqlite.connect(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn, journal_enabled=True)
+        await store.ensure_schema()
+        for i, thought_id in enumerate(("t-old-0", "t-old-1")):
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id=thought_id,
+                    essence=f"Essence for {thought_id}",
+                    content=f"Content for {thought_id}",
+                    thought_type=ThoughtType.OBSERVATION,
+                    source="test",
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    priority=Priority.P2,
+                    created_cycle=i + 1,
+                    updated_cycle=i + 1,
+                )
+            )
+        await store.create_edge(
+            EdgeRecord(
+                edge_id="edge-001",
+                from_thought_id="t-old-0",
+                to_thought_id="t-old-1",
+                edge_type=EdgeType.ASSOCIATED,
+                weight=0.9,
+                created_cycle=1,
+            )
+        )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_setup())
+
+
 @pytest.fixture
 def runner() -> CliRunner:
     """Create a Click test runner."""
@@ -152,6 +318,127 @@ def populated_db(db_path: Path) -> Path:
 
     asyncio.run(_setup())
     return db_path
+
+
+@pytest.fixture
+def journalled_db(tmp_path: Path) -> Path:
+    """A database with three thoughts, each recorded through the journal.
+
+    Distinct from ``populated_db``, whose store is built without
+    ``journal_enabled`` and so leaves ``journal_entry`` empty.
+    """
+    db_path = tmp_path / "journalled.db"
+    _write_journalled_thoughts(db_path, ["t-old-0", "t-old-1", "t-old-2"])
+    return db_path
+
+
+@pytest.fixture
+def journalled_db_with_edge(tmp_path: Path) -> Path:
+    """Two journalled thoughts (``t-old-0``, ``t-old-1``) joined by a journalled edge.
+
+    Distinct from ``journalled_db``, which has no edges. Backs the
+    cascade-collision known-defect test: ``edge`` carries an ``ON DELETE
+    CASCADE`` foreign key to ``thought`` on both endpoints, so replacing
+    ``t-old-0`` also removes this edge.
+    """
+    db_path = tmp_path / "journalled_with_edge.db"
+    _write_journalled_thought_pair_with_edge(db_path)
+    return db_path
+
+
+@pytest.fixture
+def unrelated_snapshot(runner: CliRunner, tmp_path: Path) -> Path:
+    """A one-thought snapshot with no relation to ``journalled_db`` or ``populated_db``.
+
+    Built through the CLI (a fresh source database, then ``engrava
+    snapshot``) so the snapshot line format is exactly what real restores
+    consume, not a hand-assembled JSONL fixture.
+    """
+    source_db = tmp_path / "source.db"
+    result = runner.invoke(cli, ["--db", str(source_db), "migrate"])
+    assert result.exit_code == 0, result.output
+
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+
+    async def _seed() -> None:
+        conn = await aiosqlite.connect(str(source_db))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-src",
+                essence="Essence for t-src",
+                content="Content for t-src",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=1,
+                updated_cycle=1,
+            )
+        )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_seed())
+
+    snap = tmp_path / "unrelated-snapshot.jsonl"
+    result = runner.invoke(cli, ["--db", str(source_db), "snapshot", "-o", str(snap)])
+    assert result.exit_code == 0, result.output
+    return snap
+
+
+@pytest.fixture
+def colliding_snapshot(runner: CliRunner, tmp_path: Path) -> Path:
+    """A one-thought snapshot whose ID collides with ``t-old-0`` in ``journalled_db``
+    and ``journalled_db_with_edge``.
+
+    Built through the CLI, same rationale as ``unrelated_snapshot``: the
+    snapshot line format must be exactly what a real restore consumes, not a
+    hand-assembled JSONL fixture. The colliding thought's essence/content
+    differ from the original so a stored-content check can tell replacement
+    from a no-op.
+    """
+    source_db = tmp_path / "collide-source.db"
+    result = runner.invoke(cli, ["--db", str(source_db), "migrate"])
+    assert result.exit_code == 0, result.output
+
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+
+    async def _seed() -> None:
+        conn = await aiosqlite.connect(str(source_db))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-old-0",
+                essence="Replacement essence for t-old-0",
+                content="Replacement content for t-old-0",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=1,
+                updated_cycle=1,
+            )
+        )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_seed())
+
+    snap = tmp_path / "colliding-snapshot.jsonl"
+    result = runner.invoke(cli, ["--db", str(source_db), "snapshot", "-o", str(snap)])
+    assert result.exit_code == 0, result.output
+    return snap
 
 
 class TestGlobalControls:
@@ -459,6 +746,151 @@ class TestRestore:
         )
         assert result.exit_code == 0
 
+    def test_restore_with_clear_on_empty_journal_reports_zero_discarded(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+    ) -> None:
+        """``--clear`` on a store whose journal was never enabled discards nothing.
+
+        ``populated_db`` never enables journaling, so ``journal_entry`` starts
+        (and stays) empty. The count printed must say so honestly rather than
+        the CLI staying silent about a table it now also clears.
+        """
+        assert _journal_entry_count(populated_db) == 0
+        snap = tmp_path / "snap.jsonl"
+        runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(snap)])
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(populated_db), "restore", "-i", str(snap), "--clear"],
+        )
+
+        assert result.exit_code == 0
+        assert _journal_entry_count(populated_db) == 0
+        assert "Discarded 0 journal entries" in result.output
+
+    def test_restore_with_clear_discards_the_journal(
+        self,
+        runner: CliRunner,
+        journalled_db: Path,
+        unrelated_snapshot: Path,
+    ) -> None:
+        """``--clear`` from an unrelated snapshot must not leave a journal that
+        describes thoughts the clear just removed.
+
+        Before the fix, ``journal_entry`` was not in the table list ``--clear``
+        iterates and no foreign key reaches it, so it survived untouched:
+        ``thought`` held only the restored ``t-src`` row while ``journal_entry``
+        kept all three ``t-old-*`` entries, and ``verify_journal()`` reported
+        that mismatched chain as ``valid``.
+        """
+        assert _journal_entry_count(journalled_db) == 3
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(journalled_db), "restore", "-i", str(unrelated_snapshot), "--clear"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert _stored_core_ids(journalled_db)["thought"] == {"t-src"}
+        assert _journal_entry_count(journalled_db) == 0
+        assert "Discarded 3 journal entries" in result.output
+
+        verify_result = runner.invoke(
+            cli,
+            ["--db", str(journalled_db), "--format", "json", "verify"],
+        )
+        assert verify_result.exit_code == 0, verify_result.output
+        verify_data = json.loads(verify_result.output)
+        assert verify_data["valid"] is True
+        assert verify_data["entries_checked"] == 0
+
+    def test_restore_without_clear_leaves_the_journal_untouched_for_disjoint_ids(
+        self,
+        runner: CliRunner,
+        journalled_db: Path,
+        unrelated_snapshot: Path,
+    ) -> None:
+        """A merge restore (no ``--clear``) leaves the journal alone when IDs don't collide.
+
+        ``unrelated_snapshot`` carries a single thought (``t-src``) whose ID is
+        disjoint from every ID already in ``journalled_db``, so this only
+        establishes that ``journal_entry`` survives untouched in that disjoint
+        case -- it keeps describing exactly the three pre-existing thoughts and
+        nothing about the merged-in ``t-src``. It does **not** establish that a
+        merge is safe for a *colliding* ID: restore inserts every record with
+        ``INSERT OR REPLACE``, so an incoming ID that matches an existing
+        journalled thought, edge, or action instead replaces (or, through a
+        cascading foreign-key delete, removes) that row while its journal
+        entry is left describing content that is no longer there. See the
+        known-defect tests immediately below for that case.
+        """
+        assert _journal_entry_count(journalled_db) == 3
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(journalled_db), "restore", "-i", str(unrelated_snapshot)],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Discarded" not in result.output
+        assert _journal_entry_count(journalled_db) == 3
+        assert _stored_core_ids(journalled_db)["thought"] == {
+            "t-old-0",
+            "t-old-1",
+            "t-old-2",
+            "t-src",
+        }
+
+        verify_result = runner.invoke(
+            cli,
+            ["--db", str(journalled_db), "--format", "json", "verify"],
+        )
+        assert verify_result.exit_code == 0, verify_result.output
+        verify_data = json.loads(verify_result.output)
+        assert verify_data["valid"] is True
+        assert verify_data["entries_checked"] == 3
+
+    def test_restore_service_with_clear_discards_the_journal(
+        self,
+        runner: CliRunner,
+        tmp_path: Path,
+        unrelated_snapshot: Path,
+    ) -> None:
+        """The ``--service`` restore path clears the journal exactly like the
+        single-database path.
+
+        Both branches route through the same ``_import_records_to_db``, but
+        that is an implementation detail this test does not assume -- it
+        drives the ``--service`` restore through the CLI and inspects the
+        resulting service database file directly.
+        """
+        services_dir = tmp_path / "services"
+        service_db = services_dir / "svc.db"
+        _write_journalled_thoughts(service_db, ["t-old-0", "t-old-1", "t-old-2"])
+        assert _journal_entry_count(service_db) == 3
+
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(services_dir / "ignored.db"),
+                "restore",
+                "-i",
+                str(unrelated_snapshot),
+                "--service",
+                "svc",
+                "--clear",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert _stored_core_ids(service_db)["thought"] == {"t-src"}
+        assert _journal_entry_count(service_db) == 0
+        assert "Discarded 3 journal entries" in result.output
+
     def test_restore_invalid_service_name_is_distinct_clean_error(
         self,
         runner: CliRunner,
@@ -657,6 +1089,134 @@ class TestRestore:
         # Only once the stored rows are settled does the reported failure matter.
         assert result.exit_code != 0
         assert isinstance(result.exception, SystemExit)
+
+
+class TestRestoreWithoutClearKnownJournalCollisionDefects:
+    """Pin the ID-collision gap in restore without ``--clear``.
+
+    KNOWN DEFECT -- these tests pin *current*, undesired behavior, not a
+    contract to preserve. The gap is recorded separately and awaits a product
+    decision; nothing here fixes it. Restore without ``--clear`` inserts every
+    record with ``INSERT OR REPLACE``. When a snapshot's ID collides with an
+    existing *journalled* thought, edge, or action, the live row is replaced
+    -- or, through a cascading ``ON DELETE CASCADE`` foreign-key delete,
+    removed outright -- but the journal entry describing its previous content
+    is never touched, and ``verify_journal()`` still reports the chain as
+    valid because the chain itself is still internally self-consistent; it
+    just no longer matches what is stored.
+
+    If this behavior is ever intentionally changed, these tests must fail and
+    be updated deliberately -- that is the point of pinning them here instead
+    of leaving the gap undocumented in test form.
+    """
+
+    def test_colliding_thought_id_replaces_content_but_leaves_a_stale_journal_entry(
+        self,
+        runner: CliRunner,
+        journalled_db: Path,
+        colliding_snapshot: Path,
+    ) -> None:
+        """KNOWN DEFECT: a colliding thought ID replaces content; its journal entry survives.
+
+        ``colliding_snapshot`` carries a thought whose ID (``t-old-0``) matches
+        one already in ``journalled_db``, with different essence/content. This
+        pins the exact mismatch a reviewer reported: live content changes,
+        the journal entry describing the old content survives unchanged, and
+        ``verify`` still reports the chain valid.
+        """
+        assert _journal_entry_count(journalled_db) == 3
+        before_deltas = _journal_entry_deltas(journalled_db, "t-old-0")
+        assert len(before_deltas) == 1
+        before_after = cast("dict[str, object]", before_deltas[0]["after"])
+        assert before_after["content"] == "Content for t-old-0"
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(journalled_db), "restore", "-i", str(colliding_snapshot)],
+        )
+        assert result.exit_code == 0, result.output
+
+        # The live row was replaced with the snapshot's content ...
+        assert _stored_core_ids(journalled_db)["thought"] == {"t-old-0", "t-old-1", "t-old-2"}
+        conn = sqlite3.connect(journalled_db)
+        try:
+            live_content = conn.execute(
+                "SELECT content FROM thought WHERE thought_id = ?",
+                ("t-old-0",),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert live_content == "Replacement content for t-old-0"
+
+        # ... but journal_entry was never touched: same row count, same stale delta.
+        assert _journal_entry_count(journalled_db) == 3
+        after_deltas = _journal_entry_deltas(journalled_db, "t-old-0")
+        assert after_deltas == before_deltas
+        after_after = cast("dict[str, object]", after_deltas[0]["after"])
+        assert after_after["content"] == "Content for t-old-0"  # stale: the OLD content
+
+        # verify_journal() cannot see the mismatch -- the chain is still
+        # internally self-consistent even though it no longer matches the data.
+        verify_result = runner.invoke(
+            cli,
+            ["--db", str(journalled_db), "--format", "json", "verify"],
+        )
+        assert verify_result.exit_code == 0, verify_result.output
+        verify_data = json.loads(verify_result.output)
+        assert verify_data["valid"] is True
+        assert verify_data["entries_checked"] == 3
+
+    def test_colliding_thought_id_cascades_an_edge_delete_the_journal_never_learns_about(
+        self,
+        runner: CliRunner,
+        journalled_db_with_edge: Path,
+        colliding_snapshot: Path,
+    ) -> None:
+        """KNOWN DEFECT: a colliding thought ID can cascade-delete a dependent edge unnoticed.
+
+        ``edge`` carries an ``ON DELETE CASCADE`` foreign key to ``thought`` on
+        both endpoints (schema_core.sql). ``INSERT OR REPLACE`` resolves the
+        primary-key collision on ``t-old-0`` by deleting the pre-existing row
+        first, and with ``PRAGMA foreign_keys = ON`` (always on for restore,
+        see ``_open_db``) that delete cascades onto ``edge-001``, which
+        references it. The journal's ``INSERT_EDGE`` entry for that edge is
+        never touched -- this pins the reviewer's stronger reproduction:
+        edge count 1 -> 0, all three journal entries retained and verifying
+        successfully.
+        """
+        assert _journal_entry_count(journalled_db_with_edge) == 3  # 2 thoughts + 1 edge
+
+        def _edge_count() -> int:
+            conn = sqlite3.connect(journalled_db_with_edge)
+            try:
+                row = conn.execute("SELECT COUNT(*) FROM edge").fetchone()
+                return int(row[0])
+            finally:
+                conn.close()
+
+        assert _edge_count() == 1
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(journalled_db_with_edge), "restore", "-i", str(colliding_snapshot)],
+        )
+        assert result.exit_code == 0, result.output
+
+        assert _edge_count() == 0  # cascaded away by the colliding thought's replacement
+
+        # All three journal entries -- including the edge's -- are untouched.
+        assert _journal_entry_count(journalled_db_with_edge) == 3
+        edge_deltas = _journal_entry_deltas(journalled_db_with_edge, "edge-001")
+        assert len(edge_deltas) == 1  # the INSERT_EDGE entry survives, describing a dead edge
+
+        verify_result = runner.invoke(
+            cli,
+            ["--db", str(journalled_db_with_edge), "--format", "json", "verify"],
+        )
+        assert verify_result.exit_code == 0, verify_result.output
+        verify_data = json.loads(verify_result.output)
+        assert verify_data["valid"] is True
+        assert verify_data["entries_checked"] == 3
 
 
 class TestGc:

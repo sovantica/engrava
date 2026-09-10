@@ -28,10 +28,27 @@ thought / edge / embedding / action.
 
 > **A snapshot does NOT include the audit journal.** The `journal_entry` table —
 > the tamper-evident hash chain — is **not** exported by `engrava snapshot`, and
-> therefore is **not** recreated by `restore`. A database restored from a snapshot
-> starts with an **empty journal**: the data is intact, but its prior audit
-> history is gone. If audit continuity matters, use a **physical file backup**
-> (which copies the journal verbatim), not a logical snapshot. See
+> therefore is **not** recreated by `restore`. What that leaves in the
+> *target's* journal depends on which of the three restore shapes you used:
+>
+> - **A fresh target** (the database file did not exist yet) starts with an
+>   empty journal — there was no prior journal for it to have.
+> - **`restore --clear`** empties `journal_entry` along with the four core
+>   tables it wipes, so the journal ends empty too. Otherwise it would keep
+>   describing thoughts the clear had just discarded.
+> - **A restore without `--clear`** merges into an existing database. The
+>   merged-in records are inserted directly and are not themselves journalled.
+>   When none of the snapshot's IDs collide with a thought, edge, or action the
+>   target's journal already describes, every existing entry stays in place and
+>   still describes the target's own history. **When an incoming ID does
+>   collide with journalled data**, the merge replaces that row — or, through
+>   a cascading foreign-key delete, removes it — while the journal entries
+>   describing its earlier content stay behind unchanged; `verify` still
+>   reports the chain as **valid**, even though those entries no longer
+>   describe what the database now holds.
+>
+> If audit continuity matters, use a **physical file backup** (which copies
+> the journal verbatim), not a logical snapshot. See
 > [Audit Trail](audit-trail.md).
 
 `restore` options worth knowing (see the [CLI reference](cli.md#restore) for the

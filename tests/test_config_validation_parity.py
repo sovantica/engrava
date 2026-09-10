@@ -1019,6 +1019,9 @@ _NON_CONFIG_PREFIXES: tuple[tuple[str, str], ...] = (
 
 #: Dataclasses outside those prefixes that are still not configuration.
 _NON_CONFIG_CLASSES: dict[str, str] = {
+    "engrava.cli.main.RestoreImportResult": (
+        "what one restore did -- records imported and journal entries discarded"
+    ),
     "engrava.domain.manifest.ExtensionManifest": (
         "an extension's own declaration, type-checked where it is loaded"
     ),
