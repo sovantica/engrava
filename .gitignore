@@ -50,8 +50,23 @@ package-lock.json
 
 # Package manager cache (uv). The cache dir self-ignores via an internal
 # .gitignore, but that is fragile — ignore it explicitly here too so it can
-# never be tracked. (uv.lock itself is intentionally tracked — see pyproject.)
+# never be tracked.
 .uv-cache/
+
+# uv.lock is deliberately NOT tracked, and this is the reason rather than a
+# pointer to one. It was tracked until 2026-09-10 for a reproducible developer
+# and CI environment; nothing here builds that environment any more. No
+# workflow invokes uv, every CI job installs with pip, and `uv sync` survives
+# only inside a Makefile error string. What the file did do was carry pinned
+# transitive versions that nobody installs — `pip install engrava` ignores a
+# lock entirely — so every security advisory this repository received named
+# uv.lock as its manifest and none named pyproject.toml. Alerts about versions
+# no user can resolve are not signal, and they crowd out the ones that are.
+# Dependency ranges are declared in pyproject.toml; that is the surface a user
+# actually resolves and the one worth alerting on. Developers using uv still
+# generate this file locally — it is simply not committed. Reinstating it is
+# a matter of `uv lock` and deleting the line below.
+uv.lock
 
 # OS
 .DS_Store
