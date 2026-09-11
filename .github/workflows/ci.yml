@@ -166,7 +166,18 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
+      # Full history and tags, unlike every other job here. The release-gate
+      # tests prove they can go red by pointing at this repository's own
+      # history -- a released tag, origin/main, and a commit from before a
+      # forward merge. A depth-1, tagless checkout does not carry those, and
+      # the tests are written to skip rather than fail when they are absent,
+      # so on the default checkout they vanish silently while this job still
+      # reports green: the evidence that the gates can fail is exactly the
+      # evidence that would never run. The repository is small enough that
+      # fetching all of it costs seconds.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}

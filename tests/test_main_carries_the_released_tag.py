@@ -173,9 +173,9 @@ class TestRunGateWithStubbedReads:
     resolved against whatever branches this checkout happens to have --
     passing only because a local ``refs/heads/main`` happened to exist.
     Confirmed by execution: cloning this repository shallow and
-    single-branch (the shape ``actions/checkout@v7`` produces with no
-    ``ref``/``fetch-depth`` override, which is what ``ci.yml`` uses) leaves
-    no local ``refs/heads/main`` at all, and the two tests that reach a
+    single-branch -- the shape ``actions/checkout@v7`` produces with no
+    ``ref``/``fetch-depth`` override -- leaves no local ``refs/heads/main``
+    at all, and the two tests that reach a
     real assertion below raised ``GateInputError: 'refs/heads/main' does
     not exist in this repository`` there instead of exercising the stubbed
     ``list_git_tags``/``is_ancestor`` behaviour this class exists to check.
