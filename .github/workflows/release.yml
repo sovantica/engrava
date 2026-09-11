@@ -25,6 +25,28 @@
 # never reaches the tag/push/Release code at all. See
 # scripts/verify_release_artifacts.sh for the gate itself.
 #
+# Nothing above names the version this release train *intends* to publish --
+# commit-analyzer only derives one from whatever the commit range on `dev`
+# happens to type as. `release-target.json` at the repository root is the
+# declared target: a single git-tracked file, independent of the branch name
+# that carried the work here (by the time this job runs, the source
+# `release/vX.Y.Z` branch has already been merged and deleted, so there is no
+# branch name left to read). Two checks compare the declared target against
+# reality, for the two different ways they can disagree:
+#
+#   - F1, the wrong version being published: `prepare`'s *first* plugin --
+#     ahead of the changelog, the version bump, and the artifact gate above,
+#     let alone @semantic-release/git -- runs
+#     scripts/check_computed_version_matches_target.py against
+#     `${nextRelease.version}` and fails the whole lifecycle step (by the
+#     same abort-on-first-failure contract described above) if it disagrees
+#     with release-target.json.
+#   - F2, no version being published at all: when every commit types as
+#     no-release, semantic-release's `prepare` step never runs, so there is
+#     no lifecycle step left to hook a check into. See the "Fail if a
+#     declared release target was never published" step below, which runs
+#     unconditionally after semantic-release, not as a plugin.
+#
 # `dev` is the release-trigger branch (portfolio-wide convention). `main` is a
 # stable mirror — it inherits the tagged release-commit via a separate forward
 # merge from `dev` after each release. Regular-merge strategy on `dev → main`

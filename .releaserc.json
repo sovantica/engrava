@@ -40,6 +40,12 @@
       }
     ],
     [
+      "@semantic-release/exec",
+      {
+        "prepareCmd": "python scripts/check_computed_version_matches_target.py ${nextRelease.version}"
+      }
+    ],
+    [
       "@semantic-release/changelog",
       {
         "changelogFile": "CHANGELOG.md",
