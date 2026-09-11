@@ -184,6 +184,17 @@ jobs:
             echo "published=false" >> "$GITHUB_OUTPUT"
             echo "::notice::No release-triggering commits — nothing published."
           fi
+      # No `if:` on steps.detect.outputs.published here — that is the whole
+      # point of this step. It runs whether or not a release just happened,
+      # because the failure it exists to catch (F2: release-target.json
+      # declares a version and this run published nothing) is exactly the
+      # case the `detect` step above treats as a clean, green no-op. See
+      # scripts/check_release_target_was_published.py for the check and its
+      # documented boundary (it only proves the declared target's tag
+      # exists somewhere in this checkout's history, this run or an earlier
+      # one — not that this run was the one that produced it).
+      - name: Fail if a declared release target was never published
+        run: python scripts/check_release_target_was_published.py
       # The version is now known (steps.detect.outputs.version) and the tag
       # already exists at HEAD, but the dist/ artifact has not been built or
       # uploaded yet and PyPI has not been touched — this step still sits on
