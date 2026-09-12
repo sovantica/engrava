@@ -176,13 +176,13 @@ longer being modified.
 A logical snapshot excludes the audit journal. A fresh restore target
 therefore starts with an empty journal, and `restore --clear` empties an
 existing target's journal along with the data it wipes. A restore without
-`--clear` merges into the target: when none of the snapshot's IDs collide with
-journalled data, the existing journal is left in place and still describes
-that target's own history. **When an incoming ID does collide** with a
-journalled thought, edge, or action, the merge replaces that row — or, through
-a cascading foreign-key delete, removes it — while the journal entries
-describing its earlier content stay behind; `verify` still reports the chain
-as **valid** even though it no longer matches what is stored. A physical
+`--clear` merges into the target and can orphan journal entries even when no
+incoming ID collides with what the journal already describes: a duplicate
+`(from_thought_id, to_thought_id, edge_type)` triple replaces an existing
+edge, and replacing a thought cascades to that thought's own edges and
+embeddings — neither needs its own ID to collide. The journal entries
+describing the earlier row stay behind; `verify` still reports the chain as
+**valid** even though it no longer matches what is stored. A physical
 backup preserves the journal but is tied to the database file and must be
 captured with a WAL-safe method. See [Backup & Recovery](backup-and-recovery.md)
 for the supported boundary and procedures.

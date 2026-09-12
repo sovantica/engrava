@@ -319,15 +319,14 @@ a restored target — restore itself cannot tell you.
 > Restore recreates thoughts, edges, embeddings, and actions, **not** the audit
 > journal. A **fresh target** therefore starts with an empty journal, and
 > **`--clear`** empties the journal along with the data it wipes. A restore
-> **without `--clear`** merges into the target: when the snapshot's IDs do not
-> collide with anything the target's journal already describes, the existing
-> journal is left untouched. When an incoming ID **does** collide with
-> journalled data, the merge replaces that row — or, through a cascading
-> foreign-key delete, removes it — while the journal entries describing its
-> earlier content stay behind; `verify` still reports the chain as **valid**
-> even though it no longer matches the data. See
-> [Backup & Recovery](backup-and-recovery.md#logical-snapshot-and-restore) for
-> the full breakdown.
+> **without `--clear`** merges into the target and can orphan journal entries
+> even when no incoming ID collides with one the journal describes: a
+> duplicate `(from_thought_id, to_thought_id, edge_type)` triple replaces an
+> existing edge, and replacing a thought cascades to that thought's own edges
+> and embeddings — neither needs its own ID to collide. `verify` still
+> reports the chain as **valid** even though it no longer matches the data.
+> See [Backup & Recovery](backup-and-recovery.md#logical-snapshot-and-restore)
+> for the full breakdown.
 
 ### `gc`
 

@@ -150,13 +150,14 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 > fresh target, so it starts with an empty journal regardless. That is
 > specific to a fresh target, though: restoring the same snapshot with
 > `--clear` into an *existing* journalled database empties its journal too.
-> Restoring without `--clear` merges in: when none of the snapshot's IDs
-> collide with journalled data, that database's journal is left untouched.
-> **When an incoming ID does collide**, the merge replaces that row — or,
-> through a cascading foreign-key delete, removes it — while the journal
-> entries describing its earlier content stay behind, and `verify` still
-> reports the chain as **valid**. If you need the audit history preserved,
-> take a physical file backup instead — see
+> Restoring without `--clear` merges in and can orphan journal entries even
+> when no incoming ID collides with what the journal already describes: a
+> duplicate `(from_thought_id, to_thought_id, edge_type)` triple replaces an
+> existing edge, and replacing a thought cascades to that thought's own edges
+> and embeddings — neither needs its own ID to collide. The journal entries
+> describing the earlier row stay behind, and `verify` still reports the
+> chain as **valid**. If you need the audit history preserved, take a
+> physical file backup instead — see
 > [Backup & Recovery](backup-and-recovery.md).
 
 ## Compatibility Matrix

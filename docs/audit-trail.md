@@ -443,16 +443,20 @@ trail. What restoring from one leaves the target's journal holding depends on
 how it was restored: a fresh target starts with no journal at all, and `restore
 --clear` empties `journal_entry` along with the data it wipes so the chain
 does not outlive the data it described. A restore without `--clear` merges into
-the target: when none of the snapshot's IDs collide with a thought, edge, or
-action the target's journal already describes, the existing journal is left
-exactly as it was. When an incoming ID **does** collide with journalled data,
-the merge replaces that row — or, through a cascading foreign-key delete,
-removes it — while the journal entries describing its earlier content stay in
-place; `verify` still reports the chain as **valid** even though it no longer
-matches what the database holds. To preserve the journal, back up the database
-file itself (see the upgrade/backup guidance), and note that hard-deleting an
-audited thought still leaves its content in the journal's `before`/`after`
-delta — relevant when handling erasure requests.
+the target. The merged-in records are inserted directly and are not
+themselves journalled, and a journalled row can be orphaned even when none of
+the snapshot's IDs collide with anything the journal describes. Two paths do
+that: an incoming edge with a fresh `edge_id` but the same `(from_thought_id,
+to_thought_id, edge_type)` triple as a journalled edge replaces it through
+the table's UNIQUE constraint on that triple; and replacing a thought whose
+own ID **does** collide cascades the delete, by foreign key, to that
+thought's edges and embeddings — rows whose IDs never appeared in the
+snapshot. Either way the journal entries describing the earlier row stay
+behind unchanged; `verify` still reports the chain as **valid** even though
+it no longer matches what the database holds. To preserve the journal, back
+up the database file itself (see the upgrade/backup guidance), and note that
+hard-deleting an audited thought still leaves its content in the journal's
+`before`/`after` delta — relevant when handling erasure requests.
 
 ## See also
 

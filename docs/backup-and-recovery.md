@@ -38,14 +38,16 @@ thought / edge / embedding / action.
 >   describing thoughts the clear had just discarded.
 > - **A restore without `--clear`** merges into an existing database. The
 >   merged-in records are inserted directly and are not themselves journalled.
->   When none of the snapshot's IDs collide with a thought, edge, or action the
->   target's journal already describes, every existing entry stays in place and
->   still describes the target's own history. **When an incoming ID does
->   collide with journalled data**, the merge replaces that row — or, through
->   a cascading foreign-key delete, removes it — while the journal entries
->   describing its earlier content stay behind unchanged; `verify` still
->   reports the chain as **valid**, even though those entries no longer
->   describe what the database now holds.
+>   Orphaning a journal entry does not require an incoming ID to collide with
+>   one the journal already describes. An incoming edge with a fresh `edge_id`
+>   but the same `(from_thought_id, to_thought_id, edge_type)` triple as a
+>   journalled edge replaces it through the table's own UNIQUE constraint —
+>   no ID collision needed. And replacing a thought whose **own** ID does
+>   collide cascades the delete, by foreign key, to that thought's edges and
+>   embeddings — rows whose IDs never appeared in the snapshot. Either way the
+>   journal entries describing the earlier row stay behind unchanged;
+>   `verify` still reports the chain as **valid**, even though those entries
+>   no longer describe what the database now holds.
 >
 > If audit continuity matters, use a **physical file backup** (which copies
 > the journal verbatim), not a logical snapshot. See
