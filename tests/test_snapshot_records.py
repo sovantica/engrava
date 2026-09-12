@@ -248,6 +248,26 @@ class TestFixedSql:
         assert sql == expected
         assert len(values) == len(spec.columns)
 
+    def test_plain_insert_selects_the_ordinary_insert_verb(self) -> None:
+        # The journalled-merge collision gate (engrava.cli.main) sets this when
+        # it wants SQLite itself to refuse a colliding primary key or UNIQUE
+        # constraint, instead of the default INSERT OR REPLACE silently
+        # overwriting (or cascade-deleting) the existing row.
+        spec = table_spec(CoreTable.THOUGHT)
+        data = _minimal_thought_data()
+        sql, _values = spec.build_insert(data, plain_insert=True)
+        assert sql.startswith("INSERT INTO thought ")
+        assert "OR REPLACE" not in sql
+
+    def test_plain_insert_defaults_to_false(self) -> None:
+        # Every other caller (export/verify tooling, the embedding-identity
+        # check in cli/main.py) must keep getting INSERT OR REPLACE without
+        # having to say so.
+        spec = table_spec(CoreTable.THOUGHT)
+        data = _minimal_thought_data()
+        sql, _values = spec.build_insert(data)
+        assert sql.startswith("INSERT OR REPLACE INTO thought ")
+
     def test_injection_shaped_key_is_rejected_not_interpolated(self) -> None:
         # A key crafted to escape the identifier list must be rejected as an
         # unknown column and never reach the SQL text.
@@ -348,6 +368,12 @@ class TestParseHappyPath:
         assert record.data["vector_blob"] == base64.b64encode(vector).decode("ascii")
         _sql, values = record.to_insert()
         assert vector in values
+
+    def test_to_insert_forwards_plain_insert(self) -> None:
+        record = parse_snapshot_record(_thought_line(_minimal_thought_data()), line_number=1)
+        assert isinstance(record, TableRecord)
+        sql, _values = record.to_insert(plain_insert=True)
+        assert sql.startswith("INSERT INTO thought ")
 
 
 class TestValueValidation:

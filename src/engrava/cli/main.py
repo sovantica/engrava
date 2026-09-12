@@ -22,6 +22,7 @@ import datetime
 import json
 import logging
 import os
+import sqlite3
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
@@ -63,6 +64,19 @@ logger = logging.getLogger(__name__)
 # Re-embedding thought IDs are flushed in batches of this size so restore memory
 # stays bounded by the batch rather than by the total number of thoughts.
 _REEMBED_BATCH_SIZE = 128
+
+# sqlite3.IntegrityError.sqlite_errorcode values the journalled-merge collision
+# gate (see `_import_records_to_db`) treats as a refused collision, rather than
+# an unrelated integrity failure it must let propagate unchanged (a foreign-key
+# violation, SQLITE_CONSTRAINT_FOREIGNKEY = 787, is one such unrelated case).
+# The exception's *message* is not used to tell these apart: SQLite's own text
+# reads "UNIQUE constraint failed" even for a primary-key violation, since a
+# ``PRIMARY KEY`` is implemented as a ``UNIQUE`` index internally.
+_SQLITE_CONSTRAINT_PRIMARYKEY = 1555
+_SQLITE_CONSTRAINT_UNIQUE = 2067
+_JOURNAL_GATE_CONSTRAINT_CODES = frozenset(
+    {_SQLITE_CONSTRAINT_PRIMARYKEY, _SQLITE_CONSTRAINT_UNIQUE}
+)
 
 _DISABLE_EXTENSIONS_META_KEY = "engrava_disable_extensions"
 _FALSE_ENV_FLAG_VALUES = frozenset({"", "0", "false", "no", "off"})
@@ -1604,6 +1618,8 @@ async def _reset_sqlite_vec_index_for_restore(conn: aiosqlite.Connection) -> Non
 async def _insert_record(
     conn: aiosqlite.Connection,
     record: TableRecord,
+    *,
+    plain_insert: bool,
 ) -> None:
     """Insert one validated snapshot record via fixed, allow-listed SQL.
 
@@ -1614,9 +1630,18 @@ async def _insert_record(
     Args:
         conn: Open aiosqlite connection.
         record: A validated core-table record.
+        plain_insert: When ``True``, insert with an ordinary ``INSERT`` so a
+            colliding primary key or ``UNIQUE`` constraint raises instead of
+            silently replacing (see the journalled-merge collision gate in
+            :func:`_import_records_to_db`).
+
+    Raises:
+        sqlite3.IntegrityError: If ``plain_insert`` is set and the record
+            collides with an existing row. The caller (:func:`_stream_insert`)
+            translates this into a ``click.ClickException``.
 
     """
-    sql, values = record.to_insert()
+    sql, values = record.to_insert(plain_insert=plain_insert)
     await conn.execute(sql, values)
 
 
@@ -1643,6 +1668,56 @@ def _reembed_id(
     return tid if isinstance(tid, str) else None
 
 
+async def _insert_record_under_gate(
+    conn: aiosqlite.Connection,
+    record: TableRecord,
+    *,
+    plain_insert: bool,
+) -> None:
+    """Insert one record, translating a gate-relevant collision into a clean error.
+
+    Thin wrapper around :func:`_insert_record` that exists only to keep the
+    ``try``/``except`` out of :func:`_stream_insert`'s already-long loop body.
+
+    Args:
+        conn: Open aiosqlite connection.
+        record: A validated core-table record.
+        plain_insert: See :func:`_insert_record`.
+
+    Raises:
+        click.ClickException: If ``plain_insert`` is set and the record
+            collides on a primary key or ``UNIQUE`` constraint.
+
+    """
+    try:
+        await _insert_record(conn, record, plain_insert=plain_insert)
+    except sqlite3.IntegrityError as exc:
+        if exc.sqlite_errorcode in _JOURNAL_GATE_CONSTRAINT_CODES:
+            raise _journal_gate_collision_error(record.line_number) from exc
+        raise
+
+
+def _journal_gate_collision_error(line_number: int) -> click.ClickException:
+    """Describe a refused collision under the journalled-merge collision gate.
+
+    Args:
+        line_number: 1-based snapshot line number of the record that collided.
+
+    Returns:
+        A ``click.ClickException`` naming the gate and its override.
+
+    """
+    msg = (
+        f"Restore refused: snapshot line {line_number} collides with an existing row "
+        "(matching primary key or UNIQUE constraint), and the target's journal_entry "
+        "table is not empty. Replacing that row would leave the audit trail describing "
+        "data this merge discarded, while 'engrava verify' kept reporting the chain as "
+        "valid. Re-run with --orphan-journal-entries to allow the merge and accept that "
+        "gap, or with --clear to discard the journal along with the data."
+    )
+    return click.ClickException(msg)
+
+
 async def _stream_insert(
     conn: aiosqlite.Connection,
     input_path: Path,
@@ -1650,6 +1725,7 @@ async def _stream_insert(
     skip_embeddings: bool,
     re_embed: bool,
     embedding_provider: EmbeddingProviderProtocol | None,
+    plain_insert: bool,
 ) -> int:
     """Stream a snapshot once, validating and inserting each record in order.
 
@@ -1681,15 +1757,21 @@ async def _stream_insert(
         skip_embeddings: Skip embedding records during import.
         re_embed: Re-embed thoughts via the embedding provider after insert.
         embedding_provider: ``EmbeddingProviderProtocol`` for re-embedding.
+        plain_insert: When ``True``, every record is written with an ordinary
+            ``INSERT`` instead of ``INSERT OR REPLACE`` (the journalled-merge
+            collision gate computed once by :func:`_import_records_to_db`), so
+            a colliding primary key or ``UNIQUE`` constraint is refused rather
+            than silently replacing (or cascade-deleting) the existing row.
 
     Returns:
         Total number of records written (inserts plus re-embeddings).
 
     Raises:
         click.ClickException: On a malformed record, an invalid value, an
-            embedding identity mismatch without an override flag, or the
-            target's own existing rows already disagreeing among themselves
-            or with its lock.
+            embedding identity mismatch without an override flag, a
+            journalled-merge collision refused under ``plain_insert`` (see
+            above), or the target's own existing rows already disagreeing
+            among themselves or with its lock.
 
     """
     check_incoming = not re_embed and not skip_embeddings
@@ -1716,7 +1798,7 @@ async def _stream_insert(
                 record, identity_reference, identity_reference_label
             )
 
-        await _insert_record(conn, record)
+        await _insert_record_under_gate(conn, record, plain_insert=plain_insert)
         total += 1
 
         tid = _reembed_id(record, re_embed=re_embed, embedding_provider=embedding_provider)
@@ -1760,6 +1842,26 @@ class RestoreImportResult:
     journal_entries_cleared: int
 
 
+async def _journal_entry_has_rows(conn: aiosqlite.Connection) -> bool:
+    """Report whether the target's ``journal_entry`` table currently holds a row.
+
+    Scopes the journalled-merge collision gate in :func:`_import_records_to_db`:
+    journalling is opt-in and the CLI never enables it itself, so the
+    overwhelmingly common restore target has an empty ``journal_entry`` and
+    this returns ``False``, leaving the merge behaviour exactly as it always
+    was.
+
+    Args:
+        conn: Restore connection with an active transaction.
+
+    Returns:
+        ``True`` when at least one row exists in ``journal_entry``.
+
+    """
+    cursor = await conn.execute("SELECT 1 FROM journal_entry LIMIT 1")
+    return await cursor.fetchone() is not None
+
+
 async def _import_records_to_db(
     conn: aiosqlite.Connection,
     input_path: Path,
@@ -1768,6 +1870,7 @@ async def _import_records_to_db(
     skip_embeddings: bool = False,
     re_embed: bool = False,
     embedding_provider: EmbeddingProviderProtocol | None = None,
+    orphan_journal_entries: bool = False,
 ) -> RestoreImportResult:
     """Import JSONL records into a database connection atomically.
 
@@ -1784,14 +1887,43 @@ async def _import_records_to_db(
     data and its existing journal would describe two different histories --
     the journal would keep authenticating thoughts the clear just removed --
     and ``verify_journal()`` would keep reporting that mismatched chain as
-    valid. A restore without ``--clear`` never writes to ``journal_entry``
-    itself, but that is not the same as leaving the journal *consistent*: each
-    record is still inserted with ``INSERT OR REPLACE``, so an incoming ID that
-    collides with a thought, edge, or action the journal already describes
-    replaces that row -- or, through a cascading foreign-key delete, removes it
-    -- while the journal entries describing its earlier content are left
-    behind unchanged. ``verify_journal()`` still reports that chain as valid.
-    This is a known gap, tracked separately, not a guarantee of this function.
+    valid.
+
+    A restore without ``--clear`` never writes to ``journal_entry`` itself,
+    but that is not the same as leaving the journal *consistent*. Without the
+    gate described below, every record is inserted with ``INSERT OR
+    REPLACE``, and an incoming thought, edge, or action whose id matches one
+    the journal already describes replaces it outright. But an id match is
+    not the only way a journalled row is orphaned this way, and framing it as
+    the only way is exactly the false conservatism the shipped documentation
+    used to carry: an incoming edge with a brand-new ``edge_id`` still
+    replaces a journalled edge if it repeats that table's composite
+    ``UNIQUE(from_thought_id, to_thought_id, edge_type)`` (schema_core.sql),
+    with no id ever colliding, and replacing a journalled thought cascades an
+    ``ON DELETE CASCADE`` foreign-key delete onto *that thought's own* edges
+    and embeddings -- rows whose ids never appeared in the incoming snapshot
+    at all. Either way, the journal entries describing what was just removed
+    are left behind unchanged, and ``verify_journal()`` keeps reporting that
+    mismatched chain as valid, because the chain itself stays internally
+    self-consistent; it simply no longer matches what is stored.
+
+    The **journalled-merge collision gate** closes this for every case above,
+    because it does not try to enumerate them: when this restore has no
+    ``--clear``, no ``orphan_journal_entries`` override, and the target's
+    ``journal_entry`` table is non-empty, every incoming record is instead
+    written with a plain ``INSERT``, so SQLite itself refuses any uniqueness
+    violation -- primary key or ``UNIQUE``, including the composite one above
+    -- with a ``click.ClickException`` instead of silently replacing (or
+    cascade-deleting) the row. Nothing is deleted first, so the cascade path
+    is not merely caught, it never fires. The gate is conservative, not
+    precise: it refuses *any* such collision once a journal exists, including
+    one on a row the journal never described, and ``orphan_journal_entries``
+    exists for a caller who has weighed that and wants the merge anyway --
+    which restores exactly the unconditional ``INSERT OR REPLACE`` behaviour
+    described above. The gate never applies when ``journal_entry`` is empty,
+    which is the overwhelmingly common case since journalling is opt-in and
+    the CLI never enables it itself -- that restore's merge behaviour is
+    unchanged.
 
     Args:
         conn: Open aiosqlite connection with schema applied.
@@ -1800,6 +1932,9 @@ async def _import_records_to_db(
         skip_embeddings: Skip embedding records during import.
         re_embed: Re-embed thoughts via the embedding provider after import.
         embedding_provider: ``EmbeddingProviderProtocol`` for re-embedding.
+        orphan_journal_entries: Opt out of the journalled-merge collision gate
+            described above, restoring the unconditional ``INSERT OR REPLACE``
+            merge even when the target's journal is non-empty.
 
     Returns:
         The total records imported and how many journal entries ``--clear``
@@ -1807,7 +1942,8 @@ async def _import_records_to_db(
 
     Raises:
         click.ClickException: On a malformed snapshot record, an invalid value,
-            or an embedding-model mismatch without an override flag. The
+            an embedding-model mismatch without an override flag, or a
+            collision refused by the journalled-merge collision gate. The
             transaction is rolled back before the error propagates.
 
     """
@@ -1833,12 +1969,20 @@ async def _import_records_to_db(
             # rows removed.
             journal_cursor = await conn.execute("DELETE FROM journal_entry")
             journal_entries_cleared = journal_cursor.rowcount
+        # The journalled-merge collision gate's three-part condition,
+        # evaluated once, before the insert loop below. `clear` short-circuits
+        # the query entirely -- a `--clear` restore has already emptied
+        # `journal_entry` above, so the query would return `False` anyway.
+        plain_insert = (
+            not clear and not orphan_journal_entries and await _journal_entry_has_rows(conn)
+        )
         total = await _stream_insert(
             conn,
             input_path,
             skip_embeddings=skip_embeddings,
             re_embed=re_embed,
             embedding_provider=embedding_provider,
+            plain_insert=plain_insert,
         )
         await conn.commit()
         committed = True
@@ -1890,6 +2034,7 @@ async def _restore_service_snapshot(
     clear: bool,
     skip_embeddings: bool,
     re_embed: bool,
+    orphan_journal_entries: bool,
     cfg: EngravaCLIConfig,
     services_cfg: ServicesConfig | None,
     default_embeddings: EmbeddingConfig | None,
@@ -1946,6 +2091,7 @@ async def _restore_service_snapshot(
             skip_embeddings=skip_embeddings,
             re_embed=re_embed,
             embedding_provider=emb_provider,
+            orphan_journal_entries=orphan_journal_entries,
         )
         click.echo(
             f"Restored {result.total_records} records to service {effective_service!r} "
@@ -1963,6 +2109,7 @@ async def _restore_single_db(
     clear: bool,
     skip_embeddings: bool,
     re_embed: bool,
+    orphan_journal_entries: bool,
     cfg: EngravaCLIConfig,
     default_embeddings: EmbeddingConfig | None,
 ) -> None:
@@ -2019,6 +2166,7 @@ async def _restore_single_db(
             skip_embeddings=skip_embeddings,
             re_embed=re_embed,
             embedding_provider=emb_provider,
+            orphan_journal_entries=orphan_journal_entries,
         )
         click.echo(f"Restored {result.total_records} records from {input_path}")
         if clear:
@@ -2039,6 +2187,16 @@ async def _restore_single_db(
     help="Re-embed all thoughts via the target provider (ignores source embeddings).",
 )
 @click.option(
+    "--orphan-journal-entries",
+    is_flag=True,
+    help=(
+        "Allow a merge restore (no --clear) to replace rows in a target whose "
+        "journal_entry table is not empty, even though the journal will then "
+        "describe data the merge discarded. Without this flag, such a "
+        "collision is refused."
+    ),
+)
+@click.option(
     "--service",
     "service_name",
     default=None,
@@ -2052,12 +2210,18 @@ def restore(
     clear: bool,
     skip_embeddings: bool,
     re_embed: bool,
+    orphan_journal_entries: bool,
     service_name: str | None,
 ) -> None:
     """Restore database from a JSONL snapshot file.
 
     Supports model-mismatch handling via ``--re-embed`` (re-generate
     embeddings) or ``--skip-embeddings`` (import without vectors).
+
+    A merge restore (no ``--clear``) into a target whose ``journal_entry``
+    table is not empty refuses any record that collides with an existing row,
+    to keep the audit trail from silently describing data the merge replaced
+    or removed. Pass ``--orphan-journal-entries`` to allow that merge anyway.
     """
     cfg: EngravaCLIConfig = ctx.obj["config"]
     services_cfg: ServicesConfig | None = ctx.obj.get("services_config")
@@ -2087,6 +2251,7 @@ def restore(
                 clear=clear,
                 skip_embeddings=skip_embeddings,
                 re_embed=re_embed,
+                orphan_journal_entries=orphan_journal_entries,
                 cfg=cfg,
                 services_cfg=services_cfg,
                 default_embeddings=default_embeddings,
@@ -2097,6 +2262,7 @@ def restore(
                 clear=clear,
                 skip_embeddings=skip_embeddings,
                 re_embed=re_embed,
+                orphan_journal_entries=orphan_journal_entries,
                 cfg=cfg,
                 default_embeddings=default_embeddings,
             )

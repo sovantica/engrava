@@ -295,7 +295,7 @@ class TableSpec:
                 raise InvalidColumnValueError(self.table, column, line_number)
 
     def build_insert(
-        self, data: Mapping[str, SnapshotBindValue]
+        self, data: Mapping[str, SnapshotBindValue], *, plain_insert: bool = False
     ) -> tuple[str, tuple[SnapshotBindValue, ...]]:
         """Build a fixed ``INSERT`` statement and its aligned value tuple.
 
@@ -306,6 +306,11 @@ class TableSpec:
         Args:
             data: A validated, bind-ready record mapping (columns are a subset of
                 :attr:`columns`).
+            plain_insert: When ``True``, emit an ordinary ``INSERT`` that lets
+                SQLite refuse a colliding primary key or ``UNIQUE`` constraint,
+                instead of the default ``INSERT OR REPLACE`` that silently
+                overwrites (or, through a cascading foreign key, deletes) the
+                colliding row.
 
         Returns:
             A ``(sql, values)`` pair ready for ``execute``.
@@ -314,13 +319,11 @@ class TableSpec:
         present = tuple(column for column in self.columns if column in data)
         columns_sql = ", ".join(present)
         placeholders = ", ".join("?" for _ in present)
+        verb = "INSERT" if plain_insert else "INSERT OR REPLACE"
         # Only the table name and allow-listed column constants reach the SQL
         # text; every value travels as a bound parameter, so this is not an
         # injection surface despite the f-string.
-        sql = (
-            f"INSERT OR REPLACE INTO {self.table.value} "  # noqa: S608
-            f"({columns_sql}) VALUES ({placeholders})"
-        )
+        sql = f"{verb} INTO {self.table.value} ({columns_sql}) VALUES ({placeholders})"
         values = tuple(data[column] for column in present)
         return sql, values
 
@@ -497,13 +500,17 @@ class TableRecord:
     data: Mapping[str, SnapshotScalar]
     line_number: int
 
-    def to_insert(self) -> tuple[str, tuple[SnapshotBindValue, ...]]:
+    def to_insert(self, *, plain_insert: bool = False) -> tuple[str, tuple[SnapshotBindValue, ...]]:
         """Return fixed SQL and bind values, decoding any transport encoding.
 
         The base64 ``vector_blob`` of an ``embedding`` record is decoded to bytes
         here -- at insert time -- so a record that is skipped (``--skip-embeddings``
         or ``--re-embed``) never pays the decode and a corrupt blob does not fail
         an import that would not have stored it.
+
+        Args:
+            plain_insert: Forwarded to :meth:`TableSpec.build_insert` -- see
+                there for what it selects.
 
         Returns:
             A ``(sql, values)`` pair ready for ``execute``.
@@ -516,7 +523,7 @@ class TableRecord:
         values: Mapping[str, SnapshotBindValue] = self.data
         if self.spec.table is CoreTable.EMBEDDING:
             values = _decode_embedding_blob(self.data, line_number=self.line_number)
-        return self.spec.build_insert(values)
+        return self.spec.build_insert(values, plain_insert=plain_insert)
 
 
 @dataclass(frozen=True, slots=True)

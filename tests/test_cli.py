@@ -441,6 +441,301 @@ def colliding_snapshot(runner: CliRunner, tmp_path: Path) -> Path:
     return snap
 
 
+@pytest.fixture
+def colliding_snapshot_for_populated_db(runner: CliRunner, tmp_path: Path) -> Path:
+    """A one-thought snapshot whose ID collides with ``thought-000`` in ``populated_db``.
+
+    Backs the negative control for the journalled-merge collision gate:
+    ``populated_db`` never enables journaling, so this collision must still
+    succeed and still replace, exactly as restore always behaved -- the gate
+    exists only once a journal has rows.
+    """
+    source_db = tmp_path / "collide-source-populated.db"
+    result = runner.invoke(cli, ["--db", str(source_db), "migrate"])
+    assert result.exit_code == 0, result.output
+
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+
+    async def _seed() -> None:
+        conn = await aiosqlite.connect(str(source_db))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="thought-000",
+                essence="Replacement essence for thought-000",
+                content="Replacement content for thought-000",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=1,
+                updated_cycle=1,
+            )
+        )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_seed())
+
+    snap = tmp_path / "colliding-populated-snapshot.jsonl"
+    result = runner.invoke(cli, ["--db", str(source_db), "snapshot", "-o", str(snap)])
+    assert result.exit_code == 0, result.output
+    return snap
+
+
+@pytest.fixture
+def custom_mutation_db(tmp_path: Path) -> Path:
+    """A store carrying one journal entry whose ``mutation_type`` is an arbitrary string.
+
+    ``JournalWriter.append()`` validates nothing about ``mutation_type`` -- it
+    is unconstrained ``TEXT`` -- so this writes ``CUSTOM_MUTATION``, a value no
+    other part of the codebase ever emits, directly through the writer
+    (bypassing ``create_thought``'s own journalling) to prove the gate keys
+    off "``journal_entry`` has rows", never off a specific recognised
+    ``mutation_type``.
+    """
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+    from engrava.infrastructure.sqlite.journal_writer import JournalWriter
+
+    db_path = tmp_path / "custom_mutation.db"
+
+    async def _setup() -> None:
+        conn = await aiosqlite.connect(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn, journal_enabled=False)
+        await store.ensure_schema()
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-cm-0",
+                essence="Essence for t-cm-0",
+                content="Content for t-cm-0",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=1,
+                updated_cycle=1,
+            )
+        )
+        writer = JournalWriter(conn)
+        await writer.append(
+            mutation_type="CUSTOM_MUTATION",
+            target_id="t-cm-0",
+            delta={"before": None, "after": {"content": "Content for t-cm-0"}},
+        )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_setup())
+    return db_path
+
+
+@pytest.fixture
+def colliding_snapshot_for_custom_mutation_db(runner: CliRunner, tmp_path: Path) -> Path:
+    """A one-thought snapshot whose ID collides with ``t-cm-0`` in ``custom_mutation_db``."""
+    source_db = tmp_path / "collide-source-cm.db"
+    result = runner.invoke(cli, ["--db", str(source_db), "migrate"])
+    assert result.exit_code == 0, result.output
+
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+
+    async def _seed() -> None:
+        conn = await aiosqlite.connect(str(source_db))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-cm-0",
+                essence="Replacement essence for t-cm-0",
+                content="Replacement content for t-cm-0",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=1,
+                updated_cycle=1,
+            )
+        )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_seed())
+
+    snap = tmp_path / "colliding-cm-snapshot.jsonl"
+    result = runner.invoke(cli, ["--db", str(source_db), "snapshot", "-o", str(snap)])
+    assert result.exit_code == 0, result.output
+    return snap
+
+
+@pytest.fixture
+def identical_snapshot_of_journalled_db(
+    runner: CliRunner, journalled_db: Path, tmp_path: Path
+) -> Path:
+    """A byte-for-byte snapshot of ``journalled_db`` itself, restorable back into it.
+
+    Restoring this into ``journalled_db`` collides every thought on its own
+    unchanged primary key and content. Used to show that even an identical
+    merge is refused: with the old ``INSERT OR REPLACE`` behavior this
+    silently changed every row's ``rowid`` (SQLite resolves the primary-key
+    conflict by deleting then re-inserting, even when column values match).
+    """
+    snap = tmp_path / "identical-snapshot.jsonl"
+    result = runner.invoke(cli, ["--db", str(journalled_db), "snapshot", "-o", str(snap)])
+    assert result.exit_code == 0, result.output
+    return snap
+
+
+def _thought_rowids(db_path: Path) -> dict[str, int]:
+    """Read each thought's implicit ``rowid``, keyed by ``thought_id``.
+
+    An ``INSERT OR REPLACE`` that resolves a primary-key collision by
+    deleting and re-inserting changes a row's ``rowid`` even when every
+    column value is unchanged -- a plain ``SELECT thought_id, essence, ...``
+    comparison would never see that, which is exactly the first fatal finding
+    against the abandoned detection-based branch this gate replaces.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute("SELECT thought_id, rowid FROM thought").fetchall()
+        return {str(row[0]): int(row[1]) for row in rows}
+    finally:
+        conn.close()
+
+
+def _thought_fts_match_count(db_path: Path, term: str) -> int:
+    """Count real ``thought_fts`` index entries matching ``term`` via a ``MATCH`` query.
+
+    ``SELECT COUNT(*) FROM thought_fts`` (no ``MATCH``) is USELESS here and
+    must not be used: ``thought_fts`` is an external-content FTS5 table
+    (``content='thought'``, ``content_rowid='rowid'``, schema_core.sql), and a
+    bare, unfiltered ``COUNT(*)`` over an external-content table is satisfied
+    by reading through to the row count of the backing ``thought`` table
+    itself. It reports the number of thoughts, by construction, no matter how
+    desynchronised the FTS shadow tables actually are -- it cannot observe
+    this defect at all.
+
+    A ``MATCH`` query, by contrast, scans the real inverted index and returns
+    one hit per indexed entry, including a stale entry whose rowid no longer
+    exists in ``thought`` at all. That is exactly the shape of the hazard this
+    probe exists to see: ``PRAGMA recursive_triggers`` defaults to ``0`` and
+    nothing under ``src/`` sets it, and SQLite only fires a table's ``DELETE``
+    trigger for the row an ``INSERT OR REPLACE`` conflict removes when
+    recursive triggers are enabled. So ``thought_fts_insert`` fires for the
+    new rowid while ``thought_fts_delete`` never fires for the old one, and
+    the stale entry for the removed rowid survives in the index, pointing at
+    a row that no longer exists.
+
+    Args:
+        db_path: Path to the database to inspect.
+        term: An FTS5 query term expected to match every thought under test
+            (e.g. a word common to every fixture's ``essence``/``content``).
+
+    Returns:
+        The number of ``thought_fts`` rows matching ``term`` -- real index
+        entries, not thoughts.
+
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM thought_fts WHERE thought_fts MATCH ?", (term,)
+        ).fetchone()
+        return int(row[0])
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def fresh_edge_id_duplicate_triple_snapshot(runner: CliRunner, tmp_path: Path) -> Path:
+    """A snapshot carrying only an edge record: a fresh ``edge_id``, ``edge-001``'s own triple.
+
+    Isolated to just the edge line -- the thought rows that satisfied this
+    edge's own foreign key when it was created in the source database are
+    stripped back out -- so restoring this into ``journalled_db_with_edge``
+    collides *only* on the edge table's composite
+    ``UNIQUE(from_thought_id, to_thought_id, edge_type)`` (schema_core.sql),
+    never on a thought primary key. A probe keyed on primary ids alone would
+    never see this collision at all, since ``edge_id`` itself (``edge-999``)
+    is brand new.
+    """
+    source_db = tmp_path / "edge-source.db"
+
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import (
+        EdgeRecord,
+        EdgeType,
+        LifecycleStatus,
+        Priority,
+        SqliteEngravaCore,
+        ThoughtRecord,
+        ThoughtType,
+    )
+
+    async def _seed() -> None:
+        conn = await aiosqlite.connect(str(source_db))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        await store.ensure_schema()
+        for i, tid in enumerate(("t-old-0", "t-old-1")):
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id=tid,
+                    essence=f"Essence for {tid}",
+                    content=f"Content for {tid}",
+                    thought_type=ThoughtType.OBSERVATION,
+                    source="test",
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    priority=Priority.P2,
+                    created_cycle=i + 1,
+                    updated_cycle=i + 1,
+                )
+            )
+        await store.create_edge(
+            EdgeRecord(
+                edge_id="edge-999",
+                from_thought_id="t-old-0",
+                to_thought_id="t-old-1",
+                edge_type=EdgeType.ASSOCIATED,
+                weight=0.5,
+                created_cycle=1,
+            )
+        )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_seed())
+
+    full_snap = tmp_path / "edge-source-full.jsonl"
+    result = runner.invoke(cli, ["--db", str(source_db), "snapshot", "-o", str(full_snap)])
+    assert result.exit_code == 0, result.output
+
+    edge_only_lines = [
+        line
+        for line in full_snap.read_text(encoding="utf-8").splitlines()
+        if json.loads(line).get("_type") == "edge"
+    ]
+    assert len(edge_only_lines) == 1
+    edge_only_snap = tmp_path / "edge-only.jsonl"
+    edge_only_snap.write_text("\n".join(edge_only_lines) + "\n", encoding="utf-8")
+    return edge_only_snap
+
+
 class TestGlobalControls:
     """Tests for extension isolation and verbose logging controls."""
 
@@ -1091,52 +1386,51 @@ class TestRestore:
         assert isinstance(result.exception, SystemExit)
 
 
-class TestRestoreWithoutClearKnownJournalCollisionDefects:
-    """Pin the ID-collision gap in restore without ``--clear``.
+class TestRestoreRefusesCollisionAgainstAJournalledStore:
+    """A merge restore (no ``--clear``) refuses a collision once the target is journalled.
 
-    KNOWN DEFECT -- these tests pin *current*, undesired behavior, not a
-    contract to preserve. The gap is recorded separately and awaits a product
-    decision; nothing here fixes it. Restore without ``--clear`` inserts every
-    record with ``INSERT OR REPLACE``. When a snapshot's ID collides with an
-    existing *journalled* thought, edge, or action, the live row is replaced
-    -- or, through a cascading ``ON DELETE CASCADE`` foreign-key delete,
-    removed outright -- but the journal entry describing its previous content
-    is never touched, and ``verify_journal()`` still reports the chain as
-    valid because the chain itself is still internally self-consistent; it
-    just no longer matches what is stored.
-
-    If this behavior is ever intentionally changed, these tests must fail and
-    be updated deliberately -- that is the point of pinning them here instead
-    of leaving the gap undocumented in test form.
+    Formerly ``TestRestoreWithoutClearKnownJournalCollisionDefects``: these
+    same two scenarios used to pin the KNOWN DEFECT that ``INSERT OR REPLACE``
+    silently replaced (or cascade-deleted) a journalled row, leaving its
+    journal entry describing content that was no longer there while ``verify``
+    kept reporting the chain valid. The journalled-merge collision gate in
+    ``_import_records_to_db`` (``cli/main.py``) closes that gap: once the
+    target's ``journal_entry`` table is non-empty, every incoming record is
+    written with a plain ``INSERT`` instead, so SQLite itself refuses the
+    collision. Nothing here still passes with the old ``INSERT OR REPLACE``
+    behavior -- these tests must now show the refusal and an entirely
+    untouched database, which is also the atomicity guarantee: the existing
+    ``finally: await conn.rollback()`` in ``_import_records_to_db`` discards
+    the whole transaction, including any record inserted before the one that
+    collided.
     """
 
-    def test_colliding_thought_id_replaces_content_but_leaves_a_stale_journal_entry(
+    def test_colliding_thought_id_is_refused_content_and_journal_untouched(
         self,
         runner: CliRunner,
         journalled_db: Path,
         colliding_snapshot: Path,
     ) -> None:
-        """KNOWN DEFECT: a colliding thought ID replaces content; its journal entry survives.
+        """A colliding thought ID is refused; live content and the journal are both untouched.
 
         ``colliding_snapshot`` carries a thought whose ID (``t-old-0``) matches
-        one already in ``journalled_db``, with different essence/content. This
-        pins the exact mismatch a reviewer reported: live content changes,
-        the journal entry describing the old content survives unchanged, and
-        ``verify`` still reports the chain valid.
+        one already in ``journalled_db``, with different essence/content --
+        exactly the mismatch a reviewer once reported as silently accepted.
         """
         assert _journal_entry_count(journalled_db) == 3
         before_deltas = _journal_entry_deltas(journalled_db, "t-old-0")
         assert len(before_deltas) == 1
-        before_after = cast("dict[str, object]", before_deltas[0]["after"])
-        assert before_after["content"] == "Content for t-old-0"
 
         result = runner.invoke(
             cli,
             ["--db", str(journalled_db), "restore", "-i", str(colliding_snapshot)],
         )
-        assert result.exit_code == 0, result.output
 
-        # The live row was replaced with the snapshot's content ...
+        assert result.exit_code != 0
+        assert "--orphan-journal-entries" in result.output
+        assert "journal_entry" in result.output
+
+        # Nothing was written: the live row keeps its original content ...
         assert _stored_core_ids(journalled_db)["thought"] == {"t-old-0", "t-old-1", "t-old-2"}
         conn = sqlite3.connect(journalled_db)
         try:
@@ -1146,17 +1440,12 @@ class TestRestoreWithoutClearKnownJournalCollisionDefects:
             ).fetchone()[0]
         finally:
             conn.close()
-        assert live_content == "Replacement content for t-old-0"
+        assert live_content == "Content for t-old-0"
 
-        # ... but journal_entry was never touched: same row count, same stale delta.
+        # ... and the journal is exactly as it was.
         assert _journal_entry_count(journalled_db) == 3
-        after_deltas = _journal_entry_deltas(journalled_db, "t-old-0")
-        assert after_deltas == before_deltas
-        after_after = cast("dict[str, object]", after_deltas[0]["after"])
-        assert after_after["content"] == "Content for t-old-0"  # stale: the OLD content
+        assert _journal_entry_deltas(journalled_db, "t-old-0") == before_deltas
 
-        # verify_journal() cannot see the mismatch -- the chain is still
-        # internally self-consistent even though it no longer matches the data.
         verify_result = runner.invoke(
             cli,
             ["--db", str(journalled_db), "--format", "json", "verify"],
@@ -1166,23 +1455,22 @@ class TestRestoreWithoutClearKnownJournalCollisionDefects:
         assert verify_data["valid"] is True
         assert verify_data["entries_checked"] == 3
 
-    def test_colliding_thought_id_cascades_an_edge_delete_the_journal_never_learns_about(
+    def test_colliding_thought_id_is_refused_before_any_cascade_can_fire(
         self,
         runner: CliRunner,
         journalled_db_with_edge: Path,
         colliding_snapshot: Path,
     ) -> None:
-        """KNOWN DEFECT: a colliding thought ID can cascade-delete a dependent edge unnoticed.
+        """A colliding thought ID is refused before its cascading edge delete can fire.
 
         ``edge`` carries an ``ON DELETE CASCADE`` foreign key to ``thought`` on
-        both endpoints (schema_core.sql). ``INSERT OR REPLACE`` resolves the
-        primary-key collision on ``t-old-0`` by deleting the pre-existing row
-        first, and with ``PRAGMA foreign_keys = ON`` (always on for restore,
-        see ``_open_db``) that delete cascades onto ``edge-001``, which
-        references it. The journal's ``INSERT_EDGE`` entry for that edge is
-        never touched -- this pins the reviewer's stronger reproduction:
-        edge count 1 -> 0, all three journal entries retained and verifying
-        successfully.
+        both endpoints (schema_core.sql). Under the old ``INSERT OR REPLACE``
+        behavior, resolving the primary-key collision on ``t-old-0`` deleted
+        the pre-existing row first, and with ``PRAGMA foreign_keys = ON``
+        (always on for restore, see ``_open_db``) that cascaded onto
+        ``edge-001``. A plain ``INSERT`` has no delete half, so that cascade
+        path is now unreachable rather than merely mitigated: it never gets
+        the chance to fire.
         """
         assert _journal_entry_count(journalled_db_with_edge) == 3  # 2 thoughts + 1 edge
 
@@ -1200,14 +1488,14 @@ class TestRestoreWithoutClearKnownJournalCollisionDefects:
             cli,
             ["--db", str(journalled_db_with_edge), "restore", "-i", str(colliding_snapshot)],
         )
-        assert result.exit_code == 0, result.output
 
-        assert _edge_count() == 0  # cascaded away by the colliding thought's replacement
+        assert result.exit_code != 0
+        assert "--orphan-journal-entries" in result.output
 
-        # All three journal entries -- including the edge's -- are untouched.
+        assert _edge_count() == 1  # the cascade never fired: nothing was deleted
         assert _journal_entry_count(journalled_db_with_edge) == 3
         edge_deltas = _journal_entry_deltas(journalled_db_with_edge, "edge-001")
-        assert len(edge_deltas) == 1  # the INSERT_EDGE entry survives, describing a dead edge
+        assert len(edge_deltas) == 1
 
         verify_result = runner.invoke(
             cli,
@@ -1217,6 +1505,272 @@ class TestRestoreWithoutClearKnownJournalCollisionDefects:
         verify_data = json.loads(verify_result.output)
         assert verify_data["valid"] is True
         assert verify_data["entries_checked"] == 3
+
+
+class TestJournalledMergeCollisionGate:
+    """The rest of the journalled-merge collision gate's required verification.
+
+    Complements ``TestRestoreRefusesCollisionAgainstAJournalledStore`` with the
+    cases that class does not cover: an identical-content restore (no value
+    differs, only the primary key collides), a journal entry recorded with an
+    unrecognised ``mutation_type``, the composite ``UNIQUE`` on ``edge`` that a
+    primary-id probe would miss, the negative control proving the gate is
+    scoped to a non-empty journal, and the ``--orphan-journal-entries``
+    override itself.
+    """
+
+    def test_identical_restore_is_refused_and_rowids_never_move(
+        self,
+        runner: CliRunner,
+        journalled_db: Path,
+        identical_snapshot_of_journalled_db: Path,
+    ) -> None:
+        """Restoring a store's own snapshot back into itself is refused.
+
+        Every value in the incoming record matches what is already stored --
+        only the primary key collides. Under the old ``INSERT OR REPLACE``
+        behavior SQLite still resolves that collision by deleting and
+        re-inserting the row, which silently changes its ``rowid`` (and, with
+        it, desynchronises anything keyed on ``rowid``, such as the
+        ``thought_fts`` external-content index or a persisted sqlite-vec
+        table) even though no column value differs. A plain ``INSERT`` never
+        reaches that delete-and-recreate at all.
+        """
+        before_rowids = _thought_rowids(journalled_db)
+        # "content" matches every journalled thought's own content column
+        # (`_write_journalled_thoughts` writes "Content for {thought_id}"), so
+        # this is a real per-entry count of the FTS index, not of `thought`.
+        before_fts = _thought_fts_match_count(journalled_db, "content")
+        assert before_fts == 3
+        assert _journal_entry_count(journalled_db) == 3
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(journalled_db), "restore", "-i", str(identical_snapshot_of_journalled_db)],
+        )
+
+        assert result.exit_code != 0
+        assert "--orphan-journal-entries" in result.output
+
+        assert _thought_rowids(journalled_db) == before_rowids
+        # The refused restore never inserted anything, so the index carries
+        # exactly the entries it started with -- neither a stale leftover from
+        # a delete-and-recreate nor a duplicate.
+        assert _thought_fts_match_count(journalled_db, "content") == before_fts
+        assert _journal_entry_count(journalled_db) == 3
+
+    def test_unrecognised_mutation_type_does_not_bypass_the_gate(
+        self,
+        runner: CliRunner,
+        custom_mutation_db: Path,
+        colliding_snapshot_for_custom_mutation_db: Path,
+    ) -> None:
+        """A ``CUSTOM_MUTATION`` journal entry gates a collision exactly like any other.
+
+        The gate only asks whether ``journal_entry`` has rows; it never reads
+        ``mutation_type``. A detector that instead tried to interpret the
+        journal's content could be bypassed by a value it did not recognise --
+        the second fatal finding against the abandoned branch this gate
+        replaces -- and this is unreachable here for the same reason the first
+        finding is: nothing about this record's insert depends on what
+        ``mutation_type`` says.
+        """
+        assert _journal_entry_count(custom_mutation_db) == 1
+        conn = sqlite3.connect(custom_mutation_db)
+        try:
+            before_content = conn.execute(
+                "SELECT content FROM thought WHERE thought_id = 't-cm-0'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert before_content == "Content for t-cm-0"
+
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(custom_mutation_db),
+                "restore",
+                "-i",
+                str(colliding_snapshot_for_custom_mutation_db),
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "--orphan-journal-entries" in result.output
+
+        conn = sqlite3.connect(custom_mutation_db)
+        try:
+            after_content = conn.execute(
+                "SELECT content FROM thought WHERE thought_id = 't-cm-0'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert after_content == before_content
+        assert _journal_entry_count(custom_mutation_db) == 1
+
+    def test_fresh_edge_id_with_duplicate_triple_is_refused(
+        self,
+        runner: CliRunner,
+        journalled_db_with_edge: Path,
+        fresh_edge_id_duplicate_triple_snapshot: Path,
+    ) -> None:
+        """A brand-new ``edge_id`` sharing an existing edge's triple is refused.
+
+        The incoming record does not collide with ``edge-001`` on
+        ``edge_id`` -- it has a different one (``edge-999``) -- so a probe
+        keyed on primary ids would see no collision at all. It collides on
+        ``edge``'s composite ``UNIQUE(from_thought_id, to_thought_id,
+        edge_type)`` (schema_core.sql), which the plain ``INSERT`` leaves to
+        SQLite itself to catch.
+        """
+        conn = sqlite3.connect(journalled_db_with_edge)
+        try:
+            before_edge_id = conn.execute(
+                "SELECT edge_id FROM edge WHERE from_thought_id = 't-old-0' "
+                "AND to_thought_id = 't-old-1'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert before_edge_id == "edge-001"
+
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(journalled_db_with_edge),
+                "restore",
+                "-i",
+                str(fresh_edge_id_duplicate_triple_snapshot),
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "--orphan-journal-entries" in result.output
+
+        conn = sqlite3.connect(journalled_db_with_edge)
+        try:
+            row = conn.execute("SELECT COUNT(*) FROM edge").fetchone()
+            edge_count = int(row[0])
+            surviving_edge_id = conn.execute(
+                "SELECT edge_id FROM edge WHERE from_thought_id = 't-old-0' "
+                "AND to_thought_id = 't-old-1'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert edge_count == 1
+        assert surviving_edge_id == "edge-001"  # the original edge, not edge-999
+
+    def test_colliding_restore_into_an_empty_journal_still_replaces(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        colliding_snapshot_for_populated_db: Path,
+    ) -> None:
+        """The negative control: an empty ``journal_entry`` keeps the original merge behavior.
+
+        ``populated_db`` is never journalled, which is also the overwhelmingly
+        common case in practice -- the CLI has no flag that enables
+        journaling. This restore must still succeed and still replace,
+        proving the gate is scoped to a non-empty journal rather than having
+        quietly changed the default merge behavior for everyone.
+        """
+        assert _journal_entry_count(populated_db) == 0
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(populated_db), "restore", "-i", str(colliding_snapshot_for_populated_db)],
+        )
+
+        assert result.exit_code == 0, result.output
+        conn = sqlite3.connect(populated_db)
+        try:
+            live_content = conn.execute(
+                "SELECT content FROM thought WHERE thought_id = 'thought-000'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert live_content == "Replacement content for thought-000"
+
+    def test_orphan_journal_entries_overrides_the_gate(
+        self,
+        runner: CliRunner,
+        journalled_db: Path,
+        colliding_snapshot: Path,
+    ) -> None:
+        """``--orphan-journal-entries`` restores the original merge behavior on request.
+
+        The same collision ``TestRestoreRefusesCollisionAgainstAJournalledStore``
+        shows refused now succeeds and replaces once the override is passed,
+        which is the flag's entire purpose: a caller who has weighed the gap
+        and wants the merge anyway.
+        """
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(journalled_db),
+                "restore",
+                "-i",
+                str(colliding_snapshot),
+                "--orphan-journal-entries",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        conn = sqlite3.connect(journalled_db)
+        try:
+            live_content = conn.execute(
+                "SELECT content FROM thought WHERE thought_id = 't-old-0'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert live_content == "Replacement content for t-old-0"
+        # The journal is left exactly as before: the override does not touch
+        # journal_entry, it only changes which INSERT form is used.
+        assert _journal_entry_count(journalled_db) == 3
+
+    def test_restore_help_names_the_override_flag(self, runner: CliRunner) -> None:
+        result = runner.invoke(cli, ["restore", "--help"])
+        assert result.exit_code == 0, result.output
+        assert "--orphan-journal-entries" in result.output
+
+    def test_foreign_key_violation_still_propagates_unchanged_under_the_gate(
+        self,
+        runner: CliRunner,
+        journalled_db: Path,
+    ) -> None:
+        """A foreign-key violation is a different, pre-existing error and keeps its own behavior.
+
+        An incoming edge whose endpoints do not exist in the target violates
+        ``edge``'s foreign keys to ``thought`` -- a ``sqlite3.IntegrityError``
+        with ``sqlite_errorcode`` ``787`` (``SQLITE_CONSTRAINT_FOREIGNKEY``),
+        never ``1555`` or ``2067``. The gate must not catch this: it is not a
+        collision the gate is scoped to, so it has to propagate exactly as it
+        always did (an uncaught ``IntegrityError``, not the gate's
+        ``click.ClickException``) whether or not the journalled-merge
+        collision gate is active for this restore.
+        """
+        snap = journalled_db.parent / "fk-violation.jsonl"
+        edge_data = {
+            "edge_id": "edge-fk-1",
+            "from_thought_id": "missing-a",
+            "to_thought_id": "missing-b",
+            "edge_type": "ASSOCIATED",
+            "weight": 0.5,
+            "created_cycle": 1,
+        }
+        snap.write_text(json.dumps({"_type": "edge", "data": edge_data}) + "\n", encoding="utf-8")
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(journalled_db), "restore", "-i", str(snap)],
+            standalone_mode=False,
+        )
+
+        assert isinstance(result.exception, sqlite3.IntegrityError), result.exception
+        assert result.exception.sqlite_errorcode == 787
+        assert "orphan-journal-entries" not in str(result.exception)
 
 
 class TestGc:
