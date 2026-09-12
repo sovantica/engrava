@@ -443,7 +443,34 @@ trail. What restoring from one leaves the target's journal holding depends on
 how it was restored: a fresh target starts with no journal at all, and `restore
 --clear` empties `journal_entry` along with the data it wipes so the chain does
 not outlive the data it described. A restore without `--clear` merges into the
-target. The merged-in records are inserted directly and are not themselves
+target, and if that target's journal is non-empty, a merged-in record that
+collides with an existing row — on a primary key or a `UNIQUE` constraint — is
+refused outright: the whole restore rolls back, so nothing from that snapshot
+is written, not even the records that would have inserted cleanly. This is the
+**journalled-merge collision gate**. Restoring a snapshot back into the
+journalled database it came from — one thought, one matching `INSERT_THOUGHT`
+journal entry — fails with exit code `1` and:
+
+```text
+Error: Restore refused: snapshot line 2 collides with an existing row (matching
+primary key or UNIQUE constraint), and the target's journal_entry table is not
+empty. Replacing that row would leave the audit trail describing data this
+merge discarded, while 'engrava verify' kept reporting the chain as valid.
+Re-run with --orphan-journal-entries to allow the merge and accept that gap,
+or with --clear to discard the journal along with the data.
+```
+
+The gate is conservative, not precise: it refuses *any* such
+collision once a journal exists, including one on a row the journal never
+described anything about — it does not try to work out which collisions are
+actually dangerous. It never triggers when the target's journal is empty,
+which is the overwhelmingly common case since journalling is opt-in and the
+CLI never enables it itself; an ordinary merge restore into an unjournalled
+target is exactly as before.
+
+Pass `--orphan-journal-entries` to allow the merge anyway, accepting that the
+journal may end up describing data the merge just discarded. Under that
+override, the merged-in records are inserted directly and are not themselves
 journalled, and a journalled row can be orphaned even when none of the
 snapshot's IDs collide with anything the journal describes. Within the stock
 core schema, two paths do that: an incoming edge with a fresh `edge_id` but
@@ -463,10 +490,14 @@ trigger that deletes some other row can orphan that row's journal entry on a
 restore insert that collides with nothing the target holds. In every case the
 journal entries describing the earlier row stay behind unchanged; `verify`
 still reports the chain as **valid** even though it no longer matches what the
-database holds. To preserve the journal, back up the database file itself
-(see the upgrade/backup guidance), and note that hard-deleting an audited
-thought still leaves its content in the journal's `before`/`after` delta —
-relevant when handling erasure requests.
+database holds — confirmed against the collision above: restoring it under
+`--orphan-journal-entries` still leaves `engrava verify` reporting `Journal
+integrity OK — 1 entries verified.`. `restore --clear` sidesteps all of this
+by discarding the journal along with the data it described, rather than
+letting the two disagree. To preserve the journal, back
+up the database file itself (see the upgrade/backup guidance), and note that
+hard-deleting an audited thought still leaves its content in the journal's
+`before`/`after` delta — relevant when handling erasure requests.
 
 ## See also
 

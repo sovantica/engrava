@@ -248,6 +248,24 @@ BARE_AND_MISC_BLOCKS: tuple[tuple[str, str, str, ExemptionReason], ...] = (
         "a private attribute such as '_dimension' does not",
         ExemptionReason.DIAGRAM_OR_TRANSCRIPT,
     ),
+    (
+        "docs/audit-trail.md",
+        "text",
+        "Restore refused: snapshot line 2 collides",
+        ExemptionReason.DIAGRAM_OR_TRANSCRIPT,
+    ),
+    (
+        "docs/backup-and-recovery.md",
+        "text",
+        "Restore refused: snapshot line 2 collides",
+        ExemptionReason.DIAGRAM_OR_TRANSCRIPT,
+    ),
+    (
+        "docs/upgrade.md",
+        "text",
+        "Restore refused: snapshot line 2 collides",
+        ExemptionReason.DIAGRAM_OR_TRANSCRIPT,
+    ),
     # `sql` blocks -- raw SQL run directly against the SQLite file, not through
     # any engrava-owned surface.
     (

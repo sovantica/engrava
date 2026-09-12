@@ -36,28 +36,55 @@ thought / edge / embedding / action.
 > - **`restore --clear`** empties `journal_entry` along with the four core
 >   tables it wipes, so the journal ends empty too. Otherwise it would keep
 >   describing thoughts the clear had just discarded.
-> - **A restore without `--clear`** merges into an existing database. The
->   merged-in records are inserted directly and are not themselves journalled.
->   Orphaning a journal entry does not require an incoming ID to collide with
->   one the journal already describes. Within the stock core schema, an
->   incoming edge with a fresh `edge_id` but the same `(from_thought_id,
->   to_thought_id, edge_type)` triple as a journalled edge replaces it through
->   the table's own UNIQUE constraint — no ID collision needed. And replacing
->   a thought whose **own** ID does collide cascades the delete, by foreign
->   key, to that thought's edges, embeddings, and actions — rows whose IDs
->   never appeared in the snapshot. An action only has a journal entry to
->   orphan once it has been updated at least once: `create_action` writes no
->   journal entry, only `update_action` does, so a freshly created action that
->   was never updated cascades away with nothing stale left behind. A database
->   carrying an extension-installed or user-defined trigger on these tables
->   can open further routes: the extension migration runner applies a
->   migration's SQL verbatim, including `CREATE TRIGGER` (see
->   [Extensions](extensions.md#migration-files)), so a trigger that deletes a
->   row elsewhere in the schema can orphan its journal entry on a restore
->   insert that collides with nothing the target holds. In every case the
->   journal entries describing the earlier row stay behind unchanged;
->   `verify` still reports the chain as **valid**, even though those entries
->   no longer describe what the database now holds.
+> - **A restore without `--clear`** merges into an existing database — and if
+>   that database's journal is non-empty, **it now refuses any record that
+>   collides** with an existing row on a primary key or `UNIQUE` constraint,
+>   rolling the whole restore back rather than writing anything from that
+>   snapshot. Restoring a one-thought snapshot back into the journalled
+>   database it came from failed like this:
+>
+>   ```text
+>   Error: Restore refused: snapshot line 2 collides with an existing row (matching
+>   primary key or UNIQUE constraint), and the target's journal_entry table is not
+>   empty. Replacing that row would leave the audit trail describing data this
+>   merge discarded, while 'engrava verify' kept reporting the chain as valid.
+>   Re-run with --orphan-journal-entries to allow the merge and accept that gap,
+>   or with --clear to discard the journal along with the data.
+>   ```
+>
+>   exit code `1`. This **journalled-merge collision gate** is conservative,
+>   not precise — it refuses *any* uniqueness collision once a journal exists,
+>   including one on a row the journal never described, rather than trying to
+>   work out which collisions are actually dangerous. It never triggers when
+>   the target's journal is empty, which is the ordinary case: journaling is
+>   opt-in and the CLI never turns it on itself, so a merge restore into a
+>   database that has never enabled it behaves exactly as it always has.
+>
+>   **`--orphan-journal-entries`** allows the merge anyway, and restores that
+>   prior behaviour: the merged-in records are inserted directly and are not
+>   themselves journalled, and a journal entry can be orphaned even when no
+>   incoming ID collides with one the journal already describes. Within the
+>   stock core schema, an incoming edge with a fresh `edge_id` but the same
+>   `(from_thought_id, to_thought_id, edge_type)` triple as a journalled edge
+>   replaces it through the table's own UNIQUE constraint — no ID collision
+>   needed. And replacing a thought whose **own** ID does collide cascades the
+>   delete, by foreign key, to that thought's edges, embeddings, and actions —
+>   rows whose IDs never appeared in the snapshot. An action only has a
+>   journal entry to orphan once it has been updated at least once:
+>   `create_action` writes no journal entry, only `update_action` does, so a
+>   freshly created action that was never updated cascades away with nothing
+>   stale left behind. A database carrying an extension-installed or
+>   user-defined trigger on these tables can open further routes: the
+>   extension migration runner applies a migration's SQL verbatim, including
+>   `CREATE TRIGGER` (see [Extensions](extensions.md#migration-files)), so a
+>   trigger that deletes a row elsewhere in the schema can orphan its journal
+>   entry on a restore insert that collides with nothing the target holds. In
+>   every case the journal entries describing the earlier row stay behind
+>   unchanged; `verify` still reports the chain as **valid**, even though
+>   those entries no longer describe what the database now holds — confirmed
+>   directly: restoring the collision above under `--orphan-journal-entries`
+>   still leaves `engrava verify` reporting `Journal integrity OK — 1 entries
+>   verified.`.
 >
 > If audit continuity matters, use a **physical file backup** (which copies
 > the journal verbatim), not a logical snapshot. See
@@ -65,10 +92,11 @@ thought / edge / embedding / action.
 
 `restore` options worth knowing (see the [CLI reference](cli.md#restore) for the
 full list): `--clear` to wipe the target first, `--skip-embeddings` / `--re-embed`
-to control embedding handling, and `--service` for multi-service targets.
-When `--clear` encounters a persisted sqlite-vec index, restore drops the derived
-table transactionally and the next configured open rebuilds it. Keep
-`engrava[vec]` installed for that virtual-table reset.
+to control embedding handling, `--orphan-journal-entries` to allow a merge that
+would otherwise be refused by the collision gate above, and `--service` for
+multi-service targets. When `--clear` encounters a persisted sqlite-vec index,
+restore drops the derived table transactionally and the next configured open
+rebuilds it. Keep `engrava[vec]` installed for that virtual-table reset.
 
 ### Embedding handling during restore
 

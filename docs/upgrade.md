@@ -150,14 +150,20 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 > fresh target, so it starts with an empty journal regardless. That is specific
 > to a fresh target, though: restoring the same snapshot with `--clear` into an
 > *existing* journalled database empties its journal too. Restoring without
-> `--clear` merges in and can orphan journal entries even when no incoming ID
-> collides with what the journal already describes: a duplicate
-> `(from_thought_id, to_thought_id, edge_type)` triple replaces an existing
-> edge, and replacing a thought cascades to that thought's own edges,
-> embeddings, and actions — neither needs its own ID to collide. The journal
-> entries describing the earlier row stay behind, and `verify` still reports the
-> chain as **valid**. If you need the audit history preserved, take a physical
-> file backup instead — see [Backup & Recovery](backup-and-recovery.md).
+> `--clear` merges in, and if that target's journal is non-empty, refuses any
+> record that collides with an existing row (primary key or `UNIQUE`
+> constraint), rolling the whole restore back — see the [0.6 → 0.7
+> notes](#06---07) below if you have a scripted merge restore into a
+> journalled database. `--orphan-journal-entries` allows the merge anyway and
+> restores the prior behaviour, where it can orphan journal entries even when
+> no incoming ID collides with what the journal already describes: a
+> duplicate `(from_thought_id, to_thought_id, edge_type)` triple replaces an
+> existing edge, and replacing a thought cascades to that thought's own
+> edges, embeddings, and actions — neither needs its own ID to collide. The
+> journal entries describing the earlier row stay behind, and `verify` still
+> reports the chain as **valid**. If you need the audit history preserved,
+> take a physical file backup instead — see [Backup &
+> Recovery](backup-and-recovery.md).
 
 ## Compatibility Matrix
 
@@ -168,7 +174,7 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 | 0.3.x | 0.4.0 | Yes | **Schema-changing** minor upgrade — adds the valid-time columns (additive, zero data loss). Back up first and follow the [rolling-upgrades](#rolling-upgrades-multiple-workers) note |
 | 0.4.x | 0.5.0 | Yes | **Schema-changing** minor upgrade (`user_version` 14 → 18), although the library API is drop-in. **Breaking for MCP-server users only:** the `engrava[mcp]` extra and the in-engrava `engrava-mcp` command are removed — the server moved to the standalone [`engrava-mcp`](https://github.com/sovantica/engrava-mcp) package (see the 0.4 → 0.5 note) |
 | 0.5.0 | 0.6.0 | Yes | **Schema-changing** minor upgrade (`user_version` 18 → 20), with two additive columns. Default retrieval now excludes archived thoughts, and wrong-dimension query vectors raise a typed error. An edge `decay_multiplier` of `0.0` no longer reads back as `1.0`, and a later update no longer rewrites it to `1.0` — values a 0.5.x update already overwrote stay overwritten. Back up, quiesce shared-store workers, migrate once, and review the [0.5 → 0.6 notes](#05---06) |
-| 0.6.x | 0.7.0 | Yes | No *database* schema change, but `EngravaMetrics.schema_version` moves `1 → 2` (see below). **Behaviour change:** when the resolved recency weight is `0.0` **and** a cognitive-cycle reference (`current_cycle`, explicit or via `cycle_provider`) is present, the query-less fallback path now treats recency as fully off instead of still decaying by cycle — which can change result order for stores with heterogeneous thought priorities. `recency_now` (transaction-time) callers are unaffected; that axis was already correct. Also in this release: three new `EngravaError` subclasses (`WriteContentionError`, `WriteLockTimeoutError`, `DedupLockReentryError`) can now come out of the dedup and guarded-write paths; a new public override seam, `prepare_thought_for_insert()`, restores pre-insert customization that `get_or_create()` / `upsert_by_hash()` had silently stopped routing through an overridden `create_thought()`; `gc --dry-run` now names everything the real run deletes (edges, embeddings, and actions, not only orphaned edges); a deleted thought's vector can no longer resurface through search on a database that has not run the core-12 migration; a corrupt or truncated database file now makes the CLI exit with an error instead of hanging; and `restore` now refuses an `embedding` row with an empty `owner_type`/`owner_id`, a non-ISO-8601 `created_at`, or a non-positive `dimension` — every such row was already invalid on every prior release, so this only ever rejects a snapshot that already carried a broken record. Review the [0.6 → 0.7 notes](#06---07) |
+| 0.6.x | 0.7.0 | Yes | No *database* schema change, but `EngravaMetrics.schema_version` moves `1 → 2` (see below). **Behaviour change:** when the resolved recency weight is `0.0` **and** a cognitive-cycle reference (`current_cycle`, explicit or via `cycle_provider`) is present, the query-less fallback path now treats recency as fully off instead of still decaying by cycle — which can change result order for stores with heterogeneous thought priorities. `recency_now` (transaction-time) callers are unaffected; that axis was already correct. Also in this release: three new `EngravaError` subclasses (`WriteContentionError`, `WriteLockTimeoutError`, `DedupLockReentryError`) can now come out of the dedup and guarded-write paths; a new public override seam, `prepare_thought_for_insert()`, restores pre-insert customization that `get_or_create()` / `upsert_by_hash()` had silently stopped routing through an overridden `create_thought()`; `gc --dry-run` now names everything the real run deletes (edges, embeddings, and actions, not only orphaned edges); a deleted thought's vector can no longer resurface through search on a database that has not run the core-12 migration; a corrupt or truncated database file now makes the CLI exit with an error instead of hanging; and `restore` now refuses an `embedding` row with an empty `owner_type`/`owner_id`, a non-ISO-8601 `created_at`, or a non-positive `dimension` — every such row was already invalid on every prior release, so this only ever rejects a snapshot that already carried a broken record; and a merge restore (no `--clear`) into a target whose `journal_entry` table is non-empty now refuses any record that collides with an existing row and rolls the whole restore back instead of replacing it, unless `--orphan-journal-entries` is also given — journaling is opt-in and the CLI never enables it, so this only reaches a target that already has journaling on. Review the [0.6 → 0.7 notes](#06---07) |
 
 For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 `0.x.*` line do not change the schema and are low-risk; **minor** upgrades
@@ -1362,6 +1368,68 @@ A reader whose store is subclassed, hooked, wrapped in `suspend_auto_commit()`,
 or driven from more than one task in a combination not covered above should
 test that exact combination directly — treating its absence from this list
 as a clean bill is not a conclusion this section supports.
+
+**A merge restore into a journalled target can now refuse instead of
+silently replacing data — the journalled-merge collision gate.** No schema
+change; this is `0b73414`.
+
+**Who is affected.** Anyone who has journaling on (`journal.enabled: true` in
+config, or a store constructed with `journal_enabled=True`) and restores a
+snapshot **without `--clear`** into a target whose `journal_entry` table
+already has rows, where an incoming record collides with one already there
+on a primary key or a `UNIQUE` constraint. The concrete shape is a scripted
+or periodic restore that merges overlapping or repeated snapshots into a
+long-lived journalled store — that restore, run again the way it always was,
+now fails instead of completing.
+
+**Executed, on a database with one journalled thought:** restoring that same
+database's own snapshot back into itself, with no `--clear` and no override:
+
+```text
+Error: Restore refused: snapshot line 2 collides with an existing row (matching
+primary key or UNIQUE constraint), and the target's journal_entry table is not
+empty. Replacing that row would leave the audit trail describing data this
+merge discarded, while 'engrava verify' kept reporting the chain as valid.
+Re-run with --orphan-journal-entries to allow the merge and accept that gap,
+or with --clear to discard the journal along with the data.
+```
+
+exit code `1`, and nothing from the snapshot is written — the whole restore
+rolls back, not only the colliding line. The identical restore with
+`--orphan-journal-entries` added prints `Restored 1 records from backup.jsonl`
+and exits `0`, matching 0.6.x behaviour exactly.
+
+**Who is not affected.** Anyone who has never enabled journaling — the
+default, and the CLI never turns it on for you — never has a non-empty
+`journal_entry` table, so the gate's condition is never met and every restore
+behaves exactly as before. A restore that always passes `--clear` is also
+unaffected: `--clear` empties `journal_entry` before the gate is evaluated,
+so the check sees an empty table and never triggers, the same as it always
+did. And a merge restore whose incoming records never collide with anything
+already in the target — the common case for a snapshot restored into a
+different, disjoint database — sees no refusal either, journalled or not.
+
+**What changed.** Before this release, a merge restore inserted every record
+with `INSERT OR REPLACE` unconditionally, so a collision silently replaced
+the existing row (or, for a thought, cascaded to its edges, embeddings, and
+actions) regardless of whether the target's journal already described it.
+Now, while `journal_entry` is non-empty and neither `--clear` nor
+`--orphan-journal-entries` is given, every incoming record is written with a
+plain `INSERT` instead, so SQLite itself refuses the collision. The gate is
+conservative, not precise: it refuses *any* such collision once a journal
+exists, including one on a row the journal never actually described — it
+does not try to work out in advance which collisions are safe.
+
+**What to do.** If your restore fails with the message above and you have
+weighed the resulting audit gap — the journal will describe data the merge
+just replaced, though `verify` keeps reporting it as valid — add
+`--orphan-journal-entries` to the same invocation to restore the previous
+behaviour unchanged. If instead the target should be replaced wholesale, use
+`--clear`, which empties the journal along with the data and never hits this
+gate. Either way, this only ever fires on a target you already chose to
+journal; see [Backup & Recovery](backup-and-recovery.md#logical-snapshot-and-restore)
+and [Audit Trail](audit-trail.md#backup--retention-note) for the full
+mechanism the override accepts.
 
 ### 0.5 -> 0.6
 

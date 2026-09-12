@@ -236,6 +236,7 @@ Restores a database from a JSONL snapshot produced by `snapshot`.
 | `--clear` | flag | off | Clear existing data before restoring. |
 | `--skip-embeddings` | flag | off | Import without embedding records. |
 | `--re-embed` | flag | off | Re-embed all thoughts via the target provider, ignoring source embeddings. Requires `--config` with top-level or per-service embeddings. |
+| `--orphan-journal-entries` | flag | off | Allow a merge restore (no `--clear`) into a target whose `journal_entry` table is non-empty to replace a colliding row anyway. Without it, such a collision is refused. |
 | `--service` | name | see below | The service to restore into. |
 
 For any `restore --clear`, an existing sqlite-vec table is dropped in the same
@@ -319,13 +320,18 @@ a restored target — restore itself cannot tell you.
 > Restore recreates thoughts, edges, embeddings, and actions, **not** the audit
 > journal. A **fresh target** therefore starts with an empty journal, and
 > **`--clear`** empties the journal along with the data it wipes. A restore
-> **without `--clear`** merges into the target and can orphan journal entries
-> even when no incoming ID collides with one the journal describes: a
-> duplicate `(from_thought_id, to_thought_id, edge_type)` triple replaces an
-> existing edge, and replacing a thought cascades to that thought's own
-> edges, embeddings, and actions — neither needs its own ID to collide.
-> `verify` still reports the chain as **valid** even though it no longer
-> matches the data.
+> **without `--clear`** merges into the target — and if that target's journal
+> is non-empty, **it refuses any record that collides** with an existing row
+> (primary key or `UNIQUE` constraint) and rolls the whole restore back,
+> rather than letting the merge silently replace it. Pass
+> **`--orphan-journal-entries`** to allow the merge anyway; that restores the
+> pre-gate behaviour, where a merge can orphan journal entries even when no
+> incoming ID collides with one the journal describes — a duplicate
+> `(from_thought_id, to_thought_id, edge_type)` triple replaces an existing
+> edge, and replacing a thought cascades to that thought's own edges,
+> embeddings, and actions — and `verify` still reports the chain as **valid**
+> even though it no longer matches the data. The gate never applies to an
+> empty journal, which is the ordinary case since journaling is opt-in.
 > See [Backup & Recovery](backup-and-recovery.md#logical-snapshot-and-restore)
 > for the full breakdown.
 

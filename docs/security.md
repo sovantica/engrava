@@ -176,14 +176,20 @@ longer being modified.
 A logical snapshot excludes the audit journal. A fresh restore target therefore
 starts with an empty journal, and `restore --clear` empties an existing target's
 journal along with the data it wipes. A restore without `--clear` merges into
-the target and can orphan journal entries even when no incoming ID collides with
-what the journal already describes: a duplicate `(from_thought_id,
-to_thought_id, edge_type)` triple replaces an existing edge, and replacing a
-thought cascades to that thought's own edges, embeddings, and actions — neither
-needs its own ID to collide. The journal entries describing the earlier row stay
-behind; `verify` still reports the chain as **valid** even though it no longer
-matches what is stored. A physical backup preserves the journal but is tied to
-the database file and must be captured with a WAL-safe method. See [Backup &
+the target — and if that target's journal is non-empty, it refuses any record
+that collides with an existing row (primary key or `UNIQUE` constraint) and
+rolls the whole restore back, rather than silently replacing it. This gate
+never applies to an empty journal, the ordinary case, since journaling is
+opt-in. `--orphan-journal-entries` allows the merge anyway and restores the
+prior behaviour, where it can orphan journal entries even when no incoming ID
+collides with what the journal already describes: a duplicate
+`(from_thought_id, to_thought_id, edge_type)` triple replaces an existing
+edge, and replacing a thought cascades to that thought's own edges,
+embeddings, and actions — neither needs its own ID to collide. The journal
+entries describing the earlier row stay behind; `verify` still reports the
+chain as **valid** even though it no longer matches what is stored. A physical
+backup preserves the journal but is tied to the database file and must be
+captured with a WAL-safe method. See [Backup &
 Recovery](backup-and-recovery.md) for the supported boundary and procedures.
 
 ## Audit journal threat model
