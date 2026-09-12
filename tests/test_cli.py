@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 from click.testing import CliRunner
 
 from engrava.cli.config import EngravaCLIConfig
-from engrava.cli.main import _close_quietly, cli
+from engrava.cli.main import _close_quietly, _import_records_to_db, cli
 
 # Literal SQL, never interpolated: a read-back that assembles its own query
 # cannot be trusted to disagree with the schema the command wrote to.
@@ -436,6 +436,72 @@ def colliding_snapshot(runner: CliRunner, tmp_path: Path) -> Path:
     asyncio.run(_seed())
 
     snap = tmp_path / "colliding-snapshot.jsonl"
+    result = runner.invoke(cli, ["--db", str(source_db), "snapshot", "-o", str(snap)])
+    assert result.exit_code == 0, result.output
+    return snap
+
+
+@pytest.fixture
+def colliding_snapshot_with_a_leading_new_record(runner: CliRunner, tmp_path: Path) -> Path:
+    """A two-thought snapshot: a brand-new record first, then one colliding with ``t-old-0``.
+
+    Backs the case that ``TestRestoreRefusesCollisionAgainstAJournalledStore``'s
+    own docstring describes -- the whole-transaction rollback discarding a
+    record inserted *before* the one that collides -- which none of that
+    class's other scenarios actually exercise: they each carry only the one
+    colliding record, with nothing successfully written ahead of it.
+    ``t-brand-new`` is created first in the source database, so
+    ``SELECT * FROM thought`` (no ``ORDER BY``, see the ``snapshot`` command)
+    returns it before ``t-old-0`` in the exported snapshot, and a plain
+    ``INSERT`` accepts it with no complaint before reaching the colliding
+    second record.
+    """
+    source_db = tmp_path / "collide-source-leading.db"
+    result = runner.invoke(cli, ["--db", str(source_db), "migrate"])
+    assert result.exit_code == 0, result.output
+
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+
+    async def _seed() -> None:
+        conn = await aiosqlite.connect(str(source_db))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-brand-new",
+                essence="Essence for t-brand-new",
+                content="Content for t-brand-new",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=1,
+                updated_cycle=1,
+            )
+        )
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-old-0",
+                essence="Replacement essence for t-old-0",
+                content="Replacement content for t-old-0",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=2,
+                updated_cycle=2,
+            )
+        )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_seed())
+
+    snap = tmp_path / "colliding-with-leading-snapshot.jsonl"
     result = runner.invoke(cli, ["--db", str(source_db), "snapshot", "-o", str(snap)])
     assert result.exit_code == 0, result.output
     return snap
@@ -1186,6 +1252,103 @@ class TestRestore:
         assert _journal_entry_count(service_db) == 0
         assert "Discarded 3 journal entries" in result.output
 
+    def test_restore_service_refuses_collision_against_a_journalled_store(
+        self,
+        runner: CliRunner,
+        tmp_path: Path,
+        colliding_snapshot: Path,
+    ) -> None:
+        """The ``--service`` restore path is defended by the journalled-merge collision gate too.
+
+        Every collision and override test elsewhere in this module exercises
+        only the single-database restore path. ``_restore_service_snapshot``
+        forwards ``orphan_journal_entries`` to the same
+        ``_import_records_to_db`` the single-database path uses, but nothing
+        pinned that a default ``--service`` restore into a journalled target
+        is actually refused rather than merging silently.
+        ``colliding_snapshot`` carries a thought whose ID (``t-old-0``)
+        matches one already in the service database, with different
+        essence/content.
+        """
+        services_dir = tmp_path / "services"
+        service_db = services_dir / "svc.db"
+        _write_journalled_thoughts(service_db, ["t-old-0", "t-old-1", "t-old-2"])
+        assert _journal_entry_count(service_db) == 3
+
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(services_dir / "ignored.db"),
+                "restore",
+                "-i",
+                str(colliding_snapshot),
+                "--service",
+                "svc",
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "--orphan-journal-entries" in result.output
+        assert "journal_entry" in result.output
+
+        assert _stored_core_ids(service_db)["thought"] == {"t-old-0", "t-old-1", "t-old-2"}
+        conn = sqlite3.connect(service_db)
+        try:
+            live_content = conn.execute(
+                "SELECT content FROM thought WHERE thought_id = ?",
+                ("t-old-0",),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert live_content == "Content for t-old-0"
+        assert _journal_entry_count(service_db) == 3
+
+    def test_restore_service_orphan_journal_entries_overrides_the_gate(
+        self,
+        runner: CliRunner,
+        tmp_path: Path,
+        colliding_snapshot: Path,
+    ) -> None:
+        """``--orphan-journal-entries`` under ``--service`` restores the merge too.
+
+        Complements the refusal above: the same override flag
+        ``_restore_service_snapshot`` forwards must let this collision
+        through and replace in service mode -- the flag's entire purpose --
+        exactly as it does on the single-database path.
+        """
+        services_dir = tmp_path / "services"
+        service_db = services_dir / "svc.db"
+        _write_journalled_thoughts(service_db, ["t-old-0", "t-old-1", "t-old-2"])
+
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(services_dir / "ignored.db"),
+                "restore",
+                "-i",
+                str(colliding_snapshot),
+                "--service",
+                "svc",
+                "--orphan-journal-entries",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        conn = sqlite3.connect(service_db)
+        try:
+            live_content = conn.execute(
+                "SELECT content FROM thought WHERE thought_id = ?",
+                ("t-old-0",),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert live_content == "Replacement content for t-old-0"
+        # The journal is left exactly as before: the override does not touch
+        # journal_entry, it only changes which INSERT form is used.
+        assert _journal_entry_count(service_db) == 3
+
     def test_restore_invalid_service_name_is_distinct_clean_error(
         self,
         runner: CliRunner,
@@ -1506,6 +1669,54 @@ class TestRestoreRefusesCollisionAgainstAJournalledStore:
         assert verify_data["valid"] is True
         assert verify_data["entries_checked"] == 3
 
+    def test_a_record_inserted_before_the_collision_is_also_rolled_back(
+        self,
+        runner: CliRunner,
+        journalled_db: Path,
+        colliding_snapshot_with_a_leading_new_record: Path,
+    ) -> None:
+        """The rollback discards a record inserted before the collision, too.
+
+        ``colliding_snapshot_with_a_leading_new_record`` carries
+        ``t-brand-new`` first, which the plain ``INSERT`` accepts with no
+        complaint, followed by ``t-old-0``, which collides with the
+        journalled target and aborts the whole restore. This is the class
+        docstring's own claim: the whole-transaction rollback in
+        ``_import_records_to_db`` must discard ``t-brand-new`` along with
+        refusing ``t-old-0``, not leave the earlier, otherwise-successful
+        insert sitting on disk.
+        """
+        assert _journal_entry_count(journalled_db) == 3
+
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(journalled_db),
+                "restore",
+                "-i",
+                str(colliding_snapshot_with_a_leading_new_record),
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "--orphan-journal-entries" in result.output
+
+        stored_ids = _stored_core_ids(journalled_db)["thought"]
+        assert "t-brand-new" not in stored_ids
+        assert stored_ids == {"t-old-0", "t-old-1", "t-old-2"}
+
+        conn = sqlite3.connect(journalled_db)
+        try:
+            live_content = conn.execute(
+                "SELECT content FROM thought WHERE thought_id = ?",
+                ("t-old-0",),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert live_content == "Content for t-old-0"
+        assert _journal_entry_count(journalled_db) == 3
+
 
 class TestJournalledMergeCollisionGate:
     """The rest of the journalled-merge collision gate's required verification.
@@ -1771,6 +1982,63 @@ class TestJournalledMergeCollisionGate:
         assert isinstance(result.exception, sqlite3.IntegrityError), result.exception
         assert result.exception.sqlite_errorcode == 787
         assert "orphan-journal-entries" not in str(result.exception)
+
+    async def test_a_refused_collision_leaves_the_connection_out_of_a_transaction(
+        self,
+        colliding_snapshot: Path,
+        tmp_path: Path,
+    ) -> None:
+        """A refused collision leaves ``in_transaction`` false on the caller's own open connection.
+
+        Every other test in this module drives restore through the CLI,
+        which always closes its connection afterward -- closing an
+        ``aiosqlite`` connection implicitly rolls back any open transaction,
+        so those tests cannot tell an explicit ``await conn.rollback()`` in
+        ``_import_records_to_db``'s ``finally`` block apart from one that was
+        silently removed. This calls ``_import_records_to_db`` directly on a
+        connection it keeps open across the call, so only the explicit
+        rollback -- not connection teardown -- can account for the result.
+        """
+        import aiosqlite
+
+        from engrava import (
+            LifecycleStatus,
+            Priority,
+            SqliteEngravaCore,
+            ThoughtRecord,
+            ThoughtType,
+        )
+
+        db_path = tmp_path / "direct-target.db"
+        conn = await aiosqlite.connect(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        try:
+            # Built directly against the domain API, in-line, rather than via
+            # ``_write_journalled_thoughts`` -- that helper's own ``asyncio.run()``
+            # cannot be called from inside this test's already-running event loop.
+            store = SqliteEngravaCore(conn, journal_enabled=True)
+            await store.ensure_schema()
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id="t-old-0",
+                    essence="Essence for t-old-0",
+                    content="Content for t-old-0",
+                    thought_type=ThoughtType.OBSERVATION,
+                    source="test",
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    priority=Priority.P2,
+                    created_cycle=1,
+                    updated_cycle=1,
+                )
+            )
+            await conn.commit()
+
+            with pytest.raises(click.ClickException):
+                await _import_records_to_db(conn, colliding_snapshot, orphan_journal_entries=False)
+
+            assert not conn.in_transaction
+        finally:
+            await conn.close()
 
 
 class TestGc:

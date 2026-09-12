@@ -1900,10 +1900,10 @@ async def _import_records_to_db(
     replaces a journalled edge if it repeats that table's composite
     ``UNIQUE(from_thought_id, to_thought_id, edge_type)`` (schema_core.sql),
     with no id ever colliding, and replacing a journalled thought cascades an
-    ``ON DELETE CASCADE`` foreign-key delete onto *that thought's own* edges
-    and embeddings -- rows whose ids never appeared in the incoming snapshot
-    at all. Either way, the journal entries describing what was just removed
-    are left behind unchanged, and ``verify_journal()`` keeps reporting that
+    ``ON DELETE CASCADE`` foreign-key delete onto *that thought's own* edges,
+    embeddings, and actions -- rows whose ids never appeared in the incoming
+    snapshot at all. Either way, the journal entries describing what was just
+    removed are left behind unchanged, and ``verify_journal()`` keeps reporting that
     mismatched chain as valid, because the chain itself stays internally
     self-consistent; it simply no longer matches what is stored.
 
