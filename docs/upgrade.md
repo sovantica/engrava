@@ -1386,12 +1386,7 @@ now fails instead of completing.
 database's own snapshot back into itself, with no `--clear` and no override:
 
 ```text
-Error: Restore refused: snapshot line 2 collides with an existing row (matching
-primary key or UNIQUE constraint), and the target's journal_entry table is not
-empty. Replacing that row would leave the audit trail describing data this
-merge discarded, while 'engrava verify' kept reporting the chain as valid.
-Re-run with --orphan-journal-entries to allow the merge and accept that gap,
-or with --clear to discard the journal along with the data.
+Error: Restore refused: snapshot line 2 collides with an existing row (matching primary key or UNIQUE constraint), and the target's journal_entry table is not empty. Replacing that row would leave the audit trail describing data this merge discarded, while 'engrava verify' kept reporting the chain as valid. Re-run with --orphan-journal-entries to allow the merge and accept that gap, or with --clear to discard the journal along with the data.
 ```
 
 exit code `1`, and nothing from the snapshot is written — the whole restore
