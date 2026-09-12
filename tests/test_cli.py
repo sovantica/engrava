@@ -1686,6 +1686,25 @@ class TestRestoreRefusesCollisionAgainstAJournalledStore:
         refusing ``t-old-0``, not leave the earlier, otherwise-successful
         insert sitting on disk.
         """
+        # This test's whole premise is that ``t-brand-new`` precedes the
+        # colliding ``t-old-0`` in the snapshot below. The exporter's
+        # ``SELECT * FROM thought`` (cli/main.py) carries no ``ORDER BY``, so
+        # SQL does not guarantee that order -- it only happens to match
+        # creation order today. Pin the precondition here: if export order
+        # ever changes, this fails loudly instead of leaving the assertions
+        # below passing for the wrong reason (``t-brand-new`` absent because
+        # it was never attempted, not because the rollback discarded it).
+        snapshot_lines = [
+            json.loads(line)
+            for line in colliding_snapshot_with_a_leading_new_record.read_text(
+                encoding="utf-8"
+            ).splitlines()
+        ]
+        thought_ids_in_snapshot_order = [
+            line["data"]["thought_id"] for line in snapshot_lines if line.get("_type") == "thought"
+        ]
+        assert thought_ids_in_snapshot_order == ["t-brand-new", "t-old-0"]
+
         assert _journal_entry_count(journalled_db) == 3
 
         result = runner.invoke(
