@@ -147,18 +147,17 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 
 > **Note:** a snapshot exports thoughts, edges, embeddings, and actions, but
 > **not** the audit journal (`journal_entry`). `new-old-version.db` above is a
-> fresh target, so it starts with an empty journal regardless. That is
-> specific to a fresh target, though: restoring the same snapshot with
-> `--clear` into an *existing* journalled database empties its journal too.
-> Restoring without `--clear` merges in and can orphan journal entries even
-> when no incoming ID collides with what the journal already describes: a
-> duplicate `(from_thought_id, to_thought_id, edge_type)` triple replaces an
-> existing edge, and replacing a thought cascades to that thought's own edges
-> and embeddings — neither needs its own ID to collide. The journal entries
-> describing the earlier row stay behind, and `verify` still reports the
-> chain as **valid**. If you need the audit history preserved, take a
-> physical file backup instead — see
-> [Backup & Recovery](backup-and-recovery.md).
+> fresh target, so it starts with an empty journal regardless. That is specific
+> to a fresh target, though: restoring the same snapshot with `--clear` into an
+> *existing* journalled database empties its journal too. Restoring without
+> `--clear` merges in and can orphan journal entries even when no incoming ID
+> collides with what the journal already describes: a duplicate
+> `(from_thought_id, to_thought_id, edge_type)` triple replaces an existing
+> edge, and replacing a thought cascades to that thought's own edges,
+> embeddings, and actions — neither needs its own ID to collide. The journal
+> entries describing the earlier row stay behind, and `verify` still reports the
+> chain as **valid**. If you need the audit history preserved, take a physical
+> file backup instead — see [Backup & Recovery](backup-and-recovery.md).
 
 ## Compatibility Matrix
 

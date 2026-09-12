@@ -441,20 +441,23 @@ covers the thought / edge / embedding / action tables — it does **not** includ
 the `journal_entry` table. A snapshot is therefore **not** a backup of the audit
 trail. What restoring from one leaves the target's journal holding depends on
 how it was restored: a fresh target starts with no journal at all, and `restore
---clear` empties `journal_entry` along with the data it wipes so the chain
-does not outlive the data it described. A restore without `--clear` merges into
-the target. The merged-in records are inserted directly and are not
-themselves journalled, and a journalled row can be orphaned even when none of
-the snapshot's IDs collide with anything the journal describes. Two paths do
-that: an incoming edge with a fresh `edge_id` but the same `(from_thought_id,
-to_thought_id, edge_type)` triple as a journalled edge replaces it through
-the table's UNIQUE constraint on that triple; and replacing a thought whose
-own ID **does** collide cascades the delete, by foreign key, to that
-thought's edges and embeddings — rows whose IDs never appeared in the
-snapshot. Either way the journal entries describing the earlier row stay
-behind unchanged; `verify` still reports the chain as **valid** even though
-it no longer matches what the database holds. To preserve the journal, back
-up the database file itself (see the upgrade/backup guidance), and note that
+--clear` empties `journal_entry` along with the data it wipes so the chain does
+not outlive the data it described. A restore without `--clear` merges into the
+target. The merged-in records are inserted directly and are not themselves
+journalled, and a journalled row can be orphaned even when none of the
+snapshot's IDs collide with anything the journal describes. Two paths do that:
+an incoming edge with a fresh `edge_id` but the same `(from_thought_id,
+to_thought_id, edge_type)` triple as a journalled edge replaces it through the
+table's UNIQUE constraint on that triple; and replacing a thought whose own ID
+**does** collide cascades the delete, by foreign key, to that thought's edges,
+embeddings, and actions — rows whose IDs never appeared in the snapshot. An
+action only has a journal entry to orphan once it has been updated at least
+once: `create_action` writes no journal entry, only `update_action` does, so a
+freshly created action that was never updated cascades away with nothing stale
+left behind. Either way the journal entries describing the earlier row stay
+behind unchanged; `verify` still reports the chain as **valid** even though it
+no longer matches what the database holds. To preserve the journal, back up the
+database file itself (see the upgrade/backup guidance), and note that
 hard-deleting an audited thought still leaves its content in the journal's
 `before`/`after` delta — relevant when handling erasure requests.
 

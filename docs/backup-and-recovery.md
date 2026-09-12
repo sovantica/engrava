@@ -41,13 +41,16 @@ thought / edge / embedding / action.
 >   Orphaning a journal entry does not require an incoming ID to collide with
 >   one the journal already describes. An incoming edge with a fresh `edge_id`
 >   but the same `(from_thought_id, to_thought_id, edge_type)` triple as a
->   journalled edge replaces it through the table's own UNIQUE constraint —
->   no ID collision needed. And replacing a thought whose **own** ID does
->   collide cascades the delete, by foreign key, to that thought's edges and
->   embeddings — rows whose IDs never appeared in the snapshot. Either way the
->   journal entries describing the earlier row stay behind unchanged;
->   `verify` still reports the chain as **valid**, even though those entries
->   no longer describe what the database now holds.
+>   journalled edge replaces it through the table's own UNIQUE constraint — no
+>   ID collision needed. And replacing a thought whose **own** ID does collide
+>   cascades the delete, by foreign key, to that thought's edges, embeddings,
+>   and actions — rows whose IDs never appeared in the snapshot. An action
+>   only has a journal entry to orphan once it has been updated at least once:
+>   `create_action` writes no journal entry, only `update_action` does, so a
+>   freshly created action that was never updated cascades away with nothing
+>   stale left behind. Either way the journal entries describing the earlier
+>   row stay behind unchanged; `verify` still reports the chain as **valid**,
+>   even though those entries no longer describe what the database now holds.
 >
 > If audit continuity matters, use a **physical file backup** (which copies
 > the journal verbatim), not a logical snapshot. See

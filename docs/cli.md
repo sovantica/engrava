@@ -322,9 +322,10 @@ a restored target — restore itself cannot tell you.
 > **without `--clear`** merges into the target and can orphan journal entries
 > even when no incoming ID collides with one the journal describes: a
 > duplicate `(from_thought_id, to_thought_id, edge_type)` triple replaces an
-> existing edge, and replacing a thought cascades to that thought's own edges
-> and embeddings — neither needs its own ID to collide. `verify` still
-> reports the chain as **valid** even though it no longer matches the data.
+> existing edge, and replacing a thought cascades to that thought's own
+> edges, embeddings, and actions — neither needs its own ID to collide.
+> `verify` still reports the chain as **valid** even though it no longer
+> matches the data.
 > See [Backup & Recovery](backup-and-recovery.md#logical-snapshot-and-restore)
 > for the full breakdown.
 
