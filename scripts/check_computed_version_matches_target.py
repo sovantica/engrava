@@ -94,7 +94,23 @@ RELEASE_TARGET_PATH = REPO_ROOT / "release-target.json"
 # 'run_gate(computed_version="0.7.0\n", declared_target="0.7.0")' passed
 # before this pattern used '\Z'. '\Z' matches only the true end of the
 # string, closing that case regardless of which method the call site uses.
-_NUMERIC_COMPONENT = r"(?:0|[1-9][0-9]*)"
+#
+# Each numeric component is additionally bounded to 18 digits ('[0-9]{0,17}'
+# after the leading digit), not left as '[0-9]*'. 18 digits is already far
+# beyond any component a real version scheme uses (it exceeds a 64-bit
+# integer's range), so nothing legitimate is rejected; it exists to stop a
+# component with thousands of digits from ever reaching parse_version()'s
+# int() call below, which raises a bare ValueError once a component exceeds
+# Python's own int-string conversion ceiling (4300 digits by default,
+# CPython's 'sys.get_int_max_str_digits()') -- confirmed by execution: a
+# 5,000-digit component matched the previous, unbounded pattern and then
+# raised an uncaught ValueError out of int(), rather than the clean
+# GateInputError every other malformed version gets here. The bound reduces
+# how often that path is taken; it does not replace the boundary in
+# read_declared_target() below, which still converts a ValueError from
+# int() -- reachable if this limit is ever raised or lowered independently
+# of this pattern -- into the same clean diagnostic as everything else.
+_NUMERIC_COMPONENT = r"(?:0|[1-9][0-9]{0,17})"
 VERSION_RE = re.compile(
     rf"^({_NUMERIC_COMPONENT})\.({_NUMERIC_COMPONENT})\.({_NUMERIC_COMPONENT})\Z"
 )
@@ -195,44 +211,59 @@ def read_declared_target(path: Path | None = None) -> str:
     on the module after import.
 
     Returns the version exactly as written in the file (a string), after
-    confirming it parses as a bare ``MAJOR.MINOR.PATCH`` value. Raises
-    :class:`GateInputError` for every way the declaration itself can be
-    broken: the file missing, unreadable, not valid JSON, not a JSON object,
-    missing the ``version`` key, that key not being a string, or that string
-    not being a well-formed version.
+    confirming it parses as a bare ``MAJOR.MINOR.PATCH`` value.
+
+    This is the one boundary for the whole declaration-reading path -- from
+    opening ``path`` through producing a validated version string. Everything
+    :func:`_read_declared_target` raises deliberately, as :class:`GateInputError`
+    with a diagnostic already specific to what went wrong (the file missing,
+    a symlink, not valid JSON, not a JSON object, missing the ``version``
+    key, that key not being a string, that string not being a well-formed
+    version), passes straight through unchanged below -- wrapping it here
+    would only make it vaguer. Everything else -- any exception nobody
+    anticipated -- is caught once, by the trailing ``except Exception``, and
+    converted to the same clean, fail-closed diagnostic, naming this file and
+    the exception that hit it.
+
+    This replaces what used to be a short, hand-picked list of anticipated
+    exception types on this path (``OSError`` and ``MemoryError`` around
+    ``read_text()``, ``json.JSONDecodeError`` and a second ``MemoryError``
+    around ``json.loads()``): each entry closed one specific, previously
+    found gap and left every other kind of unreadable or malformed file to
+    escape as a bare traceback -- confirmed by execution against a file
+    containing invalid UTF-8 (``UnicodeDecodeError`` out of ``read_text()``),
+    a 10,000-level nested JSON document (``RecursionError`` out of
+    ``json.loads()``), and a version component of 5,000 digits (``ValueError``
+    out of ``int()`` inside :func:`parse_version`) -- none of which is any of
+    the four types the old list named. A single boundary around the whole
+    path has no fifth type to miss, because it does not enumerate types at
+    all.
     """
     if path is None:
         path = RELEASE_TARGET_PATH
-    _assert_is_a_regular_declaration_file(path)
     try:
-        text = path.read_text()
-    except (OSError, MemoryError) as exc:
-        # 'MemoryError' alongside 'OSError': 'read_text()' raises it
-        # directly -- not wrapped in 'OSError' -- when the file is larger
-        # than this process can allocate for. Confirmed by execution: a
-        # ~15 MB release-target.json read under a 'ulimit -v' of 40 MB
-        # raised an uncaught 'MemoryError' out of 'read_text()' before this
-        # except clause covered it.
-        msg = f"could not read {path}: {exc}"
+        return _read_declared_target(path)
+    except GateInputError:
+        raise
+    except Exception as exc:  # this *is* the boundary -- see the docstring above.
+        msg = f"could not read {path}: {type(exc).__name__}: {exc}"
         raise GateInputError(msg) from exc
 
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        msg = f"{path} is not valid JSON: {exc}"
-        raise GateInputError(msg) from exc
-    except MemoryError as exc:
-        # A distinct except clause from the one above, not folded into it:
-        # 'json.loads()' builds a tree of Python objects that costs far more
-        # memory than the raw text it parses, so decoding can exhaust
-        # available memory even after the read above succeeded -- confirmed
-        # by execution: the same ~15 MB file read cleanly under a 60 MB
-        # 'ulimit -v' but raised an uncaught 'MemoryError' out of
-        # 'json.loads()' moments later, escaping this function as a bare
-        # traceback instead of the same clean, fail-closed diagnostic every
-        # other malformed or unreadable input gets here.
-        msg = f"could not parse {path}: {exc}"
-        raise GateInputError(msg) from exc
+
+def _read_declared_target(path: Path) -> str:
+    """Do the actual reading, parsing and validating, with no safety net of its own.
+
+    :func:`read_declared_target` above is the sole caller and supplies the
+    one boundary that turns any failure here -- anticipated or not -- into a
+    clean :class:`GateInputError`. This function raises whatever the
+    underlying call raises, whether that is a deliberate ``GateInputError``
+    (the four checks below) or something unanticipated (a decode error, a
+    recursion limit, an integer-conversion limit) -- it makes no attempt to
+    catch or classify the latter itself.
+    """
+    _assert_is_a_regular_declaration_file(path)
+    text = path.read_text()
+    data = json.loads(text)
 
     if not isinstance(data, dict):
         msg = f"{path} must contain a JSON object, got {type(data).__name__}"

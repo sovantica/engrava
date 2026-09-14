@@ -182,49 +182,55 @@ def _assert_is_a_regular_declaration_file(path: Path) -> None:
 def read_declared_target() -> str:
     """Return the declared target version.
 
-    Every problem with the file -- absent, a symlink, not a regular file,
-    unreadable, malformed JSON, wrong shape, an unparsable version -- is a
-    hard failure; see :func:`_assert_is_a_regular_declaration_file` and the
+    This is the one boundary for the whole declaration-reading path -- from
+    opening ``path`` through producing a validated version string. Everything
+    :func:`_read_declared_target` raises deliberately, as :class:`GateInputError`
+    with a diagnostic already specific to what went wrong (absent, a
+    symlink, not a regular file, not valid JSON, wrong shape, an unparsable
+    version -- see :func:`_assert_is_a_regular_declaration_file` and the
     module docstring for why an absent file in particular is not treated as
-    "no target declared".
+    "no target declared"), passes straight through unchanged below --
+    wrapping it here would only make it vaguer. Everything else -- any
+    exception nobody anticipated -- is caught once, by the trailing
+    ``except Exception``, and converted to the same clean, fail-closed
+    diagnostic, naming this file and the exception that hit it.
+
+    This replaces what used to be a short, hand-picked list of anticipated
+    exception types on this path (``OSError`` and ``MemoryError`` around
+    ``read_text()``, ``json.JSONDecodeError`` and a second ``MemoryError``
+    around ``json.loads()``): each entry closed one specific, previously
+    found gap and left every other kind of unreadable or malformed file to
+    escape as a bare traceback -- confirmed by execution against a file
+    containing invalid UTF-8 (``UnicodeDecodeError`` out of ``read_text()``)
+    and a 10,000-level nested JSON document (``RecursionError`` out of
+    ``json.loads()``), neither of which is any of the four types the old
+    list named. A single boundary around the whole path has no fifth type to
+    miss, because it does not enumerate types at all.
     """
     path = REPO_ROOT / RELEASE_TARGET_FILENAME
+    try:
+        return _read_declared_target(path)
+    except GateInputError:
+        raise
+    except Exception as exc:  # this *is* the boundary -- see the docstring above.
+        msg = f"could not read {path}: {type(exc).__name__}: {exc}"
+        raise GateInputError(msg) from exc
+
+
+def _read_declared_target(path: Path) -> str:
+    """Do the actual reading, parsing and validating, with no safety net of its own.
+
+    :func:`read_declared_target` above is the sole caller and supplies the
+    one boundary that turns any failure here -- anticipated or not -- into a
+    clean :class:`GateInputError`. This function raises whatever the
+    underlying call raises, whether that is a deliberate ``GateInputError``
+    (the checks below) or something unanticipated (a decode error, a
+    recursion limit) -- it makes no attempt to catch or classify the latter
+    itself.
+    """
     _assert_is_a_regular_declaration_file(path)
-
-    try:
-        text = path.read_text()
-    except (OSError, MemoryError) as exc:
-        # 'MemoryError' alongside 'OSError': 'read_text()' raises it
-        # directly -- not wrapped in 'OSError' -- when the file is larger
-        # than this process can allocate for, and an uncaught 'MemoryError'
-        # previously escaped this function as a bare traceback instead of
-        # the same clean, fail-closed diagnostic every other unreadable
-        # input gets here. Confirmed by execution: a 500 MB
-        # release-target.json read under a lowered 'RLIMIT_AS' raised an
-        # uncaught 'MemoryError' out of 'read_text()' before this except
-        # clause covered it.
-        msg = f"could not read {path}: {exc}"
-        raise GateInputError(msg) from exc
-
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        msg = f"{path} is not valid JSON: {exc}"
-        raise GateInputError(msg) from exc
-    except MemoryError as exc:
-        # A distinct except clause from the one guarding 'read_text()'
-        # above, not folded into it: 'json.loads()' builds a tree of Python
-        # objects that costs far more memory than the raw text it parses,
-        # so decoding can exhaust available memory even after the read
-        # above succeeded -- confirmed by execution: a ~15 MB
-        # release-target.json (a flat array of five million elements) read
-        # cleanly under a 60 MB 'ulimit -v' but raised an uncaught
-        # 'MemoryError' out of 'json.loads()' moments later, escaping this
-        # function as a bare traceback instead of the same clean,
-        # fail-closed diagnostic every other malformed or unreadable input
-        # gets here.
-        msg = f"could not parse {path}: {exc}"
-        raise GateInputError(msg) from exc
+    text = path.read_text()
+    data = json.loads(text)
 
     if not isinstance(data, dict):
         msg = f"{path} must contain a JSON object, got {type(data).__name__}"

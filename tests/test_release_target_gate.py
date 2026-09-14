@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -211,6 +212,124 @@ class TestReadDeclaredTarget:
         with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
             gate_module.read_declared_target(tmp_path / "does-not-exist.json")  # type: ignore[attr-defined]
         assert "could not read" in str(excinfo.value)
+
+
+class TestReadDeclaredTargetBoundary:
+    """Regressions for the single-boundary fix: no enumerated exception list, one catch-all.
+
+    ``read_declared_target()`` used to catch a short, hand-picked list of
+    anticipated exception types (``OSError``/``MemoryError`` around
+    ``read_text()``, ``json.JSONDecodeError``/``MemoryError`` around
+    ``json.loads()``). Each case here is a failure mode that list did not
+    name -- confirmed by execution against the pre-fix script, which let
+    every one of them escape as a bare traceback -- and now goes through the
+    single ``except Exception`` boundary in ``read_declared_target()``
+    instead.
+    """
+
+    def test_invalid_utf8_raises_a_clean_gate_input_error(
+        self, gate_module: object, tmp_path: Path
+    ) -> None:
+        # Regression for the finding that a file containing invalid UTF-8
+        # raised an uncaught UnicodeDecodeError out of read_text() -- not
+        # OSError, not MemoryError, so the old catch list missed it entirely.
+        path = tmp_path / "release-target.json"
+        path.write_bytes(b'{"version": "0.7.0\xff\xfe"}')
+        with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
+            gate_module.read_declared_target(path)  # type: ignore[attr-defined]
+        assert str(path) in str(excinfo.value)
+        assert "UnicodeDecodeError" in str(excinfo.value)
+
+    def test_a_deeply_nested_json_document_raises_a_clean_gate_input_error(
+        self, gate_module: object, tmp_path: Path
+    ) -> None:
+        # Regression for the finding that a 10,000-level nested JSON document
+        # raised an uncaught RecursionError out of json.loads() -- not
+        # json.JSONDecodeError, so the old catch list missed it too.
+        path = tmp_path / "release-target.json"
+        nested = "[" * 10_000 + "]" * 10_000
+        path.write_text('{"version": ' + nested + "}")
+        with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
+            gate_module.read_declared_target(path)  # type: ignore[attr-defined]
+        assert str(path) in str(excinfo.value)
+        assert "RecursionError" in str(excinfo.value)
+
+    def test_an_unrelated_oversized_integer_field_raises_a_clean_gate_input_error(
+        self, gate_module: object, tmp_path: Path
+    ) -> None:
+        # The fourth, unanticipated failure mode: a field this script never
+        # reads at all -- not "version" -- with a 5,000-digit integer
+        # literal. json.loads() itself calls int() on every JSON integer
+        # literal in the document, so this raises ValueError from *inside*
+        # json.loads(), before this script's own code ever runs -- a
+        # different trigger site than the version-component overflow below,
+        # and one nobody enumerated when writing the old catch list.
+        # Confirmed by execution against the pre-fix script: an uncaught
+        # ValueError escaped as a bare traceback out of json.loads().
+        path = tmp_path / "release-target.json"
+        huge_literal = "9" * 5000
+        path.write_text('{"version": "0.7.0", "unrelated_field": ' + huge_literal + "}")
+        with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
+            gate_module.read_declared_target(path)  # type: ignore[attr-defined]
+        assert str(path) in str(excinfo.value)
+        assert "ValueError" in str(excinfo.value)
+
+    def test_a_5000_digit_version_component_is_rejected_by_the_regex_bound(
+        self, gate_module: object, tmp_path: Path
+    ) -> None:
+        # Regression for the finding that a version component of 5,000
+        # digits satisfied the previous, unbounded VERSION_RE and then raised
+        # an uncaught ValueError out of int() inside parse_version(). The
+        # regex now bounds each component to 18 digits, so this is rejected
+        # before int() ever runs, via parse_version()'s own deliberate
+        # diagnostic -- not the generic boundary message.
+        path = tmp_path / "release-target.json"
+        huge_component = "9" * 5000
+        path.write_text(json.dumps({"version": f"0.7.{huge_component}"}))
+        with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
+            gate_module.read_declared_target(path)  # type: ignore[attr-defined]
+        assert "is not a bare MAJOR.MINOR.PATCH version" in str(excinfo.value)
+        assert "could not read" not in str(excinfo.value)
+
+    def test_an_int_conversion_limit_hit_via_parse_version_is_still_caught_by_the_boundary(
+        self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Defence in depth: the regex bound (18 digits) is what stops a
+        # pathological component from reaching int() in the first place, but
+        # the boundary in read_declared_target() must independently survive
+        # a ValueError out of int() inside parse_version() too -- not rely on
+        # the bound being the only thing standing between a malformed
+        # component and a bare traceback. VERSION_RE is widened back to its
+        # pre-fix, unbounded shape here to simulate a future change
+        # reopening the gap the bound closes, so this exercises the real
+        # int() call inside parse_version() with a 5,000-digit component,
+        # proving the boundary alone -- not the bound -- is what makes this
+        # fail closed rather than traceback. (sys.set_int_max_str_digits()
+        # cannot simulate this instead: its own minimum is 640, well above
+        # the 18-digit bound, so no legitimate process-wide setting can ever
+        # make an in-bound component overflow int() -- the bound alone
+        # already closes that door for any real deployment.)
+        unbounded_version_re = re.compile(r"^([0-9]+)\.([0-9]+)\.([0-9]+)\Z")
+        monkeypatch.setattr(gate_module, "VERSION_RE", unbounded_version_re)  # type: ignore[attr-defined]
+        path = tmp_path / "release-target.json"
+        huge_component = "9" * 5000
+        path.write_text(json.dumps({"version": f"0.7.{huge_component}"}))
+        with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
+            gate_module.read_declared_target(path)  # type: ignore[attr-defined]
+        assert str(path) in str(excinfo.value)
+        assert "ValueError" in str(excinfo.value)
+
+    def test_a_deliberate_gate_input_error_is_not_rewrapped(
+        self, gate_module: object, tmp_path: Path
+    ) -> None:
+        # The boundary must re-raise a deliberate GateInputError exactly as
+        # raised, not fold it into the generic "could not read ..." message
+        # -- that would trade a specific diagnostic for a vaguer one.
+        path = tmp_path / "release-target.json"
+        path.write_text(json.dumps({"not_version": "0.7.0"}))
+        with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
+            gate_module.read_declared_target(path)  # type: ignore[attr-defined]
+        assert str(excinfo.value) == f"{path} does not declare a 'version' key"
 
 
 class TestRunGate:

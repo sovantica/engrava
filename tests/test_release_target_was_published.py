@@ -223,6 +223,86 @@ class TestReadDeclaredTarget:
             gate_module.read_declared_target()  # type: ignore[attr-defined]
 
 
+class TestReadDeclaredTargetBoundary:
+    """Regressions for the single-boundary fix: no enumerated exception list, one catch-all.
+
+    ``read_declared_target()`` used to catch a short, hand-picked list of
+    anticipated exception types (``OSError``/``MemoryError`` around
+    ``read_text()``, ``json.JSONDecodeError``/``MemoryError`` around
+    ``json.loads()``). Each case here is a failure mode that list did not
+    name -- confirmed by execution against the pre-fix script, which let
+    every one of them escape as a bare traceback -- and now goes through the
+    single ``except Exception`` boundary in ``read_declared_target()``
+    instead.
+    """
+
+    def test_invalid_utf8_raises_a_clean_gate_input_error(
+        self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression for the finding that a file containing invalid UTF-8
+        # raised an uncaught UnicodeDecodeError out of read_text() -- not
+        # OSError, not MemoryError, so the old catch list missed it entirely.
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "release-target.json").write_bytes(b'{"version": "0.7.0\xff\xfe"}')
+        monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
+        with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
+            gate_module.read_declared_target()  # type: ignore[attr-defined]
+        assert "UnicodeDecodeError" in str(excinfo.value)
+
+    def test_a_deeply_nested_json_document_raises_a_clean_gate_input_error(
+        self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression for the finding that a 10,000-level nested JSON document
+        # raised an uncaught RecursionError out of json.loads() -- not
+        # json.JSONDecodeError, so the old catch list missed it too.
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        nested = "[" * 10_000 + "]" * 10_000
+        (repo / "release-target.json").write_text('{"version": ' + nested + "}")
+        monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
+        with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
+            gate_module.read_declared_target()  # type: ignore[attr-defined]
+        assert "RecursionError" in str(excinfo.value)
+
+    def test_an_unrelated_oversized_integer_field_raises_a_clean_gate_input_error(
+        self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The fourth, unanticipated failure mode: a field this script never
+        # reads at all -- not "version" -- with a 5,000-digit integer
+        # literal. json.loads() itself calls int() on every JSON integer
+        # literal in the document, so this raises ValueError from *inside*
+        # json.loads(), before this script's own code ever runs -- nobody
+        # enumerated this when writing the old catch list. Confirmed by
+        # execution against the pre-fix script: an uncaught ValueError
+        # escaped as a bare traceback out of json.loads().
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        huge_literal = "9" * 5000
+        (repo / "release-target.json").write_text(
+            '{"version": "0.7.0", "unrelated_field": ' + huge_literal + "}"
+        )
+        monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
+        with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
+            gate_module.read_declared_target()  # type: ignore[attr-defined]
+        assert "ValueError" in str(excinfo.value)
+
+    def test_a_deliberate_gate_input_error_is_not_rewrapped(
+        self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The boundary must re-raise a deliberate GateInputError exactly as
+        # raised, not fold it into the generic "could not read ..." message
+        # -- that would trade a specific diagnostic for a vaguer one.
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "release-target.json").write_text(json.dumps({"not_version": "0.7.0"}))
+        monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
+        with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
+            gate_module.read_declared_target()  # type: ignore[attr-defined]
+        expected_path = repo / "release-target.json"
+        assert str(excinfo.value) == f"{expected_path} does not declare a 'version' key"
+
+
 class TestResolveTagCommitAgainstADisposableRepository:
     """Exercise ``resolve_tag_commit``'s real ``^{commit}`` peel against real git objects."""
 
