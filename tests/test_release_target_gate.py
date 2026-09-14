@@ -118,6 +118,100 @@ class TestReadDeclaredTarget:
         with pytest.raises(gate_module.GateInputError):  # type: ignore[attr-defined]
             gate_module.read_declared_target(path)  # type: ignore[attr-defined]
 
+    def test_a_memory_error_while_reading_raises_gate_input_error(
+        self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression for the finding that this script caught MemoryError at
+        # neither the read nor the decode stage -- unlike
+        # check_release_target_was_published.py, which already caught it at
+        # the read stage. Confirmed by execution: a real ~15 MB
+        # release-target.json (a flat array of five million elements) read
+        # under a 40 MB 'ulimit -v' raised an uncaught MemoryError out of
+        # 'read_text()' before this except clause covered it. MemoryError is
+        # simulated directly here rather than reproducing that memory
+        # pressure in a unit test.
+        path = tmp_path / "release-target.json"
+        path.write_text(json.dumps({"version": "0.7.0"}))
+
+        def _raise_memory_error(self: Path, *args: object, **kwargs: object) -> str:
+            msg = "simulated: file too large to read"
+            raise MemoryError(msg)
+
+        monkeypatch.setattr(Path, "read_text", _raise_memory_error)
+        with pytest.raises(gate_module.GateInputError):  # type: ignore[attr-defined]
+            gate_module.read_declared_target(path)  # type: ignore[attr-defined]
+
+    def test_a_memory_error_while_decoding_raises_gate_input_error(
+        self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Sibling of the read-stage test above: 'json.loads()' builds a
+        # tree of Python objects that costs far more memory than the raw
+        # text it parses, so it can exhaust memory even after a successful
+        # read. Confirmed by execution against the real file described
+        # above under a 60 MB 'ulimit -v': the read succeeded and
+        # 'json.loads()' then raised an uncaught MemoryError.
+        path = tmp_path / "release-target.json"
+        path.write_text(json.dumps({"version": "0.7.0"}))
+
+        def _raise_memory_error(*args: object, **kwargs: object) -> object:
+            msg = "simulated: document too large to decode"
+            raise MemoryError(msg)
+
+        monkeypatch.setattr(json, "loads", _raise_memory_error)
+        with pytest.raises(gate_module.GateInputError):  # type: ignore[attr-defined]
+            gate_module.read_declared_target(path)  # type: ignore[attr-defined]
+
+    def test_a_symlinked_declaration_file_raises(self, gate_module: object, tmp_path: Path) -> None:
+        # Regression for the finding that this script's post-publication
+        # sibling (check_release_target_was_published.py) refused a
+        # symlinked release-target.json, but this pre-publication gate
+        # still followed one through a bare 'read_text()' -- letting it
+        # pass, before anything is tagged, against ambient JSON elsewhere on
+        # the filesystem. Confirmed by execution: pointing
+        # release-target.json at an unrelated file declaring a version
+        # equal to the CLI-supplied computed version made this gate exit 0
+        # before this guard existed.
+        ambient_dir = tmp_path / "ambient-outside-the-checkout"
+        ambient_dir.mkdir()
+        ambient_file = ambient_dir / "elsewhere.json"
+        ambient_file.write_text(json.dumps({"version": "9.9.9"}))
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        declared_path = repo / "release-target.json"
+        declared_path.symlink_to(ambient_file)
+
+        with pytest.raises(gate_module.GateInputError):  # type: ignore[attr-defined]
+            gate_module.read_declared_target(declared_path)  # type: ignore[attr-defined]
+
+    def test_a_non_regular_declaration_file_raises(
+        self, gate_module: object, tmp_path: Path
+    ) -> None:
+        # A directory named release-target.json is not a symlink, but it is
+        # also not a regular file -- the same "require a regular file"
+        # guard must reject it too, not just the symlink shape. Both before
+        # and after the guard, a directory raises GateInputError (read_text()
+        # already turns 'IsADirectoryError' into one via the generic OSError
+        # clause) -- so this asserts the *message* changes to the guard's
+        # own wording, which is what actually distinguishes "the guard ran"
+        # from "read_text() merely failed for an unrelated reason".
+        path = tmp_path / "release-target.json"
+        path.mkdir()
+        with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
+            gate_module.read_declared_target(path)  # type: ignore[attr-defined]
+        assert "is not a regular file" in str(excinfo.value)
+
+    def test_a_missing_file_still_reports_could_not_read(
+        self, gate_module: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The regular-file guard must not change this script's existing
+        # behaviour for the ordinary "file absent" case: it still falls
+        # through to read_text()'s own OSError, not a new "does not exist"
+        # message the guard could have introduced.
+        with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
+            gate_module.read_declared_target(tmp_path / "does-not-exist.json")  # type: ignore[attr-defined]
+        assert "could not read" in str(excinfo.value)
+
 
 class TestRunGate:
     def test_matching_versions_pass(self, gate_module: object) -> None:

@@ -67,6 +67,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import stat
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -104,6 +105,61 @@ EXIT_FAIL = 1
 
 class GateInputError(RuntimeError):
     """Raised when the declared target or the computed version cannot be resolved."""
+
+
+def _assert_is_a_regular_declaration_file(path: Path) -> None:
+    """Raise if ``path`` exists but is a symlink or another non-regular file.
+
+    Duplicated from ``check_release_target_was_published.py``'s guard of
+    the same name and for the same reason, rather than factored into a
+    shared module: the two scripts already duplicate ``VERSION_RE`` and its
+    surrounding reasoning outright (see this module's own comment above
+    that pattern), and each is invoked standalone, from a different point
+    in the release pipeline, by a different caller
+    (``@semantic-release/exec``'s ``prepareCmd`` here,
+    ``release.yml`` directly there) -- neither imports the other or any
+    third module today. Introducing one for two call sites this small would
+    add an import edge between two scripts that currently have none, for a
+    ten-line guard neither is likely to change independently of the other;
+    the existing duplication in this file is the precedent for keeping it
+    that way here too.
+
+    Unlike that script's version, a *missing* file is not raised here: this
+    function only runs before ``read_text()`` in :func:`read_declared_target`
+    below, and that call already turns a missing file into a clean
+    ``"could not read {path}: ..."`` :class:`GateInputError` on its own --
+    this script's docstring makes no claim, unlike the sibling gate's, that
+    there is no legitimate history where the file is briefly absent, so
+    there is nothing to add for that case. ``lstat()``, not ``stat()``: the
+    latter follows a symlink and reports on whatever it points at, which is
+    exactly the fact this check needs to see through, not past -- confirmed
+    by execution: pointing ``release-target.json`` at an unrelated,
+    well-formed ``release-target.json`` elsewhere on the filesystem made
+    this gate exit 0, reporting PASS against ambient JSON this checkout
+    never declared, before this check existed.
+    """
+    try:
+        file_stat = path.lstat()
+    except OSError:
+        # Missing (or otherwise unstattable, e.g. an unreadable parent
+        # directory) -- read_text() below raises its own OSError for this,
+        # with the message this script has always given for it.
+        return
+
+    if stat.S_ISLNK(file_stat.st_mode):
+        msg = (
+            f"{path} is a symlink, not a regular file. This gate refuses to "
+            "follow it: a symlink can point release-target.json's declared "
+            "contents at anything else readable on the filesystem, entirely "
+            "outside this repository checkout, and there is no way from "
+            "inside this check to tell that apart from a legitimate, "
+            "git-tracked declaration. Replace it with a regular file."
+        )
+        raise GateInputError(msg)
+
+    if not stat.S_ISREG(file_stat.st_mode):
+        msg = f"{path} is not a regular file (mode {stat.filemode(file_stat.st_mode)})."
+        raise GateInputError(msg)
 
 
 def parse_version(version: str) -> tuple[int, int, int]:
@@ -147,9 +203,16 @@ def read_declared_target(path: Path | None = None) -> str:
     """
     if path is None:
         path = RELEASE_TARGET_PATH
+    _assert_is_a_regular_declaration_file(path)
     try:
         text = path.read_text()
-    except OSError as exc:
+    except (OSError, MemoryError) as exc:
+        # 'MemoryError' alongside 'OSError': 'read_text()' raises it
+        # directly -- not wrapped in 'OSError' -- when the file is larger
+        # than this process can allocate for. Confirmed by execution: a
+        # ~15 MB release-target.json read under a 'ulimit -v' of 40 MB
+        # raised an uncaught 'MemoryError' out of 'read_text()' before this
+        # except clause covered it.
         msg = f"could not read {path}: {exc}"
         raise GateInputError(msg) from exc
 
@@ -157,6 +220,18 @@ def read_declared_target(path: Path | None = None) -> str:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
         msg = f"{path} is not valid JSON: {exc}"
+        raise GateInputError(msg) from exc
+    except MemoryError as exc:
+        # A distinct except clause from the one above, not folded into it:
+        # 'json.loads()' builds a tree of Python objects that costs far more
+        # memory than the raw text it parses, so decoding can exhaust
+        # available memory even after the read above succeeded -- confirmed
+        # by execution: the same ~15 MB file read cleanly under a 60 MB
+        # 'ulimit -v' but raised an uncaught 'MemoryError' out of
+        # 'json.loads()' moments later, escaping this function as a bare
+        # traceback instead of the same clean, fail-closed diagnostic every
+        # other malformed or unreadable input gets here.
+        msg = f"could not parse {path}: {exc}"
         raise GateInputError(msg) from exc
 
     if not isinstance(data, dict):

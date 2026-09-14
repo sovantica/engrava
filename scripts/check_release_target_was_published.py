@@ -211,6 +211,20 @@ def read_declared_target() -> str:
     except json.JSONDecodeError as exc:
         msg = f"{path} is not valid JSON: {exc}"
         raise GateInputError(msg) from exc
+    except MemoryError as exc:
+        # A distinct except clause from the one guarding 'read_text()'
+        # above, not folded into it: 'json.loads()' builds a tree of Python
+        # objects that costs far more memory than the raw text it parses,
+        # so decoding can exhaust available memory even after the read
+        # above succeeded -- confirmed by execution: a ~15 MB
+        # release-target.json (a flat array of five million elements) read
+        # cleanly under a 60 MB 'ulimit -v' but raised an uncaught
+        # 'MemoryError' out of 'json.loads()' moments later, escaping this
+        # function as a bare traceback instead of the same clean,
+        # fail-closed diagnostic every other malformed or unreadable input
+        # gets here.
+        msg = f"could not parse {path}: {exc}"
+        raise GateInputError(msg) from exc
 
     if not isinstance(data, dict):
         msg = f"{path} must contain a JSON object, got {type(data).__name__}"
@@ -317,7 +331,7 @@ def _resolves_to_any_object(ref: str) -> bool:
     raise GateInputError(msg)
 
 
-def resolve_tag_commit(version: str) -> str | None:
+def resolve_tag_commit(version: str, *, is_symbolic_tag_ref: bool | None = None) -> str | None:
     """Return the commit ``refs/tags/v<version>`` resolves to, or ``None`` if it does not name one.
 
     A symbolic ref of that name is rejected before it is ever peeled: it is
@@ -326,6 +340,20 @@ def resolve_tag_commit(version: str) -> str | None:
     see :func:`_is_symbolic_ref` for the executed proof. It is treated the
     same as a missing tag, not resolved through to whatever it happens to
     point at.
+
+    ``is_symbolic_tag_ref``, when given, is the caller's own already-known
+    answer to "is ``refs/tags/v<version>`` a symbolic ref", and this
+    function trusts it instead of asking git again. :func:`classify_target`
+    passes its own answer here, because it has to compute it anyway before
+    deciding whether to call this function at all -- without this
+    parameter, a passing run asked git the identical
+    ``git symbolic-ref --quiet refs/tags/v<version>`` question twice,
+    confirmed by execution (instrumenting ``_run_git`` on a passing
+    ``classify_target()`` call showed two identical invocations before this
+    parameter existed, one after). Every other caller -- including this
+    module's own direct tests of this function -- omits it, and the
+    ``None`` default makes this function compute the answer itself exactly
+    as it always has.
 
     Past that, the ``^{commit}`` peel is deliberate, not ``^{object}``: it
     requires the ref to resolve to a commit specifically, so a tag that
@@ -342,7 +370,9 @@ def resolve_tag_commit(version: str) -> str | None:
     instead of being silently treated as "no such tag".
     """
     tag_ref = f"refs/tags/v{version}"
-    if _is_symbolic_ref(tag_ref):
+    if is_symbolic_tag_ref is None:
+        is_symbolic_tag_ref = _is_symbolic_ref(tag_ref)
+    if is_symbolic_tag_ref:
         return None
     ref = f"{tag_ref}^{{commit}}"
     completed = _run_git(["rev-parse", "--verify", "--quiet", ref])
@@ -396,6 +426,16 @@ def classify_target(version: str) -> tuple[TagState, str | None]:
     calls. Two independent lookups of the same fact can only ever agree by
     coincidence; keeping one means there is nothing left to disagree.
 
+    That single-source-of-truth intent is about the pass/fail decision, not
+    about how many times git itself gets asked: this function's own
+    ``git symbolic-ref --quiet`` probe and :func:`resolve_tag_commit`'s used
+    to ask the identical question independently, on every passing
+    classification -- not a second opinion able to disagree with the first,
+    just the same subprocess call made twice for no reason. This function
+    computes the answer once and passes it into :func:`resolve_tag_commit`
+    via ``is_symbolic_tag_ref`` instead of letting that function re-derive
+    it.
+
     Both a tag naming a non-commit object and a tag naming a commit outside
     ``HEAD``'s history fail to establish a PASS, distinctly from each other
     and from no tag existing at all -- :attr:`TagState.NO_TAG`,
@@ -409,10 +449,11 @@ def classify_target(version: str) -> tuple[TagState, str | None]:
     ``^{object}`` can still resolve through it to whatever it points at.
     """
     tag_ref = f"refs/tags/v{version}"
-    if _is_symbolic_ref(tag_ref):
+    is_symbolic = _is_symbolic_ref(tag_ref)
+    if is_symbolic:
         return TagState.NO_TAG, None
 
-    commit = resolve_tag_commit(version)
+    commit = resolve_tag_commit(version, is_symbolic_tag_ref=is_symbolic)
     if commit is None:
         if _resolves_to_any_object(tag_ref):
             return TagState.NON_COMMIT, None

@@ -164,6 +164,30 @@ class TestReadDeclaredTarget:
         with pytest.raises(gate_module.GateInputError):  # type: ignore[attr-defined]
             gate_module.read_declared_target()  # type: ignore[attr-defined]
 
+    def test_a_memory_error_while_decoding_raises_gate_input_error(
+        self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression for the finding that reading the file was already
+        # guarded against MemoryError (see the read-stage test above) but
+        # decoding it was not: 'json.loads()' builds a tree of Python
+        # objects that costs far more memory than the raw text it parses,
+        # so it can exhaust memory even after a successful read. Confirmed
+        # by execution: a real ~15 MB release-target.json (a flat array of
+        # five million elements) read cleanly under a 60 MB 'ulimit -v' but
+        # raised an uncaught MemoryError out of 'json.loads()' before this
+        # except clause covered it. MemoryError is simulated directly here
+        # rather than reproducing that memory pressure in a unit test.
+        _write_target(tmp_path, "0.7.0")
+        monkeypatch.setattr(gate_module, "REPO_ROOT", tmp_path)  # type: ignore[attr-defined]
+
+        def _raise_memory_error(*args: object, **kwargs: object) -> object:
+            msg = "simulated: document too large to decode"
+            raise MemoryError(msg)
+
+        monkeypatch.setattr(json, "loads", _raise_memory_error)
+        with pytest.raises(gate_module.GateInputError):  # type: ignore[attr-defined]
+            gate_module.read_declared_target()  # type: ignore[attr-defined]
+
     def test_a_symlinked_declaration_file_raises(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -344,6 +368,39 @@ class TestClassifyTargetAgainstADisposableRepository:
         state, commit = gate_module.classify_target("0.7.0")  # type: ignore[attr-defined]
         assert state is gate_module.TagState.PUBLISHED  # type: ignore[attr-defined]
         assert commit == head
+
+    def test_asks_symbolic_ref_exactly_once_on_a_passing_classification(
+        self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression for the finding that a passing classify_target() call
+        # asked git the identical 'git symbolic-ref --quiet
+        # refs/tags/v<version>' question twice: once here, to decide
+        # whether to call resolve_tag_commit() at all, and once more inside
+        # resolve_tag_commit() itself, re-deriving an answer the caller
+        # already had. Confirmed by execution: instrumenting _run_git and
+        # calling classify_target() on a tag reachable from HEAD recorded
+        # two 'symbolic-ref' invocations before resolve_tag_commit() took
+        # the already-known answer as a parameter, one afterwards.
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_disposable_repo(repo)
+        subprocess.run(["git", "tag", "v0.7.0"], cwd=repo, check=True)  # noqa: S607
+        monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
+
+        calls: list[list[str]] = []
+        original_run_git = gate_module._run_git  # type: ignore[attr-defined]
+
+        def _counting_run_git(args: list[str]) -> object:
+            calls.append(list(args))
+            return original_run_git(args)
+
+        monkeypatch.setattr(gate_module, "_run_git", _counting_run_git)  # type: ignore[attr-defined]
+
+        state, _commit_sha = gate_module.classify_target("0.7.0")  # type: ignore[attr-defined]
+
+        assert state is gate_module.TagState.PUBLISHED  # type: ignore[attr-defined]
+        symbolic_ref_calls = [call for call in calls if call[0] == "symbolic-ref"]
+        assert len(symbolic_ref_calls) == 1, calls
 
     def test_a_missing_tag_is_not_published(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -638,12 +695,19 @@ class TestMainAgainstADisposableRepository:
         assert "FAIL" in captured.out
 
     def test_pass_message_states_its_own_boundary(
-        self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        gate_module: object,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
         # The PASS message must say what it actually established (git's own
         # view of this repository's history) and name what it does not
         # prove (a PyPI upload, or defence against locally altered git
-        # metadata) -- not an unqualified "has been published".
+        # metadata) -- not an unqualified "has been published". Asserting
+        # only the exit code here would not pin any of that: deleting every
+        # word of the boundary sentence and leaving a bare "PASS" would
+        # still satisfy `== 0`.
         repo = tmp_path / "repo"
         repo.mkdir()
         _init_disposable_repo(repo)
@@ -651,6 +715,12 @@ class TestMainAgainstADisposableRepository:
         _write_target(repo, "0.7.0")
         monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
         assert gate_module.main([]) == 0  # type: ignore[attr-defined]
+        captured = capsys.readouterr()
+        assert "resolves to a commit that git reports as" in captured.out
+        assert "reachable from HEAD in this repository" in captured.out
+        assert "not a defense against locally altered git metadata" in captured.out
+        assert "proof that a tag exists, not" in captured.out
+        assert "that this version reached PyPI" in captured.out
 
     def test_a_missing_tag_message_says_no_tag_exists(
         self,
