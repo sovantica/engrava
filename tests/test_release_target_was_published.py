@@ -131,6 +131,73 @@ class TestReadDeclaredTarget:
         with pytest.raises(gate_module.GateInputError):  # type: ignore[attr-defined]
             gate_module.read_declared_target()  # type: ignore[attr-defined]
 
+    def test_a_trailing_newline_in_the_version_raises(
+        self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression for the finding that "0.7.0\n" satisfied the previous
+        # '^...$'-anchored VERSION_RE under match(): '$' matches just
+        # before a trailing newline, so this value passed validation and
+        # only failed later, misleadingly, as "unpublished".
+        _write_target(tmp_path, "0.7.0\n")
+        monkeypatch.setattr(gate_module, "REPO_ROOT", tmp_path)  # type: ignore[attr-defined]
+        with pytest.raises(gate_module.GateInputError):  # type: ignore[attr-defined]
+            gate_module.read_declared_target()  # type: ignore[attr-defined]
+
+    def test_a_memory_error_while_reading_raises_gate_input_error(
+        self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression for the finding that a declaration file too large to
+        # read raised an uncaught MemoryError instead of the clean,
+        # fail-closed diagnostic every other unreadable input gets here.
+        # MemoryError is simulated directly rather than by actually
+        # allocating an oversized file -- see this task's real-command
+        # reproduction (a 500 MB file under a lowered RLIMIT_AS) for the
+        # end-to-end proof; this unit test only pins the except clause.
+        _write_target(tmp_path, "0.7.0")
+        monkeypatch.setattr(gate_module, "REPO_ROOT", tmp_path)  # type: ignore[attr-defined]
+
+        def _raise_memory_error(self: Path, *args: object, **kwargs: object) -> str:
+            msg = "simulated: file too large to read"
+            raise MemoryError(msg)
+
+        monkeypatch.setattr(Path, "read_text", _raise_memory_error)
+        with pytest.raises(gate_module.GateInputError):  # type: ignore[attr-defined]
+            gate_module.read_declared_target()  # type: ignore[attr-defined]
+
+    def test_a_symlinked_declaration_file_raises(
+        self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression for the finding that release-target.json being a
+        # symlink to unrelated, well-formed JSON elsewhere on the
+        # filesystem -- with a matching old tag already in the repository
+        # -- made this gate exit 0. A symlink is refused outright, whether
+        # or not its target is itself well-formed.
+        ambient_dir = tmp_path / "ambient-outside-the-checkout"
+        ambient_dir.mkdir()
+        ambient_file = ambient_dir / "elsewhere.json"
+        ambient_file.write_text(json.dumps({"version": "0.6.0"}))
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "release-target.json").symlink_to(ambient_file)
+
+        monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
+        with pytest.raises(gate_module.GateInputError):  # type: ignore[attr-defined]
+            gate_module.read_declared_target()  # type: ignore[attr-defined]
+
+    def test_a_non_regular_declaration_file_raises(
+        self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A directory named release-target.json is not a symlink, but it is
+        # also not a regular file -- the same "require a regular file"
+        # guard must reject it too, not just the symlink shape.
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "release-target.json").mkdir()
+        monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
+        with pytest.raises(gate_module.GateInputError):  # type: ignore[attr-defined]
+            gate_module.read_declared_target()  # type: ignore[attr-defined]
+
 
 class TestResolveTagCommitAgainstADisposableRepository:
     """Exercise ``resolve_tag_commit``'s real ``^{commit}`` peel against real git objects."""
@@ -191,6 +258,31 @@ class TestResolveTagCommitAgainstADisposableRepository:
         with pytest.raises(gate_module.GateInputError):  # type: ignore[attr-defined]
             gate_module.resolve_tag_commit("0.7.0")  # type: ignore[attr-defined]
 
+    def test_a_symbolic_ref_resolves_to_none(
+        self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression for the finding that a symbolic refs/tags/v0.7.0
+        # pointing at the current branch made this resolve straight to
+        # HEAD's own commit, with no real tag object anywhere in the
+        # repository -- confirmed by execution against the unfixed script.
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_disposable_repo(repo)
+        current_branch = subprocess.run(
+            ["git", "symbolic-ref", "--short", "HEAD"],  # noqa: S607
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(  # noqa: S603
+            ["git", "symbolic-ref", "refs/tags/v0.7.0", f"refs/heads/{current_branch}"],  # noqa: S607
+            cwd=repo,
+            check=True,
+        )
+        monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
+        assert gate_module.resolve_tag_commit("0.7.0") is None  # type: ignore[attr-defined]
+
 
 class TestIsAncestorAgainstADisposableRepository:
     """Exercise ``is_ancestor``'s real 0/1/other exit-code path against real git objects."""
@@ -231,8 +323,8 @@ class TestIsAncestorAgainstADisposableRepository:
             gate_module.is_ancestor("deadbeef", "HEAD")  # type: ignore[attr-defined]
 
 
-class TestTargetIsPublishedAgainstADisposableRepository:
-    """Exercise the composed ``target_is_published`` -- a tag alone is not enough."""
+class TestClassifyTargetAgainstADisposableRepository:
+    """Exercise the composed ``classify_target`` -- a tag alone is not enough for PUBLISHED."""
 
     def test_a_tag_on_head_is_published(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -240,9 +332,18 @@ class TestTargetIsPublishedAgainstADisposableRepository:
         repo = tmp_path / "repo"
         repo.mkdir()
         _init_disposable_repo(repo)
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],  # noqa: S607
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
         subprocess.run(["git", "tag", "v0.7.0"], cwd=repo, check=True)  # noqa: S607
         monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
-        assert gate_module.target_is_published("0.7.0") is True  # type: ignore[attr-defined]
+        state, commit = gate_module.classify_target("0.7.0")  # type: ignore[attr-defined]
+        assert state is gate_module.TagState.PUBLISHED  # type: ignore[attr-defined]
+        assert commit == head
 
     def test_a_missing_tag_is_not_published(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -251,7 +352,9 @@ class TestTargetIsPublishedAgainstADisposableRepository:
         repo.mkdir()
         _init_disposable_repo(repo)
         monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
-        assert gate_module.target_is_published("0.7.0") is False  # type: ignore[attr-defined]
+        state, commit = gate_module.classify_target("0.7.0")  # type: ignore[attr-defined]
+        assert state is gate_module.TagState.NO_TAG  # type: ignore[attr-defined]
+        assert commit is None
 
     def test_a_tag_on_an_unreachable_commit_is_not_published(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -291,7 +394,9 @@ class TestTargetIsPublishedAgainstADisposableRepository:
             check=True,
         )
         monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
-        assert gate_module.target_is_published("0.7.0") is False  # type: ignore[attr-defined]
+        state, commit = gate_module.classify_target("0.7.0")  # type: ignore[attr-defined]
+        assert state is gate_module.TagState.UNREACHABLE  # type: ignore[attr-defined]
+        assert commit == side_commit
 
     def test_a_tag_on_a_blob_is_not_published(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -309,7 +414,9 @@ class TestTargetIsPublishedAgainstADisposableRepository:
         ).stdout.strip()
         subprocess.run(["git", "tag", "v0.7.0", blob_sha], cwd=repo, check=True)  # noqa: S603, S607
         monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
-        assert gate_module.target_is_published("0.7.0") is False  # type: ignore[attr-defined]
+        state, commit = gate_module.classify_target("0.7.0")  # type: ignore[attr-defined]
+        assert state is gate_module.TagState.NON_COMMIT  # type: ignore[attr-defined]
+        assert commit is None
 
 
 class TestRunGateWithStubbedReads:
@@ -319,7 +426,11 @@ class TestRunGateWithStubbedReads:
         self, monkeypatch: pytest.MonkeyPatch, gate_module: object
     ) -> None:
         monkeypatch.setattr(gate_module, "read_declared_target", lambda: "0.7.0")  # type: ignore[attr-defined]
-        monkeypatch.setattr(gate_module, "target_is_published", lambda _version: True)  # type: ignore[attr-defined]
+        monkeypatch.setattr(  # type: ignore[attr-defined]
+            gate_module,
+            "classify_target",
+            lambda _version: (gate_module.TagState.PUBLISHED, "deadbeef"),  # type: ignore[attr-defined]
+        )
         passed, messages = gate_module.run_gate()  # type: ignore[attr-defined]
         assert passed is True
         assert any("0.7.0" in line and line.startswith("PASS") for line in messages)
@@ -328,7 +439,11 @@ class TestRunGateWithStubbedReads:
         self, monkeypatch: pytest.MonkeyPatch, gate_module: object
     ) -> None:
         monkeypatch.setattr(gate_module, "read_declared_target", lambda: "0.7.0")  # type: ignore[attr-defined]
-        monkeypatch.setattr(gate_module, "target_is_published", lambda _version: False)  # type: ignore[attr-defined]
+        monkeypatch.setattr(  # type: ignore[attr-defined]
+            gate_module,
+            "classify_target",
+            lambda _version: (gate_module.TagState.NO_TAG, None),  # type: ignore[attr-defined]
+        )
         passed, messages = gate_module.run_gate()  # type: ignore[attr-defined]
         assert passed is False
         fail_lines = [line for line in messages if line.startswith("FAIL")]
@@ -488,3 +603,150 @@ class TestMainAgainstADisposableRepository:
         (repo / "release-target.json").write_text("{not valid json")
         monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
         assert gate_module.main([]) == 1  # type: ignore[attr-defined]
+
+    def test_a_symbolic_tag_ref_exits_one(
+        self,
+        gate_module: object,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # Regression for the finding that a symbolic refs/tags/v0.7.0
+        # pointing at the current branch made the whole gate exit 0 with no
+        # real tag present -- confirmed by execution against the unfixed
+        # script in a disposable clone.
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_disposable_repo(repo)
+        current_branch = subprocess.run(
+            ["git", "symbolic-ref", "--short", "HEAD"],  # noqa: S607
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(  # noqa: S603
+            ["git", "symbolic-ref", "refs/tags/v0.7.0", f"refs/heads/{current_branch}"],  # noqa: S607
+            cwd=repo,
+            check=True,
+        )
+        _write_target(repo, "0.7.0")
+        monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
+        exit_code = gate_module.main([])  # type: ignore[attr-defined]
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "FAIL" in captured.out
+
+    def test_pass_message_states_its_own_boundary(
+        self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The PASS message must say what it actually established (git's own
+        # view of this repository's history) and name what it does not
+        # prove (a PyPI upload, or defence against locally altered git
+        # metadata) -- not an unqualified "has been published".
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_disposable_repo(repo)
+        subprocess.run(["git", "tag", "v0.7.0"], cwd=repo, check=True)  # noqa: S607
+        _write_target(repo, "0.7.0")
+        monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
+        assert gate_module.main([]) == 0  # type: ignore[attr-defined]
+
+    def test_a_missing_tag_message_says_no_tag_exists(
+        self,
+        gate_module: object,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # Fix 5: the three distinct FAIL causes must be told apart. No tag
+        # at all must not be worded like a tag-that-exists-but problem, and
+        # must not speculate about PyPI or an announcement, which this
+        # script cannot know anything about.
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_disposable_repo(repo)
+        _write_target(repo, "0.7.0")
+        monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
+        exit_code = gate_module.main([])  # type: ignore[attr-defined]
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "no tag named v0.7.0 exists" in captured.out
+        assert "does not name a commit" not in captured.out
+        assert "not reachable from HEAD" not in captured.out
+        assert "PyPI" not in captured.out
+        assert "announced" not in captured.out
+
+    def test_a_non_commit_tag_message_says_it_does_not_name_a_commit(
+        self,
+        gate_module: object,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_disposable_repo(repo)
+        blob_sha = subprocess.run(
+            ["git", "hash-object", "-w", "--stdin"],  # noqa: S607
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+            input="not a commit\n",
+        ).stdout.strip()
+        subprocess.run(["git", "tag", "v0.7.0", blob_sha], cwd=repo, check=True)  # noqa: S603, S607
+        _write_target(repo, "0.7.0")
+        monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
+        exit_code = gate_module.main([])  # type: ignore[attr-defined]
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert "does not name a commit" in captured.out
+        assert "no tag named v0.7.0 exists" not in captured.out
+        assert "not reachable from HEAD" not in captured.out
+        assert "PyPI" not in captured.out
+
+    def test_an_unreachable_commit_message_names_the_commit(
+        self,
+        gate_module: object,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _init_disposable_repo(repo)
+        base = subprocess.run(
+            ["git", "rev-parse", "HEAD"],  # noqa: S607
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(  # noqa: S603
+            ["git", "checkout", "--quiet", "-b", "main", base],  # noqa: S607
+            cwd=repo,
+            check=True,
+        )
+        subprocess.run(  # noqa: S603
+            ["git", "checkout", "--quiet", "-b", "side-branch", base],  # noqa: S607
+            cwd=repo,
+            check=True,
+        )
+        side_commit = _commit(repo, "unrelated side commit, never merged")
+        subprocess.run(["git", "tag", "v0.7.0", side_commit], cwd=repo, check=True)  # noqa: S603, S607
+        subprocess.run(
+            ["git", "checkout", "--quiet", "main"],  # noqa: S607
+            cwd=repo,
+            check=True,
+        )
+        _write_target(repo, "0.7.0")
+        monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
+        exit_code = gate_module.main([])  # type: ignore[attr-defined]
+        assert exit_code == 1
+        captured = capsys.readouterr()
+        assert f"resolves to commit {side_commit}" in captured.out
+        assert "not reachable from HEAD" in captured.out
+        assert "does not name a commit" not in captured.out
+        assert "no tag named v0.7.0 exists" not in captured.out
+        assert "PyPI" not in captured.out

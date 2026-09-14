@@ -85,9 +85,17 @@ RELEASE_TARGET_PATH = REPO_ROOT / "release-target.json"
 # below. See scripts/check_main_carries_the_released_tag.py's TAG_RE, which
 # this mirrors -- that module's docstring has the fuller history of both
 # pitfalls being found by execution, not by inspection.
+#
+# The pattern ends in '\Z', not '$': without 're.MULTILINE', '$' matches at
+# the end of the string *or* just before a trailing newline, so
+# "0.7.0\n" satisfied "^...$" up to the position before the newline and
+# was reported as equal to the clean "0.7.0" -- confirmed by execution:
+# 'run_gate(computed_version="0.7.0\n", declared_target="0.7.0")' passed
+# before this pattern used '\Z'. '\Z' matches only the true end of the
+# string, closing that case regardless of which method the call site uses.
 _NUMERIC_COMPONENT = r"(?:0|[1-9][0-9]*)"
 VERSION_RE = re.compile(
-    rf"^({_NUMERIC_COMPONENT})\.({_NUMERIC_COMPONENT})\.({_NUMERIC_COMPONENT})$"
+    rf"^({_NUMERIC_COMPONENT})\.({_NUMERIC_COMPONENT})\.({_NUMERIC_COMPONENT})\Z"
 )
 
 EXIT_OK = 0
@@ -99,13 +107,22 @@ class GateInputError(RuntimeError):
 
 
 def parse_version(version: str) -> tuple[int, int, int]:
-    """Parse a bare ``MAJOR.MINOR.PATCH`` string (no leading ``v``, no surrounding whitespace).
+    r"""Parse a bare ``MAJOR.MINOR.PATCH`` string (no leading ``v``, no surrounding whitespace).
 
     No stripping is applied before matching: a value that differs from a
     canonical version only by leading or trailing whitespace is not that
     version and must not be silently treated as though it were.
+
+    ``fullmatch()``, not ``match()``: changing ``VERSION_RE`` to end in
+    ``'\\Z'`` already closes the specific trailing-newline case this method
+    used to let through (see the pattern's own comment), but ``match()``
+    never required the pattern to consume the whole string to begin with,
+    only to match starting at position 0 -- a future change widening this
+    pattern could reopen the same class of bug under ``match()`` without
+    touching the anchor at all. ``fullmatch()`` fails closed regardless of
+    how the pattern itself is written.
     """
-    match = VERSION_RE.match(version)
+    match = VERSION_RE.fullmatch(version)
     if match is None:
         msg = f"{version!r} is not a bare MAJOR.MINOR.PATCH version"
         raise GateInputError(msg)

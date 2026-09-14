@@ -69,6 +69,14 @@ class TestParseVersion:
         with pytest.raises(gate_module.GateInputError):  # type: ignore[attr-defined]
             gate_module.parse_version("0.7.0 ")  # type: ignore[attr-defined]
 
+    def test_rejects_a_trailing_newline(self, gate_module: object) -> None:
+        # Regression for the finding that "0.7.0\n" satisfied the previous
+        # '^...$'-anchored VERSION_RE under match(): '$' matches just
+        # before a trailing newline, so a computed version corrupted with
+        # one was silently treated as equal to the clean version.
+        with pytest.raises(gate_module.GateInputError):  # type: ignore[attr-defined]
+            gate_module.parse_version("0.7.0\n")  # type: ignore[attr-defined]
+
 
 class TestReadDeclaredTarget:
     def test_reads_a_well_formed_file(self, gate_module: object, tmp_path: Path) -> None:
@@ -182,3 +190,16 @@ class TestMain:
         assert exit_code == 1
         captured = capsys.readouterr()
         assert "could not read" in captured.err
+
+    def test_a_computed_version_with_a_trailing_newline_exits_one(
+        self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression for the finding that a computed version corrupted with
+        # a trailing newline ("0.7.0\n") was reported equal to a clean
+        # declared target of "0.7.0" and exited 0 -- confirmed by execution
+        # against the unfixed script in a disposable clone.
+        target_path = tmp_path / "release-target.json"
+        target_path.write_text(json.dumps({"version": "0.7.0"}))
+        monkeypatch.setattr(gate_module, "RELEASE_TARGET_PATH", target_path)  # type: ignore[attr-defined]
+        exit_code = gate_module.main(["0.7.0\n"])  # type: ignore[attr-defined]
+        assert exit_code == 1
