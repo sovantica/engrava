@@ -96,9 +96,14 @@ RELEASE_TARGET_PATH = REPO_ROOT / "release-target.json"
 # string, closing that case regardless of which method the call site uses.
 #
 # Each numeric component is additionally bounded to 18 digits ('[0-9]{0,17}'
-# after the leading digit), not left as '[0-9]*'. 18 digits is already far
-# beyond any component a real version scheme uses (it exceeds a 64-bit
-# integer's range), so nothing legitimate is rejected; it exists to stop a
+# after the leading digit), not left as '[0-9]*'. The bound sits comfortably
+# above anything this pipeline can produce: the computed version comes from
+# semantic-release, whose semver implementation caps a component at
+# JavaScript's MAX_SAFE_INTEGER -- 16 digits -- so nothing it can emit is
+# rejected here. (An earlier version of this comment justified the bound by
+# saying 18 digits exceeds a 64-bit integer's range. It does not: the largest
+# 18-digit number is about 1.0e18 and a signed 64-bit integer reaches roughly
+# 9.2e18. The bound is fine; that reason for it was wrong.) It exists to stop a
 # component with thousands of digits from ever reaching parse_version()'s
 # int() call below, which raises a bare ValueError once a component exceeds
 # Python's own int-string conversion ceiling (4300 digits by default,
