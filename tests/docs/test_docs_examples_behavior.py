@@ -693,6 +693,34 @@ async def test_dreaming_consolidate_result_fields() -> None:
         assert isinstance(result.reflections_created, int)
 
 
+async def test_dreaming_attach_dreaming_extension_wires_consolidate() -> None:
+    """dreaming.md 'Attaching a hand-built extension to a store'.
+
+    ``attach_dreaming_extension()`` is the doc's supported alternative to the
+    private-attribute write: before it is called, ``consolidate()`` has
+    nothing wired and raises (the same guard proven by the from_config-less
+    case above); after ``store.attach_dreaming_extension(ext)``, ``consolidate()``
+    runs that attached extension and returns its real ``ConsolidationResult``
+    rather than merely accepting the call.
+    """
+    async with aiosqlite.connect(":memory:") as conn:
+        store = await _fresh_store(conn)
+        await store.create_thought(_observation())
+
+        with pytest.raises(RuntimeError):
+            await store.consolidate(current_cycle=2)
+
+        ext = DreamingExtension(
+            config=DreamingConfig(enabled=True, promote_threshold=0.55),
+        )
+        store.attach_dreaming_extension(ext)
+
+        result = await store.consolidate(current_cycle=2)
+        assert isinstance(result.promoted_count, int)
+        assert isinstance(result.edges_created, int)
+        assert isinstance(result.reflections_created, int)
+
+
 def test_hooks_protocol_conformance() -> None:
     """README + extensions + extension-hooks custom hooks satisfy the protocol.
 

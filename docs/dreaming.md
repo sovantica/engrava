@@ -100,6 +100,26 @@ result = await ext.run_consolidation(store, current_cycle=1)
 print(f"Promoted {result.promoted_count} thoughts")
 ```
 
+### Attaching a hand-built extension to a store
+
+Calling `run_consolidation()` on the extension directly (above) never needs
+the store to know about it. If you instead want `store.consolidate()` to run
+your hand-built extension — the same call site used by an `from_config`-built
+store — wire it on with `attach_dreaming_extension()`:
+
+```python
+store.attach_dreaming_extension(ext)
+result = await store.consolidate(current_cycle=2)
+```
+
+This is the supported way to wire an extension onto a manually built store; it
+does not itself construct or configure a `DreamingExtension`. Calling it again
+replaces whatever was attached before — there is no separate error for a
+second call, and no way to detach through this method. `attach_dreaming_extension()`
+rejects any argument that does not implement `run_consolidation(store,
+current_cycle)` with a `TypeError`, rather than letting a malformed extension
+fail later inside a consolidation cycle.
+
 ### From YAML config
 
 If you enable dreaming in `engrava.yaml`

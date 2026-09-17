@@ -76,6 +76,7 @@ BEHAVIOUR_BLOCKS: tuple[tuple[str, str], ...] = (
     # dreaming.md
     ("docs/dreaming.md", "promote_threshold=0.55"),  # run_consolidation
     ("docs/dreaming.md", "store.consolidate(current_cycle=1)"),  # consolidate()
+    ("docs/dreaming.md", "store.attach_dreaming_extension(ext)"),  # attach_dreaming_extension()
     # extension-hooks.md
     ("docs/extension-hooks.md", "class RecencyBoostHooks"),  # hooks protocol + score
     # extensions.md

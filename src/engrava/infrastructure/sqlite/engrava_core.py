@@ -104,6 +104,7 @@ from engrava.domain.protocols.derived_records import (
     DeriveGates,
     DeriveResult,
 )
+from engrava.domain.protocols.dreaming import DreamingConsolidatorProtocol
 from engrava.domain.protocols.embedding_provider import RoleAwareEmbeddingProvider
 from engrava.domain.protocols.hooks import DefaultEngravaHooks, EngravaHooksProtocol
 from engrava.infrastructure.sqlite.connection_revocation import ConnectionRevocationToken
@@ -125,7 +126,6 @@ if TYPE_CHECKING:
     from engrava.domain.models.metrics import EngravaMetrics, LatencyHistogram
     from engrava.domain.models.search import HybridSearchResult
     from engrava.domain.protocols.cycle_provider import CycleProvider
-    from engrava.domain.protocols.dreaming import DreamingConsolidatorProtocol
     from engrava.domain.protocols.embedding_provider import EmbeddingProviderProtocol
     from engrava.domain.protocols.hooks import MindQLExtension
     from engrava.infrastructure.sqlite.vector_sqlite_vec import SqliteVecSearchBackend
@@ -1628,7 +1628,10 @@ class SqliteEngravaCore:
         # The backend-independent dreaming consolidator, supplied by the
         # composition root when enabled. ``None`` for a manually built store or
         # dreaming-off configuration. The legacy private attribute name is kept
-        # to avoid disrupting existing diagnostic integrations.
+        # to avoid disrupting existing diagnostic integrations. This is the one
+        # slot both wiring routes target: ``from_config`` still writes it
+        # directly, and every other caller has ``attach_dreaming_extension``
+        # (below) as the supported door onto the same state.
         self._dreaming_extension: DreamingConsolidatorProtocol | None = None
         # Memory Hygiene (deterministic forgetting) policy. ``None`` (default)
         # or ``enabled=False`` ⇒ the forgetting loop never runs and no existing
@@ -12019,6 +12022,54 @@ class SqliteEngravaCore:
             retired += 1
 
         return retired
+
+    def attach_dreaming_extension(self, extension: DreamingConsolidatorProtocol) -> None:
+        """Wire a Dreaming consolidator onto this store.
+
+        This is the supported alternative to writing the private
+        ``_dreaming_extension`` attribute directly — the two are the same
+        underlying slot, so whichever one last ran wins and :meth:`consolidate`
+        cannot tell them apart. :meth:`from_config` itself still uses the
+        private write internally; this method exists for every other caller
+        (a hand-built store, a downstream integration, third-party code) that
+        today has no supported way to do what it is already doing.
+
+        Calling this again **replaces** whatever was attached before,
+        including one installed by :meth:`from_config` — the same behaviour
+        as re-assigning the private attribute has always had. There is no
+        separate "already attached" error: a second call is a deliberate
+        re-wiring, not a mistake this method can distinguish from one.
+
+        Detaching is deliberately **not** part of this seam. There is no
+        supported way to remove an attached extension in this workstream;
+        that gap is not an oversight, it is simply not yet built.
+
+        Args:
+            extension: A consolidator satisfying
+                :class:`~engrava.domain.protocols.dreaming.DreamingConsolidatorProtocol`.
+                A ``runtime_checkable`` protocol verifies only that
+                ``extension`` *has* a ``run_consolidation`` attribute by that
+                name — never that it is callable, that its parameters match,
+                or that it is a coroutine function (mirroring
+                ``_validate_provider_cycle``'s note on ``CycleProvider``). An
+                object with a same-named but wrong-shaped attribute — sync
+                instead of async, a different signature, or not callable at
+                all — passes this check and only fails once :meth:`consolidate`
+                actually calls it.
+
+        Raises:
+            TypeError: When ``extension`` has no ``run_consolidation``
+                attribute at all.
+
+        """
+        if not isinstance(extension, DreamingConsolidatorProtocol):
+            msg = (
+                "attach_dreaming_extension() requires a DreamingConsolidatorProtocol "
+                f"implementation (an async run_consolidation(store, current_cycle) "
+                f"method); got {type(extension).__name__!r}"
+            )
+            raise TypeError(msg)
+        self._dreaming_extension = extension
 
     async def consolidate(self, *, current_cycle: int | None = None) -> ConsolidationResult:
         """Run one dreaming consolidation cycle on this store.

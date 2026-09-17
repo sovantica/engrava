@@ -451,3 +451,118 @@ class TestConfigActivation:
         """A manually-built store has no wired extension → consolidate() raises."""
         with pytest.raises(RuntimeError, match="dreaming"):
             await store.consolidate(current_cycle=1)
+
+
+# ---------------------------------------------------------------------------
+# attach_dreaming_extension — the public seam beside the private write
+# ---------------------------------------------------------------------------
+
+
+async def _seeded_store(
+    tmp_path: Path, name: str
+) -> tuple[aiosqlite.Connection, SqliteEngravaCore]:
+    """A manually-constructed store seeded with promotable candidates.
+
+    Returns the raw connection alongside the store: a manual constructor
+    never owns its connection (see ``SqliteEngravaCore.close``), so the
+    caller — not ``store.close()`` — is responsible for closing it, exactly
+    as the module-level ``store`` fixture above does.
+    """
+    db = await aiosqlite.connect(str(tmp_path / name))
+    db.row_factory = aiosqlite.Row
+    s = SqliteEngravaCore(db=db)
+    await s.ensure_schema()
+    for i in range(4):
+        await s.create_thought(_obs(f"obs-{i}"))
+    return db, s
+
+
+class TestAttachDreamingExtension:
+    """The public seam for wiring a consolidator, beside the private write."""
+
+    async def test_attach_matches_private_write_behaviour(self, tmp_path: Path) -> None:
+        """Attaching through the seam runs identically to the private write.
+
+        Two identically-seeded stores, one wired through
+        ``attach_dreaming_extension`` and one through the private attribute
+        write it replaces, must produce the same ``ConsolidationResult`` for
+        the same input — proving the seam does not just set a flag but drives
+        the same code path as ``consolidate()`` already reads today.
+        """
+        cfg = _activation_cfg()
+        seam_db, via_seam = await _seeded_store(tmp_path, "via_seam.db")
+        private_db, via_private = await _seeded_store(tmp_path, "via_private.db")
+        try:
+            via_seam.attach_dreaming_extension(DreamingExtension(config=cfg))
+            via_private._dreaming_extension = DreamingExtension(config=cfg)
+
+            seam_result = await via_seam.consolidate(current_cycle=_CYCLE)
+            private_result = await via_private.consolidate(current_cycle=_CYCLE)
+
+            assert seam_result == private_result
+            assert seam_result.promoted_count >= 1
+        finally:
+            await seam_db.close()
+            await private_db.close()
+
+    async def test_second_attach_replaces_the_first(self, store: SqliteEngravaCore) -> None:
+        """Attaching again replaces whatever was attached before.
+
+        There is no "already attached" refusal: the second call simply wins,
+        exactly as a second private-attribute write would. This is
+        demonstrated by identity (the store now points at the second
+        extension), not merely by the absence of an exception.
+        """
+        first = DreamingExtension(config=_activation_cfg())
+        second = DreamingExtension(config=_activation_cfg())
+
+        store.attach_dreaming_extension(first)
+        assert store._dreaming_extension is first
+
+        store.attach_dreaming_extension(second)
+        assert store._dreaming_extension is second
+        assert store._dreaming_extension is not first
+
+    async def test_private_write_still_works_and_agrees_with_the_seam(self, tmp_path: Path) -> None:
+        """The private path is untouched: it still wires and runs dreaming.
+
+        Both doors set the same single attribute, so a store wired through
+        one and then re-wired through the other ends up in exactly the state
+        the second call describes — they cannot disagree about what is
+        attached because there is only one slot.
+        """
+        db, s = await _seeded_store(tmp_path, "private_then_seam.db")
+        try:
+            ext_a = DreamingExtension(config=_activation_cfg())
+            s._dreaming_extension = ext_a
+            assert s._dreaming_extension is ext_a
+
+            ext_b = DreamingExtension(config=_activation_cfg())
+            s.attach_dreaming_extension(ext_b)
+            assert s._dreaming_extension is ext_b
+
+            result = await s.consolidate(current_cycle=_CYCLE)
+            assert result.promoted_count >= 1
+        finally:
+            await db.close()
+
+    async def test_attach_accepts_a_conforming_extension(self, store: SqliteEngravaCore) -> None:
+        """An object implementing ``run_consolidation`` is accepted."""
+        ext = DreamingExtension(config=_activation_cfg())
+        store.attach_dreaming_extension(ext)
+        assert store._dreaming_extension is ext
+
+    async def test_attach_rejects_a_non_conforming_object(self, store: SqliteEngravaCore) -> None:
+        """An object without ``run_consolidation`` is refused at the door.
+
+        A seam that accepted anything here would only fail later, deep inside
+        a consolidation cycle; this proves it refuses immediately instead.
+        """
+
+        class NotAnExtension:
+            pass
+
+        with pytest.raises(TypeError, match="DreamingConsolidatorProtocol"):
+            store.attach_dreaming_extension(NotAnExtension())  # type: ignore[arg-type]
+
+        assert store._dreaming_extension is None
