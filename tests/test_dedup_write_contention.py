@@ -387,8 +387,8 @@ async def test_upsert_by_hash_no_op_match_releases_the_write_lock(db_path: str) 
     ``upsert_by_hash`` opens ``BEGIN IMMEDIATE`` *before* the probe runs, so it
     cannot yet know the match will turn out to need no change. When it does
     turn out that way (``changes`` computes empty), nothing is written on that
-    branch at all -- no ``UPDATE``, no journal entry -- so it
-    commits nothing (committing here would flush whatever *unrelated*,
+    branch at all -- no ``UPDATE``, no journal entry -- so it commits nothing
+    (committing here would flush whatever *unrelated*,
     still-pending work the caller already had open on this connection -- see
     :meth:`SqliteEngravaCore.upsert_by_hash`'s no-op branch). But a branch that
     writes nothing has nothing of its own to preserve either, so it does not

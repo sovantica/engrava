@@ -432,9 +432,10 @@ def test_vector_sqlite_vec_monkeypatch_via_old_path_is_observed_through_new_path
     This is the test a name-based re-export would fail: a re-export would
     leave a second module-like object under the old name, so a patch on its
     attribute would never be seen by code that imports and calls through the
-    new path -- exactly the failure a consumer (a test, or a downstream package)
-    would hit if it monkeypatches through the old path and expects the
-    effect to be observed wherever the module is actually used.
+    new path -- exactly the failure a consumer (a test, or a downstream
+    package built on this one) would hit if it monkeypatches through the
+    old path and expects the effect to be observed wherever the module is
+    actually used.
     """
     new = importlib.import_module(_NEW_VECTOR_MODULE_NAME)
     original = new.purge_orphan_vectors

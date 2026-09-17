@@ -12,9 +12,10 @@ holds for the lifetime of the process. A name-based re-export (``from
 engrava.infrastructure.sqlite.vector_sqlite_vec import *``, for instance)
 would instead leave two distinct module objects that merely look alike, and
 a consumer who monkeypatches an attribute through one of them — a test, or a
-downstream package — would silently fail to affect code that imports through the
-other. The alias makes both names resolve to the one object, so a patch
-applied through either path is observed through both.
+downstream package built on this one — would silently fail to affect code
+that imports through the other. The alias makes both names resolve to the
+one object, so a patch applied through either path is observed through
+both.
 """
 
 from __future__ import annotations

@@ -525,8 +525,9 @@ async def test_upsert_by_hash_update_branch_still_commits_pending_work(
     "whoever writes, commits" rule applied correctly. That commit is on the
     one shared connection, so it also makes durable whatever unrelated
     pending write the caller already had open; a later ``rollback()`` finds
-    nothing left to undo. This must hold both before and after the no-op branch fix,
-    since the fix only removes the no-op branch's own, separate commit call.
+    nothing left to undo. This must hold both before and after the fix to
+    the no-op branch above, since that fix only removes the no-op branch's
+    own, separate commit call.
     """
     content = "Content that receives a genuine mutable-field update."
     seeded = await store.upsert_by_hash(
@@ -560,8 +561,9 @@ async def test_upsert_by_hash_noop_inside_suspend_auto_commit_unaffected(
 ) -> None:
     """``suspend_auto_commit()`` already made ``_maybe_commit()`` a no-op there.
 
-    Confirms the no-op branch fix changes nothing observable inside a caller's
-    own ``suspend_auto_commit()`` window: a no-op ``upsert_by_hash()`` call
+    Confirms the no-op branch's commit-call removal changes nothing
+    observable inside a caller's own ``suspend_auto_commit()`` window: a
+    no-op ``upsert_by_hash()`` call
     was, and remains, side-effect-free there, because ``_skip_auto_commit``
     already suppressed the branch's ``_maybe_commit()`` call before this fix
     removed the call outright. An outer rollback still discards every write
