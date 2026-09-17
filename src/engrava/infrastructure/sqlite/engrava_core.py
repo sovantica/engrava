@@ -4043,6 +4043,103 @@ class SqliteEngravaCore:
             finally:
                 self._skip_auto_commit_depth -= 1
 
+    @contextlib.asynccontextmanager
+    async def _write_readback_savepoint(self, name: str) -> AsyncIterator[None]:
+        """Make a write and its confirming read-back one failure-atomic unit.
+
+        ``update_thought``, ``restore_thought``, ``update_edge`` and
+        ``update_action`` all write a row, then re-read it to report and
+        journal the state actually stored, and only then decide whether to
+        commit. Without this wrapper, a read-back failure (the row vanished,
+        a driver error, the row mapper rejecting a stored value) propagated
+        while the write itself stayed pending in the connection's
+        transaction — a later, unrelated commit on the same connection would
+        then publish a mutation whose own operation had reported failure.
+
+        A bare ``self._db.rollback()`` on that failure is the wrong
+        instrument: a caller may already hold this connection's transaction
+        open (see :meth:`suspend_auto_commit`), with its own writes pending
+        that must not be discarded by a sibling call's unrelated failure.
+        This uses a ``SAVEPOINT`` instead, mirroring the established pattern
+        in :meth:`_delete_thought_children_explicit` /
+        :meth:`_delete_thought_atomic`: a transaction is opened first only
+        when :attr:`self._db.in_transaction <aiosqlite.Connection.in_transaction>`
+        is not already ``True`` (tracked as ``opened_transaction``), the body
+        runs inside a named ``SAVEPOINT``, and on any failure it is unwound
+        with ``ROLLBACK TO`` + ``RELEASE`` — undoing only what this call
+        itself wrote — before the original exception propagates. Only when
+        this call is also the one that opened the transaction does it end
+        that transaction (with a rollback, never a commit); a transaction a
+        caller already held stays open, with only this call's own write
+        undone.
+
+        Cancellation is handled the same way: caught alongside every other
+        exception (``except BaseException``, not ``except Exception``) so a
+        cancellation delivered mid-body still unwinds the savepoint rather
+        than leaving it — and the write it guards — dangling on the
+        connection.
+
+        **When the unwind itself cannot be trusted, this refuses rather than
+        guesses.** If a ``RAISE(ROLLBACK)`` trigger already ended the whole
+        transaction (``self._db.in_transaction`` is already ``False`` on the
+        failure path), there is nothing left to unwind and the original
+        exception propagates unchanged. If the unwind's own statements raise,
+        recovery cannot be proven, so the connection is quarantined via
+        :meth:`_quarantine_connection` — every later write then fails fast
+        with :class:`ConnectionQuarantinedError` instead of ever reaching a
+        commit that could make the dangling write durable. A cancellation
+        raised by the unwind itself always wins over the error the unwind was
+        trying to recover from.
+
+        Args:
+            name: Savepoint name, unique among the guarded update paths (a
+                fixed literal at every call site, never caller-controlled —
+                interpolated directly into the SQL since SQLite does not
+                accept savepoint names as bound parameters).
+
+        Yields:
+            None. The caller performs its write and read-back inside the
+            block; a failure raised anywhere in it is unwound as described
+            above and then re-raised unchanged.
+
+        Raises:
+            ConnectionQuarantinedError: When an unwind attempt itself fails
+                and a consistent state could not be proven.
+
+        """
+        opened_transaction = not self._db.in_transaction
+        if opened_transaction:
+            await self._db.execute("BEGIN")
+        await self._db.execute(f"SAVEPOINT {name}")
+        try:
+            yield
+            # The release lives inside this guarded region, deliberately —
+            # see _delete_thought_children_explicit's docstring for why: a
+            # cancellation delivered while awaiting this specific call can
+            # still see the RELEASE complete on the connection, and the
+            # unwind below has to be able to recognise that as "already
+            # released", not "the write never happened".
+            await self._db.execute(f"RELEASE {name}")
+        except BaseException as exc:
+            if not self._db.in_transaction:
+                # A RAISE(ROLLBACK) trigger already ended the whole
+                # transaction (savepoint included). Nothing is left open to
+                # unwind, and nothing this call wrote can outlive it.
+                raise
+            try:
+                await self._db.execute(f"ROLLBACK TO {name}")
+                await self._db.execute(f"RELEASE {name}")
+                if opened_transaction:
+                    await self._db.rollback()
+            except BaseException as unwind_exc:
+                await self._quarantine_connection(
+                    f"{name} could not unwind its savepoint after {exc!r}: {unwind_exc!r}"
+                )
+                if isinstance(unwind_exc, asyncio.CancelledError):
+                    raise
+                raise exc from unwind_exc
+            raise
+
     def _ensure_connection_usable(self) -> None:
         """Fail fast when the connection has been quarantined.
 
@@ -7291,6 +7388,16 @@ class SqliteEngravaCore:
         through a raw connection this store does not mediate, is outside what
         any in-process lock can reach (see the concurrency documentation).
 
+        **The write and its confirming read-back are one failure-atomic
+        unit.** Both run inside :meth:`_write_readback_savepoint`: if the
+        read-back raises — the row vanished, or the mapper rejects a stored
+        value — this call's own ``UPDATE`` is unwound before the exception
+        propagates, so it can never be published by a later, unrelated
+        commit on this connection. A caller-owned transaction (a
+        :meth:`suspend_auto_commit` window already in progress) is
+        unaffected: only this call's write is undone, not the caller's
+        earlier ones.
+
         Args:
             thought_id: UUID of the thought to update.
             **changes: Fields to update.
@@ -7330,18 +7437,19 @@ class SqliteEngravaCore:
             _validate_provenance(updated.provenance)
 
             columns = self._thought_update_columns(current, updated)
-            cursor = await self._db.execute(
-                _build_update_sql("thought", columns, self._CORE_UPDATE_GUARD),
-                (*columns.values(), thought_id, expected_cycle),
-            )
-            if cursor.rowcount == 0:
-                raise StaleDataError(
-                    entity_type="ThoughtRecord",
-                    entity_id=thought_id,
-                    expected_version=expected_cycle,
+            async with self._write_readback_savepoint("update_thought_readback"):
+                cursor = await self._db.execute(
+                    _build_update_sql("thought", columns, self._CORE_UPDATE_GUARD),
+                    (*columns.values(), thought_id, expected_cycle),
                 )
+                if cursor.rowcount == 0:
+                    raise StaleDataError(
+                        entity_type="ThoughtRecord",
+                        entity_id=thought_id,
+                        expected_version=expected_cycle,
+                    )
 
-            persisted = await self._read_back_thought(thought_id)
+                persisted = await self._read_back_thought(thought_id)
 
             if self._journal is not None:
                 await self._journal.append(
@@ -7405,7 +7513,11 @@ class SqliteEngravaCore:
         owns and returns the row read back from storage after the write. It
         shares the same task-reentrant :attr:`_write_lock` critical section,
         so the read, the transition check, and the write are atomic with
-        respect to every other guarded write on this instance.
+        respect to every other guarded write on this instance. It also shares
+        :meth:`update_thought`'s :meth:`_write_readback_savepoint` protection:
+        a read-back failure unwinds this call's own write instead of leaving
+        it pending for a later, unrelated commit to publish, without
+        disturbing a caller-owned transaction already in progress.
 
         Args:
             thought_id: UUID of the archived thought to restore.
@@ -7453,18 +7565,19 @@ class SqliteEngravaCore:
             updated = current.evolve(**changes)
 
             columns = self._thought_update_columns(current, updated)
-            cursor = await self._db.execute(
-                _build_update_sql("thought", columns, self._CORE_UPDATE_GUARD),
-                (*columns.values(), thought_id, expected_cycle),
-            )
-            if cursor.rowcount == 0:
-                raise StaleDataError(
-                    entity_type="ThoughtRecord",
-                    entity_id=thought_id,
-                    expected_version=expected_cycle,
+            async with self._write_readback_savepoint("restore_thought_readback"):
+                cursor = await self._db.execute(
+                    _build_update_sql("thought", columns, self._CORE_UPDATE_GUARD),
+                    (*columns.values(), thought_id, expected_cycle),
                 )
+                if cursor.rowcount == 0:
+                    raise StaleDataError(
+                        entity_type="ThoughtRecord",
+                        entity_id=thought_id,
+                        expected_version=expected_cycle,
+                    )
 
-            persisted = await self._read_back_thought(thought_id)
+                persisted = await self._read_back_thought(thought_id)
 
             if self._journal is not None:
                 await self._journal.append(
@@ -7848,6 +7961,17 @@ class SqliteEngravaCore:
         call also writes can no longer land between this call's own read and
         write.
 
+        **The write (when there is one) and its confirming read-back are one
+        failure-atomic unit**, via :meth:`_write_readback_savepoint` — see
+        :meth:`update_thought` for what that protects against and how it
+        treats a caller-owned transaction. The ``UPDATE`` also now captures
+        its cursor and rejects a zero-row match immediately, rather than
+        trusting the read-back alone: without that check, a row deleted
+        after the initial read (so the ``UPDATE`` matches nothing) and
+        re-created under the same ``edge_id`` before the read-back runs would
+        be reported as though this call had updated it, when it had written
+        nothing at all.
+
         Args:
             edge_id: UUID of the edge to update.
             **changes: Fields to update.
@@ -7856,11 +7980,14 @@ class SqliteEngravaCore:
             The stored edge record, as persisted by this update.
 
         Raises:
-            ValueError: If the edge does not exist (including when it was
-                deleted before the write could be read back), or if the merged
-                ``metadata`` violates the shared metadata contract (a
-                non-scalar / list value, a non-finite float, or a serialized
-                size over the 64 KiB hard limit).
+            ValueError: If the edge does not exist — at the initial read, at
+                the guarded ``UPDATE`` (no row matched ``edge_id``, including
+                when the row was deleted and a different row recreated under
+                the same id before the read-back could run), or because the
+                row was deleted before the read-back could confirm the
+                write — or if the merged ``metadata`` violates the shared
+                metadata contract (a non-scalar / list value, a non-finite
+                float, or a serialized size over the 64 KiB hard limit).
 
         """
         async with self._write_lock:
@@ -7879,13 +8006,17 @@ class SqliteEngravaCore:
                 for name, value in _edge_to_core_columns(updated).items()
                 if before[name] != value
             }
-            if columns:
-                await self._db.execute(
-                    _build_update_sql("edge", columns, "edge_id = ?"),
-                    (*columns.values(), edge_id),
-                )
+            async with self._write_readback_savepoint("update_edge_readback"):
+                if columns:
+                    cursor = await self._db.execute(
+                        _build_update_sql("edge", columns, "edge_id = ?"),
+                        (*columns.values(), edge_id),
+                    )
+                    if cursor.rowcount == 0:
+                        msg = f"Edge not found: {edge_id}"
+                        raise ValueError(msg)
 
-            persisted = await self._read_back_edge(edge_id)
+                persisted = await self._read_back_edge(edge_id)
 
             if self._journal is not None:
                 await self._journal.append(
@@ -12243,6 +12374,16 @@ class SqliteEngravaCore:
         triggers no recompute. The record returned is read back from storage
         after the write, and the journal ``after`` image is the same read-back.
 
+        **The write and its confirming read-back are one failure-atomic
+        unit**, via :meth:`_write_readback_savepoint` — see
+        :meth:`update_thought` for what that protects against and how it
+        treats a caller-owned transaction. The ``UPDATE`` also captures its
+        cursor and rejects a zero-row match immediately: without that check,
+        a row deleted after the initial read (so the ``UPDATE`` matches
+        nothing) and re-created under the same ``action_id`` before the
+        read-back runs would be reported as though this call had updated it,
+        when it had written nothing at all.
+
         Args:
             action_id: UUID of the action to update.
             status: New status, or ``None`` to leave the status unchanged.
@@ -12253,8 +12394,13 @@ class SqliteEngravaCore:
             The stored action record (or, for a no-op, the unchanged record).
 
         Raises:
-            ActionNotFoundError: If the action does not exist, or if the row
-                was deleted before the write could be read back.
+            ActionNotFoundError: If the action does not exist; if the guarded
+                ``UPDATE`` matches no row (the row was deleted after the
+                initial read — including when a different row was then
+                recreated under the same ``action_id`` before the read-back
+                could run, which would otherwise be reported as though this
+                call had updated it); or if the row was deleted before the
+                read-back could confirm the write.
             InvalidTransitionError: If a real ``status`` change is illegal
                 per the action state machine.
 
@@ -12293,12 +12439,15 @@ class SqliteEngravaCore:
             if verification_changes:
                 columns["verification_status"] = updated.verification_status.value
 
-            await self._db.execute(
-                _build_update_sql("action", columns, "action_id = ?"),
-                (*columns.values(), action_id),
-            )
+            async with self._write_readback_savepoint("update_action_readback"):
+                cursor = await self._db.execute(
+                    _build_update_sql("action", columns, "action_id = ?"),
+                    (*columns.values(), action_id),
+                )
+                if cursor.rowcount == 0:
+                    raise ActionNotFoundError(action_id)
 
-            persisted = await self._read_back_action(action_id)
+                persisted = await self._read_back_action(action_id)
 
             if self._journal is not None:
                 await self._journal.append(
