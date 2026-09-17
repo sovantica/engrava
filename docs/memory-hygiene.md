@@ -223,9 +223,14 @@ an older engrava build still needs `engrava migrate` to clean up.
   more candidates qualify than the cap allows, the archive stage keeps the
   lowest-scoring, then oldest, then lowest-id thoughts; the GC stage keeps the
   oldest-archived, then lowest-id thoughts.
-- **Fail-safe on a blank slate.** When *no* signal is active (a brand-new store
-  with no access history, no confirmations, and a uniform cycle), the keep-score
-  is uninformative, so the pass archives **nothing** rather than guessing.
+- **Fail-safe on a blank slate.** A brand-new store archives nothing, but not
+  because "no signal is active" — with the default weights, `recency` and
+  `staleness` are active on presence alone (see above), so that condition is
+  essentially unreachable. The actual guard is a separate **usage-signal gate**:
+  without any usage-history signal (access counts, confirmations) anywhere in
+  the candidate pool, cycle-recency alone cannot distinguish "cold" from
+  "ingested early", so the pass archives nothing until at least one usage
+  signal has data to work with.
 - **Dry run.** With `dry_run: true`, `run_hygiene` computes and returns the set it
   *would* archive (with a per-thought reason) **without mutating anything and
   without journaling** — a safe preview before enabling for real.

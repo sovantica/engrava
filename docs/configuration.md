@@ -340,10 +340,14 @@ is no per-service `db_path` — the file is derived as `<data_dir>/<name>.db`):
 |-----|------|---------|-------------|
 | `embeddings` | `dict` | — | Per-service embedding-provider override (same shape as the top-level `embeddings` section) |
 
-The restore CLI constructs `EngravaManager` from the `services` object without
-passing the top-level `embeddings` section as `default_embeddings`. Therefore a
-service used with `restore --re-embed` must declare its provider explicitly at
-`services.configs.<name>.embeddings`; a top-level provider alone is not enough.
+The restore CLI passes the top-level `embeddings` section as `default_embeddings`
+only when `--re-embed` is set; a plain `restore` (no re-embed) constructs
+`EngravaManager` with no `default_embeddings` fallback. A per-service override
+at `services.configs.<name>.embeddings` always takes precedence when present,
+and `EngravaManager` falls back to `default_embeddings` for a service that
+does not declare its own provider. See
+[Asymmetric prefixes for instruction-tuned models](guides/embeddings.md#asymmetric-prefixes-for-instruction-tuned-models)
+for the `--re-embed` path itself.
 
 ### `journal`
 

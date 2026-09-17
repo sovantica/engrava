@@ -23,7 +23,16 @@ depends on whether the new version changes the schema.
 
 How migrations work: the core schema is versioned by SQLite's `PRAGMA
 user_version`. On the first `ensure_schema()`, Engrava runs each pending
-`vN → vN+1` step **inside a transaction** (forward-only). Most steps are
+`vN → vN+1` step in turn (forward-only). **A step is not one atomic
+transaction** — most steps run their DDL in SQLite's implicit autocommit
+(`ALTER TABLE`, `CREATE INDEX`), and at least one (the FK-recreate step) opens
+and commits more than one transaction internally to work around a SQLite
+constraint. What is guaranteed instead: each step is **idempotent** — it
+checks its own postcondition and skips work already done — and
+`PRAGMA user_version` is written and committed only after a step returns
+successfully, so a step that raises partway through is safe to retry by
+re-running `ensure_schema()`; it resumes from whatever it left behind rather
+than redoing completed work or double-applying anything. Most steps are
 **additive** (new columns, tables, and indexes), but some rebuild a table in
 place (create a new table, copy rows, drop the old, rename) — so the on-disk
 shape of a table can change across a migration.
@@ -1560,9 +1569,10 @@ startup. The schema migration runs automatically on first open as usual.
 | 16 → 17 | Adds nullable `thought.provenance` plus session/actor JSON expression indexes | Existing thoughts have no captured provenance. |
 | 17 → 18 | Adds `thought.pinned` and nullable `thought.archived_at_cycle` | Existing thoughts read as `pinned=False`; no row is treated as hygiene-archived. |
 
-All four steps run automatically inside the migration transaction on first
-`ensure_schema()`. They add columns or indexes without dropping or rewriting
-user content.
+All four steps run automatically, in order, on first `ensure_schema()` —
+each is committed on its own (there is no single transaction spanning all
+four; `user_version` advances one step at a time as each step succeeds). They
+add columns or indexes without dropping or rewriting user content.
 
 **Breaking change for MCP-server users.** The Model Context Protocol server moved
 out of `engrava` into its own package, **`engrava-mcp`**. Removed from `engrava`
@@ -1609,8 +1619,9 @@ predicates, and `invalidate`. From an upgrade standpoint, the change is
 0.4 process calls `ensure_schema()` (most apps already do this at startup), the
 core schema steps forward from `user_version = 12` (the 0.3 schema) to
 `user_version = 14` in **two additive steps** (12 → 13 adds the valid-time
-columns and their indexes; 13 → 14 adds the hot-path indexes), each inside a
-transaction. `pip install --upgrade engrava` plus your normal startup is all that
+columns and their indexes; 13 → 14 adds the hot-path indexes), each committed
+on its own as it succeeds — not as one shared transaction across both.
+`pip install --upgrade engrava` plus your normal startup is all that
 is required:
 
 ```bash

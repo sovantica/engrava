@@ -34,11 +34,11 @@ but do not expect core to invoke them.
 
 | Method | When | Returns | Status in core |
 |--------|------|---------|----------------|
-| `on_store` | After a thought is persisted | `ThoughtRecord` (enriched or unchanged) | **active** |
-| `on_retrieve` | After a thought is loaded from storage | `ThoughtRecord` (enriched or unchanged) | **active** |
+| `on_store` | After a thought row is inserted — **not** necessarily durable yet. On a plain `create_thought`, the row has already committed by this point. Inside `bulk_store`, every item's `on_store` fires as the batch is built, *before* the batch's single commit — a row error later in the same batch rolls the transaction back, and `on_store` has already run for the rows that never persist | `ThoughtRecord` (enriched or unchanged) | **active** |
+| `on_retrieve` | After a thought is loaded from storage — but only via `get_thought` and `list_thoughts`. `update_thought`, `restore_thought`, `invalidate_thought`, and the read-back inside `get_or_create` / `upsert_by_hash` all read a row back without calling it | `ThoughtRecord` (enriched or unchanged) | **active** |
 | `decay_function(thought, elapsed_cycles)` | Per-candidate decay factor, multiplied into the hygiene eviction-score | `float` in `[0.0, 1.0]` | **active** — called for each candidate when an enabled `run_hygiene()` pass reaches archive scoring; it is never consulted in search, ranking, or promotion |
 | `score_function(thought, context)` | Custom relevance score | `float` | reserved — not called by core |
-| `mindql_extension_registry()` | Register custom MindQL verbs | `dict[str, MindQLExtension]` | reserved — core wires MindQL verbs via `ExtensionManifest.mindql_extensions`, not this hook |
+| `mindql_extension_registry()` | Register custom MindQL verbs | `dict[str, MindQLExtension]` | reserved — the store itself never reads `ExtensionManifest.mindql_extensions` either; the only consumer of that field is the `engrava` CLI, which discovers verbs through the `engrava.extensions` entry-point group, not through a manifest passed to the constructor |
 
 ---
 

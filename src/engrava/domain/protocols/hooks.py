@@ -130,10 +130,14 @@ class EngravaHooksProtocol(Protocol):
 
 
 class DefaultEngravaHooks:
-    """No-op default implementation of :class:`EngravaHooksProtocol`.
+    """Default implementation of :class:`EngravaHooksProtocol`.
 
     Allows engrava to function without any extension installed.
-    Every hook is a pass-through or returns a neutral value.
+    ``on_store``, ``on_retrieve``, and ``decay_function`` are pass-throughs
+    that return their input unchanged. ``score_function`` is not neutral: it
+    returns a priority-based default score (``P1`` -> ``4.0`` ... ``P4`` ->
+    ``1.0``), not ``0.0`` or any other value-free default — harmless today
+    because core never calls it, but not a no-op if invoked directly.
     """
 
     async def on_store(self, thought: ThoughtRecord) -> ThoughtRecord:

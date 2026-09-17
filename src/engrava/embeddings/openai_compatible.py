@@ -22,7 +22,7 @@ _DEFAULT_BASE_URL = "https://api.openai.com/v1"
 #: absorbing a couple of consecutive transient blips.
 _DEFAULT_MAX_ATTEMPTS = 3
 
-#: Base delay (seconds) for the exponential backoff between retries.
+#: Base delay (seconds) for the linear backoff between retries.
 _DEFAULT_BASE_RETRY_DELAY_S = 1.0
 
 #: HTTP status codes treated as transient and therefore retryable:
@@ -50,10 +50,9 @@ class OpenAICompatibleProvider:
             retries) for a single embeddings call when the endpoint
             returns a transient error. Keyword-only; defaults to ``3``.
             A value of ``1`` disables retrying.
-        base_retry_delay_s: Base delay in seconds for the exponential
-            backoff between retries (the n-th retry waits
-            ``base_retry_delay_s * n`` seconds). Keyword-only; defaults
-            to ``1.0``.
+        base_retry_delay_s: Base delay in seconds for the linear backoff
+            between retries (the n-th retry waits ``base_retry_delay_s * n``
+            seconds). Keyword-only; defaults to ``1.0``.
 
     Examples:
         >>> provider = OpenAICompatibleProvider(
@@ -180,7 +179,7 @@ class OpenAICompatibleProvider:
     async def _request_embeddings(self, texts: list[str]) -> list[list[float]]:
         """Send a batch embedding request to the API.
 
-        The request is retried with bounded exponential backoff when the
+        The request is retried with linear backoff when the
         endpoint reports a transient failure — a transport-level timeout
         or network error, or a transient HTTP status (see
         :data:`_RETRYABLE_STATUS_CODES`). Non-transient HTTP errors (for
@@ -245,7 +244,7 @@ class OpenAICompatibleProvider:
         raise RuntimeError(msg)  # pragma: no cover
 
     async def _sleep_before_retry(self, attempt: int) -> None:
-        """Sleep with exponential backoff before the next retry attempt.
+        """Sleep with linear backoff before the next retry attempt.
 
         Args:
             attempt: The 1-based number of the attempt that just failed.

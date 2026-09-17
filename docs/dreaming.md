@@ -181,7 +181,11 @@ The remaining caps operate at different stages:
 - `max_promoted_per_run` (default `20`) limits writes in one promotion phase;
 - `max_p1_fraction` (default `0.05`) limits the corpus-wide P1 population;
 - `min_cluster_size` / `max_cluster_size` (defaults `3` / `200`) reject clusters
-  that are too small or too broad after eligibility filtering;
+  that are too small or too broad — but not symmetrically: `max_cluster_size`
+  is applied once, to the **raw** cluster, before eligibility filtering; only
+  `min_cluster_size` is re-checked afterward, against the eligible member
+  count. A raw cluster over `max_cluster_size` is rejected even if filtering
+  would have brought it back under the cap;
 - `clustering_min_new_candidates` (default `50`) skips repeat clustering when
   the eligible ACTIVE population has not grown enough. It does not skip signal
   scoring, promotion, or edge creation.
@@ -548,8 +552,13 @@ Before creating a REFLECTION, the extension derives a 16-hex content-hash
 from the sorted, **eligibility-filtered** member IDs — the same subset the
 metadata-aware eligibility filter above narrows the raw cluster down to, not
 the raw cluster itself — and checks whether any REFLECTION with
-`source = "dreaming:<hash>"` already exists (exact SQL index lookup,
-O(1), scales to any store size).  If found, the cluster is skipped. Because
+`source = "dreaming:<hash>"` already exists via
+`SELECT ... WHERE thought_type = ? AND source = ? LIMIT 1`. **This is not an
+O(1) index lookup**: the schema indexes `thought(thought_type)` but not
+`thought(source)`, so `EXPLAIN QUERY PLAN` shows the query using
+`idx_thought_type` and then scanning every matching row for the `source`
+filter — O(number of REFLECTIONs) per cluster per run, not O(1). If found, the
+cluster is skipped. Because
 the hash is over the filtered subset, the same raw cluster scanned under a
 different eligibility configuration can legitimately hash differently and
 yield a new REFLECTION.
@@ -578,7 +587,10 @@ extensions:
 
 After clustering, metadata eligibility is applied again to the resolved
 members. The cluster must still contain at least `min_cluster_size` eligible
-members and must not exceed `max_cluster_size`.
+members. `max_cluster_size` is **not** re-checked here — it was already
+enforced once, against the raw (pre-filtering) cluster in `_build_clusters` —
+so an eligible-member count under the cap does not rescue a raw cluster that
+exceeded it, and no upper bound applies to the eligible subset itself.
 
 With `cluster_quality_gating_enabled: true` (default), a cluster is rejected on
 the first failed content-quality check:
@@ -607,7 +619,7 @@ The cross-cluster boilerplate filter is controlled separately by
 | `candidates_evaluated` | Number of ACTIVE candidates in the bounded promotion pool |
 | `promoted_count` / `promoted_ids` | Promotions written and their thought IDs |
 | `skipped_gate_count` | Candidates rejected by age/confirmation gates |
-| `scores` | Computed score for every promotion candidate |
+| `scores` | Computed score for each candidate scored before scoring stopped — the loop `break`s as soon as `max_promoted_per_run` promotions are reached, so once the cap is hit, remaining candidates are not scored and are absent from this map |
 | `edges_created` | New dream-created ASSOCIATED edges |
 | `reflections_created` | New REFLECTION thoughts |
 | `promotion_capped` | Whether the corpus-wide P1 fraction prevented a promotion |

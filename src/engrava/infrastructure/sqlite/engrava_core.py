@@ -8097,8 +8097,12 @@ class SqliteEngravaCore:
     ) -> bool:
         """Check whether any thought with an exact source and thought_type exists.
 
-        Performs a single O(1) index lookup — safe to call per cluster in
-        ``_create_reflections`` regardless of store size.
+        Not an O(1) index lookup: the schema indexes ``thought(thought_type)``
+        but not ``thought(source)``, so this scans every row of the matched
+        ``thought_type`` for the ``source`` filter — O(number of rows of that
+        type), not O(1). Called per cluster in ``_create_reflections``, so
+        the cost scales with the REFLECTION count on a store with many of
+        them.
 
         Args:
             source: Exact ``source`` field value to match.

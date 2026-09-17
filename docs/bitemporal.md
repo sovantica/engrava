@@ -83,7 +83,7 @@ tables (the two record types that carry valid-time columns). A query that uses
 |---|---|---|---|
 | `valid_now` | none | the interval contains the current instant | tolerant (open bound = always in range) |
 | `valid_at <ts>` | one timestamp | the interval contains `<ts>` | tolerant |
-| `valid_within <start> <end>` | two timestamps | the interval **overlaps** `[<start>, <end>]` | tolerant |
+| `valid_within <start> <end>` | two timestamps | the interval **overlaps** the half-open window `[<start>, <end>)` — not the closed range the arguments might suggest | tolerant |
 | `valid_between <start> <end>` | two timestamps | the interval is **fully contained** in `[<start>, <end>]` | **strict** — open-bound rows are excluded |
 
 ### Worked semantics
@@ -103,8 +103,18 @@ The upper bound is **exclusive** (`valid_until` is the first instant the fact is
 | `valid_at '2026-07-01...'` | no match | upper bound is exclusive — `Jul 1` is already out |
 | `valid_at '2025-12-01...'` | no match | before `valid_from` |
 | `valid_within '2026-06-01...' '2026-12-01...'` | match | the intervals overlap (Jun–Jul) |
+| `valid_within '2026-07-01...' '2026-12-01...'` | no match | the window's own lower bound sits exactly at the fact's exclusive upper bound — the overlap is half-open on **both** intervals, so a shared boundary instant is not itself an overlap |
 | `valid_between '2025-01-01...' '2026-12-31...'` | match | `[Jan, Jul)` is fully inside the range |
 | `valid_between '2026-02-01...' '2026-12-31...'` | no match | starts before the range's lower bound |
+
+**Timestamps must carry an explicit UTC offset (`+00:00` / `Z`).** Normalisation to
+UTC only happens for offset-aware strings; a naive literal (no offset) is compared
+as plain text against already-normalised, offset-aware stored values, and
+`"...T00:00:00"` sorts lexicographically *before* `"...T00:00:00+00:00"`. That
+shifts both boundary rules above by one boundary for that literal only — an
+offset-less `valid_at` at the exact lower bound stops matching, and one at the
+exact upper bound starts matching. Every example on this page carries an
+explicit offset for this reason; do the same in your own queries.
 
 And for a fact with an **open** upper bound — valid `[2026-01-01, ∞)`:
 

@@ -17,6 +17,10 @@ works.
    leading prefix of `content` (a common convention, e.g. `essence = content[:200]`),
    only `content` is embedded — the redundant prefix is dropped so it can't dominate
    the vector. A genuinely distinct `essence` is still embedded alongside `content`.
+   **`restore --re-embed` does not apply this dedup** — it always embeds
+   `essence + "\n" + content`, unconditionally. For a corpus using the
+   `essence = content[:200]` convention, a re-embedded restore is therefore
+   *not* vector-identical to the corpus it replaces.
 2. **Query-time embedding** — at search time the query must also be a vector.
    `search_hybrid` takes the query *text* and, when a provider is configured,
    embeds it **for you** (unless you pass an explicit `query_vector`).
@@ -206,7 +210,8 @@ provider = OpenAICompatibleProvider(
 Set `base_url` to target a compatible gateway (Azure OpenAI, a local proxy, etc.).
 
 **Automatic retry on transient failures.** This provider retries a request with
-bounded exponential backoff when the endpoint reports a transient failure — a read
+linear backoff (`base_retry_delay_s * attempt` — not exponential, despite how
+this is sometimes described) when the endpoint reports a transient failure — a read
 timeout or network blip, or a transient HTTP status (`408`, `409`, `425`, `429`,
 `500`, `502`, `503`, `504`) — so a short outage is absorbed instead of failing your
 ingest. Non-transient statuses (`400`, `401`, `403`, `404`) surface immediately
@@ -221,7 +226,7 @@ applies to `OpenAICompatibleProvider` only — `OllamaProvider` and
 provider = OpenAICompatibleProvider(
     model_name="text-embedding-3-small",
     max_attempts=5,           # up to 5 tries on transient failures
-    base_retry_delay_s=0.5,   # exponential backoff starting at 0.5s
+    base_retry_delay_s=0.5,   # linear backoff starting at 0.5s (attempt 2 waits 1.0s, ...)
 )
 ```
 

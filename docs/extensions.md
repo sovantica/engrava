@@ -39,16 +39,25 @@ class MyHooks(EngravaHooksProtocol):
         return 1.0
 
     def mindql_extension_registry(self) -> dict[str, MindQLExtension]:
-        """Reserved — core wires MindQL verbs via ExtensionManifest, not this hook."""
+        """Reserved — not called by core, and not how MindQL verbs are wired."""
         return {}
 ```
 
 > Core invokes `on_store`, `on_retrieve`, and `decay_function`.
 > `decay_function` is called once per candidate when an enabled `run_hygiene()`
 > pass reaches archive scoring; its return is clamped to `[0.0, 1.0]`, and a
-> non-finite value fails safe to `1.0`. It is not a search or promotion hook. Only
-> `score_function` and `mindql_extension_registry()` are reserved and not called
-> by core; MindQL verbs are wired through `ExtensionManifest`. See
+> non-finite value fails safe to `1.0`. It is not a search or promotion hook.
+> `on_store` fires as soon as a thought row is inserted — inside `bulk_store`
+> that is per item, before the batch's own commit, so it can fire for a row
+> that a later error in the same batch then rolls back. `on_retrieve` only
+> covers reads through `get_thought` and `list_thoughts`; `update_thought`,
+> `restore_thought`, `invalidate_thought`, and the read-back inside
+> `get_or_create` / `upsert_by_hash` do not call it. `score_function` and
+> `mindql_extension_registry()` are reserved and not called by core — and
+> MindQL verbs are **not** wired through a manifest passed to the store either;
+> the store only reads `ExtensionManifest.schema_migrations`. The one consumer
+> of `mindql_extensions` is the `engrava` CLI, which discovers verbs through
+> the `engrava.extensions` entry-point group. See
 > [Available extension hooks](extension-hooks.md). Subclass
 > `DefaultEngravaHooks` if you only want to override selected methods.
 
@@ -71,8 +80,11 @@ async with aiosqlite.connect("my.db") as conn:
 
 ## Default Hooks
 
-If no hooks are provided, `DefaultEngravaHooks` is used — all methods
-are no-ops that pass through data unchanged.
+If no hooks are provided, `DefaultEngravaHooks` is used. `on_store`,
+`on_retrieve`, and `decay_function` are pass-throughs that return their input
+unchanged. `score_function` is the one exception: it returns a priority-based
+default score (`P1` → `4.0` … `P4` → `1.0`), not a neutral value — harmless
+today because core never calls it, but not a no-op if you invoke it directly.
 
 ## Custom MindQL Commands
 

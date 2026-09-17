@@ -79,9 +79,16 @@ thought can be contested by another high-confidence thought.
 
 ## Direction and edge semantics
 
-All `EdgeType` values are persisted labels. They carry no automatic graph
-reasoning, symmetry, transitivity, conflict propagation, ranking effect, or
-workflow behavior.
+`EdgeType` values are persisted labels: they carry no automatic graph
+reasoning, symmetry, transitivity, or conflict propagation. **Ranking is the
+exception, twice over.** `graph_expansion_enabled` (default `True`) traverses
+`CONSOLIDATED_FROM` edges from top-ranked REFLECTIONs to pull in their source
+OBSERVATIONs with a propagated score, regardless of what any other edge type
+means. And once a search config sets `graph_weight > 0`, the 1-hop graph
+signal builds adjacency from **every** edge in the pool in both directions,
+type-agnostic — a `CONTESTED_BY` edge boosts a neighbour's score exactly like
+any other. Both of these are separate from the `workflow behavior` an edge
+type has no automatic hand in.
 
 For `CONTESTED_BY`, choose and document one direction. This guide uses:
 
