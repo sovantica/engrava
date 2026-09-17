@@ -215,6 +215,25 @@ class TestMetadataFilter:
         preds = [FieldPredicate(f"$.k{i}", FieldOp.EQ, i) for i in range(MAX_PREDICATE_COUNT)]
         assert len(MetadataFilter(preds).predicates) == MAX_PREDICATE_COUNT
 
+    def test_predicate_cap_matches_the_published_value(self) -> None:
+        """The cap's *value*, not just its mechanism, is a published contract.
+
+        The two tests above read ``MAX_PREDICATE_COUNT`` on both sides of their
+        assertion, so they pin the mechanism (N+1 rejected, N accepted) but would
+        keep passing for any value of the constant. This test pins the value
+        itself against a literal, so changing the constant reds here and points
+        at the two places that advertise it: ``docs/api-reference.md`` (the
+        "250-predicate cap" prose) and the ``list_edges`` docstring in
+        ``src/engrava/infrastructure/sqlite/engrava_core.py``. Update both in the
+        same change as the constant.
+        """
+        assert MAX_PREDICATE_COUNT == 250, (
+            "MAX_PREDICATE_COUNT no longer matches the published 250-predicate "
+            "cap advertised in docs/api-reference.md and in the list_edges "
+            "docstring of src/engrava/infrastructure/sqlite/engrava_core.py; "
+            "update those in the same change."
+        )
+
     def test_non_predicate_element_rejected(self) -> None:
         """A non-FieldPredicate element is rejected at construction, not at compile."""
         with pytest.raises(InvalidFilterError, match="FieldPredicate"):
