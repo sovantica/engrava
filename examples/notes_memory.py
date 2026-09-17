@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """A small notes memory built with engrava — the companion to the tutorial.
 
 This is the complete, runnable version of ``docs/tutorial.md``: ingest a few

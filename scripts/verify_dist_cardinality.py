@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Assert dist/ holds exactly the two artifacts the release gate can verify,
-and nothing else at all.
+"""Assert dist/ holds exactly the two release artifacts, and nothing else at all.
 
 Run from scripts/verify_release_artifacts.sh immediately after the build,
 before anything downstream picks "the" wheel or "the" sdist out of dist/.
@@ -82,6 +81,7 @@ def _classify(path: Path) -> str:
 
 
 def main() -> int:
+    """CLI entry point."""
     if not DIST_DIR.is_dir():
         sys.stderr.write(f"verify_dist_cardinality: {DIST_DIR} does not exist\n")
         return 1

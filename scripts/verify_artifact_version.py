@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Assert the built wheel and sdist embed the version that is about to be
-tagged.
+"""Assert the built wheel and sdist embed the version that is about to be tagged.
 
 Run from scripts/verify_release_artifacts.sh, after scripts/verify_wheel_data.py
 has produced dist/*.whl and dist/*.tar.gz, with the version semantic-release
@@ -31,6 +30,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DIST_DIR = REPO_ROOT / "dist"
 VERSION_RE = re.compile(r"(?m)^Version:\s*(\S+)\s*$")
+# Argv is [script_name, expected_version]: exactly one positional argument.
+_EXPECTED_ARGC = 2
 
 
 def _wheel_metadata_version(wheel: Path) -> str | None:
@@ -58,7 +59,8 @@ def _sdist_metadata_version(sdist: Path) -> str | None:
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
+    """CLI entry point."""
+    if len(sys.argv) != _EXPECTED_ARGC:
         sys.stderr.write("usage: verify_artifact_version.py <expected-version>\n")
         return 2
     expected = sys.argv[1]

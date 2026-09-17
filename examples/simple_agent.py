@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Minimal agent using only engrava — no external services, no LLM.
 
 Demonstrates:

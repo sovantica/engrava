@@ -110,6 +110,14 @@ ignore = [
 "tests/**" = ["S101", "PLR2004", "D", "SLF001", "PT011", "B017", "FBT", "PLC0415", "ARG001", "ARG002"]
 "examples/**" = ["T201", "INP001", "D"]
 "scripts/**" = ["INP001", "T201", "ASYNC240"]
+# Both scripts import from tests/ (not an installed package), so they must
+# insert the repository root onto sys.path before that import can resolve --
+# the import cannot be moved above the sys.path mutation it depends on.
+# Scoped to these two files, not scripts/** as a whole: every other script
+# here is a genuine top-of-file-import script, and a directory-wide E402
+# ignore would stop catching a real ordering mistake in any of them.
+"scripts/build_upgrade_fixture.py" = ["E402"]
+"scripts/regenerate_search_goldens.py" = ["E402"]
 
 [tool.mypy]
 strict = true

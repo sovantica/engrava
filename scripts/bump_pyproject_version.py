@@ -30,10 +30,13 @@ import sys
 from pathlib import Path
 
 PATTERN = re.compile(r'(?m)^version\s*=\s*"[^"]+"')
+# Argv is [script_name, version]: exactly one positional argument.
+_EXPECTED_ARGC = 2
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
+    """CLI entry point."""
+    if len(sys.argv) != _EXPECTED_ARGC:
         sys.stderr.write("usage: bump_pyproject_version.py <version>\n")
         return 2
 

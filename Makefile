@@ -63,16 +63,16 @@ clean:
 
 lint:
 	@echo "$(BLUE)>> Ruff lint$(RESET)"
-	$(PYTHON) -m ruff check src/ tests/ $(RUFF_ARGS)
+	$(PYTHON) -m ruff check src/ tests/ examples/ scripts/ $(RUFF_ARGS)
 
 fmt:
-	$(PYTHON) -m ruff format src/ tests/
-	$(PYTHON) -m ruff check --fix src/ tests/
+	$(PYTHON) -m ruff format src/ tests/ examples/ scripts/
+	$(PYTHON) -m ruff check --fix src/ tests/ examples/ scripts/
 
 fmt-check:
 	@echo "$(BLUE)>> Ruff format check$(RESET)"
-	$(PYTHON) -m ruff format --check src/ tests/
-	$(PYTHON) -m ruff check src/ tests/
+	$(PYTHON) -m ruff format --check src/ tests/ examples/ scripts/
+	$(PYTHON) -m ruff check src/ tests/ examples/ scripts/
 
 typecheck:
 	@echo "$(BLUE)>> Mypy strict$(RESET)"

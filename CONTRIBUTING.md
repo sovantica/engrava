@@ -46,8 +46,8 @@ This project maintains strict code quality. All contributions must pass:
 ### Linting (ruff)
 
 ```bash
-ruff check src/ tests/
-ruff format --check src/ tests/
+ruff check src/ tests/ examples/ scripts/
+ruff format --check src/ tests/ examples/ scripts/
 ```
 
 All ruff rules are enabled (`select = ["ALL"]`). Fix any violations before
@@ -138,8 +138,8 @@ go through a pull request, for exactly this reason.
 1. **One feature per PR** — keep changes focused and reviewable.
 2. **Run all checks locally** before submitting:
    ```bash
-   ruff check src/ tests/
-   ruff format --check src/ tests/
+   ruff check src/ tests/ examples/ scripts/
+   ruff format --check src/ tests/ examples/ scripts/
    mypy --strict src/
    pytest --cov --cov-fail-under=90
    ```

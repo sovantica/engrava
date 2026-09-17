@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """engrava quickstart — a five-minute introduction.
 
 Requirements:

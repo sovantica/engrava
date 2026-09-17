@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """A memory-backed agent loop using only engrava — no external services.
 
 This is the canonical "wire engrava into an agent" example: a per-turn loop

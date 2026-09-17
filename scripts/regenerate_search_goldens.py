@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from pathlib import Path
 import sys
+from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 if str(REPOSITORY_ROOT) not in sys.path:
@@ -72,7 +72,9 @@ def main() -> int:
         for path in stale:
             print(f"STALE: {path.relative_to(REPOSITORY_ROOT)}")
         if stale:
-            print("Search goldens are out of date; run: python scripts/regenerate_search_goldens.py")
+            print(
+                "Search goldens are out of date; run: python scripts/regenerate_search_goldens.py"
+            )
             return 1
         print("Search goldens are up to date.")
         return 0
