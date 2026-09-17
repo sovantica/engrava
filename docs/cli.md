@@ -40,6 +40,9 @@ engrava --db other.db info         # flag overrides the env var
 | [`info`](#info) | Show a metrics snapshot for the database. |
 | [`verify`](#verify) | Verify the audit journal's hash chain. |
 | [`query`](#query) | Run a MindQL query. |
+| [`remember`](#remember) | Store a thought in one call and print its id. |
+| [`recall`](#recall) | Search for thoughts relevant to a query and print ranked results. |
+| [`link`](#link) | Create a typed edge between two thoughts. |
 | [`snapshot`](#snapshot) | Export thoughts, edges, embeddings, and actions to a JSONL snapshot (not the audit journal). |
 | [`restore`](#restore) | Restore a database from a JSONL snapshot. |
 | [`gc`](#gc) | Garbage-collect archived thoughts (and optionally expired ones). |
@@ -186,6 +189,300 @@ engrava query "FIND thoughts WHERE valid_now"          # only currently-valid fa
 
 The bi-temporal `valid_now`, `valid_at`, `valid_within`, and `valid_between`
 predicates work here too — see [MindQL](mindql.md) for their full semantics.
+
+## Store resolution (`remember` / `recall` / `link`)
+
+`remember`, `recall`, and `link` are the one-shot memory verbs: store or
+search a thought, or create an edge, in a single invocation — no `python -c`
+needed. They resolve the database they act on through the same two-tier
+precedence, highest first, plus the CLI's own default:
+
+1. A non-empty `--db` (or `ENGRAVA_DB`). This wins outright: with a non-empty
+   `--db`, a `--config` file — even a missing or malformed one — is never
+   read by these three commands at all. **`--db ""` does not count as given**
+   — it is resolved the same way an *omitted* `--db` is (falling through to
+   `ENGRAVA_DB`, then the CLI's own default below), because this tier tests
+   the value by truthiness, not by whether the flag appeared on the command
+   line at all. `--db .` or `--db ./engrava.db` are values; `--db ""` is not.
+2. Otherwise, a `--config` file's own `database.path` — loaded the same way
+   `SqliteEngravaCore.from_config()` loads it, so a configured `embeddings`,
+   `search`, and `journal` section all apply. This is why these three
+   commands exist separately from a bare connection: `recall` over a
+   configured embedding provider runs the same hybrid search a direct
+   library `recall()` call would, vector arm included. A non-empty `--config`
+   you named is validated here unconditionally: a file that does not exist,
+   or that fails to parse, is always an error (exit `2`) rather than being
+   silently treated as though `--config` had never been given. **`--config
+   ""` is, by the same truthiness rule as `--db` above, indistinguishable
+   from omitting `--config` entirely** — it is never validated, and this
+   tier never fires for it.
+3. Otherwise, the CLI's own default (`./engrava.db`).
+
+Exactly one tier fires per invocation; `--verbose` reports which one and the
+resolved path. None of the three commands takes a `--service` option today
+(unlike [`snapshot`](#snapshot) / [`restore`](#restore)), so a service
+selected via `services.default_service` is never reachable from any of the
+three — that config section is consulted only by `snapshot` / `restore`
+themselves.
+
+**Creation.** `remember` and `link` create the resolved database (and its
+parent directory) if it does not already exist, printing the path to stderr:
+
+```bash
+$ engrava --db new.db remember "first thought"
+Created database: new.db
+091aa106-fcc0-45a3-a19b-d335ad05ea45
+```
+
+`recall` never creates a database — a read against a database nobody wrote to
+yet exits `3` naming the resolved path, rather than silently reporting zero
+hits:
+
+```bash
+$ engrava --db missing.db recall "anything"
+Database not found: missing.db
+$ echo $?
+3
+```
+
+**Exit codes**, consistent across all three:
+
+| Code | Meaning |
+|---|---|
+| `0` | Success. |
+| `1` | An **unanticipated** failure — anything the command's own validation does not specifically check for (a corrupt database file, a directory given as `--db`, an unreadable or non-UTF-8 `--config`, ...). Every one of these three commands runs its whole body under a single error boundary: a check the command performs itself (below) keeps its own specific code and `error` kind, but *any other* exception is converted here instead of tracebacking. The message usually names the exception's type and text (e.g. `recall: unexpected DatabaseError: file is not a database`) — actionable, but never a stack trace; either half falls back to a fixed placeholder if it cannot be read safely, and a genuine Ctrl-C or `sys.exit()` raised while that message is being built escapes immediately instead of becoming this exit code at all. Rerun with `--verbose` to log the caught exception's stack (to stderr, at `DEBUG`) for a real bug report — deliberately not a full traceback: it lists each frame's filename, line number, and function name, read from the exception's own traceback without calling the exception's formatter (or a cause's, a context's, or an exception group's) a second time. That trade gives up some diagnostic detail — no chained-exception text, no source lines, no local variables — for a Ctrl-C or `sys.exit()` landing while `--verbose` builds that output now escaping immediately too, rather than the earlier behaviour where it could be absorbed and the command would still exit `1` with an ordinary error object. |
+| `2` | A usage or validation error: an unknown edge type, an empty `TEXT`, a malformed `--meta` / `--filter` token, an out-of-range `--top-k` / `--weight`, or a non-empty `--config` that does not exist or fails to parse. The message names the offending value when available, and for an enum, every valid member. |
+| `3` | The resolved database does not exist (`recall` only — `remember` / `link` create it instead). |
+| `4` | `link` named a `FROM` or `TO` thought that does not exist. The message names it, when available. |
+
+Exit `2` is also what a small, non-exhaustive set of failures Click itself
+catches use — see **What is never JSON** below for why those are plain text
+regardless of `--json`, and for the honest (not exhaustive) rule a consumer
+should apply instead of expecting a closed list.
+
+**`--json` errors.** Once a `--json` failure reaches the command's own code —
+`--type` / `--priority` / `--top-k` / `--weight` already parsed and `--json`
+already known — it is *always* a JSON object, never a bare traceback, no
+matter what ordinary exception raised it: every specific `error` kind below
+keeps its documented exit code, and anything neither this command nor its
+libraries were specifically checked for still becomes one, under `"error":
+"unexpected_error"`, exit `1` (see the exit-code table above). This does
+**not** cover a failure Click's own argument parser rejects before that code
+ever runs — a bad flag, an invalid choice, a missing value — which is plain
+usage text at exit `2` whether or not `--json` was given, because `--json`
+itself has not necessarily been parsed yet; see **What is never JSON** below
+for the full, non-exhaustive list. It also does not cover a genuine Ctrl-C or
+`sys.exit()` — even one that only surfaces while this CLI is building that
+very failure's message, or, under `--verbose`, while it is building that
+message's stack log — which propagates immediately, exactly as it would
+from a command's own body, rather than becoming a JSON object at all.
+
+```json
+{"schema": "engrava.cli.error.v1", "error": "invalid_edge_type", "message": "Invalid edge type 'MADE_UP'; valid values: ASSOCIATED, DEPENDS_ON, DERIVED_FROM, MESSAGE_OF, BRIDGE, CONSOLIDATED_FROM, CONTESTED_BY"}
+```
+
+`schema` is a plain version string (not a URL) — there is no schema registry
+to publish a URL against. `error` is a short machine-readable identifier
+(`invalid_edge_type`, `missing_thought`, `database_not_found`,
+`malformed_meta`, `malformed_filter`, `empty_text`, `invalid_top_k`,
+`invalid_weight`, `invalid_config`, `unexpected_error`); `message` usually
+contains the offending value, or — for `unexpected_error` — the underlying
+exception's type and text. It does not always: an `invalid_config` or
+`missing_thought` whose underlying `ConfigError` / `ReferentialIntegrityError`
+is a third-party subclass, or whose relevant field (the config error's
+`message`, or the referential error's `column` / `referenced_id`) is present
+but not the plain type this CLI requires before using it, instead gets a
+fixed message. That detail is **omitted**, not attempted and failed to
+read: this CLI validates a field's type — and, for `missing_thought`, that
+it names one of the two real columns and matches the id this invocation was
+actually given — before ever reading it for display, and shows nothing at
+all rather than a value it did not validate.
+
+**Reading `--json` errors from stderr.** The JSON object above is always the
+*last line* written to stderr, and nothing this CLI controls writes anything
+else to stderr afterwards — the write happens once, after every cleanup a
+failing invocation still had open (closing a database, for instance) has
+already run to completion, never before it. It is not always the *only*
+line, though: `remember` / `link` echo a `Created database: ...` notice to
+stderr the first time they create the resolved database, before anything can
+fail, and `--verbose` writes its own resolution notice (and, on an
+unanticipated failure, the caught exception's stack — filename, line number
+and function name per frame, not a full Python traceback, and typically
+multiple lines) to stderr as the invocation proceeds — all of that precedes
+the JSON object on a failing run, never follows it. Neither notice is
+guaranteed to be a single line: both echo caller-supplied text (a path, an
+exception's own message)
+raw, and a value containing a literal line feed reproduces it, spreading
+that one notice over more than one line of output.
+
+A consumer should therefore `json.loads()` only the **last non-blank
+element** of stderr, not the whole stream. `stderr.split("\n")` and
+`str.splitlines()` both recover the same final element reliably: the error
+object's own `ensure_ascii=True` encoding (see
+`_emit_and_exit` in `engrava.cli.memory_commands`) guarantees it never
+contains a literal U+0085/U+2028/U+2029 — the three Unicode line separators
+`str.splitlines()` treats as breaks but a strict `"\n"` split does not — so
+nothing inside the object itself can make the two recipes disagree about
+where it ends; the test suite proves this directly by embedding a U+2028 in
+a `--db` path and checking that both recipes decode the identical object.
+What the two recipes do **not** agree on is the *earlier* lines: one of
+those separators inside an echoed path or a stack line makes
+`str.splitlines()` split that line into extra fragments, where a strict
+`"\n"` split keeps it intact as one. That only matters to a consumer who
+also parses the earlier lines — recovering an echoed `Created database:
+...` path exactly, say — and for that, split strictly on `"\n"`. For
+recovering only the final error object, either recipe is safe.
+
+**What is never JSON, `--json` or not.** A failure Click itself rejects
+*before* this command's own code — and therefore before `--json` has even
+been parsed — always prints Click's own plain usage text to stderr and exits
+`2`. This is **not a closed list**: it is everything Click's own argument
+parser rejects on its way to calling this command's body, and that surface
+belongs to Click, not to this CLI. Known examples include an invalid `--type`
+/ `--priority` choice on `remember`, a `--top-k` or `--weight` that does not
+parse as a number, a missing required argument (`TEXT`, `FROM`/`TO`, `link`'s
+`--type`), an unknown option at the root or subcommand level, an unexpected
+extra argument, an invalid root `--format`, and a missing value for any
+option that takes one (`--db`, `--config`, `--meta`, `--filter`, `--top-k`,
+`--weight`, `--type`, `--priority`). The rule for a consumer: **if `--json`'s
+own JSON object was never confirmed to have been reached — i.e. you cannot
+rule out a parse-phase rejection — do not assume stderr decodes**; attempt
+`json.loads()` and fall back to treating the raw text as a Click usage error
+on failure, rather than relying on an enumerated exception list (this one or
+any other) to be complete.
+
+One parse-phase footgun worth naming explicitly: an option that takes a
+value (`--meta`, `--filter`, `--top-k`, `--weight`, `--type`, `--priority`)
+**consumes the very next token as that value, even if it looks like another
+flag**, so a missing value does not reliably produce an error at all —
+Click's ordinary behaviour, not a bug, for these six. Use `--option=value`
+(`=` syntax) when a value might otherwise be ambiguous with a following flag,
+rather than relying on Click to catch the omission.
+
+`--db` and `--config` are **not** on that list. A previous revision of this
+document also called `engrava --db --json remember "x"` an instance of the
+same ordinary behaviour — silently creating a database literally named
+`--json` and never seeing the real `--json` flag at all — and left it alone.
+That claim was false: the equivalent `argparse` program rejects the same
+input outright ("expected one argument"), so calling it unavoidable parser
+convention was wrong on the facts, not just generous. It is now a rejected
+usage error instead (exit `2`, Click's own plain usage text, `--json` or
+not — see **What is never JSON** above): any `--db` or `--config` value
+starting with `-` is refused before it can be silently taken as a database
+or config path. A caller who genuinely needs such a path can disambiguate it
+the usual shell way, by prefixing it (`--db ./--json`).
+
+### `remember`
+
+Stores `TEXT` as a thought and prints its id. Built over `create_thought()`
+with an explicitly constructed `ThoughtRecord` — **not** the library's
+`remember()` shorthand, which takes only text, metadata, and a dedup flag and
+always produces a `NOTE` / `P3` thought, so it cannot honour `--type` /
+`--priority`.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `TEXT` | positional | required | Content to store. `-` reads it from stdin instead. |
+| `--type` | thought type | `NOTE` | One of `TASK`, `OBSERVATION`, `BELIEF`, `REFLECTION`, `OUTPUT_DRAFT`, `NOTE`. |
+| `--priority` | priority | `P3` | One of `P1`, `P2`, `P3`, `P4` (`P1` highest). |
+| `--meta` | `KEY=VALUE` | — | Metadata entry (repeatable). Values are stored as strings. |
+| `--dedup` | flag | off | On identical existing content, bump `confirmation_count` and print the *existing* id instead of inserting a duplicate. |
+| `--json` | flag | off | Emit a JSON object (schema `engrava.cli.remember.v1`) instead of a bare id. |
+
+```bash
+engrava --db my.db remember "User prefers concise answers"
+engrava --db my.db remember "Escalate the outage" --type REFLECTION --priority P1
+echo "piped content" | engrava --db my.db remember -
+engrava --db my.db remember "tagged" --meta topic=weather --meta lang=en
+engrava --db my.db remember "same content twice" --dedup   # run again: same id, no new row
+```
+
+`--json` output:
+
+```json
+{"schema": "engrava.cli.remember.v1", "thought_id": "091aa106-fcc0-45a3-a19b-d335ad05ea45", "deduplicated": false}
+```
+
+`deduplicated` is `true` only when `--dedup` was given **and** it matched an
+existing thought — the printed `thought_id` is that existing thought's, not a
+new row's.
+
+### `recall`
+
+Searches for thoughts relevant to `QUERY` and prints ranked results. Calls
+the library `recall()` directly, so it behaves exactly like a direct library
+call against the same database or config — unlike a bare connection, which
+has no embedding provider and so no vector arm at all. This is not a
+substitute for [`query`](#query): `query` runs structural MindQL (`FIND` /
+`COUNT` / `SELECT`) with no ranking and no embedding provider of its own.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `QUERY` | positional | required | Natural-language text to search for. |
+| `--top-k` | int | `10` | Maximum results to return. |
+| `--filter` | `KEY=VALUE` | — | Metadata equality filter (repeatable, AND-combined; flat keys only — nested-path filters are a later concern). |
+| `--json` | flag | off | Emit a JSON object (schema `engrava.cli.recall.v1`) instead of a formatted table. |
+
+```bash
+engrava --db my.db recall "concise answers"
+engrava --db my.db recall "tagged" --filter topic=weather --top-k 5
+engrava --config engrava.yaml recall "concise answers" --json
+```
+
+A `KEY` missing an `=` is `malformed_filter`, exit `2` (see above). A `KEY`
+present but outside the allowed key grammar (letters, digits, and
+underscore only — no brackets, dots, spaces, `$`, or `..`) is not a
+dedicated kind: it falls through to `unexpected_error`, exit `1`, since it is
+the underlying filter library's own validation rejecting it, not a check
+this command performs itself.
+
+`--json` output:
+
+```json
+{"schema": "engrava.cli.recall.v1", "query": "concise answers", "top_k": 10, "backends_used": ["fts5", "priority", "vector"], "results": [{"thought_id": "091aa106-fcc0-45a3-a19b-d335ad05ea45", "score": 0.4714285714285715, "essence": "User prefers concise answers"}]}
+```
+
+`backends_used` names every search backend that was *available* for this
+query — `"vector"` appears only when a configured embedding provider actually
+reached the query (see [Store resolution](#store-resolution-remember--recall--link)
+above); its absence with a `--config` you expect to configure one is the
+degradation this command's whole design exists to avoid, not something to
+silently tolerate.
+
+### `link`
+
+Creates a typed edge from `FROM` to `TO` and prints its id. Builds an
+`EdgeRecord` and calls the public `create_edge()` — there is no public
+`link()` to call instead.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `FROM` | positional | required | Source thought id. |
+| `TO` | positional | required | Target thought id. |
+| `--type` | edge type | required | One of `ASSOCIATED`, `DEPENDS_ON`, `DERIVED_FROM`, `MESSAGE_OF`, `BRIDGE`, `CONSOLIDATED_FROM`, `CONTESTED_BY`. |
+| `--weight` | float | `1.0` | Relation strength, `0.0`-`1.0`. |
+| `--json` | flag | off | Emit a JSON object (schema `engrava.cli.link.v1`) instead of a bare id. |
+
+```bash
+engrava --db my.db link 091aa106-fcc0-45a3-a19b-d335ad05ea45 f4620859-3dfa-4f13-8d2e-d35df62dbba4 --type ASSOCIATED --weight 0.8
+```
+
+An unknown `--type` exits `2` naming the value and every valid member; a
+`FROM` or `TO` that does not resolve to an existing thought exits `4`,
+naming which one when available:
+
+```bash
+$ engrava --db my.db link ghost-id some-real-id --type ASSOCIATED
+link: from_thought_id 'ghost-id' does not reference an existing thought.
+$ echo $?
+4
+```
+
+`--json` output:
+
+```json
+{"schema": "engrava.cli.link.v1", "edge_id": "b190dc41-9c87-4a66-9291-d70974fd2342", "from_thought_id": "091aa106-fcc0-45a3-a19b-d335ad05ea45", "to_thought_id": "f4620859-3dfa-4f13-8d2e-d35df62dbba4", "edge_type": "ASSOCIATED", "weight": 0.8}
+```
 
 ### `snapshot`
 

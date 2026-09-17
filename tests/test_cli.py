@@ -2591,6 +2591,102 @@ class TestCliCloseQuietlyCancellation:
         assert "Error closing connection during cleanup" in caplog.text
 
 
+class _PermissionDeniedConnection:
+    """A connection whose ``close()`` raises a real, ordinary ``PermissionError``."""
+
+    async def close(self) -> None:
+        raise PermissionError(13, "Permission denied")
+
+
+class _KeyboardInterruptOnCloseStrError(Exception):
+    """Its own ``__str__`` raises ``KeyboardInterrupt``, like a real Ctrl-C mid-read."""
+
+    def __str__(self) -> str:
+        raise KeyboardInterrupt
+
+
+class _SystemExitOnCloseStrError(Exception):
+    """Its own ``__str__`` raises ``SystemExit(37)`` instead of returning text."""
+
+    def __str__(self) -> str:
+        raise SystemExit(37)
+
+
+class _KeyboardInterruptOnCloseStrConnection:
+    """A connection whose ``close()`` raises an exception hostile in its own ``__str__``."""
+
+    async def close(self) -> None:
+        message = "close"
+        raise _KeyboardInterruptOnCloseStrError(message)
+
+
+class _SystemExitOnCloseStrConnection:
+    """A connection whose ``close()`` raises an exception hostile in its own ``__str__``."""
+
+    async def close(self) -> None:
+        message = "close"
+        raise _SystemExitOnCloseStrError(message)
+
+
+class TestCliCloseQuietlyDisclosesWhyNotJustWhere:
+    """A verification round found the bare/default store tier's ``_close_quietly``
+    still passing ``exc_info=True`` after the ``--config`` tier's own cleanup log
+    (``memory_commands._opened_full_store``) had already been fixed to stop doing
+    that. ``exc_info=True`` asks the standard library's traceback formatter to
+    render the close exception a second, unguarded way -- and, separately, an
+    earlier fix at the ``--config`` tier had *also* removed the only place a
+    close failure's own diagnosis reached the log at all, trading the
+    ``exc_info=True`` defect for a real regression: frame metadata says
+    *where* closing failed, never *why*, so an ordinary ``PermissionError``,
+    a full disk, or a locked file all looked identical. ``_close_quietly``
+    now calls :func:`~engrava.cli.exception_reporting._describe_exception`
+    once on the close exception -- the same single, guarded, non-absorbing
+    attempt the boundary already made for the original exception -- and logs
+    its result alongside the existing frame-only stack, never
+    ``exc_info=True``.
+    """
+
+    async def test_an_ordinary_close_failure_now_logs_why_not_just_where(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        conn = _PermissionDeniedConnection()
+        with caplog.at_level(logging.WARNING):
+            await _close_quietly(conn)
+
+        assert "Error closing connection during cleanup" in caplog.text
+        assert "PermissionError: [Errno 13] Permission denied" in caplog.text
+        assert "in _close_quietly" in caplog.text, (
+            "the frame-only stack must still be present alongside the new "
+            "description, not replaced by it"
+        )
+        for record in caplog.records:
+            assert record.exc_info is None, (
+                "must not pass exc_info=True any more -- that is the second, "
+                "unguarded render this fix removes"
+            )
+
+    async def test_a_keyboard_interrupt_from_the_close_exceptions_str_is_not_absorbed(
+        self,
+    ) -> None:
+        """The close exception's own formatting is now read once -- a real
+        interrupt raised during that read must still escape, not be
+        swallowed the way the standard library's own traceback formatter
+        used to swallow it under ``exc_info=True``.
+        """
+        conn = _KeyboardInterruptOnCloseStrConnection()
+
+        with pytest.raises(KeyboardInterrupt):
+            await _close_quietly(conn)
+
+    async def test_a_system_exit_from_the_close_exceptions_str_is_not_absorbed(self) -> None:
+        conn = _SystemExitOnCloseStrConnection()
+
+        with pytest.raises(SystemExit) as exc_info:
+            await _close_quietly(conn)
+
+        assert exc_info.value.code == 37
+
+
 class _FormatThatComparesAsAnother(str):
     """Reads as its real text; hashes and compares as ``json``."""
 
@@ -2709,3 +2805,35 @@ class TestCliConfigChoosesTheSourceItWasGiven:
         """Genuine emptiness keeps its old meaning; only the lie is closed."""
         monkeypatch.setenv("ENGRAVA_DB", str(tmp_path / "from-env.db"))
         assert str(EngravaCLIConfig.resolve(db_path="").db_path) == str(tmp_path / "from-env.db")
+
+
+class TestModuleEntryPointExposesTheMemoryVerbs:
+    """``python -m engrava.cli.main`` must expose ``remember`` / ``recall`` / ``link``.
+
+    Running this file directly makes it ``__main__`` -- a module object
+    distinct from ``engrava.cli.main`` even though it is the same file.
+    ``engrava.cli.memory_commands`` decorates the ``cli`` Group belonging to
+    the dotted-path import, not the ``__main__`` one, so without the
+    ``__main__`` guard re-entering through that dotted import, the three new
+    commands would silently resolve as "No such command" under ``-m`` even
+    though the installed ``engrava`` console-script entry point (which never
+    runs this file as ``__main__``) works.
+    """
+
+    def test_remember_appears_in_module_entry_point_help(self) -> None:
+        completed, _elapsed = _run_engrava_subprocess(["--help"])
+        assert completed.returncode == 0, completed.stderr
+        assert "remember" in completed.stdout
+        assert "recall" in completed.stdout
+        assert "link" in completed.stdout
+
+    def test_remember_actually_runs_under_the_module_entry_point(self, tmp_path: Path) -> None:
+        db = tmp_path / "module-entry.db"
+        completed, _elapsed = _run_engrava_subprocess(
+            ["--db", str(db), "remember", "stored via python -m"]
+        )
+        assert completed.returncode == 0, (
+            f"stdout={completed.stdout!r}\nstderr={completed.stderr!r}"
+        )
+        assert "No such command" not in completed.stderr
+        assert db.exists()

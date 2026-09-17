@@ -287,6 +287,32 @@ BARE_AND_MISC_BLOCKS: tuple[tuple[str, str, str, ExemptionReason], ...] = (
         '"mechanism": "hygiene"',
         ExemptionReason.DIAGRAM_OR_TRANSCRIPT,
     ),
+    # `json` blocks -- sample `--json` output transcripts for the one-shot
+    # memory verbs (remember / recall / link) and their shared error object.
+    (
+        "docs/cli.md",
+        "json",
+        '"error": "invalid_edge_type"',
+        ExemptionReason.DIAGRAM_OR_TRANSCRIPT,
+    ),
+    (
+        "docs/cli.md",
+        "json",
+        '"schema": "engrava.cli.remember.v1"',
+        ExemptionReason.DIAGRAM_OR_TRANSCRIPT,
+    ),
+    (
+        "docs/cli.md",
+        "json",
+        '"schema": "engrava.cli.recall.v1"',
+        ExemptionReason.DIAGRAM_OR_TRANSCRIPT,
+    ),
+    (
+        "docs/cli.md",
+        "json",
+        '"schema": "engrava.cli.link.v1"',
+        ExemptionReason.DIAGRAM_OR_TRANSCRIPT,
+    ),
 )
 
 

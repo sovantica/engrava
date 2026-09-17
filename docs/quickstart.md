@@ -295,6 +295,47 @@ engrava --db my_thoughts.db snapshot -o backup.jsonl
 engrava --db my_thoughts.db restore -i backup.jsonl
 ```
 
+### Store and search a memory, from a shell
+
+`remember` and `recall` are the CLI's own two-call path — the shell
+equivalent of `store.remember()` / `store.recall()` above, for a script,
+agent harness, or CI job that has no Python of its own in the loop. `remember`
+creates `my_thoughts.db` if it does not exist yet (and says so on stderr);
+`recall` never does — it exits `3` naming the path instead of silently
+reporting zero hits against a database nobody created.
+
+```bash
+$ engrava --db my_thoughts.db remember "User prefers concise answers"
+Created database: my_thoughts.db
+091aa106-fcc0-45a3-a19b-d335ad05ea45
+
+$ engrava --db my_thoughts.db remember "User works in Berlin" --type OBSERVATION --priority P2
+f4620859-3dfa-4f13-8d2e-d35df62dbba4
+
+$ engrava --db my_thoughts.db recall "concise answers"
+thought_id                            score               essence
+------------------------------------  ------------------  ----------------------------
+091aa106-fcc0-45a3-a19b-d335ad05ea45  0.4714285714285715  User prefers concise answers
+```
+
+A broader query such as `"what does the user prefer?"` also matches the
+second, unrelated thought through the shared word "user" — hybrid search
+ranks by relevance, it does not require every query word to appear.
+
+`link` builds the edge the same way `create_edge()` does above, without the
+Python:
+
+```bash
+$ engrava --db my_thoughts.db link 091aa106-fcc0-45a3-a19b-d335ad05ea45 f4620859-3dfa-4f13-8d2e-d35df62dbba4 --type ASSOCIATED --weight 0.8
+b190dc41-9c87-4a66-9291-d70974fd2342
+```
+
+All three honour `--config` — a database resolved from `engrava.yaml`'s
+`database.path` is opened through `from_config()`, so a configured embedding
+provider, hybrid-search weights, and journal settings apply exactly as they
+would to a direct library call. See [CLI reference](cli.md#remember) for the
+full option list, exit codes, and `--json` schemas.
+
 ## Next Steps
 
 Build something next, then reach for the references:

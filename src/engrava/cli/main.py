@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 import click
 
 from engrava.cli.config import EngravaCLIConfig
+from engrava.cli.exception_reporting import _describe_exception, _frame_only_stack
 from engrava.cli.snapshot_records import (
     CoreTable,
     MetadataRecord,
@@ -152,6 +153,37 @@ async def _close_quietly(conn: Any) -> None:  # noqa: ANN401
     keeping the event loop alive) open until the real close has actually
     completed, before letting the cancellation propagate.
 
+    **The warning below no longer passes ``exc_info=True``.** A later
+    verification round found this function reached by the memory verbs'
+    own bare/default store tier (``remember`` / ``recall`` / ``link`` with
+    no ``--config``, via ``_opened_db`` above) -- not just the other
+    built-ins this module already owned -- and that ``exc_info=True`` had
+    the same live defect here that a previous round had already fixed at
+    the ``--config``-tier cleanup site in
+    :mod:`engrava.cli.memory_commands`: it asks the standard library's
+    traceback formatter to render the close exception through its own
+    overridable ``__str__``, and that formatter wraps its own rendering in
+    a bare ``except``, so a real OS ``SIGINT`` -- and separately, a
+    formatter raising ``SystemExit`` -- arriving during that render was
+    absorbed there instead of propagating, both verified live against this
+    exact function. Because the close here runs as a separately scheduled,
+    shielded task (see above) rather than inline inside the caller's
+    ``except`` block, ``exc_info=True``'s chain-walk had nothing to walk
+    beyond the close exception itself -- no implicit ``__context__`` links
+    it to whatever this coroutine was cleaning up after, unlike the
+    ``--config`` tier's inline ``await store.close()`` -- so the defect
+    here was one unwanted render, not the multi-exception cascade found
+    there. ``_frame_only_stack`` and ``_describe_exception``, shared with
+    that module through :mod:`engrava.cli.exception_reporting` (the two
+    modules import each other and neither can define these at module level
+    without a cycle -- see that module's own docstring), replace it:
+    the frame-only stack gives "where" without touching the close
+    exception's own formatting at all, and the description gives "why" --
+    an ordinary ``PermissionError``, a full disk, a locked file -- through
+    the same single, guarded, non-absorbing read
+    :func:`~engrava.cli.exception_reporting._describe_exception` always
+    performs, once, never a second render of anything.
+
     Args:
         conn: The aiosqlite connection to close.
 
@@ -162,11 +194,41 @@ async def _close_quietly(conn: Any) -> None:  # noqa: ANN401
     except asyncio.CancelledError:
         try:
             await close_task
-        except Exception:  # noqa: BLE001
-            logger.warning("Error closing connection during cleanup", exc_info=True)
+        except Exception as close_exc:  # noqa: BLE001
+            logger.warning(
+                "Error closing connection during cleanup: %s; stack (file:line "
+                "in function, not a full exception-chain rendering):\n%s",
+                _describe_exception(close_exc),
+                _frame_only_stack(close_exc),
+            )
         raise
-    except Exception:  # noqa: BLE001
-        logger.warning("Error closing connection during cleanup", exc_info=True)
+    except Exception as close_exc:  # noqa: BLE001
+        logger.warning(
+            "Error closing connection during cleanup: %s; stack (file:line "
+            "in function, not a full exception-chain rendering):\n%s",
+            _describe_exception(close_exc),
+            _frame_only_stack(close_exc),
+        )
+        # A later round found a real OS SIGINT delivered here -- after the
+        # warning above was already logged -- absorbed instead of aborting.
+        # `asyncio.run()`'s own SIGINT handler (see `asyncio.runners.Runner`)
+        # does not raise anything into this coroutine: on the first Ctrl-C it
+        # only calls the main task's `cancel()`, which *requests* a
+        # `CancelledError` but only actually throws one in at this
+        # coroutine's *next* suspension point. Nothing above this line
+        # suspends -- `_describe_exception`, `_frame_only_stack`, and
+        # `logger.warning` are all synchronous -- so a synchronous function
+        # simply cannot observe a pending cancellation at all; without an
+        # `await` here, this function would return normally, the caller's
+        # `raise` would re-raise the original error object, and the request
+        # to cancel would be silently dropped once this task finishes. This
+        # `await asyncio.sleep(0)` is a real suspension point purely to give
+        # that pending cancellation somewhere to be delivered -- it does not
+        # sleep in the timer sense, it just returns control to the event
+        # loop for one iteration, which is exactly when `Task.__step` checks
+        # for and throws in a cancellation that was requested while this
+        # coroutine was running synchronously.
+        await asyncio.sleep(0)
 
 
 async def _open_db(cfg: EngravaCLIConfig) -> Any:  # noqa: ANN401
@@ -601,9 +663,68 @@ def _configure_verbose_logging(ctx: click.Context) -> None:
 # CLI group
 # ------------------------------------------------------------------
 
+#: Subcommands that read ``ctx.obj["services_config"]`` / ``["default_embeddings"]``
+#: — see the ``cli()`` group callback below, which loads a ``--config`` file
+#: only when the invoked subcommand is one of these two.
+_SERVICES_CONFIG_COMMANDS = frozenset({"snapshot", "restore"})
+
+
+def _reject_option_shaped_value(
+    ctx: click.Context, param: click.Parameter, value: str | None
+) -> str | None:
+    """Refuse a value that looks like another option instead of silently taking it.
+
+    ``--db`` and ``--config`` are plain string options: like ``argparse``,
+    Click's parser treats whatever token immediately follows one as its
+    value -- even when that token itself starts with ``-`` and spells out
+    another known flag. ``engrava --db --json remember "x"`` therefore
+    parsed as ``--db`` bound to the literal string ``"--json"``: it created
+    a database called ``--json``, stored the thought, and exited ``0``
+    without the caller's requested ``--json`` output ever taking effect --
+    a silent write to the wrong place that defeats the very flag meant to
+    make the outcome machine-readable.
+
+    A previous revision of the documentation called this "ordinary
+    argparse behaviour" and left it alone. That claim was false: running
+    the equivalent ``argparse`` program on the same value rejects it with
+    "expected one argument" rather than accepting it. This closes the gap
+    by rejecting any ``--db`` / ``--config`` value starting with ``-`` --
+    the whole shape of the ambiguity, not just the ``--json`` instance of
+    it -- as a Click-level usage error, before either option's value ever
+    reaches a memory-verb's own resolution logic. A caller who genuinely
+    needs such a path can disambiguate it the usual shell way, by
+    prefixing it (``./--json``).
+
+    Args:
+        ctx: The option's Click context, forwarded to ``BadParameter`` for
+            its usage-message formatting.
+        param: The option being validated (``--db`` or ``--config``).
+        value: The parsed value, or ``None`` when the option was omitted.
+
+    Returns:
+        ``value`` unchanged, when it does not look like another option.
+
+    Raises:
+        click.BadParameter: ``value`` starts with ``-``.
+
+    """
+    if value is not None and value.startswith("-"):
+        message = (
+            f"{value!r} looks like an option, not a path. "
+            f"Prefix it (e.g. './{value}') if this is really the intended path."
+        )
+        raise click.BadParameter(message, ctx=ctx, param=param)
+    return value
+
 
 @click.group(cls=_ExtensionAwareGroup)
-@click.option("--db", "db_path", default=None, help="Path to SQLite database.")
+@click.option(
+    "--db",
+    "db_path",
+    default=None,
+    callback=_reject_option_shaped_value,
+    help="Path to SQLite database.",
+)
 @click.option(
     "--format",
     "output_format",
@@ -623,6 +744,7 @@ def _configure_verbose_logging(ctx: click.Context) -> None:
     "--config",
     "config_path",
     default=None,
+    callback=_reject_option_shaped_value,
     help="Path to engrava.yaml (also ENGRAVA_CONFIG env).",
 )
 @click.pass_context
@@ -654,17 +776,44 @@ def cli(
         _configure_verbose_logging(ctx)
         logger.debug("Verbose logging enabled")
 
-    # Pre-load services config for --service default resolution.
+    # Pre-load services config for --service default resolution. Gated on the
+    # two commands that actually read ``services_config`` / ``default_embeddings``
+    # off ``ctx.obj`` (``snapshot`` and ``restore`` — see their own bodies
+    # below): every other command, including the memory verbs (they resolve
+    # their own database through engrava.cli.store_resolution and never touch
+    # either value), used to pay for this load — and its failure — anyway,
+    # since a group callback runs before Click even knows which subcommand's
+    # options to parse. That made an explicit --db unable to save any command
+    # from a broken --config: this callback raised before a subcommand's own
+    # precedence logic ever ran, so --db's documented "explicit always wins"
+    # was true for the *chosen database* but false for whether the command
+    # ran at all. Scoping the load to the two commands that need it restores
+    # that precedence for everything else, while a broken --config given to
+    # snapshot/restore themselves is still reported here, once, as a clean
+    # CLI error instead of a traceback.
     services_cfg = None
     default_embeddings = None
-    if cfg.config_path and cfg.config_path.exists():
+    if ctx.invoked_subcommand in _SERVICES_CONFIG_COMMANDS and cfg.config_path is not None:
         from engrava.config import load_config  # noqa: PLC0415
 
-        ms_config = load_config(cfg.config_path)
+        try:
+            ms_config = load_config(cfg.config_path)
+        except ConfigError as exc:
+            click.echo(f"Error: {exc}", err=True)
+            sys.exit(1)
         services_cfg = ms_config.services
         default_embeddings = ms_config.embeddings
     ctx.obj["services_config"] = services_cfg
     ctx.obj["default_embeddings"] = default_embeddings
+
+    # Whether --db (or ENGRAVA_DB) was actually supplied, as opposed to
+    # cfg.db_path holding the CLI's own hardcoded default. EngravaCLIConfig
+    # folds "explicit" and "defaulted" into one value once resolved, so the
+    # memory verbs' shared store-resolution helper (see
+    # engrava.cli.store_resolution) needs this computed the same way here,
+    # from the raw option, mirroring EngravaCLIConfig.resolve's own
+    # truthiness check rather than re-deriving a different one.
+    ctx.obj["db_explicit"] = bool(db_path) or bool(os.environ.get("ENGRAVA_DB"))
 
 
 # ------------------------------------------------------------------
@@ -2597,6 +2746,20 @@ def export_cmd(ctx: click.Context, output_path: str | None, status_filter: str |
 
 
 # ------------------------------------------------------------------
+# One-shot memory verbs (remember / recall / link)
+# ------------------------------------------------------------------
+#
+# Defined in their own module — engrava.cli.memory_commands — rather than
+# inline here, and registered on `cli` purely by importing it: each command
+# is declared there with `@cli.command()` against the very `cli` group
+# object this module defines above, so the import's only observable effect
+# is that import-time decoration running. Kept as a separate module so the
+# three new verbs, their shared store-resolution helper, and this file's own
+# long-standing commands stay in different files -- this module already
+# carries unrelated in-flight changes on sibling branches.
+from engrava.cli import memory_commands as _memory_commands  # noqa: E402, F401
+
+# ------------------------------------------------------------------
 # Entry point
 # ------------------------------------------------------------------
 
@@ -2612,4 +2775,15 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Running this file directly (``python -m engrava.cli.main``, or
+    # ``python path/to/main.py``) executes it as ``__main__`` — a module
+    # object distinct from ``engrava.cli.main`` even though they share this
+    # file's code. ``engrava.cli.memory_commands`` (imported above via the
+    # dotted path) decorates the ``cli`` Group belonging to *that* import,
+    # registering remember / recall / link on it — not on this run's
+    # ``__main__.cli``, which therefore never gains the three new commands.
+    # Re-entering through the dotted import's own ``main()`` runs the
+    # canonical, fully-decorated module instead of this half-decorated one.
+    from engrava.cli.main import main as _canonical_main
+
+    _canonical_main()

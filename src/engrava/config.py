@@ -1847,7 +1847,11 @@ def load_config(path: str | Path) -> EngravaConfig:
         raise ConfigError(msg) from exc
 
     if not isinstance(raw, dict):
-        msg = "Config must be a YAML mapping (dict), got " + type(raw).__name__
+        # Names the offending value itself, not just its type -- a bare
+        # scalar document (e.g. a config file containing only `hello`) used
+        # to be reported as "got str", which named the type but dropped the
+        # value that actually appeared in the file.
+        msg = f"Config must be a YAML mapping (dict), got {type(raw).__name__}: {raw!r}"
         raise ConfigError(msg)
 
     return _parse_config(raw)
