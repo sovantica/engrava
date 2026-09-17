@@ -1,0 +1,44 @@
+# engrava — "network" quick-start profile (Ollama)
+#
+# Semantic search works, and the embedding model stays OUT of this process:
+# it runs inside a separately-running Ollama server, and engrava only makes
+# HTTP calls to it. What this needs:
+#
+#   1. Ollama installed and running, reachable at `base_url` below
+#      (https://ollama.com — not part of this package).
+#   2. The model pulled into Ollama once:  ollama pull nomic-embed-text
+#   3. The `engrava[embeddings-ollama]` extra — it pulls only `httpx`
+#      (a ~70 KB wheel on PyPI), the sole additional Python dependency
+#      this profile needs. No model file ever touches this process.
+#
+# `nomic-embed-text` produces 768-dimensional vectors (measured against a
+# live Ollama server, 2026-09-16) — hence `dimension: 768` below; a different
+# model needs its own dimension here.
+#
+# An OpenAI-compatible endpoint (`provider: openai-compatible`, a `base_url`
+# pointing at that API, and a real `api_key`) is a variant of this same
+# profile, not a separate one: the model still runs outside this process, and
+# it needs the same `engrava[embeddings-ollama]`-style single `httpx`
+# dependency (via the `embeddings-openai` extra) — only the endpoint and
+# authentication differ.
+#
+# Trade-off versus `local`: this profile needs Ollama reachable at query
+# time — no Ollama, no embeddings, and no offline fallback. `local` pays a
+# one-time download instead and never needs a network call again.
+#
+# See docs/configuration.md#quick-start-profiles.
+
+database:
+  path: "./engrava.db"
+  wal_mode: true
+
+embeddings:
+  provider: ollama
+  model: nomic-embed-text
+  base_url: "http://localhost:11434"
+  auto_embed: true
+
+extensions:
+  vector:
+    backend: numpy
+    dimension: 768   # nomic-embed-text's embedding dimension

@@ -1,0 +1,21 @@
+# engrava — "lexical" quick-start profile
+#
+# No embedding provider is configured. FTS5/BM25 keyword search, the edge
+# graph, and MindQL all work exactly as usual, and the journal is available
+# (off by default, same as every other profile). Semantic (vector) search is
+# INERT on this profile, not degraded: `search_hybrid()` / `recall()` never
+# run a vector arm when no provider is configured, so
+# `HybridSearchResult.backends_used` never contains `"vector"` and a vector
+# query returns nothing, silently — not an error.
+#
+# Cost: none beyond the base install. `pip install engrava` is enough — no
+# embeddings extra, no additional dependency, no model download. This does
+# not make store-open itself "instant"; it is simply unchanged from the base
+# install's cost.
+#
+# See docs/configuration.md#quick-start-profiles for the `network` and
+# `local` profiles, which add semantic search at their own, different costs.
+
+database:
+  path: "./engrava.db"
+  wal_mode: true

@@ -51,6 +51,19 @@ pip install 'engrava[embeddings-hf]'      # HuggingFace Inference API embeddings
 Dreaming/consolidation and the knowledge graph need **no extra** — they are part
 of the base install.
 
+> **`embeddings-local` carries a large first-run download.** It pulls
+> `sentence-transformers` and `torch` — `torch`'s current PyPI Linux/x86_64
+> wheel for Python 3.11 alone measures 554.6 MB — plus a further, separate
+> model download (~88 MB for `all-MiniLM-L6-v2`, cached under
+> `~/.cache/huggingface/hub`) on first use. `engrava-mcp[local]` is the exact
+> same download, reached through the server package instead of this one. If
+> you do not need semantic search in-process, `pip install engrava` alone
+> (no extra, no download, no model) already gives you keyword search, the
+> graph, and MindQL — see
+> [Configuration → Quick-start profiles](https://github.com/sovantica/engrava/blob/main/docs/configuration.md#quick-start-profiles)
+> for that and the Ollama-backed alternative that keeps the model out of
+> this process entirely.
+
 ### Basic Usage
 
 Store a memory and search for it in two calls — no IDs to generate, no record
@@ -257,6 +270,18 @@ the `import engrava` library. See the
 [`engrava-mcp` package](https://github.com/sovantica/engrava-mcp) for install,
 client configuration, the full tool/resource/prompt reference, and read-only
 mode.
+
+**`uvx` vs. a persistent install.** `uvx engrava-mcp` (equivalently `uv tool
+run engrava-mcp`) installs into "an ephemeral virtual environment in the uv
+cache directory" per uv's own `--help` text — fine for the lexical/network
+profiles above, which add nothing heavier than `httpx`. Once you are on the
+`local` profile (`engrava-mcp[local]`, the same `sentence-transformers` +
+`torch` download as `engrava[embeddings-local]`), `uv tool install
+'engrava-mcp[local]'` is the better fit: it installs once into a persistent
+environment — the same `uvx engrava-mcp` invocation then reuses that
+installed environment instead of resolving a fresh ephemeral one — and a
+later `uv tool upgrade engrava-mcp` re-pays only the changed packages, not
+the whole dependency tree.
 
 ## CLI
 

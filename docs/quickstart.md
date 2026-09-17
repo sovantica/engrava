@@ -2,6 +2,23 @@
 
 Get up and running with engrava in 5 minutes.
 
+## Which profile do you want?
+
+Before your first `pip install`, decide whether a machine-learning model
+should ever load into your process — the base install itself never pulls
+one in.
+
+| If you want... | Install | Cost |
+|---|---|---|
+| Keyword search only, nothing else to think about | `pip install engrava` | none — semantic search is inert, not degraded |
+| Semantic search, model stays out of your process | `pip install 'engrava[embeddings-ollama]'` + a running [Ollama](https://ollama.com) | one extra service to run; no local download |
+| Semantic search, offline after first use (only with 2 env vars set) | `pip install 'engrava[embeddings-local]'` | a large one-time download (`sentence-transformers` + `torch`, ~550+ MB) plus a first-use model download |
+
+Each option ships as a ready-to-copy `engrava.yaml` — see
+[Configuration → Quick-start profiles](configuration.md#quick-start-profiles)
+for the exact files, what each trades off, and where every number above came
+from.
+
 ## Installation
 
 Engrava requires Python `>=3.11`; the maintained CI matrix covers Python 3.11,
@@ -14,7 +31,8 @@ pip install engrava
 ```
 
 For vector search and the bundled walkthrough you also need a local
-embedding encoder — install the `embeddings-local` extra:
+embedding encoder — install the `embeddings-local` extra (the `local`
+profile above):
 
 ```bash
 pip install 'engrava[embeddings-local]'

@@ -23,6 +23,21 @@ download.
 | [`quickstart.py`](quickstart.py) | 5-minute end-to-end tour: in-memory store, percepts + utterances ingest, one dreaming cycle, hybrid-search query, top-K print. |
 | [`simple_agent.py`](simple_agent.py) | Lower-level walkthrough using a custom scoring hook, manual edges, and a fake embedding function — useful for understanding the API surface without the local-encoder dependency. |
 
+## Quick-start configuration profiles
+
+Three copy-ready `engrava.yaml` files, one per install path — pick the one
+that matches how much you want a machine-learning model in your process:
+
+| File | Profile | What you get |
+|---|---|---|
+| [`profile-lexical.yaml`](profile-lexical.yaml) | `lexical` | Keyword search only. No embeddings dependency, no download. |
+| [`profile-network-ollama.yaml`](profile-network-ollama.yaml) | `network` | Semantic search via a running Ollama server — the model stays out of this process. |
+| [`profile-local.yaml`](profile-local.yaml) | `local` | Semantic search in-process, offline after a one-time download. |
+
+See [`docs/configuration.md` → Quick-start profiles](../docs/configuration.md#quick-start-profiles)
+for the install command, the real download-size numbers, and what each
+profile trades off against the others.
+
 ## MCP client configuration
 
 Sample `mcpServers` blocks for pointing an MCP client (Claude Desktop, Claude

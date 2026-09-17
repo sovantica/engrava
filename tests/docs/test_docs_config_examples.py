@@ -162,7 +162,7 @@ EXEMPT_YAML_BLOCKS: tuple[tuple[str, str, ExemptionReason], ...] = (
 # listed here is treated as a fragment (see the module docstring for what
 # that does and does not guarantee).
 COMPLETE_YAML_BLOCKS: tuple[tuple[str, str], ...] = (
-    ("docs/configuration.md", "wal_mode: true"),
+    ("docs/configuration.md", "vec0_overfetch_factor: 4"),
     ("docs/audit-trail.md", '"./engrava.db"'),
     ("docs/backup-and-recovery.md", "path: ./fresh.db"),
 )
@@ -667,7 +667,7 @@ def test_checker_does_not_let_a_placeholder_complete_a_deleted_database_section(
     tells the reader to create would not load) -- injecting a placeholder
     path for it would hide exactly that.
     """
-    complete_block = _unique_block("docs/configuration.md", "wal_mode: true")
+    complete_block = _unique_block("docs/configuration.md", "vec0_overfetch_factor: 4")
     without_database = complete_block.body.split("search:", 1)[1]
     mutated = "search:" + without_database
     assert "database" not in yaml.safe_load(mutated)

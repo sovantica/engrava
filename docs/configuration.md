@@ -3,6 +3,138 @@
 engrava supports YAML-based configuration for production deployments.
 This document covers all configuration options.
 
+## Quick-start profiles
+
+The base install (`pip install engrava`) is light: five direct dependencies,
+no `torch`. Whether a machine-learning model ever loads into *your* process —
+and how much it costs to get there — is decided entirely by which
+**embeddings extra** you install and which provider you point `engrava.yaml`
+at. Nothing below changes an engine default; each profile is an ordinary
+`engrava.yaml`, shipped as a real file under [`examples/`](../examples/) so
+you can copy it as-is.
+
+Pick one **before** your first `pip install`, not after:
+
+| Profile | Install | Semantic search | Model runs where | One-time cost |
+|---|---|---|---|---|
+| [`lexical`](../examples/profile-lexical.yaml) | `pip install engrava` (base only) | **Inert** — no vector arm runs at all | nowhere — no provider configured | none |
+| [`network`](../examples/profile-network-ollama.yaml) | `pip install 'engrava[embeddings-ollama]'` | Works | out of process, in a separately-running Ollama server | none locally; needs Ollama running and the model pulled into it |
+| [`local`](../examples/profile-local.yaml) | `pip install 'engrava[embeddings-local]'` | Works, offline after warm-up | in this process | a large one-time dependency + model download (see below) |
+
+### `lexical` — no embedding provider
+
+```yaml
+database:
+  path: "./engrava.db"
+  wal_mode: true
+```
+
+No `embeddings:` section at all — that is the whole profile. FTS5/BM25
+keyword search, the edge graph, and MindQL all work exactly as usual, and the
+journal is available (off by default, same as every profile). **Semantic
+search is inert, not degraded**: with no provider configured,
+`search_hybrid()` / `recall()` never run a vector arm — verified against a
+live store: `HybridSearchResult.backends_used` comes back as
+`{'fts5', 'priority'}`, never containing `"vector"`, and a query that only a
+vector arm could answer returns nothing, silently, rather than raising. No
+embeddings dependency is installed and no model is ever downloaded — the
+store-open cost is exactly the base install's, not claimed to be zero or
+"instant".
+
+### `network` — Ollama, model out of process
+
+```yaml
+database:
+  path: "./engrava.db"
+  wal_mode: true
+
+embeddings:
+  provider: ollama
+  model: nomic-embed-text
+  base_url: "http://localhost:11434"
+  auto_embed: true
+
+extensions:
+  vector:
+    backend: numpy
+    dimension: 768   # nomic-embed-text's embedding dimension
+```
+
+Needs three things, none of which is a Python dependency of engrava beyond
+one small package:
+
+1. [Ollama](https://ollama.com) installed and running, reachable at
+   `base_url`.
+2. The model pulled into Ollama once: `ollama pull nomic-embed-text`.
+3. The `engrava[embeddings-ollama]` extra — it pulls exactly one additional
+   package, `httpx` (a ~70 KB wheel on PyPI), the sole cost this profile adds
+   to the Python environment. No model file ever touches this process.
+
+Verified against a live Ollama server: `store.recall()` against this exact
+profile returns `backends_used = {'fts5', 'priority', 'vector'}` — the vector
+arm ran, driven by a real HTTP call to Ollama, not a local model load.
+
+An OpenAI-compatible endpoint (`provider: openai-compatible`, its own
+`base_url`, and a real `api_key`) is a **variant of this same profile**, not
+a separate one — the model still runs outside this process, on the same
+"one HTTP dependency" cost — it is documented here as a variant rather than
+as its own profile because a profile with two backends is not one
+reproducible thing.
+
+**What you give up:** this profile needs Ollama reachable at query time.
+There is no offline fallback — if Ollama is down, embedding calls fail; the
+`local` profile trades that for a large upfront download instead.
+
+### `local` — sentence-transformers, offline after warm-up
+
+```yaml
+database:
+  path: "./engrava.db"
+  wal_mode: true
+
+embeddings:
+  provider: sentence-transformer
+  model: all-MiniLM-L6-v2
+  auto_embed: true
+
+extensions:
+  vector:
+    backend: numpy
+    dimension: 384
+```
+
+Needs the `engrava[embeddings-local]` extra, which pulls
+`sentence-transformers` and `torch`. Real, measured numbers, not general
+knowledge about these libraries:
+
+- `torch`'s current PyPI Linux/x86_64 wheel for Python 3.11
+  (`torch-2.14.0-cp311-cp311-manylinux_2_28_x86_64.whl`) is **554.6 MB**,
+  read from the PyPI package index on 2026-09-16. `sentence-transformers`
+  itself is a sub-1 MB wheel, but it brings in `transformers`, `tokenizers`,
+  and `huggingface_hub` on top, so the extra's total download exceeds
+  `torch` alone.
+- The model this profile names, `all-MiniLM-L6-v2`, is a **further, separate
+  download** — measured **88 MB** on disk under
+  `~/.cache/huggingface/hub` after the first call that uses it.
+
+**What you give up, and what "offline" actually requires.** After the
+dependency install and one warm model load, later `embed()` calls run
+in-process with no network call — but only once two environment variables
+are set: `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`. This was verified
+directly, not assumed: against this exact profile, with the model already
+cached and the network made unreachable, loading the model **still raised**
+with those two variables unset — the underlying `transformers` library
+issues a HEAD request checking for a PEFT adapter config on every load,
+cache or not, and does not fall back to the cache silently when that request
+fails. With both variables set, the identical load and query succeeded with
+no network reachable at all. Set them before your process starts if you rely
+on this profile being offline.
+
+**What you give up versus `network`:** a large one-time download (and the
+two offline environment variables above) in exchange for never needing a
+reachable service again — the inverse trade from `network`, which needs no
+local download but needs Ollama reachable at every query.
+
 ## Configuration File
 
 Create a `engrava.yaml` file:
