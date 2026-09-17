@@ -128,7 +128,7 @@ if TYPE_CHECKING:
     from engrava.domain.protocols.dreaming import DreamingConsolidatorProtocol
     from engrava.domain.protocols.embedding_provider import EmbeddingProviderProtocol
     from engrava.domain.protocols.hooks import MindQLExtension
-    from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
+    from engrava.infrastructure.sqlite.vector_sqlite_vec import SqliteVecSearchBackend
     from engrava.mindql.executor import MindQLResult
     from engrava.mindql.parser import MindQLQuery
 
@@ -2316,7 +2316,7 @@ class SqliteEngravaCore:
             embedding_dimension: Expected embedding vector dimension.
 
         """
-        from engrava.extensions.vector_sqlite_vec import (  # noqa: PLC0415
+        from engrava.infrastructure.sqlite.vector_sqlite_vec import (  # noqa: PLC0415
             SqliteVecSearchBackend,
             load_sqlite_vec,
         )

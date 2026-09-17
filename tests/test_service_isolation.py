@@ -1494,7 +1494,7 @@ class TestReEmbedRequiresProvider:
             return True
 
         monkeypatch.setattr(
-            "engrava.extensions.vector_sqlite_vec.load_sqlite_vec",
+            "engrava.infrastructure.sqlite.vector_sqlite_vec.load_sqlite_vec",
             _load_existing_vec_index,
         )
 

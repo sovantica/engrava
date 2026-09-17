@@ -1,4 +1,4 @@
-"""Tests for engrava.extensions.vector_sqlite_vec."""
+"""Tests for engrava.infrastructure.sqlite.vector_sqlite_vec."""
 
 from __future__ import annotations
 
@@ -15,13 +15,13 @@ from engrava import EmbeddingProviderContractError
 from engrava.config import ConfigError, EngravaConfig
 from engrava.domain.enums import LifecycleStatus, Priority, ThoughtType
 from engrava.domain.models.thought import ThoughtRecord
-from engrava.extensions.vector_sqlite_vec import (
+from engrava.infrastructure.service_manager import EngravaManager
+from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
+from engrava.infrastructure.sqlite.vector_sqlite_vec import (
     SqliteVecSearchBackend,
     _load_sqlite_vec_sync,
     load_sqlite_vec,
 )
-from engrava.infrastructure.service_manager import EngravaManager
-from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
 
 # Skip the real-extension integration tests when sqlite-vec is absent, but
 # never let them silently pass when it is installed and broken.
@@ -659,7 +659,7 @@ class TestVec0DimensionTakesPrecedenceOverTheProvider(TestSqliteVecRealConnectio
         dimension unresolved, would make the guarantee those tests establish a
         statement about a store no user has.
         """
-        from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
+        from engrava.infrastructure.sqlite.vector_sqlite_vec import SqliteVecSearchBackend
 
         db_path = tmp_path / "from_config_vec.db"
         cfg_file = tmp_path / "engrava.yaml"
@@ -954,7 +954,7 @@ class TestVectorOwnershipIsTheThoughtNotTheEmbeddingRow(TestSqliteVecRealConnect
         self, tmp_path: Path
     ) -> None:
         """``purge_orphan_vectors`` must key off the thought, not just the embedding row."""
-        from engrava.extensions.vector_sqlite_vec import purge_orphan_vectors
+        from engrava.infrastructure.sqlite.vector_sqlite_vec import purge_orphan_vectors
 
         store = await self._build_store(tmp_path, backend="sqlite-vec", dimension=3)
         try:

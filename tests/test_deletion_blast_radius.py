@@ -76,7 +76,7 @@ from engrava.cli.main import cli
 
 # The extension's own load sequence, reused so the read-back connections in this
 # module cannot come to load sqlite-vec differently from the code under test.
-from engrava.extensions.vector_sqlite_vec import _load_sqlite_vec_sync
+from engrava.infrastructure.sqlite.vector_sqlite_vec import _load_sqlite_vec_sync
 
 # The real-shape per-version schema builder the migration-ladder suite already
 # maintains. Reused rather than re-derived so the pre-cascade fixture below
@@ -1266,7 +1266,7 @@ class TestGcArchivedBlastRadius:
             return False
 
         monkeypatch.setattr(
-            "engrava.extensions.vector_sqlite_vec.load_sqlite_vec",
+            "engrava.infrastructure.sqlite.vector_sqlite_vec.load_sqlite_vec",
             _refuse_to_load,
         )
         with _reopen_with_vector_index(vec_indexed_mixed_lifecycle_db) as conn:
@@ -1335,7 +1335,7 @@ class TestGcArchivedBlastRadius:
             return False
 
         monkeypatch.setattr(
-            "engrava.extensions.vector_sqlite_vec.load_sqlite_vec",
+            "engrava.infrastructure.sqlite.vector_sqlite_vec.load_sqlite_vec",
             _refuse_to_load,
         )
         with _reopen_with_vector_index(vec_indexed_mixed_lifecycle_db) as conn:
@@ -1378,7 +1378,7 @@ class TestGcArchivedBlastRadius:
         """
         removed_by_the_stub: list[int] = []
         monkeypatch.setattr(
-            "engrava.extensions.vector_sqlite_vec.purge_orphan_vectors",
+            "engrava.infrastructure.sqlite.vector_sqlite_vec.purge_orphan_vectors",
             _purge_that_removes_a_vector_then_fails(removed_by_the_stub),
         )
         with _reopen_with_vector_index(vec_indexed_mixed_lifecycle_db) as conn:
@@ -2132,7 +2132,7 @@ class TestGcExpiredBlastRadius:
             return False
 
         monkeypatch.setattr(
-            "engrava.extensions.vector_sqlite_vec.load_sqlite_vec",
+            "engrava.infrastructure.sqlite.vector_sqlite_vec.load_sqlite_vec",
             _refuse_to_load,
         )
         before = self._read_thoughts(vec_indexed_ttl_lifecycle_db)
@@ -2175,7 +2175,7 @@ class TestGcExpiredBlastRadius:
         config = _write_ttl_config(tmp_path / "delete.yaml", vec_indexed_ttl_lifecycle_db, "delete")
         removed_by_the_stub: list[int] = []
         monkeypatch.setattr(
-            "engrava.extensions.vector_sqlite_vec.purge_orphan_vectors",
+            "engrava.infrastructure.sqlite.vector_sqlite_vec.purge_orphan_vectors",
             _purge_that_removes_a_vector_then_fails(removed_by_the_stub),
         )
         all_edges = {eid for eid, _src, _dst, _weight in _TTL_EDGES}

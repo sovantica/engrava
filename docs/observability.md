@@ -257,7 +257,7 @@ works too and additionally returns the live counts.)
 
 The library logs through the standard `logging` module under the **`engrava.*`**
 namespace (each module uses `logging.getLogger(__name__)`, e.g.
-`engrava.extensions.dreaming`, `engrava.extensions.vector_sqlite_vec`,
+`engrava.extensions.dreaming`, `engrava.infrastructure.sqlite.vector_sqlite_vec`,
 `engrava.config`). As a general rule it logs at **`WARNING`** (degraded
 conditions, e.g. sqlite-vec unavailable → numpy fallback), **`INFO`**
 (dreaming progress), and **`DEBUG`** (detailed internals), and raises failures

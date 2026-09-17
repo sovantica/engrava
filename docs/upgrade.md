@@ -1426,6 +1426,22 @@ journal; see [Backup & Recovery](backup-and-recovery.md#logical-snapshot-and-res
 and [Audit Trail](audit-trail.md#backup--retention-note) for the full
 mechanism the override accepts.
 
+**Logger name change: the vector-search backend's logger moved with the module.**
+No schema change, and no behaviour change to search itself — only where its log
+records appear.
+
+- `engrava.extensions.vector_sqlite_vec` was re-homed to
+  `engrava.infrastructure.sqlite.vector_sqlite_vec` (it was a SQLite adapter, not
+  an extension); the old import path keeps working via an alias.
+- The module's logger, `logging.getLogger(__name__)`, moved with it: it now
+  reports as `engrava.infrastructure.sqlite.vector_sqlite_vec` instead of
+  `engrava.extensions.vector_sqlite_vec`. The alias does not cover this — a
+  logger's name comes from the real module's `__name__`, not the path used to
+  import it.
+- **What to do:** update any log-based alerting rule or dashboard filter keyed
+  on the old logger name to the new one; otherwise those records stop
+  appearing with no error or warning.
+
 ### 0.5 -> 0.6
 
 Version 0.6 is a **schema-changing minor upgrade**. Do not roll it across old and

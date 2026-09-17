@@ -60,8 +60,8 @@ from engrava.domain.exceptions import (
 from engrava.domain.models.action import ActionRecord
 from engrava.domain.models.edge import EdgeRecord
 from engrava.domain.models.thought import ThoughtRecord
-from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
 from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
+from engrava.infrastructure.sqlite.vector_sqlite_vec import SqliteVecSearchBackend
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator

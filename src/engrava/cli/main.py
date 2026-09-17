@@ -1753,7 +1753,7 @@ async def _reset_sqlite_vec_index_for_restore(conn: aiosqlite.Connection) -> Non
     if not await _has_persisted_vector_index(conn):
         return
 
-    from engrava.extensions.vector_sqlite_vec import load_sqlite_vec  # noqa: PLC0415
+    from engrava.infrastructure.sqlite.vector_sqlite_vec import load_sqlite_vec  # noqa: PLC0415
 
     if not await load_sqlite_vec(conn):
         msg = (
@@ -2456,7 +2456,7 @@ async def _prepare_vector_index_purge(conn: aiosqlite.Connection) -> bool:
     if not await _has_persisted_vector_index(conn):
         return False
 
-    from engrava.extensions.vector_sqlite_vec import load_sqlite_vec  # noqa: PLC0415
+    from engrava.infrastructure.sqlite.vector_sqlite_vec import load_sqlite_vec  # noqa: PLC0415
 
     if not await load_sqlite_vec(conn):
         msg = (
@@ -2488,7 +2488,9 @@ async def _reconcile_vector_index(conn: aiosqlite.Connection) -> None:
             :func:`_prepare_vector_index_purge`.
 
     """
-    from engrava.extensions.vector_sqlite_vec import purge_orphan_vectors  # noqa: PLC0415
+    from engrava.infrastructure.sqlite.vector_sqlite_vec import (  # noqa: PLC0415
+        purge_orphan_vectors,
+    )
 
     await purge_orphan_vectors(conn)
 

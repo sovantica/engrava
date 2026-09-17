@@ -127,12 +127,12 @@ from engrava.embeddings.sentence_transformer import SentenceTransformerProvider
 from engrava.extensions.discovery import discover_manifests
 from engrava.extensions.dreaming import DreamingExtension
 from engrava.extensions.structural_split import SplitMode, StructuralSplitProducer
-from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
 from engrava.infrastructure.read_only_store import ReadOnlyEngrava
 from engrava.infrastructure.service_manager import EngravaManager
 from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
 from engrava.infrastructure.sqlite.hygiene import EvictionReason, HygieneResult
 from engrava.infrastructure.sqlite.journal_writer import JournalWriter
+from engrava.infrastructure.sqlite.vector_sqlite_vec import SqliteVecSearchBackend
 from engrava.metadata import percept, thought, utterance
 from engrava.mindql.executor import MindQLExecutor, MindQLResult
 from engrava.mindql.parser import MindQLCommand, MindQLParseError, MindQLQuery, parse
