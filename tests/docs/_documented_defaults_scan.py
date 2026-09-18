@@ -467,12 +467,26 @@ class _Scanner:
                 key_cell = cells[key_idx]
                 toks = _BACKTICK_RE.findall(key_cell) or [key_cell]
                 for tok in toks:
-                    self._handle_key_token(rel, j, tok, cells[default_idx], lines[j].strip(), scope)
+                    self._handle_key_token(
+                        rel,
+                        j,
+                        tok=tok,
+                        default_cell=cells[default_idx],
+                        context=lines[j].strip(),
+                        scope=scope,
+                    )
             j += 1
         return j
 
     def _handle_key_token(
-        self, rel: str, line_idx: int, tok: str, default_cell: str, context: str, scope: type | None
+        self,
+        rel: str,
+        line_idx: int,
+        *,
+        tok: str,
+        default_cell: str,
+        context: str,
+        scope: type | None,
     ) -> None:
         qual = _qualified_class(tok, self.target_classes)
         if qual:
@@ -481,7 +495,12 @@ class _Scanner:
                 self.nonexistent.append(NonexistentField(rel, line_idx + 1, cname, fname, context))
                 return
             self._claim_table(
-                rel, line_idx, fname, self.target_classes[cname], default_cell, context
+                rel,
+                line_idx,
+                field=fname,
+                cls=self.target_classes[cname],
+                raw_value=default_cell,
+                context=context,
             )
             return
         fld = _bare_field(tok, self.field_owner)
@@ -490,10 +509,24 @@ class _Scanner:
         if fld in self.ambiguous_names and self.field_owner[fld] is not scope:
             self.ambiguous_skips.append(AmbiguousSkip(rel, line_idx + 1, fld, context))
             return
-        self._claim_table(rel, line_idx, fld, self.field_owner[fld], default_cell, context)
+        self._claim_table(
+            rel,
+            line_idx,
+            field=fld,
+            cls=self.field_owner[fld],
+            raw_value=default_cell,
+            context=context,
+        )
 
     def _claim_table(
-        self, rel: str, line_idx: int, field: str, cls: type, raw_value: str, context: str
+        self,
+        rel: str,
+        line_idx: int,
+        *,
+        field: str,
+        cls: type,
+        raw_value: str,
+        context: str,
     ) -> None:
         self.table_claims.append(Claim(rel, line_idx + 1, field, cls, raw_value, "table", context))
         self._table_claimed_lines.setdefault(rel, set()).add(line_idx)
@@ -566,7 +599,14 @@ class _Scanner:
         for tok in toks:
             kv = _KV_RE.match(tok.strip())
             if kv:
-                self._handle_inline_kv(rel, start_line, kv.group(1), kv.group(2), text, scope)
+                self._handle_inline_kv(
+                    rel,
+                    start_line,
+                    lhs=kv.group(1),
+                    rhs=kv.group(2),
+                    context=text,
+                    scope=scope,
+                )
                 continue
             if _mentions_a_field(tok, self.target_classes, self.field_owner):
                 field = self._classify_field_token(rel, start_line, tok, text, scope)
@@ -625,7 +665,14 @@ class _Scanner:
         return fld, self.field_owner[fld]
 
     def _handle_inline_kv(
-        self, rel: str, start_line: int, lhs: str, rhs: str, context: str, scope: type | None
+        self,
+        rel: str,
+        start_line: int,
+        *,
+        lhs: str,
+        rhs: str,
+        context: str,
+        scope: type | None,
     ) -> None:
         """Resolve one self-contained ``field = value`` backtick token and record its claim."""
         qual = _qualified_class(lhs, self.target_classes)
@@ -635,7 +682,12 @@ class _Scanner:
                 self.nonexistent.append(NonexistentField(rel, start_line, cname, fname, context))
             else:
                 self._add_prose_claim(
-                    rel, start_line, fname, self.target_classes[cname], rhs, context
+                    rel,
+                    start_line,
+                    field=fname,
+                    cls=self.target_classes[cname],
+                    raw_value=rhs,
+                    context=context,
                 )
             return
         seg = lhs.rsplit(".", maxsplit=1)[-1]
@@ -644,10 +696,24 @@ class _Scanner:
         if seg in self.ambiguous_names and self.field_owner[seg] is not scope:
             self.ambiguous_skips.append(AmbiguousSkip(rel, start_line, seg, context))
             return
-        self._add_prose_claim(rel, start_line, seg, self.field_owner[seg], rhs, context)
+        self._add_prose_claim(
+            rel,
+            start_line,
+            field=seg,
+            cls=self.field_owner[seg],
+            raw_value=rhs,
+            context=context,
+        )
 
     def _add_prose_claim(
-        self, rel: str, start_line: int, field: str, cls: type, raw_value: str, context: str
+        self,
+        rel: str,
+        start_line: int,
+        *,
+        field: str,
+        cls: type,
+        raw_value: str,
+        context: str,
     ) -> None:
         self.prose_claims.append(
             Claim(rel, start_line, field, cls, raw_value, "inline-kv", context)
@@ -720,6 +786,7 @@ def _resolve_claim(claim: Claim) -> ResolvedClaim | UnresolvedClaim:
 def scan_documented_defaults(
     doc_files: list[Path],
     repo_root: Path,
+    *,
     field_owner: dict[str, type],
     target_classes: dict[str, type],
     ambiguous_names: set[str],

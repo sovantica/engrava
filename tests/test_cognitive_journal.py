@@ -88,6 +88,7 @@ async def writer(db: aiosqlite.Connection) -> JournalWriter:
 
 def _make_thought(
     thought_id: str = "t-001",
+    *,
     thought_type: ThoughtType = ThoughtType.TASK,
     essence: str = "Test thought",
     content: str = "Full content",

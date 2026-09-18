@@ -49,7 +49,7 @@ from engrava.domain.models.provenance import ProvenanceContext
 #: triggers infinite recursion in Pydantic's schema builder on 3.11+).
 MetadataValue = TypeAliasType(
     "MetadataValue",
-    "str | int | float | bool | None | dict[str, MetadataValue]",
+    "str | int | float | bool | dict[str, MetadataValue] | None",
 )
 
 

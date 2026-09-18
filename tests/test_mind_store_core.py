@@ -66,6 +66,7 @@ async def store(db: aiosqlite.Connection) -> SqliteEngravaCore:
 
 def _make_thought(
     thought_id: str = "t-001",
+    *,
     thought_type: ThoughtType = ThoughtType.TASK,
     essence: str = "Test thought",
     content: str = "Test thought content",

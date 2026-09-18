@@ -535,8 +535,10 @@ def _return_annotation_mismatches(
     if exception is not None:
         if (str(expected), str(actual)) != exception:
             return [
-                f"documented return-annotation exception is stale:"
-                f" got ({str(expected)!r}, {str(actual)!r}), expected {exception!r}"
+                (
+                    f"documented return-annotation exception is stale:"
+                    f" got ({str(expected)!r}, {str(actual)!r}), expected {exception!r}"
+                )
             ]
         return []
     if expected is inspect.Signature.empty:

@@ -75,6 +75,7 @@ def _mock_llm(prompt: str) -> str:
 async def _store_percept(
     store: SqliteEngravaCore,
     text: str,
+    *,
     cycle: int,
     user_id: str,
     session_id: str,
@@ -198,7 +199,12 @@ async def main() -> None:
         for turn_index, user_message in enumerate(conversation):
             # 1. store the incoming message (anchored to session + turn)
             percept_thought = await _store_percept(
-                store, user_message, cycle, user_id, session_id, turn_index
+                store,
+                user_message,
+                cycle=cycle,
+                user_id=user_id,
+                session_id=session_id,
+                turn_index=turn_index,
             )
 
             # 2. retrieve relevant prior memory

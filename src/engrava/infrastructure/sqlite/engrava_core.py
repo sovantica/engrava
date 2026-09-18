@@ -1097,10 +1097,10 @@ async def _close_quietly(conn: aiosqlite.Connection) -> None:
     except asyncio.CancelledError:
         try:
             await close_task
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning("Error closing connection during cleanup", exc_info=True)
         raise
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning("Error closing connection during cleanup", exc_info=True)
 
 
@@ -2266,7 +2266,7 @@ class SqliteEngravaCore:
             await self.close()
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning(
                 "Error closing connection in __aexit__ while the context "
                 "body's exception was propagating",
@@ -4211,7 +4211,7 @@ class SqliteEngravaCore:
         """
         try:
             task.result()
-        except BaseException:  # noqa: BLE001
+        except BaseException:
             logger.warning(
                 "close() failed while a cancellation was already pending",
                 exc_info=True,

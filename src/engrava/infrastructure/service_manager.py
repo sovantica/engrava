@@ -322,7 +322,7 @@ class EngravaManager:
                 await store.close()
             except asyncio.CancelledError as exc:
                 pending_cancellation = exc
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning("Error closing store %r", name, exc_info=True)
         self._stores.clear()
         if pending_cancellation is not None:

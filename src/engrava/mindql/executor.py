@@ -688,27 +688,35 @@ class MindQLExecutor:
         if kind == TemporalPredicateKind.VALID_NOW:
             now = _resolve_now()
             return (
-                "(valid_from IS NULL OR valid_from <= ?) "
-                "AND (valid_until IS NULL OR valid_until > ?)",
+                (
+                    "(valid_from IS NULL OR valid_from <= ?) "
+                    "AND (valid_until IS NULL OR valid_until > ?)"
+                ),
                 [now, now],
             )
         if kind == TemporalPredicateKind.VALID_AT:
             instant = predicate.start
             return (
-                "(valid_from IS NULL OR valid_from <= ?) "
-                "AND (valid_until IS NULL OR valid_until > ?)",
+                (
+                    "(valid_from IS NULL OR valid_from <= ?) "
+                    "AND (valid_until IS NULL OR valid_until > ?)"
+                ),
                 [instant, instant],
             )
         if kind == TemporalPredicateKind.VALID_WITHIN:
             return (
-                "(valid_from IS NULL OR valid_from < ?) "
-                "AND (valid_until IS NULL OR valid_until > ?)",
+                (
+                    "(valid_from IS NULL OR valid_from < ?) "
+                    "AND (valid_until IS NULL OR valid_until > ?)"
+                ),
                 [predicate.end, predicate.start],
             )
         # VALID_BETWEEN — closed containment requiring real bounds on both ends.
         return (
-            "valid_from IS NOT NULL AND valid_from >= ? "
-            "AND valid_until IS NOT NULL AND valid_until <= ?",
+            (
+                "valid_from IS NOT NULL AND valid_from >= ? "
+                "AND valid_until IS NOT NULL AND valid_until <= ?"
+            ),
             [predicate.start, predicate.end],
         )
 

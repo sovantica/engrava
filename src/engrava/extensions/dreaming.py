@@ -449,6 +449,7 @@ class DreamingExtension:
 
     async def _apply_promotions(
         self,
+        *,
         store: DreamingStoreProtocol,
         candidates: list[ThoughtRecord],
         ctx: DreamingContext,

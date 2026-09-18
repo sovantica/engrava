@@ -181,8 +181,10 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     (
         "docs/upgrade.md",
         "def dimension(self) -> int:",
-        "method fragment; a conformant provider's search path is asserted in "
-        "test_embedding_providers.TestProviderMissingRequiredMember",
+        (
+            "method fragment; a conformant provider's search path is asserted in "
+            "test_embedding_providers.TestProviderMissingRequiredMember"
+        ),
     ),
     (
         "docs/api-reference.md",
@@ -242,8 +244,10 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     (
         "docs/extension-hooks.md",
         'window_unit="word",',
-        "StructuralSplitProducer FIXED_WINDOW constructor fragment; segmentation "
-        "asserted in the structural-split tests",
+        (
+            "StructuralSplitProducer FIXED_WINDOW constructor fragment; segmentation "
+            "asserted in the structural-split tests"
+        ),
     ),
     (
         "docs/extension-hooks.md",
@@ -293,8 +297,10 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     (
         "docs/concurrency.md",
         "async with edit_lock:",
-        "fragment assuming a store and a caller-owned lock; the read-modify-write "
-        "window it closes is asserted in the concurrency-contract tests",
+        (
+            "fragment assuming a store and a caller-owned lock; the read-modify-write "
+            "window it closes is asserted in the concurrency-contract tests"
+        ),
     ),
     (
         "docs/concurrency.md",
@@ -309,8 +315,10 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     (
         "docs/concurrency.md",
         "write_lock_acquire_timeout_seconds=900",
-        "fragment assuming a store, connection, and a caller-defined slow "
-        "embedding provider; illustrative constructor tuning, not runnable as-is",
+        (
+            "fragment assuming a store, connection, and a caller-defined slow "
+            "embedding provider; illustrative constructor tuning, not runnable as-is"
+        ),
     ),
     (
         "docs/configuration.md",
@@ -345,9 +353,11 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     (
         "docs/dreaming.md",
         "class MySignal:",
-        "self-contained but synchronous — not wrapped in the asyncio.run(main()) "
-        "shape the execute-layer harness requires; wiring asserted in the "
-        "extensions test",
+        (
+            "self-contained but synchronous — not wrapped in the asyncio.run(main()) "
+            "shape the execute-layer harness requires; wiring asserted in the "
+            "extensions test"
+        ),
     ),
     (
         "docs/dreaming.md",
@@ -677,8 +687,10 @@ COMPILE_ONLY: tuple[tuple[str, str, str], ...] = (
     (
         "docs/search.md",
         "the caller owns",
-        "fragment assuming a store; transaction-time recency asserted in "
-        "test_transaction_recency.py",
+        (
+            "fragment assuming a store; transaction-time recency asserted in "
+            "test_transaction_recency.py"
+        ),
     ),
     (
         "docs/search.md",

@@ -265,17 +265,23 @@ def _fts_and_triggers(target: int) -> list[str]:
     return [
         "CREATE VIRTUAL TABLE thought_fts USING fts5("
         "essence, content, " + tokenizer + "content='thought', content_rowid='rowid');",
-        "CREATE TRIGGER thought_fts_insert AFTER INSERT ON thought BEGIN "
-        "INSERT INTO thought_fts(rowid, essence, content) "
-        "VALUES (new.rowid, new.essence, new.content); END;",
-        "CREATE TRIGGER thought_fts_delete AFTER DELETE ON thought BEGIN "
-        "INSERT INTO thought_fts(thought_fts, rowid, essence, content) "
-        "VALUES ('delete', old.rowid, old.essence, old.content); END;",
-        "CREATE TRIGGER thought_fts_update AFTER UPDATE OF essence, content ON thought BEGIN "
-        "INSERT INTO thought_fts(thought_fts, rowid, essence, content) "
-        "VALUES ('delete', old.rowid, old.essence, old.content); "
-        "INSERT INTO thought_fts(rowid, essence, content) "
-        "VALUES (new.rowid, new.essence, new.content); END;",
+        (
+            "CREATE TRIGGER thought_fts_insert AFTER INSERT ON thought BEGIN "
+            "INSERT INTO thought_fts(rowid, essence, content) "
+            "VALUES (new.rowid, new.essence, new.content); END;"
+        ),
+        (
+            "CREATE TRIGGER thought_fts_delete AFTER DELETE ON thought BEGIN "
+            "INSERT INTO thought_fts(thought_fts, rowid, essence, content) "
+            "VALUES ('delete', old.rowid, old.essence, old.content); END;"
+        ),
+        (
+            "CREATE TRIGGER thought_fts_update AFTER UPDATE OF essence, content ON thought BEGIN "
+            "INSERT INTO thought_fts(thought_fts, rowid, essence, content) "
+            "VALUES ('delete', old.rowid, old.essence, old.content); "
+            "INSERT INTO thought_fts(rowid, essence, content) "
+            "VALUES (new.rowid, new.essence, new.content); END;"
+        ),
     ]
 
 
@@ -299,8 +305,10 @@ def _indexes(target: int) -> list[str]:
     if target >= 13:
         stmts += [
             "CREATE INDEX idx_thought_valid_from ON thought(valid_from);",
-            "CREATE INDEX idx_thought_valid_until ON thought(valid_until) "
-            "WHERE valid_until IS NOT NULL;",
+            (
+                "CREATE INDEX idx_thought_valid_until ON thought(valid_until) "
+                "WHERE valid_until IS NOT NULL;"
+            ),
             "CREATE INDEX idx_thought_valid_range ON thought(valid_from, valid_until);",
             "CREATE INDEX idx_edge_valid_from ON edge(valid_from);",
             "CREATE INDEX idx_edge_valid_until ON edge(valid_until) WHERE valid_until IS NOT NULL;",
@@ -319,10 +327,14 @@ def _indexes(target: int) -> list[str]:
         stmts.append("CREATE INDEX idx_action_source_thought ON action(source_thought_id);")
     if target >= 17:
         stmts += [
-            "CREATE INDEX idx_thought_prov_session "
-            "ON thought(json_extract(provenance, '$.session_id'));",
-            "CREATE INDEX idx_thought_prov_actor "
-            "ON thought(json_extract(provenance, '$.actor_id'));",
+            (
+                "CREATE INDEX idx_thought_prov_session "
+                "ON thought(json_extract(provenance, '$.session_id'));"
+            ),
+            (
+                "CREATE INDEX idx_thought_prov_actor "
+                "ON thought(json_extract(provenance, '$.actor_id'));"
+            ),
         ]
     return stmts
 

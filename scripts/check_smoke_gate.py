@@ -224,9 +224,11 @@ def evaluate_longmemeval_recall(
     """
     if floor is None:
         return False, [
-            "LongMemEval was requested but the recall@5 floor is not yet "
-            "calibrated; commit the empirical value before enabling the "
-            "probe in CI",
+            (
+                "LongMemEval was requested but the recall@5 floor is not yet "
+                "calibrated; commit the empirical value before enabling the "
+                "probe in CI"
+            ),
         ]
 
     try:
@@ -255,9 +257,11 @@ def evaluate_longmemeval_recall(
     ]
     if not questions:
         return False, [
-            "LongMemEval dataset filtered to zero questions — every entry "
-            "matched the excluded id list, which should never happen on the "
-            "upstream oracle variant",
+            (
+                "LongMemEval dataset filtered to zero questions — every entry "
+                "matched the excluded id list, which should never happen on the "
+                "upstream oracle variant"
+            ),
         ]
 
     provider = resolve_embedding_provider_or_exit()

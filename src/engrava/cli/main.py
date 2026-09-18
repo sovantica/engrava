@@ -521,7 +521,7 @@ def _load_mindql_extensions() -> dict[str, MindQLExtension]:
                 manifest = manifest()
             for ext in getattr(manifest, "mindql_extensions", []):
                 registry[ext.command_name] = ext
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning("Failed to load extension %s", ep.name, exc_info=True)
 
     return registry
@@ -551,7 +551,7 @@ def _discover_extension_commands() -> list[click.Command]:
                     commands.extend(item for item in result if isinstance(item, click.Command))
                 elif isinstance(result, click.Command):
                     commands.append(result)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning("Failed to load CLI extension %s", ep.name, exc_info=True)
 
     return commands

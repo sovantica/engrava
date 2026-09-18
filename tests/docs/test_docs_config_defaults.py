@@ -79,10 +79,10 @@ def _scan() -> ScanResult:
     return scan_documented_defaults(
         markdown_files(),
         REPO_ROOT,
-        FIELD_OWNER,
-        TARGET_CLASSES,
-        AMBIGUOUS_NAMES,
-        SECTION_ALIASES,
+        field_owner=FIELD_OWNER,
+        target_classes=TARGET_CLASSES,
+        ambiguous_names=AMBIGUOUS_NAMES,
+        section_aliases=SECTION_ALIASES,
     )
 
 
@@ -229,7 +229,12 @@ def _write(tmp_path: Path, name: str, text: str) -> Path:
 def _fake_scan(tmp_path: Path, doc_text: str) -> ScanResult:
     doc = _write(tmp_path, "doc.md", doc_text)
     return scan_documented_defaults(
-        [doc], tmp_path, _FAKE_FIELD_OWNER, _FAKE_TARGETS, ambiguous_names=set(), section_aliases={}
+        [doc],
+        tmp_path,
+        field_owner=_FAKE_FIELD_OWNER,
+        target_classes=_FAKE_TARGETS,
+        ambiguous_names=set(),
+        section_aliases={},
     )
 
 
@@ -321,7 +326,12 @@ def test_scanner_skips_an_ambiguous_bare_name_outside_its_section(tmp_path: Path
         "### `unrelated`\n\n| Key | Default |\n|---|---|\n| `enabled` | `false` |\n",
     )
     result = scan_documented_defaults(
-        [doc], tmp_path, _FAKE_FIELD_OWNER, _FAKE_TARGETS, ambiguous, section_aliases={}
+        [doc],
+        tmp_path,
+        field_owner=_FAKE_FIELD_OWNER,
+        target_classes=_FAKE_TARGETS,
+        ambiguous_names=ambiguous,
+        section_aliases={},
     )
     assert not result.resolved
     assert len(result.ambiguous_skips) == 1
@@ -337,7 +347,12 @@ def test_scanner_accepts_an_ambiguous_bare_name_inside_its_resolved_section(tmp_
         "### `gates`\n\n| Key | Default |\n|---|---|\n| `enabled` | `true` |\n",
     )
     result = scan_documented_defaults(
-        [doc], tmp_path, _FAKE_FIELD_OWNER, _FAKE_TARGETS, ambiguous, aliases
+        [doc],
+        tmp_path,
+        field_owner=_FAKE_FIELD_OWNER,
+        target_classes=_FAKE_TARGETS,
+        ambiguous_names=ambiguous,
+        section_aliases=aliases,
     )
     assert len(result.resolved) == 1
     assert result.resolved[0].matches
