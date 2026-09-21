@@ -20,7 +20,7 @@ A query touches up to five signals; each scales differently:
 | **Vector** | The vector backend (see below) | Linear in #embeddings for both backends; **sqlite-vec scans a compact `vec0` table with a much smaller constant factor** than the Python path. |
 | **Recency** | A cheap per-candidate arithmetic decay | Negligible. |
 | **Priority** | A per-candidate enum→multiplier lookup | Negligible. |
-| **Graph** | 1-hop neighbour expansion over edges | Proportional to the fusion-pool size × average degree; **opt-in** (`graph_weight=0.0` makes zero graph queries). |
+| **Graph** | 1-hop neighbour expansion over edges | Proportional to the fusion-pool size × average degree; **opt-in** (`graph_weight=0.0` skips this ranking signal; candidate-pool expansion over `CONSOLIDATED_FROM` edges is separate, controlled by `graph_expansion_enabled`, is on by default, and reads those edges only when a reflection ranks among the top candidates). |
 
 The dominant term at scale is almost always the **vector** signal, because both
 backends compare the query against every stored embedding — the difference is how

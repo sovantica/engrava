@@ -391,8 +391,10 @@ result = await store.search_hybrid(
 ```
 
 The graph signal is **opt-in** in v0.3.0 (`default_graph_weight=0.0`).
-When the weight is `0.0`, no graph queries are made and there is zero
-performance impact.
+When the weight is `0.0`, the graph ranking signal is off and costs nothing.
+Candidate-pool expansion over `CONSOLIDATED_FROM` edges is controlled
+separately by `graph_expansion_enabled` (default `true`) and reads those edges only
+when a reflection ranks among the top candidates.
 
 ## Complete YAML surface
 

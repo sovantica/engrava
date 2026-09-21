@@ -192,8 +192,11 @@ relying on vector similarity alone. See [Search](search.md).
 
 The fifth, **opt-in** hybrid-search signal: a 1-hop-weighted neighbour boost where
 a candidate gains score if its graph neighbours also match the query. Disabled by
-default (`default_graph_weight = 0.0`), so no graph queries run unless you enable
-it. See [Search](search.md).
+default (`default_graph_weight = 0.0`), so no graph ranking queries run unless you
+enable it. Candidate-pool expansion over consolidation edges is a separate step
+controlled by `graph_expansion_enabled`, which is on by default and reads those
+edges only when a reflection ranks among the top candidates. See
+[Search](search.md).
 
 ### Percept
 

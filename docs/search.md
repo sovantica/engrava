@@ -32,7 +32,9 @@ plain way until you pass a `SearchConfig` explicitly (or an explicit per-call
 - No explicit `current_cycle`, no configured cycle provider, and no
   `recency_now` → recency skipped.
 - `priority_weight` is `0.0` → priority skipped.
-- `graph_weight` is `0.0` → graph skipped, zero overhead.
+- `graph_weight` is `0.0` → the graph ranking signal is skipped and costs
+  nothing. (Reflection-source candidate expansion is a separate step; see
+  [below](#reflection-source-candidate-expansion).)
 - All signals disabled → a dedicated query-less window of `top_k` rows (not a
   `list_thoughts` call), pre-ordered `updated_cycle DESC` so the truncation keeps
   the freshest rows. With no cycle reference, every row scores a flat `0.0`. A
@@ -261,10 +263,14 @@ result = await store.search_hybrid(
 
 ### Performance
 
-When `graph_weight=0.0` (default), no graph queries are executed and
-there is zero performance impact.  When active, the implementation
-uses a single batch SQL query bounded by
-`O(top_k × max_neighbors_per_candidate)` rows.
+When `graph_weight=0.0` (default), the graph ranking signal is off: its
+1-hop neighbour query is not executed and it adds no ranking cost. This does
+not switch off [reflection-source candidate
+expansion](#reflection-source-candidate-expansion), which is controlled
+separately by `graph_expansion_enabled` (default `true`) and reads
+`CONSOLIDATED_FROM` edges whenever a `REFLECTION` ranks among the top
+candidates. When the ranking signal is active, the implementation uses a single
+batch SQL query bounded by `O(top_k × max_neighbors_per_candidate)` rows.
 
 ### Observability
 

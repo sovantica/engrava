@@ -236,7 +236,7 @@ whole section is optional.
 | `default_vector_weight` | `float` | `0.55` | Weight for vector similarity score |
 | `default_recency_weight` | `float` | `0.10` | Weight for recency-based score |
 | `default_priority_weight` | `float` | `0.05` | Weight for priority signal |
-| `default_graph_weight` | `float` | `0.0` | Weight for 1-hop graph signal. **`0.0` ⇒ the graph signal is OFF by default** — no graph queries run and there is zero overhead. Raise it (or pass `graph_weight=` per call) to opt in. |
+| `default_graph_weight` | `float` | `0.0` | Weight for 1-hop graph signal. **`0.0` ⇒ the graph ranking signal is OFF by default** and costs nothing; candidate-pool expansion over `CONSOLIDATED_FROM` edges is controlled separately by `graph_expansion_enabled`, is on by default, and reads those edges only when a reflection ranks among the top candidates. Raise it (or pass `graph_weight=` per call) to opt in. |
 | `recency_half_life` | `int` | `50` | Cycles for recency score to halve |
 | `recency_now_half_life_seconds` | `int` | `604800` | Wall-clock seconds for transaction-time recency to halve (7 days). Used when a query supplies `recency_now`; per-call override: `recency_now_half_life`. |
 | `priority_boost_p1` | `float` | `1.0` | Score multiplier for P1 thoughts |
@@ -274,8 +274,8 @@ Weights are redistributed proportionally when a signal is unavailable
 (e.g. no `current_cycle` → recency skipped). Set any weight to `0.0`
 to disable that signal entirely.
 
-> **The graph signal is off by default.** `default_graph_weight` is `0.0`, so a
-> default store runs no graph queries at all. This is separate from
+> **The graph ranking signal is off by default.** `default_graph_weight` is
+> `0.0`, so a default store runs no graph ranking queries. This is separate from
 > `graph_expansion_enabled` (default `true`), which controls candidate-pool
 > widening over `CONSOLIDATED_FROM` edges — the *ranking* graph signal stays
 > off until you give `default_graph_weight` (or a per-call `graph_weight`) a
