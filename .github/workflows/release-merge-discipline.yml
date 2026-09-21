@@ -1,0 +1,51 @@
+# Release Merge Discipline — fails a release branch that carries a merge commit.
+# Rule (BRANCHING.md): every change reaches release/vX.Y.Z as one squash commit, so
+# origin/dev..release/vX.Y.Z must contain no merge commit. The check is
+# scripts/check_release_branch_merge_discipline.py; this workflow is its caller.
+
+name: Release Merge Discipline
+
+on:
+  push:
+    branches: ["release/**"]
+  pull_request:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+jobs:
+  merge-discipline:
+    name: No merge commits on the release branch
+    # A pull_request trigger cannot filter on the head branch, so it is filtered here:
+    # the gate applies to pull requests whose head is a release/* branch in this
+    # repository; other pull requests into dev, including pull requests from forks,
+    # are outside it (a fork's branch does not exist as origin/<branch> here).
+    # Pushes reach this job only for release/**.
+    if: >-
+      github.event_name == 'push' ||
+      (startsWith(github.head_ref, 'release/') &&
+      github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    steps:
+      # The check needs origin/dev, the release branch ref and the full ancestry
+      # between them; a full-history checkout of all branches provides them.
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # A pull_request checkout is a detached merge ref, and the script refuses a
+      # detached HEAD, so both refs are passed explicitly. The branch name comes from
+      # the event through env, never interpolated into the shell line.
+      - name: Check the release branch carries no merge commit
+        env:
+          RELEASE_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          python scripts/check_release_branch_merge_discipline.py \
+            --branch "origin/$RELEASE_BRANCH" \
+            --base origin/dev
