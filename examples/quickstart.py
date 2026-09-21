@@ -4,10 +4,13 @@ Requirements:
     pip install 'engrava[embeddings-local]'
 
 The ``[embeddings-local]`` extra pulls ``sentence-transformers`` and
-``torch`` so vector search has a real ENCODER (~30-90 MB model on first
-run, then cached locally). The encoder is NOT a language model: it
-turns text into a fixed-size vector and is fully local — no API keys
-and no network after the first download.
+``torch`` — a large one-time download (~550+ MB on the PyPI
+Linux/x86_64 wheel for Python 3.11; see docs/configuration.md's
+"Quick-start profiles" section for the exact, platform-scoped numbers)
+— so vector search has a real ENCODER, plus a further encoder model
+download on first run, then cached locally. The encoder is NOT a
+language model: it turns text into a fixed-size vector and is fully
+local — no API keys and no network after the first download.
 
 Run this directly:
     python examples/quickstart.py

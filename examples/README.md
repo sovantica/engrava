@@ -11,17 +11,21 @@ pip install 'engrava[embeddings-local]'
 ```
 
 The `embeddings-local` extra pulls `sentence-transformers` and `torch`
-and downloads a small (~30-90 MB) encoder model on first use. The
-encoder is a vector-producing model, **not** a language model — no
-API keys are needed and there is no network traffic after the first
-download.
+— a large one-time download (~550+ MB on the PyPI Linux/x86_64 wheel
+for Python 3.11) — plus a further encoder model download on first use.
+See [`docs/configuration.md` → Quick-start profiles](../docs/configuration.md#quick-start-profiles)
+for the exact, platform-scoped numbers. The encoder is a
+vector-producing model, **not** a language model — no API keys are
+needed and there is no network traffic after the first download.
 
 ## What is here
 
 | Script | What it shows |
 |---|---|
 | [`quickstart.py`](quickstart.py) | 5-minute end-to-end tour: in-memory store, percepts + utterances ingest, one dreaming cycle, hybrid-search query, top-K print. |
+| [`notes_memory.py`](notes_memory.py) | The runnable companion to [`docs/tutorial.md`](../docs/tutorial.md): ingests a handful of notes, links related ones with an edge, and searches them, using a deterministic hash in place of a real embedding model. |
 | [`simple_agent.py`](simple_agent.py) | Lower-level walkthrough using a custom scoring hook, manual edges, and a fake embedding function — useful for understanding the API surface without the local-encoder dependency. |
+| [`agent_loop.py`](agent_loop.py) | A per-turn memory-backed agent loop: store the message, retrieve prior context with hybrid search, call an LLM (a canned stand-in here), store the reply, and run dreaming consolidation every few turns. |
 
 ## Quick-start configuration profiles
 
@@ -37,6 +41,11 @@ that matches how much you want a machine-learning model in your process:
 See [`docs/configuration.md` → Quick-start profiles](../docs/configuration.md#quick-start-profiles)
 for the install command, the real download-size numbers, and what each
 profile trades off against the others.
+
+[`config.yaml`](config.yaml) is a different kind of file: not a fourth
+profile, but a fuller reference config with dreaming consolidation, the
+edge-creation gates, and every hybrid-search weight spelled out — a
+starting point to copy and tune once you have picked a profile above.
 
 ## MCP client configuration
 
@@ -58,7 +67,9 @@ Run them directly with the Python interpreter:
 
 ```bash
 python examples/quickstart.py
+python examples/notes_memory.py
 python examples/simple_agent.py
+python examples/agent_loop.py
 ```
 
 To see the dreaming consolidation step actually produce REFLECTION
@@ -83,6 +94,8 @@ teal.`.
 
 - [`docs/quickstart.md`](../docs/quickstart.md) — narrative walkthrough
   paired with `quickstart.py`.
+- [`docs/tutorial.md`](../docs/tutorial.md) — narrative walkthrough
+  paired with `notes_memory.py`.
 - [`docs/dreaming.md`](../docs/dreaming.md) — what dreaming does and
   how to configure it.
 - [`docs/benchmarks.md`](../docs/benchmarks.md) — the synthetic

@@ -399,7 +399,7 @@ Use these contracts narrowly:
 | `create_thought()` | Not idempotent; the same ID raises and a new ID creates another row |
 | `remember()` | Not idempotent; each call creates a fresh ID unless content deduplication is requested |
 | `create_thought(deduplicate=True)` / `get_or_create()` | Prevent duplicate content rows, but each hit increments `confirmation_count`; not observationally idempotent |
-| `bulk_store()` | Atomic through source+embedding commit when it owns that transaction outright — nested inside a caller's own `suspend_auto_commit()`, a caught row error can still commit the batch's successful prefix, while a caught embedding failure (see [API reference](api-reference.md#embeddinggenerationerror)) commits every row the batch inserted instead, since that failure only fires after every row is already in — and, either way, not safe to replay blindly after a post-commit derivation failure |
+| `bulk_store()` | Atomic through source+embedding commit when it owns that transaction outright — nested inside a caller's own `suspend_auto_commit()`, a caught row error can still commit the batch's successful prefix, while a caught embedding failure (see [API reference](api-reference.md#exceptions)) commits every row the batch inserted instead, since that failure only fires after every row is already in — and, either way, not safe to replay blindly after a post-commit derivation failure |
 | Retrieval calls | Do not mutate graph content, but can buffer access-frequency events when access tracking is enabled |
 
 When an API is not listed as idempotent, assume that retry requires an

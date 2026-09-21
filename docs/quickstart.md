@@ -38,11 +38,14 @@ profile above):
 pip install 'engrava[embeddings-local]'
 ```
 
-The extra pulls `sentence-transformers` and `torch` and downloads a
-small (~30-90 MB) encoder model on first use. The encoder is **not** a
-language model: it turns text into a fixed-size vector. There are no
-API keys, and there is no network traffic after the first download.
-Engrava itself does not call any LLM at any time.
+The extra pulls `sentence-transformers` and `torch` — a large one-time
+download (~550+ MB on the PyPI Linux/x86_64 wheel for Python 3.11; see
+[Configuration → Quick-start profiles](configuration.md#quick-start-profiles)
+for the exact, platform-scoped numbers) — plus a further encoder model
+download on first use. The encoder is **not** a language model: it
+turns text into a fixed-size vector. There are no API keys, and there
+is no network traffic after the first download. Engrava itself does
+not call any LLM at any time.
 
 ## Run the bundled walkthrough
 
