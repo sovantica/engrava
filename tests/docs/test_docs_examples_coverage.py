@@ -58,11 +58,13 @@ from tests.docs._md_blocks import (
 from tests.docs.test_docs_examples_execute import (
     CONCATENATED_PAGES,
     EXECUTABLE_BLOCKS,
+    FIXTURE_EXECUTED_BLOCKS,
     SYNC_EXECUTABLE_BLOCKS,
 )
 
 # (E) is derived from the execute layer's allowlists — see EXECUTABLE_BLOCKS,
-# SYNC_EXECUTABLE_BLOCKS, and CONCATENATED_PAGES in test_docs_examples_execute.py.
+# SYNC_EXECUTABLE_BLOCKS, CONCATENATED_PAGES, and FIXTURE_EXECUTED_BLOCKS in
+# test_docs_examples_execute.py.
 # Do not duplicate them.
 
 # (B) Fragments whose behavioural claim is mirrored + asserted in
@@ -205,12 +207,6 @@ COMPILE_ONLY: tuple[tuple[str, str, CompileOnlyReason, str], ...] = (
     ),
     (
         "docs/api-reference.md",
-        'FieldPredicate("$.subtype", FieldOp.EQ, "supports")',
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "undefined store; illustrative edge-metadata filter usage",
-    ),
-    (
-        "docs/api-reference.md",
         "class EmbeddingProviderProtocol(Protocol)",
         CompileOnlyReason.DEFINITION_ONLY,
         "Protocol-definition only",
@@ -253,18 +249,6 @@ COMPILE_ONLY: tuple[tuple[str, str, CompileOnlyReason, str], ...] = (
         "async def store_atomically",
         CompileOnlyReason.UNDEFINED_DOMAIN_VALUE,
         "helper-function def taking two thought records and an edge; illustrative batching",
-    ),
-    (
-        "docs/error-handling.md",
-        "async def verify_journal_with_lock_retry",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "helper-function def assuming a store; verify_journal asserted in the audit-trail test",
-    ),
-    (
-        "docs/error-handling.md",
-        "async def recall_with_degradation_flags",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "helper-function def assuming a store; degradation counters illustrative",
     ),
     (
         "docs/error-handling.md",
@@ -319,24 +303,6 @@ COMPILE_ONLY: tuple[tuple[str, str, CompileOnlyReason, str], ...] = (
         "JournalIntegrityError as exc",
         CompileOnlyReason.REQUIRES_ON_DISK_ARTIFACT,
         "`...` placeholder; needs a corrupted on-disk journal; illustrative handling",
-    ),
-    (
-        "docs/cli.md",
-        "print(result.valid)",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "illustrative CLI snippet; verify_journal asserted in the audit-trail test",
-    ),
-    (
-        "docs/concepts.md",
-        "cycle_provider=StaticCycleProvider(0)",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "undefined conn; opt-in cycle-provider wiring (behaviour in cycle-provider tests)",
-    ),
-    (
-        "docs/concepts.md",
-        "resume_from = await store.max_cycle()",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "fragment assuming a store; max_cycle recovery asserted in the cycle-provider tests",
     ),
     (
         "docs/concurrency.md",
@@ -405,12 +371,6 @@ COMPILE_ONLY: tuple[tuple[str, str, CompileOnlyReason, str], ...] = (
         "opens a real on-disk database and contains `...`; illustrative lifecycle",
     ),
     (
-        "docs/dreaming.md",
-        "graph_edge_decay=0.3",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "fragment assuming a store; graph-weighted hybrid asserted in the hybrid tests",
-    ),
-    (
         "docs/extension-hooks.md",
         "RECENT_COMMAND = MindQLExtension",
         CompileOnlyReason.DEFINITION_ONLY,
@@ -463,12 +423,6 @@ COMPILE_ONLY: tuple[tuple[str, str, CompileOnlyReason, str], ...] = (
     ),
     (
         "docs/extensions.md",
-        "discover_manifests()",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "undefined db; discovery scans installed packages",
-    ),
-    (
-        "docs/extensions.md",
         "class ExtendedStore(SqliteEngravaCore)",
         CompileOnlyReason.DEFINITION_ONLY,
         "subclass-definition-only (overrides a private method); illustrative",
@@ -478,12 +432,6 @@ COMPILE_ONLY: tuple[tuple[str, str, CompileOnlyReason, str], ...] = (
         'connect("agent-memory.db")',
         CompileOnlyReason.REQUIRES_ON_DISK_ARTIFACT,
         "opens a real on-disk database and undefined my_embed_fn; illustrative",
-    ),
-    (
-        "docs/guides/agent-memory.md",
-        "async def store_percept",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "helper-function def assuming a store; percept metadata asserted in the metadata test",
     ),
     (
         "docs/guides/agent-memory.md",
@@ -520,12 +468,6 @@ COMPILE_ONLY: tuple[tuple[str, str, CompileOnlyReason, str], ...] = (
         "inside the loop, after advancing the cycle:",
         CompileOnlyReason.UNDEFINED_DOMAIN_VALUE,
         "undefined cycle/store; run_consolidation asserted in the dreaming tests",
-    ),
-    (
-        "docs/guides/agent-memory.md",
-        "cycle = await store.max_cycle()   # the highest cycle stored",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "fragment assuming a store; illustrative cycle bootstrap",
     ),
     (
         "docs/guides/embeddings.md",
@@ -607,39 +549,9 @@ COMPILE_ONLY: tuple[tuple[str, str, CompileOnlyReason, str], ...] = (
     ),
     (
         "docs/guides/migrating-from-other-memory.md",
-        "memory.add(",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "fragment assuming a store; create_thought asserted in the CRUD behaviour test",
-    ),
-    (
-        "docs/guides/migrating-from-other-memory.md",
-        "hits = memory.search(",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "fragment assuming a store; filtered search asserted in the scoped-retrieval test",
-    ),
-    (
-        "docs/guides/migrating-from-other-memory.md",
-        "over-fetch, then filter and trim",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "fragment assuming a store; illustrative post-filter of results",
-    ),
-    (
-        "docs/guides/migrating-from-other-memory.md",
         'get_store("u1")  # u1.db',
         CompileOnlyReason.REQUIRES_ON_DISK_ARTIFACT,
         "requires an on-disk engrava.yaml + per-user db files; illustrative",
-    ),
-    (
-        "docs/guides/migrating-from-other-memory.md",
-        "json_extract(metadata_json",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "fragment assuming a conn; illustrative raw-SQL escape hatch",
-    ),
-    (
-        "docs/guides/migrating-from-other-memory.md",
-        'allowed={"public"}, owner="u1"',
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "fragment assuming a store; filters + visibility asserted in the scoped test",
     ),
     (
         "docs/known-limitations.md",
@@ -654,34 +566,10 @@ COMPILE_ONLY: tuple[tuple[str, str, CompileOnlyReason, str], ...] = (
         "requires an on-disk engrava.yaml; run_hygiene asserted in the hygiene test",
     ),
     (
-        "docs/mindql.md",
-        "Active thoughts: {count_result.count}",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "fragment assuming a conn; FIND/COUNT asserted in the MindQL behaviour test",
-    ),
-    (
-        "docs/mindql.md",
-        "from engrava import parse\n\nresult = await store.execute_mindql",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "fragment assuming a store; execute_mindql asserted in the api-reference behaviour test",
-    ),
-    (
         "docs/observability.md",
         "engrava_search_p99_ms",
         CompileOnlyReason.REQUIRES_LIVE_EXTERNAL_SERVICE,
         "requires optional prometheus_client and a file-backed store; illustrative export",
-    ),
-    (
-        "docs/observability.md",
-        "async def journal_ok",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "helper-function def assuming a store; verify_journal asserted in the journal test",
-    ),
-    (
-        "docs/observability.md",
-        "async def healthcheck",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "helper-function def assuming a store; count_thoughts asserted elsewhere",
     ),
     (
         "docs/performance.md",
@@ -700,57 +588,15 @@ COMPILE_ONLY: tuple[tuple[str, str, CompileOnlyReason, str], ...] = (
     ),
     (
         "docs/quickstart.md",
-        'recall("what does the user prefer?")',
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "fragment assuming a store; remember/recall asserted in the quickstart test",
-    ),
-    (
-        "docs/quickstart.md",
-        "Python's async ecosystem and rich ML libraries",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "fragment assuming a store; create_thought asserted in the CRUD test",
-    ),
-    (
-        "docs/quickstart.md",
         "WAL mode enables concurrent reads",
         CompileOnlyReason.UNDEFINED_DOMAIN_VALUE,
         "fragment assuming a store; create_edge asserted in the CRUD behaviour test",
     ),
     (
         "docs/quickstart.md",
-        "returns (thought_id, bm25_score) tuples",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "fragment assuming a store; search_fts shape asserted in the quickstart search test",
-    ),
-    (
-        "docs/quickstart.md",
         "Store an embedding for an existing thought",
         CompileOnlyReason.REQUIRES_LIVE_EXTERNAL_SERVICE,
         "loads a real ST model (offline in CI); asserted in the quickstart search test",
-    ),
-    (
-        "docs/quickstart.md",
-        "Found {len(result.rows)} thoughts",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "fragment assuming a conn; FIND/COUNT asserted in the MindQL behaviour test",
-    ),
-    (
-        "docs/recipes/index.md",
-        "async def store_turn",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "helper-function definition assuming an existing store",
-    ),
-    (
-        "docs/recipes/index.md",
-        "async def context_for",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "helper-function definition assuming an existing store",
-    ),
-    (
-        "docs/recipes/index.md",
-        "async def search_in_session",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "helper-function definition assuming an existing store",
     ),
     (
         "docs/recipes/index.md",
@@ -783,45 +629,6 @@ COMPILE_ONLY: tuple[tuple[str, str, CompileOnlyReason, str], ...] = (
         "undefined prompting_thought_id; action lifecycle asserted in the action test",
     ),
     (
-        "docs/recipes/index.md",
-        "resume from the stored high-water mark",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "fragment assuming a store; illustrative cycle bootstrap",
-    ),
-    (
-        "docs/search.md",
-        "print(store.fts_match_failure_count)",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "fragment assuming a store; degradation counters illustrative",
-    ),
-    (
-        "docs/search.md",
-        "the caller owns",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        (
-            "fragment assuming a store; transaction-time recency asserted in "
-            "test_transaction_recency.py"
-        ),
-    ),
-    (
-        "docs/search.md",
-        "OR-matched",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "fragment assuming a store; search_fts asserted in the quickstart search test",
-    ),
-    (
-        "docs/search.md",
-        "python async",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "fragment assuming a store; graph-weighted hybrid asserted in the hybrid tests",
-    ),
-    (
-        "docs/search.md",
-        "async def assemble_unit",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "helper-function def assuming a store; collapse/filter asserted in de-frag tests",
-    ),
-    (
         "docs/search.md",
         "include_reflections=False",
         CompileOnlyReason.UNDEFINED_DOMAIN_VALUE,
@@ -850,24 +657,6 @@ COMPILE_ONLY: tuple[tuple[str, str, CompileOnlyReason, str], ...] = (
         "row_factory = aiosqlite.Row  # required",
         CompileOnlyReason.REQUIRES_ON_DISK_ARTIFACT,
         "opens a real on-disk database; illustrative connection setup",
-    ),
-    (
-        "docs/troubleshooting.md",
-        "['fts5', 'priority', 'recency']",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "fragment assuming a store; backends_used asserted in the hybrid tests",
-    ),
-    (
-        "docs/troubleshooting.md",
-        "require an exact phrase",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "fragment assuming a store; FTS operators illustrative",
-    ),
-    (
-        "docs/troubleshooting.md",
-        "lower it if nothing clears the bar",
-        CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION,
-        "fragment assuming a store; run_consolidation asserted in the dreaming tests",
     ),
 )
 
@@ -900,11 +689,12 @@ def _executable_locations_list() -> list[str]:
     """Every location the execute layer runs, in registry order, WITHOUT deduplication.
 
     A list, not a set: two ``EXECUTABLE_BLOCKS``/``SYNC_EXECUTABLE_BLOCKS``/
-    ``CONCATENATED_PAGES`` rows (or two overlapping ranges) that resolve to the
-    same block must appear twice here, so a within-registry duplicate is
-    visible to ``test_executable_registry_has_no_duplicate_locations`` instead
-    of quietly collapsing the way ``_executable_locations()``'s ``set`` return
-    would hide it.
+    ``CONCATENATED_PAGES``/``FIXTURE_EXECUTED_BLOCKS`` rows (or two overlapping
+    ranges) that resolve to the same block must appear twice here, so a
+    within-registry duplicate is visible to
+    ``test_executable_registry_has_no_duplicate_locations`` instead of quietly
+    collapsing the way ``_executable_locations()``'s ``set`` return would hide
+    it.
     """
     locations: list[str] = []
     for rel, anchor in EXECUTABLE_BLOCKS:
@@ -917,6 +707,8 @@ def _executable_locations_list() -> list[str]:
         start = next(i for i, b in enumerate(blocks) if first_anchor in b.body)
         end = next(i for i, b in enumerate(blocks) if last_anchor in b.body)
         locations.extend(block.location for block in blocks[start : end + 1])
+    for rel, anchor, _invoke in FIXTURE_EXECUTED_BLOCKS:
+        locations.append(_unique_block(rel, anchor).location)
     return locations
 
 
@@ -966,7 +758,7 @@ def _duplicate_locations(locations: list[str]) -> list[str]:
 # growing (or shrinking, or newly used) must fail the test below, not merely change a
 # number in a captured ``-s`` report nobody reads.
 _EXPECTED_COMPILE_ONLY_REASON_TALLY: dict[str, int] = {
-    CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION.value: 35,
+    CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION.value: 0,
     CompileOnlyReason.DEFINITION_ONLY.value: 10,
     CompileOnlyReason.HARNESS_SHAPE_MISMATCH.value: 0,
     CompileOnlyReason.NO_ASSERTABLE_CLAIM.value: 0,

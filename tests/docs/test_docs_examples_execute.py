@@ -41,20 +41,30 @@ runs it in a subprocess, asserting a clean exit — so the whole worked example 
 executed against the package, including the return-shape-sensitive search
 round-trip in the middle of it.
 
-Fragment blocks that are neither self-contained nor part of an opted-in
-concatenated run (the majority — they assume an existing ``store``/``conn`` or
-show a class definition) are out of scope here; they are covered by the
-compile + phantom-API guards in ``test_docs_examples_compile.py`` and by the
-behaviour tests in ``test_docs_examples_behavior.py``.
+**Fixture-executed fragments.** A fragment that only *assumes* a store/connection
+already exists — the ``ASSUMES_STORE_OR_CONNECTION`` member of
+``CompileOnlyReason`` — needs no subprocess and no ``asyncio.run(main())``
+wrapper: it runs in-process against a fresh, plain fixture store built exactly
+as ``docs/quickstart.md``'s "Create a Store" section builds one. Each such
+block executes as written, and each helper it defines is then invoked with
+literal arguments **registered per entry** in ``FIXTURE_EXECUTED_BLOCKS`` below
+— never guessed from a parameter's name at run time.
+
+Fragment blocks that are neither self-contained, part of an opted-in
+concatenated run, nor registered in ``FIXTURE_EXECUTED_BLOCKS`` (they need a
+specially-configured store, an on-disk artifact, a live external service, or an
+undefined domain value) are out of scope here; they are covered by the compile
++ phantom-API guards in ``test_docs_examples_compile.py`` and by the behaviour
+tests in ``test_docs_examples_behavior.py``.
 
 Opting a page in
 -----------------
-Both execution shapes are **allowlist-driven**: a page runs only when it has an
-explicit entry in ``EXECUTABLE_BLOCKS`` or ``CONCATENATED_PAGES`` below. The
-opt-in lives entirely in this test module — there is no special fence syntax or
-marker in the Markdown — so the public docs (and the engrava.ai mirror) need no
-magic annotations to be executed: published Markdown stays clean of any
-test-only markers.
+All three execution shapes are **allowlist-driven**: a block runs only when it
+has an explicit entry in ``EXECUTABLE_BLOCKS``, ``CONCATENATED_PAGES``, or
+``FIXTURE_EXECUTED_BLOCKS`` below. The opt-in lives entirely in this test
+module — there is no special fence syntax or marker in the Markdown — so the
+public docs (and the engrava.ai mirror) need no magic annotations to be
+executed: published Markdown stays clean of any test-only markers.
 
 * To execute a **single** self-contained block, add a
   ``(markdown_path, anchor_substring)`` entry to ``EXECUTABLE_BLOCKS``. The
@@ -72,6 +82,15 @@ test-only markers.
   order. Anchor a contiguous run, **not** a whole page: a page may follow a
   complete example with later illustrative fragments that do not compose, so the
   range is bounded explicitly by its end anchor.
+* To execute a **store/connection fragment**, add a
+  ``(markdown_path, anchor_substring, invoke)`` entry to
+  ``FIXTURE_EXECUTED_BLOCKS``. ``invoke`` is ``None`` when the block needs no
+  further call (it already does everything it claims once a store exists), or a
+  registered async callback that invokes the block's own helper(s) with literal
+  arguments when the block only *defines* one. An ``invoke=None`` entry is
+  subject to the same ``_uncalled_top_level_functions`` guard as
+  ``SYNC_EXECUTABLE_BLOCKS``: a top-level function it defines but never calls
+  fails the test rather than passing on dead code.
 
 When you move or edit one of these blocks, update its anchor — and remember:
 editing the block means re-verifying the example.
@@ -80,13 +99,23 @@ editing the block means re-verifying the example.
 from __future__ import annotations
 
 import ast
+import asyncio
+import inspect
 import os
 import subprocess
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
+import aiosqlite
 import pytest
 
+from engrava import (
+    LifecycleStatus,
+    Priority,
+    SqliteEngravaCore,
+    ThoughtRecord,
+    ThoughtType,
+)
 from tests.docs._md_blocks import (
     REPO_ROOT,
     CodeBlock,
@@ -95,10 +124,24 @@ from tests.docs._md_blocks import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
     from pathlib import Path
+
+    # A registered post-execution call for one FIXTURE_EXECUTED_BLOCKS entry: given
+    # the block's exec namespace and the fixture's own store, invoke exactly the
+    # helper(s) the block defines with literal arguments -- never a parameter-name
+    # guess. ``None`` means the block needs no such call (it already runs to
+    # completion as a bare fragment).
+    _FixtureInvoke = Callable[[dict[str, object], SqliteEngravaCore], Awaitable[None]]
 
 # Bound for every documentation subprocess so a hung example cannot wedge CI.
 _RUN_TIMEOUT_S = 120
+
+# Bound for a fixture-executed fragment (in-process, not a subprocess) so a hung
+# example fails loudly instead of wedging the suite -- same guarantee as
+# _RUN_TIMEOUT_S, scaled down because these are fast in-memory operations, not a
+# fresh interpreter start.
+_FIXTURE_RUN_TIMEOUT_S = 15
 
 
 def _isolated_child_env() -> dict[str, str]:
@@ -550,3 +593,294 @@ def test_tutorial_page_claims_exclusion_for_exactly_the_notes_it_drops() -> None
             f"{rel_path} says {note!r} is left out of top_k=3, but the output the "
             f"page publishes ranks it.\n{claim}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Fixture-executed fragments — a fragment that only assumes an existing
+# store/connection, run in-process against a fresh fixture store.
+# ---------------------------------------------------------------------------
+
+
+async def _fresh_fixture_store(conn: aiosqlite.Connection) -> SqliteEngravaCore:
+    """Build the plain store every ``ASSUMES_STORE_OR_CONNECTION`` block is promised.
+
+    Mirrors ``docs/quickstart.md``'s "Create a Store" section exactly: a bare
+    ``SqliteEngravaCore(conn)`` over an aiosqlite connection with
+    ``row_factory = aiosqlite.Row``, schema applied via ``ensure_schema()`` --
+    no extra constructor keyword, no wrapper class, no on-disk file. A block
+    needing more than this belongs to a different ``CompileOnlyReason`` member
+    (``REQUIRES_SPECIALLY_CONFIGURED_STORE``, ``REQUIRES_ON_DISK_ARTIFACT``, ...),
+    not this one.
+    """
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(conn)
+    await store.ensure_schema()
+    return store
+
+
+async def _invoke_verify_journal_with_lock_retry(
+    ns: dict[str, object], store: SqliteEngravaCore
+) -> None:
+    """docs/error-handling.md — call with only the store; ``attempts`` keeps its default."""
+    fn = cast(
+        "Callable[[SqliteEngravaCore], Awaitable[object]]", ns["verify_journal_with_lock_retry"]
+    )
+    await fn(store)
+
+
+async def _invoke_recall_with_degradation_flags(
+    ns: dict[str, object], store: SqliteEngravaCore
+) -> None:
+    """docs/error-handling.md — call with a literal query string."""
+    fn = cast(
+        "Callable[[SqliteEngravaCore, str], Awaitable[object]]",
+        ns["recall_with_degradation_flags"],
+    )
+    await fn(store, "what does the user prefer?")
+
+
+async def _invoke_journal_ok(ns: dict[str, object], store: SqliteEngravaCore) -> None:
+    """docs/observability.md — call with only the store."""
+    fn = cast("Callable[[SqliteEngravaCore], Awaitable[object]]", ns["journal_ok"])
+    await fn(store)
+
+
+async def _invoke_healthcheck(ns: dict[str, object], store: SqliteEngravaCore) -> None:
+    """docs/observability.md — call with only the store."""
+    fn = cast("Callable[[SqliteEngravaCore], Awaitable[object]]", ns["healthcheck"])
+    await fn(store)
+
+
+async def _invoke_store_percept(ns: dict[str, object], store: SqliteEngravaCore) -> None:
+    """docs/guides/agent-memory.md — call with literal text/cycle/user/session/turn."""
+    fn = cast(
+        "Callable[[SqliteEngravaCore, str, int, str, str, int], Awaitable[object]]",
+        ns["store_percept"],
+    )
+    await fn(store, "The user prefers dark mode.", 1, "user-1", "session-1", 0)
+
+
+async def _invoke_store_turn(ns: dict[str, object], store: SqliteEngravaCore) -> None:
+    """docs/recipes/index.md — call with literal turn text and conversation metadata."""
+    fn = cast(
+        "Callable[..., Awaitable[object]]",
+        ns["store_turn"],
+    )
+    await fn(
+        store,
+        "What's the weather like?",
+        "It's sunny today.",
+        cycle=1,
+        session_id="session-1",
+        turn_index=0,
+        user_id="user-1",
+    )
+
+
+async def _invoke_context_for(ns: dict[str, object], store: SqliteEngravaCore) -> None:
+    """docs/recipes/index.md — call with a literal query and cycle."""
+    fn = cast(
+        "Callable[[SqliteEngravaCore, str, int], Awaitable[object]]",
+        ns["context_for"],
+    )
+    await fn(store, "weather", 1)
+
+
+async def _invoke_search_in_session(ns: dict[str, object], store: SqliteEngravaCore) -> None:
+    """docs/recipes/index.md — call with a literal query, session id, and cycle."""
+    fn = cast(
+        "Callable[[SqliteEngravaCore, str, str, int], Awaitable[object]]",
+        ns["search_in_session"],
+    )
+    await fn(store, "weather", "session-1", 1)
+
+
+async def _invoke_assemble_unit(ns: dict[str, object], store: SqliteEngravaCore) -> None:
+    """docs/search.md — seed one chunk the block's own filters can find, then call it.
+
+    ``assemble_unit`` never creates the unit it reads (the page's prose calls it a
+    caller-side recipe over data written earlier), so this seeds a single thought
+    with the ``session_id``/``turn_index``/``chunk_index`` metadata the block's own
+    ``FieldPredicate`` filters key on, mirroring the shape
+    ``docs/recipes/index.md``'s ``store_turn`` helper writes -- a plain
+    ``ThoughtRecord`` with conversation-scoping metadata, nothing the block would
+    not otherwise assume already exists.
+    """
+    seed = ThoughtRecord(
+        thought_id="seed-chunk-0",
+        thought_type=ThoughtType.OBSERVATION,
+        essence="What's the weather like?",
+        content="What's the weather like?",
+        priority=Priority.P2,
+        lifecycle_status=LifecycleStatus.ACTIVE,
+        created_cycle=0,
+        updated_cycle=0,
+        source="user-1",
+        metadata={"session_id": "session-1", "turn_index": 0, "chunk_index": 0},
+    )
+    await store.create_thought(seed)
+    fn = cast("Callable[[str, str], Awaitable[object]]", ns["assemble_unit"])
+    await fn("weather", "seed-chunk-0")
+
+
+# Fragments that only assume an existing store/connection -- the
+# ``ASSUMES_STORE_OR_CONNECTION`` member of ``CompileOnlyReason`` -- identified by
+# (markdown path, anchor substring, invoke). ``invoke`` is ``None`` when the block
+# already does everything it claims once a store exists; otherwise it is a
+# registered callback (above) that calls the block's own helper with literal
+# arguments. This is the source of truth these 35 promoted blocks live in;
+# ``test_docs_examples_coverage.py`` folds their locations into the executed side.
+FIXTURE_EXECUTED_BLOCKS: tuple[tuple[str, str, _FixtureInvoke | None], ...] = (
+    (
+        "docs/api-reference.md",
+        'FieldPredicate("$.subtype", FieldOp.EQ, "supports")',
+        None,
+    ),
+    (
+        "docs/error-handling.md",
+        "async def verify_journal_with_lock_retry",
+        _invoke_verify_journal_with_lock_retry,
+    ),
+    (
+        "docs/error-handling.md",
+        "async def recall_with_degradation_flags",
+        _invoke_recall_with_degradation_flags,
+    ),
+    ("docs/cli.md", "print(result.valid)", None),
+    ("docs/concepts.md", "cycle_provider=StaticCycleProvider(0)", None),
+    ("docs/concepts.md", "resume_from = await store.max_cycle()", None),
+    ("docs/dreaming.md", "graph_edge_decay=0.3", None),
+    ("docs/extensions.md", "discover_manifests()", None),
+    (
+        "docs/guides/agent-memory.md",
+        "async def store_percept",
+        _invoke_store_percept,
+    ),
+    (
+        "docs/guides/agent-memory.md",
+        "cycle = await store.max_cycle()   # the highest cycle stored",
+        None,
+    ),
+    ("docs/guides/migrating-from-other-memory.md", "memory.add(", None),
+    ("docs/guides/migrating-from-other-memory.md", "hits = memory.search(", None),
+    (
+        "docs/guides/migrating-from-other-memory.md",
+        "over-fetch, then filter and trim",
+        None,
+    ),
+    ("docs/guides/migrating-from-other-memory.md", "json_extract(metadata_json", None),
+    (
+        "docs/guides/migrating-from-other-memory.md",
+        'allowed={"public"}, owner="u1"',
+        None,
+    ),
+    ("docs/mindql.md", "Active thoughts: {count_result.count}", None),
+    (
+        "docs/mindql.md",
+        "from engrava import parse\n\nresult = await store.execute_mindql",
+        None,
+    ),
+    ("docs/observability.md", "async def journal_ok", _invoke_journal_ok),
+    ("docs/observability.md", "async def healthcheck", _invoke_healthcheck),
+    ("docs/quickstart.md", 'recall("what does the user prefer?")', None),
+    ("docs/quickstart.md", "Python's async ecosystem and rich ML libraries", None),
+    ("docs/quickstart.md", "returns (thought_id, bm25_score) tuples", None),
+    ("docs/quickstart.md", "Found {len(result.rows)} thoughts", None),
+    ("docs/recipes/index.md", "async def store_turn", _invoke_store_turn),
+    ("docs/recipes/index.md", "async def context_for", _invoke_context_for),
+    ("docs/recipes/index.md", "async def search_in_session", _invoke_search_in_session),
+    ("docs/recipes/index.md", "resume from the stored high-water mark", None),
+    ("docs/search.md", "print(store.fts_match_failure_count)", None),
+    ("docs/search.md", "the caller owns", None),
+    ("docs/search.md", "OR-matched", None),
+    ("docs/search.md", "python async", None),
+    ("docs/search.md", "async def assemble_unit", _invoke_assemble_unit),
+    ("docs/troubleshooting.md", "['fts5', 'priority', 'recency']", None),
+    ("docs/troubleshooting.md", "require an exact phrase", None),
+    ("docs/troubleshooting.md", "lower it if nothing clears the bar", None),
+)
+
+
+def _resolve_fixture_block_body(rel_path: str, anchor: str, invoke: _FixtureInvoke | None) -> str:
+    """Resolve a ``FIXTURE_EXECUTED_BLOCKS`` entry, guarding the ``invoke=None`` shape.
+
+    When ``invoke`` is ``None`` the block is expected to do its work as written,
+    with no external call into a helper it defines -- exactly the shape
+    ``_resolve_sync_block_body`` guards for ``SYNC_EXECUTABLE_BLOCKS``, and for
+    the same reason: a block could define a top-level function and never call
+    it, in which case exiting 0 would prove only that the module compiles, not
+    that the function's body ever ran. When ``invoke`` is a registered
+    callback, an uncalled top-level function is the intended shape -- the
+    callback is what invokes the block's own helper -- so the guard does not
+    apply.
+    """
+    path = REPO_ROOT / rel_path
+    matches = [b for b in extract_python_blocks(path) if anchor in b.body]
+    if len(matches) != 1:
+        pytest.fail(
+            f"Expected exactly one block in {rel_path} containing anchor {anchor!r}, "
+            f"found {len(matches)}. Update FIXTURE_EXECUTED_BLOCKS in {__file__}.",
+        )
+    body = matches[0].body
+    if invoke is None:
+        uncalled = _uncalled_top_level_functions(body)
+        if uncalled:
+            pytest.fail(
+                f"{rel_path}: the block anchored on {anchor!r} defines top-level "
+                f"function(s) {uncalled} that are never called and has no registered "
+                f"invoke callback. Exiting 0 would prove only that the block's other "
+                f"top-level statements ran, not that this function's body ever "
+                f"executes. Either call it within the block, or register an invoke "
+                f"callback in FIXTURE_EXECUTED_BLOCKS that calls it.",
+            )
+    return body
+
+
+async def _run_fixture_block(body: str, invoke: _FixtureInvoke | None) -> None:
+    """Execute one ``ASSUMES_STORE_OR_CONNECTION`` fragment against a fresh fixture.
+
+    Per-block isolation: a brand-new in-memory connection and store are built for
+    every call, so one block's rows are never what the next block's query finds.
+    Bounded: the block's own top-level code and the registered ``invoke`` call (if
+    any) are each wrapped in ``asyncio.wait_for`` so a hung example fails the test
+    instead of wedging the suite.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    try:
+        store = await _fresh_fixture_store(conn)
+        ns: dict[str, object] = {
+            "store": store,
+            "conn": conn,
+            "db": conn,
+            "__name__": "__doc_fixture__",
+        }
+        code = compile(body, "<doc-fixture-block>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+        result = eval(code, ns)  # noqa: S307 - trusted, repo-authored doc snippet
+        if inspect.iscoroutine(result):
+            await asyncio.wait_for(result, _FIXTURE_RUN_TIMEOUT_S)
+        if invoke is not None:
+            await asyncio.wait_for(invoke(ns, store), _FIXTURE_RUN_TIMEOUT_S)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.parametrize(
+    ("rel_path", "anchor", "invoke"),
+    FIXTURE_EXECUTED_BLOCKS,
+    ids=[f"{rel}#{i}" for i, (rel, _anchor, _invoke) in enumerate(FIXTURE_EXECUTED_BLOCKS)],
+)
+async def test_fixture_executed_doc_block_runs(
+    rel_path: str,
+    anchor: str,
+    invoke: _FixtureInvoke | None,
+) -> None:
+    """A fragment that only assumes a store/connection runs against a fresh fixture.
+
+    Promotes the 35 ``ASSUMES_STORE_OR_CONNECTION`` compile-only blocks out of
+    the compile-only tier: each executes against exactly the
+    plain store ``docs/quickstart.md``'s "Create a Store" section builds, and each
+    helper it defines is invoked with literal arguments registered in
+    ``FIXTURE_EXECUTED_BLOCKS`` above -- never guessed from a parameter's name.
+    """
+    body = _resolve_fixture_block_body(rel_path, anchor, invoke)
+    await _run_fixture_block(body, invoke)
