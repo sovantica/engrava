@@ -23,19 +23,34 @@ depends on whether the new version changes the schema.
 
 How migrations work: the core schema is versioned by SQLite's `PRAGMA
 user_version`. On the first `ensure_schema()`, Engrava runs each pending
-`vN → vN+1` step in turn (forward-only). **A step is not one atomic
-transaction** — most steps run their DDL in SQLite's implicit autocommit
-(`ALTER TABLE`, `CREATE INDEX`), and at least one (the FK-recreate step) opens
-and commits more than one transaction internally to work around a SQLite
-constraint. What is guaranteed instead: each step is **idempotent** — it
-checks its own postcondition and skips work already done — and
-`PRAGMA user_version` is written and committed only after a step returns
-successfully, so a step that raises partway through is safe to retry by
-re-running `ensure_schema()`; it resumes from whatever it left behind rather
-than redoing completed work or double-applying anything. Most steps are
-**additive** (new columns, tables, and indexes), but some rebuild a table in
-place (create a new table, copy rows, drop the old, rename) — so the on-disk
-shape of a table can change across a migration.
+`vN → vN+1` step in turn (forward-only). **Almost every step is one atomic
+transaction**: its DDL/DML and the `PRAGMA user_version` stamp that marks it
+done run inside a single explicit `BEGIN` / `COMMIT`, so a step that raises
+partway is rolled back in full — the database comes back exactly as it was
+before that step began, and the version is never stamped over a partial
+change. The one exception is the step that adds foreign keys to `edge`,
+`embedding` and `action` (`user_version` 11 → 12): it must toggle
+`PRAGMA foreign_keys` off and back on around rebuilding those three tables,
+and that pragma is a documented no-op while a transaction is open — a
+constraint confirmed unchanged across SQLite versions from 3.31 (2020) through
+current releases. That step commits its three table rebuilds together in
+their own internal transaction, but the step as a whole is not one atomic
+unit: a failure after the rebuilds commit but before the step returns can
+leave some of `edge` / `embedding` / `action` already carrying their foreign
+key while `user_version` is still unstamped.
+
+Every step — atomic or not — is also **idempotent**: it checks its own
+postcondition and skips work already done, and `PRAGMA user_version` is
+written and committed only after a step returns successfully. That is what
+makes re-running `ensure_schema()` after any failure safe: for an atomic
+step, the retry redoes the whole step from the unchanged pre-failure state;
+for the one step that is not atomic as a whole, the retry sees whatever
+partial foreign-key state the failed attempt left behind and finishes only
+the part that did not already complete. Either way, a step that raises never
+redoes completed work or double-applies anything. Most steps are **additive**
+(new columns, tables, and indexes), but some rebuild a table in place (create
+a new table, copy rows, drop the old, rename) — so the on-disk shape of a
+table can change across a migration.
 
 What that means for a rolling deploy:
 

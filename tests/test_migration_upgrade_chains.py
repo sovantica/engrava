@@ -69,6 +69,7 @@ from engrava.domain.exceptions import CoreMigrationError, SchemaVersionError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+    from pathlib import Path
 
 _HEAD_VERSION = 21
 
@@ -590,6 +591,24 @@ async def _user_version(db: aiosqlite.Connection) -> int:
     row = await cursor.fetchone()
     assert row is not None
     return int(row[0])
+
+
+async def _dump_thought_shape_and_rows(
+    db: aiosqlite.Connection,
+) -> tuple[list[tuple[object, ...]], list[tuple[object, ...]]]:
+    """Return ``(column_info, rows)`` for ``thought``, for a before/after diff.
+
+    Used by the per-step atomicity tests to prove a rolled-back step leaves
+    the table's column definitions (``PRAGMA table_info``) and every row's
+    decoded values (``SELECT *``) exactly matching what they were before the
+    step began, rather than trusting a single postcondition check. This is
+    not a byte-for-byte comparison and does not inspect ``thought``'s
+    foreign keys, indexes, triggers, or ``CHECK`` constraints — none of
+    which the steps this helper is used for ever touch.
+    """
+    columns = await (await db.execute("PRAGMA table_info(thought)")).fetchall()
+    rows = await (await db.execute("SELECT * FROM thought ORDER BY thought_id")).fetchall()
+    return [tuple(r) for r in columns], [tuple(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -1151,6 +1170,347 @@ async def test_v20_to_v21_partial_application_is_safe_to_retry(
         assert "revision" in {row["name"] for row in await cursor.fetchall()}
     await _assert_legacy_rows_survive(store)
     await _assert_api_roundtrip(store)
+
+
+# ---------------------------------------------------------------------------
+# 3b. Per-step transactional atomicity
+# ---------------------------------------------------------------------------
+#
+# ``_run_pending_core_migrations`` wraps every step except the FK-recreate step
+# (target version 12) in one explicit ``BEGIN``/``COMMIT`` together with its
+# ``PRAGMA user_version`` stamp. The two tests below force a real failure
+# *inside* a multi-statement step — not by reading the loop, but by making a
+# helper the step calls raise after some, but not all, of its statements have
+# already run against the connection — and show the database comes back
+# exactly as it was before the step began. The third test documents the one
+# step that cannot offer that guarantee as a single unit and shows what it
+# actually leaves behind, and that a retry still converges.
+
+
+async def test_atomic_step_failure_mid_step_leaves_database_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``v3 -> v4`` raising after 3 of its 4 ``ADD COLUMN`` calls rolls back all of them.
+
+    ``_migrate_core_v3_to_v4`` adds four columns to ``thought`` and then
+    backfills two of them. Patching ``_add_column_if_absent`` to raise on the
+    fourth column (after the first three real ``ALTER TABLE`` statements have
+    already executed against the connection) simulates a crash partway through
+    the step. Because the whole step now runs inside one explicit transaction,
+    the three columns that *did* execute must not survive the rollback: the
+    table's column definitions and every row's decoded values must read back
+    exactly matching the pre-migration snapshot (see
+    ``_dump_thought_shape_and_rows`` for exactly what that does and does not
+    cover), and ``user_version`` must never have moved off 3 —
+    not even transiently. A subsequent retry (the patch removed) must then
+    complete the step and the rest of the ladder, with the pre-existing rows
+    intact and the public API writable — proving idempotence was not
+    sacrificed to get atomicity.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    try:
+        await _bootstrap_core_at_version(conn, 3)
+        await _seed_legacy_rows(conn)
+
+        columns_before, rows_before = await _dump_thought_shape_and_rows(conn)
+
+        store = SqliteEngravaCore(conn)
+
+        added: list[str] = []
+        real_add_column = SqliteEngravaCore._add_column_if_absent
+
+        async def _flaky_add_column(
+            self: SqliteEngravaCore, table: str, column: str, column_type: str
+        ) -> None:
+            if column == "updated_at":
+                message = f"injected failure adding {column}"
+                raise RuntimeError(message)
+            added.append(column)
+            await real_add_column(self, table, column, column_type)
+
+        monkeypatch.setattr(SqliteEngravaCore, "_add_column_if_absent", _flaky_add_column)
+
+        with pytest.raises(RuntimeError, match="injected failure adding updated_at"):
+            await store.ensure_schema()
+
+        # Three of the four columns really did execute against the connection
+        # before the injected raise — this is not a no-op patch.
+        assert added == ["access_count", "last_accessed_at", "created_at"]
+
+        # The version must never have advanced past its pre-step value.
+        assert await _user_version(conn) == 3
+
+        # The schema and every row must be unchanged from before the step
+        # began: the three real ``ALTER TABLE`` statements that already ran
+        # must have been rolled back along with the rest of the transaction.
+        columns_after, rows_after = await _dump_thought_shape_and_rows(conn)
+        assert columns_after == columns_before
+        assert rows_after == rows_before
+        for column in ("access_count", "last_accessed_at", "created_at", "updated_at"):
+            assert not await store._column_exists("thought", column), (
+                f"{column} survived the rollback — the step was not atomic"
+            )
+
+        # Retry: idempotence intact, the step (and the rest of the ladder)
+        # completes, and pre-existing data survives.
+        monkeypatch.undo()
+        await store.ensure_schema()
+        assert await _user_version(conn) == _HEAD_VERSION
+        await _assert_legacy_rows_survive(store)
+        await _assert_api_roundtrip(store)
+    finally:
+        await conn.close()
+
+
+async def test_atomic_step_busy_commit_rolls_back_and_stays_retryable(
+    tmp_path: Path,
+) -> None:
+    """A ``COMMIT`` that itself fails under contention still leaves the step retryable.
+
+    Every other injected failure in this module raises from inside the step's
+    own DDL/DML, before ``COMMIT`` is ever attempted. This one instead drives
+    a real ``SQLITE_BUSY`` on the ``COMMIT`` of the last step (``v19 -> v20``,
+    a single additive ``ALTER TABLE``) by holding a second connection's read
+    transaction open across it — the one failure mode the DDL/DML-only tests
+    above cannot reach, since an in-memory connection has no second connection
+    to contend with.
+
+    ``ensure_schema`` must still raise. The migrating connection must be left
+    with no open transaction (not stuck mid-commit) and its own
+    ``PRAGMA user_version`` must read back the pre-step value, not the
+    uncommitted new one — otherwise a retry on this same connection reads the
+    uncommitted stamp and believes the step already applied. The *durable*
+    ``user_version``, read from an independent connection, must be unchanged
+    either way. Once the contending transaction is gone, a retried
+    ``ensure_schema`` on the very same (previously failed) connection must
+    actually run the step — not silently report the database as current.
+
+    Every connection opened here gets its own short ``timeout=``, bounding
+    how long SQLite's own busy-wait retries a locked statement before
+    raising ``OperationalError`` instead of leaving it at sqlite3's
+    multi-second default (this bounds SQLite's internal wait, not the
+    coroutine's own end-to-end latency, and the test does not depend on
+    wall-clock timing). Every connection is also closed from a ``finally``
+    that runs on every exit path, assertion failures included. On the
+    *unfixed* code the migrating connection is left mid-transaction, which by
+    itself is harmless -- but a `reader` (or any other connection) left open
+    past an early ``assert`` failure leaks its aiosqlite worker thread, and an
+    un-joined non-daemon thread hangs the whole interpreter at shutdown
+    instead of letting pytest ever report the failure. That hang was reproduced
+    live against the unfixed code before this fix (a bare ``reader`` opened
+    without its own ``finally``): the process had to be killed after the
+    external cap, and nothing it had already printed survived the kill,
+    which is indistinguishable from the test itself hanging.
+    """
+    db_path = tmp_path / "busy_commit.db"
+
+    # Half a second is generous for every wait this test needs and small
+    # enough that a genuine hang shows up as a fast, readable failure instead
+    # of burning the suite's time budget.
+    short_timeout = 0.5
+
+    setup = await aiosqlite.connect(str(db_path), timeout=short_timeout)
+    try:
+        await setup.execute("PRAGMA journal_mode=DELETE")
+        await _bootstrap_core_at_version(setup, 19)
+        await _seed_legacy_rows(setup)
+        await setup.commit()
+    finally:
+        await setup.close()
+
+    # A second connection holding an open read transaction is enough to make
+    # a concurrent writer's COMMIT fail with SQLITE_BUSY under a rollback
+    # journal, without ever touching the migrator's own statements.
+    reader = await aiosqlite.connect(str(db_path), timeout=short_timeout)
+    reader_closed = False
+    try:
+        await reader.execute("BEGIN")
+        await (await reader.execute("SELECT 1 FROM thought")).fetchall()
+
+        conn = await aiosqlite.connect(str(db_path), timeout=short_timeout)
+        conn.row_factory = aiosqlite.Row
+        try:
+            store = SqliteEngravaCore(conn)
+
+            with pytest.raises(aiosqlite.OperationalError, match="locked"):
+                await store.ensure_schema()
+
+            # No transaction left open on the migrating connection...
+            assert conn.in_transaction is False
+            # ...and its own view of user_version is the rolled-back pre-step
+            # value, not the uncommitted 20 a failed-but-unrolled-back COMMIT
+            # would have left visible on this same connection.
+            assert await _user_version(conn) == 19
+            # Nothing from the failed step's DDL survived either.
+            assert not await store._column_exists("thought", "archived_at")
+
+            # No migration change became durable: whatever rollback-journal
+            # I/O the failed COMMIT triggered underneath (a rollback journal
+            # can be created and synced before the lock upgrade fails), the
+            # ALTER TABLE and version stamp inside that transaction never
+            # committed, so a wholly independent connection still reads the
+            # pre-step version.
+            durable = await aiosqlite.connect(str(db_path), timeout=short_timeout)
+            try:
+                assert await _user_version(durable) == 19
+            finally:
+                await durable.close()
+
+            # Release the contending transaction and retry on the SAME
+            # connection that just failed. The bug this guards against:
+            # reading back the stuck, uncommitted user_version made a retry
+            # believe the database was already current and return without
+            # ever running the step -- so require that it actually ran this
+            # time. Closed here (not only in the outer `finally`) because the
+            # retry below needs the lock gone.
+            await reader.close()
+            reader_closed = True
+
+            await store.ensure_schema()
+            assert await _user_version(conn) == _HEAD_VERSION
+            assert await store._column_exists("thought", "archived_at")
+            await _assert_legacy_rows_survive(store)
+            await _assert_api_roundtrip(store)
+        finally:
+            await conn.close()
+    finally:
+        if not reader_closed:
+            await reader.close()
+
+
+async def test_atomic_step_ddl_only_failure_rolls_back_earlier_indexes() -> None:
+    """``v13 -> v14`` failing on its 3rd of 4 ``CREATE INDEX`` statements rolls back the first two.
+
+    Unlike the previous test (DDL + DML), this step is pure DDL: four
+    conditional ``CREATE INDEX IF NOT EXISTS`` statements. Seeding a
+    conflicting non-index object under the third index's name
+    (``idx_thought_updated_cycle``) makes that one ``CREATE INDEX`` raise a
+    real SQLite error after the first two have already executed. Both of those
+    must be rolled back along with the failure, not just left as an odd
+    "half-indexed" v13 database — and once the conflict is removed, a retry
+    must create all four and reach head.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    try:
+        await _bootstrap_core_at_version(conn, 13)
+        await _seed_legacy_rows(conn)
+        await conn.execute("CREATE TABLE idx_thought_updated_cycle (placeholder TEXT)")
+        await conn.commit()
+
+        store = SqliteEngravaCore(conn)
+        with pytest.raises(aiosqlite.OperationalError, match="idx_thought_updated_cycle"):
+            await store.ensure_schema()
+
+        assert await _user_version(conn) == 13
+        # The two indexes created before the conflicting one must have been
+        # rolled back along with it — not left behind as partial progress.
+        assert not await store._index_exists("idx_edge_to_thought")
+        assert not await store._index_exists("idx_embedding_owner")
+
+        await conn.execute("DROP TABLE idx_thought_updated_cycle")
+        await conn.commit()
+        await store.ensure_schema()
+
+        assert await _user_version(conn) == _HEAD_VERSION
+        await _assert_legacy_rows_survive(store)
+        await _assert_api_roundtrip(store)
+    finally:
+        await conn.close()
+
+
+async def test_fk_recreate_step_cannot_be_one_atomic_unit_but_still_converges() -> None:
+    """``v11 -> v12`` is the one step excluded from the outer transaction.
+
+    Its own table-swap (edge/embedding/action recreation) is atomic on its own
+    via an internal ``SAVEPOINT`` — a failure *inside* that swap rolls all
+    three back together (covered by the FK atomicity suite in
+    ``test_referential_integrity.py``). What this test demonstrates instead is
+    the residual, honestly-documented gap: the step as a **whole** is not one
+    transaction, because it must toggle ``PRAGMA foreign_keys`` — a documented
+    no-op inside any open transaction — around the swap.
+
+    The scenario: a database that already carries the FK on ``edge`` (as if an
+    earlier attempt already completed that part) but is missing
+    ``idx_edge_type_from`` (dropped independently) with a conflicting
+    placeholder object occupying that name, while ``embedding`` and ``action``
+    still lack their FK entirely. ``_migrate_core_v11_to_v12`` recreates
+    ``embedding`` and ``action`` (the savepoint-guarded swap succeeds and
+    commits), and only *then* — outside that swap, back in the outer method —
+    tries to repair the missing edge index and fails. The result is exactly
+    the shape the upgrade guide now describes for this step: some of the
+    step's work (embedding and action's foreign keys) is durably applied,
+    ``user_version`` never advances past 11, and the failure is retryable —
+    removing the conflict and re-running converges to head with the
+    pre-existing rows intact.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    try:
+        await _bootstrap_core_at_version(conn, 11)
+        await _seed_legacy_rows(conn)
+
+        # Simulate "edge already has its FK from an earlier attempt": recreate
+        # edge with the FK by hand, matching _recreate_edge_with_fk's shape,
+        # but deliberately do NOT recreate its index — then occupy that name
+        # with a non-index object, as a legacy/partial state would leave it.
+        await conn.execute(
+            "CREATE TABLE edge_new ("
+            "  edge_id           TEXT PRIMARY KEY,"
+            "  from_thought_id   TEXT NOT NULL,"
+            "  to_thought_id     TEXT NOT NULL,"
+            "  edge_type         TEXT NOT NULL,"
+            "  weight            REAL NOT NULL DEFAULT 0.5,"
+            "  created_cycle     INTEGER NOT NULL DEFAULT 0,"
+            "  source            TEXT NOT NULL DEFAULT 'EXPERIENCE',"
+            "  decay_multiplier  REAL NOT NULL DEFAULT 1.0,"
+            "  UNIQUE(from_thought_id, to_thought_id, edge_type),"
+            "  FOREIGN KEY (from_thought_id) REFERENCES thought(thought_id) ON DELETE CASCADE,"
+            "  FOREIGN KEY (to_thought_id)   REFERENCES thought(thought_id) ON DELETE CASCADE"
+            ")"
+        )
+        await conn.execute(
+            "INSERT INTO edge_new SELECT "
+            "  edge_id, from_thought_id, to_thought_id, edge_type, weight, "
+            "  created_cycle, source, decay_multiplier FROM edge"
+        )
+        await conn.execute("DROP INDEX idx_edge_type_from")
+        await conn.execute("DROP TABLE edge")
+        await conn.execute("ALTER TABLE edge_new RENAME TO edge")
+        await conn.execute("CREATE TABLE idx_edge_type_from (placeholder TEXT)")
+        await conn.commit()
+
+        store = SqliteEngravaCore(conn)
+        assert await store._fk_present("edge", "from_thought_id")
+        assert not await store._fk_present("embedding", "owner_id")
+        assert not await store._fk_present("action", "source_thought_id")
+
+        with pytest.raises(aiosqlite.OperationalError, match="idx_edge_type_from"):
+            await store.ensure_schema()
+
+        # The step failed as a whole: the version never advanced past 11.
+        assert await _user_version(conn) == 11
+        # But part of its work is durably applied — the honestly-documented
+        # residual: embedding and action already carry their FK even though
+        # the step that was supposed to add them never "completed".
+        assert await store._fk_present("embedding", "owner_id")
+        assert await store._fk_present("action", "source_thought_id")
+        # Foreign-key enforcement itself was correctly restored despite the
+        # failure — the connection is not left with enforcement silently off.
+        fk_pragma = await (await conn.execute("PRAGMA foreign_keys")).fetchone()
+        assert fk_pragma[0] == 1
+
+        # Remove the conflict and retry: convergent despite the partial state.
+        await conn.execute("DROP TABLE idx_edge_type_from")
+        await conn.commit()
+        await store.ensure_schema()
+
+        assert await _user_version(conn) == _HEAD_VERSION
+        await _assert_legacy_rows_survive(store)
+        await _assert_api_roundtrip(store)
+    finally:
+        await conn.close()
 
 
 # ---------------------------------------------------------------------------

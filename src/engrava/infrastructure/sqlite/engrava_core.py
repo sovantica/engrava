@@ -173,6 +173,19 @@ _CORE_SCHEMA_BOOTSTRAP_FLOOR = 2
 #: ``user_version`` against head without one.
 CORE_SCHEMA_HEAD_VERSION = 21
 
+#: Target version of the one core-migration step that manages its own
+#: transaction boundaries rather than running inside the single explicit
+#: transaction :meth:`SqliteEngravaCore._run_pending_core_migrations` opens for
+#: every other step (see :meth:`SqliteEngravaCore._migrate_core_v11_to_v12` and
+#: :meth:`SqliteEngravaCore._recreate_child_tables_with_fk_atomically`).
+#: ``PRAGMA foreign_keys`` is a documented no-op while a transaction is open —
+#: this step must toggle it to rebuild ``edge`` / ``embedding`` / ``action``
+#: with their foreign keys — and that no-op behaviour was verified empirically
+#: against SQLite 3.31.1 (2020, compiled from the upstream amalgamation) and
+#: 3.53.1 (current) before writing this constant: it is a stable, long-standing
+#: engine constraint, not a stale assumption inherited without checking.
+_FK_RECREATE_TARGET_VERSION: Final = 12
+
 #: Core tables whose presence on a sub-floor database means it is a real,
 #: populated store rather than an empty file — see
 #: :meth:`SqliteEngravaCore._has_any_core_table`.
@@ -2514,12 +2527,66 @@ class SqliteEngravaCore:
         only the steps whose target version exceeds ``current_version``. Each
         step is idempotent and **verifies its own postcondition**, raising
         :class:`CoreMigrationError` (or the underlying SQLite error) before it
-        returns if the migrated structure is absent. The ``user_version`` is
-        stamped and committed only *after* the step returns successfully, so a
-        failed or interrupted migration leaves the version at the last
-        fully-applied step and the next ``ensure_schema`` retries the remaining
-        tail — a failure can never mark the database current over a
-        partially-migrated schema.
+        returns if the migrated structure is absent.
+
+        **Atomicity.** Every step here except
+        :data:`_FK_RECREATE_TARGET_VERSION` runs its DDL/DML, the
+        ``PRAGMA user_version`` stamp, and the ``COMMIT`` itself all inside
+        one ``try``: SQLite's schema-modifying statements (``ALTER TABLE``,
+        ``CREATE TABLE|INDEX|TRIGGER``, ``DROP``, the FTS5 rebuild) are fully
+        transactional, so a step whose DDL/DML or version stamp raises
+        partway rolls back to exactly the database state before it began —
+        nothing it already executed survives the failure — and the version
+        is never stamped over a partial change. A failing ``COMMIT`` itself
+        (for example SQLite reporting the database locked because a
+        concurrent reader still holds a transaction) is covered the same
+        way: the rollback that follows returns the connection to that same
+        pre-step state, with no transaction left open on it and the durable
+        ``user_version`` unchanged, so a retry does not read back an
+        uncommitted stamp on this connection and mistake the step for
+        already applied. That guarantee holds when the compensating
+        rollback itself succeeds. If it instead raises an ``Exception``,
+        that failure is logged and the original migration failure is still
+        what propagates (see the ``except`` block below) — but if the
+        rollback, or the logging call right after it, raises something that
+        is not an ``Exception`` — a cancellation delivered while this
+        coroutine is suspended on that ``await`` is the case that matters
+        here, and a logging handler that itself raises from ``emit()``
+        behaves the same way — the inner ``except Exception`` does not
+        catch it: that exception propagates in the original failure's
+        place, with the original kept only as its ``__context__``. Either
+        way, once the
+        compensating rollback has failed, this connection's transaction
+        state is no longer known and it should not be reused. When the
+        rollback does succeed, a retry
+        re-enters the same step from that unchanged state, and because
+        every step is *also* independently idempotent (checks its own
+        postcondition, guards its own ``ADD COLUMN`` / uses
+        ``IF NOT EXISTS``), the retry converges whether or not this outer
+        transaction is what rolled the previous attempt back.
+
+        The one exception is the foreign-key recreate step
+        (``_FK_RECREATE_TARGET_VERSION`` / :meth:`_migrate_core_v11_to_v12`),
+        which is **not** wrapped here: it must toggle
+        ``PRAGMA foreign_keys`` off and back on around its own table swap, and
+        that pragma is a documented no-op while any transaction — including
+        the one this method would open — is already active. When the swap is
+        actually needed (some child table still lacks its FK),
+        :meth:`_migrate_core_v11_to_v12` calls
+        :meth:`_recreate_child_tables_with_fk_atomically`, whose own leading
+        ``commit()`` closes any transaction left open by an earlier step
+        before toggling the pragma — from that point this step runs in
+        autocommit and provides its own atomicity for the swap via an
+        internal ``SAVEPOINT`` (see that method's docstring for exactly what
+        it can leave behind and why re-running is still safe). When no
+        *existing* table needs the swap (each one either already carries
+        its FK or was never there to begin with — a partial database is
+        "nothing to migrate" here, same as the comment above this method's
+        ``migration_needed`` computation says), that call — and its leading
+        ``commit()`` — never happens: the trailing
+        ``CREATE INDEX`` and the ``PRAGMA user_version`` stamp this step
+        still issues then run in whatever transaction state the connection
+        was already in when this step started, not necessarily autocommit.
 
         Args:
             current_version: The database's current ``user_version``. It is at
@@ -2530,9 +2597,40 @@ class SqliteEngravaCore:
         for target_version, migrate in self._core_migration_steps():
             if target_version <= current_version:
                 continue
-            await migrate()
-            await self._db.execute(f"PRAGMA user_version = {target_version}")
-            await self._db.commit()
+            if target_version == _FK_RECREATE_TARGET_VERSION:
+                await migrate()
+                await self._db.execute(f"PRAGMA user_version = {target_version}")
+                await self._db.commit()
+                continue
+            await self._db.execute("BEGIN")
+            try:
+                await migrate()
+                await self._db.execute(f"PRAGMA user_version = {target_version}")
+                await self._db.commit()
+            except BaseException:
+                # ``BaseException``, not ``Exception``: a cancellation delivered
+                # mid-step must also roll back rather than leave a half-applied
+                # schema change committed by a later, unrelated statement.
+                # ``commit()`` is inside this ``try`` (not after it) for the
+                # same reason: a ``COMMIT`` that itself fails -- e.g. SQLite
+                # reporting the database locked because a concurrent reader
+                # still holds a transaction -- otherwise left the transaction
+                # open on this connection, which then reads back the
+                # *uncommitted* new ``user_version`` and can make a retried
+                # ``ensure_schema`` on this same connection believe the step
+                # already applied when nothing durable happened at all.
+                try:
+                    await self._db.rollback()
+                except Exception:
+                    # A rollback failure here does not change what needs to
+                    # propagate -- the migration failure above is still the
+                    # real error. Logged rather than raised, the same
+                    # convention ``_close_quietly`` uses for a cleanup
+                    # failure while another exception is already in flight
+                    # (see its docstring), applied here to a rollback
+                    # instead of a close.
+                    logger.warning("Error rolling back failed core migration step", exc_info=True)
+                raise
 
     async def _has_any_core_table(self) -> bool:
         """Return whether the database already carries user data in a core table.
@@ -2948,6 +3046,13 @@ class SqliteEngravaCore:
     ) -> None:
         # Write-lock classification: bucket 2 (schema bootstrap) -- see ensure_schema.
         """Recreate the child tables that still lack their FK, atomically.
+
+        :meth:`_run_pending_core_migrations` wraps every other core-migration
+        step in one outer transaction but deliberately excludes this one's
+        target version (see ``_FK_RECREATE_TARGET_VERSION``): that pragma
+        toggle below is a no-op inside a transaction, so an outer ``BEGIN``
+        would silently defeat it. This method is where the atomicity for the
+        excluded step actually lives instead.
 
         All three recreations run inside ONE explicit SAVEPOINT so the whole
         swap is atomic. Under sqlite3 legacy isolation (aiosqlite's default) the
