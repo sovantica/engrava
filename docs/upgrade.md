@@ -1078,8 +1078,9 @@ version checks are also new: destructive commands refuse outside the head
 version, read commands warn below it and refuse above it, and the new
 `SchemaVersionError` (exported from the package root) is what `ensure_schema()`,
 `from_config()`, `EngravaManager.get_store()`, and `engrava migrate` raise
-when a database is a populated schema below the bootstrap floor, or stamped
-above this build's head version.
+when a database is a populated schema below the bootstrap floor, an empty
+but older-shaped schema below that same floor, or stamped above this
+build's head version.
 
 **What to do.** Run `engrava migrate` if you have not already, on any
 database below head that you plan to run `gc` or `restore` against. If the
