@@ -230,8 +230,12 @@ capability. With the seam disabled — the default — the recipe above is compl
 as written.
 
 For large corpora, import in batches (e.g. a few thousand rows per
-`suspend_auto_commit()` block) to keep each transaction short — long
-transactions block the background SQLite thread (see
+`suspend_auto_commit()` block) to keep each transaction short. A slow SQL
+statement blocks the background SQLite thread; an open transaction alone does
+not, but the window holds the store's write lock, so a different task's write
+waits for it, for at most `write_lock_acquire_timeout_seconds`, and raises
+`WriteLockTimeoutError` after that — a long hold can make the waiting write
+fail instead of complete (see
 [Known Limitations](../known-limitations.md#aiosqlite-proxy-architecture)).
 If you have embeddings configured, note that each new thought is embedded on
 write (see the [Embeddings guide](embeddings.md)), so a bulk load pays the

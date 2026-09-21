@@ -120,8 +120,14 @@ SQLite on a dedicated background thread and proxies calls via `asyncio`.
 This has implications:
 
 - **Connection objects** should not be shared across event loops.
-- **Long-running transactions** block the background thread — keep transactions
-  short.
+- **Long-running SQL statements** block the background thread: it runs one call
+  at a time, so a slow statement delays every other call on that connection. An
+  open transaction alone does not — while a `suspend_auto_commit()` window sits
+  idle, other tasks' reads still run. What the window does hold is the store's
+  write lock, so a different task's write waits for it, for at most
+  `write_lock_acquire_timeout_seconds`, and raises `WriteLockTimeoutError`
+  after that — a long hold can make the waiting write fail instead of complete
+  (see [Concurrency](concurrency.md)). Keep transactions short.
 - **WAL mode** is used by default for concurrent read access. Writes are
   serialized by SQLite's single-writer lock.
 
