@@ -198,13 +198,15 @@ locking — that is the supported way to run independent writers.
 
 Separately: if the store ever quarantines its connection
 (an internal safety response to an indeterminate transaction), quarantine
-revokes admission synchronously: every new operation on the store or its journal
-then fails fast with `ConnectionQuarantinedError`, so no write can flush an
-orphaned transaction. It does not retract an operation already in flight — a
-reader admitted just before quarantine may complete a possibly-stale read on the
-pre-quarantine connection (never a commit). During quarantine the physical
-connection close is a detached, best-effort cleanup; a permanently-hung close is
-only a pending-task lifecycle nicety, not a safety concern.
+revokes admission synchronously: any new operation that touches the database or
+its journal then fails fast with `ConnectionQuarantinedError`, so no write can
+flush an orphaned transaction. A call that never reaches the database can still
+return, for example a search with an empty query text or a degenerate query
+vector, which returns `[]`. Quarantine does not retract an operation already in
+flight — a reader admitted just before quarantine may complete a possibly-stale
+read on the pre-quarantine connection (never a commit). During quarantine the
+physical connection close is a detached, best-effort cleanup; a permanently-hung
+close is only a pending-task lifecycle nicety, not a safety concern.
 
 ## Embedding Dimension Consistency
 
