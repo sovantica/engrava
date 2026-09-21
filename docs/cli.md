@@ -130,6 +130,42 @@ $ echo $?
 1
 ```
 
+## Unreadable or corrupt databases
+
+`info`, `verify`, `query`, `gc`, `migrate`, and `export` open the configured
+database before doing anything else, and so do `snapshot` and `restore` when
+no `--config` is also given. A file that exists but is not a valid SQLite
+database (truncated, corrupted, or a plain text file), a path that is a
+directory, or any other failure while opening it exits `1` with a message
+naming the configured path — never a stack trace and never a hang:
+
+```bash
+$ engrava --db corrupt.sqlite info
+info: corrupt.sqlite: unexpected DatabaseError: file is not a database
+$ echo $?
+1
+```
+
+The named path is exactly the one the invocation was configured with — via
+`--db`, `ENGRAVA_DB`, or the CLI's own default — never resolved to an absolute
+path the caller did not supply. Rerun with `--verbose` to log the caught
+exception's stack (frame filename, line, and function only, the same
+deliberately-not-a-full-traceback shape the `remember` / `recall` / `link`
+`unexpected_error` exit code uses, below) at `DEBUG` for a bug report.
+
+`snapshot` and `restore` are the two exceptions: when `--config` is also
+given to either, the CLI loads it in its own group callback, before either
+command's body — and this boundary — ever runs. A `--config` value the
+loader itself rejects — missing, unparseable YAML, or the wrong shape —
+still exits `1` with a clean `Error: ...` message from that same callback;
+a `--config` path that cannot even be opened (a directory, a
+permission error, content that is not valid UTF-8) is not caught there and
+can exit `1` with a raw traceback instead of a message naming the path.
+
+The `--service` branch of `snapshot` / `restore` resolves a different,
+per-service path through service resolution (see above) instead — an
+unclassified failure there is not yet named this way either.
+
 ### `info`
 
 Shows a metrics snapshot (counts, etc.) for the current database. Takes no
@@ -250,7 +286,7 @@ $ echo $?
 | Code | Meaning |
 |---|---|
 | `0` | Success. |
-| `1` | An **unanticipated** failure — anything the command's own validation does not specifically check for (a corrupt database file, a directory given as `--db`, an unreadable or non-UTF-8 `--config`, ...). Every one of these three commands runs its whole body under a single error boundary: a check the command performs itself (below) keeps its own specific code and `error` kind, but *any other* exception is converted here instead of tracebacking. The message usually names the exception's type and text (e.g. `recall: unexpected DatabaseError: file is not a database`) — actionable, but never a stack trace; either half falls back to a fixed placeholder if it cannot be read safely, and a genuine Ctrl-C or `sys.exit()` raised while that message is being built escapes immediately instead of becoming this exit code at all. Rerun with `--verbose` to log the caught exception's stack (to stderr, at `DEBUG`) for a real bug report — deliberately not a full traceback: it lists each frame's filename, line number, and function name, read from the exception's own traceback without calling the exception's formatter (or a cause's, a context's, or an exception group's) a second time. That trade gives up some diagnostic detail — no chained-exception text, no source lines, no local variables — for a Ctrl-C or `sys.exit()` landing while `--verbose` builds that output now escaping immediately too, rather than the earlier behaviour where it could be absorbed and the command would still exit `1` with an ordinary error object. |
+| `1` | An **unanticipated** failure — anything the command's own validation does not specifically check for (a corrupt database file, a directory given as `--db`, an unreadable or non-UTF-8 `--config`, ...). Every one of these three commands runs its whole body under a single error boundary: a check the command performs itself (below) keeps its own specific code and `error` kind, but *any other* exception is converted here instead of tracebacking. The message names the resolved database's path, right after the command name, followed by the exception's own type and text (e.g. `recall: /data/store.db: unexpected DatabaseError: file is not a database`) — actionable, and specific to *this* invocation's database rather than leaving an operator running against several stores to guess which one failed. It is never a stack trace; either half of the exception's own description falls back to a fixed placeholder if it cannot be read safely, and a genuine Ctrl-C or `sys.exit()` raised while that message is being built escapes immediately instead of becoming this exit code at all. The path is only named once the database has actually been resolved — a failure earlier than that (there is none today) would fall back to the path-free `recall: unexpected ...` form. Rerun with `--verbose` to log the caught exception's stack (to stderr, at `DEBUG`) for a real bug report — deliberately not a full traceback: it lists each frame's filename, line number, and function name, read from the exception's own traceback without calling the exception's formatter (or a cause's, a context's, or an exception group's) a second time. That trade gives up some diagnostic detail — no chained-exception text, no source lines, no local variables — for a Ctrl-C or `sys.exit()` landing while `--verbose` builds that output now escaping immediately too, rather than the earlier behaviour where it could be absorbed and the command would still exit `1` with an ordinary error object. |
 | `2` | A usage or validation error: an unknown edge type, an empty `TEXT`, a malformed `--meta` / `--filter` token, an out-of-range `--top-k` / `--weight`, or a non-empty `--config` that does not exist or fails to parse. The message names the offending value when available, and for an enum, every valid member. |
 | `3` | The resolved database does not exist (`recall` only — `remember` / `link` create it instead). |
 | `4` | `link` named a `FROM` or `TO` thought that does not exist. The message names it, when available. |

@@ -1970,16 +1970,34 @@ class TestJournalledMergeCollisionGate:
         runner: CliRunner,
         journalled_db: Path,
     ) -> None:
-        """A foreign-key violation is a different, pre-existing error and keeps its own behavior.
+        """A foreign-key violation is a different, pre-existing error and keeps its own kind.
 
         An incoming edge whose endpoints do not exist in the target violates
         ``edge``'s foreign keys to ``thought`` -- a ``sqlite3.IntegrityError``
         with ``sqlite_errorcode`` ``787`` (``SQLITE_CONSTRAINT_FOREIGNKEY``),
         never ``1555`` or ``2067``. The gate must not catch this: it is not a
-        collision the gate is scoped to, so it has to propagate exactly as it
-        always did (an uncaught ``IntegrityError``, not the gate's
-        ``click.ClickException``) whether or not the journalled-merge
-        collision gate is active for this restore.
+        collision the gate is scoped to, so it never becomes the gate's own
+        ``click.ClickException`` (naming ``--orphan-journal-entries``)
+        regardless of whether the journalled-merge collision gate is active
+        for this restore.
+
+        It no longer escapes the CLI *uncaught*, though: ``_run_command``
+        (see ``engrava.cli.main``) now converts it, the same as any other
+        unclassified database failure, into exit ``1`` with a message naming
+        the resolved database and the exception's own type and text -- not a
+        raw traceback that never says which store hit the violation. That
+        conversion is exactly why ``sqlite3.IntegrityError`` /
+        ``sqlite_errorcode`` are no longer observable through
+        ``result.exception`` or ``result.output``: the printed text is
+        ``"restore: <path>: unexpected IntegrityError: FOREIGN KEY
+        constraint failed"``, and nowhere in it -- not in the command name,
+        not in the path, not in the exception's own text -- does SQLite's
+        numeric error code ever appear. This test therefore
+        pins the type/code claim directly against ``_import_records_to_db``
+        -- the function ``restore`` calls, one layer below the boundary that
+        converts the exception -- and pins the CLI-visible behaviour (exit
+        code, database naming, no gate message) separately against the
+        ``restore`` command itself.
         """
         snap = journalled_db.parent / "fk-violation.jsonl"
         edge_data = {
@@ -1992,15 +2010,40 @@ class TestJournalledMergeCollisionGate:
         }
         snap.write_text(json.dumps({"_type": "edge", "data": edge_data}) + "\n", encoding="utf-8")
 
+        async def _direct_import() -> BaseException:
+            import aiosqlite
+
+            conn = await aiosqlite.connect(str(journalled_db))
+            try:
+                # SQLite ships with foreign-key enforcement off per connection;
+                # ``restore`` itself turns this on when it opens its own
+                # connection (see ``_open_db`` in ``engrava.cli.main``), so a
+                # direct connection needs the same pragma to reproduce the
+                # violation this test pins.
+                await conn.execute("PRAGMA foreign_keys = ON")
+                await _import_records_to_db(conn, snap, orphan_journal_entries=False)
+            except BaseException as exc:  # noqa: BLE001 -- pinning exactly what escapes here
+                return exc
+            finally:
+                await conn.close()
+            pytest.fail("_import_records_to_db did not raise for an FK violation")
+
+        direct_exc = asyncio.run(_direct_import())
+        assert type(direct_exc) is sqlite3.IntegrityError, direct_exc
+        assert direct_exc.sqlite_errorcode == 787
+        assert direct_exc.sqlite_errorcode not in (1555, 2067)
+
         result = runner.invoke(
             cli,
             ["--db", str(journalled_db), "restore", "-i", str(snap)],
             standalone_mode=False,
         )
 
-        assert isinstance(result.exception, sqlite3.IntegrityError), result.exception
-        assert result.exception.sqlite_errorcode == 787
-        assert "orphan-journal-entries" not in str(result.exception)
+        assert isinstance(result.exception, SystemExit), result.exception
+        assert result.exception.code == 1
+        assert str(journalled_db) in result.output
+        assert "IntegrityError" in result.output
+        assert "orphan-journal-entries" not in result.output
 
     async def test_a_refused_collision_leaves_the_connection_out_of_a_transaction(
         self,
@@ -2417,14 +2460,26 @@ def _assert_completed_fails_fast(
     )
 
 
-def _assert_fails_fast_and_names_the_problem(args: list[str]) -> None:
-    """Assert *args* exits non-zero, promptly, with the failure named."""
+def _assert_fails_fast_and_names_the_problem(args: list[str], *, db_path: Path) -> None:
+    """Assert *args* exits non-zero, promptly, naming the configured database's own path.
+
+    Stronger than checking the word "database" appears: that word alone
+    survives a regression to a message like "a database error occurred",
+    which leaves an operator running against several stores -- or with the
+    path coming from ``ENGRAVA_DB``/``--config`` rather than a literal
+    ``--db`` on the command they typed -- unable to tell which store failed.
+    Checking for *this invocation's* ``db_path`` fails on exactly that
+    regression, and also failed against the pre-fix behaviour (a raw Python
+    traceback whose frames name this CLI's own source files, never the
+    caller's database) -- see this test module's own history for the
+    red-then-green run that proved it.
+    """
     completed, elapsed = _run_engrava_subprocess(args)
     _assert_completed_fails_fast(completed, elapsed)
-    combined = (completed.stdout + completed.stderr).lower()
-    assert "database" in combined, (
-        f"expected the failure to name the database problem\nstdout={completed.stdout!r}\n"
-        f"stderr={completed.stderr!r}"
+    combined = completed.stdout + completed.stderr
+    assert str(db_path) in combined, (
+        f"expected the failure to name the configured database path {str(db_path)!r}\n"
+        f"stdout={completed.stdout!r}\nstderr={completed.stderr!r}"
     )
 
 
@@ -2477,25 +2532,33 @@ class TestCorruptDatabaseExitsInsteadOfHanging:
     """
 
     def test_info(self, corrupt_db: Path, populated_db: Path) -> None:
-        _assert_fails_fast_and_names_the_problem(["--db", str(corrupt_db), "info"])
+        _assert_fails_fast_and_names_the_problem(
+            ["--db", str(corrupt_db), "info"], db_path=corrupt_db
+        )
         _assert_succeeds(["--db", str(populated_db), "info"])
 
     def test_verify(self, corrupt_db: Path, populated_db: Path) -> None:
-        _assert_fails_fast_and_names_the_problem(["--db", str(corrupt_db), "verify"])
+        _assert_fails_fast_and_names_the_problem(
+            ["--db", str(corrupt_db), "verify"], db_path=corrupt_db
+        )
         _assert_succeeds(["--db", str(populated_db), "verify"])
 
     def test_query(self, corrupt_db: Path, populated_db: Path) -> None:
         _assert_fails_fast_and_names_the_problem(
-            ["--db", str(corrupt_db), "query", "COUNT thoughts"]
+            ["--db", str(corrupt_db), "query", "COUNT thoughts"], db_path=corrupt_db
         )
         _assert_succeeds(["--db", str(populated_db), "query", "COUNT thoughts"])
 
     def test_gc(self, corrupt_db: Path, populated_db: Path) -> None:
-        _assert_fails_fast_and_names_the_problem(["--db", str(corrupt_db), "gc", "--dry-run"])
+        _assert_fails_fast_and_names_the_problem(
+            ["--db", str(corrupt_db), "gc", "--dry-run"], db_path=corrupt_db
+        )
         _assert_succeeds(["--db", str(populated_db), "gc", "--dry-run"])
 
     def test_migrate(self, corrupt_db: Path, tmp_path: Path) -> None:
-        _assert_fails_fast_and_names_the_problem(["--db", str(corrupt_db), "migrate"])
+        _assert_fails_fast_and_names_the_problem(
+            ["--db", str(corrupt_db), "migrate"], db_path=corrupt_db
+        )
         # migrate is the one built-in whose target need not exist yet — a
         # fresh path is its own "known good" control (see
         # TestMigrate.test_migrate_creates_schema above).
@@ -2505,7 +2568,7 @@ class TestCorruptDatabaseExitsInsteadOfHanging:
         bad_out = tmp_path / "bad.snapshot.jsonl"
         good_out = tmp_path / "good.snapshot.jsonl"
         _assert_fails_fast_and_names_the_problem(
-            ["--db", str(corrupt_db), "snapshot", "-o", str(bad_out)]
+            ["--db", str(corrupt_db), "snapshot", "-o", str(bad_out)], db_path=corrupt_db
         )
         _assert_succeeds(["--db", str(populated_db), "snapshot", "-o", str(good_out)])
 
@@ -2513,13 +2576,13 @@ class TestCorruptDatabaseExitsInsteadOfHanging:
         bad_out = tmp_path / "bad.export.json"
         good_out = tmp_path / "good.export.json"
         _assert_fails_fast_and_names_the_problem(
-            ["--db", str(corrupt_db), "export", "-o", str(bad_out)]
+            ["--db", str(corrupt_db), "export", "-o", str(bad_out)], db_path=corrupt_db
         )
         _assert_succeeds(["--db", str(populated_db), "export", "-o", str(good_out)])
 
     def test_restore(self, corrupt_db: Path, valid_snapshot: Path, tmp_path: Path) -> None:
         _assert_fails_fast_and_names_the_problem(
-            ["--db", str(corrupt_db), "restore", "-i", str(valid_snapshot)]
+            ["--db", str(corrupt_db), "restore", "-i", str(valid_snapshot)], db_path=corrupt_db
         )
         good_target = tmp_path / "restored-for-control.db"
         _assert_succeeds(["--db", str(good_target), "restore", "-i", str(valid_snapshot)])

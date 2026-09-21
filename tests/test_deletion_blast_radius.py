@@ -1403,7 +1403,17 @@ class TestGcArchivedBlastRadius:
             assert _sync_id_set(conn, _ALL_EMBEDDING_OWNERS) == thoughts_before
             assert _sync_id_set(conn, _ALL_ACTION_IDS) == actions_before
             assert _sync_vec_rowids(conn) == vectors_before
-        assert isinstance(result.exception, sqlite3.OperationalError), result.exception
+        # The purge failure no longer escapes as a raw, uncaught
+        # OperationalError: `_run_command` (engrava.cli.main) now converts
+        # every unclassified database failure into a clean exit-1 message
+        # naming the resolved database, the same as a corrupt file or a
+        # directory given as --db. The rollback this test exists to prove
+        # is unaffected either way -- what changed is only how the already-
+        # rolled-back failure is reported.
+        assert isinstance(result.exception, SystemExit), result.exception
+        assert result.exception.code == 1
+        assert str(vec_indexed_mixed_lifecycle_db) in result.output
+        assert "OperationalError" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -2217,4 +2227,11 @@ class TestGcExpiredBlastRadius:
             assert _sync_id_set(conn, _ALL_EMBEDDING_OWNERS) == set(_TTL_THOUGHT_IDS)
             assert _sync_id_set(conn, _ALL_ACTION_IDS) == all_actions
             assert _sync_vec_rowids(conn) == vectors_before
-        assert isinstance(result.exception, sqlite3.OperationalError), result.exception
+        # See the matching comment in TestGcArchivedBlastRadius's own
+        # purge-failure test: `_run_command` now converts this into a clean
+        # exit-1 message naming the resolved database instead of an
+        # uncaught OperationalError -- the rollback is unaffected.
+        assert isinstance(result.exception, SystemExit), result.exception
+        assert result.exception.code == 1
+        assert str(vec_indexed_ttl_lifecycle_db) in result.output
+        assert "OperationalError" in result.output

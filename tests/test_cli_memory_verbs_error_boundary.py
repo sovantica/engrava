@@ -89,6 +89,7 @@ class TestPreviouslyTracebackingCasesNowProduceTheDocumentedObject:
         assert result.exit_code == 1
         payload = json.loads(_last_line(result.output))
         assert payload["error"] == "unexpected_error"
+        assert str(target) in payload["message"]
 
     def test_corrupt_database_file_is_the_documented_object(self, tmp_path: Path) -> None:
         db = tmp_path / "corrupt.db"
@@ -100,7 +101,11 @@ class TestPreviouslyTracebackingCasesNowProduceTheDocumentedObject:
         assert result.exit_code == 1
         payload = json.loads(_last_line(result.output))
         assert payload["error"] == "unexpected_error"
-        assert "database" in payload["message"].lower()
+        # Stronger than "mentions the word database": that survives a
+        # regression to a message that no longer names *which* database --
+        # exactly the gap an operator running against several stores, or
+        # with the path coming from --config/ENGRAVA_DB, hits.
+        assert str(db) in payload["message"]
 
     def test_uninitialised_empty_database_is_the_documented_object(self, tmp_path: Path) -> None:
         db = tmp_path / "empty.db"
@@ -112,6 +117,7 @@ class TestPreviouslyTracebackingCasesNowProduceTheDocumentedObject:
         assert result.exit_code == 1
         payload = json.loads(_last_line(result.output))
         assert payload["error"] == "unexpected_error"
+        assert str(db) in payload["message"]
 
     def test_directory_as_config_is_the_documented_object(self, tmp_path: Path) -> None:
         config_dir = tmp_path / "a_directory.yaml"
@@ -165,6 +171,7 @@ class TestPreviouslyTracebackingCasesNowProduceTheDocumentedObject:
         assert result.exit_code == 1
         payload = json.loads(_last_line(result.output))
         assert payload["error"] == "unexpected_error"
+        assert str(db) in payload["message"]
 
 
 class _NobodyAnticipatedError(Exception):
@@ -1121,7 +1128,10 @@ class TestMutationSurvivorsFromTheReviewAreNowClosedGaps:
 
         result = runner.invoke(cli, ["--db", str(db), "remember", "hi", "--json"])
         payload = json.loads(_last_line(result.output))
-        assert payload["message"].startswith("remember: unexpected ")
+        # The resolved database sits between the command name and
+        # "unexpected" -- naming *which* database is what this whole
+        # boundary now exists to add over a bare "remember: unexpected ...".
+        assert payload["message"].startswith(f"remember: {db}: unexpected ")
 
     def test_unexpected_error_is_logged_with_a_frame_stack_under_verbose(
         self,

@@ -487,6 +487,17 @@ async def _apply_destructive_schema_gate(conn: Any, *, command: str) -> None:  #
 def _run(coro: Any) -> Any:  # noqa: ANN401
     """Run an async coroutine from sync CLI context.
 
+    Shared with ``engrava.cli.memory_commands``, whose three verbs run their
+    own coroutine under this exact call but already have their own
+    catch-all -- :func:`~engrava.cli.memory_commands._error_boundary` wraps
+    the call itself, not just the coroutine -- so this stays a bare
+    ``asyncio.run()`` rather than gaining the failure-conversion
+    :func:`_run_command` below adds for this module's own eight built-ins.
+    Giving this shared, lower-level function that behaviour too would run it
+    a second time for every memory-verb failure, replacing
+    ``_error_boundary``'s own ``--json``-aware conversion with this module's
+    plainer, stderr-only one.
+
     Args:
         coro: Awaitable to execute.
 
@@ -495,6 +506,74 @@ def _run(coro: Any) -> Any:  # noqa: ANN401
 
     """
     return asyncio.run(coro)
+
+
+def _run_command(coro: Any, *, command: str, db_path: Path | None) -> Any:  # noqa: ANN401
+    """Run one of this module's eight built-in commands, naming its database on failure.
+
+    Every one of them (``info``, ``verify``, ``query``, ``snapshot``,
+    ``restore``, ``gc``, ``migrate``, ``export``) ends by calling this once
+    with its own async body -- the single choke point their failures funnel
+    through. A failure none of them checks for
+    specifically -- a corrupt or truncated ``--db`` file surfacing as
+    ``sqlite3.DatabaseError`` from :func:`_open_db`'s first ``PRAGMA``, a
+    directory given as ``--db`` surfacing as ``OSError``, a close failure on
+    the success path -- used to propagate straight out of ``asyncio.run()``
+    as a raw Python traceback: not just noisy, but silent about *which*
+    database it happened to, since neither the traceback's own frames (they
+    name this module's source file, never the caller's database) nor several
+    of these exceptions' own text (``sqlite3``'s "file is not a database" and
+    "no such table" carry no path at all) say so.
+
+    ``click.ClickException`` and ``click.Abort`` propagate unconverted:
+    both are Click's own clean-failure vocabulary -- raised throughout the
+    restore/snapshot record-import path with a message already written for
+    the operator -- and Click's own top-level dispatcher already gives each
+    its documented formatting and exit code. Converting one here would
+    replace that with this function's generic, ``unexpected``-prefixed
+    shape instead of leaving it alone.
+
+    Mirrors :func:`~engrava.cli.memory_commands._error_boundary`'s generic
+    branch (same ``_describe_exception`` / ``_frame_only_stack`` primitives,
+    same ``--verbose``-gated ``DEBUG`` stack log), but plainer: this module's
+    commands have no ``--json`` error envelope for a failure, so the
+    converted message is written straight to stderr.
+
+    Args:
+        coro: Awaitable to execute.
+        command: This invocation's command name (e.g. ``"info"``), named at
+            the front of a converted failure.
+        db_path: The single-file database this run acts on, if any -- named
+            in a converted failure right after ``command``. ``None`` for the
+            ``--service`` branch of ``snapshot`` / ``restore``, which never
+            opens ``db_path`` at all (it resolves a per-service path through
+            :class:`~engrava.infrastructure.service_manager.EngravaManager`
+            instead): naming ``db_path`` there would name a file the failure
+            never touched.
+
+    Returns:
+        The coroutine result, on success.
+
+    """
+    try:
+        return asyncio.run(coro)
+    except (click.ClickException, click.Abort):
+        raise
+    except Exception as exc:  # noqa: BLE001 -- deliberate: this module's one catch-all boundary
+        description = _describe_exception(exc)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Unexpected %s in %r; caught exception's stack (file:line in "
+                "function, not a full exception-chain rendering):\n%s",
+                description,
+                command,
+                _frame_only_stack(exc),
+            )
+        if db_path is not None:
+            click.echo(f"{command}: {db_path}: unexpected {description}", err=True)
+        else:
+            click.echo(f"{command}: unexpected {description}", err=True)
+        sys.exit(1)
 
 
 def _format_rows(
@@ -907,7 +986,7 @@ def info(ctx: click.Context) -> None:
                     f"p99={stats['search_latency']['p99_ms']:.1f}ms"
                 )
 
-    _run(_info())
+    _run_command(_info(), command="info", db_path=cfg.db_path)
 
 
 # ------------------------------------------------------------------
@@ -954,7 +1033,7 @@ def verify(ctx: click.Context) -> None:
             if not result.valid:
                 sys.exit(1)
 
-    _run(_verify())
+    _run_command(_verify(), command="verify", db_path=cfg.db_path)
 
 
 # ------------------------------------------------------------------
@@ -1022,7 +1101,7 @@ def query(ctx: click.Context, mql: str) -> None:
                 click.echo(f"Query error: {exc}", err=True)
                 sys.exit(1)
 
-    _run(_query())
+    _run_command(_query(), command="query", db_path=cfg.db_path)
 
 
 # ------------------------------------------------------------------
@@ -1194,7 +1273,15 @@ def snapshot(ctx: click.Context, output_path: str | None, service_name: str | No
                 total = await _export_db_to_jsonl(conn, out)
                 click.echo(f"Exported {total} records to {out}")
 
-    _run(_snapshot())
+    _run_command(
+        _snapshot(),
+        command="snapshot",
+        # None for --service: that branch never opens cfg.db_path at all, it
+        # resolves its own per-service path through EngravaManager instead
+        # (see _run's own docstring on why naming cfg.db_path there would
+        # name the wrong file).
+        db_path=None if effective_service else cfg.db_path,
+    )
 
 
 # ------------------------------------------------------------------
@@ -2468,7 +2555,13 @@ def restore(
                 default_embeddings=default_embeddings,
             )
 
-    _run(_restore())
+    _run_command(
+        _restore(),
+        command="restore",
+        # None for --service: see the matching comment on snapshot's own
+        # _run call, and _run's docstring.
+        db_path=None if effective_service else cfg.db_path,
+    )
 
 
 # ------------------------------------------------------------------
@@ -2697,7 +2790,7 @@ def gc(ctx: click.Context, *, dry_run: bool, expired: bool) -> None:
                     return
             await _gc_archived(conn, dry_run=dry_run, quiet=expired)
 
-    _run(_gc())
+    _run_command(_gc(), command="gc", db_path=cfg.db_path)
 
 
 # ------------------------------------------------------------------
@@ -2740,7 +2833,7 @@ def migrate(ctx: click.Context) -> None:
                 sys.exit(1)
         click.echo(f"Schema up to date: {cfg.db_path}")
 
-    _run(_migrate())
+    _run_command(_migrate(), command="migrate", db_path=cfg.db_path)
 
 
 # ------------------------------------------------------------------
@@ -2796,7 +2889,7 @@ def export_cmd(ctx: click.Context, output_path: str | None, status_filter: str |
             )
             click.echo(f"Exported {len(thoughts)} thoughts, {len(edges)} edges to {out}")
 
-    _run(_export())
+    _run_command(_export(), command="export", db_path=cfg.db_path)
 
 
 # ------------------------------------------------------------------

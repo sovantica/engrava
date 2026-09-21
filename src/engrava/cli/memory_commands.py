@@ -60,6 +60,7 @@ from engrava.config_validation import ConfigError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
+    from pathlib import Path
 
     from engrava.cli.config import EngravaCLIConfig
 
@@ -192,8 +193,45 @@ def _fail(*, as_json: bool, kind: str, message: str, code: int) -> NoReturn:
     raise _CliError(as_json=as_json, kind=kind, message=message, code=code)
 
 
+class _ResolvedDatabasePath:
+    """Single-slot mutable box for the database path a command body resolves.
+
+    :func:`_error_boundary`'s generic branch needs to name the resolved
+    store's path when an unclassified exception (a corrupt ``--db`` file, an
+    uninitialised database, ...) reaches it, but that path is only known once
+    :func:`_resolve_for_command` returns -- itself running *inside* the
+    ``with`` block, since a malformed ``--config`` is one of the failures the
+    boundary exists to convert with its own specific kind, never the generic
+    one. A command body sets ``.path`` immediately after resolution succeeds;
+    a failure raised before that point leaves it at the default ``None``, and
+    the generic branch falls back to a path-free message rather than naming a
+    database nothing has resolved yet. This happens today, not just
+    hypothetically: :func:`_resolve_for_command` only gives ``--config``
+    itself the specific ``invalid_config`` treatment for an exact
+    :class:`~engrava.config_validation.ConfigError`; a directory or
+    non-UTF-8 ``--config`` path raises ``IsADirectoryError`` /
+    ``UnicodeDecodeError`` instead, before resolution ever returns, and
+    ``remember`` reports it exactly this way -- ``"remember: unexpected
+    IsADirectoryError: [Errno 21] Is a directory: '...'"``, with no database
+    path in the message.
+
+    Deliberately not a ``dataclass``: ``tests/test_config_validation_parity.py``
+    discovers every dataclass under ``engrava`` by walking the package and
+    requires each one to be classified as configuration or not. This is
+    neither -- it is per-invocation mutable state with a single field that
+    changes after construction, not a settings object -- so a plain class
+    with ``__slots__`` avoids tripping a gate built for an entirely different
+    question.
+    """
+
+    __slots__ = ("path",)
+
+    def __init__(self) -> None:
+        self.path: Path | None = None
+
+
 @contextmanager
-def _error_boundary(*, as_json: bool, command: str) -> Iterator[None]:
+def _error_boundary(*, as_json: bool, command: str) -> Iterator[_ResolvedDatabasePath]:
     """Guard a memory-verb body -- the one seam it passes through on the way out.
 
     Wraps a command's *entire* body — synchronous validation, store
@@ -370,9 +408,18 @@ def _error_boundary(*, as_json: bool, command: str) -> Iterator[None]:
         command: The command name (``"remember"`` / ``"recall"`` /
             ``"link"``), named in the fallback message.
 
+    Yields:
+        A :class:`_ResolvedDatabasePath` box, empty until the command body
+        sets its ``.path`` right after :func:`_resolve_for_command` returns.
+        The generic branch below reads it back to name the database an
+        unclassified failure (a corrupt ``--db`` file, an uninitialised
+        database, ...) happened against, the same way the command's own
+        "Database not found" / "Created database" messages already do.
+
     """
+    database = _ResolvedDatabasePath()
     try:
-        yield
+        yield database
     except _CliError as exc:
         _emit_and_exit(as_json=exc.as_json, kind=exc.kind, message=exc.message, code=exc.code)
     except Exception as exc:  # noqa: BLE001 -- deliberate: the CLI's one catch-all boundary
@@ -420,10 +467,15 @@ def _error_boundary(*, as_json: bool, command: str) -> Iterator[None]:
                 command,
                 _frame_only_stack(exc),
             )
+        message = (
+            f"{command}: {database.path}: unexpected {description}"
+            if database.path is not None
+            else f"{command}: unexpected {description}"
+        )
         _emit_and_exit(
             as_json=as_json,
             kind=_UNEXPECTED_ERROR_KIND,
-            message=f"{command}: unexpected {description}",
+            message=message,
             code=_UNEXPECTED_ERROR_EXIT_CODE,
         )
 
@@ -787,7 +839,7 @@ def remember(
     unreadable ``--config`` — becomes the documented error object with a
     generic kind instead of a traceback.
     """
-    with _error_boundary(as_json=as_json, command="remember"):
+    with _error_boundary(as_json=as_json, command="remember") as boundary_database:
         if text == "-":
             text = sys.stdin.read()
         if not text.strip():
@@ -800,6 +852,7 @@ def remember(
 
         metadata = _parse_kv_pairs(meta_pairs, option_name="--meta", as_json=as_json)
         cfg, resolved = _resolve_for_command(ctx, as_json=as_json)
+        boundary_database.path = resolved.db_path
 
         async def _remember() -> None:
             pre_existing = resolved.db_path.exists()
@@ -879,7 +932,7 @@ def recall(
     path, a corrupt database, an unreadable ``--config`` — becomes the
     documented error object with a generic kind instead of a traceback.
     """
-    with _error_boundary(as_json=as_json, command="recall"):
+    with _error_boundary(as_json=as_json, command="recall") as boundary_database:
         if top_k < 1:
             _fail(
                 as_json=as_json,
@@ -890,6 +943,7 @@ def recall(
 
         filters = _parse_kv_pairs(filter_pairs, option_name="--filter", as_json=as_json)
         cfg, resolved = _resolve_for_command(ctx, as_json=as_json)
+        boundary_database.path = resolved.db_path
 
         if not resolved.db_path.exists():
             _fail(
@@ -983,7 +1037,7 @@ def link(
     unreadable ``--config`` — becomes the documented error object with a
     generic kind instead of a traceback.
     """
-    with _error_boundary(as_json=as_json, command="link"):
+    with _error_boundary(as_json=as_json, command="link") as boundary_database:
         if edge_type_str not in _VALID_EDGE_TYPES:
             _fail(
                 as_json=as_json,
@@ -1013,6 +1067,7 @@ def link(
             )
 
         cfg, resolved = _resolve_for_command(ctx, as_json=as_json)
+        boundary_database.path = resolved.db_path
 
         async def _link() -> None:
             pre_existing = resolved.db_path.exists()
