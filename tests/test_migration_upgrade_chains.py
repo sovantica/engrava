@@ -1108,21 +1108,25 @@ async def test_postcondition_failure_raises_and_leaves_version_retryable(
         await conn.close()
 
 
-async def test_v20_to_v21_partial_application_is_safe_to_retry(
+async def test_v20_to_v21_atomic_step_failure_leaves_no_columns_behind(
     fresh_db: aiosqlite.Connection,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The new ``revision`` rung: a step that raises partway can be re-run.
+    """The new ``revision`` rung is atomic: a step that raises partway leaves nothing behind.
 
     ``_migrate_core_v20_to_v21`` adds ``revision`` to ``thought``, then
-    ``edge``, then ``action``, each via ``_add_column_if_absent``. Injecting a
-    failure right after the ``thought`` column lands (but before ``edge`` or
-    ``action`` are touched) simulates a real interrupt mid-step: this
-    demonstrates -- rather than merely asserts -- that ``user_version`` stays
-    at 20 (the postcondition-before-stamp invariant), that the partially
-    applied column survives, and that a plain re-run (the idempotent
-    duplicate-column guard) completes the remaining two columns and reaches
-    head without redoing or losing anything.
+    ``edge``, then ``action``, each via ``_add_column_if_absent``, all inside
+    the one explicit transaction that wraps every step except the FK-recreate
+    step (see :meth:`SqliteEngravaCore._run_pending_core_migrations`).
+    Injecting a failure right after the ``thought`` column lands (but before
+    ``edge`` or ``action`` are touched) simulates a real interrupt mid-step.
+    Because the whole step runs as a single transaction, the ``ALTER TABLE``
+    that already executed against the connection is rolled back along with
+    everything else: this demonstrates -- rather than merely asserts -- that
+    ``user_version`` stays at 20 and that none of the three columns, not even
+    ``thought.revision``, survive on disk. A plain re-run then applies the
+    step from scratch and reaches head without losing anything that came
+    before it.
     """
     await _bootstrap_core_at_version(fresh_db, 20)
     await _seed_legacy_rows(fresh_db)
@@ -1144,15 +1148,16 @@ async def test_v20_to_v21_partial_application_is_safe_to_retry(
     with pytest.raises(RuntimeError, match="injected mid-migration failure"):
         await store.ensure_schema()
 
-    # The step raised before returning, so the loop never reached the stamp:
-    # the version is still 20, not 21 -- even though thought.revision itself
-    # already exists on disk.
+    # The step raised inside its transaction, before COMMIT: the rollback
+    # that follows undoes the ADD COLUMN that already ran against the
+    # connection along with the rest of the step. The version is still 20,
+    # and thought.revision does not exist on disk either.
     assert await _user_version(fresh_db) == 20
     assert calls == ["thought"]
 
     cursor = await fresh_db.execute("PRAGMA table_info(thought)")
     thought_column_names = {row["name"] for row in await cursor.fetchall()}
-    assert "revision" in thought_column_names
+    assert "revision" not in thought_column_names
     cursor = await fresh_db.execute("PRAGMA table_info(edge)")
     edge_column_names = {row["name"] for row in await cursor.fetchall()}
     assert "revision" not in edge_column_names
@@ -1160,8 +1165,8 @@ async def test_v20_to_v21_partial_application_is_safe_to_retry(
     action_column_names = {row["name"] for row in await cursor.fetchall()}
     assert "revision" not in action_column_names
 
-    # Retry: the thought column is idempotently skipped (already present), and
-    # edge + action pick up where the interrupted step left off.
+    # Retry: nothing was left behind to skip, so the step re-applies all
+    # three columns from scratch and the rest of the ladder completes.
     monkeypatch.undo()
     await store.ensure_schema()
     assert await _user_version(fresh_db) == _HEAD_VERSION
