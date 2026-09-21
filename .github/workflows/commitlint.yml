@@ -7,6 +7,9 @@ on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
 
+permissions:
+  contents: read
+
 jobs:
   commitlint:
     name: Lint PR title + commits
