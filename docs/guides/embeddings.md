@@ -142,8 +142,15 @@ caller's own `suspend_auto_commit()`, a caught failure can still commit the
 batch's already-inserted rows (see the [API reference](../api-reference.md))
 — and, when `auto_embed` is on, embeds them all in **one** batch provider call (using
 the role-aware `embed_document_batch` when the provider exposes it, else
-`embed_batch`) instead of one round trip per thought. The stored vectors are
-identical to embedding each thought individually. `get_or_create` and
+`embed_batch`). Whether that call saves round trips depends on the provider:
+`OpenAICompatibleProvider` and `OllamaProvider` send the whole batch in one
+request per attempt (`OpenAICompatibleProvider` sends it again when it retries a
+transient failure; `OllamaProvider` does not retry), and
+`SentenceTransformerProvider` encodes it in a single model call, but
+`HuggingFaceProvider` and `CallbackProvider` implement the batch as a loop that
+still calls the underlying API or callback once per text. A custom provider
+can implement a genuine batch. The stored vectors are identical to embedding
+each thought individually. `get_or_create` and
 `upsert_by_hash` are content-hash convenience writes over the same
 deduplication — see [the write-API guide](agent-memory.md) and the
 [API reference](../api-reference.md).
