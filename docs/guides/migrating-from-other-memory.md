@@ -27,7 +27,7 @@ common concepts onto Engrava:
 |---|---|---|
 | "Memory" / "record" / "document" | **`ThoughtRecord`** | The unit you store. Has `essence` (short) + `content` (full). |
 | "Memory type" / "role" | **`thought_type`** (`OBSERVATION`, `BELIEF`, `TASK`, …) | A small fixed taxonomy; see [Core Concepts](../concepts.md). |
-| Free-form metadata / `metadata={...}` | **`ThoughtRecord.metadata`** | An arbitrary JSON dict, persisted and round-tripped. |
+| Free-form metadata / `metadata={...}` | **`ThoughtRecord.metadata`** | A dict with `str` keys whose values are `str`, `int`, finite `float`, `bool`, `None` or nested dicts of the same, persisted and round-tripped. Lists, tuples, sets, custom objects, non-`str` keys, `NaN` / `Infinity` and serialised metadata over 64 KiB are rejected (a 4 KiB soft warning); see [the `metadata` field](../api-reference.md#metadata-field). |
 | "User id" / "session id" / namespace | A key inside **`metadata`** (or `source`) | Engrava has no built-in tenant field — see [scoping](#filtering-scoping--multi-tenancy). |
 | Relationship / link between memories | **`EdgeRecord`** (typed, weighted) | First-class graph. Letting edges feed ranking is **opt-in**: `default_graph_weight` is `0.0`, so imported relationships change no ranking until you raise it — see [Search](../search.md). |
 | Embedding / vector | Stored on write only with `embedding_provider=...` **and** `auto_embed=True`; otherwise call `store_embedding(thought_id, vector)` yourself | See the [Embeddings guide](embeddings.md). |
