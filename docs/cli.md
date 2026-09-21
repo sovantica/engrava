@@ -89,7 +89,7 @@ commands:
 
 | `--service` | Services config loaded? | Result |
 |---|---|---|
-| `--service NAME` (explicit) | either | Targets service **NAME**. Its database is found/created in the services `data_dir` if a config is loaded, otherwise in the **parent directory of `--db`** (i.e. `<parent-of-db>/NAME.db`). |
+| `--service NAME` (explicit) | either | Targets service **NAME**. Its database is looked up in the services `data_dir` if a config is loaded, otherwise in the **parent directory of `--db`** (i.e. `<parent-of-db>/NAME.db`). `snapshot` exits `1` if it does not exist; `restore` creates it. |
 | omitted | yes | Falls back to `services.default_service`. |
 | omitted | no | Operates on the single `--db` database (not service mode). |
 
@@ -553,9 +553,11 @@ record per line) — **not** the audit journal; see below.
 **`--service`** resolves in three ways (see [Service resolution](#service-resolution)):
 
 - **Explicit `--service NAME`** targets that service even with no services config
-  — the service database is looked up/created in the data directory, which is the
+  — the service database is looked up in the data directory, which is the
   services config's `data_dir` if one is loaded, otherwise the **parent directory
-  of `--db`**.
+  of `--db`**. `snapshot` only reads: if that service database does not already
+  exist it prints `Service 'NAME' not found` and exits `1` without creating
+  anything (`restore` is the command that creates a missing service database).
 - **Omitted, with a services config loaded** → falls back to
   `services.default_service`.
 - **Omitted, with no services config** → snapshots the single `--db` database.
