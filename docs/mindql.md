@@ -14,11 +14,12 @@ read-only SQL passthrough.
 
 - The command verb (`FIND`, `COUNT`, `SELECT`) is case-insensitive.
 - `FIND` and `COUNT` **require a table name** as the second token.
-- A simple `WHERE` condition is `field operator value`; string values must be
-  single-quoted, bare numbers are coerced to `int`/`float`. The quoting decides
-  the type: a single-quoted value is kept **verbatim as a string**, so a
-  zero-padded identifier like `source = '007'` matches the stored string `'007'`,
-  whereas an unquoted `created_cycle = 7` is coerced to the integer `7`.
+- A simple `WHERE` condition is `field operator value`. The quoting decides the
+  type: a single-quoted value is kept **verbatim as a string**, so a zero-padded
+  identifier like `source = '007'` matches the stored string `'007'`, whereas an
+  unquoted `created_cycle = 7` is coerced to the integer `7` (or to a float, for
+  `7.5`). An unquoted word that is not a number stays a string (`source = abc`),
+  but a value containing spaces must be quoted.
 - Operators: `=`, `!=`, `>`, `<`, `>=`, `<=`, and `IN (...)`.
 - Conditions combine with `AND`, `OR`, and parentheses (see
   [Boolean expressions](#boolean-expressions-and-or-parentheses)).
