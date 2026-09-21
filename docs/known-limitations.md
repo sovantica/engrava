@@ -217,12 +217,24 @@ close is only a pending-task lifecycle nicety, not a safety concern.
 ## Embedding Dimension Consistency
 
 All embeddings for a given database must use the same dimensionality. Mixing
-dimensions (e.g., 384 and 768) is not supported and will cause search to
-return incorrect results.
+dimensions (e.g., 384 and 768) is not supported. What happens depends on the
+vector backend:
 
-Engrava validates the stored model identity and raises
-`EmbeddingModelMismatchError` rather than mixing incompatible vectors. A
-deliberate CLI re-embed is available while restoring a snapshot into a
+- With the sqlite-vec backend, storing a vector whose length differs from the
+  backend's dimension raises `sqlite3.OperationalError`.
+- With the NumPy backend, once a store holds vectors of two lengths, a search
+  raises: `VectorDimensionMismatchError` for a query whose length differs from
+  the first stored vector's, and a `ValueError` from NumPy for a query of that
+  length.
+
+Engrava also checks the stored model identity (name, dimension and document
+prefix); a mismatch it finds is reported as `EmbeddingModelMismatchError`. The
+model check runs at a store instance's first embedding write or first
+`verify_embedding_model()` on a store that has a provider. Once it has passed,
+later embedding writes on that instance are not compared again, so a
+differently sized vector written afterwards is not refused by it.
+
+A deliberate CLI re-embed is available while restoring a snapshot into a
 configured direct database or service. Pass `--config`: direct mode uses the
 top-level `embeddings` provider, while service mode prefers its per-service
 override and otherwise uses the top-level provider. Without a configured
