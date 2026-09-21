@@ -14,6 +14,14 @@ sources of incidental noise (the per-run temp directory path, and the
 wall-clock timestamps ``info``'s metrics snapshot embeds). Running the same
 matrix here, against the current code, and normalizing the same way, must
 reproduce that file byte-for-byte.
+
+The two ``info`` entries are the deliberate exception: ``info`` used to print
+one ``schema_version`` — the metrics snapshot's own shape version — under a
+label an operator had every reason to read as the database's. Both entries
+were regenerated once, on purpose, to capture ``info`` now naming the two
+numbers apart (``metrics_schema_version`` / ``database_schema_version`` in
+JSON; both spelled out in the text line), not to loosen this test's guarantee
+against an *unintended* change from the store-resolution refactor itself.
 """
 
 from __future__ import annotations

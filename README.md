@@ -304,8 +304,12 @@ installed — a pass that is about to delete stops **before deleting anything** 
 exits `1` rather than stranding those vectors in an index nothing can then reach
 them through.
 
-`engrava info` now renders the same metrics snapshot contract exposed by
-`await store.metrics()`.
+`engrava info`'s `--format json` output carries every field of the metrics
+snapshot exposed by `await store.metrics()`, with the snapshot's own schema
+version renamed `metrics_schema_version`, plus two fields the snapshot itself
+does not carry, `db_path` and `database_schema_version` — see [Upgrade
+Guide](docs/upgrade.md#06---07). The default text output is a shorter summary
+of that same data, not the full snapshot.
 
 See the [CLI reference](https://github.com/sovantica/engrava/blob/main/docs/cli.md) for every command and option.
 

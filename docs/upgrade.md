@@ -198,7 +198,7 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 | 0.3.x | 0.4.0 | Yes | **Schema-changing** minor upgrade — adds the valid-time columns (additive, zero data loss). Back up first and follow the [rolling-upgrades](#rolling-upgrades-multiple-workers) note |
 | 0.4.x | 0.5.0 | Yes | **Schema-changing** minor upgrade (`user_version` 14 → 18), although the library API is drop-in. **Breaking for MCP-server users only:** the `engrava[mcp]` extra and the in-engrava `engrava-mcp` command are removed — the server moved to the standalone [`engrava-mcp`](https://github.com/sovantica/engrava-mcp) package (see the 0.4 → 0.5 note) |
 | 0.5.0 | 0.6.0 | Yes | **Schema-changing** minor upgrade (`user_version` 18 → 20), with two additive columns. Default retrieval now excludes archived thoughts, and wrong-dimension query vectors raise a typed error. An edge `decay_multiplier` of `0.0` no longer reads back as `1.0`, and a later update no longer rewrites it to `1.0` — values a 0.5.x update already overwrote stay overwritten. Back up, quiesce shared-store workers, migrate once, and review the [0.5 → 0.6 notes](#05---06) |
-| 0.6.x | 0.7.0 | Yes | **Schema-changing** minor upgrade (`user_version` 20 → 21): every `thought` / `edge` / `action` row gains a `revision INTEGER NOT NULL DEFAULT 0` column, and `EngravaMetrics.schema_version` separately moves `1 → 2` (see below). `update_thought`, `restore_thought`, `update_edge` and `update_action` now check and increment `revision` atomically on every guarded write, so a write that lands after another guarded write touched the same row — including from a second connection or process — raises `StaleDataError` instead of silently overwriting; `update_edge` and `update_action` could never raise it before. No public method signature changed. **Behaviour change:** when the resolved recency weight is `0.0` **and** a cognitive-cycle reference (`current_cycle`, explicit or via `cycle_provider`) is present, the query-less fallback path now treats recency as fully off instead of still decaying by cycle — which can change result order for stores with heterogeneous thought priorities. `recency_now` (transaction-time) callers are unaffected; that axis was already correct. Also in this release: three new `EngravaError` subclasses (`WriteContentionError`, `WriteLockTimeoutError`, `DedupLockReentryError`) can now come out of the dedup and guarded-write paths; a new public override seam, `prepare_thought_for_insert()`, restores pre-insert customization that `get_or_create()` / `upsert_by_hash()` had silently stopped routing through an overridden `create_thought()`; `gc --dry-run` now names everything the real run deletes (edges, embeddings, and actions, not only orphaned edges); a deleted thought's vector can no longer resurface through search on a database that has not run the core-12 migration; a corrupt or truncated database file now makes the CLI exit with an error instead of hanging; and `restore` now refuses an `embedding` row with an empty `owner_type`/`owner_id`, a non-ISO-8601 `created_at`, or a non-positive `dimension` — every such row was already invalid on every prior release, so this only ever rejects a snapshot that already carried a broken record; and a merge restore (no `--clear`) into a target whose `journal_entry` table is non-empty now refuses any record that collides with an existing row and rolls the whole restore back instead of replacing it, unless `--orphan-journal-entries` is also given — journaling is opt-in and the CLI never enables it, so this only reaches a target that already has journaling on. Review the [0.6 → 0.7 notes](#06---07) |
+| 0.6.x | 0.7.0 | Yes | **Schema-changing** minor upgrade (`user_version` 20 → 21): every `thought` / `edge` / `action` row gains a `revision INTEGER NOT NULL DEFAULT 0` column; `EngravaMetrics.schema_version` separately moves `1 → 2`; and `engrava --format json info` loses its `schema_version` key in favor of `metrics_schema_version` + `database_schema_version` (see below). `update_thought`, `restore_thought`, `update_edge` and `update_action` now check and increment `revision` atomically on every guarded write, so a write that lands after another guarded write touched the same row — including from a second connection or process — raises `StaleDataError` instead of silently overwriting; `update_edge` and `update_action` could never raise it before. No public method signature changed. **Behaviour change:** when the resolved recency weight is `0.0` **and** a cognitive-cycle reference (`current_cycle`, explicit or via `cycle_provider`) is present, the query-less fallback path now treats recency as fully off instead of still decaying by cycle — which can change result order for stores with heterogeneous thought priorities. `recency_now` (transaction-time) callers are unaffected; that axis was already correct. Also in this release: three new `EngravaError` subclasses (`WriteContentionError`, `WriteLockTimeoutError`, `DedupLockReentryError`) can now come out of the dedup and guarded-write paths; a new public override seam, `prepare_thought_for_insert()`, restores pre-insert customization that `get_or_create()` / `upsert_by_hash()` had silently stopped routing through an overridden `create_thought()`; `gc --dry-run` now names everything the real run deletes (edges, embeddings, and actions, not only orphaned edges); a deleted thought's vector can no longer resurface through search on a database that has not run the core-12 migration; a corrupt or truncated database file now makes the CLI exit with an error instead of hanging; and `restore` now refuses an `embedding` row with an empty `owner_type`/`owner_id`, a non-ISO-8601 `created_at`, or a non-positive `dimension` — every such row was already invalid on every prior release, so this only ever rejects a snapshot that already carried a broken record; and a merge restore (no `--clear`) into a target whose `journal_entry` table is non-empty now refuses any record that collides with an existing row and rolls the whole restore back instead of replacing it, unless `--orphan-journal-entries` is also given — journaling is opt-in and the CLI never enables it, so this only reaches a target that already has journaling on. Review the [0.6 → 0.7 notes](#06---07) |
 
 For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 `0.x.*` line do not change the schema and are low-risk; **minor** upgrades
@@ -336,9 +336,10 @@ suggests:
   upgrade has no `measured` key, and a snapshot written after does.
 - A script that only shells out to `engrava info` (or `engrava --format json
   info`) and parses its output is affected too, even though it never imports
-  `engrava` or the `EngravaMetrics` type at all: the CLI builds that output
-  from `asdict(metrics)`, so its JSON gains the `measured` key and its
-  `schema_version` value moves to `2` right along with the library object.
+  `engrava` or the `EngravaMetrics` type at all: the CLI's JSON gains the
+  `measured` key right along with the library object. Its `schema_version`
+  key does **not** simply move to `2` the same way — this release removes
+  that key outright; see the next break below for what replaces it.
 - Code that only reads individual fields (`m.thoughts.total`, `m.storage.db_bytes`,
   etc.) without inspecting `schema_version` is unaffected.
 - A **subclass of `EngravaMetrics`** that appends its own field (nothing in
@@ -366,14 +367,49 @@ check to `2`. If you persist snapshots, branch on `schema_version` (or on the
 presence of the `measured` key) when reading old records back, and prefer
 checking `measured` over trusting an all-zero snapshot as a real reading —
 see [Observability → Configuration](observability.md#configuration). If you
-parse `engrava --format json info` output in a script, update it the same
-way: expect the new `measured` key and the `schema_version` value `2`. Also
+parse `engrava --format json info` output in a script, update it too: it
+gains the new `measured` key, and — separately — its `schema_version` key is
+gone; see the next break for what replaces it. Also
 review any consumer that constructs `EngravaMetrics` positionally (directly
 or through a subclass), depends on its field order, rebuilds one from named
 keywords, validates its key set, or unpacks `**asdict(snapshot)` into a
 function typed for the old field set — that last case raises an
 unexpected-keyword error immediately rather than persisting or silently
 accepting anything, so it is not the same population as the bullets above.
+
+**Typed break: `engrava --format json info` loses its `schema_version` key.**
+`info` used to build its JSON output from `**asdict(metrics)`, so this key
+was always `EngravaMetrics.schema_version` — the metrics snapshot's own
+shape version — never the database's. An operator reading `Schema version:`
+in the text output, or `schema_version` in the JSON, had every reason to
+read it as the database's `PRAGMA user_version`; it was not. This release
+fixes that instead of carrying it forward with a new `measured` key
+alongside it.
+
+**What changed.** `engrava --format json info` now reports
+`metrics_schema_version` (what `schema_version` used to mean) and
+`database_schema_version` (the database's stamped `user_version` — the same
+number [Schema-version checks](cli.md#schema-version-checks) gates on) as two
+separate keys; `schema_version` itself is gone. The text output's `Schema
+version:` line is now `Metrics schema version: 2 (database schema version:
+20)` — both numbers named and shown, never one number under an ambiguous
+label.
+
+**Who is affected.** Any script that parses `engrava --format json info` and
+reads `data["schema_version"]` breaks with a `KeyError` immediately, which is
+the least-bad failure mode here: it fails loudly rather than silently
+comparing a metrics-snapshot version against a database-version expectation
+(or vice versa). A script that only greps the text output for `Schema
+version:` also breaks, now finding `Metrics schema version:` instead. Code
+that reads other `info` fields (`thoughts`, `edges`, `storage`,
+`search_latency`, `measured`, `db_path`) is unaffected.
+
+**What to do.** Update `data["schema_version"]` to `data["metrics_schema_version"]`
+if that is what you meant, or to `data["database_schema_version"]` if you were
+actually trying to read the database's own schema version — which is the
+version [`engrava migrate`](cli.md#migrate) acts on, not the metrics
+snapshot's. Update any text-output grep for `Schema version:` to `Metrics
+schema version:`.
 
 **New exception types: `WriteContentionError` and `WriteLockTimeoutError`.**
 Neither class existed on 0.6.0; both are new `EngravaError` subclasses,

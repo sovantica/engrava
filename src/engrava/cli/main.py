@@ -960,19 +960,27 @@ def info(ctx: click.Context) -> None:
             sys.exit(1)
 
         async with _opened_db(cfg) as conn:
-            await _apply_read_schema_gate(conn, command="info")
+            database_schema_version = await _read_schema_version(conn)
+            _apply_read_schema_gate_for_version(database_schema_version, command="info")
             store = SqliteEngravaCore(conn)
             metrics = await store.metrics()
+            metrics_fields = asdict(metrics)
+            metrics_schema_version = metrics_fields.pop("schema_version")
             stats: dict[str, Any] = {
                 "db_path": str(cfg.db_path.resolve()),
-                **asdict(metrics),
+                "metrics_schema_version": metrics_schema_version,
+                "database_schema_version": database_schema_version,
+                **metrics_fields,
             }
 
             if cfg.output_format == "json":
                 click.echo(json.dumps(stats, indent=2))
             else:
                 click.echo(f"Database: {stats['db_path']}")
-                click.echo(f"Schema version: {stats['schema_version']}")
+                click.echo(
+                    f"Metrics schema version: {stats['metrics_schema_version']} "
+                    f"(database schema version: {stats['database_schema_version']})"
+                )
                 click.echo(
                     f"Thoughts: {stats['thoughts']['total']} ({stats['thoughts']['by_type']})"
                 )

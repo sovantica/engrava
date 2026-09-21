@@ -57,7 +57,13 @@ a disabled store and for a measured store that has served no searches.
 
 ## CLI
 
-`engrava info` now renders the same snapshot contract used by the Python API.
+`engrava info` renders the same snapshot the Python API returns, with one
+deliberate difference: its own `schema_version` is exposed as
+`metrics_schema_version`, alongside a `database_schema_version` field the
+Python snapshot does not carry (the database's `PRAGMA user_version`, read
+separately) — see [Upgrade Guide → 0.6 -> 0.7](upgrade.md#06---07) for why the
+CLI output and the `EngravaMetrics` object are no longer key-for-key
+identical.
 
 ```bash
 engrava --db mydata.db info

@@ -173,7 +173,21 @@ command-specific options.
 
 ```bash
 engrava --db engrava.db info
+# Database: engrava.db
+# Metrics schema version: 2 (database schema version: 20)
+# Thoughts: 128 ({'OBSERVATION': 100, 'REFLECTION': 28})
+# ...
 ```
+
+The two version numbers are unrelated and are named separately on purpose:
+`metrics schema version` is the shape of the `EngravaMetrics` object returned
+by `await store.metrics()` (bumped when a field is added to that dataclass),
+and `database schema version` is the database's own `PRAGMA user_version` —
+the one [Schema-version checks](#schema-version-checks) above gates on.
+`--format json info` carries the same two numbers as
+`metrics_schema_version` and `database_schema_version`; see the [Upgrade
+Guide](upgrade.md#06---07) if you parse that JSON and used to read
+`schema_version`.
 
 Use this after an upgrade or a restore to confirm the database is readable and
 the counts look right.

@@ -25,6 +25,7 @@ from click.testing import CliRunner
 
 from engrava.cli.config import EngravaCLIConfig
 from engrava.cli.main import _close_quietly, _import_records_to_db, _rollback_quietly, cli
+from engrava.infrastructure.sqlite.engrava_core import CORE_SCHEMA_HEAD_VERSION
 
 # Literal SQL, never interpolated: a read-back that assembles its own query
 # cannot be trusted to disagree with the schema the command wrote to.
@@ -913,14 +914,79 @@ class TestInfo:
         assert "Thoughts: 3" in result.output
         assert "Edges: 1" in result.output
 
+    def test_info_table_format_names_both_schema_versions(
+        self, runner: CliRunner, populated_db: Path
+    ) -> None:
+        """The human line must name which number is which, and show both.
+
+        A fresh ``populated_db`` is stamped at ``CORE_SCHEMA_HEAD_VERSION`` by
+        ``ensure_schema()``, while the metrics snapshot's own shape version
+        (``EngravaMetrics.schema_version``) is a separate, much smaller
+        number — asserting they differ here is not incidental, it is the
+        defect this label used to hide.
+        """
+        result = runner.invoke(cli, ["--db", str(populated_db), "info"])
+        assert result.exit_code == 0
+        expected_line = (
+            f"Metrics schema version: 2 (database schema version: {CORE_SCHEMA_HEAD_VERSION})"
+        )
+        assert expected_line in result.output
+        assert "Schema version:" not in result.output
+        assert CORE_SCHEMA_HEAD_VERSION != 2
+
     def test_info_json_format(self, runner: CliRunner, populated_db: Path) -> None:
         result = runner.invoke(cli, ["--db", str(populated_db), "--format", "json", "info"])
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["thoughts"]["total"] == 3
         assert data["edges"]["total"] == 1
-        assert data["schema_version"] == 2
+        assert data["metrics_schema_version"] == 2
+        assert data["database_schema_version"] == CORE_SCHEMA_HEAD_VERSION
+        assert "schema_version" not in data
         assert data["search_latency"]["sample_count"] == 0
+
+    @pytest.mark.parametrize(
+        "stamped_version",
+        [CORE_SCHEMA_HEAD_VERSION - 2, CORE_SCHEMA_HEAD_VERSION - 4],
+    )
+    def test_info_json_reports_a_non_head_database_schema_version(
+        self, runner: CliRunner, populated_db: Path, stamped_version: int
+    ) -> None:
+        """``database_schema_version`` must track the stamped ``PRAGMA
+        user_version``, not any hard-coded constant.
+
+        The database-backed ``info`` tests above build their database
+        through ``ensure_schema()``, which always lands on
+        ``CORE_SCHEMA_HEAD_VERSION`` -- on that fixture shape, an
+        implementation that reads ``PRAGMA user_version`` and one that just
+        returns ``CORE_SCHEMA_HEAD_VERSION`` report the same number and
+        those tests cannot tell them apart. Stamping to a single other
+        value would only rule out that one constant, so this is
+        parametrized over two different non-head values: no single
+        hard-coded return value, head or otherwise, can satisfy both.
+        Also confirm ``metrics_schema_version`` does not move with the
+        stamp -- the two numbers are unrelated -- and that the
+        behind-schema warning this stamp is expected to trigger (see
+        test_schema_version_gate.py) is actually emitted, so a build that
+        silently dropped that warning would not pass this test either.
+        """
+        conn = sqlite3.connect(str(populated_db))
+        try:
+            conn.execute(f"PRAGMA user_version = {stamped_version}")
+            conn.commit()
+        finally:
+            conn.close()
+
+        # The stamp is behind head, so this read command warns on stderr
+        # (see test_schema_version_gate.py) and still runs; read only
+        # stdout so that warning does not corrupt the JSON parse.
+        result = runner.invoke(cli, ["--db", str(populated_db), "--format", "json", "info"])
+        assert result.exit_code == 0, result.output
+        assert "behind" in result.stderr.lower()
+        data = json.loads(result.stdout)
+        assert data["database_schema_version"] == stamped_version
+        assert data["database_schema_version"] != CORE_SCHEMA_HEAD_VERSION
+        assert data["metrics_schema_version"] == 2
 
     def test_info_missing_db(self, runner: CliRunner, tmp_path: Path) -> None:
         missing = tmp_path / "nonexistent.db"
