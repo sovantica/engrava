@@ -1,6 +1,6 @@
 # Error Handling and Recovery
 
-This guide describes the error and persistence contracts of Engrava v0.6. It is
+This guide describes the error and persistence contracts of Engrava v0.7. It is
 for application code that must decide whether to fix an input, retry a remote
 call, reconcile a partial write, or replace a store.
 
