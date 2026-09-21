@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import importlib.util
+import logging
 import uuid
 from dataclasses import dataclass
 from importlib import resources
@@ -2483,6 +2484,398 @@ class TestV11ToV12PostconditionCatchesVanishedTable:
                 await (await db.execute("PRAGMA foreign_key_list(embedding)")).fetchall(),
             )
             assert recreated_fks == [], "a half-swapped embedding table was committed"
+
+
+class TestRecreateFkCleanupDoesNotReplaceTheOriginalError:
+    """A failing rollback or pragma-restore during migration cleanup must not
+    replace the migration failure that triggered it.
+
+    ``_recreate_child_tables_with_fk_atomically``'s outer cleanup used to be
+    an unconditional ``finally: try: await self._db.rollback() finally: await
+    self._db.execute("PRAGMA foreign_keys=ON")``. A failure in either
+    statement there raised in front of whatever the recreate body was
+    already failing with, so a user whose ``engrava migrate`` hit a mid-swap
+    error and then hit a rollback or pragma failure on top of it saw only
+    the second, purely-mechanical error -- never the actual reason their
+    migration failed, which is the only thing they can act on.
+    """
+
+    async def test_rollback_failure_during_cleanup_does_not_replace_the_original_error(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Before this fix: a user would see ``OperationalError("injected
+        rollback failure")`` -- the cleanup's own error -- when a mid-recreate
+        failure's cleanup rollback also failed. After this fix: they see the
+        real migration failure (``RuntimeError("injected mid-recreate
+        failure")``), with the rollback failure only in the log.
+        """
+        db_path = tmp_path / "rollback-cleanup-failure.sqlite"
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await TestMigrationV11ToV12._bootstrap_v11_schema(db)
+            await db.execute(
+                "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+                "VALUES ('t1', 'OBSERVATION', 'a', 'a', 'P3')",
+            )
+            await db.commit()
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            core = SqliteEngravaCore(db=db, embedding_provider=None, auto_embed=False)
+
+            async def _fail_body() -> None:
+                msg = "injected mid-recreate failure"
+                raise RuntimeError(msg)
+
+            monkeypatch.setattr(core, "_recreate_embedding_with_fk", _fail_body)
+
+            async def _failing_rollback() -> None:
+                msg = "injected rollback failure"
+                raise aiosqlite.OperationalError(msg)
+
+            monkeypatch.setattr(db, "rollback", _failing_rollback)
+
+            with (
+                caplog.at_level(logging.WARNING),
+                pytest.raises(RuntimeError, match="injected mid-recreate failure") as exc_info,
+            ):
+                await core.ensure_schema()
+
+            assert "injected rollback failure" not in str(exc_info.value), (
+                "the rollback's own failure must not replace the migration failure"
+            )
+            assert "rolling back the migration transaction" in caplog.text
+            assert "injected rollback failure" in caplog.text
+
+            # The pragma restore is still attempted (and, here, succeeds) even
+            # though the rollback ahead of it failed.
+            monkeypatch.undo()
+            fk_row = await (await db.execute("PRAGMA foreign_keys")).fetchone()
+            assert fk_row is not None
+            assert fk_row[0] == 1, "FK enforcement must still be restored after a failed rollback"
+
+    async def test_pragma_restore_failure_during_cleanup_does_not_replace_the_original_error(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The pragma-restore half of the same cleanup, isolated from the rollback."""
+        db_path = tmp_path / "pragma-cleanup-failure.sqlite"
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await TestMigrationV11ToV12._bootstrap_v11_schema(db)
+            await db.execute(
+                "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+                "VALUES ('t1', 'OBSERVATION', 'a', 'a', 'P3')",
+            )
+            await db.commit()
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            core = SqliteEngravaCore(db=db, embedding_provider=None, auto_embed=False)
+
+            async def _fail_body() -> None:
+                msg = "injected mid-recreate failure"
+                raise RuntimeError(msg)
+
+            monkeypatch.setattr(core, "_recreate_embedding_with_fk", _fail_body)
+
+            real_execute = db.execute
+
+            async def _execute(sql: str, *args: object, **kwargs: object) -> object:
+                if sql == "PRAGMA foreign_keys=ON":
+                    msg = "injected pragma restore failure"
+                    raise aiosqlite.OperationalError(msg)
+                return await real_execute(sql, *args, **kwargs)
+
+            monkeypatch.setattr(db, "execute", _execute)
+
+            with (
+                caplog.at_level(logging.WARNING),
+                pytest.raises(RuntimeError, match="injected mid-recreate failure") as exc_info,
+            ):
+                await core.ensure_schema()
+
+            assert "injected pragma restore failure" not in str(exc_info.value), (
+                "the pragma restore's own failure must not replace the migration failure"
+            )
+            assert "restoring PRAGMA foreign_keys" in caplog.text
+            assert "injected pragma restore failure" in caplog.text
+
+            # The rollback ahead of it still ran (the transaction is closed)
+            # even though the pragma restore after it failed.
+            monkeypatch.undo()
+            assert not db.in_transaction
+
+    async def test_pragma_restore_failure_on_the_clean_success_path_still_propagates(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Control: with no original error, a pragma-restore failure IS the
+        error and must propagate unchanged -- never logged and swallowed the
+        way a cleanup failure alongside a real migration failure is. Mirrors
+        ``_close_quietly``'s documented success-path contract for a close.
+        """
+        db_path = tmp_path / "pragma-clean-path-failure.sqlite"
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await TestMigrationV11ToV12._bootstrap_v11_schema(db)
+            await db.commit()
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            core = SqliteEngravaCore(db=db, embedding_provider=None, auto_embed=False)
+
+            real_execute = db.execute
+
+            async def _execute(sql: str, *args: object, **kwargs: object) -> object:
+                if sql == "PRAGMA foreign_keys=ON":
+                    msg = "injected pragma restore failure on the success path"
+                    raise aiosqlite.OperationalError(msg)
+                return await real_execute(sql, *args, **kwargs)
+
+            monkeypatch.setattr(db, "execute", _execute)
+
+            with pytest.raises(aiosqlite.OperationalError, match="success path"):
+                await core.ensure_schema()
+
+    async def test_rollback_failure_on_the_clean_success_path_still_restores_the_pragma(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The symmetric case: the cleanup rollback itself fails on the clean
+        success path (no original migration error). Before this fix, the
+        pragma restore below the rollback was never reached, silently
+        leaving FK enforcement off for the rest of the connection's life.
+        After this fix, the pragma restore still runs -- verified by reading
+        it back from the connection, not from a mock's call list -- and the
+        rollback's own failure still reaches the caller rather than being
+        silently lost.
+        """
+        db_path = tmp_path / "rollback-clean-path-failure.sqlite"
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await TestMigrationV11ToV12._bootstrap_v11_schema(db)
+            await db.commit()
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            core = SqliteEngravaCore(db=db, embedding_provider=None, auto_embed=False)
+
+            async def _failing_rollback() -> None:
+                msg = "injected rollback failure on the success path"
+                raise aiosqlite.OperationalError(msg)
+
+            monkeypatch.setattr(db, "rollback", _failing_rollback)
+
+            with pytest.raises(aiosqlite.OperationalError, match="success path"):
+                await core.ensure_schema()
+
+            monkeypatch.undo()
+            fk_row = await (await db.execute("PRAGMA foreign_keys")).fetchone()
+            assert fk_row is not None
+            assert fk_row[0] == 1, (
+                "FK enforcement must still be restored even though the "
+                "cleanup rollback ahead of it failed on the success path"
+            )
+
+    async def test_rollback_raising_cancellederror_directly_still_restores_the_pragma(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The cleanup rollback raises ``asyncio.CancelledError`` itself --
+        not because this coroutine was cancelled from the outside, but
+        because the rollback call's own body raises it directly (a
+        ``BaseException``, not an ``Exception``).
+
+        ``_run_cleanup_step_quietly``'s shield-then-redraw re-awaits an
+        already-finished task through an ``except Exception``, which does
+        not catch a second ``CancelledError`` -- so before this fix, this
+        exact case let the ``CancelledError`` escape the cleanup helper
+        before the pragma restore below it ever ran. This must still reach
+        the caller (never swallowed), and the pragma restore must still have
+        run first.
+        """
+        db_path = tmp_path / "rollback-clean-path-cancellederror.sqlite"
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await TestMigrationV11ToV12._bootstrap_v11_schema(db)
+            await db.commit()
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            core = SqliteEngravaCore(db=db, embedding_provider=None, auto_embed=False)
+
+            async def _cancelling_rollback() -> None:
+                raise asyncio.CancelledError
+
+            monkeypatch.setattr(db, "rollback", _cancelling_rollback)
+
+            with pytest.raises(asyncio.CancelledError):
+                await core.ensure_schema()
+
+            monkeypatch.undo()
+            fk_row = await (await db.execute("PRAGMA foreign_keys")).fetchone()
+            assert fk_row is not None
+            assert fk_row[0] == 1, (
+                "FK enforcement must still be restored even though the "
+                "cleanup rollback raised CancelledError directly"
+            )
+
+    async def test_rollback_raising_a_plain_baseexception_still_restores_the_pragma(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The general case behind the ``CancelledError`` case above: any
+        ``BaseException`` that is not an ``Exception`` (a custom one here,
+        standing in for ``SystemExit``/``KeyboardInterrupt``) raised by the
+        cleanup rollback must still let the pragma restore run, and must
+        still reach the caller unchanged.
+        """
+
+        class _InjectedBaseException(BaseException):
+            pass
+
+        db_path = tmp_path / "rollback-clean-path-baseexception.sqlite"
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await TestMigrationV11ToV12._bootstrap_v11_schema(db)
+            await db.commit()
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            core = SqliteEngravaCore(db=db, embedding_provider=None, auto_embed=False)
+
+            async def _failing_rollback() -> None:
+                msg = "injected non-Exception BaseException from rollback"
+                raise _InjectedBaseException(msg)
+
+            monkeypatch.setattr(db, "rollback", _failing_rollback)
+
+            with pytest.raises(_InjectedBaseException, match="non-Exception"):
+                await core.ensure_schema()
+
+            monkeypatch.undo()
+            fk_row = await (await db.execute("PRAGMA foreign_keys")).fetchone()
+            assert fk_row is not None
+            assert fk_row[0] == 1, (
+                "FK enforcement must still be restored even though the "
+                "cleanup rollback raised a plain BaseException"
+            )
+
+    async def test_cancellation_during_the_cleanup_rollback_is_not_swallowed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A cancellation delivered while the cleanup rollback is in flight
+        must still reach the caller -- never converted into, or absorbed
+        underneath, the migration failure it is cleaning up after -- and the
+        pragma restore after it must still run.
+        """
+        db_path = tmp_path / "rollback-cleanup-cancel.sqlite"
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await TestMigrationV11ToV12._bootstrap_v11_schema(db)
+            await db.execute(
+                "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+                "VALUES ('t1', 'OBSERVATION', 'a', 'a', 'P3')",
+            )
+            await db.commit()
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            core = SqliteEngravaCore(db=db, embedding_provider=None, auto_embed=False)
+
+            async def _fail_body() -> None:
+                msg = "injected mid-recreate failure"
+                raise RuntimeError(msg)
+
+            monkeypatch.setattr(core, "_recreate_embedding_with_fk", _fail_body)
+
+            real_rollback = db.rollback
+            started = asyncio.Event()
+            may_finish = asyncio.Event()
+            finished = False
+
+            async def _blocking_rollback() -> None:
+                nonlocal finished
+                started.set()
+                await may_finish.wait()
+                await real_rollback()
+                finished = True
+
+            monkeypatch.setattr(db, "rollback", _blocking_rollback)
+
+            task = asyncio.create_task(core.ensure_schema())
+            await started.wait()
+            task.cancel()
+            may_finish.set()
+
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert finished, (
+                "the rollback never ran to completion under cancellation -- the "
+                "exact leak this cleanup exists to prevent"
+            )
+
+            monkeypatch.undo()
+            fk_row = await (await db.execute("PRAGMA foreign_keys")).fetchone()
+            assert fk_row is not None
+            assert fk_row[0] == 1, (
+                "the pragma restore must still run even though a cancellation "
+                "arrived during the rollback ahead of it"
+            )
+
+    async def test_cancellation_during_the_pragma_restore_is_not_swallowed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The symmetric case: cancellation while restoring the pragma itself
+        (rollback already completed) must also reach the caller, not be
+        absorbed by the ``except Exception`` half of the cleanup step.
+        """
+        db_path = tmp_path / "pragma-cleanup-cancel.sqlite"
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            await TestMigrationV11ToV12._bootstrap_v11_schema(db)
+            await db.execute(
+                "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+                "VALUES ('t1', 'OBSERVATION', 'a', 'a', 'P3')",
+            )
+            await db.commit()
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            core = SqliteEngravaCore(db=db, embedding_provider=None, auto_embed=False)
+
+            async def _fail_body() -> None:
+                msg = "injected mid-recreate failure"
+                raise RuntimeError(msg)
+
+            monkeypatch.setattr(core, "_recreate_embedding_with_fk", _fail_body)
+
+            real_execute = db.execute
+            started = asyncio.Event()
+            may_finish = asyncio.Event()
+
+            async def _execute(sql: str, *args: object, **kwargs: object) -> object:
+                if sql == "PRAGMA foreign_keys=ON":
+                    started.set()
+                    await may_finish.wait()
+                return await real_execute(sql, *args, **kwargs)
+
+            monkeypatch.setattr(db, "execute", _execute)
+
+            task = asyncio.create_task(core.ensure_schema())
+            await started.wait()
+            task.cancel()
+            may_finish.set()
+
+            with pytest.raises(asyncio.CancelledError):
+                await task
 
 
 class TestAddColumnIfAbsentExactMatch:

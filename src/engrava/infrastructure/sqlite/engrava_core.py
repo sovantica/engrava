@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from importlib import resources
 from itertools import islice
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, NoReturn, Self
+from typing import TYPE_CHECKING, Any, Final, NoReturn, Self
 
 import aiosqlite
 import numpy as np
@@ -118,7 +118,7 @@ from engrava.infrastructure.sqlite.hygiene import (
 from engrava.infrastructure.sqlite.journal_writer import JournalWriter
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Sequence
 
     from engrava.config import HygienePolicyConfig, MetricsConfig, SearchConfig
     from engrava.domain.manifest import ExtensionManifest
@@ -1143,6 +1143,91 @@ async def _close_quietly(conn: aiosqlite.Connection) -> None:
         raise
     except Exception:
         logger.warning("Error closing connection during cleanup", exc_info=True)
+
+
+async def _run_cleanup_step_quietly(
+    step: Callable[[], Coroutine[Any, Any, object]],
+    description: str,
+    *,
+    log_failure: Callable[[Exception], None] | None = None,
+) -> asyncio.CancelledError | None:
+    """Run one cleanup statement, logging rather than raising an ordinary failure.
+
+    Generalises :func:`_close_quietly`'s shield-then-redraw technique (see
+    that function's docstring for the full rationale) to an arbitrary
+    cleanup statement -- a transaction rollback, a pragma restore -- rather
+    than specifically a connection close. A migration cleanup that must run
+    more than one such step in sequence (rollback, then restore a pragma)
+    needs the same "log a failure here, don't let it replace what is already
+    propagating" treatment for each step, and this is that treatment,
+    written once -- shared across the infrastructure and CLI layers rather
+    than copied, unlike :func:`_close_quietly` and its CLI counterpart
+    (:mod:`engrava.cli.main`'s own ``_close_quietly``), which predate this
+    helper and already drifted from each other once (the CLI copy gained a
+    hostile-``__str__``-safe render and a cancellation/SIGINT-delivery fix
+    the infrastructure copy still lacks). ``step`` is a zero-argument
+    callable rather than an already-created coroutine so that a synchronous
+    failure -- raised by calling it, before anything is scheduled -- is also
+    caught here rather than escaping before the shield is even in place.
+
+    An ordinary failure (not a cancellation) is logged and swallowed: the
+    caller already knows an exception is propagating through it, and this
+    step's own failure is secondary information, not the error to report. A
+    cancellation delivered to *this* call while the step is in flight is
+    different -- a control-flow signal, not an ordinary error -- so it is
+    never swallowed. It is returned rather than raised so a caller running
+    several steps in sequence can still finish the remaining ones before
+    deciding which exception ultimately propagates.
+
+    The default log line is a plain ``exc_info=True`` warning, matching this
+    module's own ``_close_quietly``. A caller whose logging needs to differ
+    -- a different logger, or a message shape like the CLI's own
+    ``_close_quietly``/``_rollback_quietly``, which reads the cleanup
+    exception once through a guarded, non-absorbing description instead of
+    letting the standard traceback formatter render it a second, unguarded
+    way -- passes ``log_failure`` rather than this being forked into a
+    second copy of the whole function.
+
+    Args:
+        step: Zero-argument callable returning the awaitable to run, e.g.
+            ``self._db.rollback`` or ``lambda: self._db.execute("PRAGMA ...")``.
+        description: Human-readable description of the step, used only in
+            the default warning logged on an ordinary failure (ignored when
+            ``log_failure`` is given).
+        log_failure: Called with the cleanup step's own exception instead of
+            the default warning, when the step fails with an ordinary
+            (non-cancellation) exception. Never called for a cancellation.
+
+    Returns:
+        The ``CancelledError`` delivered to this call, if any. ``None`` when
+        the step ran to completion -- successfully or not -- without this
+        call itself being cancelled.
+
+    """
+    try:
+        task = asyncio.ensure_future(step())
+        await asyncio.shield(task)
+    except asyncio.CancelledError as exc:
+        try:
+            await task
+        except Exception as cleanup_exc:
+            if log_failure is not None:
+                log_failure(cleanup_exc)
+            else:
+                logger.warning("Error %s during cleanup", description, exc_info=True)
+        return exc
+    except Exception as cleanup_exc:
+        if log_failure is not None:
+            log_failure(cleanup_exc)
+        else:
+            logger.warning("Error %s during cleanup", description, exc_info=True)
+        # See ``_close_quietly`` for why this matters: without a real
+        # suspension point after the synchronous logging above, a
+        # cancellation or SIGINT requested while this coroutine was running
+        # synchronously would be silently dropped instead of reaching the
+        # caller.
+        await asyncio.sleep(0)
+    return None
 
 
 def _validate_provider_cycle(value: object) -> int:
@@ -3104,11 +3189,35 @@ class SqliteEngravaCore:
         is silently ignored inside an open transaction, so a leaked "off" state
         would make the rest of the session accept orphans and skip
         ``ON DELETE CASCADE`` without ever raising. Both the disable and the
-        savepoint therefore live inside the outer ``try`` whose ``finally``
-        closes any still-open transaction and re-enables enforcement. That
-        covers every transaction-control statement except the leading
-        ``commit()``, which precedes the ``try`` and runs while enforcement is
-        still on.
+        savepoint therefore live inside the outer ``try``, whose ``except``
+        (failure or cancellation) and ``else`` (success) branches both close
+        any still-open transaction and re-enable enforcement — a plain
+        ``finally`` cannot draw that distinction, and the two branches need
+        different treatment of a cleanup failure (see below). That covers
+        every transaction-control statement except the leading ``commit()``,
+        which precedes the ``try`` and runs while enforcement is still on.
+
+        On the ``except`` path, a failure rolling back or restoring the
+        pragma must not replace the exception (or cancellation) already
+        propagating from the body above — an ordinary failure in either
+        step is logged underneath instead, via ``_run_cleanup_step_quietly``,
+        and both steps are attempted even if the first one fails; a
+        cancellation of the cleanup itself is the one thing that still
+        outranks the original exception's plain ``raise``. On the ``else``
+        path there is no original exception to protect, so an ordinary
+        cleanup failure is not merely logged there — it is the error, and
+        propagates. The rollback there is usually a no-op with nothing open
+        to undo, but a no-op rollback can still raise: not only an ordinary
+        ``Exception`` (e.g. against a connection that has already gone
+        away), but a ``CancelledError`` or other ``BaseException`` raised
+        directly by the rollback call, which ``_run_cleanup_step_quietly``'s
+        own shield-then-redraw does not catch and would otherwise let escape
+        before the pragma restore is even attempted — so that path wraps the
+        pragma restore in a plain ``finally`` rather than relying on the
+        helper alone. See :meth:`_restore_after_successful_recreate` for
+        exactly which of the two exceptions is the one actually raised in
+        each case, and which is instead only chained onto it as
+        ``__cause__``.
 
         This is a strong best effort, not an absolute postcondition: if the
         cleanup ``rollback()`` itself fails while leaving a transaction active,
@@ -3132,7 +3241,7 @@ class SqliteEngravaCore:
         try:
             # Inside the try: a failure (or cancellation) delivered on this await
             # may still leave the pragma applied on the connection, so the
-            # ``finally`` below must already cover it.
+            # ``except``/``else`` below must already cover it.
             await self._db.execute("PRAGMA foreign_keys=OFF")
             await self._db.execute("SAVEPOINT recreate_fk")
             try:
@@ -3151,8 +3260,8 @@ class SqliteEngravaCore:
                 # table) for the next attempt to inherit, then release it.
                 #
                 # If one of these control statements itself fails, it propagates
-                # and the outer ``finally`` discards the whole transaction — the
-                # safe outcome, and deliberately NOT a further ``RELEASE``:
+                # and the outer ``except`` below discards the whole transaction —
+                # the safe outcome, and deliberately NOT a further ``RELEASE``:
                 # releasing the OUTERMOST savepoint COMMITS, so a release after a
                 # failed ``ROLLBACK TO`` would durably commit the half-swap.
                 await self._db.execute("ROLLBACK TO recreate_fk")
@@ -3164,20 +3273,156 @@ class SqliteEngravaCore:
                 # no-op inside a transaction — actually takes effect.
                 await self._db.execute("RELEASE recreate_fk")
                 await self._db.commit()
+        except BaseException as exc:
+            # The recreate above (or its own unwind) raised, or was cancelled —
+            # that is what the caller needs to see. Rolling back and restoring
+            # the pragma are real cleanup, but a failure in either one must not
+            # replace it -- logged underneath instead, via
+            # ``_run_cleanup_step_quietly``, exactly as ``_close_quietly``'s
+            # docstring states for a connection close. Both steps are attempted
+            # even if the first one fails, since leaving the pragma unrestored
+            # would silently disable FK enforcement for the whole session --
+            # matching the previous nested-``finally`` shape's guarantee.
+            # ``PRAGMA foreign_keys`` is ignored inside a transaction, so the
+            # rollback runs first, exactly as it did before. A cancellation
+            # delivered to *this* cleanup, though, is a fresh control-flow
+            # signal, not an ordinary failure: it wins over whatever was
+            # propagating before it -- the same precedence ``_close_quietly``
+            # gives a cancellation over the error it is cleaning up after --
+            # but ``from exc`` still records what that error was, rather than
+            # discarding it, since it is exactly the information a caller who
+            # catches the cancellation would want to see.
+            rollback_cancelled = await _run_cleanup_step_quietly(
+                self._db.rollback,
+                "rolling back the migration transaction",
+            )
+            pragma_cancelled = await _run_cleanup_step_quietly(
+                lambda: self._db.execute("PRAGMA foreign_keys=ON"),
+                "restoring PRAGMA foreign_keys",
+            )
+            if pragma_cancelled is not None:
+                raise pragma_cancelled from exc
+            if rollback_cancelled is not None:
+                raise rollback_cancelled from exc
+            raise
+        else:
+            # Clean path: the rollback is usually a no-op (nothing is left
+            # open to undo), but it is still a real await against a real
+            # connection and can itself fail -- e.g. against a connection
+            # that has already gone away. There is no original exception to
+            # protect here, so unlike the ``except`` branch above, a failure
+            # in either cleanup step must reach the caller rather than being
+            # logged and swallowed -- see
+            # :meth:`_restore_after_successful_recreate` for the shape.
+            await self._restore_after_successful_recreate()
+
+    async def _restore_after_successful_recreate(self) -> None:
+        """Roll back the (normally no-op) transaction and restore the pragma.
+
+        The cleanup half of the ``else`` (success) branch of
+        :meth:`_recreate_child_tables_with_fk_atomically`, split out to keep
+        that method's branch count down. Issued UNCONDITIONALLY: the caller
+        does not gate this on ``in_transaction``, since that flag is read
+        straight off the connection and can be stale relative to a statement
+        still queued in aiosqlite's worker, which could skip a rollback that
+        is in fact still needed.
+
+        Unlike that method's ``except`` branch, there is no original
+        exception to protect here, so a failure in either step below is not
+        merely logged -- it IS an error and must reach the caller, exactly
+        as ``_close_quietly``'s docstring states for a close on the success
+        path. But losing the pragma restore because the rollback ahead of it
+        raised would silently leave FK enforcement off for the rest of the
+        connection's life, so the pragma restore is wrapped in a plain
+        ``finally`` under the rollback -- the same guarantee the deleted
+        nested-``finally`` shape this whole cleanup replaced used to give --
+        rather than relying only on ``_run_cleanup_step_quietly``'s own
+        return-a-``CancelledError``-instead-of-raising convention: that
+        helper's own shield-then-redraw re-awaits an already-finished task
+        through an ``except Exception``, so a rollback that raises a
+        ``BaseException`` directly -- a synchronous ``CancelledError`` not
+        delivered by the outer task's own ``cancel()``, a ``SystemExit``, a
+        ``KeyboardInterrupt``, or a custom ``BaseException`` -- escapes that
+        call uncaught instead of coming back as its documented return value.
+        The ``except BaseException`` below exists to catch exactly that
+        escape (as well as anything else that could in principle escape the
+        helper) so the ``finally`` beneath it still runs either way.
+
+        Both steps are attempted no matter what either one raises -- that
+        much holds unconditionally, guaranteed by the ``finally`` above, not
+        merely by ``_run_cleanup_step_quietly``'s own convention. What
+        happens to the two exceptions differs by case, and not every case
+        gets the same treatment:
+
+        * Neither step fails: nothing is raised.
+        * Exactly one step fails: that exception is re-raised bare, with no
+          ``from`` -- genuinely unchanged, including its own
+          ``__cause__``/``__context__``, whatever they already were.
+        * Both fail: the pragma restore's exception is the one actually
+          raised (its loss is the silent, lasting one -- FK enforcement left
+          off) -- via ``raise ... from`` the rollback's, so the rollback's is
+          not discarded, but it is then visible only as that exception's
+          ``__cause__`` in the traceback, not as the exception a caller's
+          ``except SomeType:`` would itself catch.
+
+        A cancellation is not special-cased against an ordinary exception in
+        the "both fail" case above: whichever of the two steps failed
+        *last* (the pragma restore, always, since it runs second) is the one
+        raised, cancellation or not. That differs from the ``except``
+        branch's own cleanup, where an ordinary cleanup-step failure is
+        always only logged and never propagates at all, and the one thing
+        that can still outrank the original body exception's plain ``raise``
+        is a cancellation of the cleanup itself. There is no original body
+        exception here for a cancellation to need to outrank, and an
+        ordinary cleanup failure is not merely logged here -- it is the
+        error, so it propagates rather than being swallowed.
+        """
+        rollback_error: BaseException | None = None
+        pragma_error: BaseException | None = None
+
+        def _capture_rollback_exc(exc: Exception) -> None:
+            nonlocal rollback_error
+            rollback_error = exc
+
+        def _capture_pragma_exc(exc: Exception) -> None:
+            nonlocal pragma_error
+            pragma_error = exc
+
+        try:
+            rollback_cancelled = await _run_cleanup_step_quietly(
+                self._db.rollback,
+                "rolling back the (normally no-op) migration transaction",
+                log_failure=_capture_rollback_exc,
+            )
+            if rollback_cancelled is not None:
+                rollback_error = rollback_cancelled
+        except BaseException as exc:  # noqa: BLE001 -- see docstring above
+            rollback_error = exc
         finally:
+            # Attempted no matter what happened above -- an ordinary
+            # exception captured into ``rollback_error``, a cancellation
+            # returned as one, or a raw ``BaseException`` caught just above.
             try:
-                # ``PRAGMA foreign_keys`` is ignored inside a transaction, so
-                # close any that is still open first. Issued UNCONDITIONALLY:
-                # ``in_transaction`` is read straight off the connection and can
-                # be stale relative to a statement still queued in aiosqlite's
-                # worker, so gating on it could skip a rollback that is in fact
-                # needed. On the committed success path this is a no-op.
-                await self._db.rollback()
-            finally:
-                # Nested so the restore is still attempted even if the rollback
-                # above fails — the pragma is per-connection, and leaving it OFF
-                # would silently disable FK enforcement for the whole session.
-                await self._db.execute("PRAGMA foreign_keys=ON")
+                pragma_cancelled = await _run_cleanup_step_quietly(
+                    lambda: self._db.execute("PRAGMA foreign_keys=ON"),
+                    "restoring PRAGMA foreign_keys",
+                    log_failure=_capture_pragma_exc,
+                )
+                if pragma_cancelled is not None:
+                    pragma_error = pragma_cancelled
+            except BaseException as exc:  # noqa: BLE001 -- see docstring above
+                pragma_error = exc
+
+        # Both steps have now been attempted, whatever either one raised.
+        # Exactly which of the two propagates, and how, differs by case --
+        # see the docstring above for the three cases this covers and the
+        # two it does not.
+        if pragma_error is not None:
+            if rollback_error is not None:
+                raise pragma_error from rollback_error
+            raise pragma_error
+        if rollback_error is not None:
+            raise rollback_error
 
     async def _migrate_core_v11_to_v12(self) -> None:
         """Add referential integrity (FK + ON DELETE CASCADE) to child tables.

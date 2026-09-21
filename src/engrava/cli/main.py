@@ -50,6 +50,7 @@ from engrava.domain.protocols.hooks import MindQLExtension
 from engrava.infrastructure.sqlite.engrava_core import (
     CORE_SCHEMA_HEAD_VERSION,
     SqliteEngravaCore,
+    _run_cleanup_step_quietly,
 )
 
 if TYPE_CHECKING:
@@ -229,6 +230,53 @@ async def _close_quietly(conn: Any) -> None:  # noqa: ANN401
         # for and throws in a cancellation that was requested while this
         # coroutine was running synchronously.
         await asyncio.sleep(0)
+
+
+async def _rollback_quietly(conn: Any) -> None:  # noqa: ANN401
+    """Roll back *conn*'s transaction, logging rather than raising if that fails.
+
+    ``_import_records_to_db`` runs the whole restore in one transaction and
+    rolls it back on any validation or insert failure. That rollback runs
+    while the failure that triggered it is already propagating, so it must
+    follow the same rule :func:`_close_quietly`'s docstring states for a
+    connection close: a cleanup failure is real information, but it belongs
+    logged underneath the original error, not raised in front of it. A bare
+    ``await conn.rollback()`` in that cleanup would let a rollback failure
+    silently replace the record/insert error the caller actually needs to
+    see.
+
+    Delegates the actual shield-then-redraw mechanics to the infrastructure
+    layer's :func:`~engrava.infrastructure.sqlite.engrava_core._run_cleanup_step_quietly`
+    rather than re-deriving them here: unlike :func:`_close_quietly` -- which
+    is copied, not shared, between this module and the infrastructure layer,
+    and already drifted once as a result (the CLI copy gained a
+    hostile-``__str__``-safe render and a cancellation/SIGINT-delivery fix
+    the infrastructure copy still lacks) -- there is no import cycle blocking
+    a shared helper here, so this uses it directly instead of adding a third
+    copy of the same technique. Only the logging shape is CLI-specific
+    (``_describe_exception``/``_frame_only_stack`` instead of a bare
+    ``exc_info=True``), so that is the one thing passed in.
+
+    Args:
+        conn: The aiosqlite connection whose transaction to roll back.
+
+    """
+
+    def _log_rollback_failure(rollback_exc: Exception) -> None:
+        logger.warning(
+            "Error rolling back transaction during cleanup: %s; stack (file:line "
+            "in function, not a full exception-chain rendering):\n%s",
+            _describe_exception(rollback_exc),
+            _frame_only_stack(rollback_exc),
+        )
+
+    cancelled = await _run_cleanup_step_quietly(
+        conn.rollback,
+        "rolling back the transaction",
+        log_failure=_log_rollback_failure,
+    )
+    if cancelled is not None:
+        raise cancelled
 
 
 async def _open_db(cfg: EngravaCLIConfig) -> Any:  # noqa: ANN401
@@ -2093,12 +2141,13 @@ async def _import_records_to_db(
         click.ClickException: On a malformed snapshot record, an invalid value,
             an embedding-model mismatch without an override flag, or a
             collision refused by the journalled-merge collision gate. The
-            transaction is rolled back before the error propagates.
+            transaction is rolled back before the error propagates; a
+            failure in that rollback itself is logged and does not replace
+            the error above -- see :func:`_rollback_quietly`.
 
     """
     total = 0
     journal_entries_cleared = 0
-    committed = False
     # Open the transaction explicitly so atomicity holds regardless of the
     # connection's isolation configuration (it does not depend on the driver's
     # implicit-transaction default).
@@ -2134,11 +2183,14 @@ async def _import_records_to_db(
             plain_insert=plain_insert,
         )
         await conn.commit()
-        committed = True
-    finally:
-        if not committed:
-            # Any validation or insert failure discards the whole restore.
-            await conn.rollback()
+    except BaseException:
+        # Any validation or insert failure -- or a failure in the commit
+        # itself, or a cancellation -- discards the whole restore. That is
+        # what the caller needs to see, so a rollback failure here is
+        # secondary and goes through ``_rollback_quietly`` rather than
+        # replacing it.
+        await _rollback_quietly(conn)
+        raise
     return RestoreImportResult(
         total_records=total,
         journal_entries_cleared=journal_entries_cleared,

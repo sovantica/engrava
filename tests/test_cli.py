@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 from click.testing import CliRunner
 
 from engrava.cli.config import EngravaCLIConfig
-from engrava.cli.main import _close_quietly, _import_records_to_db, cli
+from engrava.cli.main import _close_quietly, _import_records_to_db, _rollback_quietly, cli
 
 # Literal SQL, never interpolated: a read-back that assembles its own query
 # cannot be trusted to disagree with the schema the command wrote to.
@@ -2058,6 +2058,165 @@ class TestJournalledMergeCollisionGate:
             assert not conn.in_transaction
         finally:
             await conn.close()
+
+    async def test_a_rollback_failure_during_cleanup_does_not_replace_the_original_error(
+        self,
+        colliding_snapshot: Path,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A rollback failure while a collision error is propagating must not
+        replace it.
+
+        Before this fix, ``_import_records_to_db``'s cleanup was a bare
+        ``finally: if not committed: await conn.rollback()`` -- a rollback
+        failure there raises in front of the collision ``click.ClickException``
+        that triggered it, so a user restoring into a journalled store sees a
+        message about the rollback itself (e.g. a disk error) instead of the
+        collision that is actually actionable. After the fix, the collision
+        error still reaches the caller unchanged and the rollback failure is
+        only in the log.
+        """
+        import aiosqlite
+
+        from engrava import (
+            LifecycleStatus,
+            Priority,
+            SqliteEngravaCore,
+            ThoughtRecord,
+            ThoughtType,
+        )
+
+        db_path = tmp_path / "rollback-failure-target.db"
+        conn = await aiosqlite.connect(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        try:
+            store = SqliteEngravaCore(conn, journal_enabled=True)
+            await store.ensure_schema()
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id="t-old-0",
+                    essence="Essence for t-old-0",
+                    content="Content for t-old-0",
+                    thought_type=ThoughtType.OBSERVATION,
+                    source="test",
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    priority=Priority.P2,
+                    created_cycle=1,
+                    updated_cycle=1,
+                )
+            )
+            await conn.commit()
+
+            real_rollback = conn.rollback
+
+            async def _failing_rollback() -> None:
+                await real_rollback()
+                msg = "injected rollback failure"
+                raise sqlite3.OperationalError(msg)
+
+            conn.rollback = _failing_rollback  # type: ignore[method-assign]
+
+            with (
+                caplog.at_level(logging.WARNING),
+                pytest.raises(click.ClickException) as exc_info,
+            ):
+                await _import_records_to_db(conn, colliding_snapshot, orphan_journal_entries=False)
+
+            # The caller sees the ORIGINAL collision error, not the rollback's.
+            assert "injected rollback failure" not in str(exc_info.value)
+            # ...and the rollback failure is logged underneath it.
+            assert "Error rolling back transaction during cleanup" in caplog.text
+            assert "injected rollback failure" in caplog.text
+        finally:
+            conn.rollback = real_rollback  # type: ignore[method-assign]
+            await conn.close()
+
+    def test_a_clean_restore_is_unaffected_by_the_rollback_cleanup_path(
+        self,
+        colliding_snapshot_with_a_leading_new_record: Path,
+        journalled_db: Path,
+    ) -> None:
+        """Control: an ordinary, non-colliding restore never touches the
+        rollback-failure path at all -- it commits and returns normally.
+        """
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(journalled_db),
+                "restore",
+                "-i",
+                str(colliding_snapshot_with_a_leading_new_record),
+                "--orphan-journal-entries",
+            ],
+            standalone_mode=False,
+        )
+        assert result.exit_code == 0, result.output
+
+
+class _FakeRollbackConnection:
+    """Stand-in connection for testing the CLI's ``_rollback_quietly`` in isolation.
+
+    Mirrors ``_FakeConnection`` (used for ``_close_quietly``): ``started`` fires
+    the instant ``rollback()`` begins running so a test can wait for it to
+    genuinely be in flight before delivering a cancellation, and ``may_finish``
+    holds it from completing until the test says so.
+    """
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.may_finish = asyncio.Event()
+        self.finished = False
+
+    async def rollback(self) -> None:
+        self.started.set()
+        await self.may_finish.wait()
+        self.finished = True
+
+
+class _FailingRollbackConnection:
+    """A connection whose ``rollback()`` raises an ordinary exception."""
+
+    async def rollback(self) -> None:
+        msg = "rollback blew up"
+        raise RuntimeError(msg)
+
+
+class TestCliRollbackQuietlyCancellation:
+    """``_rollback_quietly`` needs the same cancellation handling as ``_close_quietly``.
+
+    A rollback and a close are different statements with the same shape of
+    problem: both are aiosqlite suspension points, so an unshielded
+    cancellation could abandon either mid-flight.
+    """
+
+    async def test_the_rollback_still_completes_when_cancelled_mid_rollback(self) -> None:
+        """A cancellation mid-rollback must not abandon the rollback itself."""
+        conn = _FakeRollbackConnection()
+        task = asyncio.create_task(_rollback_quietly(conn))
+        await conn.started.wait()
+        task.cancel()
+        conn.may_finish.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert conn.finished, (
+            "conn.rollback() never ran to completion under cancellation -- the "
+            "exact leak _rollback_quietly exists to prevent"
+        )
+
+    async def test_an_ordinary_exception_from_rollback_is_still_swallowed_and_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Control: the documented, uncancelled behaviour must be unchanged."""
+        conn = _FailingRollbackConnection()
+        with caplog.at_level(logging.WARNING):
+            await _rollback_quietly(conn)
+
+        assert "Error rolling back transaction during cleanup" in caplog.text
 
 
 class TestGc:
