@@ -268,6 +268,61 @@ class TestAccessSubstrate:
         assert row is not None
         assert row.access_count == 0
 
+    async def test_flush_of_all_stale_entries_does_not_commit_the_callers_pending_edit(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        """A flush whose whole batch is stale writes nothing and commits nothing.
+
+        Mirrors the ``delete_thought`` defect pinned in
+        ``tests/test_referential_integrity.py``: every buffered id's thought
+        was deleted before the flush runs, so the batched ``UPDATE`` matches
+        zero rows across the board — this call has nothing of its own to make
+        durable, and must not commit a caller's own pending transaction.
+        """
+        store._access_tracking_enabled = True
+        await store.create_thought(_obs("stale"))
+        await store.create_thought(_obs("unrelated"))
+        await store.get_thought("stale")  # buffers one access
+        assert len(store._access_buffer) == 1
+
+        await store.delete_thought("stale")  # the buffered id no longer exists
+
+        await store._db.execute("BEGIN")
+        await store._db.execute(
+            "UPDATE thought SET essence = ? WHERE thought_id = ?",
+            ("edited-by-caller", "unrelated"),
+        )
+
+        flushed = await store.flush_access_buffer()
+
+        assert flushed == 1  # the stale entry is still drained from the buffer
+        assert store._db.in_transaction is True, (
+            "the caller's own transaction, with their pending edit still "
+            "inside it, must still be open after an all-stale flush"
+        )
+        await store._db.rollback()
+
+        row = await store.get_thought("unrelated")
+        assert row is not None
+        assert row.essence == "Essence unrelated", (
+            "the caller's rollback must undo their own edit -- an all-stale "
+            "flush_access_buffer() must not have committed it on their behalf"
+        )
+
+    async def test_ordinary_flush_still_commits(self, store: SqliteEngravaCore) -> None:
+        """Control: a flush with at least one live match commits as before."""
+        store._access_tracking_enabled = True
+        await store.create_thought(_obs("t"))
+        await store.get_thought("t")
+
+        flushed = await store.flush_access_buffer()
+
+        assert flushed == 1
+        assert store._db.in_transaction is False, "a real access-count write must still commit"
+        after = await store.get_thought("t")
+        assert after is not None
+        assert after.access_count == 1
+
     async def test_access_flush_is_not_journaled(self) -> None:
         """The batched access flush writes no journal entry and keeps the chain valid.
 

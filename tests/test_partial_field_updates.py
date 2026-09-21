@@ -49,6 +49,7 @@ from engrava.domain.models import MetadataValue
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
+    from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Fixtures + helpers
@@ -778,6 +779,69 @@ class TestUpdateEdge:
         assert not [s for s in statements if s.lstrip().upper().startswith("UPDATE EDGE SET")]
         assert returned.weight == 0.5
 
+    async def test_no_op_update_does_not_commit_the_callers_pending_edit(
+        self,
+        store: SqliteEngravaCore,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """A no-op ``update_edge`` (no journal) has nothing of its own to commit.
+
+        Mirrors the ``delete_thought`` defect this pins in
+        ``tests/test_referential_integrity.py``: the caller opens a
+        transaction, makes its own pending edit, then calls a store method
+        that — on this branch — writes nothing at all. That method must not
+        reach out and commit the caller's unrelated pending work.
+        """
+        await self._seed(store)
+
+        await db.execute("BEGIN")
+        await db.execute(
+            "UPDATE thought SET essence = ? WHERE thought_id = ?",
+            ("edited-by-caller", "t-1"),
+        )
+
+        returned = await store.update_edge("e-1")
+
+        assert returned.weight == 0.5
+        assert db.in_transaction is True, (
+            "the caller's own transaction, with their pending edit still "
+            "inside it, must still be open after a no-op update_edge() call"
+        )
+        await db.rollback()
+
+        row = await _row(db, "thought", "thought_id", "t-1")
+        assert row["essence"] == "essence", (
+            "the caller's rollback must undo their own edit -- a no-op "
+            "update_edge() must not have committed it on their behalf"
+        )
+
+    async def test_no_op_update_still_commits_when_journaled(
+        self,
+        journaling_store: SqliteEngravaCore,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """A no-op ``update_edge`` still journals (before == after) when enabled.
+
+        That journal entry is itself a real row insert on this connection, so
+        unlike the un-journaled no-op above, this call *does* have something
+        of its own to make durable — the fix must still commit here.
+        """
+        await self._seed(journaling_store)
+
+        returned = await journaling_store.update_edge("e-1")
+
+        assert returned.weight == 0.5
+        assert db.in_transaction is False, (
+            "a no-op update_edge() that journaled a before==after entry must "
+            "still commit that entry"
+        )
+        assert journaling_store._journal is not None
+        entries = await journaling_store._journal.get_entries(
+            target_id="e-1",
+            mutation_type="UPDATE_EDGE",
+        )
+        assert len(entries) == 1
+
     async def test_update_of_an_edge_deleted_before_the_write_raises(
         self,
         store: SqliteEngravaCore,
@@ -815,6 +879,121 @@ class TestUpdateEdge:
         with pytest.raises(ValueError, match="Edge not found"):
             await store.update_edge("e-1", weight=0.9)
         assert any(s.lstrip().upper().startswith("UPDATE EDGE SET") for s in statements)
+
+
+class TestUpdateEdgeWroteAnythingDiscrimination:
+    """``wrote_anything`` must reflect ``total_changes``, not "``append`` was called".
+
+    ``update_edge`` used to set ``wrote_anything = True`` merely because the
+    journal's ``append`` was invoked -- ``append`` never checks whether its own
+    ``INSERT`` actually landed, so a trigger on ``journal_entry`` can veto it
+    with ``RAISE(IGNORE)`` while the flag still claims a write happened. Both
+    tests below share one file-backed database (a second connection is needed
+    to check durability) and the same trigger; they differ only in whether
+    that trigger writes something of its own before vetoing.
+    """
+
+    async def _open(self, tmp_path: Path, name: str) -> tuple[aiosqlite.Connection, Path]:
+        db_path = tmp_path / name
+        db = await aiosqlite.connect(str(db_path))
+        db.row_factory = aiosqlite.Row
+        bootstrap = SqliteEngravaCore(db, journal_enabled=True)
+        await bootstrap.ensure_schema()
+        return db, db_path
+
+    async def test_trigger_write_before_the_journal_veto_is_durable(self, tmp_path: Path) -> None:
+        """The trigger's own write survives even though the journal insert was vetoed."""
+        db, db_path = await self._open(tmp_path, "update-edge-journal-veto-durable.sqlite")
+        try:
+            store = SqliteEngravaCore(db, journal_enabled=True)
+            await store.create_thought(_thought("t-1"))
+            await store.create_thought(_thought("t-2"))
+            await store.create_edge(_edge())
+            await db.execute("CREATE TABLE audit(note TEXT)")
+            await db.execute(
+                "CREATE TRIGGER journal_insert_audit BEFORE INSERT ON journal_entry "
+                "BEGIN INSERT INTO audit VALUES ('attempted'); SELECT RAISE(IGNORE); END"
+            )
+            await db.commit()
+            journal_rows_before = (
+                await (await db.execute("SELECT COUNT(*) FROM journal_entry")).fetchone()
+            )[0]
+
+            returned = await store.update_edge("e-1")
+
+            assert returned.weight == 0.5
+
+            other = await aiosqlite.connect(str(db_path))
+            try:
+                cursor = await other.execute("SELECT COUNT(*) FROM audit")
+                row = await cursor.fetchone()
+                assert row is not None
+                assert row[0] == 1, (
+                    "the trigger's own audit insert ran before it vetoed the "
+                    "journal entry, and must be committed even though "
+                    "journal_entry itself gained no row"
+                )
+                cursor = await other.execute("SELECT COUNT(*) FROM journal_entry")
+                row = await cursor.fetchone()
+                assert row is not None
+                assert row[0] == journal_rows_before, (
+                    "the journal insert itself was genuinely vetoed -- "
+                    "no new row, only the two thought/edge creations already there"
+                )
+            finally:
+                await other.close()
+        finally:
+            await db.close()
+
+    async def test_a_journal_veto_that_writes_nothing_commits_nothing(self, tmp_path: Path) -> None:
+        """A pure veto (no trigger side effect at all) must not commit a caller's own edit.
+
+        This is the regression this fix closes: the old code set
+        ``wrote_anything = True`` unconditionally whenever journaling was
+        enabled, regardless of whether ``append``'s own ``INSERT`` actually
+        took effect -- so a no-op edit with journaling on always committed,
+        even when this call itself had genuinely written nothing.
+        """
+        db, _ = await self._open(tmp_path, "update-edge-journal-veto-write-free.sqlite")
+        try:
+            store = SqliteEngravaCore(db, journal_enabled=True)
+            await store.create_thought(_thought("t-1"))
+            await store.create_thought(_thought("t-2"))
+            await store.create_thought(_thought("t-3", essence="essence-unrelated"))
+            await store.create_edge(_edge())
+            await db.execute(
+                "CREATE TRIGGER journal_insert_ignore BEFORE INSERT ON journal_entry "
+                "BEGIN SELECT RAISE(IGNORE); END"
+            )
+            await db.commit()
+
+            await db.execute("BEGIN")
+            await db.execute(
+                "UPDATE thought SET essence = ? WHERE thought_id = ?",
+                ("edited-by-caller", "t-3"),
+            )
+
+            returned = await store.update_edge("e-1")
+
+            assert returned.weight == 0.5
+            assert db.in_transaction is True, (
+                "the caller's own transaction, with their pending edit still "
+                "inside it, must still be open after a call whose only "
+                "attempted write (the journal insert) was silently vetoed "
+                "and left nothing behind"
+            )
+            await db.rollback()
+
+            cursor = await db.execute("SELECT essence FROM thought WHERE thought_id = ?", ("t-3",))
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row["essence"] == "essence-unrelated", (
+                "the caller's rollback must undo their own edit -- a "
+                "genuinely write-free update_edge() must not have committed "
+                "it on their behalf"
+            )
+        finally:
+            await db.close()
 
 
 # ---------------------------------------------------------------------------

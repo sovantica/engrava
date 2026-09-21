@@ -961,6 +961,129 @@ class TestParentDeleteSuppressedByRaiseIgnore:
             row = await cursor.fetchone()
             assert row is not None
             assert row[0] == 0, "the orphaned edge must still be swept for a nonexistent id"
+            assert db.in_transaction is False, (
+                "the sweep is a real write even though `deleted` is False -- "
+                "delete_thought must still commit it, not mistake `deleted is "
+                "False` for 'this call wrote nothing' and roll it back"
+            )
+
+
+class TestChildTriggerWriteSurvivesAVetoedSweep:
+    """``wrote_anything`` must reflect ``total_changes``, not a per-delete rowcount.
+
+    ``_delete_thought_children_explicit`` used to OR together the ``rowcount``
+    of its three deletes. A ``BEFORE DELETE`` trigger on any of the three
+    child tables can write a real row of its own (an audit entry, say) and
+    then veto its own statement with ``RAISE(IGNORE)`` -- which reverts only
+    that statement, not the trigger's earlier writes, but leaves every
+    rowcount involved at zero. The old computation therefore reported
+    ``wrote_anything=False`` for a call that really did write something, and
+    ``delete_thought`` rolled that write back instead of committing it.
+
+    The two tests below share one scaffold (the same audit table and
+    trigger) and differ only in whether the trigger ever actually fires --
+    proving the fix discriminates the two states rather than merely
+    happening to pass on one of them.
+    """
+
+    async def test_trigger_write_before_the_veto_is_durable(self, tmp_path: Path) -> None:
+        """The trigger's own write must survive even though the sweep saw rowcount zero."""
+        db_path = tmp_path / "child-trigger-write-durable.sqlite"
+        db = await aiosqlite.connect(str(db_path))
+        try:
+            db.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(db, embedding_provider=None, auto_embed=False)
+            await store.ensure_schema()
+            await db.execute("PRAGMA foreign_keys = OFF")
+            await store.create_thought(_make_thought("t2"))
+            # An orphaned edge for a `thought_id` that was never inserted --
+            # only creatable with enforcement off, exactly like the sweep's
+            # other tests above.
+            await store.create_edge(_make_edge("e1", "ghost", "t2"))
+            await db.execute("CREATE TABLE audit(note TEXT)")
+            await db.execute(
+                "CREATE TRIGGER edge_delete_audit BEFORE DELETE ON edge "
+                "BEGIN INSERT INTO audit VALUES ('swept'); SELECT RAISE(IGNORE); END"
+            )
+            await db.commit()
+
+            deleted = await store.delete_thought("ghost")
+
+            assert deleted is False, "'ghost' was never a live thought"
+            assert await store.get_thought("ghost") is None
+
+            # Durability, not merely visibility on the writer's own
+            # connection: an uncommitted row on `db` would be indistinguishable
+            # from a durable one there, so this reads from a second, separate
+            # connection to the same file.
+            other = await aiosqlite.connect(str(db_path))
+            try:
+                cursor = await other.execute("SELECT COUNT(*) FROM audit")
+                row = await cursor.fetchone()
+                assert row is not None
+                assert row[0] == 1, (
+                    "the trigger's own audit insert ran before it vetoed the "
+                    "edge delete, and must be committed even though the "
+                    "vetoed delete's own rowcount was zero"
+                )
+            finally:
+                await other.close()
+        finally:
+            await db.close()
+
+    async def test_a_veto_that_writes_nothing_commits_nothing(self, tmp_path: Path) -> None:
+        """The same trigger, never fired, must leave a caller's own transaction alone."""
+        db_path = tmp_path / "child-trigger-write-free.sqlite"
+        db = await aiosqlite.connect(str(db_path))
+        try:
+            db.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(db, embedding_provider=None, auto_embed=False)
+            await store.ensure_schema()
+            await store.create_thought(_make_thought("unrelated"))
+            await db.execute("CREATE TABLE audit(note TEXT)")
+            await db.execute(
+                "CREATE TRIGGER edge_delete_audit BEFORE DELETE ON edge "
+                "BEGIN INSERT INTO audit VALUES ('swept'); SELECT RAISE(IGNORE); END"
+            )
+            await db.commit()
+
+            # No orphaned edge, embedding, or action row exists for "ghost" --
+            # the trigger above is installed but has nothing to fire on, so
+            # this call is genuinely write-free, not merely vetoed.
+            await db.execute("BEGIN")
+            await db.execute(
+                "UPDATE thought SET essence = ? WHERE thought_id = ?",
+                ("edited-by-caller", "unrelated"),
+            )
+
+            deleted = await store.delete_thought("ghost")
+
+            assert deleted is False
+            assert db.in_transaction is True, (
+                "the caller's own transaction, with their pending edit still "
+                "inside it, must still be open after a call that wrote "
+                "nothing of its own"
+            )
+            await db.rollback()
+
+            row = await store.get_thought("unrelated")
+            assert row is not None
+            assert row.essence == "essence-unrelated", (
+                "the caller's rollback must undo their own edit -- a "
+                "genuinely write-free delete_thought() must not have "
+                "committed it on their behalf"
+            )
+
+            other = await aiosqlite.connect(str(db_path))
+            try:
+                cursor = await other.execute("SELECT COUNT(*) FROM audit")
+                row2 = await cursor.fetchone()
+                assert row2 is not None
+                assert row2[0] == 0, "the trigger never fired, so nothing was ever written"
+            finally:
+                await other.close()
+        finally:
+            await db.close()
 
 
 class TestVetoedDeleteEndsTheTransactionItOpened:
@@ -978,20 +1101,21 @@ class TestVetoedDeleteEndsTheTransactionItOpened:
     the outer transaction, so ``self._db.in_transaction`` stayed ``True``
     indefinitely on the connection that ran it.
 
-    ``delete_thought`` and ``cleanup_expired``'s delete strategy do not
-    reveal this in practice: both call an unconditional-enough
-    ``_maybe_commit()`` immediately afterwards (``delete_thought`` always;
-    ``cleanup_expired`` whenever its batch had any expired candidate at
-    all), with no ``await`` in between that could let a second connection
-    observe the gap, so the leak closes before either method returns.
-    ``run_hygiene`` is different: it only commits ``if archived_count or
-    gc_count``, and both stay zero when every eligible thought in the GC
-    batch is vetoed, so nothing ever closes it -- this is the reproduction
-    the fix targets. The first two tests below still pin the general rule
-    directly on ``self._db.in_transaction`` (not just on the GC path)
-    because relying on an incidental later commit is not the same as the
-    veto branch closing what it opened, and a future reordering of either
-    caller must not silently reintroduce the leak.
+    ``delete_thought`` and ``cleanup_expired``'s delete strategy also close
+    this gap themselves now, from the other end: each gates its own call to
+    ``_maybe_commit()`` on whether anything was actually written, and rolls
+    back a self-opened, still-empty transaction otherwise (see
+    ``TestPubliclyVetoedWritesDoNotCommitACallersTransaction`` below for what
+    that was fixing — a still-open *caller* transaction the old unconditional
+    commit reached out and closed early). ``run_hygiene`` was already like
+    this: it only commits ``if archived_count or gc_count``, and both stay
+    zero when every eligible thought in the GC batch is vetoed, so nothing
+    else would ever close it — this is the reproduction the fix targets. The
+    first two tests below still pin the general rule directly on
+    ``self._db.in_transaction`` (not just on the GC path) because relying on
+    a caller's own later action is not the same as the veto branch closing
+    what it opened, and a future reordering of any caller must not silently
+    reintroduce the leak.
 
     A genuine second connection to the same file is required to observe the
     lock from outside -- a shared ``:memory:`` database cannot host
@@ -1096,10 +1220,11 @@ class TestVetoedDeleteEndsTheTransactionItOpened:
 
             assert deleted is False
             assert db.in_transaction is False, (
-                "delete_thought's own _maybe_commit call happens to close this "
-                "transaction anyway (it runs unconditionally right after), but "
-                "the veto branch must not depend on that -- it must close what "
-                "it opened on its own"
+                "delete_thought's own rollback-on-write-free branch also "
+                "closes this transaction (nothing was deleted here, so it "
+                "does not reach _maybe_commit at all), but the veto branch "
+                "inside _delete_thought_atomic must not depend on that -- it "
+                "must close what it opened on its own"
             )
             await self._assert_second_connection_can_write_immediately(db_path)
         finally:
@@ -1133,9 +1258,10 @@ class TestVetoedDeleteEndsTheTransactionItOpened:
 
             assert result.expired_count == 1
             assert db.in_transaction is False, (
-                "cleanup_expired's own _maybe_commit call happens to close "
-                "this transaction anyway (it runs whenever any candidate was "
-                "found, veto or not), but the veto branch must not depend on "
+                "cleanup_expired's own rollback-on-write-free branch also "
+                "closes this transaction (nothing was deleted in this batch, "
+                "so it does not reach _maybe_commit at all), but the veto "
+                "branch inside _delete_thought_atomic must not depend on "
                 "that -- it must close what it opened on its own"
             )
             await self._assert_second_connection_can_write_immediately(db_path)
@@ -1234,19 +1360,17 @@ class TestVetoedDeleteEndsTheTransactionItOpened:
         caller's own commit/rollback to decide.
 
         This calls ``_delete_thought_atomic`` directly rather than the public
-        ``delete_thought``: the public method always ends its own call with
-        an unconditional ``_maybe_commit()`` (see its docstring), which
-        commits *any* open transaction whenever ``_skip_auto_commit`` is not
-        set -- caller-owned or not. That is ``delete_thought``'s own,
-        separate contract as a guarded write, unrelated to whether the
-        *veto branch inside* ``_delete_thought_atomic`` disturbs a
-        transaction it did not open. Only ``suspend_auto_commit`` suppresses
-        that outer commit (via ``_skip_auto_commit``), which is why cases 1
-        and 2 above route through the public method and this one does not: a
-        raw, unmediated ``BEGIN`` with no ``suspend_auto_commit`` window is
-        exactly the "known residual gap" ``_serialize_dedup_probe`` documents
-        for the sibling dedup path -- outside what any guarded write's own
-        commit step promises to leave alone.
+        ``delete_thought`` so this test is the narrowest possible pin on the
+        internal ownership mechanism, independent of whatever the public
+        method's own call site does with it.
+        ``delete_thought`` itself no longer needs a ``suspend_auto_commit``
+        window to leave a raw, unmediated caller ``BEGIN`` alone on this
+        path: it now gates its own ``_maybe_commit()`` on whether it actually
+        deleted anything, exactly like this method gates its own transaction
+        handling — see ``TestPubliclyVetoedWritesDoNotCommitACallersTransaction``
+        for that behaviour exercised through the public method, with a real
+        pending edit under the caller's ``BEGIN`` and a ``rollback()`` that
+        must actually undo it.
         """
         db_path = tmp_path / "explicit-begin-untouched.sqlite"
         db = await aiosqlite.connect(str(db_path))
@@ -1258,15 +1382,164 @@ class TestVetoedDeleteEndsTheTransactionItOpened:
             await self._install_ignore_trigger(db)
 
             await db.execute("BEGIN")
-            deleted = await store._delete_thought_atomic("vetoed")
+            result = await store._delete_thought_atomic("vetoed")
 
-            assert deleted is False
+            assert result.deleted is False
+            assert result.wrote_anything is False
             assert db.in_transaction is True, (
                 "the caller's own explicit BEGIN, opened before this call and "
                 "with nothing written under it yet, must still be open here"
             )
             await db.rollback()
             assert await store.get_thought("vetoed") is not None
+        finally:
+            await db.close()
+
+
+class TestPubliclyVetoedWritesDoNotCommitACallersTransaction:
+    """A write-free outcome must not commit a caller's own pending edit.
+
+    ``_delete_thought_atomic`` (exercised above) never touches a transaction
+    it did not open. But before this fix, its two public callers,
+    ``delete_thought`` and ``cleanup_expired``, undid that protection from the
+    outside: both called ``_maybe_commit()`` unconditionally on return,
+    regardless of whether anything was actually deleted. When a caller had
+    opened its own transaction first (a raw ``BEGIN``, or a real write buried
+    a few frames up the same task) and had a pending edit of its own sitting
+    in it, a vetoed delete's unconditional commit durably applied that edit
+    too — the caller's own later ``rollback()`` had nothing left to undo.
+
+    Each test below reproduces exactly that: a caller-owned transaction, a
+    real pending edit inside it, a write-free call, and a ``rollback()`` that
+    must actually undo the edit. The controls alongside confirm the ordinary,
+    writing path is unchanged: it keeps committing, caller-owned transaction
+    or not, because "whoever writes, commits" was never in question — only
+    the write-free branch was.
+    """
+
+    async def test_delete_thought_veto_does_not_commit_the_callers_pending_edit(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "delete-thought-veto-caller-txn.sqlite"
+        db = await aiosqlite.connect(str(db_path))
+        try:
+            db.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(db, embedding_provider=None, auto_embed=False)
+            await store.ensure_schema()
+            await store.create_thought(_make_thought("vetoed"))
+            await store.create_thought(_make_thought("unrelated"))
+            await db.execute(
+                "CREATE TRIGGER thought_delete_ignore BEFORE DELETE ON thought "
+                "BEGIN SELECT RAISE(IGNORE); END"
+            )
+
+            await db.execute("BEGIN")
+            await db.execute(
+                "UPDATE thought SET essence = ? WHERE thought_id = ?",
+                ("edited-by-caller", "unrelated"),
+            )
+
+            deleted = await store.delete_thought("vetoed")
+
+            assert deleted is False
+            assert db.in_transaction is True, (
+                "the caller's own transaction, with their pending edit still "
+                "inside it, must still be open after a vetoed delete_thought()"
+            )
+            await db.rollback()
+
+            row = await store.get_thought("unrelated")
+            assert row is not None
+            assert row.essence == "essence-unrelated", (
+                "the caller's rollback must undo their own edit -- a vetoed "
+                "delete_thought() must not have committed it on their behalf"
+            )
+        finally:
+            await db.close()
+
+    async def test_ordinary_delete_thought_still_commits(self, tmp_path: Path) -> None:
+        """Control: a real delete, with no caller transaction, commits as before."""
+        db_path = tmp_path / "delete-thought-ordinary-commit.sqlite"
+        db = await aiosqlite.connect(str(db_path))
+        try:
+            db.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(db, embedding_provider=None, auto_embed=False)
+            await store.ensure_schema()
+            await store.create_thought(_make_thought("t1"))
+
+            deleted = await store.delete_thought("t1")
+
+            assert deleted is True
+            assert db.in_transaction is False, "a real delete must still commit"
+            assert await store.get_thought("t1") is None
+        finally:
+            await db.close()
+
+    async def test_cleanup_expired_all_vetoed_does_not_commit_the_callers_pending_edit(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "cleanup-expired-veto-caller-txn.sqlite"
+        db = await aiosqlite.connect(str(db_path))
+        try:
+            db.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(
+                db, embedding_provider=None, auto_embed=False, ttl_strategy="delete"
+            )
+            await store.ensure_schema()
+            past = "2026-01-01T00:00:00+00:00"
+            now = "2026-06-01T00:00:00+00:00"
+            await store.create_thought(_make_thought("vetoed", expires_at=past))
+            await store.create_thought(_make_thought("unrelated"))
+            await db.execute(
+                "CREATE TRIGGER thought_delete_ignore BEFORE DELETE ON thought "
+                "BEGIN SELECT RAISE(IGNORE); END"
+            )
+
+            await db.execute("BEGIN")
+            await db.execute(
+                "UPDATE thought SET essence = ? WHERE thought_id = ?",
+                ("edited-by-caller", "unrelated"),
+            )
+
+            result = await store.cleanup_expired(now=now)
+
+            assert result.expired_count == 1
+            assert db.in_transaction is True, (
+                "the caller's own transaction, with their pending edit still "
+                "inside it, must still be open after a fully-vetoed batch"
+            )
+            await db.rollback()
+
+            row = await store.get_thought("unrelated")
+            assert row is not None
+            assert row.essence == "essence-unrelated", (
+                "the caller's rollback must undo their own edit -- a "
+                "fully-vetoed cleanup_expired() must not have committed it"
+            )
+        finally:
+            await db.close()
+
+    async def test_ordinary_cleanup_expired_still_commits(self, tmp_path: Path) -> None:
+        """Control: a real expiry delete, with no caller transaction, commits."""
+        db_path = tmp_path / "cleanup-expired-ordinary-commit.sqlite"
+        db = await aiosqlite.connect(str(db_path))
+        try:
+            db.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(
+                db, embedding_provider=None, auto_embed=False, ttl_strategy="delete"
+            )
+            await store.ensure_schema()
+            past = "2026-01-01T00:00:00+00:00"
+            now = "2026-06-01T00:00:00+00:00"
+            await store.create_thought(_make_thought("t1", expires_at=past))
+
+            result = await store.cleanup_expired(now=now)
+
+            assert result.expired_count == 1
+            assert db.in_transaction is False, "a real expiry delete must still commit"
+            assert await store.get_thought("t1") is None
         finally:
             await db.close()
 

@@ -1033,6 +1033,10 @@ _NON_CONFIG_CLASSES: dict[str, str] = {
     "engrava.domain.protocols.derived_records.DerivedRecord": "a record a producer emits",
     "engrava.domain.protocols.hooks.MindQLExtension": "an extension registration",
     "engrava.domain.protocols.hooks.ScoringContext": "per-query scoring inputs",
+    "engrava.infrastructure.sqlite.engrava_core._DeleteAtomicResult": (
+        "one _delete_thought_atomic call's outcome -- what it deleted and whether it wrote "
+        "anything, not settings"
+    ),
     "engrava.infrastructure.sqlite.engrava_core._DerivationOutcome": "one derivation's outcome",
     "engrava.infrastructure.sqlite.extension_migrations._AppliedMigration": (
         "a migration ledger row"
