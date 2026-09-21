@@ -142,8 +142,11 @@ latency and see [Performance](performance.md#the-brute-force-ceiling-and-how-to-
 ## FTS5 Availability
 
 FTS5 is included in the standard SQLite build since version 3.9.0 (2015).
-Most Python distributions include it. If FTS5 is not available, `search_fts()`
-raises an error at schema creation time.
+Most Python distributions include it. If FTS5 is not available, creating the
+schema fails: `ensure_schema()` (and so opening a new store) raises a
+`sqlite3.DatabaseError` and the store does not open. Separately, on a store that
+is already open, `search_fts()` returns an empty list rather than raising when
+the `thought_fts` table does not exist.
 
 To verify FTS5 support:
 
