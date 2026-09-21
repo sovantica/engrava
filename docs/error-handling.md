@@ -56,14 +56,21 @@ These failures require a changed request, not backoff:
   SQLite error text.
 - `InvalidTransitionError` rejects an illegal lifecycle/action transition, and
   `ReadOnlyViolationError` rejects a write through `ReadOnlyEngrava`.
-- `StaleDataError` is recoverable only through a new read-modify-write cycle. Do
-  not replay stale `changes` without checking the newer record — and do not
-  assume the record still exists, because a row deleted mid-call raises this too.
-  Note what it does **not** tell you: the guard compares `updated_cycle`, which
-  only a caller advances, so an ordinary competing edit passes through it and
-  overwrites — see
-  [Concurrency](concurrency.md#optimistic-concurrency-and-staledataerror). Its
-  absence is not evidence that no one else wrote.
+- `StaleDataError` means a guarded update matched no row: another guarded write
+  bumped the row's `revision` between your read and your write, or the row was
+  deleted in that window. The error does not say which, and nothing of the
+  rejected update was written. It is recoverable only through a new
+  read-modify-write cycle: re-read the record, recompute the change, and do not
+  replay stale `changes` without checking the newer record. Do not assume the
+  record still exists, because a row deleted mid-call raises this too. The
+  engine bumps `revision` on every guarded write, so a guarded update whose
+  read-to-write window another writer's guarded write lands in raises this
+  error, whatever field that other write touched, instead of silently
+  overwriting that write. Between ordinary tasks sharing one store the write
+  lock serialises guarded writes, so it almost never fires there; the shapes it
+  does catch are a write from a second store on the same file and a same-task
+  nested write from a caller-owned hook — see
+  [Concurrency](concurrency.md#optimistic-concurrency-and-staledataerror).
 - `DerivedRecordError` means a producer violated a derivation gate or collided
   with an unrelated identity. The source thought is already durable on the
   automatic post-store path; some earlier derived children may also be durable.
