@@ -215,9 +215,19 @@ different model name or a different dimension, the stored vectors are
 incompatible with new ones, so it refuses rather than silently mixing
 dimensions (which would corrupt similarity results).
 
-**Fix.** Use the same embedding model the database was created with, or restore
-a trusted snapshot with a configured provider and deliberately re-embed the
-corpus. Direct mode uses top-level `embeddings`:
+The same error is raised when only the provider's `document_prefix` differs from
+the one the corpus was embedded with: adding one to a store built without,
+changing it, or removing it. A non-empty prefix is recorded as a fingerprint
+next to the model name; a store built without one records none. Adding,
+changing or removing a prefix is therefore a change to the corpus identity, and
+the vectors already stored were produced under the old one. A change to the
+`query_prefix` alone does not raise this error; it raises
+`EmbeddingQueryPrefixMismatchError` at search time instead. See
+[Embeddings guide → Asymmetric prefixes](guides/embeddings.md#asymmetric-prefixes-for-instruction-tuned-models).
+
+**Fix.** Use the same embedding model and `document_prefix` the database was
+created with, or restore a trusted snapshot with a configured provider and
+deliberately re-embed the corpus. Direct mode uses top-level `embeddings`:
 
 ```bash
 engrava --db restored.db --config engrava.yaml restore \
