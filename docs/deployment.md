@@ -136,6 +136,49 @@ only closes a connection it **owns**:
 Wire whichever applies into your framework's shutdown hook (e.g. FastAPI
 `lifespan`, a signal handler) so an interrupted process still closes cleanly.
 
+### If the worker never answers
+
+`store.close()` waits for the background worker to finish whatever it was
+doing before it can close the connection — including flushing buffered
+access-tracking data first, when that feature is on. Those are two separate
+waits, each bounded on its own by `close_timeout_seconds` (30 seconds by
+default; tune it on `from_config()` / the manual constructor) rather than
+open-ended — **not one shared budget for the call, and not the same
+consequence if either one expires:**
+
+- **The flush wait's bound expiring** is treated as an ordinary flush
+  failure — the buffered access-tracking counts are best-effort telemetry
+  that self-heals from a lost flush — so it quarantines nothing by itself.
+  `close()` still goes on to attempt the physical close afterwards on an
+  owned connection.
+- **The physical-close wait's bound expiring** is the one with a lasting
+  consequence: the store is left permanently unusable — every further
+  operation on it, including a second `close()`, raises
+  `ConnectionQuarantinedError` — because the worker's last operation never
+  reported and the connection's true state can no longer be trusted.
+
+A worker that never answers at all can therefore make one `close()` call on
+an owned connection wait up to *twice* `close_timeout_seconds` (60 seconds
+at the default) before returning: up to the full bound stuck in the flush
+(no lasting effect on its own), then up to the full bound again stuck in the
+physical close (the one that quarantines). Either way, a caller closing a
+store whose worker has stopped responding still gets control back instead
+of hanging forever — just not within a single `close_timeout_seconds`
+window.
+
+Bounding `close()` does not bound the **process**, and the reason is not the
+worker thread. Measurement behind this bound tested that explanation and
+ruled it out: a daemon and a non-daemon worker thread took the same ~20
+seconds to exit, and by the time that residual delay is even observed the
+worker thread has already finished. The delay instead lives inside the
+interpreter's own async-runtime shutdown sequence, which runs *after* your
+code — including a returned `close()` — has already handed back control, so
+nothing about how `close()` waits (bounded or not) can shorten it. If a
+clean, prompt process exit matters for your deployment, treat a
+`ConnectionQuarantinedError` from `close()` as a signal to end the process
+explicitly (rather than trusting the ordinary shutdown path) — that is a
+choice about how you exit, not a fix to the underlying delay.
+
 ## See also
 
 - [Concurrency](concurrency.md) — what one store guarantees, busy timeout, isolation

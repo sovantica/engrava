@@ -1295,6 +1295,52 @@ def _validate_provider_cycle(value: object) -> int:
 #: provider or a larger batch ceiling than this covers.
 _WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS = 600.0
 
+#: How long :meth:`SqliteEngravaCore.close` waits for the aiosqlite worker
+#: thread to answer the physical close before giving up on it. Unbounded
+#: before this: a worker that never answers — busy with something
+#: legitimately slow, or genuinely wedged inside a call nothing can
+#: interrupt — left ``close()`` queued behind it forever. See ``close``'s own
+#: docstring for what happens once this bound expires.
+#:
+#: **Not a per-call budget.** ``close()`` applies this same value a second
+#: time, independently, to the access-buffer flush it runs before the
+#: physical close — so one call can wait up to *twice* this figure (60s at
+#: the default) when the worker never answers at all, not this figure as a
+#: ceiling on the whole call. See :meth:`SqliteEngravaCore.close` for why
+#: the flush needs its own bound rather than sharing one with the close.
+#:
+#: Derived from a number already in this file, not an unrelated one:
+#: :meth:`SqliteEngravaCore.from_config` sets ``PRAGMA busy_timeout=5000`` on
+#: every connection it opens — five seconds is already this product's own
+#: line between "the database is legitimately busy" and "something is
+#: wrong", at the level SQLite itself can see. ``close()`` is waiting on the
+#: same worker thread from one layer above that PRAGMA, so its bound uses a
+#: small integer multiple of that figure for headroom (the close's own WAL
+#: bookkeeping, plus whatever the worker was already doing when the stop
+#: request was queued behind it) rather than inventing an unrelated number:
+#: **30 seconds, six times the busy-timeout floor.**
+#:
+#: This is deliberately much shorter than
+#: :data:`_WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS` (600s) — that bound covers a
+#: *different* task waiting through a legitimate, network-bound embedding
+#: round trip that never touches the worker thread at all (the wait happens
+#: on the Python/asyncio side, while the connection itself is idle). This
+#: bound covers a caller waiting on the worker thread itself, where
+#: measurement behind this bound found only two shapes: a slow statement
+#: that finishes in seconds, or a worker that will never answer at any
+#: bound, however large — so a large default buys nothing for the first
+#: case and only makes the second case's caller wait longer than it has to.
+#: That caller is plausibly a short-lived command-line invocation through
+#: the ``--config`` tier (``SqliteEngravaCore.from_config`` — the case that
+#: motivated this): the CLI's other, bare-connection tier calls
+#: ``aiosqlite.Connection.close()`` directly and does not go through this
+#: method at all, so it does not inherit this bound regardless of the
+#: default chosen here.
+#: Tune it via ``SqliteEngravaCore(..., close_timeout_seconds=...)`` /
+#: ``from_config(..., close_timeout_seconds=...)`` for a deployment whose
+#: legitimate closes run slower than this covers.
+_CLOSE_TIMEOUT_SECONDS: Final = 30.0
+
 
 class _TaskReentrantLock:
     """An ``asyncio``-compatible lock that the *same task* may re-acquire freely.
@@ -1572,6 +1618,21 @@ class SqliteEngravaCore:
             ``bulk_store`` with network-bound embedding under load, since a
             legitimate hold longer than this value now fails loudly instead
             of completing.
+        close_timeout_seconds: How long :meth:`close` waits for the aiosqlite
+            worker thread to answer the physical close before giving up on
+            it and quarantining the store — see :meth:`close` and
+            :data:`_CLOSE_TIMEOUT_SECONDS` for what expiry does and how the
+            default is derived. Raise this for a deployment whose legitimate
+            closes (a large WAL checkpoint, a busy worker finishing real
+            work) routinely run slower than the default covers; lower it to
+            get control back sooner when the worker is wedged and will
+            never answer. The same shorter bound is all a merely-slow close
+            gets to prove itself in, though:
+            :meth:`_finish_close_wait` cannot tell a slow worker from a wedged
+            one, so a lower value also raises the odds of quarantining a store
+            whose close was healthy and would have finished. The close itself
+            runs to completion either way — the bound stops this call's
+            observation of it, never the close.
 
     """
 
@@ -1595,6 +1656,7 @@ class SqliteEngravaCore:
         derive_gates: DeriveGates | None = None,
         cycle_provider: CycleProvider | None = None,
         write_lock_acquire_timeout_seconds: float = _WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS,
+        close_timeout_seconds: float = _CLOSE_TIMEOUT_SECONDS,
     ) -> None:
         self._db = db
         self._hooks: EngravaHooksProtocol = hooks or DefaultEngravaHooks()
@@ -1630,6 +1692,11 @@ class SqliteEngravaCore:
         # Also retains quarantine's own close task so it is neither GC'd
         # while pending nor reported as an unretrieved-exception task.
         self._quarantine_close_task: asyncio.Task[None] | None = None
+        # Bound on how long close() waits for the worker to answer the
+        # physical close before quarantining the store instead -- see
+        # close() and _CLOSE_TIMEOUT_SECONDS for the derivation and what
+        # expiry does.
+        self._close_timeout_seconds: float = close_timeout_seconds
         self._fts_available: bool = False
         self._fts_probed: bool = False
         # Count of primary FTS5 ``MATCH`` executions that raised an
@@ -2130,6 +2197,7 @@ class SqliteEngravaCore:
         *,
         cycle_provider: CycleProvider | None = None,
         write_lock_acquire_timeout_seconds: float = _WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS,
+        close_timeout_seconds: float = _CLOSE_TIMEOUT_SECONDS,
     ) -> Self:
         """Create a fully configured instance from a YAML config file.
 
@@ -2154,6 +2222,10 @@ class SqliteEngravaCore:
                 constructor — see its own docstring. Not read from the config
                 file (it is a runtime tuning knob, not corpus-affecting
                 configuration).
+            close_timeout_seconds: Forwarded verbatim to the constructor —
+                see its own and :meth:`close`'s docstrings. Not read from the
+                config file, for the same reason as
+                ``write_lock_acquire_timeout_seconds`` above.
 
         Returns:
             A configured ``SqliteEngravaCore`` with schema applied.
@@ -2227,6 +2299,7 @@ class SqliteEngravaCore:
                 derive_gates=config.derive,
                 cycle_provider=cycle_provider,
                 write_lock_acquire_timeout_seconds=write_lock_acquire_timeout_seconds,
+                close_timeout_seconds=close_timeout_seconds,
             )
             store._owns_connection = True
 
@@ -2281,9 +2354,10 @@ class SqliteEngravaCore:
 
         Flushes any pending access-buffer events first (best-effort — a flush
         failure never blocks the close, and neither does a cancellation
-        arriving while the flush is in flight), then closes the connection
-        when this instance owns it. No-op on the connection when it is
-        caller-managed (i.e. created via the manual constructor).
+        arriving while the flush is in flight, nor does the flush's own
+        bound expiring — see the bounded-wait paragraph below), then closes
+        the connection when this instance owns it. No-op on the connection
+        when it is caller-managed (i.e. created via the manual constructor).
 
         **Coordinates with a concurrent or prior quarantine.**
         :meth:`_quarantine_connection` schedules its own physical close of
@@ -2331,6 +2405,74 @@ class SqliteEngravaCore:
         itself resolved to; the shared task keeps running to completion
         regardless, so nothing is left half-closed by letting the
         cancellation through.
+
+        **The wait on the worker is bounded, not indefinite -- applied
+        twice in sequence, once to the flush above and once to the physical
+        close below, not once as a shared budget for the whole call.** The
+        access-buffer flush awaits the same worker directly (through
+        ``_write_lock`` and a raw ``executemany``), so it is wrapped in its
+        own ``asyncio.wait_for(..., timeout=self._close_timeout_seconds)``
+        immediately above; an unresponsive worker would otherwise hang
+        there first, before the physical-close bound described next is
+        ever reached, silently defeating it for every store with access
+        tracking on. A flush timeout is just another flush failure to this
+        call -- caught the same way, for the same reason (the buffered
+        counts are documented best-effort telemetry, self-healing after a
+        lost flush). **Because each wait gets the full
+        :attr:`_close_timeout_seconds` independently, one call to this
+        method can take up to twice that value** (60s at the default) when
+        the worker never answers at all -- up to the full bound stuck in
+        the flush, then up to the full bound again stuck in the close --
+        not :attr:`_close_timeout_seconds` itself as a per-call ceiling.
+
+        The physical close is bounded the same way: both branches drain
+        the task under :attr:`_close_timeout_seconds` (default
+        :data:`_CLOSE_TIMEOUT_SECONDS`, configurable via the constructor /
+        :meth:`from_config`) rather than forever. A worker that is merely
+        slow still gets that whole window to answer — the task itself is
+        never cancelled by the bound, only *this call's observation of it*
+        stops, so a slow-but-finite close keeps running to completion behind
+        the scenes exactly as it would without a bound. A worker that never
+        answers at all leaves the task not ``done()`` when the bound
+        expires; this call then hands off to :meth:`_quarantine_connection`
+        with that same task already installed in
+        :attr:`_quarantine_close_task`, so quarantine's own coordination
+        (above) sees a physical close already in flight and defers to it
+        rather than starting a second one — an expired bound never causes a
+        second physical close, whether this is the first ``close()`` on this
+        store or a later one piggybacking on an earlier expiry. The store is
+        left terminally unusable either way (the same
+        :class:`~engrava.domain.exceptions.ConnectionQuarantinedError` every
+        other quarantine path raises, not a new sibling state), because the
+        worker's last operation never reported and the connection's true
+        state is unknown from here. This call itself raises that same error
+        once the hand-off completes — unless a cancellation of this call's
+        own await was already pending (from the flush above, or from
+        draining the task), which outranks a *discovered* expiry exactly as
+        it outranks a discovered close failure elsewhere in this method: the
+        expiry is logged instead, and the pending cancellation is what
+        propagates.
+
+        **Bounding this wait does not bound how long the process itself may
+        take to exit afterwards, and the reason is not the worker thread.**
+        Measurement behind this bound ruled out the thread's daemon status
+        as the cause: a daemon and a non-daemon worker took the same ~20s to
+        exit, and by the time that residual wait is even observed the worker
+        thread has already finished — the delay lives inside the
+        interpreter's own async-runtime shutdown sequence, which runs
+        *after* this method (and the rest of your code) has already
+        returned control, not in anything ``close()`` is waiting on. That
+        residual cost is therefore outside what this method — or any bound
+        it applies — can fix; see ``docs/deployment.md`` for what a caller
+        can do about it.
+
+        Raises:
+            ConnectionQuarantinedError: When this call's own wait for the
+                worker exceeds :attr:`_close_timeout_seconds` before a
+                cancellation of this call does. The store is unusable from
+                this point on regardless of whether the worker eventually
+                does answer.
+
         """
         # A cancellation during the flush must not skip the close below --
         # that would strand the connection's non-daemon worker exactly like
@@ -2343,35 +2485,166 @@ class SqliteEngravaCore:
         pending_cancellation: asyncio.CancelledError | None = None
         if self._access_tracking_enabled:
             try:
-                await self.flush_access_buffer()
+                # Bounded on the same budget as the physical close below --
+                # this also awaits the worker directly (via ``_write_lock``
+                # + ``self._db.executemany``), so an unresponsive worker
+                # would otherwise hang here before the close-task bound is
+                # ever reached, defeating it for every store with access
+                # tracking on. A timeout is just another flush failure to
+                # this call: caught by the same ``except Exception`` below,
+                # exactly as "a flush failure never blocks the close"
+                # already promises, since the buffered counts are
+                # documented best-effort telemetry a lost flush self-heals
+                # from -- there is nothing here worth preserving in the
+                # background the way the physical close is preserved.
+                await asyncio.wait_for(
+                    self.flush_access_buffer(), timeout=self._close_timeout_seconds
+                )
             except asyncio.CancelledError as exc:
                 pending_cancellation = exc
             except Exception:  # noqa: BLE001
                 logger.debug("access-buffer flush on close failed; counts are best-effort")
         if self._owns_connection:
-            if self._quarantine_close_task is not None:
-                cancel_error = await self._drain_shielded(self._quarantine_close_task)
-                if cancel_error is not None:
-                    pending_cancellation = cancel_error
-            else:
-                self._quarantine_close_task = asyncio.ensure_future(self._db.close())
-                cancel_error = await self._drain_shielded(self._quarantine_close_task)
-                if cancel_error is not None:
-                    pending_cancellation = cancel_error
-                elif pending_cancellation is None:
-                    # This is the real, non-quarantined close -- unlike the
-                    # piggyback branch above, its own outcome is actionable, so
-                    # it is surfaced (not discarded): a clean close returns
-                    # None, an ordinary failure or an independent cancellation
-                    # of the task itself both raise via result().
-                    self._quarantine_close_task.result()
-                else:
-                    # A cancellation was already deferred above (from the
-                    # flush) -- see :meth:`_log_close_failure_over_pending_cancellation`
-                    # for the rule this follows.
-                    self._log_close_failure_over_pending_cancellation(self._quarantine_close_task)
+            task, is_new_task = self._resolve_close_task()
+            cancel_error = await self._drain_shielded(
+                task, timeout_seconds=self._close_timeout_seconds
+            )
+            pending_cancellation = await self._finish_close_wait(
+                task,
+                is_new_task=is_new_task,
+                cancel_error=cancel_error,
+                pending_cancellation=pending_cancellation,
+            )
         if pending_cancellation is not None:
             raise pending_cancellation
+
+    def _resolve_close_task(self) -> tuple[asyncio.Task[None], bool]:
+        """Return the physical-close task for this call to drain.
+
+        Reuses :attr:`_quarantine_close_task` when a physical close is
+        already in flight -- started by a concurrent quarantine, or by a
+        prior ``close()`` call this one is piggybacking on -- rather than
+        ever starting a second, independent close on the same connection
+        (see :meth:`close` for why two concurrent closes on the pinned
+        aiosqlite version can leave a caller's future unresolved forever).
+        Only when nothing is in flight yet does this start the real,
+        non-quarantined close and install it.
+
+        Returns:
+            The task to drain, and whether this call is the one that just
+            created it (``True``) versus piggybacking on one that already
+            existed (``False``) -- :meth:`_finish_close_wait` uses this to
+            decide whether the task's outcome is actionable to this caller.
+
+        """
+        existing_task = self._quarantine_close_task
+        if existing_task is not None:
+            return existing_task, False
+        task = asyncio.ensure_future(self._db.close())
+        self._quarantine_close_task = task
+        return task, True
+
+    async def _finish_close_wait(
+        self,
+        task: asyncio.Task[None],
+        *,
+        is_new_task: bool,
+        cancel_error: asyncio.CancelledError | None,
+        pending_cancellation: asyncio.CancelledError | None,
+    ) -> asyncio.CancelledError | None:
+        """Interpret one drain of the physical-close task and act on it.
+
+        The state transition in outcome 1 always happens when the bound has
+        expired, regardless of any cancellation -- cancellation precedence
+        (outcomes 1 and 2) only decides which exception ultimately
+        propagates, never whether the store gets quarantined. Three
+        outcomes, most-authoritative first for that reason:
+
+        1. **The bound expired before the worker answered** (``task`` still
+           not ``done()``): quarantines via :meth:`_abandon_expired_close`
+           (never a second physical close -- see that method) unconditionally,
+           whether or not a cancellation is also pending -- including a
+           cancellation of *this call's own await while draining the task*
+           (``cancel_error``), which does not short-circuit the quarantine.
+           Then either raises
+           :class:`~engrava.domain.exceptions.ConnectionQuarantinedError`, or,
+           if a cancellation was already pending -- ``cancel_error`` from
+           draining just now, or ``pending_cancellation`` deferred earlier in
+           :meth:`close` (the access-buffer flush), ``cancel_error`` preferred
+           when both are set -- only logs the expiry and returns that
+           cancellation instead.
+        2. **The task finished within the bound, but this call's own await
+           was cancelled while draining it** (``cancel_error`` set): returned
+           as the new ``pending_cancellation`` -- it outranks whatever the
+           task itself resolved to.
+        3. **The task finished within the bound, with no cancellation of this
+           call's own drain**: a genuine outcome is surfaced only when this
+           call is the one that created the task (``is_new_task``) -- a
+           piggybacked task's outcome is never actionable to this caller,
+           exactly as before this bound existed.
+
+        Args:
+            task: The physical-close task that was just drained.
+            is_new_task: Whether this call created ``task`` itself, per
+                :meth:`_resolve_close_task`.
+            cancel_error: Whatever :meth:`_drain_shielded` returned for this
+                drain.
+            pending_cancellation: Any cancellation already deferred earlier
+                in :meth:`close` (the access-buffer flush).
+
+        Returns:
+            The cancellation that should ultimately propagate from
+            :meth:`close`, if any.
+
+        Raises:
+            ConnectionQuarantinedError: Per outcome 1 above.
+
+        """
+        if not task.done():
+            # The bound expired before the worker answered -- slow or
+            # genuinely wedged, this call cannot tell which and does not
+            # need to. See close()'s own docstring for why this always
+            # quarantines (never a second physical close) and raises the
+            # same error every other quarantined path already raises.
+            # This runs even when `cancel_error` is set: `_drain_shielded`
+            # re-shields and keeps waiting out its own bound on a
+            # cancellation of our await, so a cancelled drain and a genuine
+            # expiry can coincide -- cancellation only decides which
+            # exception propagates next, never whether this transition
+            # happens.
+            await self._abandon_expired_close(task)
+            propagating_cancellation = (
+                cancel_error if cancel_error is not None else pending_cancellation
+            )
+            if propagating_cancellation is None:
+                raise ConnectionQuarantinedError(
+                    self._quarantine_reason
+                    or f"close() did not complete within {self._close_timeout_seconds:.1f}s"
+                )
+            logger.warning(
+                "close() exceeded its %.1fs bound while a cancellation was "
+                "already pending; the store is now quarantined",
+                self._close_timeout_seconds,
+            )
+            return propagating_cancellation
+        if cancel_error is not None:
+            return cancel_error
+        if is_new_task:
+            # This is the real, non-quarantined close -- unlike the
+            # piggyback case, its own outcome is actionable, so it is
+            # surfaced (not discarded): a clean close returns None, an
+            # ordinary failure or an independent cancellation of the task
+            # itself both raise via result().
+            if pending_cancellation is None:
+                task.result()
+            else:
+                # A cancellation was already deferred above (from the
+                # flush) -- see :meth:`_log_close_failure_over_pending_cancellation`
+                # for the rule this follows.
+                self._log_close_failure_over_pending_cancellation(task)
+        # else: piggybacking on a task that finished within this call's own
+        # bound -- outcome discarded, exactly as before this bound existed.
+        return pending_cancellation
 
     async def __aenter__(self) -> Self:
         """Enter the async context manager.
@@ -4810,8 +5083,10 @@ class SqliteEngravaCore:
             raise ConnectionQuarantinedError(self._quarantine_reason or "connection unusable")
 
     @staticmethod
-    async def _drain_shielded(task: asyncio.Task[None]) -> asyncio.CancelledError | None:
-        """Await a shielded task to completion, returning any cancellation of us.
+    async def _drain_shielded(
+        task: asyncio.Task[None], *, timeout_seconds: float | None = None
+    ) -> asyncio.CancelledError | None:
+        """Await a shielded task, up to an optional bound, returning any cancellation of us.
 
         The task is observed via a **single** :func:`asyncio.wait` waiter that is
         awaited under :func:`asyncio.shield` and reused across every cancellation
@@ -4822,14 +5097,31 @@ class SqliteEngravaCore:
         swallowed) so the caller can honor it once the task is safely complete;
         the task's own success/failure is left on the task for the caller.
 
+        ``timeout_seconds`` bounds *our own observation*, never the task: it is
+        forwarded straight to the single ``asyncio.wait`` call above, so the
+        deadline is set once, when this is first called, and does not restart on
+        a repeated cancellation of our await (the same "one waiter, reused"
+        property the unbounded case already relies on). ``task`` is never
+        cancelled by a timeout — the caller decides what an unanswered task means
+        by checking ``task.done()`` once this returns; a task that has not
+        answered keeps running afterwards exactly as it would have without a
+        bound, which is what lets a later drain (a piggybacking ``close()``, or
+        :meth:`_quarantine_connection`) keep observing the very same task rather
+        than a cancelled one.
+
         Args:
-            task: The already-scheduled task to drain to completion.
+            task: The already-scheduled task to drain.
+            timeout_seconds: Maximum time to wait for ``task``. ``None`` (the
+                default) waits without a bound, exactly as before this parameter
+                existed.
 
         Returns:
-            The last ``CancelledError`` raised into our await, or ``None``.
+            The last ``CancelledError`` raised into our await, or ``None``. Check
+            ``task.done()`` after this returns to tell a real bound expiry
+            (``False``) apart from the task actually finishing (``True``).
 
         """
-        waiter = asyncio.ensure_future(asyncio.wait({task}))
+        waiter = asyncio.ensure_future(asyncio.wait({task}, timeout=timeout_seconds))
         cancelled: asyncio.CancelledError | None = None
         while not waiter.done():
             try:
@@ -4868,6 +5160,50 @@ class SqliteEngravaCore:
                 "close() failed while a cancellation was already pending",
                 exc_info=True,
             )
+
+    async def _abandon_expired_close(self, task: asyncio.Task[None]) -> None:
+        """Quarantine the store after :meth:`close`'s own bound expires unanswered.
+
+        Called only when a caller of :meth:`close` stops waiting on the
+        physical close task because :attr:`_close_timeout_seconds` elapsed
+        with the task still not ``done()``. The task itself is never
+        cancelled here or anywhere upstream — it keeps running (or not) in
+        the background exactly as :meth:`_quarantine_connection`'s own
+        detached close already does; this only stops *this call* from
+        waiting on it any longer.
+
+        Delegates to :meth:`_quarantine_connection`, which is idempotent, so
+        a concurrent quarantine (a prior compensating-rollback failure, a
+        different caller's own ``close()`` also timing out on this same
+        task, or a second ``close()`` after this one already gave up)
+        collapses onto whichever caller gets there first. Because ``task``
+        is already installed in :attr:`_quarantine_close_task` by the time
+        this runs, :meth:`_quarantine_connection`'s own physical-close step
+        finds it non-``None`` and defers to it rather than starting a second
+        one — the same coordination :meth:`close` already relies on for a
+        concurrent quarantine, reused here so an expired bound can never
+        cause a second physical close on the pinned connection.
+
+        That deferral also means :meth:`_quarantine_connection` will *not*
+        attach its own done-callback to ``task`` (it only does that for a
+        task it creates itself), so this method attaches
+        :meth:`_consume_quarantine_close` directly — otherwise the task's
+        eventual outcome, whenever the worker finally answers, if ever,
+        would be reported as an unretrieved task exception instead of
+        quietly discarded. Attaching it more than once (a second caller
+        hitting this same path for the same task) is harmless: the callback
+        only reads the outcome, which is safe to read repeatedly.
+
+        Args:
+            task: The in-flight physical-close task this call gave up
+                waiting on.
+
+        """
+        task.add_done_callback(self._consume_quarantine_close)
+        await self._quarantine_connection(
+            f"close() did not complete within {self._close_timeout_seconds:.1f}s "
+            "-- the connection worker has not answered"
+        )
 
     @staticmethod
     def _consume_quarantine_close(task: asyncio.Task[None]) -> None:

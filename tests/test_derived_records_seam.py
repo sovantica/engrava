@@ -32,6 +32,7 @@ import hashlib
 import logging
 import sqlite3
 import struct
+import threading
 import time
 import unicodedata
 from pathlib import Path
@@ -2104,6 +2105,281 @@ async def test_quarantine_during_an_in_flight_close_does_not_double_close(
     await asyncio.wait_for(close_task, timeout=5.0)
 
     assert close_calls["n"] == 1, "the real connection must be physically closed exactly once"
+
+
+async def _wedge_the_worker_thread(
+    conn: aiosqlite.Connection,
+) -> tuple[asyncio.Future, threading.Event]:
+    """Genuinely block the aiosqlite worker thread, not merely slow it down.
+
+    A monkeypatched ``async def`` "slow close" (used by the tests above)
+    only ever blocks at the ``asyncio`` layer -- the underlying worker
+    thread is idle the whole time and would pick up a queued stop sentinel
+    instantly. That is enough to test bounded *observation*, but the bound
+    this exercises is specifically meant to survive a worker that will
+    never answer at all, and the two are not the same failure to construct.
+
+    This registers a real SQLite user-defined function that, once invoked,
+    blocks the calling thread on a ``threading.Event`` -- a synchronous,
+    OS-level block with no ``await`` anywhere nothing in ``asyncio`` can
+    reach or cancel. Firing it via ``conn.execute(...)`` without awaiting
+    the result queues that call onto aiosqlite's single worker thread
+    exactly like any other statement; once the thread picks it up, it is
+    genuinely stuck there -- every later item on the same queue, including
+    ``close()``'s own stop request, waits behind it with no supported way
+    to interrupt it, matching the shape a truly wedged worker takes in
+    production far more closely than an ``asyncio``-level mock does.
+
+    Returns:
+        The in-flight ``execute()`` future (still pending) and the
+        ``threading.Event`` the caller must ``.set()`` to unwedge the
+        worker and let this test clean up after itself.
+
+    """
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _wedge() -> int:
+        entered.set()
+        release.wait()  # blocks the real OS thread until the test releases it
+        return 0
+
+    await conn.create_function("wedge_worker_thread", 0, _wedge)
+    wedge_future = asyncio.ensure_future(conn.execute("SELECT wedge_worker_thread()"))
+    # threading.Event.wait() is a blocking call -- polling .is_set() keeps
+    # this coroutine, and the event loop it runs on, from blocking too. Not
+    # an asyncio.Event: the signal crosses from the worker's real OS thread,
+    # which cannot set an asyncio primitive directly.
+    while not entered.is_set():  # noqa: ASYNC110
+        await asyncio.sleep(0.001)
+    return wedge_future, release
+
+
+async def test_close_bound_expires_on_a_genuinely_unresponsive_worker() -> None:
+    """The first close() on a genuinely wedged worker returns bounded, not never.
+
+    Before this bound existed, ``close()`` awaited the physical close with no
+    limit at all: queued behind a worker that will never answer, it would
+    never return -- the exact failure this test constructs for real via
+    :func:`_wedge_the_worker_thread`, rather than a finite, merely-slow mock.
+    A bound that only proved itself against a mock that always eventually
+    returns would not actually prove anything about the unbounded case.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(conn, close_timeout_seconds=0.2)
+    store._owns_connection = True
+    await store.ensure_schema()
+
+    wedge_future, release = await _wedge_the_worker_thread(conn)
+    try:
+        started = time.monotonic()
+        with pytest.raises(ConnectionQuarantinedError):
+            await asyncio.wait_for(store.close(), timeout=5.0)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 2.0, (
+            "close() must return within its own bound, not wait out the "
+            "unresponsive worker -- the outer wait_for(timeout=5.0) is only "
+            "a suite-safety net, not the property under test"
+        )
+        assert store._connection_quarantined is True
+        with pytest.raises(ConnectionQuarantinedError):
+            await store._db.commit()
+    finally:
+        # Release the wedged thread and drain everything queued behind it
+        # (the wedge call itself, and close()'s own stop request) so
+        # nothing outlives this test -- a genuinely stuck worker that is
+        # never released leaks a live, non-daemon thread for as long as the
+        # process runs.
+        release.set()
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(wedge_future, timeout=5.0)
+        close_task = store._quarantine_close_task
+        assert close_task is not None
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(close_task, timeout=5.0)
+        deadline = time.monotonic() + 5.0
+        while conn._thread.is_alive() and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+        assert not conn._thread.is_alive(), (
+            "the aiosqlite worker thread survived past the test -- it is "
+            "not a daemon and would otherwise block interpreter shutdown "
+            "for the rest of the suite"
+        )
+
+
+async def test_close_bound_expires_again_on_a_second_call_without_a_second_physical_close() -> None:
+    """A second close() on the same wedge is bounded too, and starts nothing new.
+
+    The first close() expiring is the easy half. This covers the amendment's
+    harder requirement: a caller that calls close() again after the first
+    one gave up must not trigger a second physical close on the pinned
+    connection (two concurrent closes can each enqueue their own stop
+    sentinel, and the worker only ever answers the first -- see close()'s
+    own docstring), and must still get its own call bounded rather than
+    inheriting an unbounded wait on whatever the first call started.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(conn, close_timeout_seconds=0.2)
+    store._owns_connection = True
+    await store.ensure_schema()
+
+    wedge_future, release = await _wedge_the_worker_thread(conn)
+    try:
+        with pytest.raises(ConnectionQuarantinedError):
+            await asyncio.wait_for(store.close(), timeout=5.0)
+        first_close_task = store._quarantine_close_task
+        assert first_close_task is not None
+
+        started = time.monotonic()
+        with pytest.raises(ConnectionQuarantinedError):
+            await asyncio.wait_for(store.close(), timeout=5.0)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 2.0, "the second close() must also be bounded, not inherit an open wait"
+        assert store._quarantine_close_task is first_close_task, (
+            "a second close() must piggyback on the same physical-close task "
+            "-- a different task here would mean a second, independent "
+            "close() was issued against the same underlying connection"
+        )
+    finally:
+        release.set()
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(wedge_future, timeout=5.0)
+        close_task = store._quarantine_close_task
+        assert close_task is not None
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(close_task, timeout=5.0)
+        deadline = time.monotonic() + 5.0
+        while conn._thread.is_alive() and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+        assert not conn._thread.is_alive(), (
+            "the aiosqlite worker thread survived past the test -- it is "
+            "not a daemon and would otherwise block interpreter shutdown "
+            "for the rest of the suite"
+        )
+
+
+async def test_close_cancelled_while_draining_a_wedged_worker_still_quarantines() -> None:
+    """A caller cancelled while draining the task must still see the store quarantined.
+
+    ``_drain_shielded`` does not return early when *our* await of it is
+    cancelled: it re-shields and keeps waiting until its own bounded
+    ``asyncio.wait(...)`` completes. Against a genuinely wedged worker, that
+    bound then expires with the task still not ``done()`` -- so this call to
+    ``close()`` can end up with a non-``None`` cancellation *and* a genuine,
+    unrelated expiry at the same time. The expiry must still reach
+    ``_abandon_expired_close`` (quarantine + log) regardless: cancellation
+    precedence decides which exception propagates out of ``close()``, never
+    whether the store gets quarantined.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(conn, close_timeout_seconds=0.2)
+    store._owns_connection = True
+    await store.ensure_schema()
+
+    wedge_future, release = await _wedge_the_worker_thread(conn)
+    try:
+        close_task = asyncio.ensure_future(store.close())
+        await asyncio.sleep(0.01)  # let close() start draining the physical-close task
+        close_task.cancel()
+
+        started = time.monotonic()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(close_task, timeout=5.0)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 2.0, (
+            "the cancelled close() must still return once its own bound "
+            "expires, not wait out the unresponsive worker indefinitely"
+        )
+        assert store._connection_quarantined is True, (
+            "an expired bound must quarantine the store even when this "
+            "call's own await was cancelled while draining the task"
+        )
+        with pytest.raises(ConnectionQuarantinedError):
+            await store._db.commit()
+    finally:
+        release.set()
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(wedge_future, timeout=5.0)
+        close_task = store._quarantine_close_task
+        assert close_task is not None
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(close_task, timeout=5.0)
+        deadline = time.monotonic() + 5.0
+        while conn._thread.is_alive() and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+        assert not conn._thread.is_alive(), (
+            "the aiosqlite worker thread survived past the test -- it is "
+            "not a daemon and would otherwise block interpreter shutdown "
+            "for the rest of the suite"
+        )
+
+
+async def test_close_bound_covers_the_access_buffer_flush_too() -> None:
+    """A wedged worker cannot be reached only through the flush step either.
+
+    ``close()`` flushes the access buffer *before* it ever reaches the
+    bounded physical-close drain -- and that flush awaits the same worker
+    directly (``_write_lock`` + a raw ``executemany``), with no bound of its
+    own until this test's own fix. Access tracking defaults to ``False`` on
+    the manual constructor, but ``from_config`` turns it on whenever dreaming
+    is enabled, and ``DreamingConfig.access_tracking_enabled`` itself
+    defaults to ``True`` -- so a store built the way most deployments build
+    one (dreaming on, nothing said about access tracking) would have hung
+    here even with the physical-close bound in place, exactly the case
+    docs/deployment.md promises is covered. Executed with a genuinely wedged
+    worker, not reasoned about: a buffer entry is seeded directly so the
+    flush actually reaches ``executemany`` instead of returning early on an
+    empty buffer.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(conn, access_tracking_enabled=True, close_timeout_seconds=0.2)
+    store._owns_connection = True
+    await store.ensure_schema()
+    store._access_buffer.record("some-thought-id", now="2026-01-01T00:00:00+00:00")
+    assert len(store._access_buffer) == 1
+
+    wedge_future, release = await _wedge_the_worker_thread(conn)
+    try:
+        started = time.monotonic()
+        with pytest.raises(ConnectionQuarantinedError):
+            # The outer wait_for is only a suite-safety net (per the sibling
+            # tests above) -- without the flush bound, this would need it to
+            # actually fire, which is exactly the regression this guards.
+            await asyncio.wait_for(store.close(), timeout=5.0)
+        elapsed = time.monotonic() - started
+
+        # Worst case here is the flush's own bound plus the physical-close
+        # bound run back to back (~0.4s at this test's 0.2s setting) --
+        # comfortably under any margin that would indicate an unbounded
+        # wait slipped through.
+        assert elapsed < 2.0, (
+            "close() must not hang in the access-buffer flush before it "
+            "ever reaches the bounded physical close"
+        )
+        assert store._connection_quarantined is True
+    finally:
+        release.set()
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(wedge_future, timeout=5.0)
+        close_task = store._quarantine_close_task
+        if close_task is not None:
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(close_task, timeout=5.0)
+        deadline = time.monotonic() + 5.0
+        while conn._thread.is_alive() and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+        assert not conn._thread.is_alive(), (
+            "the aiosqlite worker thread survived past the test -- it is "
+            "not a daemon and would otherwise block interpreter shutdown "
+            "for the rest of the suite"
+        )
 
 
 async def test_cancelled_rollback_task_quarantines_and_propagates_cancelled(
