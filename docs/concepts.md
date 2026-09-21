@@ -92,7 +92,11 @@ CREATED -> ACTIVE -> DONE -> ARCHIVED
 ARCHIVED --restore_thought()--> ACTIVE
 ```
 
-`LifecycleStatus` transitions are enforced (`evolve()` rejects illegal jumps).
+`LifecycleStatus` transitions are checked when you pass a `LifecycleStatus`
+member: `evolve(lifecycle_status=LifecycleStatus.DONE)` (and the equivalent
+`update_thought` call) raises `InvalidTransitionError` on an illegal jump. The
+check does not run when the target is given as a plain string such as `"DONE"`,
+so pass the enum member and do not rely on the guard for string input.
 Most thoughts you create will start `ACTIVE`; `ACTIVE -> ARCHIVED` is a valid
 direct transition and does not require an intermediate `DONE`. The canonical
 reverse transition is `restore_thought()`, which restores `ARCHIVED -> ACTIVE`
