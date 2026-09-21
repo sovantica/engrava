@@ -69,14 +69,19 @@ The bi-temporal `valid_from` / `valid_until` bounds on a `ThoughtRecord` or
   interval is refused; and `invalidate_thought()` / `invalidate_edge()` reject a
   `valid_until` earlier than the record's stored `valid_from`.
 - **On read** — the invariant lives in the domain model, and the store
-  reconstructs that model whenever it loads a row (`get_thought()`,
-  `get_edges()`, and every ranked/query read). A row that became inverted **out
-  of band** — for example one written by an older engrava build before this
-  validation existed, or edited directly in the database file — therefore raises
-  a `ValidationError` when it is read back, rather than silently returning a
-  corrupt interval. This is a deliberate fail-loud choice for a data-integrity
-  fault. If you are upgrading a database that may contain such rows, repair them
-  (set the offending bound to `NULL`, or correct the order) before reading.
+  reconstructs that model whenever it loads a full record (`get_thought()`,
+  `list_thoughts()`, `get_edges()` and `list_edges()`). A row that became
+  inverted **out of band** — for example one written by an older engrava build
+  before this validation existed, or edited directly in the database file —
+  therefore raises a `ValidationError` when it is loaded through one of those
+  calls, rather than silently returning a corrupt interval. This is a
+  deliberate fail-loud choice for a data-integrity fault. Ranked search is the
+  exception: `search_fts()`, `search_similar()`, `search_hybrid()` and
+  `recall()` return ids and scores without rebuilding the model, so an inverted
+  row can still appear in their results, and the `ValidationError` surfaces
+  only when you load that record (for example with `get_thought()`). If you are
+  upgrading a database that may contain such rows, repair them (set the
+  offending bound to `NULL`, or correct the order) before reading.
 
 Bounds are compared as UTC-normalised instants, so differing offsets are
 reconciled before the check. Two cases are **not** inversions and remain
