@@ -35,9 +35,9 @@ import aiosqlite
 import pytest
 
 from engrava import (
-    ActionNotFoundError,
     ActionStatus,
     SqliteEngravaCore,
+    StaleDataError,
 )
 from tests.test_partial_field_updates import (
     _action,
@@ -237,6 +237,16 @@ class TestZeroRowUpdateIsRejectedDespiteRecreation:
         *when the UPDATE runs* (rowcount 0), then recreated before the
         read-back. Without the rowcount check, the read-back finds the
         recreated row and reports it as though this call had updated it.
+
+        The zero-row match now raises ``StaleDataError`` rather than the
+        plain ``ValueError`` this test originally pinned: a later item gave
+        every guarded update a ``revision`` column, and a row deleted then
+        recreated under the same id is exactly the "matched no row" case
+        that error now names uniformly across ``update_thought`` /
+        ``update_edge`` / ``update_action``. The property this test exists
+        for -- nothing of this call is written, and the recreated row is
+        never reported as this call's own result -- is unchanged; only the
+        exception's type is.
         """
         store = journaling_store
         await store.create_thought(_thought("t-1"))
@@ -260,7 +270,7 @@ class TestZeroRowUpdateIsRejectedDespiteRecreation:
 
         _interleave_after_statement(store, "UPDATE edge SET", _recreate)
 
-        with pytest.raises(ValueError, match="Edge not found"):
+        with pytest.raises(StaleDataError):
             await store.update_edge("e-1", weight=0.9)
 
         assert store._journal is not None
@@ -271,7 +281,16 @@ class TestZeroRowUpdateIsRejectedDespiteRecreation:
         self,
         journaling_store: SqliteEngravaCore,
     ) -> None:
-        """The action counterpart of the edge case above."""
+        """The action counterpart of the edge case above.
+
+        Hooks ``_get_action_row`` -- the raw-row read ``update_action`` uses
+        internally to reach the ``revision`` a later item added -- rather
+        than ``_get_action`` (the domain-mapped read a different, unrelated
+        caller uses): ``update_action`` does not call ``_get_action`` at
+        all, so hooking it would leave the delete below never firing and the
+        recreate below colliding with the still-live row instead of
+        reproducing the intended race.
+        """
         store = journaling_store
         await store.create_thought(_thought("t-1"))
         await store.create_action(_action("a-1"))
@@ -279,7 +298,7 @@ class TestZeroRowUpdateIsRejectedDespiteRecreation:
         async def _delete() -> None:
             await store._db.execute("DELETE FROM action WHERE action_id = ?", ("a-1",))
 
-        _interleave_once(store, "_get_action", _delete)
+        _interleave_once(store, "_get_action_row", _delete)
 
         async def _recreate() -> None:
             await store._db.execute(
@@ -292,7 +311,7 @@ class TestZeroRowUpdateIsRejectedDespiteRecreation:
 
         _interleave_after_statement(store, "UPDATE action SET", _recreate)
 
-        with pytest.raises(ActionNotFoundError):
+        with pytest.raises(StaleDataError):
             await store.update_action("a-1", status=ActionStatus.EXECUTING)
 
         assert store._journal is not None

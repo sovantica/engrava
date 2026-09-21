@@ -477,7 +477,7 @@ class TestCore18Migration:
             s = SqliteEngravaCore(conn)
             await s.ensure_schema()
             cursor = await conn.execute("PRAGMA user_version")
-            assert (await cursor.fetchone())[0] == 20
+            assert (await cursor.fetchone())[0] == 21
             cursor = await conn.execute("PRAGMA table_info(thought)")
             cols = {row["name"] for row in await cursor.fetchall()}
             assert "pinned" in cols
@@ -537,7 +537,7 @@ class TestCore18Migration:
             s = SqliteEngravaCore(conn)
             await s.ensure_schema()
             cursor = await conn.execute("PRAGMA user_version")
-            assert (await cursor.fetchone())[0] == 20
+            assert (await cursor.fetchone())[0] == 21
 
             fetched = await s.get_thought("legacy")
             assert fetched is not None
@@ -594,7 +594,7 @@ class TestArchivedAtColumnMigration:
             s = SqliteEngravaCore(conn)
             await s.ensure_schema()
             cursor = await conn.execute("PRAGMA user_version")
-            assert (await cursor.fetchone())[0] == 20
+            assert (await cursor.fetchone())[0] == 21
             cursor = await conn.execute("PRAGMA table_info(thought)")
             cols = {row["name"] for row in await cursor.fetchall()}
             assert "archived_at" in cols
@@ -658,7 +658,7 @@ class TestArchivedAtColumnMigration:
             s = SqliteEngravaCore(conn)
             await s.ensure_schema()
             cursor = await conn.execute("PRAGMA user_version")
-            assert (await cursor.fetchone())[0] == 20
+            assert (await cursor.fetchone())[0] == 21
 
             fetched = await s.get_thought("legacy")
             assert fetched is not None

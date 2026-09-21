@@ -156,22 +156,32 @@ SQLite supports one writer at a time. With WAL mode, readers do not block
 writers and vice versa. `aiosqlite` marshals every call onto one background
 thread, so concurrent tasks' **statements** do not run at the same time.
 
-That is statement-level serialisation, and it is not the same as operation-level
+That is statement-level serialisation, and it is not by itself operation-level
 safety. Engrava's update methods (`update_thought`, `restore_thought`,
 `upsert_by_hash`, `update_edge`, `update_action`) read the row, apply the change
-in memory, then write — and another writer's whole update can land in that
-window. Two writers editing the **same field** of the same row therefore lose one
-of the two writes, silently and without an error. Editing different fields is
-safe — an update writes only the columns it owns — **except** when one of the two
-writers stamps a new `updated_cycle`: every thought update carries a version
-guard on that column, so the other update then matches no row and is rejected in
-full with `StaleDataError`, sharing no field with it or not.
+in memory, then write. Two genuinely concurrent tasks **sharing one store
+instance** are serialised end to end by an in-process write lock, so one
+task's own read-modify-write cannot be corrupted by another's landing mid-way
+— see [Concurrency](concurrency.md#many-async-tasks-one-store). What survives
+as a real gap is a competing write from **outside** that lock: a same-task
+nested call reached through a caller-owned hook, or a write from a *second
+store on the same database file* (a second connection, or a second process).
+Every core row now carries a `revision` column that every guarded update
+checks and increments atomically, so a competing write landing in either of
+those gaps makes the guard match no row and raises `StaleDataError` — nothing
+of the rejected update is written — rather than silently overwriting. Two
+writers editing the same field, serialised through that guard, still resolve
+last-write-wins, which is the correct outcome for two genuine edits; what the
+guard removes is a write being torn or lost without any signal at all. See
+[Optimistic concurrency](concurrency.md#optimistic-concurrency-and-staledataerror)
+for the full contract.
 
 **Only one store may write a given database file.** The locks that order
 engrava's own operations live on the store instance, so a second store — in
 another process, or a second connection in this one — is outside all of them.
-WAL and `busy_timeout` keep the *file* intact under that topology; they do not
-make the *operations* correct.
+WAL and `busy_timeout` keep the *file* intact under that topology, and the
+`revision` guard above keeps a lost-update race from landing silently; neither
+makes multiple concurrent writers on one file a supported topology.
 
 The full contract, the guarantees that do hold, and the idioms that close the
 gap are in [Concurrency](concurrency.md). For multi-service setups via

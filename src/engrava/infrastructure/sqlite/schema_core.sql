@@ -1,5 +1,13 @@
 -- engrava: Core thought-graph schema (free-tier boundary — no internal-cognitive columns).
--- Version: core-20 (thought.archived_at — the wall-clock instant the Memory
+-- Version: core-21 (thought.revision / edge.revision / action.revision — the
+--          row-version guard column, INTEGER NOT NULL DEFAULT 0 on all three,
+--          incremented atomically by every guarded UPDATE as part of the same
+--          statement that checks it (revision = revision + 1 WHERE id = ? AND
+--          revision = ?), replacing updated_cycle as the concurrency guard;
+--          appended last for column-order parity with the in-place ALTER ...
+--          ADD COLUMN; not added to embedding, which is a carrier owned by its
+--          thought rather than an independently updatable entity;
+--          core-20 (thought.archived_at — the wall-clock instant the Memory
 --          Hygiene loop archived a thought; nullable TEXT (UTC-normalised
 --          ISO-8601), stamped only by the hygiene archive path and cleared on
 --          restore, appended last for column-order parity with the in-place
@@ -99,7 +107,14 @@ CREATE TABLE IF NOT EXISTS thought (
     -- with archived_at NULL (archived before this column existed) has no
     -- real-time stamp and is therefore never GC-eligible while the wall-clock
     -- window is active — the irreversible stage fails closed.
-    archived_at       TEXT
+    archived_at       TEXT,
+    -- Row-version guard (core-21). Incremented atomically by every guarded
+    -- UPDATE (update_thought / restore_thought) as part of the same statement
+    -- that checks it, so a write matches only the row this call actually
+    -- read. NOT NULL DEFAULT 0 needs no backfill: a pre-existing row and a
+    -- freshly inserted one both start at 0. Appended last for the same
+    -- column-order parity as the columns above.
+    revision          INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS edge (
@@ -120,6 +135,9 @@ CREATE TABLE IF NOT EXISTS edge (
     -- reserved meaning; no secondary index (filtering is a full json_extract
     -- scan, as with thought metadata).
     metadata_json     TEXT NOT NULL DEFAULT '{}',
+    -- Row-version guard (core-21). Same contract as thought.revision, guarding
+    -- update_edge's UPDATE. Appended last for column-order parity.
+    revision          INTEGER NOT NULL DEFAULT 0,
     UNIQUE(from_thought_id, to_thought_id, edge_type),
     FOREIGN KEY (from_thought_id) REFERENCES thought(thought_id) ON DELETE CASCADE,
     FOREIGN KEY (to_thought_id) REFERENCES thought(thought_id) ON DELETE CASCADE
@@ -151,6 +169,10 @@ CREATE TABLE IF NOT EXISTS action (
     status              TEXT NOT NULL DEFAULT 'PLANNED',
     verification_status TEXT NOT NULL DEFAULT 'PENDING',
     raw_metrics_json    TEXT,
+    -- Row-version guard (core-21). Same contract as thought.revision, guarding
+    -- update_action's UPDATE, bumped only on an actual change (a no-op update
+    -- returns before any write). Appended last for column-order parity.
+    revision             INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (source_thought_id) REFERENCES thought(thought_id) ON DELETE CASCADE
 );
 
@@ -361,4 +383,4 @@ CREATE INDEX IF NOT EXISTS idx_thought_prov_actor
 -- current. A DDL failure above leaves ``user_version = 0`` so the next
 -- ``ensure_schema()`` re-runs this idempotent bootstrap rather than skipping
 -- every migration against an incomplete schema (postcondition-before-stamp).
-PRAGMA user_version = 20;
+PRAGMA user_version = 21;

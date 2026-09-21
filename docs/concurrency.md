@@ -153,15 +153,23 @@ direct `append()` call as unmediated use of the connection.
   `access_count` / `last_accessed_at` from `record_access()`, and
   `confirmation_count`.
 
-  **This holds only while nobody stamps a cycle.** Every update also carries a
-  version guard on `updated_cycle`
-  ([below](#optimistic-concurrency-and-staledataerror)). If the competing writer
-  moved that column, your update matches no row and is **rejected in full** with
-  `StaleDataError` — even though the two edits share no field. So two edits to
-  different fields both survive when both are ordinary edits, and stop doing so
-  the moment either one stamps a cycle. (This is a *rule*, not a race: the guard
-  is part of every update's `WHERE` clause, whichever call happens to run
-  second under the write lock above.)
+  **This holds for the ordinary case — two genuinely concurrent tasks on this
+  store — because the write lock above already serialises them end to end: by
+  the time the second call does its own internal read, the first call's write
+  has fully committed, so the second call's guard is captured against the
+  post-first-call row and never finds it stale.** Every update also carries a
+  `revision` guard now ([below](#optimistic-concurrency-and-staledataerror)),
+  and the engine bumps `revision` on *every* guarded write, automatically — not
+  only when a caller stamps something. What that guard actually catches is
+  exactly the interleavings the write lock does **not** serialise: a same-task
+  nested write reached through a caller-owned hook (the lock is
+  task-reentrant, so it does not block this), and a second *store* on the same
+  database file (a second process, or a second connection in this one). Either
+  of those now makes the guarded write match no row and raise `StaleDataError`
+  in full — even when the two edits share no column — where before, the first
+  case only ever raised if the competing writer happened to stamp a cycle
+  explicitly, and the second case never raised at all (see [Multiple stores,
+  one database file](#multiple-stores-one-database-file)).
 - **A deduplication sighting counts.** `create_thought(deduplicate=True)` and
   `get_or_create()` bump `confirmation_count` **relative to what is stored**
   (`confirmation_count + 1`, evaluated by SQLite), so a bump made by another
@@ -200,13 +208,11 @@ direct `append()` call as unmediated use of the connection.
   landing mid-operation), not the ordinary fact that two edits to the same
   field can only leave one final value. Whichever call's critical section runs
   second determines the field's value, deterministically and without error.
-- **`update_edge` / `update_action` still carry no version guard.** They are
-  now inside the same critical section as everything else, but keyed on id
-  alone — a same-field edit still simply overwrites, with no `StaleDataError`
-  possible under any circumstance.
-- **`StaleDataError` does not detect "someone else wrote it."** See
+- **`StaleDataError` does not detect "someone else wrote it," in general.** See
   [Optimistic concurrency](#optimistic-concurrency-and-staledataerror) below for
-  what the version guard actually rejects.
+  what the `revision` guard actually rejects — it is a per-row write counter,
+  not a semantic-conflict detector, and it says nothing about two sessions
+  writing contradictory content to two *different* rows.
 - **A same-*task* nested call is not blocked by its own lock.** A caller-owned
   hook or callback that itself issues a write, invoked synchronously from
   inside another operation's read-modify-write span (not a second `asyncio`
@@ -364,51 +370,60 @@ from the exception alone. Lower it only for a deployment that never drives
 
 ## Optimistic concurrency and `StaleDataError`
 
-`update_thought`, `restore_thought` and `upsert_by_hash` carry a version guard,
-and it detects less than its name suggests. The guard compares the row's
-`updated_cycle` against the value read at the start of the call — and **no
-engrava operation advances `updated_cycle` on its own.** A cycle is stamped only
-when a caller passes `updated_cycle=` to `update_thought` or `current_cycle=` to
-`restore_thought`. `update_edge` and `update_action` carry no version guard at
-all — their writes are keyed on the row id alone — so they never raise
-`StaleDataError` under any circumstance.
+`update_thought`, `restore_thought`, `update_edge`, `update_action` and
+`upsert_by_hash` all carry a `revision` guard. Every core row (`thought`,
+`edge`, `action`) has a `revision` column, and every one of these guarded
+writes both checks and increments it in the same atomic `UPDATE` — `revision
+= revision + 1 WHERE id = ? AND revision = ?`. **No caller action arms this:**
+unlike the `updated_cycle` guard this replaced (which nothing advanced on its
+own, so an ordinary edit passed it silently), `revision` moves on *every*
+guarded write to a row, automatically. `update_edge` and `update_action` carry
+this guard for the first time — before this, neither could ever raise
+`StaleDataError`.
 
 **`StaleDataError` means the guarded `UPDATE` matched no row.** Two different
 situations produce that, and the error does not tell them apart:
 
-- the row's `updated_cycle` is no longer the value this call read — a competing
-  writer stamped a cycle; or
+- the row's `revision` is no longer the value this call read — *any* other
+  guarded write landed on this row in between, whatever field it touched; or
 - **the row no longer exists** — a competing writer deleted it between this
-  call's read and its write. (`ThoughtNotFoundError` covers a row that was
-  already missing when the call *started*, not one that vanished mid-call.)
+  call's read and its write. (`ThoughtNotFoundError` / `ActionNotFoundError` /
+  a `ValueError` for edges covers a row that was already missing when the call
+  *started*, not one that vanished mid-call.)
 
 The consequences are worth stating plainly:
 
-- **An ordinary concurrent edit does not raise `StaleDataError`.** The row
-  changed, the guard does not notice, and the write proceeds. The semantics are
-  last-write-wins, per column.
-- **A competing cycle stamp does raise it, whatever your edit touched**, and the
-  rejected update then writes *nothing at all* — no field of it reaches storage.
-  Recover by re-reading the record and recomputing the change; do not replay the
-  original `changes`.
+- **An ordinary concurrent edit now raises `StaleDataError`, whatever field it
+  touched**, the moment it lands on a row between this call's own read and
+  write — because `revision` moved. The rejected update then writes *nothing
+  at all* — no field of it reaches storage. Recover by re-reading the record
+  and recomputing the change; do not replay the original `changes`.
+- In the ordinary case of two genuinely concurrent tasks **on this store
+  instance**, this almost never fires: the write lock ([Many async tasks, one
+  store](#many-async-tasks-one-store)) already serialises them end to end, so
+  the second call's own read happens strictly after the first call's write has
+  committed, and its guard is captured against the post-first-call `revision`.
+- What it *does* catch, for the first time, is exactly the two shapes the
+  write lock cannot reach: a same-task nested write issued from inside a
+  caller-owned hook (the lock is task-reentrant, so it does not block this —
+  see the narrow shape noted under [Many async tasks, one
+  store](#many-async-tasks-one-store)), and a write from a **second store on
+  the same database file** — a second connection in this process, or a second
+  process entirely. Both used to be silently lost (or, for the same-task case,
+  spuriously rejected only if the competing write happened to stamp a cycle
+  explicitly); both now raise `StaleDataError` before anything is written. See
+  [Multiple stores, one database file](#multiple-stores-one-database-file) for
+  the cross-connection case in full.
 
-So `StaleDataError` is neither a general staleness check nor a reliable "someone
-stamped a cycle" signal: it is "this write found no row to apply to". Do not read
-its *absence* as proof nobody else wrote. If your application needs caller-level
-staleness detection, keep your own version value in `metadata` and compare it
-yourself, or serialise the edits with the lock idiom above.
-
-**A genuinely concurrent, different task on this instance can no longer trigger
-this by interleaving:** the guard's baseline (`current.updated_cycle`,
-read fresh at the start of the call) and the guarded write it protects are now
-one critical section, so nothing a *different* task does can land between them
-— see [Many async tasks, one store](#many-async-tasks-one-store). What still
-can, in-process, is the narrow same-task nested-call shape noted there: a
-caller-owned hook that issues its own write, invoked synchronously from inside
-this call's own read-modify-write span, still runs (the lock is
-task-reentrant) and can move the cycle before this call's own write executes.
-Across connections, nothing changed: a second store on the same file can still
-trigger it exactly as before.
+`StaleDataError` is still not a general semantic-conflict detector: it is "this
+write found no row to apply to", nothing more. It says nothing about two
+sessions writing contradictory content to two *different* rows, and an
+`update_edge` / `update_action` call that changes nothing (a true no-op) issues
+no `UPDATE` at all, so it cannot go stale — there is nothing for it to be stale
+against. If your application needs to know it read the row a specific caller
+last wrote — not merely that nothing else has touched it since — that
+caller-visible check is not yet part of the public API (it is designed, and
+scheduled for a later release, but not shipped).
 
 ## Busy timeout
 
@@ -549,10 +564,17 @@ cannot do is make engrava's own multi-statement operations correct across
 connections, because every mechanism that orders those operations lives on a
 single store object and stops at its boundary:
 
-1. **An update can be silently discarded.** The read-modify-write window
-   described above does not stop at the store — a second store's edit lands in it
-   just the same, and the `updated_cycle` guard does not report it. Between two
-   *processes* no in-process lock could close that window even in principle.
+1. **An update landing in the window is now rejected, not silently discarded.**
+   The read-modify-write window described above does not stop at the store — a
+   second store's edit can still land inside it, since no *in-process* lock
+   could ever reach across a connection boundary — but the `revision` guard
+   lives in the database itself, not in a lock, so it closes this window
+   anyway: the first store's own guarded write reads `revision` fresh at write
+   time, finds the second store's committed bump, matches no row, and raises
+   `StaleDataError` instead of overwriting. This is a correctness improvement,
+   not a support statement — multiple writers on one file remain outside what
+   this store is built and tested for (below), and a caller still needs a
+   retry idiom for the newly-typed rejection.
 2. **`deduplicate=True`, `get_or_create()`, `upsert_by_hash()` and
    `bulk_store(deduplicate=True)` no longer duplicate across stores.** The
    in-process `asyncio.Lock` is still per store instance, but the
@@ -579,8 +601,8 @@ single store object and stops at its boundary:
    RuntimeError: Failed to append journal entry after 5 retries due to sequence contention
    ```
 
-   That error is the loud symptom of this topology. The first of the three
-   (the silently-discarded update) has no symptom at all; the second is no
+   That error is the loud symptom of this topology. The first of the three now
+   raises `StaleDataError` (above) rather than staying silent; the second is no
    longer a failure in the case this store manages — only the raw-transaction
    fallback described above still fails the same way, silently.
 
@@ -624,8 +646,8 @@ for when to choose per-service isolation over in-store filtering.
 | Many async tasks, one store, one loop | ✅ | The normal case — share the store. The rows below qualify it. |
 | Many readers (WAL) | ✅ | Readers never block the writer. |
 | One writer at a time | ✅ | SQLite serialises writes. |
-| Two tasks editing **different** fields of one row | ✅ | An update writes only the columns it owns — unless one of them stamps `updated_cycle` (next row). |
-| Either task stamping `updated_cycle` | ✅ | The guard's read and the write it protects are now one critical section across tasks, so a competing stamp can no longer land mid-call and spuriously reject an unrelated edit. |
+| Two tasks editing **different** fields of one row | ✅ | An update writes only the columns it owns, and the write lock serialises the two calls end to end, so the second one's `revision` guard always matches. |
+| A competing guarded write landing between one call's own read and write | ✅ (rejected) | `revision` bumps on every guarded write automatically; a write that lands in that window — a same-task nested call, or a second store on the file — makes the guard match no row, and the call raises `StaleDataError` rather than landing partially or silently. |
 | Two tasks editing the **same** field of one row | ✅ | Still last write wins — that is the correct outcome for two genuine edits — but each call's own read and write can no longer be corrupted by the other landing mid-operation. |
 | Two tasks moving one row through its state machine | ✅ | Each transition is validated against the row the *previous, now-completed* call actually left — a forbidden composite move is rejected instead of silently landing. |
 | `suspend_auto_commit()` with another writer on that store | ✅ | The window now holds a task-reentrant lock for its duration; a different task's write waits instead of joining the window's transaction. |

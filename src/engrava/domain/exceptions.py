@@ -67,20 +67,24 @@ class StaleDataError(EngravaError):
     """Raised when a guarded write matches no row.
 
     Two situations produce that, and this error does not tell them apart:
-    another writer stamped a new ``updated_cycle`` between this operation's read
-    and its write, or the row was deleted in that window. Either way nothing of
-    the operation was applied.
+    another guarded write landed on this row (bumping its ``revision``)
+    between this operation's read and its write, or the row was deleted in
+    that window. Either way nothing of the operation was applied.
 
-    It is narrower than "the row changed" — nothing in engrava advances
-    ``updated_cycle`` on its own, so an ordinary competing edit passes the guard
-    and overwrites rather than raising — and also broader, because a delete
-    raises it too. Recover by re-reading the record (which may now be gone) and
-    recomputing the change.
+    Unlike the ``updated_cycle`` guard this replaced — which nothing in
+    engrava advanced on its own, so an ordinary competing edit passed it
+    silently — the engine bumps ``revision`` by one on *every* guarded write
+    to a row, automatically. So this error now means what its name says: the
+    row really did move since this call read it (or it is gone). It is still
+    broader than "the row changed" in one direction — a delete raises it too,
+    since there is no longer a row to distinguish "moved" from "gone" against.
+    Recover by re-reading the record (which may now be gone) and recomputing
+    the change.
 
     Args:
         entity_type: Type of entity (e.g., 'ThoughtRecord').
         entity_id: Identifier of the entity.
-        expected_version: The ``updated_cycle`` the caller expected.
+        expected_version: The ``revision`` the caller's guarded write expected.
 
     """
 
@@ -535,28 +539,35 @@ class CoreMigrationError(EngravaError):
 class SchemaVersionError(EngravaError):
     """Raised when ``ensure_schema`` refuses to open a database as-is.
 
-    Two distinct refusals share this type, both because the engine has been
+    Three distinct refusals share this type, all because the engine has been
     handed a database it cannot safely bring to a known state on its own:
 
     * ``"populated_sub_floor"`` — the stamped ``user_version`` is below the
       version the bootstrap script assumes (empty), but the file already
-      carries a core table. Stamping it current with a script of
-      ``CREATE ... IF NOT EXISTS`` statements would leave whatever the file
-      actually contains silently mislabelled as a fresh, fully-migrated
-      schema.
+      carries a core table with at least one row. Stamping it current with a
+      script of ``CREATE ... IF NOT EXISTS`` statements would leave whatever
+      the file actually contains silently mislabelled as a fresh,
+      fully-migrated schema.
+    * ``"stale_shape_sub_floor"`` — the stamped ``user_version`` is below the
+      bootstrap floor and the file's core tables held zero rows (so
+      ``"populated_sub_floor"`` did not fire), but they already existed
+      under an older shape the bootstrap script's
+      ``CREATE ... IF NOT EXISTS`` statements left untouched. Left alone,
+      the database would end up stamped current without the columns that
+      older shape is missing.
     * ``"newer_than_head"`` — the stamped ``user_version`` is higher than
       this build's head version. The migration registry has no step to run
       and nothing tells the caller that the file was written by a newer
       engrava.
 
-    Constructed via :meth:`populated_sub_floor` or :meth:`newer_than_head`
-    rather than directly, so the message is always built from the same two
-    version numbers the caller already has.
+    Constructed via :meth:`populated_sub_floor`, :meth:`stale_shape_sub_floor`
+    or :meth:`newer_than_head` rather than directly, so the message is always
+    built from the same version numbers the caller already has.
 
     Args:
         current_version: The database's stamped ``user_version``.
-        reason: Which refusal this is — ``"populated_sub_floor"`` or
-            ``"newer_than_head"``.
+        reason: Which refusal this is — ``"populated_sub_floor"``,
+            ``"stale_shape_sub_floor"`` or ``"newer_than_head"``.
         message: Human-readable description, built by the named constructor.
 
     """
@@ -587,6 +598,43 @@ class SchemaVersionError(EngravaError):
             "schema state."
         )
         return cls(current_version, "populated_sub_floor", message)
+
+    @classmethod
+    def stale_shape_sub_floor(cls, current_version: int, floor_version: int) -> SchemaVersionError:
+        """Build the refusal for a sub-floor database bootstrapped over an older shape.
+
+        The message states only what the branch that raises this actually
+        established: :meth:`SqliteEngravaCore._has_any_core_table` already
+        found zero rows in every core table. It does not follow that the
+        file is otherwise empty or safe to discard — a sub-floor database
+        can still carry data in a non-core (e.g. extension) table that this
+        check never inspects — so the message says that too, and does not
+        suggest removing the file.
+
+        Args:
+            current_version: The database's stamped ``user_version``. Never
+                touched by this refusal: it fires before the bootstrap
+                script — and its trailing stamp — ever runs, so there is
+                nothing here to undo.
+            floor_version: The lowest version the bootstrap script may assume
+                is an empty file.
+
+        Returns:
+            A :class:`SchemaVersionError` describing the refusal.
+
+        """
+        message = (
+            f"Database is stamped user_version={current_version}, below the "
+            f"bootstrap floor (v{floor_version}); its core tables already "
+            "exist under an older shape that the bootstrap script's "
+            "`CREATE ... IF NOT EXISTS` statements would leave untouched. "
+            "Refusing to stamp it current — this build cannot tell which "
+            "older version produced these tables and will not guess. No "
+            "core table holds a row, but the file may still carry data "
+            "this check does not examine (e.g. in a non-core or extension "
+            "table)."
+        )
+        return cls(current_version, "stale_shape_sub_floor", message)
 
     @classmethod
     def newer_than_head(cls, current_version: int, head_version: int) -> SchemaVersionError:
@@ -789,30 +837,46 @@ class ConnectionQuarantinedError(EngravaError):
 
 
 class WriteContentionError(EngravaError):
-    """Raised when the dedup probe-and-insert window cannot get the write lock.
+    """Raised when a guarded write cannot get past lock contention.
 
-    ``create_thought(deduplicate=True)``, ``get_or_create`` and
-    ``upsert_by_hash`` open their "check existing, then insert or bump" window
-    with ``BEGIN IMMEDIATE`` so a second connection — a second process, or a
-    second store on the same database file — reaching the same window is
-    turned away at transaction *start* rather than mid-transaction, which is
-    the classic embedded-SQLite deadlock shape a deferred ``BEGIN`` invites.
+    Two distinct mechanisms raise this, both converting a raw
+    :class:`sqlite3.OperationalError` (``database is locked``) into a typed,
+    catchable failure:
 
-    SQLite's own busy handler (``PRAGMA busy_timeout``) already waits for the
-    lock before giving up, and the store retries the whole ``BEGIN IMMEDIATE``
-    a bounded number of times with backoff on top of that. This error is
-    raised only once both are exhausted, so a caller sees a typed, catchable
-    failure instead of a raw :class:`sqlite3.OperationalError` leaking out of
-    the public API.
+    * The dedup probe-and-insert window. ``create_thought(deduplicate=True)``,
+      ``get_or_create`` and ``upsert_by_hash`` open their "check existing,
+      then insert or bump" window with ``BEGIN IMMEDIATE`` so a second
+      connection — a second process, or a second store on the same database
+      file — reaching the same window is turned away at transaction *start*
+      rather than mid-transaction, which is the classic embedded-SQLite
+      deadlock shape a deferred ``BEGIN`` invites. SQLite's own busy handler
+      (``PRAGMA busy_timeout``) already waits for the lock before giving up,
+      and the store retries the whole ``BEGIN IMMEDIATE`` a bounded number of
+      times with backoff on top of that; this error is raised only once both
+      are exhausted (``attempts`` reflects that count).
+    * The ``revision``-guarded update paths. ``update_thought``,
+      ``restore_thought``, ``update_edge`` and ``update_action`` each execute
+      at most one guarded ``UPDATE`` per call — ``update_edge`` executes none
+      when the merged change leaves every column equal to its current value,
+      since there is then nothing to write; if that single ``execute()`` does
+      run and reports lock contention (after SQLite's own busy-timeout wait),
+      it is converted here too, rather than left to leak as a raw driver
+      error — this is not retried at the application level (``attempts`` is
+      always ``1``), since a caller is already free to retry the whole
+      operation.
 
-    Retrying the call outright is safe: the transaction that would have done
-    the work never started, so nothing was read or written under it — there
-    is no partial state to reconcile, only contention to wait out.
+    Retrying the call outright is safe in both cases: whichever transaction
+    would have done the work never started (the dedup case) or made no
+    change (a contended ``UPDATE`` affects zero rows when it fails to
+    execute at all), so nothing was read or written under it — there is no
+    partial state to reconcile, only contention to wait out.
 
     Args:
         operation: Name of the guarded method that could not get the lock
-            (e.g. ``"create_thought"``).
-        attempts: Number of ``BEGIN IMMEDIATE`` attempts made before giving up.
+            (e.g. ``"create_thought"``, ``"update_thought"``).
+        attempts: Number of attempts made before giving up — the number of
+            ``BEGIN IMMEDIATE`` attempts for the dedup window, always ``1``
+            for a guarded update's single ``execute()``.
 
     Examples:
         >>> raise WriteContentionError(operation="create_thought", attempts=3)

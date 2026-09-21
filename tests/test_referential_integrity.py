@@ -31,6 +31,7 @@ import datetime
 import importlib.util
 import uuid
 from dataclasses import dataclass
+from importlib import resources
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -56,12 +57,14 @@ from engrava.domain.exceptions import (
     CoreMigrationError,
     DuplicateEdgeError,
     ReferentialIntegrityError,
+    SchemaVersionError,
 )
 from engrava.domain.models.action import ActionRecord
 from engrava.domain.models.edge import EdgeRecord
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
 from engrava.infrastructure.sqlite.vector_sqlite_vec import SqliteVecSearchBackend
+from tests.test_migration_upgrade_chains import _bootstrap_core_at_version
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -168,7 +171,7 @@ class TestForeignKeysActuallyEnforced:
         cursor = await store._db.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 20
+        assert row[0] == 21
 
 
 class TestCreateEdgeRejectsOrphans:
@@ -1413,7 +1416,7 @@ class TestMigrationV11ToV12:
             await core.ensure_schema()
             version_row = await (await db.execute("PRAGMA user_version")).fetchone()
             assert version_row is not None
-            assert version_row[0] == 20
+            assert version_row[0] == 21
             for table, expected in (("edge", 1), ("embedding", 1), ("action", 1), ("thought", 2)):
                 row = await (
                     await db.execute(f"SELECT COUNT(*) FROM {table}")  # noqa: S608
@@ -1498,7 +1501,7 @@ class TestMigrationV11ToV12:
             await core.ensure_schema()  # second pass — must converge without error
             version_row = await (await db.execute("PRAGMA user_version")).fetchone()
             assert version_row is not None
-            assert version_row[0] == 20
+            assert version_row[0] == 21
             # FK declarations must still be exactly 2 on edge, not duplicated.
             rows = list(await (await db.execute("PRAGMA foreign_key_list(edge)")).fetchall())
             assert len(rows) == 2
@@ -1652,7 +1655,7 @@ class TestMigrationV11ToV12:
             await core.ensure_schema()
             version_row = await (await db.execute("PRAGMA user_version")).fetchone()
             assert version_row is not None
-            assert version_row[0] == 20
+            assert version_row[0] == 21
             for table, expected in (("edge", 1), ("embedding", 1), ("action", 1), ("thought", 2)):
                 row = await (
                     await db.execute(f"SELECT COUNT(*) FROM {table}")  # noqa: S608
@@ -1814,7 +1817,7 @@ class TestBootstrapAtomicity:
             await core.ensure_schema()
             version_row = await (await db.execute("PRAGMA user_version")).fetchone()
             assert version_row is not None
-            assert version_row[0] == 20
+            assert version_row[0] == 21
             for table in ("thought", "edge", "embedding", "action", "_metadata", "thought_fts"):
                 row = await (
                     await db.execute(
@@ -1827,6 +1830,123 @@ class TestBootstrapAtomicity:
             # The recovered schema is usable end to end.
             await core.create_thought(_make_thought("t-after-retry"))
             assert await core.get_thought("t-after-retry") is not None
+
+    async def test_older_build_interrupted_bootstrap_refuses_instead_of_stamping_head(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A pre-existing older-shape core table must not end up stamped head.
+
+        This is the *cross-version* counterpart to
+        ``test_bootstrap_failure_leaves_version_unstamped_and_retryable``
+        above: that test interrupts **this build's own** bootstrap and shows a
+        retry converges cleanly, because every table it half-created already
+        has this build's full column set. Here the database instead comes
+        from an **older build** whose own bootstrap died before its stamp —
+        a real v20 schema (reconstructed the same way
+        ``test_migration_upgrade_chains.py`` reconstructs every historical
+        shape) with zero rows and ``user_version = 0``.
+
+        ``schema_core.sql`` is pure ``CREATE ... IF NOT EXISTS``, so run
+        against that file it leaves the pre-existing v20-shape ``thought`` /
+        ``edge`` / ``action`` tables — missing the ``revision`` column —
+        completely untouched, while its own unconditional trailing
+        ``PRAGMA user_version = 21`` would otherwise stamp the database
+        current anyway. ``ensure_schema`` must instead refuse, and leave the
+        version off head so a later open keeps refusing rather than reading
+        the database as fully migrated.
+        """
+        db_path = tmp_path / "interrupted-older-build.sqlite"
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            # A genuine v20 shape, stamped v20 by the reconstruction helper...
+            await _bootstrap_core_at_version(db, 20)
+            # ...then knocked back to 0: the stamp this database's own
+            # (older) bootstrap never reached, because it died first.
+            await db.execute("PRAGMA user_version = 0")
+            await db.commit()
+
+            cols_before = {
+                row["name"]
+                for row in await (await db.execute("PRAGMA table_info(thought)")).fetchall()
+            }
+            assert "revision" not in cols_before
+
+            core = SqliteEngravaCore(db=db, embedding_provider=None, auto_embed=False)
+            with pytest.raises(SchemaVersionError, match="older shape"):
+                await core.ensure_schema()
+
+            version_row = await (await db.execute("PRAGMA user_version")).fetchone()
+            assert version_row is not None
+            assert version_row[0] != 21, (
+                "must not be left stamped head over a schema missing `revision`"
+            )
+            cols_after = {
+                row["name"]
+                for row in await (await db.execute("PRAGMA table_info(thought)")).fetchall()
+            }
+            assert "revision" not in cols_after
+
+            # A second open refuses the same way -- it is not a one-shot
+            # warning that then silently opens the file as current.
+            with pytest.raises(SchemaVersionError):
+                await core.ensure_schema()
+            version_row = await (await db.execute("PRAGMA user_version")).fetchone()
+            assert version_row is not None
+            assert version_row[0] != 21
+
+
+class TestBootstrapShapeCheckIsSelfUpdating:
+    """The bootstrap postcondition is not pinned to one hard-coded column.
+
+    A version of this check that looked only for the ``revision`` column
+    caught today's cross-version bootstrap hazard, but would silently stop
+    catching it the day a *next* core migration adds a column: an
+    older-shape leftover table missing only that new column would still
+    carry ``revision`` and pass. Deriving the check from a disposable
+    reference database built off the exact ``schema_core.sql`` text means
+    any missing column trips it, with nothing in this method to update when
+    the script gains one. Demonstrated directly against a synthetic "one
+    column further" schema standing in for a migration that has not been
+    written yet, rather than waiting for a real one to land.
+    """
+
+    async def test_a_hypothetical_future_column_is_caught_without_a_code_change(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "future-migration-probe.sqlite"
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(db=db, embedding_provider=None, auto_embed=False)
+            await store.ensure_schema()
+
+            real_schema_sql = (
+                resources.files("engrava.infrastructure.sqlite")
+                .joinpath("schema_core.sql")
+                .read_text(encoding="utf-8")
+            )
+            marker = (
+                "CREATE TABLE IF NOT EXISTS thought (\n    thought_id        TEXT    PRIMARY KEY,"
+            )
+            assert real_schema_sql.count(marker) == 1, "the fixture depends on this exact text"
+            # A stand-in for "the next core migration": a column this build's
+            # schema_core.sql does not declare anywhere.
+            future_schema_sql = real_schema_sql.replace(
+                marker, marker + "\n    probe_next_core_column TEXT,"
+            )
+            assert future_schema_sql != real_schema_sql
+
+            # This store's tables already exist (bootstrapped above), so the
+            # check compares them instead of short-circuiting on "nothing
+            # exists yet". Against the schema it was actually bootstrapped
+            # from, the check passes.
+            assert await store._existing_core_tables_match_bootstrap_shape(real_schema_sql) is True
+            # Against a schema one column further, it correctly reports the
+            # gap -- no change to this method itself is needed to catch it.
+            assert (
+                await store._existing_core_tables_match_bootstrap_shape(future_schema_sql) is False
+            )
 
 
 class TestV11ToV12PostconditionCatchesVanishedTable:
@@ -1953,7 +2073,7 @@ class TestV11ToV12PostconditionCatchesVanishedTable:
             await core.ensure_schema()
             version_row = await (await db.execute("PRAGMA user_version")).fetchone()
             assert version_row is not None
-            assert version_row[0] == 20
+            assert version_row[0] == 21
             for table, column in (
                 ("edge", "from_thought_id"),
                 ("edge", "to_thought_id"),

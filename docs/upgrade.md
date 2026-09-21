@@ -183,7 +183,7 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 | 0.3.x | 0.4.0 | Yes | **Schema-changing** minor upgrade — adds the valid-time columns (additive, zero data loss). Back up first and follow the [rolling-upgrades](#rolling-upgrades-multiple-workers) note |
 | 0.4.x | 0.5.0 | Yes | **Schema-changing** minor upgrade (`user_version` 14 → 18), although the library API is drop-in. **Breaking for MCP-server users only:** the `engrava[mcp]` extra and the in-engrava `engrava-mcp` command are removed — the server moved to the standalone [`engrava-mcp`](https://github.com/sovantica/engrava-mcp) package (see the 0.4 → 0.5 note) |
 | 0.5.0 | 0.6.0 | Yes | **Schema-changing** minor upgrade (`user_version` 18 → 20), with two additive columns. Default retrieval now excludes archived thoughts, and wrong-dimension query vectors raise a typed error. An edge `decay_multiplier` of `0.0` no longer reads back as `1.0`, and a later update no longer rewrites it to `1.0` — values a 0.5.x update already overwrote stay overwritten. Back up, quiesce shared-store workers, migrate once, and review the [0.5 → 0.6 notes](#05---06) |
-| 0.6.x | 0.7.0 | Yes | No *database* schema change, but `EngravaMetrics.schema_version` moves `1 → 2` (see below). **Behaviour change:** when the resolved recency weight is `0.0` **and** a cognitive-cycle reference (`current_cycle`, explicit or via `cycle_provider`) is present, the query-less fallback path now treats recency as fully off instead of still decaying by cycle — which can change result order for stores with heterogeneous thought priorities. `recency_now` (transaction-time) callers are unaffected; that axis was already correct. Also in this release: three new `EngravaError` subclasses (`WriteContentionError`, `WriteLockTimeoutError`, `DedupLockReentryError`) can now come out of the dedup and guarded-write paths; a new public override seam, `prepare_thought_for_insert()`, restores pre-insert customization that `get_or_create()` / `upsert_by_hash()` had silently stopped routing through an overridden `create_thought()`; `gc --dry-run` now names everything the real run deletes (edges, embeddings, and actions, not only orphaned edges); a deleted thought's vector can no longer resurface through search on a database that has not run the core-12 migration; a corrupt or truncated database file now makes the CLI exit with an error instead of hanging; and `restore` now refuses an `embedding` row with an empty `owner_type`/`owner_id`, a non-ISO-8601 `created_at`, or a non-positive `dimension` — every such row was already invalid on every prior release, so this only ever rejects a snapshot that already carried a broken record; and a merge restore (no `--clear`) into a target whose `journal_entry` table is non-empty now refuses any record that collides with an existing row and rolls the whole restore back instead of replacing it, unless `--orphan-journal-entries` is also given — journaling is opt-in and the CLI never enables it, so this only reaches a target that already has journaling on. Review the [0.6 → 0.7 notes](#06---07) |
+| 0.6.x | 0.7.0 | Yes | **Schema-changing** minor upgrade (`user_version` 20 → 21): every `thought` / `edge` / `action` row gains a `revision INTEGER NOT NULL DEFAULT 0` column, and `EngravaMetrics.schema_version` separately moves `1 → 2` (see below). `update_thought`, `restore_thought`, `update_edge` and `update_action` now check and increment `revision` atomically on every guarded write, so a write that lands after another guarded write touched the same row — including from a second connection or process — raises `StaleDataError` instead of silently overwriting; `update_edge` and `update_action` could never raise it before. No public method signature changed. **Behaviour change:** when the resolved recency weight is `0.0` **and** a cognitive-cycle reference (`current_cycle`, explicit or via `cycle_provider`) is present, the query-less fallback path now treats recency as fully off instead of still decaying by cycle — which can change result order for stores with heterogeneous thought priorities. `recency_now` (transaction-time) callers are unaffected; that axis was already correct. Also in this release: three new `EngravaError` subclasses (`WriteContentionError`, `WriteLockTimeoutError`, `DedupLockReentryError`) can now come out of the dedup and guarded-write paths; a new public override seam, `prepare_thought_for_insert()`, restores pre-insert customization that `get_or_create()` / `upsert_by_hash()` had silently stopped routing through an overridden `create_thought()`; `gc --dry-run` now names everything the real run deletes (edges, embeddings, and actions, not only orphaned edges); a deleted thought's vector can no longer resurface through search on a database that has not run the core-12 migration; a corrupt or truncated database file now makes the CLI exit with an error instead of hanging; and `restore` now refuses an `embedding` row with an empty `owner_type`/`owner_id`, a non-ISO-8601 `created_at`, or a non-positive `dimension` — every such row was already invalid on every prior release, so this only ever rejects a snapshot that already carried a broken record; and a merge restore (no `--clear`) into a target whose `journal_entry` table is non-empty now refuses any record that collides with an existing row and rolls the whole restore back instead of replacing it, unless `--orphan-journal-entries` is also given — journaling is opt-in and the CLI never enables it, so this only reaches a target that already has journaling on. Review the [0.6 → 0.7 notes](#06---07) |
 
 For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 `0.x.*` line do not change the schema and are low-risk; **minor** upgrades
@@ -1450,6 +1450,44 @@ records appear.
 - **What to do:** update any log-based alerting rule or dashboard filter keyed
   on the old logger name to the new one; otherwise those records stop
   appearing with no error or warning.
+
+**A real row-version guard on the four update paths, and a new `revision`
+column behind it.** **Schema change:** `user_version` 20 → 21, additive —
+`thought`, `edge` and `action` each gain `revision INTEGER NOT NULL DEFAULT 0`
+(not `embedding`, which carries no revision of its own). The migration runs
+automatically on the next `ensure_schema()` / factory open; no backfill step
+is needed, since the default already gives every pre-existing row `revision =
+0`, identical to a freshly inserted one.
+
+**What changed.** `update_thought` and `restore_thought` already carried a
+version guard, but it compared `updated_cycle` — a cognitive-recency signal
+nothing in the store ever advanced on its own, so an ordinary concurrent edit
+passed it silently. That guard now compares and increments `revision`
+instead, and the engine bumps it on every guarded write automatically, with
+no caller action required to arm it. `update_edge` and `update_action` gain
+the same guard for the first time — before this release, neither could ever
+raise `StaleDataError` under any circumstance.
+
+**Who is affected.** Anyone relying on the previous silence: a competing edit
+that used to land unnoticed — whether from a second task nested inside a
+caller-owned hook on the same store, or, for the first time, from a
+**second connection or process writing the same database file** — now makes
+the guarded write raise `StaleDataError` instead. Code that never saw a
+conflict because conflicts were invisible needs a retry idiom: re-read the
+row, recompute the intended change, and reissue the call — do not replay the
+original arguments against the stale read. See
+[Concurrency](concurrency.md#optimistic-concurrency-and-staledataerror) for
+the full contract.
+
+**What did not change.** No public method gained, lost, or renamed a
+parameter — `revision` is not a field on any domain model and is not
+returned by `model_dump()` or any read path; it is an internal column the
+guarded `UPDATE` statements alone read and write. There is still no
+caller-supplied expectation to pass (no `expected_revision` argument on any
+method) — a caller cannot yet assert "reject this write unless the row is
+still exactly the one I read"; only the engine's own automatic bump is
+enforced. `create_thought` / `create_edge` / `create_action` are unaffected:
+a newly inserted row simply starts at `revision = 0`.
 
 ### 0.5 -> 0.6
 

@@ -1647,6 +1647,8 @@ class TestGcExpiredBlastRadius:
             The exact row expected afterwards.
 
         """
+        before_revision = before["revision"]
+        assert isinstance(before_revision, int)
         return {
             **before,
             "lifecycle_status": LifecycleStatus.ARCHIVED.value,
@@ -1656,6 +1658,16 @@ class TestGcExpiredBlastRadius:
             "expires_at": None,
             "archived_at_cycle": None,
             "archived_at": None,
+            # A maintenance sweep must not be defeated by a stale caller
+            # expectation, so archival advances the row's revision counter --
+            # but it does not check that counter itself, because nothing about
+            # a maintenance archival depends on what any caller last read. The
+            # expected value is computed from the row's own before-state
+            # (never read back from the row under test): a build that stopped
+            # bumping on archive would leave the after-row's revision equal to
+            # ``before_revision``, one short of this expectation, and this
+            # assertion would catch it.
+            "revision": before_revision + 1,
         }
 
     @classmethod

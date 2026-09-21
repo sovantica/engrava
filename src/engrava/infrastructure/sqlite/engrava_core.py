@@ -171,7 +171,7 @@ _CORE_SCHEMA_BOOTSTRAP_FLOOR = 2
 #: an instance) so a caller that has not opened a store yet — the CLI's
 #: schema-state gate, in particular — can compare a database's stamped
 #: ``user_version`` against head without one.
-CORE_SCHEMA_HEAD_VERSION = 20
+CORE_SCHEMA_HEAD_VERSION = 21
 
 #: Core tables whose presence on a sub-floor database means it is a real,
 #: populated store rather than an empty file — see
@@ -2365,10 +2365,21 @@ class SqliteEngravaCore:
         relies on.
 
         Applies the full ``schema_core.sql`` (including the FTS5 virtual table
-        and sync triggers) only when the database predates the migration-ladder
-        floor **and carries no core table yet** — a populated sub-floor
-        database refuses instead (see :class:`SchemaVersionError`). A database
-        at or above the floor is upgraded incrementally through the ordered
+        and sync triggers) only when the database predates the
+        migration-ladder floor **and no core table holds a row yet** (see
+        :meth:`_has_any_core_table` — this is row presence, not mere table
+        existence, so an empty table an interrupted bootstrap left behind
+        does not itself count as "populated") — a sub-floor database that
+        already has a populated core table refuses instead (see
+        :class:`SchemaVersionError`). Before that script runs, whichever core
+        tables already exist there (necessarily still empty, or the refusal
+        above already fired) are also checked against it (see
+        :meth:`_existing_core_tables_match_bootstrap_shape`): one already
+        carrying an older shape the script's ``CREATE ... IF NOT EXISTS``
+        statements would leave untouched is refused up front, before
+        anything is written, rather than only discovered after a stamp the
+        script's own last statement already committed. A database at or
+        above the floor is upgraded incrementally through the ordered
         core-migration registry (see :meth:`_core_migration_steps`) up to the
         head version (:data:`CORE_SCHEMA_HEAD_VERSION`). A database stamped
         **above** head also refuses rather than silently skipping every
@@ -2379,9 +2390,12 @@ class SqliteEngravaCore:
         manifest supplied via the ``manifests`` constructor parameter.
 
         Raises:
-            SchemaVersionError: When the database is a populated sub-floor
-                schema this build cannot bootstrap, or is stamped newer than
-                this build's head version.
+            SchemaVersionError: When the database is a sub-floor schema with
+                a populated core table this build cannot bootstrap, is a
+                sub-floor schema whose zero-row core tables already exist
+                under an older shape the bootstrap script would leave
+                untouched, or is stamped newer than this build's head
+                version.
 
         """
         cursor = await self._db.execute("PRAGMA user_version")
@@ -2409,6 +2423,16 @@ class SqliteEngravaCore:
                 .joinpath("schema_core.sql")
                 .read_text(encoding="utf-8")
             )
+            if not await self._existing_core_tables_match_bootstrap_shape(schema_sql):
+                # A core table already exists here (with zero rows, or
+                # ``_has_any_core_table`` above would already have refused),
+                # but not under this script's own shape -- it predates this
+                # build. Refusing *before* running anything means there is no
+                # stamp for a crash between the write and an undo to strand:
+                # nothing was written, so there is nothing to undo.
+                raise SchemaVersionError.stale_shape_sub_floor(
+                    current_version, _CORE_SCHEMA_BOOTSTRAP_FLOOR
+                )
             await self._db.executescript(schema_sql)
         elif current_version > CORE_SCHEMA_HEAD_VERSION:
             # The migration registry has no step targeting a version this high
@@ -2457,7 +2481,7 @@ class SqliteEngravaCore:
         Returns:
             Entries ordered by ascending target version, contiguous from the
             first post-bootstrap step (``v2 -> v3`` rebuilds the FTS index) up
-            to the head version (``v19 -> v20``).
+            to the head version (``v20 -> v21``).
 
         """
         return (
@@ -2479,6 +2503,7 @@ class SqliteEngravaCore:
             (18, self._migrate_core_v17_to_v18),
             (19, self._migrate_core_v18_to_v19),
             (20, self._migrate_core_v19_to_v20),
+            (21, self._migrate_core_v20_to_v21),
         )
 
     async def _run_pending_core_migrations(self, current_version: int) -> None:
@@ -2526,6 +2551,14 @@ class SqliteEngravaCore:
         contrast, carries at least one row somewhere — that is what
         "populated" means here.
 
+        The ``sqlite_master.name`` lookup is matched ``COLLATE NOCASE``:
+        SQLite itself resolves table identifiers case-insensitively (a
+        ``CREATE TABLE IF NOT EXISTS thought`` matches an existing ``THOUGHT``
+        just as ``SELECT ... FROM thought`` reads from it), so a plain
+        case-sensitive string comparison against the stored name could miss a
+        core table written under a different case and report an empty file
+        that is not one.
+
         Returns:
             ``True`` if any table in :data:`_CORE_TABLE_NAMES` exists **and**
             holds at least one row.
@@ -2533,7 +2566,7 @@ class SqliteEngravaCore:
         """
         for table in _CORE_TABLE_NAMES:
             cursor = await self._db.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? COLLATE NOCASE",
                 (table,),
             )
             if await cursor.fetchone() is None:
@@ -2545,6 +2578,112 @@ class SqliteEngravaCore:
             if await row_cursor.fetchone() is not None:
                 return True
         return False
+
+    async def _existing_core_tables_match_bootstrap_shape(self, schema_sql: str) -> bool:
+        """Return whether every already-existing core table matches ``schema_sql``.
+
+        Checked **before** ``schema_sql`` is run, not after: the script is
+        pure ``CREATE ... IF NOT EXISTS``, so it can only skip an existing
+        table under an older shape, never fix it — while still stamping
+        ``user_version`` current at its own trailing statement regardless.
+        Checking first means a mismatch is refused with nothing yet written:
+        no stamp has landed, so there is nothing to undo and no window
+        between a stamp and an undo for a crash to split apart.
+
+        A table that does not exist yet is not a mismatch — it is exactly
+        what the script is about to create, whether this is a genuinely
+        fresh file or a retry of *this build's own* bootstrap interrupted
+        partway through. ``CREATE TABLE`` is atomic, so any table an earlier,
+        interrupted run of this exact script already finished already carries
+        the full head shape and matches; tables it had not reached yet are
+        simply absent here and the now-completing script creates them fresh.
+
+        A genuinely fresh file — no core table exists at all — skips the
+        comparison entirely rather than opening a disposable reference
+        connection it would never need: that keeps the common case (every
+        brand-new database) exactly as cheap, and as free of incidental
+        connection churn, as before this check existed.
+
+        When at least one core table does already exist, this bootstraps a
+        disposable, provably-fresh reference database from ``schema_sql``
+        itself — rather than naming one column the current head happens to
+        add last, which would stop being a witness the moment a *future*
+        migration adds another — and compares each such table's column set
+        against it. The comparison is self-updating: whatever the script
+        declares next release, the reference picks it up automatically, with
+        no separate constant for a future column to fall out of sync with.
+
+        **What this does not check.** The comparison is column *names* only —
+        it says nothing about types, defaults, constraints, collations,
+        column order, or generated/hidden columns (some of which
+        ``PRAGMA table_info`` does not even surface). A hand-built table
+        carrying the right column names under a different type or a hostile
+        constraint would pass. No build this project has ever shipped
+        produces such a table, which is why this is a documented limit of
+        the check rather than something it is fixed to catch — it
+        establishes equal column names across the core tables, nothing more.
+
+        **What this does not serialize.** This is a single connection's own
+        pre-check, not a cross-process lock. Two different engrava builds
+        bootstrapping the same fresh file at the same time can still
+        interleave: each can pass this check while no core table yet exists,
+        then each runs its own ``schema_core.sql`` and stamps its own head
+        version, and whichever runs last wins. Detecting or preventing that
+        race is outside what this method — or any check confined to a single
+        connection — can do.
+
+        Args:
+            schema_sql: The ``schema_core.sql`` text about to be run, if this
+                check passes.
+
+        Returns:
+            ``True`` if every core table already present on ``self._db`` has
+            exactly the column set a fresh bootstrap of ``schema_sql`` gives
+            it. Vacuously ``True`` when no core table exists yet.
+
+        """
+        existing_tables = [table for table in _CORE_TABLE_NAMES if await self._table_exists(table)]
+        if not existing_tables:
+            return True
+        async with aiosqlite.connect(":memory:") as reference:
+            await reference.executescript(schema_sql)
+            for table in existing_tables:
+                actual = await self._table_column_names(self._db, table)
+                expected = await self._table_column_names(reference, table)
+                if actual != expected:
+                    return False
+        return True
+
+    @staticmethod
+    async def _table_column_names(conn: aiosqlite.Connection, table: str) -> frozenset[str]:
+        """Return the set of column names ``table`` carries on ``conn``.
+
+        Reads each ``PRAGMA table_info`` row **by position**
+        (``cid, name, type, notnull, dflt_value, pk`` — ``name`` is index 1),
+        never by key. ``conn`` here is not always a connection this class
+        configured itself: the disposable reference database this is also
+        called against is plain ``aiosqlite.connect(...)`` with no
+        ``row_factory`` set, and a caller could hand this a connection with
+        any row factory at all. Indexing by key only works when the row
+        factory happens to be ``aiosqlite.Row`` (or another mapping); reading
+        by position works whether the row comes back as that or as a plain
+        tuple, so this makes no assumption about the connection it is given.
+
+        Args:
+            conn: Open connection to inspect.
+            table: The table name. Always drawn from the fixed
+                :data:`_CORE_TABLE_NAMES` tuple, never caller input, so the
+                f-string interpolation below cannot carry anything the
+                allow-list did not already name.
+
+        Returns:
+            The table's column names, order-independent. Empty if the table
+            does not exist on ``conn``.
+
+        """
+        cursor = await conn.execute(f"PRAGMA table_info({table})")
+        rows = await cursor.fetchall()
+        return frozenset(row[1] for row in rows)
 
     async def _probe_fts(self) -> None:
         """Detect whether the ``thought_fts`` FTS5 table exists.
@@ -3377,6 +3516,60 @@ class SqliteEngravaCore:
         # version, closing the "version bumped without the column" hole.
         await self._require_column(20, "thought", "archived_at")
 
+    async def _migrate_core_v20_to_v21(self) -> None:
+        """Add the row-version guard column ``revision`` (core-21).
+
+        Purely additive: ``thought``, ``edge`` and ``action`` each gain
+        ``revision INTEGER NOT NULL DEFAULT 0``. Not ``embedding`` — it is a
+        carrier owned by its thought, not an independently updatable entity.
+
+        ``NOT NULL DEFAULT 0`` makes a separate backfill step unnecessary: every
+        pre-existing row reads back ``revision = 0`` the instant the column
+        exists, identically to a freshly bootstrapped row that has never been
+        written. There is no NULL state for a write-time guard to special-case.
+
+        This column is the enforcement primitive the guarded ``UPDATE``
+        statements on ``update_thought`` / ``restore_thought`` / ``update_edge``
+        / ``update_action`` compare and increment atomically (``revision =
+        revision + 1 WHERE id = ? AND revision = ?``) — it replaces
+        ``updated_cycle`` as the guard column, since ``updated_cycle`` is a
+        cognitive-recency signal nothing in this store advances on its own and
+        is not safe to overload as a write counter.
+
+        The add is guarded against the duplicate-column error exactly as every
+        earlier ``ADD COLUMN`` rung guards its own, so a database already
+        carrying the column (a partial or re-run migration) is left unchanged.
+        A postcondition assertion per table confirms each added column is
+        present before the migration loop bumps ``user_version``, closing the
+        "version bumped without the column" hole an interrupt could otherwise
+        open — the same pattern every prior rung in this ladder uses.
+
+        ``thought`` is always present by this point (the first table created
+        by the fresh DDL and by every earlier migration path), so its
+        ``ALTER`` needs no table-existence guard, exactly as
+        ``_migrate_core_v19_to_v20`` reasons about the same table. ``edge``
+        and ``action`` may each be absent in a partial bootstrap (a
+        thought-only database) — guarded by ``_table_exists`` exactly as
+        ``_migrate_core_v18_to_v19`` guards its own ``edge`` work and
+        ``_migrate_core_v15_to_v16`` guards its own ``action`` work. Either
+        table is only ever created from nothing by the base DDL, which at v21
+        already carries ``revision``, so a table that later comes into
+        existence is self-healing — no database can reach a state with an
+        ``edge`` or ``action`` table that lacks ``revision``.
+        """
+        await self._add_column_if_absent("thought", "revision", "INTEGER NOT NULL DEFAULT 0")
+        # Postcondition: the column must exist before the loop bumps the
+        # version, closing the "version bumped without the column" hole.
+        await self._require_column(21, "thought", "revision")
+
+        if await self._table_exists("edge"):
+            await self._add_column_if_absent("edge", "revision", "INTEGER NOT NULL DEFAULT 0")
+            await self._require_column(21, "edge", "revision")
+
+        if await self._table_exists("action"):
+            await self._add_column_if_absent("action", "revision", "INTEGER NOT NULL DEFAULT 0")
+            await self._require_column(21, "action", "revision")
+
     async def _fk_present(self, table: str, column: str) -> bool:
         """Return whether ``column`` has the required thought-cascade foreign key.
 
@@ -3419,9 +3612,16 @@ class SqliteEngravaCore:
             )
 
     async def _table_exists(self, table: str) -> bool:
-        """Return ``True`` when ``table`` is registered in ``sqlite_master``."""
+        """Return ``True`` when ``table`` is registered in ``sqlite_master``.
+
+        Matched ``COLLATE NOCASE``, the same as :meth:`_has_any_core_table`:
+        SQLite resolves table identifiers case-insensitively, so a
+        case-sensitive comparison here could report a table absent when it
+        exists under a different case and every real DDL/DML statement
+        against it already resolves fine.
+        """
         cursor = await self._db.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? COLLATE NOCASE",
             (table,),
         )
         return await cursor.fetchone() is not None
@@ -4140,6 +4340,64 @@ class SqliteEngravaCore:
                 raise exc from unwind_exc
             raise
 
+    async def _execute_revision_guarded_write(
+        self,
+        sql: str,
+        params: tuple[object, ...],
+        *,
+        operation: str,
+    ) -> aiosqlite.Cursor:
+        """Execute a ``revision``-guarded ``UPDATE``, typing lock contention.
+
+        ``update_thought``, ``restore_thought``, ``update_edge`` and
+        ``update_action`` all execute their guarded write through this, so a
+        lock timeout on any of them surfaces as :class:`WriteContentionError`
+        rather than a raw :class:`sqlite3.OperationalError` — the same
+        conversion :meth:`_begin_dedup_write_lock` already performs for the
+        dedup window's own ``BEGIN IMMEDIATE``. An ordinary ``UPDATE`` from a
+        second connection or process has always been able to hit the write
+        lock and time out — a ``revision`` predicate in the ``WHERE`` clause
+        does not, by itself, introduce SQL-level contention that was not
+        already there. What changed is how often that contention now surfaces
+        as a *typed* error: before these four paths ran through this method, a
+        lock timeout on any of them propagated as a raw
+        :class:`sqlite3.OperationalError`, and only
+        ``_begin_dedup_write_lock``'s cross-connection window converted its
+        own — leaving these four untyped would now be a gap this method
+        exists to close, not a property they merely inherit.
+
+        No application-level retry is added: ``PRAGMA busy_timeout`` already
+        makes SQLite wait out ordinary contention inside this single
+        ``execute()`` call, and a caller is free to retry the whole operation
+        (a safe thing to do, since nothing was written before this call
+        raised). Only a busy/lock error converts; any other
+        :class:`sqlite3.OperationalError` (a genuine I/O failure, a schema
+        problem) is never mistaken for contention and propagates unchanged.
+
+        Args:
+            sql: The guarded ``UPDATE`` statement, as built by
+                :func:`_build_update_sql`.
+            params: The statement's bound parameters, in order.
+            operation: Name of the calling public method, carried onto
+                :class:`WriteContentionError` for a caller that logs or
+                branches on it.
+
+        Returns:
+            The cursor from the executed statement.
+
+        Raises:
+            WriteContentionError: The write could not proceed because the
+                connection reported lock contention.
+            sqlite3.OperationalError: Some other, non-busy failure.
+
+        """
+        try:
+            return await self._db.execute(sql, params)
+        except sqlite3.OperationalError as exc:
+            if not _is_busy_error(exc):
+                raise
+            raise WriteContentionError(operation=operation, attempts=1) from exc
+
     def _ensure_connection_usable(self) -> None:
         """Fail fast when the connection has been quarantined.
 
@@ -4511,13 +4769,19 @@ class SqliteEngravaCore:
         )
 
     #: Guard clause every core thought UPDATE carries: the row identity plus the
-    #: ``updated_cycle`` the caller read. Nothing in the store advances that
-    #: column, so a write is rejected only when a *caller* stamped a new cycle in
-    #: between, or the row was deleted — the two cases ``rowcount == 0`` cannot
-    #: tell apart. Being on *every* update, it also rejects an edit that shares
-    #: no column with the cycle-stamping one; the public docstrings say both
-    #: rather than implying a general staleness check.
-    _CORE_UPDATE_GUARD = "thought_id = ? AND updated_cycle = ?"
+    #: ``revision`` this call read. The engine itself increments ``revision`` by
+    #: one on every guarded write (``revision = revision + 1`` in the same
+    #: statement that checks it — see :func:`_build_update_sql`'s
+    #: ``bump_column``), so a write is rejected whenever *any* other guarded
+    #: write landed since this call's own read, or the row was deleted — the two
+    #: cases ``rowcount == 0`` cannot tell apart. Being on *every* update, it
+    #: also rejects an edit that shares no column with the row-version-moving
+    #: one; the public docstrings say both rather than implying a general
+    #: staleness check. ``updated_cycle`` is not this guard's column: it is a
+    #: cognitive-recency signal nothing in this store advances on its own, and
+    #: is not safe to overload as a write counter (see the module history for
+    #: why the two were once, incorrectly, the same column).
+    _CORE_UPDATE_GUARD = "thought_id = ? AND revision = ?"
 
     def _thought_to_core_columns(self, thought: ThoughtRecord) -> dict[str, object]:
         """Map a ThoughtRecord to the column values an UPDATE may write.
@@ -5082,6 +5346,17 @@ class SqliteEngravaCore:
         **Raising aborts the create.** No row is inserted, and — on every path
         this seam covers — no journal entry is appended either: a rejection
         here leaves no trace.
+
+        **Out of the ``revision`` contract, on the path where it matters
+        most.** This seam postdates the revision guard's design and is not
+        part of it. On :meth:`bulk_store`'s path in particular, this call runs
+        for the whole batch *before* ``bulk_store`` takes its own write lock
+        (see the invocation-count note above) — so a subclass override that
+        persists a write of its own here does so **outside** ``_write_lock``
+        and outside any ``revision`` bookkeeping. Such a write is a
+        third-party mutation this store neither guards nor bumps; treat it as
+        unmediated use of the connection, in the same sense the concurrency
+        documentation uses that phrase for a caller's own raw transaction.
 
         Args:
             thought: The candidate record, already validated (metadata,
@@ -7203,7 +7478,10 @@ class SqliteEngravaCore:
           out of hygiene GC and prevents a stale marker from an earlier hygiene
           episode (left behind by a low-level un-archive) from making a
           later TTL re-archival GC-eligible on the earlier, already-elapsed
-          restore windows.
+          restore windows. This write also bumps ``revision`` — unconditionally,
+          not enforced against a caller's read — for the same reason
+          :meth:`_hygiene_archive` does: the lifecycle just changed underneath
+          any caller-held token, so that token must not survive it.
         * **delete**: Physically deletes the expired thought rows (cascading
           to edges, embeddings, and actions via ON DELETE CASCADE).
 
@@ -7251,7 +7529,8 @@ class SqliteEngravaCore:
                     )
                     await self._db.execute(
                         "UPDATE thought SET lifecycle_status = ?, expires_at = NULL, "
-                        "archived_at_cycle = NULL, archived_at = NULL "
+                        "archived_at_cycle = NULL, archived_at = NULL, "
+                        "revision = revision + 1 "
                         "WHERE thought_id = ?",
                         (LifecycleStatus.ARCHIVED.value, tid),
                     )
@@ -7362,13 +7641,13 @@ class SqliteEngravaCore:
         journal ``after`` image is the same read-back.
 
         **What the version guard does and does not catch.** The write carries a
-        guard on ``updated_cycle`` as read at the start of the call, and nothing
-        in engrava advances that column on its own — only a caller passing
-        ``updated_cycle=`` here, or ``current_cycle=`` to
-        :meth:`restore_thought`, moves it. ``StaleDataError`` therefore does not
-        mean *the row changed*: it means the guarded ``UPDATE`` matched no row,
-        which happens when a competing writer stamped a cycle **or deleted the
-        row**.
+        guard on ``revision`` as read at the start of the call, and the engine
+        itself increments ``revision`` by one on every guarded write to this
+        row — atomically, in the same ``UPDATE`` that checks it — so no caller
+        action is needed to arm it. ``StaleDataError`` therefore means the
+        guarded ``UPDATE`` matched no row, which happens when **any** other
+        guarded write landed on this row since it was read here **or the row
+        was deleted**; it does not distinguish the two.
 
         **The read, the validation, and the write are now one critical section
         with respect to every other task on this instance:** the whole span
@@ -7409,9 +7688,9 @@ class SqliteEngravaCore:
             ThoughtNotFoundError: If the thought does not exist when the call
                 starts, or if the row was deleted before the write could be read
                 back.
-            StaleDataError: If the guarded write matches no row — another writer
-                stamped a new ``updated_cycle`` since the row was read, or
-                deleted the row. Nothing of this update is written when it is
+            StaleDataError: If the guarded write matches no row — another
+                guarded write landed on this row since it was read here, or it
+                was deleted. Nothing of this update is written when it is
                 raised.
             ValueError: If the post-``evolve`` metadata violates the
                 metadata-shape or size invariants enforced by
@@ -7419,6 +7698,8 @@ class SqliteEngravaCore:
                 provenance is not a
                 :class:`~engrava.domain.models.provenance.ProvenanceContext`
                 (per :func:`_validate_provenance`).
+            WriteContentionError: The guarded write could not proceed because
+                the connection reported lock contention.
             ConnectionQuarantinedError: When the connection has been quarantined.
 
         """
@@ -7430,7 +7711,7 @@ class SqliteEngravaCore:
 
             current = self._row_to_thought(current_row)
 
-            expected_cycle = current.updated_cycle
+            expected_revision = int(current_row["revision"])
             updated = current.evolve(**changes)
 
             _validate_metadata(updated.metadata)
@@ -7438,15 +7719,18 @@ class SqliteEngravaCore:
 
             columns = self._thought_update_columns(current, updated)
             async with self._write_readback_savepoint("update_thought_readback"):
-                cursor = await self._db.execute(
-                    _build_update_sql("thought", columns, self._CORE_UPDATE_GUARD),
-                    (*columns.values(), thought_id, expected_cycle),
+                cursor = await self._execute_revision_guarded_write(
+                    _build_update_sql(
+                        "thought", columns, self._CORE_UPDATE_GUARD, bump_column="revision"
+                    ),
+                    (*columns.values(), thought_id, expected_revision),
+                    operation="update_thought",
                 )
                 if cursor.rowcount == 0:
                     raise StaleDataError(
                         entity_type="ThoughtRecord",
                         entity_id=thought_id,
-                        expected_version=expected_cycle,
+                        expected_version=expected_revision,
                     )
 
                 persisted = await self._read_back_thought(thought_id)
@@ -7531,11 +7815,13 @@ class SqliteEngravaCore:
             ThoughtNotFoundError: If the thought does not exist, or if the row
                 was deleted before the write could be read back.
             InvalidTransitionError: If the thought is not currently ``ARCHIVED``.
-            StaleDataError: If the guarded write matches no row — another writer
-                stamped a new ``updated_cycle`` since the row was read, or
-                deleted the row (see :meth:`update_thought` for what that guard
-                does and does not catch). Nothing of the restore is written when
-                it is raised.
+            StaleDataError: If the guarded write matches no row — another
+                guarded write landed on this row since it was read here, or it
+                was deleted (see :meth:`update_thought` for what that guard
+                does and does not catch). Nothing of the restore is written
+                when it is raised.
+            WriteContentionError: The guarded write could not proceed because
+                the connection reported lock contention.
 
         """
         async with self._write_lock:
@@ -7551,7 +7837,7 @@ class SqliteEngravaCore:
                     target_state=LifecycleStatus.ACTIVE.value,
                 )
 
-            expected_cycle = current.updated_cycle
+            expected_revision = int(current_row["revision"])
             # Pass the enum (not its value) so ``evolve`` runs the state-machine
             # transition check — the ARCHIVED -> ACTIVE edge is what makes the
             # archive reversible.
@@ -7566,15 +7852,18 @@ class SqliteEngravaCore:
 
             columns = self._thought_update_columns(current, updated)
             async with self._write_readback_savepoint("restore_thought_readback"):
-                cursor = await self._db.execute(
-                    _build_update_sql("thought", columns, self._CORE_UPDATE_GUARD),
-                    (*columns.values(), thought_id, expected_cycle),
+                cursor = await self._execute_revision_guarded_write(
+                    _build_update_sql(
+                        "thought", columns, self._CORE_UPDATE_GUARD, bump_column="revision"
+                    ),
+                    (*columns.values(), thought_id, expected_revision),
+                    operation="restore_thought",
                 )
                 if cursor.rowcount == 0:
                     raise StaleDataError(
                         entity_type="ThoughtRecord",
                         entity_id=thought_id,
-                        expected_version=expected_cycle,
+                        expected_version=expected_revision,
                     )
 
                 persisted = await self._read_back_thought(thought_id)
@@ -7952,8 +8241,14 @@ class SqliteEngravaCore:
         the call intended to write — and the journal ``after`` image is the
         same read-back.
 
-        The write is keyed on ``edge_id`` alone — there is no version guard on
-        this path, so it never raises ``StaleDataError``. It is a
+        **The write (when there is one) carries a ``revision`` guard**, exactly
+        like :meth:`update_thought`'s: the row's ``revision`` at the start of
+        this call is checked and incremented atomically by the same ``UPDATE``,
+        so any other guarded write that landed on this row since it was read
+        here — or a delete — makes the ``UPDATE`` match no row, and this call
+        raises ``StaleDataError`` rather than silently overwriting. An edit
+        that changes nothing issues no ``UPDATE`` at all (see below), so it
+        cannot go stale — there is nothing for it to be stale against. It is a
         read-modify-write like :meth:`update_thought`, and shares the same
         task-reentrant :attr:`_write_lock` critical section: the
         read, the merge, and the write are atomic with respect to every other
@@ -7980,14 +8275,18 @@ class SqliteEngravaCore:
             The stored edge record, as persisted by this update.
 
         Raises:
-            ValueError: If the edge does not exist — at the initial read, at
-                the guarded ``UPDATE`` (no row matched ``edge_id``, including
-                when the row was deleted and a different row recreated under
-                the same id before the read-back could run), or because the
-                row was deleted before the read-back could confirm the
-                write — or if the merged ``metadata`` violates the shared
-                metadata contract (a non-scalar / list value, a non-finite
-                float, or a serialized size over the 64 KiB hard limit).
+            ValueError: If the edge does not exist at the initial read, or if
+                the merged ``metadata`` violates the shared metadata contract
+                (a non-scalar / list value, a non-finite float, or a
+                serialized size over the 64 KiB hard limit).
+            StaleDataError: If a real change's guarded ``UPDATE`` matches no
+                row — another guarded write landed on this row since it was
+                read here (including a delete, and including a delete
+                followed by a different row recreated under the same
+                ``edge_id`` before the read-back could run). Nothing of this
+                update is written when it is raised.
+            WriteContentionError: The guarded write could not proceed because
+                the connection reported lock contention.
 
         """
         async with self._write_lock:
@@ -7997,6 +8296,7 @@ class SqliteEngravaCore:
                 raise ValueError(msg)
 
             current = _row_to_edge(current_row)
+            expected_revision = int(current_row["revision"])
             updated = type(current).model_validate({**current.model_dump(mode="json"), **changes})
             _validate_metadata(updated.metadata)
 
@@ -8008,13 +8308,22 @@ class SqliteEngravaCore:
             }
             async with self._write_readback_savepoint("update_edge_readback"):
                 if columns:
-                    cursor = await self._db.execute(
-                        _build_update_sql("edge", columns, "edge_id = ?"),
-                        (*columns.values(), edge_id),
+                    cursor = await self._execute_revision_guarded_write(
+                        _build_update_sql(
+                            "edge",
+                            columns,
+                            "edge_id = ? AND revision = ?",
+                            bump_column="revision",
+                        ),
+                        (*columns.values(), edge_id, expected_revision),
+                        operation="update_edge",
                     )
                     if cursor.rowcount == 0:
-                        msg = f"Edge not found: {edge_id}"
-                        raise ValueError(msg)
+                        raise StaleDataError(
+                            entity_type="EdgeRecord",
+                            entity_id=edge_id,
+                            expected_version=expected_revision,
+                        )
 
                 persisted = await self._read_back_edge(edge_id)
 
@@ -8086,6 +8395,10 @@ class SqliteEngravaCore:
             ValueError: If the edge does not exist, ``valid_until`` is not a
                 valid ISO-8601 timestamp, or ``valid_until`` is earlier than the
                 edge's existing ``valid_from`` (an inverted validity interval).
+            StaleDataError: If the guarded write matches no row — see
+                :meth:`update_edge`, which this delegates to.
+            WriteContentionError: The guarded write could not proceed because
+                the connection reported lock contention.
 
         """
         normalized = validate_iso8601_nullable(valid_until)
@@ -11760,6 +12073,14 @@ class SqliteEngravaCore:
         raw :meth:`update_thought`; that low-level path does not manage them, so
         prefer :meth:`restore_thought` / the hygiene and TTL flows.
 
+        **The write also bumps ``revision``, but does not enforce it.** Hygiene
+        must not be defeated by a caller holding a stale read — it archives
+        unconditionally (subject only to the predicate guard above, which is
+        about *protection*, not staleness) — but a caller's own token for this
+        row must not survive an archival it did not cause, since the row's
+        lifecycle just changed underneath it. Bumping (without checking)
+        ``revision`` achieves both at once.
+
         The mutation is recorded as an ordinary ``UPDATE_THOUGHT`` journal entry
         — **no new mutation type** — with the forgetting rationale nested in the
         delta under ``eviction_reason`` so the decision is reconstructable and
@@ -11850,7 +12171,8 @@ class SqliteEngravaCore:
                 update_params.append(inactivity_cutoff_iso)
             cursor = await self._db.execute(
                 "UPDATE thought SET lifecycle_status = ?, "  # noqa: S608 - interpolation is only ``?`` placeholders
-                "expires_at = NULL, archived_at_cycle = ?, archived_at = ? "
+                "expires_at = NULL, archived_at_cycle = ?, archived_at = ?, "
+                "revision = revision + 1 "
                 "WHERE thought_id = ? AND lifecycle_status IN (?, ?) AND pinned = 0"
                 + priority_guard
                 + inactivity_guard,
@@ -12343,7 +12665,11 @@ class SqliteEngravaCore:
         therefore permitted in **any** status, including a terminal
         ``CONFIRMED`` / ``FAILED`` action (verification legitimately advances
         while the status stays terminal). The transition is validated against the
-        record *this* call read, and the write carries no version guard. The
+        record *this* call read. On a real change the write carries a
+        ``revision`` guard exactly like :meth:`update_thought`'s: the row's
+        ``revision`` at the start of this call is checked and incremented
+        atomically by the same ``UPDATE``. A no-op (below) issues no ``UPDATE``
+        at all, so it cannot go stale. The
         read, the transition check, and the write share the same
         task-reentrant :attr:`_write_lock` critical section every other guarded
         write on this instance uses, so a competing move issued by
@@ -12394,21 +12720,26 @@ class SqliteEngravaCore:
             The stored action record (or, for a no-op, the unchanged record).
 
         Raises:
-            ActionNotFoundError: If the action does not exist; if the guarded
-                ``UPDATE`` matches no row (the row was deleted after the
-                initial read — including when a different row was then
-                recreated under the same ``action_id`` before the read-back
-                could run, which would otherwise be reported as though this
-                call had updated it); or if the row was deleted before the
-                read-back could confirm the write.
+            ActionNotFoundError: If the action does not exist at the initial
+                read.
+            StaleDataError: If a real change's guarded ``UPDATE`` matches no
+                row — another guarded write landed on this row since it was
+                read here (including a delete, and including a delete
+                followed by a different row recreated under the same
+                ``action_id`` before the read-back could run). Nothing of
+                this update is written when it is raised.
             InvalidTransitionError: If a real ``status`` change is illegal
                 per the action state machine.
+            WriteContentionError: The guarded write could not proceed because
+                the connection reported lock contention.
 
         """
         async with self._write_lock:
-            current = await self._get_action(action_id)
-            if current is None:
+            action_row = await self._get_action_row(action_id)
+            if action_row is None:
                 raise ActionNotFoundError(action_id)
+            current = _row_to_action(action_row)
+            expected_revision = int(action_row["revision"])
 
             status_changes = status is not None and status != current.status
             verification_changes = (
@@ -12440,12 +12771,22 @@ class SqliteEngravaCore:
                 columns["verification_status"] = updated.verification_status.value
 
             async with self._write_readback_savepoint("update_action_readback"):
-                cursor = await self._db.execute(
-                    _build_update_sql("action", columns, "action_id = ?"),
-                    (*columns.values(), action_id),
+                cursor = await self._execute_revision_guarded_write(
+                    _build_update_sql(
+                        "action",
+                        columns,
+                        "action_id = ? AND revision = ?",
+                        bump_column="revision",
+                    ),
+                    (*columns.values(), action_id, expected_revision),
+                    operation="update_action",
                 )
                 if cursor.rowcount == 0:
-                    raise ActionNotFoundError(action_id)
+                    raise StaleDataError(
+                        entity_type="ActionRecord",
+                        entity_id=action_id,
+                        expected_version=expected_revision,
+                    )
 
                 persisted = await self._read_back_action(action_id)
 
@@ -12510,9 +12851,27 @@ class SqliteEngravaCore:
             The action record, or ``None`` if not found.
 
         """
-        cursor = await self._db.execute("SELECT * FROM action WHERE action_id = ?", (action_id,))
-        row = await cursor.fetchone()
+        row = await self._get_action_row(action_id)
         return _row_to_action(row) if row is not None else None
+
+    async def _get_action_row(self, action_id: str) -> aiosqlite.Row | None:
+        """Fetch the raw ``action`` row by id, or ``None`` when absent.
+
+        The counterpart of :py:meth:`_get_thought_row` / :py:meth:`_get_edge_row`
+        for actions: :meth:`update_action` needs the raw ``revision`` column
+        for its guard, which :meth:`_get_action`'s mapped
+        :class:`~engrava.domain.models.action.ActionRecord` does not carry (it
+        is not a domain-model field — see :meth:`update_thought` for why).
+
+        Args:
+            action_id: UUID of the action.
+
+        Returns:
+            The raw row, or ``None`` if not found.
+
+        """
+        cursor = await self._db.execute("SELECT * FROM action WHERE action_id = ?", (action_id,))
+        return await cursor.fetchone()
 
     async def _recompute_action_outcome(self, thought_id: str) -> None:
         """Recompute and persist a thought's denormalised ``action_outcome_score``.
@@ -12658,8 +13017,14 @@ def _edge_to_core_columns(edge: EdgeRecord) -> dict[str, object]:
     }
 
 
-def _build_update_sql(table: str, columns: Iterable[str], guard: str) -> str:
-    """Compose an UPDATE that assigns exactly ``columns``.
+def _build_update_sql(
+    table: str,
+    columns: Iterable[str],
+    guard: str,
+    *,
+    bump_column: str | None = None,
+) -> str:
+    """Compose an UPDATE that assigns exactly ``columns``, optionally bumping a counter.
 
     Every update in the store writes a subset of its table's columns — the ones
     the operation owns — so the statement is shaped per call instead of being a
@@ -12671,12 +13036,22 @@ def _build_update_sql(table: str, columns: Iterable[str], guard: str) -> str:
         columns: Column names to assign, each bound to a ``?`` placeholder, in
             the order their values are passed.
         guard: The WHERE clause, its own placeholders included.
+        bump_column: When given, an additional ``{bump_column} = {bump_column}
+            + 1`` assignment is appended — a self-referential increment, not a
+            bound value, which is why it is a separate parameter rather than
+            one more entry in ``columns`` (which always binds a caller-supplied
+            value). Used for the ``revision`` guard: the row's own current
+            value is incremented in the same atomic statement that checks it,
+            never read-then-written as two steps.
 
     Returns:
         The composed UPDATE statement.
 
     """
     assignments = ", ".join(f"{name} = ?" for name in columns)
+    if bump_column is not None:
+        bump_assignment = f"{bump_column} = {bump_column} + 1"
+        assignments = f"{assignments}, {bump_assignment}" if assignments else bump_assignment
     return f"UPDATE {table} SET {assignments} WHERE {guard}"  # noqa: S608 -- table/columns/guard are internal literals; all values are bound
 
 

@@ -6,48 +6,62 @@ a *withheld* promise drifts just as quietly, because nothing fails when the docs
 keep claiming safety the code stopped providing. Every claim on that page that
 can be exercised in-process is pinned here, in both directions:
 
-* **Guarantees** — an edit writes only the columns it owns, so two edits to
-  different fields both survive; a confirmation bump is relative, so it survives
-  a second connection; and, as of the in-process task-reentrant write lock
-  (see ``TestInProcessCriticalSection`` below), the read, the validation, and the
-  write of ``update_thought`` / ``restore_thought`` / ``update_edge`` /
-  ``update_action`` are now one critical section **across genuinely concurrent
-  tasks** on this instance, and ``suspend_auto_commit()`` genuinely excludes
-  every other task's guarded write for its duration.
-* **Non-guarantees** — same-field edits still resolve last-write-wins (that is
-  the correct outcome for two genuine, independent edits — what changed is that
-  neither call's own read or write can now be corrupted by the other's), and a
-  same-*task* nested call reached through a caller-owned hook, not a second
-  ``asyncio`` task, is unaffected by a task-scoped lock: ``TestOneStoreManyTasks``
-  below (unchanged from before this stage) still uses the single-task
-  ``_interleave_once`` stand-in for exactly that residual shape. The edge/action
-  write paths still carry no version guard; a second *store* on the same
-  database file is still unordered outside the dedup window (stage 3, not this
-  one).
-* **The one exception (pre-existing)** — the content-hash dedup probe-and-insert
-  window (``create_thought(deduplicate=True)``, ``get_or_create``,
+* **Guarantees** — an edit writes only the columns it owns, so two *sequential*
+  edits to different fields both survive; a confirmation bump is relative, so
+  it survives a second connection; the in-process task-reentrant write lock
+  (see ``TestInProcessCriticalSection`` below) makes the read, the validation,
+  and the write of ``update_thought`` / ``restore_thought`` / ``update_edge`` /
+  ``update_action`` one critical section **across genuinely concurrent tasks**
+  on this instance; ``suspend_auto_commit()`` genuinely excludes every other
+  task's guarded write for its duration; and, as of the ``revision`` guard
+  (stage 3 — this module's newest layer), **every guarded update's row-version
+  check is enforced in the database itself**, so it now also catches a
+  competing write from a *different store on the same file* — including a
+  second process, per ``TestTwoStoresOneFile`` below — not only a different
+  task on this instance. ``update_edge`` and ``update_action`` carry this
+  guard for the first time; before this stage neither could ever raise a
+  staleness error.
+* **Non-guarantees** — same-field edits still resolve last-write-wins when
+  nothing else moved the row's ``revision`` in between (the correct outcome
+  for two genuine, sequential edits); and a same-*task* nested call reached
+  through a caller-owned hook, not a second ``asyncio`` task, is still
+  unaffected by the task-scoped write lock — but the ``revision`` guard now
+  catches it where the old ``updated_cycle`` guard could not, because
+  ``revision`` moves on *every* guarded write to a row, whatever field it
+  touched, with no caller action required to arm it. ``TestOneStoreManyTasks``
+  below still uses the single-task ``_interleave_once`` stand-in for that
+  same-task shape; what used to land silently (or land in a state the domain
+  model forbids) now raises ``StaleDataError`` before anything is written.
+* **The dedup probe-and-insert window (pre-existing, stage 1)** — the
+  content-hash window (``create_thought(deduplicate=True)``, ``get_or_create``,
   ``upsert_by_hash``) orders across a second store on the same file: it opens
   with ``BEGIN IMMEDIATE``, so a second store reaching the same window while it
   is open cannot even start its own transaction. It waits out ordinary
   contention and, only past a bounded number of retries, raises
-  ``WriteContentionError`` instead of racing the probe. Nothing else in this
-  module reaches across connections.
+  ``WriteContentionError`` instead of racing the probe. This is independent of
+  the ``revision`` guard — it orders the probe itself, not a later guarded
+  update.
 
-Two distinct interleaving techniques are used, deliberately kept apart:
+Three interleaving techniques are used, deliberately kept apart:
 
-* ``TestOneStoreManyTasks`` / ``TestEdgeAndActionUpdatesCarryNoVersionGuard`` /
+* ``TestOneStoreManyTasks`` / ``TestEdgeAndActionUpdatesCarryARevisionGuard`` /
   ``TestStateMachineChecksUseTheStateThisCallRead`` reuse the one-shot seam from
   ``test_partial_field_updates`` (``_interleave_once``) to run a competing
   operation **inline, on the same task**, at the exact point between an
   operation's read and its write. This is a same-task TOCTOU stand-in, not a
   second ``asyncio`` task — the write lock's task-reentrancy deliberately
   does not block it (that is what makes a write issued from inside the
-  caller's own ``suspend_auto_commit`` complete instead of deadlocking), so
-  these cases are unaffected and still document real, current behaviour.
+  caller's own ``suspend_auto_commit`` complete instead of deadlocking) — but
+  the ``revision`` guard now rejects it, where before this stage it could only
+  ever land (silently, or in a forbidden composite state).
 * ``TestInProcessCriticalSection`` and ``TestSuspendAutoCommitIsStoreWide`` use
   genuinely separate ``asyncio.Task`` objects, paused at a precise point via
   :class:`asyncio.Event` handshakes (never a sleep or a timeout) — these are the
   cases the task-reentrant write lock actually changes.
+* ``TestTwoStoresOneFile`` uses two independent store instances sharing one
+  database file to exercise the guard **across connections** — the shape a
+  second process has. This is the class this stage exists for: before it, a
+  second store's edit was lost with no error at all; now it is rejected.
 
 No test depends on wall-clock timing or on how the event loop happens to
 schedule beyond the FIFO ordering ``asyncio`` itself guarantees for
@@ -277,20 +291,20 @@ async def two_stores(
 class TestOneStoreManyTasks:
     """What sharing a single store between concurrent tasks does and does not buy."""
 
-    async def test_interleaved_edits_to_different_fields_both_survive(
+    async def test_interleaved_edits_to_different_fields_now_reject_the_second(
         self,
         store: SqliteEngravaCore,
         db: aiosqlite.Connection,
     ) -> None:
-        """Two edits that touch different columns do not overwrite each other.
+        """Different columns no longer save an interleaved edit from rejection.
 
-        The guarantee the docs state: an update writes only the columns the
-        operation gave a new value to, so a competing edit landing between this
-        one's read and its write is preserved as long as the two edits do not
-        name the same field. The guarantee has an exception, pinned by
-        ``test_a_competing_cycle_stamp_rejects_an_edit_to_a_different_field``
-        below: a competing writer who moves ``updated_cycle`` trips the version
-        guard and this update is rejected outright, different field or not.
+        Before the ``revision`` guard, an update writing only the columns it
+        owns meant a competing edit to a *different* field survived even when
+        interleaved this tightly. Now ``revision`` moves on **every** guarded
+        write, whatever field it touched, so this call's guard — captured
+        against the row it read, before the competing edit landed — no longer
+        matches. The whole update is rejected, not merged: even the essence
+        field this call owns is not written.
         """
         await store.create_thought(_thought())
         landed: list[str] = []
@@ -301,26 +315,29 @@ class TestOneStoreManyTasks:
 
         _interleave_once(store, "_get_thought_row", _competing_edit)
 
-        await store.update_thought("t-1", essence="mine")
+        with pytest.raises(StaleDataError):
+            await store.update_thought("t-1", essence="mine")
 
         # Precondition: the competing edit really reached storage first.
         assert landed == [Priority.P1.value]
         row = await _row(db, "t-1")
-        assert row["essence"] == "mine"
+        assert row["essence"] == "essence"
         assert row["priority"] == Priority.P1.value
 
-    async def test_interleaved_edits_to_one_field_keep_only_the_later_write(
+    async def test_interleaved_edits_to_one_field_now_reject_the_second(
         self,
         store: SqliteEngravaCore,
         db: aiosqlite.Connection,
     ) -> None:
-        """A competing edit to the same field is discarded, silently.
+        """A competing edit to the same field is caught, not silently discarded.
 
-        The non-guarantee. ``update_thought`` reads the row, evolves it in
-        memory, then writes — and aiosqlite serialises *statements*, not method
-        bodies, so a second task's whole update can land in that window. The
-        write that issues its UPDATE last wins and the other is gone, with no
-        error and nothing in the row to show it ever happened.
+        Before the ``revision`` guard, ``update_thought`` read the row, evolved
+        it in memory, then wrote — and aiosqlite serialises *statements*, not
+        method bodies, so a second task's whole update could land in that
+        window and simply be overwritten, with nothing in the row to show it
+        ever happened. Now the second call's guard no longer matches once the
+        first has bumped ``revision``, so it raises ``StaleDataError`` instead
+        of silently winning.
         """
         await store.create_thought(_thought())
         landed: list[str] = []
@@ -331,29 +348,29 @@ class TestOneStoreManyTasks:
 
         _interleave_once(store, "_get_thought_row", _competing_edit)
 
-        returned = await store.update_thought("t-1", essence="from this task")
+        with pytest.raises(StaleDataError):
+            await store.update_thought("t-1", essence="from this task")
 
         # Precondition: the competing edit really reached storage first, so the
-        # assertion below is about it being overwritten, not about it never
+        # assertion below is about it surviving unclobbered, not about it never
         # having happened.
         assert landed == ["from the other task"]
         row = await _row(db, "t-1")
-        assert row["essence"] == "from this task"
-        assert returned.essence == "from this task"
+        assert row["essence"] == "from the other task"
 
     async def test_a_competing_cycle_stamp_rejects_an_edit_to_a_different_field(
         self,
         store: SqliteEngravaCore,
         db: aiosqlite.Connection,
     ) -> None:
-        """The version guard is on every update, so it rejects unrelated edits too.
+        """The revision guard is on every update, so it rejects unrelated edits too.
 
-        This is the limit of the "different fields both survive" guarantee. The
-        competing writer here touches **only** ``updated_cycle``; this call
-        touches only ``essence``. They share no column — and the edit is still
-        rejected, because the guard is part of every update's ``WHERE`` clause,
-        not something that fires only when the two edits collide. Nothing of the
-        rejected update reaches storage.
+        This is one instance of the general rule pinned by the two tests
+        above: the competing writer here touches **only** ``updated_cycle``;
+        this call touches only ``essence``. They share no column — and the
+        edit is still rejected, because ``revision`` bumps on every guarded
+        write regardless of which columns it touches. Nothing of the rejected
+        update reaches storage.
         """
         await store.create_thought(_thought())
 
@@ -405,7 +422,7 @@ class TestOneStoreManyTasks:
         assert exc_info.value.entity_id == "t-1"
         assert exc_info.value.expected_version == 0
 
-    async def test_upsert_by_hash_overwrites_a_competing_edit_without_raising(
+    async def test_upsert_by_hash_now_raises_on_a_competing_edit(
         self,
         store: SqliteEngravaCore,
         db: aiosqlite.Connection,
@@ -414,8 +431,10 @@ class TestOneStoreManyTasks:
 
         ``upsert_by_hash`` documents ``StaleDataError`` for a row modified
         between its probe and its update. It inherits ``update_thought``'s
-        guard, so an ordinary competing edit passes straight through it: the
-        upsert's value overwrites the competing one and no error is raised.
+        guard, and that guard now enforces: the competing edit bumps
+        ``revision`` between the probe and the upsert's own guarded write, so
+        the upsert's write matches no row and raises — the competing edit's
+        value survives untouched rather than being silently overwritten.
         """
         await store.create_thought(_thought(content="shared content"))
         landed: list[str] = []
@@ -426,31 +445,33 @@ class TestOneStoreManyTasks:
 
         _interleave_once(store, "_get_thought_row", _competing_edit)
 
-        await store.upsert_by_hash(
-            _thought("t-unused", essence="from the upsert", content="shared content"),
-        )
+        with pytest.raises(StaleDataError):
+            await store.upsert_by_hash(
+                _thought("t-unused", essence="from the upsert", content="shared content"),
+            )
 
         # Precondition: the competing edit really reached storage first.
         assert landed == ["from the other task"]
         row = await _row(db, "t-1")
-        assert row["essence"] == "from the upsert"
+        assert row["essence"] == "from the other task"
         assert await _thought_ids(db) == ["t-1"]
 
 
-class TestEdgeAndActionUpdatesCarryNoVersionGuard:
-    """The other update paths have the window too, and not even the cycle guard."""
+class TestEdgeAndActionUpdatesCarryARevisionGuard:
+    """The other update paths now have the same guard update_thought does.
 
-    async def test_interleaved_edge_edits_to_one_field_keep_only_the_later_write(
+    Before this stage, ``update_edge`` and ``update_action`` were keyed on id
+    alone and could never raise a staleness error — a competing edit was
+    discarded with nothing that could ever have flagged it. They now carry the
+    same ``revision`` guard :class:`update_thought` does.
+    """
+
+    async def test_interleaved_edge_edits_to_one_field_now_reject_the_second(
         self,
         store: SqliteEngravaCore,
         db: aiosqlite.Connection,
     ) -> None:
-        """``update_edge`` is keyed on the id alone, so it cannot reject anything.
-
-        Thought updates at least carry an ``updated_cycle`` guard, narrow as it
-        is. The edge write path carries none, so a competing edit is discarded
-        with nothing that could ever have flagged it.
-        """
+        """``update_edge``'s guard rejects a competing edit instead of losing it."""
         await store.create_thought(_thought("t-1"))
         await store.create_thought(_thought("t-2", content="the other end"))
         await store.create_edge(_edge())
@@ -465,30 +486,43 @@ class TestEdgeAndActionUpdatesCarryNoVersionGuard:
 
         _interleave_once(store, "_get_edge_row", _competing_edit)
 
-        await store.update_edge("e-1", weight=0.1)
+        with pytest.raises(StaleDataError):
+            await store.update_edge("e-1", weight=0.1)
 
         # Precondition: the competing edit really reached storage first.
         assert landed == [0.9]
         cursor = await db.execute("SELECT weight FROM edge WHERE edge_id = 'e-1'")
         row = await cursor.fetchone()
         assert row is not None
-        assert row["weight"] == 0.1
+        assert row["weight"] == 0.9
 
 
 class TestStateMachineChecksUseTheStateThisCallRead:
-    """A lifecycle check that already passed is not re-checked against storage."""
+    """A lifecycle check that already passed is not re-checked against storage.
 
-    async def test_interleaved_lifecycle_moves_can_produce_a_forbidden_state(
+    Before the ``revision`` guard, two legal transitions read against a stale
+    snapshot could compose into a state the machine forbids — this class used
+    to demonstrate exactly that. Now the guarded write's ``revision`` check
+    catches the second call before its already-validated transition can land,
+    so the forbidden composite state can no longer be reached this way.
+    """
+
+    async def test_interleaved_lifecycle_moves_now_reject_before_landing(
         self,
         store: SqliteEngravaCore,
         db: aiosqlite.Connection,
     ) -> None:
-        """Two legal transitions compose into one the state machine forbids.
+        """The second, stale-validated write is rejected, not merely mis-validated.
 
-        ``update_thought`` validates the transition against the record *it*
-        read. A competing writer moving the row in between does not invalidate
-        that check, so ``ACTIVE -> DONE`` can land on a row that is already
-        ``ARCHIVED`` — and ``ARCHIVED -> DONE`` is not an allowed edge.
+        ``update_thought`` still validates the transition against the record
+        *it* read — a competing writer moving the row in between does not
+        invalidate that in-memory check. What is new is the guarded write
+        itself: ``ACTIVE -> DONE``, validated against the pre-interleave
+        ``ACTIVE`` snapshot, would have landed on a row already moved to
+        ``ARCHIVED`` (and ``ARCHIVED -> DONE`` is not an allowed edge) — but
+        the guarded ``UPDATE`` now matches no row, since ``revision`` moved
+        when the competing archive landed, so nothing is written and
+        ``StaleDataError`` is raised instead.
         """
         await store.create_thought(_thought())
         landed: list[str] = []
@@ -499,25 +533,29 @@ class TestStateMachineChecksUseTheStateThisCallRead:
 
         _interleave_once(store, "_get_thought_row", _competing_archive)
 
-        await store.update_thought("t-1", lifecycle_status=LifecycleStatus.DONE)
+        with pytest.raises(StaleDataError):
+            await store.update_thought("t-1", lifecycle_status=LifecycleStatus.DONE)
 
         # Precondition: the row really was ARCHIVED when the second write landed.
         assert landed == [LifecycleStatus.ARCHIVED.value]
         row = await _row(db, "t-1")
-        assert row["lifecycle_status"] == LifecycleStatus.DONE.value
-        # ...and that edge is not one the state machine would have allowed.
+        assert row["lifecycle_status"] == LifecycleStatus.ARCHIVED.value
+        # ...and that edge is not one the state machine would have allowed,
+        # which is exactly why the rejection matters here.
         assert not LifecycleStatus.ARCHIVED.can_transition_to(LifecycleStatus.DONE)
 
-    async def test_interleaved_action_moves_can_produce_a_forbidden_state(
+    async def test_interleaved_action_moves_now_reject_before_landing(
         self,
         store: SqliteEngravaCore,
         db: aiosqlite.Connection,
     ) -> None:
-        """The same hole in the action state machine.
+        """The same fix in the action state machine.
 
-        ``PLANNED -> BLOCKED`` is validated against the read state, so it lands
-        on a row another writer already moved to ``EXECUTING`` — and
-        ``EXECUTING -> BLOCKED`` is not an allowed edge.
+        ``PLANNED -> BLOCKED`` is validated against the read state, which
+        would have landed on a row another writer already moved to
+        ``EXECUTING`` (``EXECUTING -> BLOCKED`` is not an allowed edge) — but
+        ``update_action``'s own ``revision`` guard now rejects the write
+        first.
         """
         await store.create_thought(_thought())
         await store.create_action(_action())
@@ -530,17 +568,19 @@ class TestStateMachineChecksUseTheStateThisCallRead:
             assert row is not None
             landed.append(row["status"])
 
-        _interleave_once(store, "_get_action", _competing_start)
+        _interleave_once(store, "_get_action_row", _competing_start)
 
-        await store.update_action("a-1", status=ActionStatus.BLOCKED)
+        with pytest.raises(StaleDataError):
+            await store.update_action("a-1", status=ActionStatus.BLOCKED)
 
         # Precondition: the row really was EXECUTING when the second write landed.
         assert landed == [ActionStatus.EXECUTING.value]
         cursor = await db.execute("SELECT status FROM action WHERE action_id = 'a-1'")
         row = await cursor.fetchone()
         assert row is not None
-        assert row["status"] == ActionStatus.BLOCKED.value
-        # ...and that edge is not one the state machine would have allowed.
+        assert row["status"] == ActionStatus.EXECUTING.value
+        # ...and that edge is not one the state machine would have allowed,
+        # which is exactly why the rejection matters here.
         assert not ActionStatus.EXECUTING.can_transition_to(ActionStatus.BLOCKED)
 
 
@@ -1574,26 +1614,31 @@ class TestSuspendAutoCommitIsStoreWide:
 
 
 class TestTwoStoresOneFile:
-    """Nothing orders operations across stores — except the dedup probe window.
+    """The ``revision`` guard is the first thing in this module to order stores.
 
-    ``update_thought`` (below) still lets a second store's edit land unordered
-    with the first's, per the module docstring. The two dedup tests further
-    down are the module's one exception: they now demonstrate
-    ``BEGIN IMMEDIATE`` turning that same shape of race into a typed
-    ``WriteContentionError`` instead of a silent duplicate.
+    Before stage 3, nothing ordered a guarded update across stores except the
+    dedup probe window (the two tests further down): a lost update crossed
+    the connection boundary unchanged, silently, which is why multiple stores
+    writing one file stayed unsupported. The ``revision`` guard lives in the
+    database rather than in any in-process lock, so it is the first mechanism
+    in this module that reaches across connections for the ordinary
+    read-modify-write paths too — this class's first test is the direct
+    reproduction this stage exists to fix.
     """
 
-    async def test_an_edit_from_a_second_store_is_discarded_without_raising(
+    async def test_an_edit_from_a_second_store_is_now_caught_not_discarded(
         self,
         two_stores: tuple[SqliteEngravaCore, SqliteEngravaCore, aiosqlite.Connection],
     ) -> None:
-        """The lost update crosses the connection boundary unchanged.
+        """The lost update across the connection boundary is now a raised error.
 
-        Same window as the single-store case, but now the competing write comes
-        from a different connection — the shape a second process has. Between two
-        processes no in-process lock could close it even in principle, which is
-        why multiple stores writing one file is unsupported rather than merely
-        discouraged.
+        Same window as the single-store case, but the competing write comes
+        from a different connection — the shape a second process has. Before
+        the ``revision`` guard, no in-process lock could close this even in
+        principle; the guard closes it anyway, because it lives in the
+        database itself: store A's guarded write reads ``revision`` fresh at
+        write time and finds store B's committed bump, so it matches no row
+        and raises ``StaleDataError`` instead of silently overwriting.
         """
         store_a, store_b, conn_a = two_stores
         await store_a.create_thought(_thought())
@@ -1605,13 +1650,14 @@ class TestTwoStoresOneFile:
 
         _interleave_once(store_a, "_get_thought_row", _edit_from_the_second_store)
 
-        await store_a.update_thought("t-1", essence="from the first store")
+        with pytest.raises(StaleDataError):
+            await store_a.update_thought("t-1", essence="from the first store")
 
         # Precondition: the second store's edit really committed, and the first
         # store's connection could see it.
         assert landed == ["from the second store"]
         row = await _row(conn_a, "t-1")
-        assert row["essence"] == "from the first store"
+        assert row["essence"] == "from the second store"
 
     async def test_deduplication_across_stores_raises_instead_of_duplicating(
         self,

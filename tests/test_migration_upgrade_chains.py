@@ -1,6 +1,6 @@
 """Whole-ladder schema migration hardening for ``ensure_schema``.
 
-``ensure_schema`` migrates a database up to the head ``user_version`` (20)
+``ensure_schema`` migrates a database up to the head ``user_version`` (21)
 through an ordered migration registry plus a loop over a chain of per-version
 ``_migrate_core_v*`` helpers. Existing suites cover single rungs (the
 v13->v14 hot-path indexes and the v18->v19 edge metadata column); this module
@@ -11,11 +11,11 @@ undetected.
 Four properties are asserted:
 
 * **Exhaustive convergence.** For every seed version ``v`` in
-  ``{fresh, 2..19}`` a *real-shape* schema-at-``v`` fixture (the actual tables,
+  ``{fresh, 2..20}`` a *real-shape* schema-at-``v`` fixture (the actual tables,
   columns, indexes and FTS tokenizer that version shipped — reconstructed from
   the migration helpers and cross-checked against the historical
   ``schema_core.sql``) is stamped, pre-migration rows are written, and
-  ``ensure_schema`` must land at v20, be idempotent on a second run, and leave
+  ``ensure_schema`` must land at v21, be idempotent on a second run, and leave
   every pre-existing thought / edge / embedding queryable through the public
   read surface (get / list / FTS / hybrid). A post-migration API write must
   also succeed — the exact failure mode ("a missing column makes the first
@@ -70,7 +70,7 @@ from engrava.domain.exceptions import CoreMigrationError, SchemaVersionError
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-_HEAD_VERSION = 20
+_HEAD_VERSION = 21
 
 # The user (non-shadow) tables that exist at head v20, compared column-by-column
 # for fresh-vs-migrated parity. This list mirrors a source of truth (the tables a
@@ -128,6 +128,7 @@ _LEGACY_TERM = "beacon"
 #   v18 thought.pinned + thought.archived_at_cycle
 #   v19 edge.metadata_json
 #   v20 thought.archived_at
+#   v21 thought.revision / edge.revision / action.revision
 #
 # The base (v2/v3) tables predate the public git history; v2 differs from v3
 # only in the FTS tokenizer (v2 shipped the pre-hyphen-aware config that
@@ -163,30 +164,32 @@ def _thought_columns(target: int) -> list[str]:
         "consolidated_from TEXT",
         "visibility        TEXT    NOT NULL DEFAULT 'selective'",
     ]
-    if target >= 4:
-        cols += [
-            "access_count      INTEGER NOT NULL DEFAULT 0",
-            "last_accessed_at  TEXT",
-            "created_at        TEXT",
-            "updated_at        TEXT",
-        ]
-    if target >= 7:
-        cols.append("expires_at        TEXT")
-    if target >= 11:
-        cols.append("metadata_json     TEXT    NOT NULL DEFAULT '{}'")
-    if target >= 13:
-        cols += ["valid_from        TEXT", "valid_until       TEXT"]
-    if target >= 16:
-        cols.append("action_outcome_score REAL")
-    if target >= 17:
-        cols.append("provenance        TEXT")
-    if target >= 18:
-        cols += [
-            "pinned            INTEGER NOT NULL DEFAULT 0",
-            "archived_at_cycle INTEGER",
-        ]
-    if target >= 20:
-        cols.append("archived_at       TEXT")
+    # Every column from here on is purely additive and appended in
+    # introduction order -- a (min_version, definitions) table instead of one
+    # `if` per rung keeps this reconstruction from growing a branch per
+    # migration forever.
+    appended_since: tuple[tuple[int, tuple[str, ...]], ...] = (
+        (
+            4,
+            (
+                "access_count      INTEGER NOT NULL DEFAULT 0",
+                "last_accessed_at  TEXT",
+                "created_at        TEXT",
+                "updated_at        TEXT",
+            ),
+        ),
+        (7, ("expires_at        TEXT",)),
+        (11, ("metadata_json     TEXT    NOT NULL DEFAULT '{}'",)),
+        (13, ("valid_from        TEXT", "valid_until       TEXT")),
+        (16, ("action_outcome_score REAL",)),
+        (17, ("provenance        TEXT",)),
+        (18, ("pinned            INTEGER NOT NULL DEFAULT 0", "archived_at_cycle INTEGER")),
+        (20, ("archived_at       TEXT",)),
+        (21, ("revision          INTEGER NOT NULL DEFAULT 0",)),
+    )
+    for min_version, definitions in appended_since:
+        if target >= min_version:
+            cols.extend(definitions)
     return cols
 
 
@@ -211,6 +214,8 @@ def _edge_table(target: int) -> str:
         cols += ["valid_from        TEXT", "valid_until       TEXT"]
     if target >= 19:
         cols.append("metadata_json     TEXT NOT NULL DEFAULT '{}'")
+    if target >= 21:
+        cols.append("revision          INTEGER NOT NULL DEFAULT 0")
     cols.append("UNIQUE(from_thought_id, to_thought_id, edge_type)")
     if target >= 12:
         cols += [
@@ -247,6 +252,8 @@ def _action_table(target: int) -> str:
         "verification_status TEXT NOT NULL DEFAULT 'PENDING'",
         "raw_metrics_json    TEXT",
     ]
+    if target >= 21:
+        cols.append("revision             INTEGER NOT NULL DEFAULT 0")
     if target >= 12:
         cols.append(
             "FOREIGN KEY (source_thought_id) REFERENCES thought(thought_id) ON DELETE CASCADE"
@@ -703,7 +710,7 @@ async def _assert_api_roundtrip(store: SqliteEngravaCore) -> None:
 # 1. Exhaustive version-ladder convergence matrix
 # ---------------------------------------------------------------------------
 
-_LADDER_SEEDS: list[int | None] = [None, *range(2, 20)]
+_LADDER_SEEDS: list[int | None] = [None, *range(2, 21)]
 
 
 @pytest.mark.parametrize(
@@ -774,13 +781,13 @@ async def test_core_tables_list_matches_the_bootstrapped_schema() -> None:
 
 
 async def test_fresh_equals_migrated_from_v2() -> None:
-    """A fresh v20 database is structurally equivalent to one migrated from v2.
+    """A fresh v21 database is structurally equivalent to one migrated from v2.
 
     This walks the entire ladder (v2 rebuilds FTS, v11->v12 recreates the FK
     tables, v18->v19 adds the edge metadata column, v19->v20 adds the
-    thought.archived_at column) and asserts the end state matches a clean
-    bootstrap column-for-column, FK-for-FK, index-for-index, trigger-for-trigger,
-    and on the FTS config.
+    thought.archived_at column, v20->v21 adds the revision columns) and
+    asserts the end state matches a clean bootstrap column-for-column,
+    FK-for-FK, index-for-index, trigger-for-trigger, and on the FTS config.
     """
     fresh = await _new_fresh_db()
     migrated = await _new_migrated_db(2, seed=True)
@@ -794,7 +801,7 @@ async def test_fresh_equals_migrated_from_v2() -> None:
         await migrated.close()
 
 
-@pytest.mark.parametrize("seed_version", list(range(2, 20)))
+@pytest.mark.parametrize("seed_version", list(range(2, 21)))
 async def test_fresh_equals_migrated_every_seed(seed_version: int) -> None:
     """Parity holds for every seed version, not just v2.
 
@@ -813,7 +820,7 @@ async def test_fresh_equals_migrated_every_seed(seed_version: int) -> None:
         await migrated.close()
 
 
-@pytest.mark.parametrize("seed_version", list(range(12, 20)))
+@pytest.mark.parametrize("seed_version", list(range(12, 21)))
 async def test_fresh_equals_migrated_strict_column_order_public_range(seed_version: int) -> None:
     """Full cid-order column parity holds across the public (v12+) range.
 
@@ -887,11 +894,11 @@ async def test_parity_check_detects_default_drift(
 async def test_migration_registry_is_contiguous_and_ordered(
     fresh_db: aiosqlite.Connection,
 ) -> None:
-    """The registry is the single source of upgrade order: contiguous 3..20.
+    """The registry is the single source of upgrade order: contiguous 3..21.
 
     Every entry's target version is strictly greater than the previous one and
     the sequence is gap-free from the first post-bootstrap step (``v2 -> v3``)
-    to head (``v19 -> v20``), so the loop applies exactly the right tail for any
+    to head (``v20 -> v21``), so the loop applies exactly the right tail for any
     starting version and a future migration is one appended entry.
     """
     store = SqliteEngravaCore(fresh_db)
@@ -1080,6 +1087,70 @@ async def test_postcondition_failure_raises_and_leaves_version_retryable(
         await _assert_api_roundtrip(store)
     finally:
         await conn.close()
+
+
+async def test_v20_to_v21_partial_application_is_safe_to_retry(
+    fresh_db: aiosqlite.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The new ``revision`` rung: a step that raises partway can be re-run.
+
+    ``_migrate_core_v20_to_v21`` adds ``revision`` to ``thought``, then
+    ``edge``, then ``action``, each via ``_add_column_if_absent``. Injecting a
+    failure right after the ``thought`` column lands (but before ``edge`` or
+    ``action`` are touched) simulates a real interrupt mid-step: this
+    demonstrates -- rather than merely asserts -- that ``user_version`` stays
+    at 20 (the postcondition-before-stamp invariant), that the partially
+    applied column survives, and that a plain re-run (the idempotent
+    duplicate-column guard) completes the remaining two columns and reaches
+    head without redoing or losing anything.
+    """
+    await _bootstrap_core_at_version(fresh_db, 20)
+    await _seed_legacy_rows(fresh_db)
+    store = SqliteEngravaCore(fresh_db)
+
+    original_add_column = SqliteEngravaCore._add_column_if_absent
+    calls: list[str] = []
+
+    async def _boom_after_thought(
+        self: SqliteEngravaCore, table: str, column: str, column_type: str
+    ) -> None:
+        await original_add_column(self, table, column, column_type)
+        calls.append(table)
+        if table == "thought":
+            message = "injected mid-migration failure after the thought column"
+            raise RuntimeError(message)
+
+    monkeypatch.setattr(SqliteEngravaCore, "_add_column_if_absent", _boom_after_thought)
+    with pytest.raises(RuntimeError, match="injected mid-migration failure"):
+        await store.ensure_schema()
+
+    # The step raised before returning, so the loop never reached the stamp:
+    # the version is still 20, not 21 -- even though thought.revision itself
+    # already exists on disk.
+    assert await _user_version(fresh_db) == 20
+    assert calls == ["thought"]
+
+    cursor = await fresh_db.execute("PRAGMA table_info(thought)")
+    thought_column_names = {row["name"] for row in await cursor.fetchall()}
+    assert "revision" in thought_column_names
+    cursor = await fresh_db.execute("PRAGMA table_info(edge)")
+    edge_column_names = {row["name"] for row in await cursor.fetchall()}
+    assert "revision" not in edge_column_names
+    cursor = await fresh_db.execute("PRAGMA table_info(action)")
+    action_column_names = {row["name"] for row in await cursor.fetchall()}
+    assert "revision" not in action_column_names
+
+    # Retry: the thought column is idempotently skipped (already present), and
+    # edge + action pick up where the interrupted step left off.
+    monkeypatch.undo()
+    await store.ensure_schema()
+    assert await _user_version(fresh_db) == _HEAD_VERSION
+    for table in ("thought", "edge", "action"):
+        cursor = await fresh_db.execute(f"PRAGMA table_info({table})")
+        assert "revision" in {row["name"] for row in await cursor.fetchall()}
+    await _assert_legacy_rows_survive(store)
+    await _assert_api_roundtrip(store)
 
 
 # ---------------------------------------------------------------------------
@@ -1358,7 +1429,7 @@ def test_quoted_tokens_cannot_open_a_comment(open_quote: str, close_quote: str) 
         f"CREATE TABLE {opener}(x);\n"
         "PRAGMA user_version = 19;\n"
         f"CREATE TABLE {closer}(x);\n"
-        "PRAGMA user_version = 20;\n"
+        f"PRAGMA user_version = {_HEAD_VERSION};\n"
     )
 
     assert _count_user_version_mentions(fragments) == 2
@@ -1413,7 +1484,7 @@ def test_a_quoted_semicolon_cannot_forge_a_statement_boundary(
     """
     quoted = f"{open_quote}a;b{close_quote}"
     fragments = _sql_fragments(
-        f"CREATE TABLE t (c TEXT DEFAULT {quoted});\nPRAGMA user_version = 20;"
+        f"CREATE TABLE t (c TEXT DEFAULT {quoted});\nPRAGMA user_version = {_HEAD_VERSION};"
     )
 
     assert len(fragments) == 2
@@ -1621,6 +1692,37 @@ async def test_has_any_core_table_distinguishes_empty_tables_from_real_rows(
     await fresh_db.execute("INSERT INTO thought (thought_id) VALUES ('legacy-1')")
     await fresh_db.commit()
     assert await store._has_any_core_table() is True
+
+
+async def test_populated_sub_floor_database_under_a_different_case_still_refuses(
+    fresh_db: aiosqlite.Connection,
+) -> None:
+    """A core table under a different case is still found and still refuses.
+
+    SQLite resolves table identifiers case-insensitively -- ``CREATE TABLE IF
+    NOT EXISTS thought`` matches an existing ``THOUGHT`` just as ``SELECT ...
+    FROM thought`` reads its rows -- so the ``sqlite_master.name`` lookup
+    ``_has_any_core_table`` and ``_table_exists`` use has to match the same
+    way, or a real, populated legacy table stored under a case variant would
+    be invisible to the check and the database would be bootstrapped as
+    though it were empty.
+    """
+    await fresh_db.execute("CREATE TABLE THOUGHT (thought_id TEXT PRIMARY KEY, essence TEXT)")
+    await fresh_db.execute(
+        "INSERT INTO THOUGHT (thought_id, essence) VALUES ('legacy-1', 'predates the ladder')"
+    )
+    await fresh_db.commit()
+    assert await _user_version(fresh_db) == 0
+
+    store = SqliteEngravaCore(fresh_db)
+    assert await store._has_any_core_table() is True
+
+    with pytest.raises(SchemaVersionError) as exc_info:
+        await store.ensure_schema()
+
+    assert exc_info.value.reason == "populated_sub_floor"
+    assert exc_info.value.current_version == 0
+    assert await _user_version(fresh_db) == 0, "a refusal must not stamp any version"
 
 
 async def test_newer_than_head_database_refuses_to_open(

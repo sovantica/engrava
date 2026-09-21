@@ -39,6 +39,7 @@ from engrava import (
     LifecycleStatus,
     Priority,
     SqliteEngravaCore,
+    StaleDataError,
     ThoughtNotFoundError,
     ThoughtRecord,
     ThoughtType,
@@ -243,7 +244,7 @@ class TestUpdateThoughtBlastRadius:
 
         await store.update_thought("t-1", essence="new essence")
 
-        assert _set_columns(statements, "thought") == {"essence", "updated_at"}
+        assert _set_columns(statements, "thought") == {"essence", "updated_at", "revision"}
 
     async def test_concurrent_access_telemetry_survives_an_update(
         self,
@@ -318,7 +319,13 @@ class TestUpdateThoughtBlastRadius:
 
         after = dict(await _row(db, "thought", "thought_id", "t-1"))
         changed = {key for key in before if before[key] != after[key]}
-        assert changed == {"essence", "updated_at", "access_count", "last_accessed_at"}
+        assert changed == {
+            "essence",
+            "updated_at",
+            "access_count",
+            "last_accessed_at",
+            "revision",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +654,7 @@ class TestUpdateEdge:
 
         await store.update_edge("e-1", weight=0.9)
 
-        assert _set_columns(statements, "edge") == {"weight"}
+        assert _set_columns(statements, "edge") == {"weight", "revision"}
 
     async def test_concurrent_weight_change_survives_an_update(
         self,
@@ -688,7 +695,7 @@ class TestUpdateEdge:
 
         after = dict(await _row(db, "edge", "edge_id", "e-1"))
         changed = {key for key in before if before[key] != after[key]}
-        assert changed == {"decay_multiplier", "weight"}
+        assert changed == {"decay_multiplier", "weight", "revision"}
 
     async def test_journal_after_image_reflects_the_concurrent_write(
         self,
@@ -775,7 +782,13 @@ class TestUpdateEdge:
         self,
         store: SqliteEngravaCore,
     ) -> None:
-        """An edge deleted between the read and the write is not reported as updated."""
+        """An edge deleted between the read and the write is not reported as updated.
+
+        The guarded ``UPDATE`` matches no row (the row is gone), which is
+        exactly what ``StaleDataError`` means now that the write carries a
+        ``revision`` guard — see ``update_thought`` for why this error does
+        not distinguish "moved" from "gone".
+        """
         await self._seed(store)
 
         async def _delete() -> None:
@@ -783,7 +796,7 @@ class TestUpdateEdge:
 
         _interleave_once(store, "_get_edge_row", _delete)
 
-        with pytest.raises(ValueError, match="Edge not found"):
+        with pytest.raises(StaleDataError):
             await store.update_edge("e-1", weight=0.9)
 
     async def test_update_of_an_edge_deleted_after_the_write_raises(
@@ -826,7 +839,7 @@ class TestUpdateAction:
 
         await store.update_action("a-1", status=ActionStatus.EXECUTING)
 
-        assert _set_columns(statements, "action") == {"status"}
+        assert _set_columns(statements, "action") == {"status", "revision"}
 
     async def test_concurrent_verification_change_survives_a_status_update(
         self,
@@ -842,7 +855,7 @@ class TestUpdateAction:
                 (VerificationStatus.PARTIAL.value, "a-1"),
             )
 
-        _interleave_once(store, "_get_action", _verify)
+        _interleave_once(store, "_get_action_row", _verify)
 
         returned = await store.update_action("a-1", status=ActionStatus.EXECUTING)
 
@@ -867,13 +880,13 @@ class TestUpdateAction:
                 (VerificationStatus.PARTIAL.value, "a-1"),
             )
 
-        _interleave_once(store, "_get_action", _verify)
+        _interleave_once(store, "_get_action_row", _verify)
 
         await store.update_action("a-1", status=ActionStatus.EXECUTING)
 
         after = dict(await _row(db, "action", "action_id", "a-1"))
         changed = {key for key in before if before[key] != after[key]}
-        assert changed == {"status", "verification_status"}
+        assert changed == {"status", "verification_status", "revision"}
 
     async def test_journal_after_image_reflects_the_concurrent_write(
         self,
@@ -889,7 +902,7 @@ class TestUpdateAction:
                 (VerificationStatus.PARTIAL.value, "a-1"),
             )
 
-        _interleave_once(journaling_store, "_get_action", _verify)
+        _interleave_once(journaling_store, "_get_action_row", _verify)
 
         await journaling_store.update_action("a-1", status=ActionStatus.EXECUTING)
 
@@ -909,15 +922,22 @@ class TestUpdateAction:
         self,
         store: SqliteEngravaCore,
     ) -> None:
-        """An action deleted between the read and the write is not reported as updated."""
+        """An action deleted between the read and the write is not reported as updated.
+
+        The guarded ``UPDATE`` matches no row (the row is gone), which is
+        exactly what ``StaleDataError`` means now that the write carries a
+        ``revision`` guard — see ``update_thought`` for why this error does
+        not distinguish "moved" from "gone". ``ActionNotFoundError`` remains
+        what the *initial* read raises, before any guarded write is attempted.
+        """
         await self._seed(store)
 
         async def _delete() -> None:
             await store._db.execute("DELETE FROM action WHERE action_id = ?", ("a-1",))
 
-        _interleave_once(store, "_get_action", _delete)
+        _interleave_once(store, "_get_action_row", _delete)
 
-        with pytest.raises(ActionNotFoundError):
+        with pytest.raises(StaleDataError):
             await store.update_action("a-1", status=ActionStatus.EXECUTING)
 
     async def test_update_of_an_action_deleted_after_the_write_raises(
@@ -961,8 +981,10 @@ class TestColumnMapsMatchTheSchema:
         # excluded because no update has ever written it — a known defect (an
         # edit to ``content`` leaves the stored hash pointing at the old text),
         # preserved here deliberately rather than sanctioned: changing it moves
-        # deduplication behaviour and belongs to its own change.
-        excluded = {"thought_id", "content_hash"}
+        # deduplication behaviour and belongs to its own change. ``revision``
+        # is excluded because it is engine-bumped (``revision = revision + 1``
+        # in the guarded ``UPDATE`` itself), never a caller-supplied value.
+        excluded = {"thought_id", "content_hash", "revision"}
         assert mapped | excluded == await self._table_columns(db, "thought")
         assert not mapped & excluded
 
@@ -974,8 +996,9 @@ class TestColumnMapsMatchTheSchema:
         from engrava.infrastructure.sqlite.engrava_core import _edge_to_core_columns
 
         mapped = set(_edge_to_core_columns(_edge()))
-        # ``edge_id`` identifies the row being updated.
-        excluded = {"edge_id"}
+        # ``edge_id`` identifies the row being updated. ``revision`` is
+        # excluded because it is engine-bumped, never a caller-supplied value.
+        excluded = {"edge_id", "revision"}
         assert mapped | excluded == await self._table_columns(db, "edge")
         assert not mapped & excluded
 
