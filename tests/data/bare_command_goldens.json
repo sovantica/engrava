@@ -6,7 +6,7 @@
       "info"
     ],
     "exit_code": 0,
-    "output": "Database: WORKDIR/populated.db\nMetrics schema version: 2 (database schema version: 20)\nThoughts: 2 ({'OBSERVATION': 2})\nEdges: 1 ({'ASSOCIATED': 1})\nStorage: 180224 bytes\nSearch latency: n=0 p50=0.0ms p95=0.0ms p99=0.0ms\n"
+    "output": "Database: WORKDIR/populated.db\nMetrics schema version: 2 (database schema version: 21)\nThoughts: 2 ({'OBSERVATION': 2})\nEdges: 1 ({'ASSOCIATED': 1})\nStorage: 180224 bytes\nSearch latency: n=0 p50=0.0ms p95=0.0ms p99=0.0ms\n"
   },
   {
     "args": [
@@ -17,7 +17,7 @@
       "info"
     ],
     "exit_code": 0,
-    "output": "{\n  \"db_path\": \"WORKDIR/populated.db\",\n  \"metrics_schema_version\": 2,\n  \"database_schema_version\": 20,\n  \"snapshot_timestamp\": 0.0,\n  \"thoughts\": {\n    \"by_type\": {\n      \"OBSERVATION\": 2\n    },\n    \"by_status\": {\n      \"ACTIVE\": 2\n    },\n    \"total\": 2\n  },\n  \"edges\": {\n    \"by_type\": {\n      \"ASSOCIATED\": 1\n    },\n    \"total\": 1\n  },\n  \"storage\": {\n    \"db_bytes\": 180224,\n    \"wal_bytes\": 0,\n    \"vec_index_bytes\": 0,\n    \"total_bytes\": 180224\n  },\n  \"search_latency\": {\n    \"sample_count\": 0,\n    \"p50_ms\": 0.0,\n    \"p95_ms\": 0.0,\n    \"p99_ms\": 0.0,\n    \"min_ms\": 0.0,\n    \"max_ms\": 0.0,\n    \"mean_ms\": 0.0\n  },\n  \"measured\": true\n}\n"
+    "output": "{\n  \"db_path\": \"WORKDIR/populated.db\",\n  \"metrics_schema_version\": 2,\n  \"database_schema_version\": 21,\n  \"snapshot_timestamp\": 0.0,\n  \"thoughts\": {\n    \"by_type\": {\n      \"OBSERVATION\": 2\n    },\n    \"by_status\": {\n      \"ACTIVE\": 2\n    },\n    \"total\": 2\n  },\n  \"edges\": {\n    \"by_type\": {\n      \"ASSOCIATED\": 1\n    },\n    \"total\": 1\n  },\n  \"storage\": {\n    \"db_bytes\": 180224,\n    \"wal_bytes\": 0,\n    \"vec_index_bytes\": 0,\n    \"total_bytes\": 180224\n  },\n  \"search_latency\": {\n    \"sample_count\": 0,\n    \"p50_ms\": 0.0,\n    \"p95_ms\": 0.0,\n    \"p99_ms\": 0.0,\n    \"min_ms\": 0.0,\n    \"max_ms\": 0.0,\n    \"mean_ms\": 0.0\n  },\n  \"measured\": true\n}\n"
   },
   {
     "args": [
