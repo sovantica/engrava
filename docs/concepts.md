@@ -12,6 +12,11 @@ more sense.
 
 ```
                  ┌──────────────────────────────────────────┐
+   REFLECTION    │  cluster summary of related thoughts      │  (higher-order, system-made)
+                 └───────────────┬──────────────────────────┘
+                                 │ CONSOLIDATED_FROM  (created by dreaming)
+                                 │ (the edge points from the reflection to its member)
+                 ┌───────────────▼──────────────────────────┐
    OBSERVATION   │  "User prefers email over phone"         │  essence (prompt-facing)
    (a thought)   │  content: "Stated during onboarding..."  │  content (full text)
                  │  priority P2 · lifecycle ACTIVE           │
@@ -19,10 +24,6 @@ more sense.
                                  │ ASSOCIATED  (an edge: typed, weighted)
                  ┌───────────────▼──────────────────────────┐
    BELIEF        │  "This user is low-touch"                 │
-                 └───────────────┬──────────────────────────┘
-                                 │ CONSOLIDATED_FROM  (created by dreaming)
-                 ┌───────────────▼──────────────────────────┐
-   REFLECTION    │  cluster summary of related thoughts      │  (higher-order, system-made)
                  └──────────────────────────────────────────┘
 ```
 
