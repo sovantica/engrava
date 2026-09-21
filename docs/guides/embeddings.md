@@ -401,7 +401,7 @@ A few rules make this safe to adopt incrementally:
   not passed to it.
 - **Changing `document_prefix` requires a deliberate re-embed.** The document prefix
   is part of the corpus identity: change it and every stored vector would change.
-  Turning it on (or changing it) on a store that already holds vectors raises
+  Turning it on, changing it, or turning it off on a store that already holds vectors raises
   `EmbeddingModelMismatchError` — Engrava never silently re-embeds. Re-embed on
   purpose by restoring a snapshot with `--re-embed` and `--config` (which applies
   the top-level provider in direct mode, or a per-service override before the
