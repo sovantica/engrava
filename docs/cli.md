@@ -755,7 +755,7 @@ indented JSON document and can be filtered by lifecycle status.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `-o`, `--output` | path | `<db>.export.json` (derived) | Output JSON file path. |
+| `-o`, `--output` | path | `<db-stem>.export.json` (derived) | Output JSON file path. Written next to the database with the `.db` suffix replaced, e.g. `--db engrava.db` → `engrava.export.json`. |
 | `--status` | lifecycle status | all | Only export thoughts with this `lifecycle_status` (e.g. `ACTIVE`). |
 
 ```bash
