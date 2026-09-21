@@ -279,9 +279,12 @@ Resolution is deliberately simple, and an explicit argument always wins:
 2. Otherwise, if a provider is configured, its value is pulled **and validated**
    — it must be a real, non-negative `int` (a `bool` is rejected). An invalid
    value raises `CycleProviderError`.
-3. Otherwise the cycle stays `None` — exactly today's behaviour (recency off, no
-   age-gating). **No provider configured = unchanged**: a store built without one
-   behaves byte-for-byte as before.
+3. Otherwise the cycle stays `None`. `search_hybrid` then applies no cycle
+   (recency off, no age-gating). `consolidate()` and `run_hygiene()` are the
+   exception: their age-gating needs a cycle, so once a real pass is about to run
+   they raise `ValueError` rather than invent a default. (A disabled hygiene policy
+   is a no-op that needs no cycle.) Pass `current_cycle=...` or configure a
+   provider for those two.
 
 > **Read-time only.** The provider feeds ranking and eligibility; it **never**
 > stamps `created_cycle` / `updated_cycle` on writes. Write-side cycles stay your
