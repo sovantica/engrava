@@ -42,6 +42,9 @@ Or when constructing the store directly:
 import aiosqlite
 from engrava import SqliteEngravaCore
 
+# Abbreviated for brevity: a bare async-with here can let a close failure
+# mask a real error. See "Graceful shutdown" in deployment.md for the safe
+# explicit-close shape.
 async with aiosqlite.connect("engrava.db") as conn:
     conn.row_factory = aiosqlite.Row
     store = SqliteEngravaCore(conn, journal_enabled=True)
@@ -301,6 +304,7 @@ one-time cost to every open. For periodic rather than on-open checking, call
 
 ```python
 import aiosqlite
+import sys
 import uuid
 from engrava import (
     SqliteEngravaCore,
@@ -310,7 +314,24 @@ from engrava import (
     LifecycleStatus,
 )
 
-async with aiosqlite.connect(":memory:") as conn:
+
+async def _close_quietly(conn: aiosqlite.Connection) -> None:
+    """Close *conn*, reporting rather than raising if the close itself fails.
+
+    ``aiosqlite.Connection.__aexit__`` is an unconditional ``await
+    close()``, so a bare ``async with aiosqlite.connect(...)`` would let a
+    close failure here replace whatever the block above actually raised.
+    Used only from the exception path below -- the ordinary success-path
+    close still propagates a genuine failure normally.
+    """
+    try:
+        await conn.close()
+    except Exception as exc:  # noqa: BLE001 - deliberately broad: never replace the real error
+        print(f"warning: failed to close the database connection: {exc}", file=sys.stderr)
+
+
+conn = await aiosqlite.connect(":memory:")
+try:
     conn.row_factory = aiosqlite.Row
     store = SqliteEngravaCore(conn, journal_enabled=True)
     await store.ensure_schema()
@@ -336,6 +357,11 @@ async with aiosqlite.connect(":memory:") as conn:
     # The chain verifies.
     result = await store.journal.verify_integrity()
     assert result.valid and result.entries_checked == 2
+except BaseException:
+    await _close_quietly(conn)
+    raise
+else:
+    await conn.close()
 ```
 
 ## Security model & guarantees

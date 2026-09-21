@@ -127,11 +127,27 @@ only closes a connection it **owns**:
   conn = await aiosqlite.connect("engrava.db")
   conn.row_factory = aiosqlite.Row
   store = SqliteEngravaCore(conn)
-  ...
-  await conn.close()  # the caller owns and closes the connection
+  try:
+      ...
+  except BaseException:
+      # A failure above is what the caller needs to see; a close failure in
+      # this cleanup is secondary, so it is reported rather than allowed to
+      # replace it.
+      try:
+          await conn.close()
+      except Exception as exc:  # noqa: BLE001 - never replace the real error
+          print(f"warning: failed to close the database connection: {exc}")
+      raise
+  else:
+      await conn.close()  # the caller owns and closes the connection
   ```
 
-  (Using `async with aiosqlite.connect(...) as conn:` handles this for you.)
+  A bare `async with aiosqlite.connect(...) as conn:` looks like a shortcut
+  for this, but `aiosqlite.Connection.__aexit__` is an unconditional `await
+  close()` — if the block above raised, a close failure there replaces the
+  real error instead of the caller ever seeing it. Use the explicit
+  `try`/`except`/`else` shape above whenever a close failure must never hide
+  the original one.
 
 Wire whichever applies into your framework's shutdown hook (e.g. FastAPI
 `lifespan`, a signal handler) so an interrupted process still closes cleanly.

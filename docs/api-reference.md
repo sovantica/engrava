@@ -16,6 +16,9 @@ config-driven, one-call setup that opens and owns the connection, use the
 import aiosqlite
 from engrava import SqliteEngravaCore
 
+# Abbreviated for brevity: a bare async-with here can let a close failure
+# mask a real error. See "Graceful shutdown" in deployment.md for the safe
+# explicit-close shape.
 async with aiosqlite.connect(":memory:") as conn:
     conn.row_factory = aiosqlite.Row
     store = SqliteEngravaCore(conn)

@@ -356,6 +356,113 @@ class ExemptionReason(Enum):
     DUPLICATE_KEY_ALTERNATE_FORMS = "duplicate-key-alternate-forms"
 
 
+class CompileOnlyReason(Enum):
+    """Closed vocabulary for why a compile-only ``python`` documentation block is not
+    executed or behaviour-asserted.
+
+    Not every member names something that genuinely *cannot* be executed --
+    ``NO_ASSERTABLE_CLAIM``'s own definition says the block would run cleanly exactly
+    as written, and ``HARNESS_SHAPE_MISMATCH`` names a limitation of the execute-layer
+    harness, not a property of the example. "Not executed" is the accurate claim; "can
+    never be executed" is not, and members should not be extended on the assumption
+    that it is.
+
+    Mirrors :class:`ExemptionReason` for the ``python`` fence's own, larger, previously
+    unclassified tier: the 122 blocks in ``COMPILE_ONLY`` (see
+    ``test_docs_examples_coverage.py``) used to carry 113 distinct free-text reasons --
+    122 against 113 is nine duplicate uses, not a one-sentence-per-nine-blocks ratio --
+    so nobody could count how many blocks were exempt for which cause, or notice one
+    cause quietly growing. Every ``COMPILE_ONLY``
+    entry now cites exactly one of these members in addition to its free-text note; the
+    note may still say something the member cannot (which exact API, which specific
+    test mirrors it) -- the member is what gets counted, the note is what gets read.
+
+    Extend this enum deliberately when a genuinely new reason a block is not executed
+    or behaviour-asserted appears -- never by grepping the old free-text sentence for
+    a keyword.
+    """
+
+    #: A plain, default-configured store or connection is the block's only obstacle,
+    #: and literal arguments (a string, an int, a default-valued keyword) cover
+    #: everything else it needs. Concretely: building
+    #: ``aiosqlite.connect(":memory:")`` with ``row_factory = aiosqlite.Row``, wrapping
+    #: it in a bare ``SqliteEngravaCore(conn)``, and calling ``ensure_schema()`` -- with
+    #: no extra constructor keyword, no wrapper class, and no other collaborator --
+    #: reproduces everything the block's own undefined names need. A bare fragment
+    #: that calls straight into ``store``/``conn`` (``await store.recall(...)``), or a
+    #: helper function that takes one as its only out-of-the-ordinary parameter (its
+    #: other parameters, if any, being plain literals such as a query string or a
+    #: cycle number) and is never invoked in the block, both qualify. A block needing
+    #: a *differently built* store (extra constructor keywords, a wrapper class) or
+    #: any non-literal collaborator does not -- see ``REQUIRES_SPECIALLY_CONFIGURED_STORE``
+    #: and ``UNDEFINED_DOMAIN_VALUE`` respectively.
+    ASSUMES_STORE_OR_CONNECTION = "assumes-store-or-connection"
+
+    #: The block needs more than a plain store/connection: an undefined value or
+    #: callable standing in for domain-specific data a generic fixture cannot
+    #: manufacture as a literal -- a specific id (``src_id``, ``some_thought_id``), a
+    #: record or collection of records (``fact``, ``transient_thought``, the
+    #: ``items``/``first``/``second``/``link`` arguments of a helper that builds or
+    #: links them), a vector (``embedding``), a caller-supplied callback
+    #: (``my_embed_fn``, ``my_llm``), a loop-control flag (``running``), a name only
+    #: defined or imported in a sibling block on the same page (``observation``,
+    #: ``RecencyBoostHooks``, ``RECENT_COMMAND``, an unimported ``ThoughtRecord``), or a
+    #: second collaborator beyond the store itself (a caller-owned lock, an embedding
+    #: provider instance).
+    UNDEFINED_DOMAIN_VALUE = "undefined-domain-value"
+
+    #: The block needs a store built differently from the plain default -- an extra
+    #: constructor keyword that changes what the store can do (``journal_enabled=True``
+    #: before ``store.journal`` is usable), or the store wrapped in a class that changes
+    #: its behaviour (``ReadOnlyEngrava(store)`` before a write raises
+    #: ``ReadOnlyViolationError``, which is the block's whole point). A plain
+    #: ``SqliteEngravaCore(conn)`` with schema applied does not exhibit what the block
+    #: demonstrates; a differently-configured one would.
+    REQUIRES_SPECIALLY_CONFIGURED_STORE = "requires-specially-configured-store"
+
+    #: The block's entire content is a definition -- a class, a ``Protocol``, a
+    #: subclass, a bare method/function signature stub (body is ``...``), or a
+    #: plugin/extension object -- never invoked or asserted within the block, so no
+    #: collaborator would make it prove anything by itself.
+    DEFINITION_ONLY = "definition-only"
+
+    #: The block's own point is bound to a real on-disk path in a way a disposable,
+    #: single-process fixture cannot cheaply substitute for -- not necessarily because
+    #: the file must already exist (a fresh ``connect("engrava.db")`` call creates its
+    #: own file just fine; that alone is not this reason). Concretely: an
+    #: ``engrava.yaml`` config file ``from_config`` must read with real content, a data
+    #: directory ``EngravaManager`` manages across several stores, on-disk migration
+    #: SQL files referenced by a package-relative path, a corrupted on-disk journal to
+    #: exercise a startup failure, or an example whose claim is that a named ``.db``
+    #: file's data survives **across separate process invocations** -- a property one
+    #: subprocess run cannot demonstrate no matter how cheaply it creates the file.
+    REQUIRES_ON_DISK_ARTIFACT = "requires-on-disk-artifact"
+
+    #: The block needs a live external system a test cannot cheaply fake: real model
+    #: weights (``SentenceTransformerProvider``), a real network endpoint and API key
+    #: (``OpenAICompatibleProvider``, ``HuggingFaceProvider``), or a running local
+    #: service (``OllamaProvider``). An optional Python dependency that merely is not
+    #: guaranteed installed (e.g. ``prometheus_client``) is not a live external system
+    #: by itself -- no service, endpoint, credential, or network is involved, only a
+    #: package that may be absent. A current entry citing this reason for that alone
+    #: is a known open question for the category-review pass, not a member of what
+    #: this reason actually names.
+    REQUIRES_LIVE_EXTERNAL_SERVICE = "requires-live-external-service"
+
+    #: The block would run cleanly exactly as written -- no undefined collaborator, no
+    #: disk, no network -- but asserts or prints nothing, so there is no claim for a
+    #: test to check even though nothing prevents running it: a standalone capability
+    #: probe against stdlib ``sqlite3``, a bare logging-configuration statement, or an
+    #: object construction with no observable outcome.
+    NO_ASSERTABLE_CLAIM = "no-assertable-claim"
+
+    #: The block is self-contained and would behave correctly if run, but its shape
+    #: does not fit the execute layer's required entrypoint convention (an
+    #: ``asyncio.run(main())``-wrapped script) -- e.g. a synchronous class definition
+    #: plus wiring that never awaits anything.
+    HARNESS_SHAPE_MISMATCH = "harness-shape-mismatch"
+
+
 def _dedent(line: str, indent: int) -> str:
     """Strip up to ``indent`` leading spaces from a captured body line."""
     stripped = line[:indent]

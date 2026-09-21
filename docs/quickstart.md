@@ -117,25 +117,53 @@ reports the REFLECTION coverage dreaming produces. See
 
 ```python
 import asyncio
+import sys
 import aiosqlite
 from engrava import SqliteEngravaCore
+
+
+async def _close_quietly(conn: aiosqlite.Connection) -> None:
+    """Close *conn*, reporting rather than raising if the close itself fails.
+
+    ``aiosqlite.Connection.__aexit__`` is an unconditional ``await
+    close()``, so a bare ``async with aiosqlite.connect(...)`` would let a
+    close failure here replace whatever the block above actually raised.
+    Used only from the exception path below -- the ordinary success-path
+    close still propagates a genuine failure normally.
+    """
+    try:
+        await conn.close()
+    except Exception as exc:  # noqa: BLE001 - deliberately broad: never replace the real error
+        print(f"warning: failed to close the database connection: {exc}", file=sys.stderr)
+
 
 async def main() -> None:
     # SqliteEngravaCore wraps an open aiosqlite connection.
     # Use ":memory:" for experimentation, or a file path to persist.
-    async with aiosqlite.connect(":memory:") as conn:
+    conn = await aiosqlite.connect(":memory:")
+    try:
         conn.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(conn)
         await store.ensure_schema()
         print("Store ready!")
+    except BaseException:
+        await _close_quietly(conn)
+        raise
+    else:
+        await conn.close()
 
 asyncio.run(main())
 ```
 
-> The rest of this page assumes you are inside the `async with` block above,
-> so `store` and `conn` are in scope. For a configuration-driven alternative,
+> The rest of this page assumes you are inside the `try` block above, so
+> `store` and `conn` are in scope. For a configuration-driven alternative,
 > use `await SqliteEngravaCore.from_config("engrava.yaml")` (it opens and owns
-> the connection for you).
+> the connection for you). A bare `async with aiosqlite.connect(...)` looks
+> like a shortcut for the same thing, but its `__aexit__` unconditionally
+> calls `close()` — if the block raised, a close failure there replaces the
+> real error. See ["Graceful shutdown"](deployment.md#graceful-shutdown) for
+> why the explicit `try`/`except`/`else` shape above is what production code
+> should use instead.
 
 ## Store and search a memory — the short way
 

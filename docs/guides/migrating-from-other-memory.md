@@ -114,6 +114,7 @@ small fake export):
 
 ```python
 import asyncio
+import sys
 import uuid
 
 import aiosqlite
@@ -153,8 +154,24 @@ async def bulk_import(store, items: list[dict[str, str]]) -> int:
     return await store.count_thoughts()
 
 
+async def _close_quietly(conn: aiosqlite.Connection) -> None:
+    """Close *conn*, reporting rather than raising if the close itself fails.
+
+    ``aiosqlite.Connection.__aexit__`` is an unconditional ``await
+    close()``, so a bare ``async with aiosqlite.connect(...)`` would let a
+    close failure here replace whatever the block above actually raised.
+    Used only from the exception path below -- the ordinary success-path
+    close still propagates a genuine failure normally.
+    """
+    try:
+        await conn.close()
+    except Exception as exc:  # noqa: BLE001 - deliberately broad: never replace the real error
+        print(f"warning: failed to close the database connection: {exc}", file=sys.stderr)
+
+
 async def main() -> None:
-    async with aiosqlite.connect(":memory:") as conn:
+    conn = await aiosqlite.connect(":memory:")
+    try:
         conn.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(conn)
         await store.ensure_schema()
@@ -163,6 +180,11 @@ async def main() -> None:
         # 4 exported rows, one duplicate collapsed -> 3 stored.
         assert total == 3
         print(f"Imported {total} thoughts.")
+    except BaseException:
+        await _close_quietly(conn)
+        raise
+    else:
+        await conn.close()
 
 
 if __name__ == "__main__":

@@ -42,6 +42,9 @@ import aiosqlite
 from engrava import SqliteEngravaCore, SentenceTransformerProvider
 
 provider = SentenceTransformerProvider(model_name="all-MiniLM-L6-v2")
+# Abbreviated for brevity: a bare async-with here can let a close failure
+# mask a real error. See "Graceful shutdown" in deployment.md for the safe
+# explicit-close shape.
 async with aiosqlite.connect("engrava.db") as conn:
     conn.row_factory = aiosqlite.Row
     store = SqliteEngravaCore(conn, embedding_provider=provider, auto_embed=True)
@@ -109,6 +112,9 @@ import aiosqlite
 from engrava import SqliteEngravaCore, EmbeddingGenerationError
 
 async def strict_ingest(provider: object, text: str) -> None:
+    # Abbreviated for brevity: a bare async-with here can let a close
+    # failure mask a real error. See "Graceful shutdown" in deployment.md
+    # for the safe explicit-close shape.
     async with aiosqlite.connect("engrava.db") as conn:
         conn.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(
@@ -144,6 +150,9 @@ import aiosqlite
 from engrava import SqliteEngravaCore, ThoughtRecord, ThoughtType, Priority, LifecycleStatus
 
 async def batch_ingest(provider: object, texts: list[str]) -> None:
+    # Abbreviated for brevity: a bare async-with here can let a close
+    # failure mask a real error. See "Graceful shutdown" in deployment.md
+    # for the safe explicit-close shape.
     async with aiosqlite.connect("engrava.db") as conn:
         conn.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(

@@ -70,6 +70,9 @@ import aiosqlite
 from engrava import SqliteEngravaCore
 
 hooks = MyHooks()
+# Abbreviated for brevity: a bare async-with here can let a close failure
+# mask a real error. See "Graceful shutdown" in deployment.md for the safe
+# explicit-close shape.
 async with aiosqlite.connect("my.db") as conn:
     conn.row_factory = aiosqlite.Row
     store = SqliteEngravaCore(conn, hooks=hooks)
@@ -275,6 +278,9 @@ applied automatically during `ensure_schema()`:
 import aiosqlite
 from engrava import SqliteEngravaCore
 
+# Abbreviated for brevity: a bare async-with here can let a close failure
+# mask a real error. See "Graceful shutdown" in deployment.md for the safe
+# explicit-close shape.
 async with aiosqlite.connect("my.db") as db:
     db.row_factory = aiosqlite.Row
     store = SqliteEngravaCore(db, manifests=[manifest])

@@ -185,6 +185,7 @@ with no known end (`valid_until` left open):
 
 ```python
 import asyncio
+import sys
 import uuid
 
 import aiosqlite
@@ -198,8 +199,24 @@ from engrava import (
 )
 
 
+async def _close_quietly(conn: aiosqlite.Connection) -> None:
+    """Close *conn*, reporting rather than raising if the close itself fails.
+
+    ``aiosqlite.Connection.__aexit__`` is an unconditional ``await
+    close()``, so a bare ``async with aiosqlite.connect(...)`` would let a
+    close failure here replace whatever the block above actually raised.
+    Used only from the exception path below -- the ordinary success-path
+    close still propagates a genuine failure normally.
+    """
+    try:
+        await conn.close()
+    except Exception as exc:  # noqa: BLE001 - deliberately broad: never replace the real error
+        print(f"warning: failed to close the database connection: {exc}", file=sys.stderr)
+
+
 async def main() -> None:
-    async with aiosqlite.connect(":memory:") as conn:
+    conn = await aiosqlite.connect(":memory:")
+    try:
         conn.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(conn)
         await store.ensure_schema()
@@ -224,6 +241,11 @@ async def main() -> None:
         assert fetched.valid_from == "2026-01-01T00:00:00+00:00"
         assert fetched.valid_until is None  # open upper bound
         print("valid_from:", fetched.valid_from, "valid_until:", fetched.valid_until)
+    except BaseException:
+        await _close_quietly(conn)
+        raise
+    else:
+        await conn.close()
 
 
 asyncio.run(main())
@@ -237,6 +259,7 @@ it, one after it does not:
 
 ```python
 import asyncio
+import sys
 import uuid
 
 import aiosqlite
@@ -252,8 +275,24 @@ from engrava import (
 )
 
 
+async def _close_quietly(conn: aiosqlite.Connection) -> None:
+    """Close *conn*, reporting rather than raising if the close itself fails.
+
+    ``aiosqlite.Connection.__aexit__`` is an unconditional ``await
+    close()``, so a bare ``async with aiosqlite.connect(...)`` would let a
+    close failure here replace whatever the block above actually raised.
+    Used only from the exception path below -- the ordinary success-path
+    close still propagates a genuine failure normally.
+    """
+    try:
+        await conn.close()
+    except Exception as exc:  # noqa: BLE001 - deliberately broad: never replace the real error
+        print(f"warning: failed to close the database connection: {exc}", file=sys.stderr)
+
+
 async def main() -> None:
-    async with aiosqlite.connect(":memory:") as conn:
+    conn = await aiosqlite.connect(":memory:")
+    try:
         conn.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(conn)
         await store.ensure_schema()
@@ -286,6 +325,11 @@ async def main() -> None:
         assert len(march.rows) == 1  # inside the valid window
         assert len(september.rows) == 0  # after valid_until
         print("March match:", len(march.rows), "September match:", len(september.rows))
+    except BaseException:
+        await _close_quietly(conn)
+        raise
+    else:
+        await conn.close()
 
 
 asyncio.run(main())
@@ -299,6 +343,7 @@ a query for an instant before the cut-off still finds it:
 
 ```python
 import asyncio
+import sys
 import uuid
 
 import aiosqlite
@@ -314,8 +359,24 @@ from engrava import (
 )
 
 
+async def _close_quietly(conn: aiosqlite.Connection) -> None:
+    """Close *conn*, reporting rather than raising if the close itself fails.
+
+    ``aiosqlite.Connection.__aexit__`` is an unconditional ``await
+    close()``, so a bare ``async with aiosqlite.connect(...)`` would let a
+    close failure here replace whatever the block above actually raised.
+    Used only from the exception path below -- the ordinary success-path
+    close still propagates a genuine failure normally.
+    """
+    try:
+        await conn.close()
+    except Exception as exc:  # noqa: BLE001 - deliberately broad: never replace the real error
+        print(f"warning: failed to close the database connection: {exc}", file=sys.stderr)
+
+
 async def main() -> None:
-    async with aiosqlite.connect(":memory:") as conn:
+    conn = await aiosqlite.connect(":memory:")
+    try:
         conn.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(conn)
         await store.ensure_schema()
@@ -354,6 +415,11 @@ async def main() -> None:
         assert still_there is not None
         assert still_there.valid_until == "2026-06-01T00:00:00+00:00"
         print("valid_now before:", len(before.rows), "after:", len(after.rows))
+    except BaseException:
+        await _close_quietly(conn)
+        raise
+    else:
+        await conn.close()
 
 
 asyncio.run(main())

@@ -133,6 +133,7 @@ caller-created clarification task. No LLM is involved.
 
 ```python
 import asyncio
+import sys
 import uuid
 
 import aiosqlite
@@ -178,8 +179,24 @@ def incompatible_single_value_claims(
     )
 
 
+async def _close_quietly(connection: aiosqlite.Connection) -> None:
+    """Close *connection*, reporting rather than raising if the close itself fails.
+
+    ``aiosqlite.Connection.__aexit__`` is an unconditional ``await
+    close()``, so a bare ``async with aiosqlite.connect(...)`` would let a
+    close failure here replace whatever the block above actually raised.
+    Used only from the exception path below -- the ordinary success-path
+    close still propagates a genuine failure normally.
+    """
+    try:
+        await connection.close()
+    except Exception as exc:  # noqa: BLE001 - deliberately broad: never replace the real error
+        print(f"warning: failed to close the database connection: {exc}", file=sys.stderr)
+
+
 async def main() -> None:
-    async with aiosqlite.connect(":memory:") as connection:
+    connection = await aiosqlite.connect(":memory:")
+    try:
         connection.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(connection, journal_enabled=True)
         await store.ensure_schema()
@@ -346,6 +363,11 @@ async def main() -> None:
             )
         )
         print(clarification.thought_id)
+    except BaseException:
+        await _close_quietly(connection)
+        raise
+    else:
+        await connection.close()
 
 
 asyncio.run(main())
