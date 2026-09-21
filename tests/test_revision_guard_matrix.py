@@ -1,9 +1,9 @@
 """The revision guard's matrix, pinned row by row: what bumps, what enforces.
 
 An earlier design for this same mechanism was rejected before a line of code
-was written because its matrix of which paths bump and which enforce was
-asserted, not tested, and repeated review rounds each found one more unread
-branch it got wrong. This module is the direct counter-measure: for every
+was written: its matrix of which paths bump and which enforce was asserted
+rather than tested, and each re-reading of the code turned up another branch
+the matrix had got wrong. This module is the direct counter-measure: for every
 mutating path, a test reads the row's ``revision`` column with raw SQL before
 and after the call, so "bumps" and "does not bump" are observed facts rather
 than something inferred from the returned domain record (which never carries
