@@ -20,7 +20,14 @@ Gate inventory (priority order — first failure rejects the cluster):
    tokens (English-only lexicon; clusters in other languages are not
    flagged by this gate — see the limitation note on ``_CONTRADICTION_PAIRS``).
 4. :func:`is_low_cohesion` — mean pairwise cosine of member embeddings
-   below the configured threshold (mixed-topic cluster).
+   below the configured threshold (mixed-topic cluster). Computed as
+   ``dot / (||a|| * ||b||)`` rather than the previous raw dot product,
+   which removes that formula's magnitude sensitivity in the common
+   case but is not an exact transform — it changes which side of the
+   threshold several non-finite and overflowing input shapes land on,
+   in both directions, relative to the pre-fix formula — see
+   :func:`cluster_cohesion_score` for exactly which, executed, and the
+   0.7 -> 0.8 upgrade note for the gate-level effect.
 5. :func:`is_external_source_homogeneous` — at least the configured
    fraction of members come from external sources per the self-anchored
    ``metadata.source.is_self`` semantic.  Belt-and-suspenders over the
@@ -44,6 +51,7 @@ so there was no mechanism to add.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from collections import Counter
 from typing import TYPE_CHECKING
@@ -271,19 +279,167 @@ def has_contradictory_members(
 # ---------------------------------------------------------------------------
 
 
+def _pairwise_cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
+    """Compute the true cosine similarity between two embedding vectors.
+
+    **Design decision — normalisation lives here, at the gate, not at the
+    provider boundary.** ``EmbeddingProviderProtocol.embed()`` is documented
+    to return an "L2-normalized" vector, but only
+    :class:`~engrava.embeddings.sentence_transformer.SentenceTransformerProvider`
+    actually does; ``HuggingFaceProvider``, ``OllamaProvider``,
+    ``OpenAICompatibleProvider`` and ``CallbackProvider`` all pass through
+    whatever magnitude the remote model or user callback returns. Normalising
+    at the provider boundary instead would change what *every* consumer of
+    those vectors sees (vector-index storage, dedup similarity, any future
+    caller doing its own dot product) for a fix whose scope is this one gate.
+    Normalising here keeps the blast radius to the cohesion computation:
+    every other consumer of a raw provider vector is unaffected, and the
+    gate now approximates the quantity its name and the documentation
+    promise for every provider — see the Returns section below for where
+    floating-point arithmetic still keeps that from being exact.
+
+    **Design decision — a zero-length vector has no direction, so its
+    cosine with anything is undefined; this returns ``0.0`` for that case,
+    deliberately** rather than raising or silently treating it as either
+    "identical" or "orthogonal" by accident. ``0.0`` is the conservative
+    choice for a *cohesion* gate: a zero vector normally means an embedding
+    failure or empty input, and treating it as similar to anything would
+    let a broken vector silently prop up a cluster's cohesion score. This
+    happens to match what the pre-fix raw-dot-product formula already
+    returned for a zero-vector pair (a dot product against the zero vector
+    is trivially zero regardless of the other vector), so it is not an
+    observable behaviour change for that case — what changes is that it is
+    now a stated policy rather than an accident of the arithmetic.
+
+    Args:
+        vec_a: First embedding vector.
+        vec_b: Second embedding vector.
+
+    Returns:
+        An approximation of the cosine similarity, which is mathematically
+        bounded to ``[-1.0, 1.0]`` — but this function's floating-point
+        arithmetic is not guaranteed to respect that bound even for
+        ordinary, finite input: two identical copies of
+        ``[1.0, 2.0**-26]`` compute ``1.0000000000000002``, and scaling
+        that same direction by ``3`` computes ``0.9999999999999998``
+        instead — not bit-identical, despite representing the same pair
+        of directions (see :func:`cluster_cohesion_score` for the full
+        executed comparison). Returns ``0.0`` if either vector's norm
+        computes to zero — including a non-zero vector whose squared
+        components all underflow to zero in ``float64`` (e.g. every
+        component near ``1e-200``). This zero-norm check also fires when
+        the *other* vector contains ``nan`` or ``inf``: ``[nan]`` paired
+        with ``[0.0]`` returns ``0.0``, not ``nan``, because ``vec_b``'s
+        norm is genuinely zero and that check is evaluated before
+        ``vec_a``'s ``nan`` can propagate through the division. A pair
+        that does not hit the zero-norm branch but whose components
+        overflow ``float64`` when squared and summed (e.g. ``[1e200]``
+        against ``[-1e200]``) returns ``nan`` instead. See
+        :func:`cluster_cohesion_score` for which of these executed cases
+        change a gate decision relative to the pre-fix raw-dot-product
+        formula, and in which direction.
+
+    """
+    dot = sum(x * y for x, y in zip(vec_a, vec_b, strict=False))
+    norm_a = math.sqrt(sum(x * x for x in vec_a))
+    norm_b = math.sqrt(sum(y * y for y in vec_b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
 def cluster_cohesion_score(cluster_embeddings: list[list[float]]) -> float:
     """Compute the cluster cohesion as mean pairwise cosine similarity.
 
-    Member embeddings are assumed L2-normalised, so the cosine
-    similarity of two members reduces to their dot product.  A cluster with
-    fewer than two embeddings is trivially cohesive (returns ``1.0``).
+    Computes an approximation of the true cosine similarity of each pair —
+    ``dot(a, b) / (||a|| * ||b||)`` — rather than assuming member
+    embeddings are already L2-normalised. Only one shipped embedding
+    provider
+    (:class:`~engrava.embeddings.sentence_transformer.SentenceTransformerProvider`)
+    returns vectors close to unit length; for a provider that does not, a
+    raw dot product varies with vector magnitude as well as direction,
+    which is not the cosine this gate is named after and documented to
+    compute. Dividing by the norms here removes that magnitude sensitivity
+    in the common case, but this is floating-point arithmetic, not an
+    exact transform: it is not bit-identical even for a provider that
+    already normalises. Executed: two identical copies of
+    ``[1.0, 2.0**-26]`` score ``1.0000000000000002`` (marginally over the
+    ``1.0`` a true self-similarity cannot exceed); the same direction
+    scaled by ``3`` scores ``0.9999999999999998`` instead of the same
+    value. A pair whose components were originally normalised in single
+    (``float32``) precision before being widened to Python floats — a
+    realistic shape for a vector already normalised at the source — can
+    shift by around ``1e-8`` relative to the raw dot product, not merely
+    by a rounding step of the ``float64`` this function computes in; see
+    the upgrade notes for the executed pair and the exact figures. See
+    :func:`_pairwise_cosine_similarity` for the zero-vector and
+    non-finite-input policy. A cluster with fewer than two embeddings is
+    trivially cohesive (returns ``1.0``).
+
+    **This changes the gate's output for most pairs whose norm product
+    (``||a|| * ||b||``) is not ``1.0`` — but not for every such pair.**
+    Two counter-examples, both executed: an orthogonal pair such as
+    ``[2.0, 0.0]`` against ``[0.0, 3.0]`` has norm product ``6.0`` yet
+    scores ``0.0`` under both the old and the new formula, because the
+    dot product itself is ``0.0`` and zero divided by any nonzero norm
+    product is still zero; and a pair whose norm product happens to equal
+    ``1.0`` (``[2.0, 0.0]`` against ``[0.5, 0.0]``) scores ``1.0`` under
+    both formulas too, by coincidence. A ``cluster_quality_cohesion_threshold``
+    tuned against the old (magnitude-sensitive) score is not automatically
+    tuned against a different function just because a provider returns
+    non-unit vectors — see the upgrade notes for the executed cases that
+    do move, and in which direction (it depends on the sign of each
+    pair's cosine as well as its norm product, so pairs in the same
+    cluster can shift oppositely).
+
+    **Non-finite and overflowing input.** If any pairwise cosine is
+    ``nan`` and neither vector in that pair hit the zero-norm branch (see
+    :func:`_pairwise_cosine_similarity`), the mean that averages it in is
+    ``nan`` too — ``nan`` propagates through the sum and division
+    unconditionally, regardless of how many other pairs in the cluster
+    are well-behaved. This function does not detect or reject that case;
+    it returns ``nan`` as computed. :func:`is_low_cohesion` compares that
+    ``nan`` against its threshold with ``<``, which Python (and IEEE 754)
+    defines as ``False`` for any comparison involving ``nan``, so a
+    cluster with a ``nan`` cohesion score is reported as *not* low-cohesion
+    and passes this gate. That admit-on-``nan`` comparison predates this
+    change and is not addressed by this function — but which *inputs*
+    reach it, and which instead reach the zero-norm branch and score
+    ``0.0``, changed here, in both directions, executed:
+
+    * ``[nan]`` paired with ``[0.0]`` scored ``nan`` under the pre-fix
+      raw-dot-product formula (``nan * 0.0`` is ``nan``) and scores
+      ``0.0`` here (:func:`_pairwise_cosine_similarity`'s zero-norm check
+      on the genuinely-zero vector fires first). ``nan`` compares as "not
+      low cohesion" (admitted); ``0.0`` compares as low cohesion for any
+      positive threshold (rejected) — so this pair's cluster flips from
+      admitted to rejected relative to the pre-fix formula.
+    * ``[1e200]`` paired with ``[-1e200]`` scored ``-inf`` under the
+      pre-fix raw-dot-product formula (correctly rejected, since ``-inf``
+      is below any threshold) and scores ``nan`` here, because both norms
+      overflow to ``inf`` and ``-inf / inf`` is ``nan`` — so this pair's
+      cluster flips from rejected to admitted, the opposite direction.
+
+    Neither outcome was designed; both are accidents of floating-point
+    arithmetic, on the old formula and this one alike. See the upgrade
+    notes for the full executed comparison, including a case that does
+    *not* change (an overflowing orthogonal pair stays rejected under
+    both formulas).
 
     Args:
         cluster_embeddings: One embedding vector per cluster member.
 
     Returns:
-        Mean pairwise cosine in ``[-1.0, 1.0]`` (practically ``[0.0, 1.0]``
-        for sentence-transformer embeddings); higher means tighter cluster.
+        An approximation of the mean pairwise cosine, mathematically
+        bounded to ``[-1.0, 1.0]`` (practically ``[0.0, 1.0]`` for
+        sentence-transformer embeddings) but not guaranteed to respect
+        that bound in floating-point arithmetic even for ordinary finite
+        input — see the executed ``1.0000000000000002`` case above.
+        Higher means tighter cluster. Returns ``nan`` if any pairwise
+        cosine is ``nan``, and ``0.0`` — not ``nan`` — for a pairwise
+        comparison that hit the zero-norm branch despite one side
+        containing ``nan``/``inf``; see the non-finite-and-overflowing
+        note above for both directions this can move a gate decision.
 
     """
     n = len(cluster_embeddings)
@@ -295,7 +451,7 @@ def cluster_cohesion_score(cluster_embeddings: list[list[float]]) -> float:
         vec_a = cluster_embeddings[i]
         for j in range(i + 1, n):
             vec_b = cluster_embeddings[j]
-            total_similarity += sum(x * y for x, y in zip(vec_a, vec_b, strict=False))
+            total_similarity += _pairwise_cosine_similarity(vec_a, vec_b)
             pair_count += 1
     return total_similarity / pair_count if pair_count else 1.0
 
@@ -316,7 +472,19 @@ def is_low_cohesion(
     Returns:
         ``(is_loose, cohesion)`` — ``is_loose`` is ``True`` when
         ``cohesion < cohesion_threshold``; ``cohesion`` is the observed
-        mean pairwise cosine.
+        mean pairwise cosine, which is ``nan`` when
+        :func:`cluster_cohesion_score` computed a non-finite pairwise
+        value (see its docstring). ``nan < cohesion_threshold`` is
+        ``False`` for any threshold, so a ``nan`` cohesion reports
+        ``is_loose=False`` — the cluster is treated as *not* low-cohesion
+        and admitted. That comparison itself is pre-existing behaviour,
+        unchanged by this function — but as of the 0.7 -> 0.8 change,
+        which inputs actually produce ``nan`` (and are therefore admitted
+        by this comparison) versus ``0.0`` (and are therefore rejected)
+        is not the same as before: see :func:`cluster_cohesion_score`'s
+        non-finite-and-overflowing note for two executed input shapes
+        that now land on the opposite side of this gate from where the
+        pre-fix formula put them.
 
     """
     score = cluster_cohesion_score(cluster_embeddings)

@@ -199,6 +199,7 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 | 0.4.x | 0.5.0 | Yes | **Schema-changing** minor upgrade (`user_version` 14 → 18), although the library API is drop-in. **Breaking for MCP-server users only:** the `engrava[mcp]` extra and the in-engrava `engrava-mcp` command are removed — the server moved to the standalone [`engrava-mcp`](https://github.com/sovantica/engrava-mcp) package (see the 0.4 → 0.5 note) |
 | 0.5.0 | 0.6.0 | Yes | **Schema-changing** minor upgrade (`user_version` 18 → 20), with two additive columns. Default retrieval now excludes archived thoughts, and wrong-dimension query vectors raise a typed error. An edge `decay_multiplier` of `0.0` no longer reads back as `1.0`, and a later update no longer rewrites it to `1.0` — values a 0.5.x update already overwrote stay overwritten. Back up, quiesce shared-store workers, migrate once, and review the [0.5 → 0.6 notes](#05---06) |
 | 0.6.x | 0.7.0 | Yes | **Schema-changing** minor upgrade (`user_version` 20 → 21): every `thought` / `edge` / `action` row gains a `revision INTEGER NOT NULL DEFAULT 0` column; `EngravaMetrics.schema_version` separately moves `1 → 2`; and `engrava --format json info` loses its `schema_version` key in favor of `metrics_schema_version` + `database_schema_version` (see below). `update_thought`, `restore_thought`, `update_edge` and `update_action` now check and increment `revision` atomically on every guarded write, so a write that lands after another guarded write touched the same row — including from a second connection or process — raises `StaleDataError` instead of silently overwriting; `update_edge` and `update_action` could never raise it before. No public method signature changed. **Behaviour change:** when the resolved recency weight is `0.0` **and** a cognitive-cycle reference (`current_cycle`, explicit or via `cycle_provider`) is present, the query-less fallback path now treats recency as fully off instead of still decaying by cycle — which can change result order for stores with heterogeneous thought priorities. `recency_now` (transaction-time) callers are unaffected; that axis was already correct. Also in this release: three new `EngravaError` subclasses (`WriteContentionError`, `WriteLockTimeoutError`, `DedupLockReentryError`) can now come out of the dedup and guarded-write paths; a new public override seam, `prepare_thought_for_insert()`, restores pre-insert customization that `get_or_create()` / `upsert_by_hash()` had silently stopped routing through an overridden `create_thought()`; `gc --dry-run` now names everything the real run deletes (edges, embeddings, and actions, not only orphaned edges); a deleted thought's vector can no longer resurface through search on a database that has not run the core-12 migration; a corrupt or truncated database file now makes the CLI exit with an error instead of hanging; and `restore` now refuses an `embedding` row with an empty `owner_type`/`owner_id`, a non-ISO-8601 `created_at`, or a non-positive `dimension` — every such row was already invalid on every prior release, so this only ever rejects a snapshot that already carried a broken record; and a merge restore (no `--clear`) into a target whose `journal_entry` table is non-empty now refuses any record that collides with an existing row and rolls the whole restore back instead of replacing it, unless `--orphan-journal-entries` is also given — journaling is opt-in and the CLI never enables it, so this only reaches a target that already has journaling on. Review the [0.6 → 0.7 notes](#06---07) |
+| 0.7.x | 0.8.0 | Yes | No schema change. **Behaviour change:** the dreaming clustering cohesion gate (`cluster_quality_cohesion_threshold`) now divides by both vectors' norms instead of using a raw dot product — see the [0.7 → 0.8 notes](#07---08). Moves the score for most non-unit-vector providers, executed to also move it slightly for vectors that were originally computed in `float32` (a common shape even for `SentenceTransformerProvider` output) once converted to Python floats, and changes which side of `cohesion_threshold` a cluster lands on for at least two executed non-finite/overflowing input shapes — this is not limited to non-normalising providers. |
 
 For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 `0.x.*` line do not change the schema and are low-risk; **minor** upgrades
@@ -206,6 +207,166 @@ For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 [rolling-upgrades](#rolling-upgrades-multiple-workers) note below.
 
 ## Version Notes
+
+### 0.7 -> 0.8
+
+**Behaviour change: the dreaming clustering cohesion gate now computes a
+true cosine similarity instead of a raw dot product.** No schema migration
+is involved.
+
+**Who is affected.** Anyone running the dreaming consolidation loop with
+`gates.cluster_quality_enabled` on. Two populations, executed separately:
+
+- Any provider whose vectors are not close to unit length —
+  `HuggingFaceProvider`, `OllamaProvider`, `OpenAICompatibleProvider`, and
+  `CallbackProvider` all return whatever magnitude the remote model or
+  user callback produces, and the score can move by a large, provider-
+  and pair-dependent amount (see the disagreement case below, an old
+  score of `1.5` dropping to a true cosine of `~0.29`).
+- `SentenceTransformerProvider` output, and any other already-near-unit
+  vector, is not exempt: it moves too, by a smaller amount that is still
+  not negligible. Executed: a pair whose components were originally
+  rounded to `float32` precision (`0.6000000238418579`,
+  `0.800000011920929` against `[1.0, 0.0]` — the value a `[0.6, 0.8]`
+  direction normalises to in single precision, once that native
+  `float32` output is widened to Python's `float`) scores
+  `0.6000000238418579` under the old raw-dot-
+  product formula and `0.6000000095367428` here — a difference of about
+  `1.4e-8`. That is roughly a hundred million times the size of a single
+  `float64` rounding step, because the source of the discrepancy is not
+  `float64` rounding at all: it is the residual imprecision the vector
+  already carried from being rounded to `float32` before this function
+  ever sees it, which only becomes visible once the norm is recomputed
+  in double precision. A `cluster_quality_cohesion_threshold` set
+  anywhere in `(0.6000000095367428, 0.6000000238418579)` — not only a
+  value sitting exactly on one of the two scores — flips this specific
+  pair's contribution.
+
+**What changed.** `cluster_cohesion_score()` (backing the
+`is_low_cohesion` gate and its `cluster_quality_cohesion_threshold`) used
+to compute the mean pairwise **dot product** of member embeddings,
+documented as a cosine similarity on the assumption that every provider's
+vectors are L2-normalised. That assumption held for one shipped provider
+and not the others, so for the rest the gate's score varied with vector
+magnitude, not just direction — two members embedded by the same provider
+could look "more cohesive" than another pair purely because that provider
+happened to produce longer vectors for them, independent of topical
+similarity. The gate now divides by both vectors' norms
+(`dot(a, b) / (||a|| * ||b||)`), which approximates the cosine similarity
+the documentation and the gate's name have always claimed, for every
+provider — see below for where floating-point arithmetic, not any
+provider's magnitude, still keeps this from being exact.
+
+**Where the fix lives, and why.** Normalisation was added at the gate
+(`_pairwise_cosine_similarity`, in
+`engrava/extensions/dreaming_cluster_quality.py`), not at the embedding
+provider boundary. Normalising at the boundary would change what every
+other consumer of a provider's vectors sees (vector-index storage, dedup
+similarity, any future direct dot-product caller) for a fix scoped to one
+gate; normalising only inside the gate keeps every other embedding
+consumer byte-identical to before.
+
+**Zero-length vectors.** A zero vector has no direction, so its cosine
+with anything is undefined. `_pairwise_cosine_similarity` returns `0.0`
+for that pair, deliberately, rather than raising or guessing a value — the
+conservative choice for a *cohesion* gate, since a zero vector normally
+signals an embedding failure or empty input, and treating it as similar to
+anything would let a broken vector prop up a cluster's score. This is not
+an observable behaviour change by itself: the old raw-dot-product formula
+already produced `0.0` for any pair involving a zero vector too, since a
+dot product against the zero vector is trivially zero regardless of the
+other vector's direction. What changes is that this is now a stated
+policy rather than an accident of the arithmetic — if a future change
+altered how the non-zero-vector case is computed, the zero-vector case
+would no longer coincidentally agree with it unless someone remembered
+this paragraph.
+
+**Non-finite and overflowing input can now land a cluster on the other
+side of the gate — executed, two directions.** Neither direction was
+designed; both are accidents of the arithmetic, on the old formula and
+the new one alike, and this release does not attempt to make either side
+"correct" — that is a separate, filed decision. It only documents what
+actually happens, because the previous revision of this note denied that
+anything did.
+
+- A member vector containing `nan` or `inf`, paired with a member vector
+  whose own norm is exactly (or underflows to) zero, now scores `0.0`
+  instead of `nan`. Executed: `[nan]` paired with `[0.0]` scored `nan`
+  under the pre-fix raw-dot-product formula (`nan * 0.0` is `nan`) and
+  scores `0.0` here — the zero-norm check on the *other*, genuinely-zero
+  vector fires before the `nan` in the first vector is ever examined.
+  `[inf]` paired with `[0.0]` does the same, for the same reason (`inf *
+  0.0` is also `nan`). Because `nan < cohesion_threshold` is `False` but
+  `0.0 < cohesion_threshold` is `True` for the default `0.40`, a cluster
+  containing this pair moves from **admitted** (pre-fix) to **rejected**
+  (this release).
+- An anti-parallel pair whose magnitudes overflow `float64` now scores
+  `nan` instead of a signed infinity. Executed: `[1e200]` paired with
+  `[-1e200]` scored `-inf` under the pre-fix raw-dot-product formula
+  (`1e200 * -1e200` overflows to `-inf` directly) — correctly rejected,
+  since `-inf` is below any threshold — and scores `nan` here, because
+  both norms overflow to `inf` and `-inf / inf` is `nan`. Because `nan <
+  cohesion_threshold` is `False`, this cluster moves from **rejected**
+  (pre-fix) to **admitted** (this release) — the opposite direction from
+  the case above.
+- Not every overflowing pair changes: an orthogonal pair whose components
+  also overflow (`[1e200, 0.0]` against `[0.0, 1e200]`) scores `0.0`
+  under both formulas (the dot product itself is `0.0`, so the division
+  is `0.0 / inf`, not `inf / inf`) and stays rejected either way.
+
+**Your `cluster_quality_cohesion_threshold` was tuned against a different
+function, on every provider — check which direction before assuming a
+regression, even on `SentenceTransformerProvider`.** The default (`0.40`)
+was calibrated on `SentenceTransformerProvider` output; the executed
+`float32`-precision case above (a `~1.4e-8` shift) shows that provider is
+not exempt, though the shift there is far smaller than on a
+non-normalising provider. For a provider whose vectors are not close to
+unit length, the relationship between the old score and the new one is
+exact: `raw_dot_product = ||a|| * ||b|| * true_cosine`. That means
+the direction of the shift for any one pair depends on **both** the
+product of that pair's norms and the **sign of its cosine** — not on the
+norm product alone, so different pairs in the same corpus, under the same
+provider, can move in opposite directions:
+
+- `||a|| * ||b|| > 1` (common for a model whose native output is not
+  scaled to unit length) **with a positive cosine**: the old score reads
+  higher than the true cosine — reported cohesion **drops** after the
+  upgrade (the executed disagreement case below is exactly this shape: an
+  old score of `1.5`, outside the `[-1, 1]` range a cosine can even take,
+  drops to a true cosine of `~0.29`).
+- `||a|| * ||b|| > 1` **with a negative cosine**: the old score reads
+  lower (more negative) than the true cosine — reported cohesion
+  **rises** after the upgrade.
+- `||a|| * ||b|| < 1` **with a positive cosine**: the old score reads
+  lower than the true cosine — reported cohesion **rises** after the
+  upgrade.
+- `||a|| * ||b|| < 1` **with a negative cosine**: the old score reads
+  higher (less negative) than the true cosine — reported cohesion
+  **drops** after the upgrade. (Executed: `[0.5, 0]` paired with
+  `[-0.5, 0]`, norm product `0.25 < 1`, old score `-0.25`, new score
+  `-1.0` — cohesion drops, not rises, because the pair is negatively
+  correlated; norm product alone would have predicted a rise.)
+
+A single corpus commonly contains both positively- and negatively-
+correlated pairs, so it can move in both directions at once under one
+provider. Computing your provider's typical vector norms tells you which
+norm-product regime you are in, but not which way any given pair's score
+moves — that also needs the sign of its cosine, which is exactly what
+this change starts to account for.
+
+**What to do.** Re-run your cohesion threshold calibration against the
+new score on a representative sample of your own clusters, whichever
+provider you are on. On `SentenceTransformerProvider` the shift is small
+(the executed case above moves a `0.6`-ish score by `~1.4e-8`) but not
+zero, so a threshold that happens to sit within that gap can flip; on a
+non-normalising provider the shift can be much larger and does not have
+a single expected direction — do not infer one from typical norms alone,
+since pairs in your corpus can move oppositely (see above). Separately,
+if any of your embeddings can be `nan`, `inf`, or large enough to
+overflow `float64` when squared, review the non-finite/overflowing
+section above: this release can flip a cluster from admitted to rejected
+or the reverse for those specific input shapes, independent of your
+provider's typical magnitude.
 
 ### 0.6 -> 0.7
 
