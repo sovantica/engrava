@@ -276,25 +276,40 @@ __all__ = [
 
 
 # ------------------------------------------------------------------
-# Backward-compatibility aliases — deprecated, remove in v0.4
+# Backward-compatibility aliases for the pre-rename (MindStore-era) names.
+#
+# Policy: kept, not scheduled for removal. A caller may keep using these
+# names — removing them would be a breaking change, and under this
+# project's versioning that computes a major release, which is not a
+# price this surface is worth paying on its own. Keeping them costs one
+# attribute lookup (the __getattr__ below) and no ongoing maintenance.
+# This is not a promise they live forever; it is the current position,
+# to be revisited deliberately rather than left to expire silently. New
+# code should use the current names, which is what the DeprecationWarning
+# on access points at.
 # ------------------------------------------------------------------
 import warnings as _warnings
+
+# The source of truth for every pre-rename alias this module still serves.
+# Tests reach into this constant (rather than hand-copying it) so that an
+# alias added here without test coverage fails loudly instead of shipping
+# silently.
+_DEPRECATED_ALIASES: dict[str, object] = {
+    "SqliteMindStoreCore": SqliteEngravaCore,
+    "MindStoreManager": EngravaManager,
+    "MindStoreConfig": EngravaConfig,
+    "MindStoreError": EngravaError,
+    "MindStoreCoreProtocol": EngravaCoreProtocol,
+    "MindStoreHooksProtocol": EngravaHooksProtocol,
+    "DefaultMindStoreHooks": DefaultEngravaHooks,
+    "ReadOnlyMindStore": ReadOnlyEngrava,
+}
 
 
 def __getattr__(name: str) -> object:
     """Lazy deprecation aliases for renamed symbols."""
-    _aliases: dict[str, object] = {
-        "SqliteMindStoreCore": SqliteEngravaCore,
-        "MindStoreManager": EngravaManager,
-        "MindStoreConfig": EngravaConfig,
-        "MindStoreError": EngravaError,
-        "MindStoreCoreProtocol": EngravaCoreProtocol,
-        "MindStoreHooksProtocol": EngravaHooksProtocol,
-        "DefaultMindStoreHooks": DefaultEngravaHooks,
-        "ReadOnlyMindStore": ReadOnlyEngrava,
-    }
-    if name in _aliases:
-        target = _aliases[name]
+    if name in _DEPRECATED_ALIASES:
+        target = _DEPRECATED_ALIASES[name]
         target_name = getattr(target, "__name__", str(target))
         _warnings.warn(
             f"{name} is deprecated, use {target_name} instead",
