@@ -673,7 +673,11 @@ async def measure_synthesis_coverage(
             # early-return in a ``try`` body bypasses ``else``, unlike a
             # ``finally``) -- leaving ``db`` unclosed on this path. Fall
             # through to the single ``return`` after the try/except/else
-            # instead, so every exit closes the connection the same way.
+            # instead, so this branch closes the connection the same way
+            # the other one below does. That still is not an absolute: a
+            # failure inside the earlier ``aiosqlite.connect(...)`` call
+            # never reaches this ``try`` at all, and a close interrupted by
+            # a cancellation may not run to completion either.
             coverage = 0.0
         else:
             reflection_memberships = await _collect_reflection_memberships(store)

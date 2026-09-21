@@ -47,6 +47,7 @@ from engrava.domain.enums import (
 )
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.extensions.dreaming_reflection_content import build_reflection_content_v2
+from engrava.infrastructure.sqlite.engrava_core import _close_quietly
 
 _REFLECTION_TYPE = "REFLECTION"
 
@@ -231,6 +232,76 @@ async def _reenrich_one(
     return True
 
 
+async def _reenrich_all_batches(
+    db: aiosqlite.Connection,
+    *,
+    batch_size: int,
+    dry_run: bool,
+    config: DreamingConfig,
+    now: datetime.datetime,
+) -> int:
+    """Paginate through every legacy v1 REFLECTION batch and enrich it.
+
+    Split out of :func:`reenrich` so the connection's open/close pair
+    around this loop is the only thing left in that function's own
+    ``try`` — keeping this loop's branching (fetch, per-row enrich,
+    cursor advance, commit, termination) out of the same block that
+    decides how to close the connection.
+
+    Args:
+        db: The open aiosqlite connection to walk.
+        batch_size: Number of rows to fetch per pass.
+        dry_run: When ``True``, log what would be updated without
+            issuing any ``UPDATE`` statement.
+        config: ``DreamingConfig`` carrying the fields the v2 builder needs.
+        now: The timestamp stamped on every enriched row this pass.
+
+    Returns:
+        Total number of rows enriched (or that would be enriched, in
+        dry-run mode).
+
+    """
+    total = 0
+    after_thought_id: str | None = None
+    while True:
+        batch = await _fetch_legacy_reflection_batch(
+            db,
+            batch_size=batch_size,
+            after_thought_id=after_thought_id,
+        )
+        if not batch:
+            break
+
+        for thought_id, legacy_content in batch:
+            ok = await _reenrich_one(
+                db,
+                thought_id=thought_id,
+                legacy_content=legacy_content,
+                config=config,
+                now=now,
+                dry_run=dry_run,
+            )
+            if ok:
+                total += 1
+
+        # Advance the pagination cursor regardless of mode — the batch is
+        # sorted by thought_id ascending, so the last row is the greatest
+        # id we have seen.  In production mode an UPDATE flips the row out
+        # of the legacy filter and the plain ``LIMIT`` would be enough; in
+        # dry-run mode the cursor is what guarantees forward progress
+        # because no UPDATE is issued.
+        after_thought_id = batch[-1][0]
+
+        if not dry_run:
+            await db.commit()
+
+        # When a short batch comes back, no further rows remain.
+        if len(batch) < batch_size:
+            break
+
+    return total
+
+
 async def reenrich(
     db_path: Path,
     *,
@@ -269,45 +340,29 @@ async def reenrich(
     effective_config = config if config is not None else DreamingConfig()
     now = datetime.datetime.now(datetime.UTC)
 
-    total = 0
-    after_thought_id: str | None = None
-    async with aiosqlite.connect(str(db_path)) as db:
-        while True:
-            batch = await _fetch_legacy_reflection_batch(
-                db,
-                batch_size=batch_size,
-                after_thought_id=after_thought_id,
-            )
-            if not batch:
-                break
-
-            for thought_id, legacy_content in batch:
-                ok = await _reenrich_one(
-                    db,
-                    thought_id=thought_id,
-                    legacy_content=legacy_content,
-                    config=effective_config,
-                    now=now,
-                    dry_run=dry_run,
-                )
-                if ok:
-                    total += 1
-
-            # Advance the pagination cursor regardless of mode — the
-            # batch is sorted by thought_id ascending, so the last row
-            # is the greatest id we have seen.  In production mode an
-            # UPDATE flips the row out of the legacy filter and the
-            # plain ``LIMIT`` would be enough; in dry-run mode the
-            # cursor is what guarantees forward progress because no
-            # UPDATE is issued.
-            after_thought_id = batch[-1][0]
-
-            if not dry_run:
-                await db.commit()
-
-            # When a short batch comes back, no further rows remain.
-            if len(batch) < batch_size:
-                break
+    db = await aiosqlite.connect(str(db_path))
+    try:
+        total = await _reenrich_all_batches(
+            db,
+            batch_size=batch_size,
+            dry_run=dry_run,
+            config=effective_config,
+            now=now,
+        )
+    except BaseException:
+        # The body already raised (or was cancelled) -- that is what the
+        # caller needs to see, so a failure in this cleanup close is
+        # secondary and goes through ``_close_quietly`` rather than
+        # replacing it. Mirrors ``_opened_db`` in ``engrava.cli.main``:
+        # ``aiosqlite.Connection.__aexit__`` is a bare, unconditional
+        # ``await close()`` and cannot draw this distinction itself.
+        await _close_quietly(db)
+        raise
+    else:
+        # The body succeeded. A close failure here is not secondary to
+        # anything -- it is the only error there is, so it must propagate
+        # normally rather than being logged and swallowed.
+        await db.close()
 
     return total
 

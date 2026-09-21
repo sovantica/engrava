@@ -12,6 +12,8 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 from typing import TYPE_CHECKING
 
@@ -318,3 +320,137 @@ def test_default_config_used_when_omitted() -> None:
     cfg = DreamingConfig()
     assert cfg.top_keyphrases_count == 3
     assert cfg.top_member_excerpts_count == 5
+
+
+# ---------------------------------------------------------------------------
+# Cleanup-close ordering
+# ---------------------------------------------------------------------------
+
+
+class TestReenrichCleanupClose:
+    """``reenrich`` must not let a close failure replace the body's own failure.
+
+    It used a bare ``async with aiosqlite.connect(...) as db:`` --
+    ``aiosqlite.Connection.__aexit__`` is an unconditional ``await
+    close()`` and cannot distinguish a cleanup close (something in the
+    body already raised) from a success-path one, so a failure in that
+    close would replace whatever the body actually raised.
+    """
+
+    async def test_body_failure_survives_a_failing_cleanup_close(
+        self, populated_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A close failure during cleanup must not replace the body's own failure."""
+        import scripts.reenrich_reflections_to_v2 as reenrich_module
+
+        close_calls = {"n": 0}
+        real_connect = reenrich_module.aiosqlite.connect
+
+        def _spy_connect(*args: object, **kwargs: object) -> object:
+            # ``aiosqlite.connect()`` itself is synchronous -- it returns a
+            # ``Connection`` proxy immediately without opening anything, so
+            # this spy must be a plain sync function too: an ``async def``
+            # spy would support only one of ``await``/``async with`` and
+            # fail for the wrong reason.
+            conn = real_connect(*args, **kwargs)
+            real_close = conn.close
+
+            async def _close_blows_up() -> None:
+                close_calls["n"] += 1
+                await real_close()
+                msg = "close blew up during cleanup"
+                raise RuntimeError(msg)
+
+            conn.close = _close_blows_up
+            return conn
+
+        monkeypatch.setattr(reenrich_module.aiosqlite, "connect", _spy_connect)
+
+        async def _fetch_blows_up(*args: object, **kwargs: object) -> object:
+            msg = "original body failure"
+            raise ValueError(msg)
+
+        monkeypatch.setattr(reenrich_module, "_fetch_legacy_reflection_batch", _fetch_blows_up)
+
+        with pytest.raises(ValueError, match="original body failure"):
+            await reenrich_module.reenrich(populated_db)
+
+        assert close_calls["n"] == 1, (
+            "the cleanup close was never attempted -- a regression that "
+            "drops the close call entirely would also let the original "
+            "ValueError escape untouched, so that alone is not enough"
+        )
+
+    async def test_body_failure_survives_a_close_that_never_releases_anything(
+        self, populated_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A close that raises *before* releasing anything must not win either.
+
+        The spy above calls the real ``close()`` first and only raises on
+        top of it, so the connection is already released before the
+        simulated failure. That spy cannot tell a helper that
+        reports-and-swallows an ordinary close failure apart from one that
+        would also paper over a close that raises *before* doing any of
+        its own cleanup, which is the failure mode that actually leaks:
+        the connection and its non-daemon worker thread stay alive. This
+        spy never touches the real close at all, so the assertions below
+        are about that observable state rather than about whether a close
+        was merely attempted.
+        """
+        import scripts.reenrich_reflections_to_v2 as reenrich_module
+
+        opened: list[aiosqlite.Connection] = []
+        real_connect = reenrich_module.aiosqlite.connect
+
+        def _spy_connect(*args: object, **kwargs: object) -> object:
+            conn = real_connect(*args, **kwargs)
+            opened.append(conn)
+
+            async def _close_raises_before_releasing_anything() -> None:
+                msg = "close blew up before releasing anything"
+                raise RuntimeError(msg)
+
+            conn.close = _close_raises_before_releasing_anything
+            return conn
+
+        monkeypatch.setattr(reenrich_module.aiosqlite, "connect", _spy_connect)
+
+        async def _fetch_blows_up(*args: object, **kwargs: object) -> object:
+            msg = "original body failure"
+            raise ValueError(msg)
+
+        monkeypatch.setattr(reenrich_module, "_fetch_legacy_reflection_batch", _fetch_blows_up)
+
+        try:
+            with pytest.raises(ValueError, match="original body failure"):
+                await reenrich_module.reenrich(populated_db)
+
+            assert opened, "the connect() spy never observed a connection being opened"
+            conn = opened[0]
+            assert conn._connection is not None, (
+                "the connection was released even though the close spy "
+                "never touched the real close -- the thread-alive "
+                "assertion below would then be trivially true, so this "
+                "pins the precondition instead"
+            )
+            assert conn._thread.is_alive(), (
+                "the worker thread has already stopped even though the "
+                "close spy raised before doing any cleanup -- the point "
+                "of this test is that a close failing this way is *not* "
+                "silently turned into a released connection; if this ever "
+                "goes false, something started forcing a release on a "
+                "close that raised before performing one, and this test's "
+                "assumptions need re-checking"
+            )
+        finally:
+            # The spy above never lets the real close run, so the worker
+            # thread from this test would otherwise outlive it -- stop and
+            # join it directly rather than through the (deliberately
+            # broken) patched ``close``.
+            for conn in opened:
+                if conn._thread.is_alive():
+                    stopped = conn.stop()
+                    if stopped is not None:
+                        with contextlib.suppress(TimeoutError):
+                            await asyncio.wait_for(stopped, timeout=5)
+                    conn._thread.join(timeout=5)
