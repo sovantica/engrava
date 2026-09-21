@@ -226,8 +226,9 @@ The source is durable before automatic derivation. Each derived child's row is
 then committed as its own unit before its embedding and `DERIVED_FROM` edge are
 completed. Re-running `derive_existing(source_id)` reuses deterministic children
 and edges and fills missing enrichment, provided the producer obeys the
-deterministic content contract. A failed compensating rollback is the one case
-that terminally quarantines the connection.
+deterministic content contract. A failed compensating rollback of a derived
+child terminally quarantines the connection; that is one of several causes,
+listed under [Terminal connection quarantine](#terminal-connection-quarantine).
 
 ## Transaction context behavior
 
@@ -356,13 +357,27 @@ metrics-level signals.
 
 ## Terminal connection quarantine
 
-`ConnectionQuarantinedError` means Engrava could not guarantee that a
-compensating rollback for a derived child completed. The old connection may
-have an indeterminate open transaction, so the store revokes all new operations
-and replaces its internal connection with a failing proxy. This state never
-clears. The operation that caused the rollback can surface its original or
-derivation error; once quarantine is installed, the next newly-admitted public
-operation raises `ConnectionQuarantinedError`.
+`ConnectionQuarantinedError` means Engrava could not prove that a rollback or
+unwind it depends on completed, or that the connection's last operation ever
+reported. The old connection may have an indeterminate open transaction, so the
+store revokes all new operations and replaces its internal connection with a
+failing proxy. This state never clears. Any of these triggers it:
+
+- the compensating rollback for a derived child did not cleanly complete;
+- the savepoint unwind of a guarded write (`update_thought`,
+  `restore_thought`, `update_edge`, `update_action`) failed;
+- the savepoint unwind of a `delete_thought` failed, including a delete made
+  through the TTL delete strategy or hygiene garbage collection — an ordinary
+  error such as a trigger veto can cause this, not only a cancellation, and the
+  derived-records seam need not be involved;
+- `close()` gave up waiting on the physical close after
+  `close_timeout_seconds` — see
+  [Deployment](deployment.md#if-the-worker-never-answers).
+
+The call that triggered the quarantine can surface its original error (or a
+cancellation that outranks it); a `close()` whose bound expired raises
+`ConnectionQuarantinedError` itself. Once quarantine is installed, the next
+newly-admitted public operation raises `ConnectionQuarantinedError`.
 
 Close the old store, open a new one, and inspect durable state before deciding
 what to repeat:
