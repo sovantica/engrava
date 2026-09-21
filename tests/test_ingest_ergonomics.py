@@ -18,7 +18,10 @@ explicitly.
 
 from __future__ import annotations
 
+import contextlib
+import inspect
 import logging
+import struct
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -38,6 +41,7 @@ from engrava import (
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+    from pathlib import Path
 
     from engrava.domain.models.thought import ThoughtRecord
 
@@ -208,6 +212,91 @@ async def _embedding_store(
     )
     await s._probe_fts()
     return s
+
+
+class _FlakyProvider:
+    """Succeeds only when the embed text contains a chosen marker, else raises.
+
+    Lets a test drive a sequence of embed attempts where some succeed (with a
+    fixed, recognisable vector) and later ones fail, to check what a real
+    on-disk connection reads back afterwards.
+    """
+
+    dimension = 4
+    model_name = "flaky-4"
+
+    def __init__(self, *, succeeds_on: str, vector: list[float]) -> None:
+        self._succeeds_on = succeeds_on
+        self._vector = vector
+
+    async def embed(self, text: str) -> list[float]:
+        if self._succeeds_on in text:
+            return self._vector
+        msg = f"provider exploded for: {text!r}"
+        raise RuntimeError(msg)
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        return [await self.embed(t) for t in texts]
+
+
+async def _open_file_store(
+    db_path: str,
+    provider: object,
+    *,
+    require_embedding: bool = False,
+) -> tuple[SqliteEngravaCore, aiosqlite.Connection]:
+    """Build an auto-embed store over a real on-disk file (not ``:memory:``).
+
+    A second, independent connection can then read this file back to confirm
+    what is actually durable, rather than trusting what the writer's own
+    connection sees before it has necessarily flushed a commit to disk.
+    """
+    conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(
+        conn,
+        embedding_provider=provider,  # type: ignore[arg-type]
+        auto_embed=True,
+        require_embedding=require_embedding,
+    )
+    await store.ensure_schema()
+    return store, conn
+
+
+async def _durable_thought_count(db_path: str, thought_id: str) -> int:
+    """Read the durable row count for ``thought_id`` from a fresh connection."""
+    conn = await aiosqlite.connect(db_path)
+    try:
+        return await _count(conn, "SELECT COUNT(*) FROM thought WHERE thought_id = ?", thought_id)
+    finally:
+        await conn.close()
+
+
+async def _durable_thought_content(db_path: str, thought_id: str) -> str | None:
+    """Read the durable ``content`` for ``thought_id`` from a fresh connection."""
+    conn = await aiosqlite.connect(db_path)
+    try:
+        cursor = await conn.execute(
+            "SELECT content FROM thought WHERE thought_id = ?", (thought_id,)
+        )
+        row = await cursor.fetchone()
+        return None if row is None else str(row[0])
+    finally:
+        await conn.close()
+
+
+async def _durable_embedding_vector(db_path: str, thought_id: str) -> list[float]:
+    """Read the durable embedding vector for ``thought_id`` from a fresh connection."""
+    conn = await aiosqlite.connect(db_path)
+    try:
+        cursor = await conn.execute(
+            "SELECT vector_blob, dimension FROM embedding WHERE owner_id = ?", (thought_id,)
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        return list(struct.unpack(f"{row[1]}f", row[0]))
+    finally:
+        await conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1065,6 +1154,149 @@ async def test_bulk_store_all_dedup_hits_issues_no_embed_call(
 # ---------------------------------------------------------------------------
 
 
+def test_require_embedding_docstring_does_not_overclaim_top_level_durability() -> None:
+    """The constructor's ``require_embedding`` entry must not say "committed either way".
+
+    That phrase is only true for ``create_thought``/``update_thought``: a
+    standalone ``bulk_store`` shares one transaction between its insert loop
+    and the trailing batch-embed call, so a strict failure rolls the *whole
+    batch* back instead (see ``test_bulk_store_strict_embed_failure_rolls_back``
+    above) — the row this docstring tells an operator to repair may not exist.
+    The entry must call that exception out by name rather than claim every
+    top-level path commits regardless of which one raised.
+    """
+    doc = inspect.getdoc(SqliteEngravaCore) or ""
+    start = doc.index("require_embedding:")
+    end = doc.index("search_config:")
+    section = doc[start:end]
+
+    assert "committed either way" not in section
+    assert "bulk_store" in section
+    # A keyword check like this one can pass against a docstring that asserts
+    # the opposite of the truth, as long as it contains "bulk_store" and
+    # avoids one forbidden phrase — it does not verify behaviour. The
+    # behaviour is instead asserted directly by
+    # ``test_require_embedding_flag_flips_durability_through_a_typed_except``
+    # and ``test_nested_update_rollback_can_leave_a_stale_embedding`` below.
+    # This assertion only guards a specific absolute this file has already
+    # gotten wrong once, so a regression back to it is caught immediately.
+    assert "it never decides whether the thought row survives" not in section
+
+
+async def test_require_embedding_flag_flips_durability_through_a_typed_except(
+    tmp_path: Path,
+) -> None:
+    """Same provider failure, same caller code, opposite durable outcome.
+
+    The constructor docstring must not claim ``require_embedding`` "never
+    decides whether the thought row survives": it does, indirectly, because
+    it decides the exception *type*, and an ordinary caller ``except
+    EmbeddingGenerationError`` clause only catches the strict-mode error.
+    Nested inside the caller's own ``suspend_auto_commit()`` window, that
+    difference decides whether the window exits cleanly (commits) or lets
+    the exception escape (rolls back). Verified from a second, independent
+    connection onto the same on-disk file, per ``require_embedding`` value.
+    """
+    for require_embedding, expect_durable in ((True, True), (False, False)):
+        db_path = str(tmp_path / f"flag-{require_embedding}.db")
+        store, conn = await _open_file_store(
+            db_path, _FailingProvider(), require_embedding=require_embedding
+        )
+        try:
+            with contextlib.suppress(RuntimeError):
+                # RuntimeError here is the default, untyped provider error
+                # escaping the window uncaught.
+                async with store.suspend_auto_commit():
+                    with contextlib.suppress(EmbeddingGenerationError):
+                        # Only the strict-mode error is caught here.
+                        await store.create_thought(_thought("t-flag"))
+        finally:
+            await conn.close()
+
+        durable = await _durable_thought_count(db_path, "t-flag")
+        expected = 1 if expect_durable else 0
+        assert durable == expected, (
+            f"require_embedding={require_embedding}: expected durable rows="
+            f"{expected}, got {durable}"
+        )
+
+
+async def test_nested_update_rollback_can_leave_a_stale_embedding(
+    tmp_path: Path,
+) -> None:
+    """A rolled-back nested update does not guarantee a consistent embedding.
+
+    Two-step sequence: a standalone update A -> B commits (the update commits
+    before re-embedding) while its own re-embed fails, leaving content B with
+    the embedding of A. A later nested update B -> C then also fails to
+    re-embed and escapes uncaught, rolling the outer window back to content
+    B — but the embedding was never touched by either failure, so it still
+    represents A, not B. Verified by reading both columns back from a second,
+    independent connection onto the same on-disk file.
+    """
+    vector_a = [1.0, 0.0, 0.0, 0.0]
+    db_path = str(tmp_path / "stale-embed.db")
+    store, conn = await _open_file_store(db_path, _FlakyProvider(succeeds_on="A", vector=vector_a))
+    try:
+        await store.create_thought(_thought("t-stale", essence="e", content="content-A"))
+
+        # Standalone update A -> B commits; re-embed of B fails and propagates.
+        with pytest.raises(RuntimeError):
+            await store.update_thought("t-stale", content="content-B")
+
+        # Nested update B -> C: re-embed of C also fails, escapes uncaught,
+        # and the outer window rolls the content change back to B.
+        with pytest.raises(RuntimeError):
+            async with store.suspend_auto_commit():
+                await store.update_thought("t-stale", content="content-C")
+    finally:
+        await conn.close()
+
+    content = await _durable_thought_content(db_path, "t-stale")
+    vector = await _durable_embedding_vector(db_path, "t-stale")
+    assert content == "content-B", "rollback should restore the pre-nested-update content"
+    assert vector == vector_a, (
+        "the embedding is still the one from the first failure and was never "
+        "repaired by the second rollback — content and embedding disagree"
+    )
+
+
+async def test_create_then_update_in_same_window_rollback_leaves_no_row(
+    tmp_path: Path,
+) -> None:
+    """A rolled-back window can erase a row, not just revert it.
+
+    Rollback does not unwind to "before this call" — it unwinds to whatever
+    existed when the *outermost* ``suspend_auto_commit()`` window opened. If
+    the thought was created earlier in that same window, a later update's
+    re-embed failure that escapes the window rolls the create back too: the
+    thought does not revert to some prior durable state, it stops existing
+    at all. Verified from a second, independent connection onto the same
+    on-disk file.
+    """
+    vector_a = [1.0, 0.0, 0.0, 0.0]
+    db_path = str(tmp_path / "create-then-update-rollback.db")
+    store, conn = await _open_file_store(db_path, _FlakyProvider(succeeds_on="A", vector=vector_a))
+
+    async def _create_then_update() -> None:
+        async with store.suspend_auto_commit():
+            await store.create_thought(_thought("t-window", essence="e", content="content-A"))
+            await store.update_thought("t-window", content="content-B")
+
+    try:
+        with pytest.raises(RuntimeError):
+            await _create_then_update()
+    finally:
+        await conn.close()
+
+    durable = await _durable_thought_count(db_path, "t-window")
+    assert durable == 0, (
+        "the create happened inside the same window as the failing update, "
+        "so the whole window's rollback erases it — it does not revert to "
+        "its pre-update state"
+    )
+
+
 async def test_auto_embed_failure_warns_and_propagates_by_default(
     db: aiosqlite.Connection,
     caplog: pytest.LogCaptureFixture,
@@ -1119,6 +1351,30 @@ async def test_bulk_store_strict_embed_failure_rolls_back(
         await store.bulk_store(thoughts)
 
     # Whole transaction rolled back: no thoughts, no embeddings.
+    assert await _count(db, "SELECT COUNT(*) FROM thought") == 0
+    assert await _count(db, "SELECT COUNT(*) FROM embedding") == 0
+
+
+async def test_strict_embed_failure_nested_in_suspend_auto_commit_is_not_durable(
+    db: aiosqlite.Connection,
+) -> None:
+    """A single-item strict failure nested in the caller's own window is not durable.
+
+    ``create_thought`` does not own the outermost transaction here — the
+    caller's own ``suspend_auto_commit()`` window does — so raising
+    ``EmbeddingGenerationError`` does not commit the row on its own. If the
+    caller lets that outer window's exit see the exception (the case here),
+    the whole window rolls back and the thought never persists, contrary to
+    the single-item-is-always-committed intuition that holds only when this
+    call owns its own transaction.
+    """
+    store = await _embedding_store(db, _FailingProvider(), require_embedding=True)
+
+    with pytest.raises(EmbeddingGenerationError):
+        async with store.suspend_auto_commit():
+            await store.create_thought(_thought("t-nested-strict"))
+
+    # The outer window rolled back: the row was never made durable.
     assert await _count(db, "SELECT COUNT(*) FROM thought") == 0
     assert await _count(db, "SELECT COUNT(*) FROM embedding") == 0
 

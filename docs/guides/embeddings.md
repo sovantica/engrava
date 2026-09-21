@@ -78,14 +78,31 @@ own `suspend_auto_commit()` window, nothing is durable yet: the outermost
 window's exit decides — caught and exited cleanly, the row commits; uncaught,
 it rolls back with the rest of that window. This is surfaced two ways:
 
-- The failure is **never silent**: a `WARNING` naming the thought id and the
-  provider error is always logged, then the provider's own exception propagates
-  (unchanged default behaviour).
+- An `Exception` that escapes the guarded embed call (`provider.embed()` /
+  `embed_batch()`, or their role-aware equivalents) is never silent: a
+  `WARNING` naming the thought id and the provider error is always logged,
+  then the provider's own exception propagates (unchanged default
+  behaviour). That guarantee is scoped to that one call, not to provider
+  failures in general — a provider whose `model_name` property raises (read
+  right after a successful embed, to store alongside the vector) skips the
+  logging and typing entirely, regardless of `require_embedding` or
+  exception type. A provider that raises `asyncio.CancelledError` (or any
+  other `BaseException` that is not an `Exception`) from inside the guarded
+  embed call also skips it — it propagates directly, with no `WARNING` and
+  without ever becoming `EmbeddingGenerationError`.
 - Set `require_embedding: true` (config) or `require_embedding=True` (constructor)
   to turn that failure into a typed `EmbeddingGenerationError` — the explicit
   fail-fast for operators who would rather the write raise loudly than leave an
-  unembedded thought behind. The flag only governs how loudly the missing
-  embedding is reported, not the durability outcome above.
+  unembedded thought behind. The flag decides the exception *type*, not the
+  durability outcome above by itself — but that type *can* affect durability
+  when the failure happens nested inside a caller's own
+  `suspend_auto_commit()` window, if the caller's own exception handling
+  distinguishes the two types: an `except EmbeddingGenerationError` clause
+  around the call catches the strict-mode error and lets that window exit
+  cleanly (so it commits), while the same clause does not catch the untyped
+  provider exception raised by default, which escapes the window and rolls
+  it back. A caller that instead catches both types, or neither, sees the
+  same outcome regardless of this flag.
 
 ```python
 import aiosqlite

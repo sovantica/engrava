@@ -1505,14 +1505,30 @@ class SqliteEngravaCore:
             provider's own exception (byte-identical to prior behaviour). When
             ``True``, that failure is normalised into a typed
             :class:`~engrava.domain.exceptions.EmbeddingGenerationError` — the
-            opt-in fail-fast. At the top level the thought is already
-            committed either way, so this governs how loudly the missing
-            embedding is surfaced, not whether the row is persisted. Nested
-            inside the caller's own :meth:`suspend_auto_commit` window the
-            row is not yet durable when auto-embed runs, so this still only
-            governs how loudly the failure is surfaced, not whether the
-            pending row survives the outer commit. No effect unless
-            ``auto_embed`` is on.
+            opt-in fail-fast. This flag decides the exception *type*, not
+            whether the call that raised it already committed its own row.
+            When a single-item call (``create_thought``/``update_thought``)
+            owns its own transaction, that row is already durable by the
+            time auto-embed runs regardless of this flag, and a standalone
+            :meth:`bulk_store` rolls its whole batch back regardless of this
+            flag too (see that exception's docstring for the full per-path
+            outcome, including the nested case, where nothing is durable
+            yet on either flag setting until the caller's own outermost
+            window exits). But the exception type this flag picks *can*
+            affect durability when the failure happens nested inside a
+            caller's own ``suspend_auto_commit()`` window — only when the
+            caller's own exception handling distinguishes the two types: an
+            ``except EmbeddingGenerationError`` clause around the failing
+            call catches the strict-mode error and lets that outer window
+            exit cleanly (so it commits), while the same clause does not
+            catch the untyped provider exception this flag raises by
+            default, which escapes the window and rolls it back — same
+            provider failure, same caller code, opposite durable outcome. A
+            caller whose ``except`` clause instead catches both types (a
+            bare ``except Exception``) or neither sees the same outcome
+            regardless of this flag; only type-discriminating handling makes
+            the flag's choice of exception type observable in durability. No
+            effect unless ``auto_embed`` is on.
         search_config: Optional default hybrid-search weights from config.
         journal_enabled: Whether to record mutations in the hash-chain
             journal.  Defaults to ``False``.
@@ -9183,10 +9199,21 @@ class SqliteEngravaCore:
         embedding is now stale against the new content, and the row is
         still findable by vector search against that outdated vector; if
         the row had no embedding before, it still has none, and remains
-        unfindable by vector search. If the update instead rolled back,
-        the retained embedding matches the restored content and nothing
-        is inconsistent. A standalone ``bulk_store``'s rollback leaves
-        nothing behind at all.
+        unfindable by vector search. If the update instead rolled back —
+        only possible when this call is nested inside a caller's own window
+        and the caller lets the failure escape it — the durable state
+        reverts to whatever existed when that *outermost* window opened,
+        not merely to what this call itself started from: an earlier write
+        to the same thought inside the same window is undone right along
+        with it. If the thought was created inside that same window, it no
+        longer exists at all afterward — there is nothing to be "left
+        behind". If it already existed before the window opened, it
+        reverts to that pre-window state, and the retained embedding
+        matches it only if it already did: an earlier update on the same
+        thought, before this window ever opened, whose own re-embed failed
+        can already have left that pre-window state stale, and this
+        rollback neither detects nor repairs that. A standalone
+        ``bulk_store``'s rollback leaves nothing behind at all.
 
         See ``docs/api-reference.md``'s ``bulk_store`` and
         ``EmbeddingGenerationError`` entries for the fuller treatment. This
@@ -9226,10 +9253,24 @@ class SqliteEngravaCore:
         prefix-redundant ``essence`` to avoid double-counting the opening),
         embeds it via the configured provider, and persists the vector.
 
-        A provider failure is never silent: it is routed through
+        An ``Exception`` that escapes the guarded call to
+        :func:`_embed_document` below is never silent: it is routed through
         :meth:`_on_auto_embed_failure`, which logs a ``WARNING`` naming the
         thought and then re-raises the provider error (default) or a typed
         :class:`EmbeddingGenerationError` (when ``require_embedding=True``).
+        That guarantee is scoped to this one call, not to provider failures
+        in general: ``provider.model_name`` is read afterward, outside the
+        ``try``/``except``, to pass to :meth:`store_embedding`, so a
+        provider whose ``model_name`` property raises skips the routing
+        entirely regardless of ``require_embedding`` or exception type — no
+        ``WARNING``, no :class:`EmbeddingGenerationError`. A
+        ``BaseException`` that is not an ``Exception`` raised *from inside*
+        the guarded call — :class:`asyncio.CancelledError` is the one that
+        matters in practice — is also not caught by the ``except Exception``
+        here, so it skips the routing too: no ``WARNING`` is logged and it
+        is never normalised into :class:`EmbeddingGenerationError`. Either
+        way it still propagates, so it is not swallowed, only unlogged and
+        untyped.
         Whether the thought row is durable yet depends on whether this
         call owns the outermost transaction: on its own, the insert or
         update has already committed by the time this runs, so the

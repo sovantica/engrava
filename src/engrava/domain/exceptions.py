@@ -298,9 +298,20 @@ class EmbeddingGenerationError(EngravaError):
     against the new content, and the row is still findable by vector
     search against that outdated vector; if the row had no embedding
     before, it still has none, and remains unfindable by vector search.
-    If the update instead rolled back, the retained embedding matches the
-    restored content and nothing is inconsistent. A standalone
-    ``bulk_store``'s rollback leaves nothing behind at all.
+    If the update instead rolled back — only possible when this call is
+    nested inside a caller's own window and the caller lets the failure
+    escape it — the durable state reverts to whatever existed when that
+    *outermost* window opened, not merely to what this call itself started
+    from: an earlier write to the same thought inside the same window is
+    undone right along with it. If the thought was created inside that
+    same window, it no longer exists at all afterward — there is nothing
+    to be "left behind". If it already existed before the window opened,
+    it reverts to that pre-window state, and the retained embedding
+    matches it only if it already did: an earlier update on the same
+    thought, before this window ever opened, whose own re-embed failed can
+    already have left that pre-window state stale, and this rollback
+    neither detects nor repairs that. A standalone ``bulk_store``'s
+    rollback leaves nothing behind at all.
 
     See ``docs/api-reference.md``'s ``bulk_store`` and
     ``EmbeddingGenerationError`` entries for the fuller treatment. By
