@@ -115,6 +115,23 @@ def test_notes_memory_runs_to_completion() -> None:
     assert "Stored 4 notes." in result.stdout
 
 
+def test_simple_agent_runs_to_completion() -> None:
+    """``simple_agent.py`` runs the lower-level, no-encoder walkthrough to a clean exit.
+
+    Uses ``numpy``-seeded pseudo-embeddings from a plain ``embed()`` helper — a
+    core dependency, not the local-embeddings extra — so it always runs. The
+    similarity-search ranking is randomized per process (the helper seeds from
+    the builtin ``hash()``, which is salted per interpreter run), so the
+    assertions below stick to what stays constant across every run: the fixed
+    query text, the fixed count of stored thoughts, and the closing marker.
+    """
+    result = _run_example("simple_agent.py")
+    assert result.returncode == 0, f"non-zero exit; stderr=\n{result.stderr}"
+    assert "Query: 'wet cats and rain'" in result.stdout
+    assert result.stdout.count("[+] thought") == 5
+    assert "Done." in result.stdout
+
+
 def test_dreaming_benefit_script_not_shipped() -> None:
     """The fresh-store dreaming walkthrough script is not part of the public surface.
 
