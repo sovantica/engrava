@@ -237,9 +237,11 @@ waits for it, for at most `write_lock_acquire_timeout_seconds`, and raises
 `WriteLockTimeoutError` after that — a long hold can make the waiting write
 fail instead of complete (see
 [Known Limitations](../known-limitations.md#aiosqlite-proxy-architecture)).
-If you have embeddings configured, note that each new thought is embedded on
-write (see the [Embeddings guide](embeddings.md)), so a bulk load pays the
-embedding cost up front — pre-compute vectors or import in batches accordingly.
+Configuring an embedding provider is not enough to embed on write: a new thought
+is embedded only when both `embedding_provider=...` and `auto_embed=True` are set
+(`auto_embed` defaults to `False`; see the [Embeddings guide](embeddings.md)). If
+you have enabled both, a bulk load pays the embedding cost up front — pre-compute
+vectors or import in batches accordingly.
 See the [Performance guide](../performance.md#write-throughput-and-bulk-ingest)
 for the throughput levers in detail.
 
