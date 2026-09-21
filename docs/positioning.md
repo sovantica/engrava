@@ -46,8 +46,9 @@ relates to the other memory options you might be choosing between.
   service across many machines, use a dedicated vector database.
 - **You need more than one process writing the same store.** Only one store may
   write a database file; any number may read it. WAL lets readers and that one
-  writer coexist, and one process can drive many async tasks against the store —
-  but two writers on one file is unsupported, not merely contended. See
+  writer coexist, and one process can share a store across the async tasks of
+  one event loop — but two writers on one file is unsupported, not merely
+  contended. See
   [Concurrency](concurrency.md#multiple-stores-one-database-file).
 - **You want the library to call an LLM for you.** Engrava does no LLM-side fact
   extraction, summarisation, or entity resolution (see [Non-goals](#non-goals)).

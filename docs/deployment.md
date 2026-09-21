@@ -37,10 +37,12 @@ async def main() -> None:
 - **Share that one store across the tasks in the loop.** You do **not** need a
   pool of stores for in-process concurrency. A guarded write's own read and
   write are one critical section across tasks, so a genuinely concurrent
-  task's whole operation can no longer land in the middle of another's — but
-  two tasks editing the *same field* of the same row still leave only the
-  later one's value in place. What this does not cover is a read-modify-write
-  *your own code* spans across two separate calls. See
+  task's whole operation does not land in the middle of another's, except that
+  `get_or_create` and `upsert_by_hash` release the lock between their two
+  probes on a miss when not nested inside a `suspend_auto_commit()` window. Two
+  tasks editing the *same field* of the same row leave only the later one's
+  value in place. What this does not cover is a read-modify-write *your own
+  code* spans across two separate calls. See
   [Concurrency](concurrency.md#many-async-tasks-one-store) for the exact
   guarantees and the idioms that close that gap.
 
@@ -91,8 +93,12 @@ servers (Gunicorn/Uvicorn workers, etc.):
 - **Reads scale freely** under WAL — many readers and one writer coexist, across
   processes as well as within one.
 - **Route every write to one process.** Two workers writing one file is not a
-  contention trade-off you can tune with `busy_timeout`; it silently loses updates
-  and can duplicate deduplicated content. See
+  contention trade-off you can tune with `busy_timeout`. A guarded update
+  whose read-to-write window another writer's guarded write lands in raises
+  `StaleDataError` instead of silently overwriting that write (the write that
+  landed first succeeds; the stale one raises). Deduplication does not duplicate
+  across stores apart from a raw-transaction fallback. Other cross-store races
+  remain, so one writer per file is the contract. See
   [Concurrency → Multiple stores, one database file](concurrency.md#multiple-stores-one-database-file).
 - **Per-tenant or per-worker isolation:** give each its own database file via
   [`EngravaManager`](concurrency.md#per-service-isolation) when you need

@@ -53,22 +53,29 @@ and [Known Limitations](known-limitations.md#sqlite-vec-pre-v1-status).
 
 ## Can multiple processes or tasks use the same store at once?
 
-**Tasks: yes, with limits.** Share one store across the tasks in your event
-loop — aiosqlite serialises their statements on its background thread and WAL
-lets readers and a single writer coexist. A guarded write's own read and write
-are one critical section across tasks, so a genuinely concurrent task's whole
-operation can no longer land in the middle of another's — but two tasks
-editing the *same field* of the same row still leave only the later one's
-value; that is not a race, just two edits to one field. What this does not
-cover is a read-modify-write *your own code* spans across two separate calls
-(`get_thought()` now, `update_thought()` later) — serialise that yourself when
-tasks genuinely compete for a row. See
+**Tasks: yes, with limits.** Share one store across the tasks of one event
+loop — WAL lets readers and a single writer coexist, and a task-reentrant write
+lock makes each guarded write's own read and write one critical section, so a
+genuinely concurrent task's whole operation does not land in the middle of
+another's, except that `get_or_create` and `upsert_by_hash` release the lock
+between their two probes on a miss when not nested inside a
+`suspend_auto_commit()` window. Two tasks editing the *same field* of the
+same row leave only the later one's value; that is not a race, just two edits
+to one field. The limits: one store used from several event loops is not
+supported (use one store per loop), and a read-modify-write *your own code*
+spans across two separate calls (`get_thought()` now, `update_thought()` later)
+is not covered — serialise that yourself when tasks genuinely compete for a
+row. See
 [Concurrency](concurrency.md#many-async-tasks-one-store).
 
 **Processes: no.** Only one store may *write* a given database file; any number
 may read it. This is not a contention trade-off you can tune away — the locks
-that order engrava's own operations stop at the store instance, so a second
-writer loses updates and can duplicate deduplicated content. For multi-tenant or
+that order engrava's own operations stop at the store instance. A guarded update
+whose read-to-write window another writer's guarded write lands in raises
+`StaleDataError` instead of silently overwriting that write (the write that
+landed first succeeds; the stale one raises). Deduplication does not duplicate
+across stores apart from a raw-transaction fallback. Other cross-store races
+remain, so one writer per file is the contract. For multi-tenant or
 multi-worker setups, give each writer its own database file via `EngravaManager`
 (each has its own lock).
 
