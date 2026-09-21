@@ -133,17 +133,30 @@ though a rising `fts_match_failure_count` is how you see it happening. See
 
 **Symptom.** `run_consolidation(...)` returns `promoted_count == 0` every time.
 
-**Cause.** Promotion requires a candidate to clear **two independent bars**, and
-either one alone keeps the count at zero:
+**Cause.** A candidate has to pass every stage below, and failing any one keeps
+the count at zero. Check them in this order:
 
 1. **The age gate.** A thought is eligible only when
    `current_cycle - created_cycle >= min_age_cycles` (default `1`). If you never
    advance your cycle counter — every thought stays at the same `current_cycle`
    you created it in — `0 >= 1` is false and nothing is ever eligible. This is
    the most common cause. See [Core Concepts → Cycle](concepts.md).
-2. **The promotion threshold.** Even after the gate passes, a candidate's
-   weighted signal score must reach `promote_threshold`. Brand-new, unconfirmed,
+2. **The confirmation gate.** Unless `allow_zero_confirmation` is `True` (the
+   default), `confirmation_count` must be at least `min_confirmations` (default
+   `2`). With the flag turned off and no confirmations recorded, nothing passes.
+3. **Eligibility filters.** By default only `OBSERVATION` thoughts are promoted
+   (`promote_targets`), and the metadata filters can reject a thought, for
+   example the default `excluded_content_types` entry `code`. See
+   [Dreaming → Eligibility filters and corpus caps](dreaming.md#eligibility-filters-and-corpus-caps).
+4. **The promotion threshold.** Even after the stages above pass, a candidate's
+   weighted signal score must be **strictly greater than** `promote_threshold`; a
+   score exactly equal to it does not promote. Brand-new, unconfirmed,
    never-accessed thoughts score low, so a high threshold promotes nothing.
+5. **The caps.** A run promotes at most `max_promoted_per_run` thoughts (default
+   `20`), and it needs a free P1 slot. The number of free P1 slots for a run is
+   `max_p1_fraction` of the store (default `0.05`), rounded down but never below
+   one thought, minus the thoughts that are already P1, so a small store has
+   only a few slots and none once its P1 count has reached that number.
 
 **Fix.**
 
