@@ -6,9 +6,12 @@ provider so retrieval actually understands meaning, and how the query side
 works.
 
 > **Embeddings are optional.** With no provider configured, search still works
-> using the bundled lexical FTS5/BM25 index — the vector signal is simply
-> skipped (`HybridSearchResult.backends_used` will not contain `"vector"`). Add
-> a provider to get semantic retrieval.
+> using the bundled lexical FTS5/BM25 index — the vector signal is skipped
+> (`HybridSearchResult.backends_used` will not contain `"vector"`) unless you
+> pass your own `query_vector` to `search_hybrid` for thoughts whose vectors you
+> stored with `store_embedding`. A provider plus `auto_embed=True` (new
+> thoughts are embedded on write) gives semantic retrieval without supplying
+> vectors yourself; otherwise store vectors yourself with `store_embedding`.
 
 ## Two things a provider gives you
 

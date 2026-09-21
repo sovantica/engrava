@@ -68,7 +68,7 @@ erroring when its prerequisite is missing. Work through this checklist:
 
 | If… | then… |
 |---|---|
-| No `embedding_provider` is configured | the **vector** signal is skipped — only FTS/priority run. A purely semantic query with no shared keywords may find nothing. |
+| No `embedding_provider` is configured (and you pass no `query_vector`) | the **vector** signal is skipped — only FTS/priority run. A purely semantic query with no shared keywords may find nothing. Passing your own `query_vector` re-enables the vector signal without a provider, for thoughts whose vectors you stored with `store_embedding`. |
 | You pass `query_text` but no provider and no `query_vector` | same as above — there is no vector to compare against. |
 | No explicit `current_cycle` or `recency_now`, and no configured `cycle_provider` | the **recency** signal is skipped because no recency reference is available. |
 | `recency_weight` is `0.0` | recency is disabled even when a cycle or transaction-time reference is available. |
