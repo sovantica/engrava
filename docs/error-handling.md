@@ -202,11 +202,12 @@ unchanged and assume that doing so re-embeds: an update that no longer changes
 
 `bulk_store()` is different. Source rows, journal entries, and batch-generated
 embeddings run inside one `suspend_auto_commit()` transaction. Called on its
-own, any `Exception` during that phase, including a provider exception, rolls
-the batch back and nothing from it is persisted. The `require_embedding` option
-controls whether that provider failure is wrapped as `EmbeddingGenerationError`;
-it does not change the rollback. Task cancellation is the `BaseException`
-caveat described under transaction contexts below.
+own, any exception during that phase, including a provider exception or a task
+cancellation, rolls the batch back and nothing from it is persisted. The
+`require_embedding` option controls whether that provider failure is wrapped as
+`EmbeddingGenerationError`; it does not change the rollback. The one window the
+rollback does not cover is a cancellation that lands during the final commit,
+described under transaction contexts below.
 
 Nested inside a caller's own `suspend_auto_commit()` window, the batch shares
 that outer transaction: a row error still aborts the batch's own inserts, but
@@ -233,8 +234,8 @@ listed under [Terminal connection quarantine](#terminal-connection-quarantine).
 ## Transaction context behavior
 
 `suspend_auto_commit()` groups writes on one store connection. A normal exit
-commits once; an `Exception` escaping the block causes a rollback and is
-re-raised.
+commits once; any exception escaping the block, including task cancellation,
+causes a rollback of the outermost transaction and is re-raised.
 
 ```python
 async def store_atomically(store, first, second, link):
@@ -259,11 +260,16 @@ Operational rules:
   for the full contract.
 - Automatic on-store derivation is skipped inside a caller-held transaction.
   After commit, invoke `derive_existing()` explicitly for sources that need it.
-- In v0.6, the rollback branch catches `Exception`; `asyncio.CancelledError` is a
-  `BaseException` and does not pass through that branch. If cancellation reaches
-  a suspended-commit window, close/discard that store connection before
-  continuing and reconcile the affected IDs from a new store. Do not let a later
-  commit decide the fate of an indeterminate transaction.
+- The rollback branch catches `BaseException`, so `asyncio.CancelledError`
+  (and `SystemExit` or `KeyboardInterrupt`) escaping the block body rolls the
+  outermost transaction back like any other error. The exception to that rule is
+  a cancellation that lands during the outermost window's own `commit()`: the
+  commit runs after the body has returned, outside the rollback branch, so it
+  may or may not have completed by the time the cancellation propagates. Treat
+  the outcome as indeterminate: reconcile the affected IDs from a new store
+  before repeating anything, and do not let a later commit decide it. See the
+  `suspend_auto_commit()` entry in the
+  [0.6 to 0.7 upgrade notes](upgrade.md#06---07) for the change.
 
 For the supported writer topology and task boundaries, see
 [Concurrency](concurrency.md).
