@@ -19,10 +19,14 @@ Engrava does not make every write idempotent.
 | `StaleDataError` | The guarded update matched no row — another guarded write bumped the row's `revision` in between, **or deleted the row**; **nothing** of the rejected update was written | Re-read, recompute the intended change, then issue a new update — and handle the row being gone | No, not without re-reading |
 | Remote embedding timeout, network error, `408`, `409`, `425`, `429`, or selected `5xx` | Depends on the operation; a single thought/update may already be committed | Let the provider exhaust its bounded retry policy, then reconcile by thought ID | Not the whole write blindly |
 | SQLite `OperationalError` containing `locked` or `busy` | The operation did not complete successfully; reconcile durable state when the write boundary is ambiguous | Reduce writer contention or increase `busy_timeout`; retry only an operation known to converge | Only with operation-specific proof |
+| `WriteContentionError` | The call could not get the cross-connection write lock, after `busy_timeout` and, for the dedup calls, the store's own bounded retries; the failed attempt wrote nothing | Retry the call; if it keeps recurring, remove the contention (see SQLite lock contention below) | Yes, the call itself |
+| `WriteLockTimeoutError` | A task could not get the store's in-process write lock within `write_lock_acquire_timeout_seconds`; the guarded write did not start | Find the cause first: a task spawned and awaited from inside another task's open `suspend_auto_commit()` window (drive writes from the one task that opened it), or a bound too small for a slow embedding provider (raise it) | Not until the cause is fixed |
+| `DedupLockReentryError` | A task re-entered the dedup window it already holds and was refused instead of blocking on itself | Fix the caller: an `update_thought()` override reached from `upsert_by_hash()`'s hit branch must not call back into a dedup entry point | No |
 | Rising `fts_match_failure_count` | Search retried with sanitized FTS syntax; the vector and other hybrid arms can still contribute | Inspect warning logs and offending queries | Engrava already retries the FTS arm once |
 | Rising `vector_arm_degradation_count` | The vector arm returned no results for an empty, zero, or non-finite query vector | Fix query embedding generation | No; the same vector degrades again |
 | `EmbeddingGenerationError` from single-item create/update | If this call owns its outermost transaction, the thought/update is committed; embedding is missing (create), or, only if the row already had one, left in place and now stale (update) — otherwise still none. Nested inside the caller's own `suspend_auto_commit()`, nothing is durable yet: the *outermost* window's exit decides, and rollback reverts to whatever existed when that outermost window opened, not just to before this call — an earlier write to the same thought inside the same window is undone too, and a thought created inside that window no longer exists at all after rollback | If this call owned its transaction: look up the thought and repair its embedding, do not recreate it. If it was nested and the outer window rolled back, do not assume based on which call you issued — look the thought up by id first: absent means nothing this window wrote for it survived, including an earlier create in the same window — create it; present means it reverted to whatever state existed before the window opened — reissue the write against that state (a blind create instead raises `ValueError` on the still-existing id) | Only when durable: retry embedding, not creation/update. Otherwise, look the thought up first and branch on what you find: create it if absent, or reissue the update if it is present — do not retry blindly based on which call you originally issued |
-| `JournalIntegrityError`, `ExtensionMigrationError` | Store opening or migration was rejected | Stop writes, preserve the files, diagnose or restore | No |
+| `JournalIntegrityError`, `ExtensionMigrationError`, `SchemaVersionError`, `CoreMigrationError` | Store opening or migration was rejected; `CoreMigrationError` leaves the schema version at the last fully applied step | Stop writes, preserve the files, diagnose or restore. For `SchemaVersionError`, read `reason`: `newer_than_head` needs a newer Engrava; for the two sub-floor reasons, do not delete or re-initialise the file (see below) | No |
+| `EngravaError` caught as the base class | Depends on the subclass; the base type says nothing about what committed | Handle the specific subclasses above first and put a base-class handler after them; treat anything that reaches it as unclassified | Not on the base type alone |
 | `ConnectionQuarantinedError` | The store instance is terminally unusable | Close it, create a new store over a fresh connection, then reconcile durable state | Never on the same store |
 
 ## Caller, data, and configuration errors
@@ -71,6 +75,21 @@ These failures require a changed request, not backoff:
   does catch are a write from a second store on the same file and a same-task
   nested write from a caller-owned hook — see
   [Concurrency](concurrency.md#optimistic-concurrency-and-staledataerror).
+- `WriteLockTimeoutError` and `DedupLockReentryError` are raised instead of a
+  hang. The first means a task waited longer than
+  `write_lock_acquire_timeout_seconds` for the store's write lock; the exception
+  alone does not say whether a task was spawned and awaited from inside another
+  task's open `suspend_auto_commit()` window (a caller bug: issue the window's
+  writes from the one task that opened it) or the bound is too small for a
+  slow embedding provider or large batch (raise it). The second means the same
+  task tried to enter the dedup window it already holds, typically an
+  `update_thought()` override reached from `upsert_by_hash()`'s hit branch that
+  calls back into `create_thought(deduplicate=True)`, `get_or_create()`,
+  `upsert_by_hash()` or `bulk_store(deduplicate=True)`. Repeating that call unchanged
+  cannot help; see
+  [Concurrency](concurrency.md#a-deadlock-this-store-cannot-resolve-raises-it-does-not-hang)
+  and
+  [Extension hooks](extension-hooks.md#1b3-a-pre-existing-restriction-update_thought-on-upsert_by_hashs-hit-branch).
 - `DerivedRecordError` means a producer violated a derivation gate or collided
   with an unrelated identity. The source thought is already durable on the
   automatic post-store path; some earlier derived children may also be durable.
@@ -79,6 +98,34 @@ These failures require a changed request, not backoff:
 not caller mistakes. Do not keep opening the same files in a write-capable
 process. Preserve the database and WAL files, inspect the reported sequence or
 migration, and follow [Backup & Recovery](backup-and-recovery.md).
+
+`SchemaVersionError` and `CoreMigrationError` are the same kind of failure,
+raised by `ensure_schema()` and so by `from_config()`,
+`EngravaManager.get_store()`, and `engrava migrate`. `SchemaVersionError`
+carries `current_version` and a `reason`:
+
+- `newer_than_head`: the file was written by a newer Engrava. `engrava migrate`
+  cannot help; upgrade Engrava before opening it.
+- `populated_sub_floor` and `stale_shape_sub_floor`: the file is stamped below
+  the bootstrap floor and this build cannot tell which older version produced
+  it, so it refuses instead of stamping it current. Do not delete or
+  re-initialise it — even when no core table holds a row, it may carry data
+  outside the core tables — preserve it and follow Backup & Recovery.
+
+`CoreMigrationError` means a migration step returned without leaving the
+structure it targets (a column, table, index, foreign key, or trigger) in place.
+The version is not stamped past the last fully applied step, so the next
+`ensure_schema()` retries the remaining steps rather than treating a
+half-migrated file as current; repeating the open without changing anything is
+not a fix. Replace the database from a backup, or use a build that matches its
+schema history.
+
+`EngravaError` is the base of every typed error above except `ConfigError`,
+which derives from `ValueError`. It is not raised directly and carries no
+guarantee about what committed, so a handler for it belongs after the specific
+ones: Python runs the first `except` clause that matches, and a base-class
+clause written first hides the specific recovery below it. A raw
+`sqlite3.OperationalError` is not an `EngravaError` either.
 
 The complete exception surface is listed in the
 [API Reference](api-reference.md#exceptions).
@@ -251,8 +298,10 @@ Operational rules:
   normally tells the context manager to commit.
 - `suspend_auto_commit()` holds a task-reentrant lock for its whole duration: a
   *different* task's write on the same store instance now waits for the window
-  to close instead of joining its transaction, and nesting on the *same* task
-  is supported (only the outermost call commits or rolls back). Drive the
+  to close instead of joining its transaction (a wait that is bounded: past
+  `write_lock_acquire_timeout_seconds` it raises `WriteLockTimeoutError`), and
+  nesting on the *same* task is supported (only the outermost call commits or
+  rolls back). Drive the
   window from one task at a time regardless — a second task's write is safe
   from corruption, but it still simply waits, so interleaving unrelated writes
   through a long-running window serialises them for no benefit. See
@@ -281,6 +330,15 @@ SQLite permits many readers but only one writer. Stores opened through
 `PRAGMA busy_timeout=5000`, so a competing connection waits for up to five
 seconds before surfacing `database is locked`. A manually supplied connection
 keeps its own pragma settings.
+
+`create_thought(deduplicate=True)`, `get_or_create()`, `upsert_by_hash()`,
+`bulk_store(deduplicate=True)` and the `revision`-guarded updates
+(`update_thought`, `restore_thought`, `update_edge`, `update_action`) convert
+contention that outlasts `busy_timeout` into `WriteContentionError`, carrying
+`operation` and `attempts`; from `bulk_store` the `operation` reads
+`"create_thought"`, the shared dedup path's label. The failed attempt wrote
+nothing, so retrying that call outright is safe. Other write
+paths can still surface the raw `OperationalError` from the table above.
 
 Prefer removing contention over adding a generic retry loop:
 
