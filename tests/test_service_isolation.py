@@ -1803,6 +1803,215 @@ class TestGetStoreConcurrency:
             await mgr.close_all()
 
 
+class TestManagerLifecycleLockOrdering:
+    """``get_store``, ``delete_service`` and ``close_all`` share one lock.
+
+    Before this fix, ``get_store`` was the only one of the three that ever
+    took ``self._lock`` -- ``delete_service`` and ``close_all`` touched
+    ``self._stores`` (and, for delete, the filesystem) with no coordination
+    at all. Each test below barrier-controls one of the three pairwise
+    overlaps this exposed, using the same started/may-finish ``asyncio.Event``
+    technique the existing cancellation tests above use, so the interleaving
+    is deterministic rather than timing-dependent.
+    """
+
+    async def test_create_vs_close_all_closes_the_in_flight_store(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``close_all`` must not finish while a same-named creation is in flight.
+
+        Before this fix, ``close_all`` never looked at an in-flight
+        creation at all: if ``get_store`` was suspended between opening the
+        connection and inserting it into the cache, ``close_all`` would run
+        to completion first, and the connection created afterward was never
+        closed -- it outlived shutdown. Now ``close_all`` snapshots
+        ``_creating`` under the lock and waits for anything captured there
+        to land before it can return, so the store this test stalls
+        mid-creation is guaranteed to be closed by the time both calls
+        finish, regardless of which one is "first".
+        """
+        data_dir = tmp_path / "lock-create-close"
+        mgr = EngravaManager(data_dir=data_dir)
+
+        started = asyncio.Event()
+        may_finish = asyncio.Event()
+        real_ensure_schema = SqliteEngravaCore.ensure_schema
+
+        async def _stalled_ensure_schema(
+            self: SqliteEngravaCore, *args: object, **kwargs: object
+        ) -> None:
+            started.set()
+            await may_finish.wait()
+            await real_ensure_schema(self, *args, **kwargs)
+
+        monkeypatch.setattr(SqliteEngravaCore, "ensure_schema", _stalled_ensure_schema)
+
+        create_task = asyncio.create_task(mgr.get_store("stalled"))
+        await started.wait()
+
+        close_task = asyncio.create_task(mgr.close_all())
+        # Give close_all() a chance to take its snapshot of the in-flight
+        # creation (pure scheduler yields, no wall-clock race: the creation
+        # itself cannot proceed past `may_finish.wait()` regardless of how
+        # many turns this takes).
+        for _ in range(10):
+            await asyncio.sleep(0)
+        may_finish.set()
+
+        store = await create_task
+        await close_task
+
+        assert store is not None
+        assert mgr._stores == {}, "close_all must not leave the in-flight store cached"
+        db_path = data_dir / "stalled.db"
+        assert db_path.exists(), "the store's schema was written before its connection closed"
+
+        deadline = time.monotonic() + 2.0
+        while store._db._thread.is_alive() and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+        assert not store._db._thread.is_alive(), (
+            "close_all must close a store whose creation was already in "
+            "flight when it started -- otherwise its connection (and its "
+            "non-daemon worker thread) outlives shutdown"
+        )
+
+    async def test_create_vs_delete_never_unlinks_a_file_mid_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``delete_service`` must not race a same-named creation's file write.
+
+        Before this fix, ``delete_service`` checked
+        ``if name in self._stores`` with no lock at all: while a same-named
+        ``_create_store`` was mid-flight (already holding the file open and
+        writing its schema, but not yet in the cache), ``delete_service``
+        would see "not cached", conclude the database already exists as a
+        finished file, and unlink it out from under the write in progress.
+        Now ``delete_service`` sees the in-flight creation in ``_creating``
+        and waits for it to land before it re-checks, so the file it
+        unlinks is always the one the finished creation actually wrote.
+        """
+        data_dir = tmp_path / "lock-create-delete"
+        mgr = EngravaManager(data_dir=data_dir)
+
+        started = asyncio.Event()
+        may_finish = asyncio.Event()
+        real_ensure_schema = SqliteEngravaCore.ensure_schema
+
+        async def _stalled_ensure_schema(
+            self: SqliteEngravaCore, *args: object, **kwargs: object
+        ) -> None:
+            started.set()
+            await may_finish.wait()
+            await real_ensure_schema(self, *args, **kwargs)
+
+        monkeypatch.setattr(SqliteEngravaCore, "ensure_schema", _stalled_ensure_schema)
+
+        create_task = asyncio.create_task(mgr.get_store("stalled"))
+        await started.wait()
+
+        delete_task = asyncio.create_task(mgr.delete_service("stalled"))
+        # Give delete_service() a chance to observe the in-flight creation
+        # and start waiting on it (pure scheduler yields -- the creation
+        # itself is still held at `may_finish.wait()`).
+        for _ in range(10):
+            await asyncio.sleep(0)
+        may_finish.set()
+
+        store = await create_task
+        await delete_task  # must not raise FileNotFoundError
+
+        assert store is not None
+        assert mgr._stores == {}, "delete_service must remove the store it deleted from the cache"
+        db_path = data_dir / "stalled.db"
+        assert not db_path.exists(), (
+            "delete_service must delete the file the creation actually wrote"
+        )
+        for suffix in (".db-wal", ".db-shm"):
+            assert not db_path.with_suffix(suffix).exists()
+
+        deadline = time.monotonic() + 2.0
+        while store._db._thread.is_alive() and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+        assert not store._db._thread.is_alive(), (
+            "delete_service must close the connection it deletes the file for"
+        )
+
+    async def test_close_all_does_not_block_creation_of_a_different_service(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Closing one cached store must not corrupt or block another's creation.
+
+        Before this fix, ``close_all`` iterated ``self._stores.items()``
+        directly with no snapshot: an insertion into ``self._stores`` from
+        a concurrent ``get_store()`` call for a different name, landing
+        during an ``await store.close()`` in that loop, raised
+        ``RuntimeError: dictionary changed size during iteration`` on the
+        next iteration step. This stalls the *close* of an already-cached
+        store and, while that close is still in flight, creates a second,
+        unrelated service -- asserting both that no ``RuntimeError`` occurs
+        and that the second service ends up fully alive and cached
+        afterward, untouched by the close of the first.
+        """
+        data_dir = tmp_path / "lock-close-create"
+        mgr = EngravaManager(data_dir=data_dir)
+        store_first = await mgr.get_store("first")
+
+        close_started = asyncio.Event()
+        may_finish_close = asyncio.Event()
+        real_close = store_first.close
+
+        async def _stalled_close() -> None:
+            close_started.set()
+            await may_finish_close.wait()
+            await real_close()
+
+        monkeypatch.setattr(store_first, "close", _stalled_close)
+
+        close_task = asyncio.create_task(mgr.close_all())
+        await close_started.wait()
+
+        # "first" is still mid-close here. Creating an unrelated second
+        # service must succeed on its own, without waiting for close_all()
+        # and without raising from close_all()'s snapshot loop.
+        store_second = await mgr.get_store("second")
+
+        may_finish_close.set()
+        await close_task  # must not raise
+
+        assert store_second is not None
+        assert mgr._stores == {"second": store_second}, (
+            "close_all must drop only the store it closed, leaving a "
+            "concurrently created, unrelated service cached"
+        )
+        assert (data_dir / "first.db").exists(), "close_all does not delete database files"
+        assert (data_dir / "second.db").exists()
+
+        deadline = time.monotonic() + 2.0
+        while store_first._db._thread.is_alive() and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+        assert not store_first._db._thread.is_alive(), "close_all must still close the first store"
+        assert store_second._db._thread.is_alive(), (
+            "the concurrently created second store must survive this close_all call"
+        )
+
+        # "second" surviving the first close_all() call is the assertion
+        # above -- but a live, non-daemon worker thread left running past
+        # this test's own teardown is a real leak regardless: nothing else
+        # in this test closes it, and without an explicit close here it
+        # keeps running until whenever the cyclic garbage collector gets to
+        # the connection object, which can land during a later, unrelated
+        # test. Close it through the manager's normal (unpatched) path --
+        # the stalled `close` was set on `store_first`, not `store_second`
+        # -- and wait for the thread to actually exit before returning.
+        await mgr.close_all()
+        deadline = time.monotonic() + 2.0
+        while store_second._db._thread.is_alive() and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+        assert not store_second._db._thread.is_alive(), (
+            "the second store's connection must not outlive this test"
+        )
+
+
 class TestDefaultServiceFromConfig:
     """Fix 4: CLI resolves default_service from engrava.yaml."""
 
