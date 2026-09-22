@@ -1995,6 +1995,114 @@ async def _reset_sqlite_vec_index_for_restore(conn: aiosqlite.Connection) -> Non
     await conn.execute("DROP TABLE embedding_vec")
 
 
+async def _stale_embedding_rowids_before_replace(
+    conn: aiosqlite.Connection,
+    record: TableRecord,
+) -> list[int]:
+    """Return ``embedding`` rowids one incoming record's own insert is about to destroy.
+
+    An ordinary merge restore inserts every record with ``INSERT OR REPLACE``.
+    Two of those replacements destroy an existing ``embedding`` row without
+    routing through :func:`_reset_sqlite_vec_index_for_restore` (that helper
+    only runs for ``--clear``/``--re-embed``): replacing a ``thought`` whose
+    id already exists cascade-deletes every ``embedding`` row it owns, and
+    replacing an ``embedding`` row that collides on its own ``embedding_id``
+    deletes-then-reinserts it directly. Either way the destroyed row's rowid
+    is freed, and SQLite is then free to hand that same rowid to a later
+    ``embedding`` insert in this same restore -- at which point a vec0 entry
+    still keyed to the old rowid would silently resolve to the new row.
+
+    Must be called *before* the record that does the replacing is inserted --
+    once it runs, the row this looks up is already gone.
+
+    Args:
+        conn: Restore connection with an active transaction.
+        record: The about-to-be-inserted record that may replace an existing
+            row (only ``thought`` and ``embedding`` records ever do).
+
+    Returns:
+        The rowids of ``embedding`` rows this insert is about to destroy,
+        empty when the record introduces no collision (the common case).
+
+    """
+    if record.spec.table is CoreTable.THOUGHT:
+        thought_id = record.data.get("thought_id")
+        if not isinstance(thought_id, str):
+            return []
+        cursor = await conn.execute(
+            "SELECT rowid FROM embedding WHERE owner_type = 'THOUGHT' AND owner_id = ?",
+            (thought_id,),
+        )
+    elif record.spec.table is CoreTable.EMBEDDING:
+        embedding_id = record.data.get("embedding_id")
+        if not isinstance(embedding_id, str):
+            return []
+        cursor = await conn.execute(
+            "SELECT rowid FROM embedding WHERE embedding_id = ?",
+            (embedding_id,),
+        )
+    else:
+        return []
+    rows = await cursor.fetchall()
+    return [int(row[0]) for row in rows]
+
+
+async def _refresh_sqlite_vec_for_replaced_rows(
+    conn: aiosqlite.Connection,
+    rowids: frozenset[int],
+) -> None:
+    """Purge vec0 entries at rowids an ordinary merge restore just replaced.
+
+    Complements :func:`_reset_sqlite_vec_index_for_restore`, which handles
+    ``--clear``/``--re-embed`` by dropping the whole index. An ordinary merge
+    never drops it, but it can still replace an existing ``embedding`` row
+    (directly, or by cascade-deleting it off a replaced ``thought``) and have
+    a later insert in the same restore land on the freed rowid -- see
+    :func:`_stale_embedding_rowids_before_replace`. ``embedding_vec`` is
+    keyed by rowid, and :meth:`SqliteVecSearchBackend.sync_embeddings`'s
+    startup reconciliation only backfills a rowid that is entirely *absent*
+    from it, never one that is merely stale, so a vec0 entry left behind
+    under a reused rowid would keep resolving search hits to the wrong
+    vector forever.
+
+    Deleting exactly these rowids here, inside the same restore transaction,
+    makes each one absent again by the time this transaction commits, so the
+    next sqlite-vec-enabled open's reconciliation treats it as missing and
+    backfills it from the ``embedding`` table's current row -- the
+    replacement's own vector, never the one it displaced.
+
+    Args:
+        conn: Restore connection with an active transaction.
+        rowids: Rowids of ``embedding`` rows this restore replaced or
+            cascade-deleted, collected before each replacing insert. A no-op
+            when empty, which is the common case.
+
+    Raises:
+        click.ClickException: If a persisted vec0 index exists but sqlite-vec
+            cannot be loaded to refresh it safely.
+
+    """
+    if not rowids:
+        return
+    if not await _has_persisted_vector_index(conn):
+        return
+
+    from engrava.infrastructure.sqlite.vector_sqlite_vec import load_sqlite_vec  # noqa: PLC0415
+
+    if not await load_sqlite_vec(conn):
+        msg = (
+            "Restore replaced embedding rows covered by an existing sqlite-vec "
+            "index but could not load sqlite-vec to refresh it safely. Install "
+            "'engrava[vec]' and retry."
+        )
+        raise click.ClickException(msg)
+    placeholders = ",".join("?" * len(rowids))
+    await conn.execute(
+        f"DELETE FROM embedding_vec WHERE rowid IN ({placeholders})",  # noqa: S608
+        tuple(rowids),
+    )
+
+
 async def _insert_record(
     conn: aiosqlite.Connection,
     record: TableRecord,
@@ -2077,6 +2185,39 @@ async def _insert_record_under_gate(
         raise
 
 
+async def _insert_record_tracking_replacement(
+    conn: aiosqlite.Connection,
+    record: TableRecord,
+    *,
+    plain_insert: bool,
+    replaced_rowids: set[int],
+) -> None:
+    """Insert one record, first recording any ``embedding`` rowid it is about to replace.
+
+    Thin wrapper around :func:`_insert_record_under_gate` that exists only to
+    keep the pre-insert lookup out of :func:`_stream_insert`'s already-long
+    loop body. Under ``plain_insert`` a collision is refused outright (see
+    :func:`_insert_record_under_gate`) rather than replacing anything, so
+    there is nothing to look up in that case.
+
+    Args:
+        conn: Open aiosqlite connection.
+        record: A validated core-table record about to be inserted.
+        plain_insert: See :func:`_insert_record`.
+        replaced_rowids: Mutated in place with the rowids of any ``embedding``
+            row this record's own insert is about to destroy -- see
+            :func:`_stale_embedding_rowids_before_replace`.
+
+    Raises:
+        click.ClickException: If ``plain_insert`` is set and the record
+            collides on a primary key or ``UNIQUE`` constraint.
+
+    """
+    if not plain_insert:
+        replaced_rowids.update(await _stale_embedding_rowids_before_replace(conn, record))
+    await _insert_record_under_gate(conn, record, plain_insert=plain_insert)
+
+
 def _journal_gate_collision_error(line_number: int) -> click.ClickException:
     """Describe a refused collision under the journalled-merge collision gate.
 
@@ -2098,6 +2239,25 @@ def _journal_gate_collision_error(line_number: int) -> click.ClickException:
     return click.ClickException(msg)
 
 
+@dataclass(frozen=True, slots=True)
+class StreamInsertResult:
+    """Outcome of one streaming pass over a snapshot's records.
+
+    Attributes:
+        total_records: Total number of records written (inserts plus
+            re-embeddings).
+        replaced_embedding_rowids: Rowids of ``embedding`` rows this pass
+            replaced or cascade-deleted -- directly, or by replacing the
+            ``thought`` that owned them -- collected so the caller can refresh
+            any persisted vec0 entry still keyed to one of them. Empty for
+            the overwhelmingly common restore that replaces nothing.
+
+    """
+
+    total_records: int
+    replaced_embedding_rowids: frozenset[int]
+
+
 async def _stream_insert(
     conn: aiosqlite.Connection,
     input_path: Path,
@@ -2106,7 +2266,7 @@ async def _stream_insert(
     re_embed: bool,
     embedding_provider: EmbeddingProviderProtocol | None,
     plain_insert: bool,
-) -> int:
+) -> StreamInsertResult:
     """Stream a snapshot once, validating and inserting each record in order.
 
     Each record is fully validated -- structure and values -- immediately before
@@ -2144,7 +2304,8 @@ async def _stream_insert(
             than silently replacing (or cascade-deleting) the existing row.
 
     Returns:
-        Total number of records written (inserts plus re-embeddings).
+        The total records written and the ``embedding`` rowids this pass
+        replaced (see :class:`StreamInsertResult`).
 
     Raises:
         click.ClickException: On a malformed record, an invalid value, an
@@ -2158,6 +2319,7 @@ async def _stream_insert(
     total = 0
     reembedded = 0
     reembed_batch: list[str] = []
+    replaced_rowids: set[int] = set()
 
     (
         identity_reference,
@@ -2178,7 +2340,9 @@ async def _stream_insert(
                 record, identity_reference, identity_reference_label
             )
 
-        await _insert_record_under_gate(conn, record, plain_insert=plain_insert)
+        await _insert_record_tracking_replacement(
+            conn, record, plain_insert=plain_insert, replaced_rowids=replaced_rowids
+        )
         total += 1
 
         tid = _reembed_id(record, re_embed=re_embed, embedding_provider=embedding_provider)
@@ -2202,7 +2366,9 @@ async def _stream_insert(
     await _finalize_embedding_identity(
         conn, may_adopt_identity=may_adopt_identity, identity_reference=identity_reference
     )
-    return total
+    return StreamInsertResult(
+        total_records=total, replaced_embedding_rowids=frozenset(replaced_rowids)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2368,7 +2534,7 @@ async def _import_records_to_db(
         plain_insert = (
             not clear and not orphan_journal_entries and await _journal_entry_has_rows(conn)
         )
-        total = await _stream_insert(
+        stream_result = await _stream_insert(
             conn,
             input_path,
             skip_embeddings=skip_embeddings,
@@ -2376,6 +2542,12 @@ async def _import_records_to_db(
             embedding_provider=embedding_provider,
             plain_insert=plain_insert,
         )
+        total = stream_result.total_records
+        # Ordinary merge never drops the vec0 index the way clear/re_embed do
+        # (via _reset_sqlite_vec_index_for_restore above), but it can still
+        # have replaced embedding rows whose freed rowid a later insert in
+        # this same pass reused -- refresh exactly those before committing.
+        await _refresh_sqlite_vec_for_replaced_rows(conn, stream_result.replaced_embedding_rowids)
         await conn.commit()
     except BaseException:
         # Any validation or insert failure -- or a failure in the commit

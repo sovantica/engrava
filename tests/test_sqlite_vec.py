@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import importlib.util
+import json
 import sqlite3
 import struct
 from pathlib import Path
@@ -12,6 +14,7 @@ import aiosqlite
 import pytest
 
 from engrava import EmbeddingProviderContractError
+from engrava.cli.main import _import_records_to_db
 from engrava.config import ConfigError, EngravaConfig
 from engrava.domain.enums import LifecycleStatus, Priority, ThoughtType
 from engrava.domain.models.thought import ThoughtRecord
@@ -1424,3 +1427,218 @@ class TestVectorBackendSelectionUsesTheValidatedName:
                 await manager.get_store("svc")
         finally:
             await manager.close_all()
+
+
+# ------------------------------------------------------------------
+# Merge restore must not leave a stale vec0 vector under a reused rowid.
+# ------------------------------------------------------------------
+
+
+def _thought_replace_line(thought_id: str, *, essence: str) -> str:
+    """Serialise a ``thought`` snapshot line that replaces an existing row."""
+    return json.dumps(
+        {
+            "_type": "thought",
+            "data": {
+                "thought_id": thought_id,
+                "thought_type": "OBSERVATION",
+                "essence": essence,
+                "content": f"content {thought_id}",
+                "priority": "P3",
+            },
+        }
+    )
+
+
+def _embedding_snapshot_line(
+    embedding_id: str,
+    owner_id: str,
+    model_name: str,
+    vector: list[float],
+) -> str:
+    """Serialise an ``embedding`` snapshot line carrying an explicit vector."""
+    blob = struct.pack(f"{len(vector)}f", *vector)
+    return json.dumps(
+        {
+            "_type": "embedding",
+            "data": {
+                "embedding_id": embedding_id,
+                "owner_type": "THOUGHT",
+                "owner_id": owner_id,
+                "model_name": model_name,
+                "dimension": len(vector),
+                "vector_blob": base64.b64encode(blob).decode("ascii"),
+                "created_at": "2026-01-01T00:00:00+00:00",
+            },
+        }
+    )
+
+
+@sqlite_vec_required
+class TestMergeRestoreDoesNotLeaveAStaleVectorUnderAReusedRowid:
+    """Regression: a restored row's vector must be its own.
+
+    Ordinary merge restore (no ``--clear``/``--re-embed``) never resets the
+    vec0 index -- only those two flags route through
+    ``_reset_sqlite_vec_index_for_restore``. In an unjournalled target,
+    replacing an embedded thought cascade-deletes its old ``embedding`` row,
+    freeing its rowid; the incoming replacement embedding can land on that
+    same freed rowid. Before the fix, the old vec0 entry at that rowid was
+    never invalidated, so it kept winning search under the new row's
+    identity. This builds that exact scenario against a real sqlite-vec
+    backend and shows which vector wins after a reopen.
+    """
+
+    async def _build_target_with_one_embedded_thought(
+        self,
+        tmp_path: Path,
+        *,
+        model_name: str,
+        vector: list[float],
+    ) -> Path:
+        """Build a target db with one thought and its vec0-indexed embedding."""
+        db_path = tmp_path / "target.db"
+        db = await aiosqlite.connect(str(db_path))
+        db.row_factory = aiosqlite.Row
+        try:
+            await db.execute("PRAGMA foreign_keys = ON")
+            store = SqliteEngravaCore(db)
+            store._owns_connection = True
+            await store.ensure_schema()
+            await store._configure_vector_backend(
+                backend_name="sqlite-vec", embedding_dimension=len(vector)
+            )
+            assert isinstance(store._vector_backend, SqliteVecSearchBackend)
+            await _make_thought(store, "t-x")
+            await store.store_embedding(thought_id="t-x", vector=vector, model_name=model_name)
+        finally:
+            await store.close()
+        return db_path
+
+    async def _embedding_rowid_for_owner(self, db_path: Path, *, owner_id: str) -> int:
+        """Return the (sole) ``embedding`` rowid owned by a thought.
+
+        Looked up by ``owner_id`` rather than ``embedding_id``: the point of
+        this whole scenario is that the *embedding_id changes* across the
+        replace while the underlying rowid is what may (or may not) get
+        reused, so asserting on rowid-by-owner is what actually exercises
+        the defect.
+        """
+        conn = await aiosqlite.connect(str(db_path))
+        try:
+            cursor = await conn.execute(
+                "SELECT rowid FROM embedding WHERE owner_type = 'THOUGHT' AND owner_id = ?",
+                (owner_id,),
+            )
+            row = await cursor.fetchone()
+        finally:
+            await conn.close()
+        assert row is not None
+        return int(row[0])
+
+    async def test_restored_rows_own_vector_wins_after_reopen(self, tmp_path: Path) -> None:
+        """The exact scenario: forced rowid reuse via a merge restore.
+
+        Pre-fix this fails: the old vector (``old_vector``) keeps winning a
+        search for itself even though the target thought's embedding was
+        replaced, and a search for the new vector (``new_vector``) does not
+        find a perfect match at all. Post-fix, the reverse holds.
+        """
+        model_name = _PARITY_MODEL
+        old_vector = [1.0, 0.0, 0.0]
+        new_vector = [0.0, 1.0, 0.0]
+
+        target = await self._build_target_with_one_embedded_thought(
+            tmp_path, model_name=model_name, vector=old_vector
+        )
+        old_rowid = await self._embedding_rowid_for_owner(target, owner_id="t-x")
+
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_replace_line("t-x", essence="replaced")
+            + "\n"
+            + _embedding_snapshot_line("e-new", "t-x", model_name, new_vector)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        conn = await aiosqlite.connect(str(target))
+        conn.row_factory = aiosqlite.Row
+        try:
+            await conn.execute("PRAGMA foreign_keys = ON")
+            await _import_records_to_db(conn, snap)
+        finally:
+            await conn.close()
+
+        # Confirm the mechanism actually fired: the replacement embedding
+        # landed on the exact rowid the old one held. If this assertion ever
+        # fails, SQLite's rowid-reuse behaviour changed and the rest of this
+        # test no longer exercises the defect.
+        new_rowid = await self._embedding_rowid_for_owner(target, owner_id="t-x")
+        assert new_rowid == old_rowid
+
+        # Reopen -- this is where the sqlite-vec reconciliation pass runs.
+        db = await aiosqlite.connect(str(target))
+        db.row_factory = aiosqlite.Row
+        try:
+            await db.execute("PRAGMA foreign_keys = ON")
+            store = SqliteEngravaCore(db)
+            store._owns_connection = True
+            await store._configure_vector_backend(backend_name="sqlite-vec", embedding_dimension=3)
+            old_query_hit = await store.search_similar(old_vector, top_k=1)
+            new_query_hit = await store.search_similar(new_vector, top_k=1)
+        finally:
+            await store.close()
+
+        # The restored row's own vector must win: a query for the new vector
+        # is a perfect match, a query for the vector it replaced is not.
+        assert new_query_hit, "search for the replacement vector returned nothing"
+        assert new_query_hit[0][0] == "t-x"
+        assert new_query_hit[0][1] == pytest.approx(1.0, abs=1e-6)
+        assert old_query_hit, "search for the old vector returned nothing"
+        assert old_query_hit[0][1] == pytest.approx(0.0, abs=1e-6)
+
+    async def test_unrelated_merge_leaves_an_untouched_vector_alone(self, tmp_path: Path) -> None:
+        """A merge that replaces nothing must not purge any existing vector.
+
+        Guards against an overly broad fix: only rowids this restore actually
+        replaced should ever be touched.
+        """
+        model_name = _PARITY_MODEL
+        vector = [1.0, 0.0, 0.0]
+
+        target = await self._build_target_with_one_embedded_thought(
+            tmp_path, model_name=model_name, vector=vector
+        )
+
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_replace_line("t-y", essence="unrelated")
+            + "\n"
+            + _embedding_snapshot_line("e-y", "t-y", model_name, [0.0, 0.0, 1.0])
+            + "\n",
+            encoding="utf-8",
+        )
+
+        conn = await aiosqlite.connect(str(target))
+        conn.row_factory = aiosqlite.Row
+        try:
+            await conn.execute("PRAGMA foreign_keys = ON")
+            await _import_records_to_db(conn, snap)
+        finally:
+            await conn.close()
+
+        db = await aiosqlite.connect(str(target))
+        db.row_factory = aiosqlite.Row
+        try:
+            await db.execute("PRAGMA foreign_keys = ON")
+            store = SqliteEngravaCore(db)
+            store._owns_connection = True
+            await store._configure_vector_backend(backend_name="sqlite-vec", embedding_dimension=3)
+            hit = await store.search_similar(vector, top_k=1)
+        finally:
+            await store.close()
+
+        assert hit
+        assert hit[0][0] == "t-x"
+        assert hit[0][1] == pytest.approx(1.0, abs=1e-6)
