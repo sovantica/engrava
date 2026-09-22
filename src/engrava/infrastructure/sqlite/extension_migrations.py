@@ -746,6 +746,10 @@ class ExtensionMigrationRunner:
             ExtensionMigrationError: If the recorded legacy version exceeds the
                 number of declared migration files (downgrade), or a baseline
                 file cannot be read.
+            asyncio.CancelledError: If cancelled while the backfill's savepoint
+                is open. The savepoint is rolled back first, exactly as for a
+                backfill failure, and the cancellation then propagates
+                unwrapped so the caller's own cancellation handling still runs.
 
         """
         cursor = await db.execute(
@@ -792,10 +796,23 @@ class ExtensionMigrationRunner:
                     ),
                 )
             await db.execute(f"RELEASE SAVEPOINT {savepoint}")
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
+            # Roll the failed backfill back; suppress any secondary cleanup
+            # error so the typed migration error (or, for a cancellation, the
+            # cancellation itself) is what surfaces to the caller.
+            # ``asyncio.CancelledError`` is a ``BaseException`` subclass (not
+            # ``Exception``, since Python 3.8), so it is named explicitly here
+            # rather than relying on a bare ``except:`` -- that would also
+            # swallow ``SystemExit``/``KeyboardInterrupt``, which must keep
+            # propagating unimpeded.
             with contextlib.suppress(Exception):
                 await db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                 await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            if isinstance(exc, asyncio.CancelledError):
+                # Not a backfill failure -- the savepoint is unwound the same
+                # way, but the cancellation itself propagates unwrapped so the
+                # caller's own cancellation handling still runs.
+                raise
             msg = f"Failed to adopt legacy migration history: {exc}"
             raise ExtensionMigrationError(manifest.name, msg) from exc
         await db.commit()
