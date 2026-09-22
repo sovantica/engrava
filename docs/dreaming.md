@@ -588,6 +588,17 @@ yield a new REFLECTION.
 Re-running `run_consolidation()` on unchanged data creates zero
 duplicate REFLECTIONs.
 
+### Recovery from a failed embedding
+
+REFLECTION creation embeds the synthesis text itself (when the store has
+auto-embed configured) before the extension stores its own centroid vector.
+If that embedding attempt fails — a transient provider timeout, a rate
+limit — the attempt is rolled back in full: no REFLECTION, no centroid, no
+`CONSOLIDATED_FROM` edges are left behind for that cluster. The cluster's
+content-hash is therefore never recorded either, so the next consolidation
+pass processes it exactly like it was never attempted, rather than skipping
+it as "already exists" forever.
+
 ### Configuration
 
 ```yaml

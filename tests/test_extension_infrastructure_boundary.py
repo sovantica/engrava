@@ -73,6 +73,7 @@ _DREAMING_STORE_CAPABILITIES = {
     "count_thoughts",
     "create_edge",
     "create_thought",
+    "delete_thought",
     "get_edges",
     "get_embedding",
     "get_thought",

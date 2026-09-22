@@ -1494,7 +1494,34 @@ class DreamingExtension:
                 try:
                     await store.create_thought(reflection)
                 except Exception:  # noqa: BLE001
-                    logger.debug("Could not create reflection thought %s", reflection_id)
+                    # By the time create_thought can fail here (most often
+                    # the provider call behind auto-embed), its row can
+                    # already be inserted-but-not-yet-durable: this whole
+                    # pass runs inside the suspend_auto_commit() window
+                    # opened above, so nothing commits until that window's
+                    # own clean exit -- and catching the failure here, then
+                    # continuing to the next cluster, is exactly what keeps
+                    # it clean. Left at that, the eventual commit would still
+                    # make the half-written REFLECTION (no centroid, no
+                    # CONSOLIDATED_FROM edges) durable, and its now-persisted
+                    # source hash would make every future pass skip the
+                    # cluster as "already handled" forever. Undo the partial
+                    # insert explicitly instead, so a failed attempt leaves
+                    # nothing durable behind and the next pass re-attempts
+                    # the same cluster from a clean slate.
+                    logger.debug(
+                        "Could not create reflection thought %s; rolling back",
+                        reflection_id,
+                    )
+                    try:
+                        await store.delete_thought(reflection_id)
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "Could not roll back partially created reflection "
+                            "%s after a failed create_thought; it may be left "
+                            "incomplete",
+                            reflection_id,
+                        )
                     continue
 
                 # --- Store centroid embedding ---

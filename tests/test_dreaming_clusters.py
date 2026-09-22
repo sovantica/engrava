@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any
 import aiosqlite
 import pytest
 
-from engrava import SqliteEngravaCore
+from engrava import CallbackProvider, SqliteEngravaCore
 from engrava.config import (
     DreamingConfig,
     DreamingGates,
@@ -544,6 +544,95 @@ class TestCreateReflections:
         emb = await store.get_embedding(reflections[0].thought_id)
         assert emb is not None
         assert emb.dimension == 3
+
+
+class TestReflectionEmbeddingFailureRecovery:
+    """A transient embedding failure must not permanently strand a REFLECTION.
+
+    Regression coverage: a REFLECTION's own auto-embed can fail (provider
+    timeout, rate limit, ...) after ``create_thought`` has already inserted
+    its row inside the consolidation pass's ``suspend_auto_commit()``
+    window. The failed attempt must leave nothing durable behind, so the
+    next pass over the same cluster starts clean rather than finding an
+    already-materialised source hash and skipping it forever.
+    """
+
+    async def test_failed_embed_leaves_no_incomplete_reflection(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A provider failure while creating a REFLECTION is fully undone."""
+
+        class _ProviderHealth:
+            healthy = True
+
+        health = _ProviderHealth()
+
+        def _flaky_embed(text: str) -> list[float]:
+            # The REFLECTION's own embed input always starts with its
+            # essence ("REFLECTION [...]"); member thoughts' essences
+            # ("concept A" / "concept A related") never do, so this only
+            # ever targets the reflection's own embedding attempt.
+            if text.startswith("REFLECTION") and not health.healthy:
+                msg = "simulated transient embedding provider failure"
+                raise RuntimeError(msg)
+            return [float(len(text) % 7) / 7.0] * 4
+
+        provider = CallbackProvider(
+            callback=_flaky_embed,
+            dimension=4,
+            model_name="flaky-test",
+        )
+        db = await aiosqlite.connect(str(tmp_path / "embed-fail.db"))
+        db.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(db, embedding_provider=provider, auto_embed=True)
+        await store.ensure_schema()
+        try:
+            # Source thoughts embed successfully -- the provider is healthy
+            # at this point.
+            t1 = await store.create_thought(_make("t-fail-1", essence="concept A"))
+            t2 = await store.create_thought(
+                _make("t-fail-2", essence="concept A related"),
+            )
+            cluster = frozenset([t1.thought_id, t2.thought_id])
+            ext = DreamingExtension(config=_reflection_cfg())
+
+            # RED behaviour this guards against: the reflection's own embed
+            # fails, yet an ACTIVE, centroid-less, edge-less REFLECTION used
+            # to survive the pass and permanently block a retry.
+            health.healthy = False
+            count_failed = await ext._create_reflections(
+                store,
+                [cluster],
+                current_cycle=5,
+            )
+            assert count_failed == 0
+            assert await store.list_thoughts(thought_type=ThoughtType.REFLECTION) == []
+
+            # Provider recovers -- a repeated pass over the *same* cluster
+            # must succeed cleanly, not skip it as "already exists".
+            health.healthy = True
+            count_recovered = await ext._create_reflections(
+                store,
+                [cluster],
+                current_cycle=6,
+            )
+            assert count_recovered == 1
+
+            reflections = await store.list_thoughts(thought_type=ThoughtType.REFLECTION)
+            assert len(reflections) == 1
+            reflection = reflections[0]
+
+            emb = await store.get_embedding(reflection.thought_id)
+            assert emb is not None
+
+            edges = await store.get_edges(reflection.thought_id, direction="OUT")
+            consolidated_targets = {
+                e.to_thought_id for e in edges if e.edge_type == EdgeType.CONSOLIDATED_FROM
+            }
+            assert consolidated_targets == {t1.thought_id, t2.thought_id}
+        finally:
+            await db.close()
 
 
 # Fixed UTC-normalised ISO-8601 instants for valid-time tests
