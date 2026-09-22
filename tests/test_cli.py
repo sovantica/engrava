@@ -24,7 +24,13 @@ if TYPE_CHECKING:
 from click.testing import CliRunner
 
 from engrava.cli.config import EngravaCLIConfig
-from engrava.cli.main import _close_quietly, _import_records_to_db, _rollback_quietly, cli
+from engrava.cli.main import (
+    _close_quietly,
+    _export_db_to_jsonl,
+    _import_records_to_db,
+    _rollback_quietly,
+    cli,
+)
 from engrava.infrastructure.sqlite.engrava_core import CORE_SCHEMA_HEAD_VERSION
 
 # Literal SQL, never interpolated: a read-back that assembles its own query
@@ -1133,6 +1139,193 @@ class TestSnapshot:
         assert result.exit_code != 0
         assert "Invalid --service value" in result.output
         assert isinstance(result.exception, SystemExit)
+
+
+async def _concurrent_writer_commit_after(
+    populated_db: Path, paused: asyncio.Event, resume: asyncio.Event
+) -> None:
+    """Commit a thought+edge pair through a second connection, once ``paused``.
+
+    Stands in for "the one supported concurrent writer" against ``engrava``'s
+    SQLite backend: a second ``SqliteEngravaCore`` on the same file, not a
+    mock. Waits for ``paused`` (set by the export side once it has scanned
+    `thought` and is about to scan `edge`), commits, then sets ``resume`` so
+    the paused export continues.
+
+    Args:
+        populated_db: Path to the database both connections share.
+        paused: Set by the caller once export has reached the point between
+            its thought-table and edge-table scans.
+        resume: Set here once the commit lands, to let export continue.
+
+    """
+    import aiosqlite
+
+    from engrava import (
+        EdgeRecord,
+        EdgeType,
+        LifecycleStatus,
+        Priority,
+        SqliteEngravaCore,
+        ThoughtRecord,
+        ThoughtType,
+    )
+
+    await paused.wait()
+    writer_conn = await aiosqlite.connect(str(populated_db))
+    writer_conn.row_factory = aiosqlite.Row
+    await writer_conn.execute("PRAGMA foreign_keys = ON")
+    writer_store = SqliteEngravaCore(writer_conn)
+    await writer_store.create_thought(
+        ThoughtRecord(
+            thought_id="thought-concurrent",
+            essence="written mid-export",
+            content="written mid-export",
+            thought_type=ThoughtType.OBSERVATION,
+            source="test",
+            lifecycle_status=LifecycleStatus.ACTIVE,
+            priority=Priority.P2,
+            created_cycle=99,
+            updated_cycle=99,
+        )
+    )
+    await writer_store.create_edge(
+        EdgeRecord(
+            edge_id="edge-concurrent",
+            from_thought_id="thought-concurrent",
+            to_thought_id="thought-000",
+            edge_type=EdgeType.ASSOCIATED,
+            weight=0.5,
+            created_cycle=99,
+        )
+    )
+    await writer_conn.commit()
+    await writer_conn.close()
+    resume.set()
+
+
+async def _export_with_commit_interleaved_before_edge_scan(populated_db: Path, out: Path) -> None:
+    """Run ``_export_db_to_jsonl`` while a concurrent writer commits mid-scan.
+
+    Pauses the export connection right before its ``SELECT * FROM edge`` --
+    after the thought-table scan, before the edge-table one -- starts the
+    concurrent writer (:func:`_concurrent_writer_commit_after`), and resumes
+    once it has committed. Uses the same technique
+    ``TestInProcessCriticalSection`` in ``test_concurrency_contract.py`` uses
+    for the store's own guards: a genuine ``asyncio.Task``, paused and
+    resumed via an ``asyncio.Event`` handshake, never a sleep or a mock.
+
+    Args:
+        populated_db: Path to the source database.
+        out: Where the snapshot is written.
+
+    """
+    import aiosqlite
+
+    export_conn = await aiosqlite.connect(str(populated_db))
+    export_conn.row_factory = aiosqlite.Row
+    # Matches how the real CLI opens a connection for `snapshot` (`_open_db`
+    # in `engrava.cli.main`) -- WAL mode is what makes a concurrent writer's
+    # commit non-blocking against an open reader, which is what lets this
+    # test observe the race rather than have the writer simply wait out the
+    # reader's lock.
+    await export_conn.execute("PRAGMA journal_mode = WAL")
+    await export_conn.execute("PRAGMA foreign_keys = ON")
+
+    paused = asyncio.Event()
+    resume = asyncio.Event()
+    original_execute = export_conn.execute
+    edge_scan_seen = False
+
+    async def _tracking_execute(sql: str, *args: object, **kwargs: object) -> object:
+        nonlocal edge_scan_seen
+        if sql == "SELECT * FROM edge" and not edge_scan_seen:
+            edge_scan_seen = True
+            paused.set()
+            await resume.wait()
+        return await original_execute(sql, *args, **kwargs)
+
+    setattr(export_conn, "execute", _tracking_execute)  # noqa: B010 -- see store patch above for why setattr, not a subclass
+
+    try:
+        await asyncio.gather(
+            _concurrent_writer_commit_after(populated_db, paused, resume),
+            _export_db_to_jsonl(export_conn, out),
+        )
+    finally:
+        await export_conn.close()
+
+
+class TestSnapshotObservesOneConsistentState:
+    """A snapshot must not stream a mix of before- and after-commit rows.
+
+    ``_export_db_to_jsonl`` scans the thought, edge, embedding, and action
+    tables one at a time. Without an enclosing read transaction, each scan is
+    its own independent read against whatever the database's current state
+    happens to be -- so a writer committing a new thought and its edge
+    between the thought scan and the edge scan leaves the edge in the
+    snapshot while the thought it references never made it in. This does not
+    need a mocked writer to show: it uses the one supported concurrent writer
+    (a second ``SqliteEngravaCore`` on the same file), paused and resumed
+    with a genuine ``asyncio.Task`` at the exact point between the two scans,
+    the same technique ``TestInProcessCriticalSection`` in
+    ``test_concurrency_contract.py`` uses for the store's own guards.
+    """
+
+    def test_export_survives_a_commit_between_the_thought_and_edge_scans(
+        self,
+        populated_db: Path,
+        tmp_path: Path,
+    ) -> None:
+        """A thought+edge pair committed mid-export must not appear split.
+
+        Either the pair is entirely absent from the snapshot (export's read
+        transaction opened before the commit) or entirely present (it opened
+        after) -- never an edge with no matching thought. The dangling-edge
+        shape is asserted directly against the snapshot file, and then again
+        by actually restoring it: a mixed snapshot fails restore's
+        foreign-key validation, a consistent one restores cleanly.
+
+        The interleaved export runs inside its own ``asyncio.run()`` (as
+        ``populated_db`` above already does for its setup), rather than this
+        test itself being ``async def``: ``restore`` below goes through the
+        real CLI, whose command bodies call ``asyncio.run()`` themselves,
+        which cannot nest inside a loop pytest-asyncio already has running.
+        """
+        out = tmp_path / "interleaved.snapshot.jsonl"
+        asyncio.run(_export_with_commit_interleaved_before_edge_scan(populated_db, out))
+
+        thought_ids: set[str] = set()
+        edge_referenced_ids: set[str] = set()
+        with out.open(encoding="utf-8") as f:
+            for line in f:
+                record = json.loads(line)
+                if record["_type"] == "thought":
+                    thought_ids.add(record["data"]["thought_id"])
+                elif record["_type"] == "edge":
+                    edge_referenced_ids.add(record["data"]["from_thought_id"])
+                    edge_referenced_ids.add(record["data"]["to_thought_id"])
+
+        dangling = edge_referenced_ids - thought_ids
+        assert not dangling, (
+            f"snapshot carries an edge referencing thought id(s) {dangling!r} that "
+            "never made it into the same snapshot -- a mixed before/after read"
+        )
+
+        # A consistent snapshot must also restore cleanly into a fresh target
+        # -- the dangling-edge shape above is exactly what fails restore's
+        # foreign-key validation.
+        target_db = tmp_path / "restored-from-interleaved.db"
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["--db", str(target_db), "restore", "-i", str(out)],
+            standalone_mode=False,
+        )
+        assert result.exit_code == 0, (
+            f"restore of a snapshot with no dangling edge must succeed cleanly, got: "
+            f"{result.output!r}"
+        )
 
 
 class TestRestore:

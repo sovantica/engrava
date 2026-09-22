@@ -1117,27 +1117,25 @@ def query(ctx: click.Context, mql: str) -> None:
 # ------------------------------------------------------------------
 
 
-async def _export_db_to_jsonl(conn: Any, out: Path) -> int:  # noqa: ANN401
-    """Export all core tables from a connection to a JSONL file.
+async def _snapshot_metadata_record(conn: Any) -> dict[str, Any]:  # noqa: ANN401
+    """Build the ``{"_type": "metadata", ...}`` header record for a snapshot.
 
-    Writes metadata header, then thought/edge/embedding/action records.
+    Reads the stamped schema version and, if present, the embedding-model
+    lock (name + dimension). Called from inside the same read transaction
+    :func:`_export_db_to_jsonl` opens for its table scans, so this header
+    describes the same database state the four table streams do.
 
     Args:
-        conn: Open aiosqlite connection.
-        out: Output file path.
+        conn: Open aiosqlite connection, inside an open read transaction.
 
     Returns:
-        Total number of records exported.
+        The metadata record, ready to serialize as the snapshot's first line.
 
     """
-    total = 0
-
-    # Write metadata header.
     cursor = await conn.execute("PRAGMA user_version")
     row = await cursor.fetchone()
     schema_version = int(row[0]) if row else 0
 
-    # Read embedding model lock if present.
     model_name: str | None = None
     dimension: int | None = None
     try:
@@ -1154,43 +1152,108 @@ async def _export_db_to_jsonl(conn: Any, out: Path) -> int:  # noqa: ANN401
     except Exception:  # noqa: BLE001
         logger.debug("_metadata table not available for snapshot headers")
 
-    with out.open("w", encoding="utf-8") as f:
-        meta_record: dict[str, Any] = {
-            "_type": "metadata",
-            "schema_version": schema_version,
-        }
-        if model_name is not None:
-            meta_record["embedding_model_name"] = model_name
-        if dimension is not None:
-            meta_record["embedding_dimension"] = dimension
-        f.write(json.dumps(meta_record, ensure_ascii=False) + "\n")
-        total += 1
+    meta_record: dict[str, Any] = {
+        "_type": "metadata",
+        "schema_version": schema_version,
+    }
+    if model_name is not None:
+        meta_record["embedding_model_name"] = model_name
+    if dimension is not None:
+        meta_record["embedding_dimension"] = dimension
+    return meta_record
 
-        _select_all_sql = {
-            CoreTable.THOUGHT: "SELECT * FROM thought",
-            CoreTable.EDGE: "SELECT * FROM edge",
-            CoreTable.EMBEDDING: "SELECT * FROM embedding",
-            CoreTable.ACTION: "SELECT * FROM action",
-        }
-        for table in _CORE_TABLES:
-            cursor = await conn.execute(_select_all_sql[table])
-            keys = [desc[0] for desc in cursor.description] if cursor.description else []
-            async for row in cursor:
-                record: dict[str, Any] = {}
-                for i, key in enumerate(keys):
-                    val = row[i]
-                    if isinstance(val, bytes):
-                        import base64  # noqa: PLC0415
 
-                        val = base64.b64encode(val).decode("ascii")
-                    record[key] = val
-                line = json.dumps(
-                    {"_type": table.value, "data": record},
-                    default=str,
-                    ensure_ascii=False,
-                )
-                f.write(line + "\n")
-                total += 1
+_SELECT_ALL_CORE_TABLE_SQL: dict[CoreTable, str] = {
+    CoreTable.THOUGHT: "SELECT * FROM thought",
+    CoreTable.EDGE: "SELECT * FROM edge",
+    CoreTable.EMBEDDING: "SELECT * FROM embedding",
+    CoreTable.ACTION: "SELECT * FROM action",
+}
+
+
+async def _stream_table_records(conn: Any, f: TextIO, table: CoreTable) -> int:  # noqa: ANN401
+    """Scan one core table and append its rows to an open snapshot file.
+
+    Called once per table, inside the same read transaction every other
+    call in the same export shares -- this function itself runs exactly one
+    ``SELECT`` and does not open or close a transaction.
+
+    Args:
+        conn: Open aiosqlite connection, inside an open read transaction.
+        f: The snapshot file, already open for text writing.
+        table: Which core table to scan.
+
+    Returns:
+        The number of records written for this table.
+
+    """
+    written = 0
+    cursor = await conn.execute(_SELECT_ALL_CORE_TABLE_SQL[table])
+    keys = [desc[0] for desc in cursor.description] if cursor.description else []
+    async for row in cursor:
+        record: dict[str, Any] = {}
+        for i, key in enumerate(keys):
+            val = row[i]
+            if isinstance(val, bytes):
+                import base64  # noqa: PLC0415
+
+                val = base64.b64encode(val).decode("ascii")
+            record[key] = val
+        line = json.dumps(
+            {"_type": table.value, "data": record},
+            default=str,
+            ensure_ascii=False,
+        )
+        f.write(line + "\n")
+        written += 1
+    return written
+
+
+async def _export_db_to_jsonl(conn: Any, out: Path) -> int:  # noqa: ANN401
+    """Export all core tables from a connection to a JSONL file.
+
+    Writes metadata header, then thought/edge/embedding/action records.
+
+    Args:
+        conn: Open aiosqlite connection.
+        out: Output file path.
+
+    Returns:
+        Total number of records exported.
+
+    """
+    total = 0
+
+    # Open the transaction explicitly, before any read, so the metadata
+    # header and all four table scans below observe one consistent database
+    # state -- the same before-or-after state relative to any concurrent
+    # writer, for the whole export -- rather than each `await
+    # conn.execute(...)` running as its own independent implicit read. A
+    # writer committing a new thought and its edge between two scans could
+    # otherwise leave the edge in the snapshot while the thought it
+    # references never made it in, which restore later refuses as a
+    # dangling foreign key. This mirrors how `_import_records_to_db` opens
+    # its own explicit `BEGIN` rather than depending on the driver's
+    # implicit-transaction default -- read-only here, so the transaction is
+    # closed with a `commit()` (equivalent to `rollback()` for a read, but
+    # matches the pattern the write path already uses) rather than left open.
+    await conn.execute("BEGIN")
+    try:
+        meta_record = await _snapshot_metadata_record(conn)
+        with out.open("w", encoding="utf-8") as f:
+            f.write(json.dumps(meta_record, ensure_ascii=False) + "\n")
+            total += 1
+            for table in _CORE_TABLES:
+                total += await _stream_table_records(conn, f, table)
+        await conn.commit()
+    except BaseException:
+        # A read-only transaction has nothing to lose from a rollback -- this
+        # only exists so a failure here (a disk error writing `out`, a
+        # cancellation) leaves the connection out of an open transaction for
+        # its caller, the same guarantee `_import_records_to_db` gives its
+        # own caller on failure.
+        await _rollback_quietly(conn)
+        raise
 
     return total
 
