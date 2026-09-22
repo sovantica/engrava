@@ -11373,6 +11373,54 @@ class SqliteEngravaCore:
             scores[thought_id] = boost_map.get(priority_val, 0.0)
         return scores
 
+    async def _fetch_candidate_edges_deduped(
+        self,
+        all_ids: list[str],
+    ) -> list[dict[str, object]]:
+        """Fetch every edge touching any of ``all_ids``, chunked and deduplicated.
+
+        The candidate-ID list is queried in 450-wide chunks (SQLite's bound
+        parameter ceiling makes one query per chunk necessary once the
+        candidate pool is large). An edge whose two endpoints fall in
+        *different* chunks satisfies both chunks' ``OR`` predicate and is
+        returned once per chunk it touches — this keeps only the first copy
+        by ``edge_id`` so such a cross-chunk edge is never built into both
+        endpoints' adjacency twice, which would double its weight in the
+        boost computed from it.
+
+        Args:
+            all_ids: Candidate thought IDs to fetch adjacent edges for.
+
+        Returns:
+            Deduplicated edge rows, each a mapping with ``from``, ``to`` and
+            ``weight`` keys.
+
+        """
+        chunk_size = 450
+        edge_rows: list[dict[str, object]] = []
+        seen_edge_ids: set[str] = set()
+        for i in range(0, len(all_ids), chunk_size):
+            chunk = all_ids[i : i + chunk_size]
+            placeholders = ", ".join("?" for _ in chunk)
+            sql = (
+                f"SELECT edge_id, from_thought_id, to_thought_id, weight "  # noqa: S608
+                f"FROM edge WHERE from_thought_id IN ({placeholders}) "
+                f"OR to_thought_id IN ({placeholders}) "
+                f"ORDER BY weight DESC"
+            )
+            params = [*chunk, *chunk]
+            cursor = await self._db.execute(sql, params)
+            rows = await cursor.fetchall()
+            for r in rows:
+                edge_id = str(r["edge_id"])
+                if edge_id in seen_edge_ids:
+                    continue
+                seen_edge_ids.add(edge_id)
+                edge_rows.append(
+                    {"from": r["from_thought_id"], "to": r["to_thought_id"], "weight": r["weight"]},
+                )
+        return edge_rows
+
     async def _load_graph_signal(
         self,
         *,
@@ -11405,25 +11453,7 @@ class SqliteEngravaCore:
             return {}
 
         all_ids = list(candidate_scores.keys())
-        # Batch query — fetch all edges touching any candidate
-        chunk_size = 450
-        edge_rows: list[dict[str, object]] = []
-        for i in range(0, len(all_ids), chunk_size):
-            chunk = all_ids[i : i + chunk_size]
-            placeholders = ", ".join("?" for _ in chunk)
-            sql = (
-                f"SELECT from_thought_id, to_thought_id, weight "  # noqa: S608
-                f"FROM edge WHERE from_thought_id IN ({placeholders}) "
-                f"OR to_thought_id IN ({placeholders}) "
-                f"ORDER BY weight DESC"
-            )
-            params = [*chunk, *chunk]
-            cursor = await self._db.execute(sql, params)
-            rows = await cursor.fetchall()
-            edge_rows.extend(
-                {"from": r["from_thought_id"], "to": r["to_thought_id"], "weight": r["weight"]}
-                for r in rows
-            )
+        edge_rows = await self._fetch_candidate_edges_deduped(all_ids)
 
         # Build adjacency: candidate → list of (neighbour_id, edge_weight)
         adjacency: dict[str, list[tuple[str, float]]] = {}

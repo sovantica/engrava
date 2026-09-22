@@ -554,6 +554,107 @@ class TestGraphAwareSearch:
 
 
 # ---------------------------------------------------------------------------
+# TestGraphRankingChunkedFetch
+# ---------------------------------------------------------------------------
+
+
+class TestGraphRankingChunkedFetch:
+    """``_load_graph_signal``'s 450-candidate chunked edge fetch.
+
+    The candidate-ID list is split into 450-wide chunks, one query per
+    chunk. An edge whose two endpoints land in different chunks must still
+    contribute exactly once to each endpoint's boost.
+    """
+
+    async def test_edge_crossing_chunk_boundary_contributes_once_per_endpoint(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """A 451-candidate pool with an edge crossing the 450 boundary.
+
+        ``t-from`` sits in the first chunk (index 0), ``t-to`` sits alone in
+        the second chunk (index 450) — the two chunk queries each match this
+        edge's ``OR`` predicate, so an unfixed fetch returns it twice and
+        doubles its weighted contribution to both endpoints' graph boost.
+        """
+        t_from = await store.create_thought(_make("t-from"))
+        t_to = await store.create_thought(_make("t-to"))
+        edge = EdgeRecord(
+            edge_id="e-cross-chunk",
+            from_thought_id=t_from.thought_id,
+            to_thought_id=t_to.thought_id,
+            edge_type=EdgeType.ASSOCIATED,
+            weight=0.8,
+            created_cycle=1,
+        )
+        await store.create_edge(edge)
+
+        from_base_score = 0.4
+        to_base_score = 0.6
+        candidate_scores: dict[str, float] = {t_from.thought_id: from_base_score}
+        # 449 filler candidates pad the rest of the first 450-wide chunk.
+        # They reference no edges, so they need no backing thought rows —
+        # ``_load_graph_signal`` only ever queries the ``edge`` table.
+        for i in range(449):
+            candidate_scores[f"filler-{i}"] = 0.1
+        candidate_scores[t_to.thought_id] = to_base_score
+        assert len(candidate_scores) == 451
+
+        graph_edge_decay = 0.5
+        max_neighbors = 5  # >= 2, so a duplicate isn't hidden by [:max_neighbors] slicing
+
+        boosts = await store._load_graph_signal(
+            candidate_scores=candidate_scores,
+            graph_edge_decay=graph_edge_decay,
+            max_neighbors=max_neighbors,
+        )
+
+        expected_from_boost = edge.weight * to_base_score * graph_edge_decay
+        expected_to_boost = edge.weight * from_base_score * graph_edge_decay
+
+        assert boosts[t_from.thought_id] == pytest.approx(expected_from_boost)
+        assert boosts[t_to.thought_id] == pytest.approx(expected_to_boost)
+
+    async def test_edge_within_single_chunk_unaffected(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """Both endpoints in the same (small) chunk — ordinary, unchanged case."""
+        t_a = await store.create_thought(_make("t-a-same-chunk"))
+        t_b = await store.create_thought(_make("t-b-same-chunk"))
+        edge = EdgeRecord(
+            edge_id="e-same-chunk",
+            from_thought_id=t_a.thought_id,
+            to_thought_id=t_b.thought_id,
+            edge_type=EdgeType.ASSOCIATED,
+            weight=0.7,
+            created_cycle=1,
+        )
+        await store.create_edge(edge)
+
+        a_base_score = 0.3
+        b_base_score = 0.9
+        candidate_scores = {
+            t_a.thought_id: a_base_score,
+            t_b.thought_id: b_base_score,
+        }
+        graph_edge_decay = 0.5
+
+        boosts = await store._load_graph_signal(
+            candidate_scores=candidate_scores,
+            graph_edge_decay=graph_edge_decay,
+            max_neighbors=5,
+        )
+
+        assert boosts[t_a.thought_id] == pytest.approx(
+            edge.weight * b_base_score * graph_edge_decay
+        )
+        assert boosts[t_b.thought_id] == pytest.approx(
+            edge.weight * a_base_score * graph_edge_decay
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestEdgeCreationConfig
 # ---------------------------------------------------------------------------
 
