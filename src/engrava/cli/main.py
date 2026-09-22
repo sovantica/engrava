@@ -46,6 +46,7 @@ from engrava.config import (
     resolve_embedding_provider,
 )
 from engrava.config_validation import ConfigError
+from engrava.domain.dreaming import CENTROID_MODEL_NAME
 from engrava.domain.protocols.hooks import MindQLExtension
 from engrava.infrastructure.sqlite.engrava_core import (
     CORE_SCHEMA_HEAD_VERSION,
@@ -1551,15 +1552,26 @@ async def _read_embedding_lock(conn: aiosqlite.Connection) -> tuple[str, int] | 
 async def _existing_embedding_identities(conn: aiosqlite.Connection) -> list[tuple[str, int]]:
     """Return every distinct declared identity already in the target's ``embedding`` table.
 
+    Excludes rows whose ``model_name`` is :data:`CENTROID_MODEL_NAME`: a
+    ``dreaming-centroid`` row is a computed mean of member vectors, not
+    something a configured embedding provider produced, so it is bookkeeping
+    rather than corpus identity -- exactly as it already is at write time in
+    ``SqliteEngravaCore._ensure_embedding_model_lock``. A healthy store with
+    reflections legitimately carries both, and comparing the centroid tag
+    against the provider identity would refuse that healthy store.
+
     Args:
         conn: Restore connection with an active transaction.
 
     Returns:
-        Distinct ``(model_name, dimension)`` pairs currently stored, in no
-        particular order.
+        Distinct non-centroid ``(model_name, dimension)`` pairs currently
+        stored, in no particular order.
 
     """
-    cursor = await conn.execute("SELECT DISTINCT model_name, dimension FROM embedding")
+    cursor = await conn.execute(
+        "SELECT DISTINCT model_name, dimension FROM embedding WHERE model_name != ?",
+        (CENTROID_MODEL_NAME,),
+    )
     rows = await cursor.fetchall()
     return [(str(row[0]), int(row[1])) for row in rows]
 
@@ -1606,15 +1618,20 @@ async def _finalize_embedding_identity(
     ``may_adopt_identity`` is only ever ``True`` when the target began the
     restore with neither a stored model nor any embedding rows (see
     ``_initial_embedding_state``), so this already implies the identity
-    check ran; ``identity_reference`` is ``None`` only when no embedding row
-    was ever inserted, in which case there is nothing to adopt.
+    check ran; ``identity_reference`` is ``None`` when no non-centroid
+    embedding row was ever inserted -- either because none was inserted at
+    all, or because every inserted row was a ``CENTROID_MODEL_NAME`` row,
+    which is exempt from ever becoming the reference (see
+    ``_check_embedding_row_before_insert``) -- and in either case there is
+    nothing to adopt.
 
     Args:
         conn: Restore connection with an active transaction.
         may_adopt_identity: Whether the target started this restore eligible
             for adoption.
-        identity_reference: The identity every inserted embedding row was
-            checked to declare, or ``None`` if none were inserted.
+        identity_reference: The identity every non-centroid inserted
+            embedding row was checked to declare, or ``None`` if none was
+            inserted.
 
     """
     if may_adopt_identity and identity_reference is not None:
@@ -1687,13 +1704,21 @@ async def _check_embedding_row_before_insert(
     record: TableRecord,
     identity_reference: tuple[str, int] | None,
     identity_reference_label: str,
-) -> tuple[str, int]:
+) -> tuple[str, int] | None:
     """Validate one about-to-be-inserted embedding row and update the reference.
 
     Called only for an ``embedding``-table record that will actually be
     inserted (the caller has already excluded ``--skip-embeddings`` /
     ``--re-embed``), so this is where both the structural check (dimension
     vs. blob) and the cross-row identity check happen.
+
+    A row declaring ``model_name == CENTROID_MODEL_NAME`` still gets the
+    structural check -- its ``dimension`` must still match its own
+    ``vector_blob`` -- but is exempt from the identity check in both
+    directions: it is never compared against ``identity_reference``, and it
+    never becomes (or updates) that reference for the rows after it. See
+    :func:`_existing_embedding_identities` for why -- the same exemption
+    already exists at write time and this mirrors it for restore.
 
     Args:
         record: A validated ``embedding``-table record about to be inserted.
@@ -1702,7 +1727,8 @@ async def _check_embedding_row_before_insert(
             ``identity_reference`` came from, for a mismatch message.
 
     Returns:
-        The identity every embedding row must now agree on.
+        The identity every non-centroid embedding row must now agree on --
+        ``identity_reference`` unchanged when this row is a centroid row.
 
     Raises:
         click.ClickException: If the row is structurally invalid, or its
@@ -1710,6 +1736,8 @@ async def _check_embedding_row_before_insert(
 
     """
     row_identity = await _assert_embedding_row_structurally_valid(record)
+    if row_identity[0] == CENTROID_MODEL_NAME:
+        return identity_reference
     return _track_embedding_identity(
         row_identity,
         identity_reference,

@@ -1794,4 +1794,199 @@ class TestEmbeddingIdentityInvariant:
         assert asyncio.run(_dump_table(target, "thought"))
         metadata = asyncio.run(_metadata_map(target))
         assert "embedding_dimension" not in metadata
-        assert "embedding_model_name" not in metadata
+
+
+# ---------------------------------------------------------------------------
+# Centroid rows are corpus-identity bookkeeping, never a provider to lock to.
+# ---------------------------------------------------------------------------
+
+
+async def _healthy_reflection_store(
+    db_path: Path,
+    *,
+    provider_model: str,
+    dimension: int,
+) -> None:
+    """Build a database with real provider embeddings and a real centroid row.
+
+    Mirrors ``extensions/dreaming.py``'s own write path: two ordinary
+    thoughts embedded under a configured provider's ``(model_name,
+    dimension)`` via ``store_embedding()``, and a REFLECTION thought embedded
+    under the ``CENTROID_MODEL_NAME`` sentinel via the exact same
+    ``store_embedding()`` call dreaming.py itself makes
+    (``extensions/dreaming.py:1500-1505``). This is the shape of a healthy
+    store that genuinely uses reflections -- restore must not treat the
+    sentinel as a disagreeing provider identity.
+
+    Args:
+        db_path: Path to create the database at.
+        provider_model: The provider model name the two source thoughts are
+            embedded under.
+        dimension: Shared vector dimension for every embedding written here.
+
+    """
+    from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+    from engrava.domain.dreaming import CENTROID_MODEL_NAME
+
+    conn = await aiosqlite.connect(str(db_path))
+    conn.row_factory = aiosqlite.Row
+    try:
+        store = SqliteEngravaCore(conn)
+        await store.ensure_schema()
+        for i in range(2):
+            tid = f"t-src-{i}"
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id=tid,
+                    essence=f"essence {tid}",
+                    content=f"content {tid}",
+                    thought_type=ThoughtType.OBSERVATION,
+                    source="test",
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    priority=Priority.P2,
+                    created_cycle=1,
+                    updated_cycle=1,
+                )
+            )
+            vector = [0.0] * dimension
+            vector[i % dimension] = 1.0
+            await store.store_embedding(tid, vector, model_name=provider_model)
+
+        reflection_id = "t-reflection"
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id=reflection_id,
+                essence="reflection essence",
+                content="reflection content",
+                thought_type=ThoughtType.REFLECTION,
+                source="dreaming:test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=1,
+                updated_cycle=1,
+            )
+        )
+        centroid_vector = [0.5] * dimension
+        await store.store_embedding(reflection_id, centroid_vector, model_name=CENTROID_MODEL_NAME)
+    finally:
+        await conn.close()
+
+
+class TestRestoreExemptsCentroidRowsFromTheIdentityInvariant:
+    """Regression: a centroid row must never gate provider identity.
+
+    ``_ensure_embedding_model_lock`` already exempts
+    ``CENTROID_MODEL_NAME`` at write time (``a3abb7a``); restore had no
+    counterpart, so a perfectly healthy store containing both provider
+    vectors and reflection centroids was refused on restore into a fresh
+    target, and a merge into an already-healthy centroid-bearing target
+    could be refused too -- even with ``--skip-embeddings``, because the
+    pre-loop existing-rows scan runs before that flag is ever consulted.
+    """
+
+    def test_restoring_a_healthy_reflection_snapshot_into_a_fresh_target_succeeds(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """A snapshot with both provider and centroid rows must restore clean.
+
+        Before the fix this is refused outright: the centroid row's
+        ``(CENTROID_MODEL_NAME, dimension)`` identity was compared against
+        the provider identity like any other row and rejected as a mismatch.
+        """
+        source = tmp_path / "source.db"
+        asyncio.run(_healthy_reflection_store(source, provider_model="model-P", dimension=3))
+
+        snap = tmp_path / "snap.jsonl"
+        snap_result = runner.invoke(cli, ["--db", str(source), "snapshot", "-o", str(snap)])
+        assert snap_result.exit_code == 0, snap_result.output
+
+        fresh_target = tmp_path / "fresh.db"
+        result = runner.invoke(cli, ["--db", str(fresh_target), "restore", "-i", str(snap)])
+
+        assert result.exit_code == 0, result.output
+
+        source_thoughts = asyncio.run(_dump_table(source, "thought"))
+        target_thoughts = asyncio.run(_dump_table(fresh_target, "thought"))
+        assert target_thoughts == source_thoughts
+
+        source_embeddings = asyncio.run(_dump_table(source, "embedding"))
+        target_embeddings = asyncio.run(_dump_table(fresh_target, "embedding"))
+        assert {row["embedding_id"] for row in target_embeddings} == {
+            row["embedding_id"] for row in source_embeddings
+        }
+        model_names = {row["model_name"] for row in target_embeddings}
+        assert model_names == {"model-P", "dreaming-centroid"}
+
+        source_edges = asyncio.run(_dump_table(source, "edge"))
+        target_edges = asyncio.run(_dump_table(fresh_target, "edge"))
+        assert target_edges == source_edges
+
+        # The lock adopts the real provider identity, never the sentinel.
+        metadata = asyncio.run(_metadata_map(fresh_target))
+        assert metadata["embedding_model_name"] == "model-P"
+        assert metadata["embedding_dimension"] == "3"
+
+    def test_merging_into_an_already_healthy_centroid_bearing_target_succeeds(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """The pre-loop existing-rows scan must not refuse a healthy target.
+
+        ``_initial_embedding_state`` runs unconditionally, before
+        ``--skip-embeddings`` is even consulted -- so this restore carries no
+        embedding rows of its own (``--skip-embeddings``) and would still be
+        refused before the fix, purely because the *target* already
+        legitimately disagrees-by-sentinel with itself.
+        """
+        target = tmp_path / "target.db"
+        asyncio.run(_healthy_reflection_store(target, provider_model="model-P", dimension=3))
+
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-unrelated")) + "\n", encoding="utf-8"
+        )
+
+        result = runner.invoke(
+            cli, ["--db", str(target), "restore", "-i", str(snap), "--skip-embeddings"]
+        )
+
+        assert result.exit_code == 0, result.output
+        thought_ids = {row["thought_id"] for row in asyncio.run(_dump_table(target, "thought"))}
+        assert "t-unrelated" in thought_ids
+        assert "t-reflection" in thought_ids
+
+    def test_a_genuine_provider_mismatch_is_still_rejected_alongside_a_centroid_row(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """The centroid exemption must not loosen a real identity mismatch.
+
+        The incoming snapshot carries a legitimate centroid row (exempt) and
+        a provider row that genuinely disagrees with the target's lock (not
+        exempt) -- only the latter must be refused.
+        """
+        target = tmp_path / "target.db"
+        asyncio.run(_locked_target(target, model_name="model-A", dimension=3))
+
+        from engrava.domain.dreaming import CENTROID_MODEL_NAME
+
+        mismatched_vector = struct.pack("3f", 0.1, 0.2, 0.3)
+        centroid_vector = struct.pack("3f", 0.4, 0.4, 0.4)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-mismatch"))
+            + "\n"
+            + _embedding_line("e-mismatch", "t-mismatch", "model-B", 3, mismatched_vector)
+            + "\n"
+            + _thought_line(_minimal_thought_data("t-reflection"))
+            + "\n"
+            + _embedding_line("e-centroid", "t-reflection", CENTROID_MODEL_NAME, 3, centroid_vector)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert "'model-A' at dimension 3" in result.output
+        assert "'model-B' at dimension 3" in result.output
+        # Rejected before any write lands.
+        assert asyncio.run(_dump_table(target, "thought")) == []
