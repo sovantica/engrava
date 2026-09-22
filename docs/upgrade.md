@@ -1699,6 +1699,34 @@ still exactly the one I read"; only the engine's own automatic bump is
 enforced. `create_thought` / `create_edge` / `create_action` are unaffected:
 a newly inserted row simply starts at `revision = 0`.
 
+**`store_embedding()`'s base row write and its vector-index update are now one
+failure-atomic unit, and the embedding-identity check now runs on every call
+instead of only the first.** No schema change.
+
+**What changed.** `store_embedding()` now wraps the `embedding` row write and
+the vector backend's index update (when a vector backend is configured) in
+the same savepoint the four update paths above already use, so a failure in
+the index update (e.g. a vector rejected by the vector backend) no longer
+leaves the row write pending for a later, unrelated commit on the same
+connection to pick up. Separately, `_ensure_embedding_model_lock` no longer
+skips its comparison after the first call on a store instance: the stored
+model name, dimension, and document-prefix fingerprint are now compared
+against every embedding write and every `verify_embedding_model()` call, not
+cached as "already verified" after the first one.
+
+**Who is affected.** Anyone who kept one long-lived store instance around
+while pointing it at a rotating or growing set of embedding models or
+dimensions, relying on the mismatch check never firing again after the first
+successful write. The next write with a different model name, dimension, or
+document prefix now raises `EmbeddingModelMismatchError` instead of being
+accepted silently. Anyone using a single model/dimension per store instance
+sees no behaviour change from the identity check.
+
+**What to do.** If a store instance is intentionally reused across different
+embedding configurations, construct a new store instance (or a new database)
+per configuration instead, or catch `EmbeddingModelMismatchError` and handle
+the switch explicitly (re-embed, or route to a different store).
+
 ### 0.5 -> 0.6
 
 Version 0.6 is a **schema-changing minor upgrade**. Do not roll it across old and

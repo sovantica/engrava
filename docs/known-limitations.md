@@ -229,10 +229,9 @@ vector backend:
 
 Engrava also checks the stored model identity (name, dimension and document
 prefix); a mismatch it finds is reported as `EmbeddingModelMismatchError`. The
-model check runs at a store instance's first embedding write or first
-`verify_embedding_model()` on a store that has a provider. Once it has passed,
-later embedding writes on that instance are not compared again, so a
-differently sized vector written afterwards is not refused by it.
+model check runs on every embedding write and on every `verify_embedding_model()`
+call on a store that has a provider — not only the first — so it does not stop
+comparing after the first write.
 
 A deliberate CLI re-embed is available while restoring a snapshot into a
 configured direct database or service. Pass `--config`: direct mode uses the

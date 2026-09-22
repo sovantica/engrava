@@ -1724,7 +1724,6 @@ class SqliteEngravaCore:
         # per-thought auto-embed so the batch path can embed all rows in one
         # provider call after the insert loop. False for every other caller.
         self._suppress_auto_embed: bool = False
-        self._embedding_model_verified: bool = False
         # Configuration objects are required to be *exactly* their class, not
         # instances of it. A subclass passes ``isinstance`` and is still free to
         # report one set of settings while it is validated and another every
@@ -4592,14 +4591,18 @@ class SqliteEngravaCore:
     # ------------------------------------------------------------------
 
     async def _ensure_embedding_model_lock(self, model_name: str, dimension: int) -> None:
-        """Lazy-lock the embedding model on first ``store_embedding()``.
+        """Lock the embedding model on first ``store_embedding()``, verify on every call.
 
         On first call (no ``embedding_model_name`` in ``_metadata``), writes
         the model name, dimension, and — only when the active provider
         applies a non-empty ``document_prefix`` — the deterministic
         fingerprint of that prefix and the ``query_prefix`` the corpus is
-        built to pair with. On subsequent calls, verifies the provider
-        matches the stored values.
+        built to pair with. On this and every later call, the stored values
+        are read back and compared against the arguments — there is no
+        instance-level cache that lets a later call skip the comparison, so a
+        store instance that is handed a different model, dimension, or
+        document prefix on a later call is refused just as reliably as one
+        constructed fresh with the mismatched provider.
 
         The document-prefix fingerprint is part of the *corpus identity*:
         changing the ``document_prefix`` changes what every stored vector
@@ -4632,9 +4635,6 @@ class SqliteEngravaCore:
         # every caller by construction rather than relying on each one to
         # remember to wrap it.
         async with self._write_lock:
-            if self._embedding_model_verified:
-                return
-
             # Ensure _metadata table exists (idempotent).
             await self._migrate_core_v4_to_v5()
 
@@ -4697,8 +4697,6 @@ class SqliteEngravaCore:
                         stored_dimension=stored_dimension,
                         configured_dimension=dimension,
                     )
-
-            self._embedding_model_verified = True
 
     @staticmethod
     def _describe_corpus_model(model_name: str, fingerprint: str | None) -> str:
@@ -9720,8 +9718,14 @@ class SqliteEngravaCore:
             The persisted EmbeddingRecord.
 
         Raises:
-            EmbeddingModelMismatchError: When model_name does not match
-                the model already stored in ``_metadata``.
+            EmbeddingModelMismatchError: When model_name, its dimension, or
+                its document-prefix fingerprint does not match the one
+                already stored in ``_metadata`` — checked on every call, not
+                only the first.
+            ConnectionQuarantinedError: When the base row write succeeds but
+                the vec0 upsert fails and the resulting unwind cannot itself
+                be trusted to have undone it cleanly (see
+                :meth:`_write_readback_savepoint`).
 
         """
         async with self._write_lock:
@@ -9731,47 +9735,58 @@ class SqliteEngravaCore:
             blob = struct.pack(f"{dimension}f", *vector)
             created_at = datetime.datetime.now(datetime.UTC).isoformat()
 
-            cursor = await self._db.execute(
-                "SELECT rowid FROM embedding WHERE embedding_id = ?",
-                (eid,),
-            )
-            existing_row = await cursor.fetchone()
-
-            rowid: int
-            if existing_row is None:
-                await self._db.execute(
-                    "INSERT INTO embedding "
-                    "(embedding_id, owner_type, owner_id, model_name, "
-                    "dimension, vector_blob, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (eid, "THOUGHT", thought_id, model_name, dimension, blob, created_at),
-                )
+            # The base ``embedding`` row and the ``vec0`` upsert are one
+            # failure-atomic unit: without this, a vec0 rejection (e.g. a
+            # wrong-dimension vector) after the base row already succeeded
+            # left that row pending in the connection's open transaction,
+            # where a later, unrelated commit on the same connection would
+            # publish it — a vector-less row silently corrupting the
+            # embedding table. See :meth:`_write_readback_savepoint`.
+            async with self._write_readback_savepoint("store_embedding"):
                 cursor = await self._db.execute(
                     "SELECT rowid FROM embedding WHERE embedding_id = ?",
                     (eid,),
                 )
-                inserted_row = await cursor.fetchone()
-                if inserted_row is None:
-                    msg = f"Embedding row missing after insert: {eid}"
-                    raise RuntimeError(msg)
-                rowid = int(inserted_row["rowid"])
-            else:
-                rowid = int(existing_row["rowid"])
-                await self._db.execute(
-                    "UPDATE embedding SET "
-                    "owner_type = ?, owner_id = ?, model_name = ?, dimension = ?, "
-                    "vector_blob = ?, created_at = ? "
-                    "WHERE embedding_id = ?",
-                    ("THOUGHT", thought_id, model_name, dimension, blob, created_at, eid),
-                )
+                existing_row = await cursor.fetchone()
 
-            # Keep the vec0 vector table in sync when a vector backend is active.
-            if self._vector_backend is not None:
-                await self._vector_backend.upsert_embedding(
-                    self._db,
-                    rowid=rowid,
-                    vector=vector,
-                )
+                rowid: int
+                if existing_row is None:
+                    await self._db.execute(
+                        "INSERT INTO embedding "
+                        "(embedding_id, owner_type, owner_id, model_name, "
+                        "dimension, vector_blob, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (eid, "THOUGHT", thought_id, model_name, dimension, blob, created_at),
+                    )
+                    cursor = await self._db.execute(
+                        "SELECT rowid FROM embedding WHERE embedding_id = ?",
+                        (eid,),
+                    )
+                    inserted_row = await cursor.fetchone()
+                    if inserted_row is None:
+                        msg = f"Embedding row missing after insert: {eid}"
+                        raise RuntimeError(msg)
+                    rowid = int(inserted_row["rowid"])
+                else:
+                    rowid = int(existing_row["rowid"])
+                    await self._db.execute(
+                        "UPDATE embedding SET "
+                        "owner_type = ?, owner_id = ?, model_name = ?, dimension = ?, "
+                        "vector_blob = ?, created_at = ? "
+                        "WHERE embedding_id = ?",
+                        ("THOUGHT", thought_id, model_name, dimension, blob, created_at, eid),
+                    )
+
+                # Keep the vec0 vector table in sync when a vector backend is
+                # active. A rejection here (e.g. a wrong-dimension vector) is
+                # unwound together with the base row write above, by the
+                # savepoint this block is nested in.
+                if self._vector_backend is not None:
+                    await self._vector_backend.upsert_embedding(
+                        self._db,
+                        rowid=rowid,
+                        vector=vector,
+                    )
 
             await self._maybe_commit()
         return EmbeddingRecord(

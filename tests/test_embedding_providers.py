@@ -458,6 +458,120 @@ class TestModelImmutability:
 
 
 # ---------------------------------------------------------------------------
+# Model identity is re-checked on every call, not only the first
+# ---------------------------------------------------------------------------
+
+
+class TestModelReCheckOnEveryCall:
+    """A single long-lived store instance re-verifies identity every call.
+
+    Regression coverage for the lazy lock's early return that used to make
+    ``_ensure_embedding_model_lock`` a no-op after its first successful call:
+    once ``self._embedding_model_verified`` was set, a *later* call on that
+    same instance skipped the comparison entirely, so a differently sized
+    (or differently named, or differently prefixed) vector was accepted
+    silently instead of raising ``EmbeddingModelMismatchError``. Uses a real
+    temporary file database (not ``:memory:``) so these tests exercise the
+    same on-disk ``_metadata`` round trip production code does.
+    """
+
+    async def _file_store(self, tmp_path: Path) -> SqliteEngravaCore:
+        conn = await aiosqlite.connect(str(tmp_path / "recheck.db"))
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA foreign_keys = ON")
+        store = SqliteEngravaCore(conn)
+        store._owns_connection = True
+        await store.ensure_schema()
+        return store
+
+    async def test_dimension_mismatch_raises_on_a_later_call(self, tmp_path: Path) -> None:
+        store = await self._file_store(tmp_path)
+        try:
+            await store.create_thought(_make_thought("t-1"))
+            await store.create_thought(_make_thought("t-2"))
+
+            await store.store_embedding(
+                thought_id="t-1", vector=[0.1, 0.2, 0.3], model_name="same-model"
+            )
+            with pytest.raises(EmbeddingModelMismatchError, match="dim=3"):
+                await store.store_embedding(
+                    thought_id="t-2",
+                    vector=[0.1, 0.2, 0.3, 0.4],
+                    model_name="same-model",
+                )
+        finally:
+            await store.close()
+
+    async def test_model_name_mismatch_raises_on_a_later_call(self, tmp_path: Path) -> None:
+        store = await self._file_store(tmp_path)
+        try:
+            await store.create_thought(_make_thought("t-1"))
+            await store.create_thought(_make_thought("t-2"))
+
+            await store.store_embedding(
+                thought_id="t-1", vector=[0.1, 0.2, 0.3], model_name="model-A"
+            )
+            with pytest.raises(EmbeddingModelMismatchError, match="model-A"):
+                await store.store_embedding(
+                    thought_id="t-2",
+                    vector=[0.1, 0.2, 0.3],
+                    model_name="model-B",
+                )
+        finally:
+            await store.close()
+
+    async def test_document_prefix_mismatch_raises_on_a_later_call(self, tmp_path: Path) -> None:
+        provider_a = _RolePrefixSpy(document_prefix="passage: ", model_name="prefix-model")
+        conn = await aiosqlite.connect(str(tmp_path / "recheck_prefix.db"))
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA foreign_keys = ON")
+        store = SqliteEngravaCore(conn, embedding_provider=provider_a, auto_embed=True)
+        store._owns_connection = True
+        await store.ensure_schema()
+        try:
+            await store.create_thought(_make_thought("t-1"))
+
+            # Same store instance, same model_name/dimension — only the
+            # provider's document_prefix changes, as it would if a caller
+            # swapped configuration on a long-lived instance without
+            # rebuilding the store.
+            store._embedding_provider = _RolePrefixSpy(
+                document_prefix="different: ", model_name="prefix-model"
+            )
+            with pytest.raises(EmbeddingModelMismatchError):
+                await store.create_thought(_make_thought("t-2"))
+        finally:
+            await store.close()
+
+    async def test_verify_embedding_model_rechecks_on_every_call(self, tmp_path: Path) -> None:
+        """``verify_embedding_model()`` also loses its own eager-check cache."""
+        provider_a = CallbackProvider(_dummy_embed, dimension=4, model_name="verify-A")
+        conn = await aiosqlite.connect(str(tmp_path / "recheck_verify.db"))
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA foreign_keys = ON")
+        store = SqliteEngravaCore(conn, embedding_provider=provider_a)
+        store._owns_connection = True
+        await store.ensure_schema()
+        try:
+            await store.create_thought(_make_thought("t-verify"))
+            await store.store_embedding(
+                thought_id="t-verify", vector=[0.1, 0.2, 0.3, 0.4], model_name="verify-A"
+            )
+            # First eager check succeeds (matches what was just locked).
+            await store.verify_embedding_model()
+
+            # Swap the provider on the same instance and verify again — a
+            # cached "already verified" flag would let this pass silently.
+            store._embedding_provider = CallbackProvider(
+                _dummy_embed, dimension=4, model_name="verify-B"
+            )
+            with pytest.raises(EmbeddingModelMismatchError, match="verify-A"):
+                await store.verify_embedding_model()
+        finally:
+            await store.close()
+
+
+# ---------------------------------------------------------------------------
 # Schema migration core-4 → core-5
 # ---------------------------------------------------------------------------
 
