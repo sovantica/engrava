@@ -4924,7 +4924,7 @@ class SqliteEngravaCore:
 
     @contextlib.asynccontextmanager
     async def _write_readback_savepoint(self, name: str) -> AsyncIterator[None]:
-        """Make a write and its confirming read-back one failure-atomic unit.
+        """Make a write, its confirming read-back and its journal entry one unit.
 
         ``update_thought``, ``restore_thought``, ``update_edge`` and
         ``update_action`` all write a row, then re-read it to report and
@@ -4934,6 +4934,18 @@ class SqliteEngravaCore:
         while the write itself stayed pending in the connection's
         transaction — a later, unrelated commit on the same connection would
         then publish a mutation whose own operation had reported failure.
+
+        The journal append runs inside this same block, not after it, for
+        the identical reason: ``JournalWriter.append`` awaits a chain-tail
+        read before its own ``INSERT``, and a failure or cancellation in
+        that await must unwind the row write too — a mutation the journal
+        never recorded must never be the one thing that survives. Releasing
+        the savepoint before the append ran (the original shape of every
+        call site above) left that same failure window with no savepoint
+        protecting the row write any more, guarded only by
+        :attr:`_write_lock` — a lock, not a transaction guard — so a later,
+        unrelated commit on the same connection could publish the row write
+        with no matching journal entry.
 
         A bare ``self._db.rollback()`` on that failure is the wrong
         instrument: a caller may already hold this connection's transaction
@@ -4977,9 +4989,9 @@ class SqliteEngravaCore:
                 accept savepoint names as bound parameters).
 
         Yields:
-            None. The caller performs its write and read-back inside the
-            block; a failure raised anywhere in it is unwound as described
-            above and then re-raised unchanged.
+            None. The caller performs its write, read-back, and journal
+            append inside the block; a failure raised anywhere in it is
+            unwound as described above and then re-raised unchanged.
 
         Raises:
             ConnectionQuarantinedError: When an unwind attempt itself fails
@@ -8443,12 +8455,14 @@ class SqliteEngravaCore:
         through a raw connection this store does not mediate, is outside what
         any in-process lock can reach (see the concurrency documentation).
 
-        **The write and its confirming read-back are one failure-atomic
-        unit.** Both run inside :meth:`_write_readback_savepoint`: if the
-        read-back raises — the row vanished, or the mapper rejects a stored
-        value — this call's own ``UPDATE`` is unwound before the exception
-        propagates, so it can never be published by a later, unrelated
-        commit on this connection. A caller-owned transaction (a
+        **The write, its confirming read-back, and its journal entry are one
+        failure-atomic unit.** All three run inside
+        :meth:`_write_readback_savepoint`: if the read-back raises — the row
+        vanished, or the mapper rejects a stored value — or the journal
+        append itself fails or is cancelled, this call's own ``UPDATE`` is
+        unwound before the exception propagates, so it can never be
+        published by a later, unrelated commit on this connection without
+        the journal entry that documents it. A caller-owned transaction (a
         :meth:`suspend_auto_commit` window already in progress) is
         unaffected: only this call's write is undone, not the caller's
         earlier ones.
@@ -8511,15 +8525,15 @@ class SqliteEngravaCore:
 
                 persisted = await self._read_back_thought(thought_id)
 
-            if self._journal is not None:
-                await self._journal.append(
-                    mutation_type="UPDATE_THOUGHT",
-                    target_id=thought_id,
-                    delta={
-                        "before": current.model_dump(mode="json"),
-                        "after": persisted.model_dump(mode="json"),
-                    },
-                )
+                if self._journal is not None:
+                    await self._journal.append(
+                        mutation_type="UPDATE_THOUGHT",
+                        target_id=thought_id,
+                        delta={
+                            "before": current.model_dump(mode="json"),
+                            "after": persisted.model_dump(mode="json"),
+                        },
+                    )
 
             await self._maybe_commit()
 
@@ -8575,9 +8589,11 @@ class SqliteEngravaCore:
         so the read, the transition check, and the write are atomic with
         respect to every other guarded write on this instance. It also shares
         :meth:`update_thought`'s :meth:`_write_readback_savepoint` protection:
-        a read-back failure unwinds this call's own write instead of leaving
-        it pending for a later, unrelated commit to publish, without
-        disturbing a caller-owned transaction already in progress.
+        a read-back failure, or a failed or cancelled journal append, unwinds
+        this call's own write instead of leaving it pending for a later,
+        unrelated commit to publish without the journal entry that documents
+        it, without disturbing a caller-owned transaction already in
+        progress.
 
         Args:
             thought_id: UUID of the archived thought to restore.
@@ -8644,15 +8660,15 @@ class SqliteEngravaCore:
 
                 persisted = await self._read_back_thought(thought_id)
 
-            if self._journal is not None:
-                await self._journal.append(
-                    mutation_type="UPDATE_THOUGHT",
-                    target_id=thought_id,
-                    delta={
-                        "before": current.model_dump(mode="json"),
-                        "after": persisted.model_dump(mode="json"),
-                    },
-                )
+                if self._journal is not None:
+                    await self._journal.append(
+                        mutation_type="UPDATE_THOUGHT",
+                        target_id=thought_id,
+                        delta={
+                            "before": current.model_dump(mode="json"),
+                            "after": persisted.model_dump(mode="json"),
+                        },
+                    )
             await self._maybe_commit()
         return persisted
 
@@ -9077,10 +9093,11 @@ class SqliteEngravaCore:
         call also writes can no longer land between this call's own read and
         write.
 
-        **The write (when there is one) and its confirming read-back are one
-        failure-atomic unit**, via :meth:`_write_readback_savepoint` — see
-        :meth:`update_thought` for what that protects against and how it
-        treats a caller-owned transaction. The ``UPDATE`` also now captures
+        **The write (when there is one), its confirming read-back, and its
+        journal entry are one failure-atomic unit**, via
+        :meth:`_write_readback_savepoint` — see :meth:`update_thought` for
+        what that protects against and how it treats a caller-owned
+        transaction. The ``UPDATE`` also now captures
         its cursor and rejects a zero-row match immediately, rather than
         trusting the read-back alone: without that check, a row deleted
         after the initial read (so the ``UPDATE`` matches nothing) and
@@ -9163,15 +9180,15 @@ class SqliteEngravaCore:
 
                 persisted = await self._read_back_edge(edge_id)
 
-            if self._journal is not None:
-                await self._journal.append(
-                    mutation_type="UPDATE_EDGE",
-                    target_id=edge_id,
-                    delta={
-                        "before": current.model_dump(mode="json"),
-                        "after": persisted.model_dump(mode="json"),
-                    },
-                )
+                if self._journal is not None:
+                    await self._journal.append(
+                        mutation_type="UPDATE_EDGE",
+                        target_id=edge_id,
+                        delta={
+                            "before": current.model_dump(mode="json"),
+                            "after": persisted.model_dump(mode="json"),
+                        },
+                    )
             # An edit that changes nothing (``columns`` empty) writes no
             # column of its own *unless* journaling is enabled: the journal
             # entry above is itself a real row insert (JournalWriter.append
@@ -13689,8 +13706,8 @@ class SqliteEngravaCore:
         triggers no recompute. The record returned is read back from storage
         after the write, and the journal ``after`` image is the same read-back.
 
-        **The write and its confirming read-back are one failure-atomic
-        unit**, via :meth:`_write_readback_savepoint` — see
+        **The write, its confirming read-back, and its journal entry are one
+        failure-atomic unit**, via :meth:`_write_readback_savepoint` — see
         :meth:`update_thought` for what that protects against and how it
         treats a caller-owned transaction. The ``UPDATE`` also captures its
         cursor and rejects a zero-row match immediately: without that check,
@@ -13779,21 +13796,21 @@ class SqliteEngravaCore:
 
                 persisted = await self._read_back_action(action_id)
 
-            if self._journal is not None:
-                await self._journal.append(
-                    mutation_type="UPDATE_ACTION",
-                    target_id=action_id,
-                    delta={
-                        "before": {
-                            "status": current.status.value,
-                            "verification_status": current.verification_status.value,
+                if self._journal is not None:
+                    await self._journal.append(
+                        mutation_type="UPDATE_ACTION",
+                        target_id=action_id,
+                        delta={
+                            "before": {
+                                "status": current.status.value,
+                                "verification_status": current.verification_status.value,
+                            },
+                            "after": {
+                                "status": persisted.status.value,
+                                "verification_status": persisted.verification_status.value,
+                            },
                         },
-                        "after": {
-                            "status": persisted.status.value,
-                            "verification_status": persisted.verification_status.value,
-                        },
-                    },
-                )
+                    )
 
             # Outcome-affecting iff the change lands a terminal status, or
             # changes verification on an already-terminal action. Because the
