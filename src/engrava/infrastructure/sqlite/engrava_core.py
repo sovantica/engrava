@@ -4616,6 +4616,15 @@ class SqliteEngravaCore:
         ``_metadata`` shape is byte-identical to the legacy one and a
         pre-existing unprefixed store never false-trips the lock.
 
+        ``model_name == CENTROID_MODEL_NAME`` is exempt from all of the
+        above: a REFLECTION centroid is a computed mean of member vectors,
+        not something a configured embedding provider produced, so its
+        sentinel tag is bookkeeping rather than a corpus identity. It must
+        never be compared against the locked identity, and it must never
+        itself lock the corpus identity either — including the edge case
+        where a centroid write happens to be the very first
+        ``store_embedding()`` call ever made on a store.
+
         Args:
             model_name: Model identifier from the current provider.
             dimension: Vector dimensionality from the current provider.
@@ -4626,6 +4635,11 @@ class SqliteEngravaCore:
                 from the one stored in ``_metadata``.
 
         """
+        if model_name == CENTROID_MODEL_NAME:
+            # Bookkeeping tag, not a provider identity: skip the comparison
+            # and the metadata write in both directions.
+            return
+
         # Held for this whole method, not just by callers that happen to
         # already have it: ``store_embedding`` holds it for its entire body
         # (a free re-entrant no-op here), but ``verify_embedding_model`` — a

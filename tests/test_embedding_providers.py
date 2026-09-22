@@ -571,6 +571,73 @@ class TestModelReCheckOnEveryCall:
             await store.close()
 
 
+class TestCentroidModelNameExemptFromLock:
+    """A REFLECTION centroid's sentinel ``model_name`` never touches the lock.
+
+    ``CENTROID_MODEL_NAME`` tags a computed centroid vector, not a provider
+    identity, so it must be exempt from ``_ensure_embedding_model_lock`` in
+    both directions: it must not be checked against an already-locked
+    identity, and it must not itself lock the corpus identity when it
+    happens to be the first ``store_embedding()`` call ever made.
+    """
+
+    async def _file_store(self, tmp_path: Path, name: str) -> SqliteEngravaCore:
+        conn = await aiosqlite.connect(str(tmp_path / name))
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA foreign_keys = ON")
+        store = SqliteEngravaCore(conn)
+        store._owns_connection = True
+        await store.ensure_schema()
+        return store
+
+    async def test_centroid_write_does_not_raise_against_a_locked_real_model(
+        self, tmp_path: Path
+    ) -> None:
+        from engrava.domain.dreaming import CENTROID_MODEL_NAME
+
+        store = await self._file_store(tmp_path, "centroid_exempt.db")
+        try:
+            await store.create_thought(_make_thought("t-1"))
+            await store.create_thought(_make_thought("t-2"))
+
+            # Locks the corpus identity to a real provider model.
+            await store.store_embedding(
+                thought_id="t-1", vector=[0.1, 0.2, 0.3], model_name="real-model"
+            )
+            # A centroid write, tagged with the sentinel, must not be
+            # compared against the locked identity.
+            await store.store_embedding(
+                thought_id="t-2", vector=[0.4, 0.5, 0.6], model_name=CENTROID_MODEL_NAME
+            )
+        finally:
+            await store.close()
+
+    async def test_centroid_write_as_first_call_does_not_lock_corpus_identity(
+        self, tmp_path: Path
+    ) -> None:
+        from engrava.domain.dreaming import CENTROID_MODEL_NAME
+
+        store = await self._file_store(tmp_path, "centroid_first_call.db")
+        try:
+            await store.create_thought(_make_thought("t-1"))
+            await store.create_thought(_make_thought("t-2"))
+
+            # The very first store_embedding() call ever made on this store
+            # is a centroid write — it must not lock the corpus identity to
+            # the sentinel name.
+            await store.store_embedding(
+                thought_id="t-1", vector=[0.1, 0.2, 0.3], model_name=CENTROID_MODEL_NAME
+            )
+            # A genuinely different, real model name must still succeed —
+            # it would have raised EmbeddingModelMismatchError here if the
+            # centroid write had wrongly locked the identity first.
+            await store.store_embedding(
+                thought_id="t-2", vector=[0.4, 0.5, 0.6], model_name="real-model"
+            )
+        finally:
+            await store.close()
+
+
 # ---------------------------------------------------------------------------
 # Schema migration core-4 → core-5
 # ---------------------------------------------------------------------------
