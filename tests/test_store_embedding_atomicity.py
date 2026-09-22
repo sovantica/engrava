@@ -83,6 +83,13 @@ async def _embedding_row_count(db: aiosqlite.Connection) -> int:
     return int(row["c"])
 
 
+async def _metadata_value(db: aiosqlite.Connection, key: str) -> str | None:
+    """Read a raw ``_metadata`` value, or ``None`` when the key is absent."""
+    cursor = await db.execute("SELECT value FROM _metadata WHERE key = ?", (key,))
+    row = await cursor.fetchone()
+    return None if row is None else str(row["value"])
+
+
 @sqlite_vec_required
 class TestStoreEmbeddingSqliteVecAtomicity:
     """A vec0-layer rejection must not leave the base row committable."""
@@ -206,5 +213,163 @@ class TestStoreEmbeddingNumpyBackendFailure:
 
             await _make_thought(store, "t-real2")
             assert await _embedding_row_count(db) == 1
+        finally:
+            await store.close()
+
+
+class TestFirstEmbeddingIdentityAtomicity:
+    """A rejected *first* ``store_embedding()`` must not durably lock identity.
+
+    Before this fix, ``store_embedding`` called ``_ensure_embedding_model_lock``
+    *before* opening its own ``_write_readback_savepoint``. On an empty corpus
+    that helper writes and commits the ``_metadata`` identity rows
+    unconditionally, so a first call whose base/vec0 write then failed still
+    left that identity durably locked — with no way for a corrected retry to
+    succeed short of manual ``_metadata`` surgery. This is distinct from
+    ``TestStoreEmbeddingSqliteVecAtomicity`` / ``TestStoreEmbeddingNumpyBackendFailure``
+    above, which cover a *second*-call bypass already fixed separately: these
+    tests are about the identity lock itself outliving the very first write it
+    was meant to gate.
+    """
+
+    @sqlite_vec_required
+    async def test_dimension_mismatch_on_first_call_leaves_no_identity_committed(
+        self, tmp_path: Path
+    ) -> None:
+        """vec0's width is fixed at store-configuration time, not derived from the first vector.
+
+        A first vector whose length disagrees with that configured width
+        fails the vec0 upsert. Before the fix, the identity lock had already
+        committed (with the *wrong*, rejected dimension) before that upsert
+        ever ran, so even a corrected retry using the store's actual
+        configured dimension was refused.
+        """
+        store = await _build_store(tmp_path, backend="sqlite-vec", dimension=3)
+        db = store._db
+        try:
+            await _make_thought(store, "t-first")
+            await _make_thought(store, "t-second")
+
+            with pytest.raises(Exception, match="Dimension mismatch"):
+                await store.store_embedding(
+                    thought_id="t-first", vector=[1.0, 0.0, 0.0, 0.0], model_name="m"
+                )
+
+            # The failed call left no base row, no open transaction, and —
+            # this is the fix — no identity lock either.
+            assert await _embedding_row_count(db) == 0
+            assert db.in_transaction is False
+            assert await _metadata_value(db, "embedding_model_name") is None
+
+            # A corrected retry, using the dimension the store was actually
+            # configured for, succeeds on the same connection.
+            record = await store.store_embedding(
+                thought_id="t-second", vector=[1.0, 0.0, 0.0], model_name="m"
+            )
+            assert await _embedding_row_count(db) == 1
+            assert record.dimension == 3
+            assert await _metadata_value(db, "embedding_model_name") == "m"
+            assert await _metadata_value(db, "embedding_dimension") == "3"
+        finally:
+            await store.close()
+
+        # And after reopening the file on a fresh connection, a further
+        # write against the corrected identity still succeeds.
+        reopened = await _build_store(tmp_path, backend="sqlite-vec", dimension=3)
+        try:
+            await _make_thought(reopened, "t-third")
+            await reopened.store_embedding(
+                thought_id="t-third", vector=[0.0, 1.0, 0.0], model_name="m"
+            )
+            assert await _embedding_row_count(reopened._db) == 2
+        finally:
+            await reopened.close()
+
+    async def test_fk_violation_on_first_call_leaves_no_identity_committed(
+        self, tmp_path: Path
+    ) -> None:
+        """A first write against a nonexistent ``thought_id`` fails the owner FK.
+
+        The numpy backend has no vec0 width to violate, so the only way this
+        first call fails is the ``embedding.owner_id`` foreign key. The
+        failed attempt uses a 4-dimensional placeholder vector (stand-in
+        data from before the real embedding pipeline was wired up); the
+        corrected retry uses the real 3-dimensional one. Before the fix, the
+        placeholder's dimension had already locked the corpus identity, so
+        even a retry with the right ``thought_id`` *and* the right dimension
+        for the real provider was refused.
+        """
+        store = await _build_store(tmp_path, backend="numpy", dimension=3, db_name="numpy-fk")
+        db = store._db
+        try:
+            await _make_thought(store, "t-real")
+
+            with pytest.raises(Exception, match="FOREIGN KEY"):
+                await store.store_embedding(
+                    thought_id="does-not-exist",
+                    vector=[1.0, 0.0, 0.0, 0.0],
+                    model_name="m",
+                )
+
+            assert await _embedding_row_count(db) == 0
+            assert db.in_transaction is False
+            assert await _metadata_value(db, "embedding_model_name") is None
+
+            record = await store.store_embedding(
+                thought_id="t-real", vector=[1.0, 0.0, 0.0], model_name="m"
+            )
+            assert await _embedding_row_count(db) == 1
+            assert record.dimension == 3
+            assert await _metadata_value(db, "embedding_model_name") == "m"
+            assert await _metadata_value(db, "embedding_dimension") == "3"
+        finally:
+            await store.close()
+
+        reopened = await _build_store(tmp_path, backend="numpy", dimension=3, db_name="numpy-fk")
+        try:
+            await _make_thought(reopened, "t-real2")
+            await reopened.store_embedding(
+                thought_id="t-real2", vector=[0.0, 1.0, 0.0], model_name="m"
+            )
+            assert await _embedding_row_count(reopened._db) == 2
+        finally:
+            await reopened.close()
+
+    async def test_centroid_first_call_that_fails_locks_nothing(self, tmp_path: Path) -> None:
+        """The centroid sentinel's lock exemption must survive this fix.
+
+        A REFLECTION centroid write that happens to be the very first
+        ``store_embedding()`` call ever made is exempt from the identity lock
+        in both directions: it must never be compared against a locked
+        identity, and it must never lock one itself. That must hold even
+        when that first call's own base-row write fails — the sentinel
+        short-circuits before the identity-lock machinery runs at all, so
+        moving that machinery inside the write's own savepoint (this fix)
+        must not change that a rejected centroid write locks nothing,
+        before or after.
+        """
+        from engrava.domain.dreaming import CENTROID_MODEL_NAME
+
+        store = await _build_store(
+            tmp_path, backend="numpy", dimension=3, db_name="centroid-first-fail"
+        )
+        db = store._db
+        try:
+            with pytest.raises(Exception, match="FOREIGN KEY"):
+                await store.store_embedding(
+                    thought_id="does-not-exist",
+                    vector=[0.1, 0.2, 0.3],
+                    model_name=CENTROID_MODEL_NAME,
+                )
+
+            assert await _embedding_row_count(db) == 0
+            assert await _metadata_value(db, "embedding_model_name") is None
+
+            await _make_thought(store, "t-real")
+            record = await store.store_embedding(
+                thought_id="t-real", vector=[0.4, 0.5, 0.6], model_name="real-model"
+            )
+            assert record.dimension == 3
+            assert await _metadata_value(db, "embedding_model_name") == "real-model"
         finally:
             await store.close()

@@ -233,6 +233,12 @@ model check runs on every embedding write and on every `verify_embedding_model()
 call on a store that has a provider — not only the first — so it does not stop
 comparing after the first write.
 
+A first `store_embedding()` call whose own write fails — a vector whose length
+disagrees with the sqlite-vec backend's configured width, or a `thought_id`
+naming no `thought` row — locks nothing: the model identity commits only
+together with that first write actually landing, so a corrected retry on the
+same store is not refused by an identity a failed call left behind.
+
 A deliberate CLI re-embed is available while restoring a snapshot into a
 configured direct database or service. Pass `--config`: direct mode uses the
 top-level `embeddings` provider, while service mode prefers its per-service

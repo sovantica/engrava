@@ -4590,7 +4590,9 @@ class SqliteEngravaCore:
     # Embedding model immutability
     # ------------------------------------------------------------------
 
-    async def _ensure_embedding_model_lock(self, model_name: str, dimension: int) -> None:
+    async def _ensure_embedding_model_lock(
+        self, model_name: str, dimension: int, *, commit: bool = True
+    ) -> None:
         """Lock the embedding model on first ``store_embedding()``, verify on every call.
 
         On first call (no ``embedding_model_name`` in ``_metadata``), writes
@@ -4625,9 +4627,30 @@ class SqliteEngravaCore:
         where a centroid write happens to be the very first
         ``store_embedding()`` call ever made on a store.
 
+        **The first-call identity write is committed here only when
+        ``commit`` is true.** ``verify_embedding_model`` wants exactly that:
+        it establishes identity on an empty corpus on its own account,
+        independent of any write, so its call keeps the default and the
+        identity lands durably the moment this method returns, as it always
+        has. ``store_embedding`` wants the opposite — its call passes
+        ``commit=False`` and makes the identity write itself, from inside
+        the same :meth:`_write_readback_savepoint` span as the base/vec0
+        write it exists to gate: a rejected first vector (wrong dimension,
+        an invalid owner) then unwinds the identity write along with it,
+        instead of leaving a wrongly-locked identity behind for a corrected
+        retry to fail against.
+
         Args:
             model_name: Model identifier from the current provider.
             dimension: Vector dimensionality from the current provider.
+            commit: Whether the first-call identity write commits on its own
+                account. ``True`` (the default, used by
+                ``verify_embedding_model``) commits immediately, exactly as
+                this method always has. ``False`` (used by
+                ``store_embedding``) leaves the write pending for the
+                caller's own enclosing savepoint/commit to resolve, so it
+                rolls back together with a failed write it was meant to
+                gate rather than surviving it.
 
         Raises:
             EmbeddingModelMismatchError: When the configured model, its
@@ -4682,7 +4705,8 @@ class SqliteEngravaCore:
                         "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
                         (_METADATA_QUERY_PREFIX, _query_prefix),
                     )
-                await self._maybe_commit()
+                if commit:
+                    await self._maybe_commit()
             else:
                 stored_model = row["value"]
                 dim_cursor = await self._db.execute(
@@ -9877,8 +9901,10 @@ class SqliteEngravaCore:
     ) -> EmbeddingRecord:
         """Persist an embedding vector for a thought.
 
-        On first call, locks the embedding model in ``_metadata``.
-        Subsequent calls verify the model matches the stored one.
+        On first call, locks the embedding model in ``_metadata`` — atomically
+        with this call's own write, so a first call that fails (wrong
+        dimension, an invalid ``thought_id``) locks nothing. Subsequent calls
+        verify the model matches the stored one.
 
         Args:
             thought_id: UUID of the thought that owns this embedding.
@@ -9901,20 +9927,27 @@ class SqliteEngravaCore:
 
         """
         async with self._write_lock:
-            await self._ensure_embedding_model_lock(model_name, len(vector))
             eid = embedding_id or f"emb-{_uuid.uuid5(_uuid.NAMESPACE_URL, thought_id)}"
             dimension = len(vector)
             blob = struct.pack(f"{dimension}f", *vector)
             created_at = datetime.datetime.now(datetime.UTC).isoformat()
 
-            # The base ``embedding`` row and the ``vec0`` upsert are one
-            # failure-atomic unit: without this, a vec0 rejection (e.g. a
-            # wrong-dimension vector) after the base row already succeeded
-            # left that row pending in the connection's open transaction,
-            # where a later, unrelated commit on the same connection would
-            # publish it — a vector-less row silently corrupting the
-            # embedding table. See :meth:`_write_readback_savepoint`.
+            # The identity lock, the base ``embedding`` row and the ``vec0``
+            # upsert are one failure-atomic unit: without this, a first call
+            # on an empty corpus that locked the model identity but then
+            # failed its own base/vec0 write (a wrong-dimension vector, an
+            # invalid owner) left that identity committed regardless — a
+            # corrected retry would then fail verification against a corpus
+            # identity no write had actually survived to justify. Passing
+            # ``commit=False`` keeps the identity write itself inside this
+            # same savepoint span, so it unwinds together with a rejected
+            # base/vec0 write instead of outliving it; a wrong-dimension
+            # vector or vec0 rejection after the base row already succeeded
+            # unwinds the same way, leaving nothing pending in the
+            # connection's open transaction for a later, unrelated commit to
+            # publish. See :meth:`_write_readback_savepoint`.
             async with self._write_readback_savepoint("store_embedding"):
+                await self._ensure_embedding_model_lock(model_name, dimension, commit=False)
                 cursor = await self._db.execute(
                     "SELECT rowid FROM embedding WHERE embedding_id = ?",
                     (eid,),
