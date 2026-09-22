@@ -9616,7 +9616,9 @@ class SqliteEngravaCore:
 
         Builds the embed payload via :func:`_build_embed_input` (which drops a
         prefix-redundant ``essence`` to avoid double-counting the opening),
-        embeds it via the configured provider, and persists the vector.
+        embeds it via the configured provider, and persists the vector —
+        but only if the thought's stored ``essence``/``content`` still match
+        what was just embedded (see "Staleness" below).
 
         An ``Exception`` that escapes the guarded call to
         :func:`_embed_document` below is never silent: it is routed through
@@ -9648,6 +9650,33 @@ class SqliteEngravaCore:
         still findable by vector search only if the row had one before
         and the update committed.
 
+        **Staleness.** The provider call above is a slow, arbitrary network
+        round trip made *outside* :attr:`_write_lock` (see the call sites in
+        :meth:`update_thought` and :meth:`_finish_create_thought`), so by the
+        time it returns, an unrelated later write may already have changed
+        this same thought's ``essence``/``content`` — or deleted the row
+        outright — and installed its own, newer vector. Installing this
+        call's vector unconditionally would silently overwrite that newer
+        vector with one computed from now-superseded content, even though
+        the durable text and FTS index already reflect the later write.
+        Guarded against here, atomically with the install: immediately
+        before calling :meth:`store_embedding`, the thought's *current*
+        stored ``essence``/``content`` are re-read under :attr:`_write_lock`
+        and compared against what was actually embedded above. A mismatch —
+        including the row no longer existing — means this completion is
+        stale: it is dropped silently rather than installed, on the
+        assumption that either the later write already triggered its own,
+        current auto-embed, or (if it did not, e.g. a metadata-only write)
+        the vector already in place is the one that write left there, which
+        is correct for its content. Comparing content rather than a revision
+        counter also covers thought-id reuse after a delete: a revision
+        counter restarts at zero on the recreated row, which could
+        coincidentally equal a revision captured before the deletion, but
+        the *content* only matches when it is genuinely the same content —
+        installing in that case is correct, not stale, because the vector
+        this call computed is valid for whatever row currently holds that
+        content.
+
         Args:
             thought: The thought to embed.
 
@@ -9666,11 +9695,25 @@ class SqliteEngravaCore:
         except Exception as exc:  # noqa: BLE001 -- provider may raise any type; re-raised in handler
             self._on_auto_embed_failure(thought.thought_id, exc)
 
-        await self.store_embedding(
-            thought.thought_id,
-            vector,
-            model_name=provider.model_name,
-        )
+        model_name = provider.model_name
+        async with self._write_lock:
+            current_row = await self._get_thought_row(thought.thought_id)
+            if (
+                current_row is None
+                or current_row["essence"] != thought.essence
+                or current_row["content"] != thought.content
+            ):
+                logger.debug(
+                    "Dropping stale auto-embed completion for %s: essence/content "
+                    "changed (or the row was deleted) since this embed was scheduled.",
+                    thought.thought_id,
+                )
+                return
+            await self.store_embedding(
+                thought.thought_id,
+                vector,
+                model_name=model_name,
+            )
 
     async def _rebind_consolidated_reflections(self, source_id: str) -> int:
         """Recompute the centroids of REFLECTIONs that summarize a source.
@@ -9689,6 +9732,23 @@ class SqliteEngravaCore:
         :meth:`update_thought`, so metadata/priority churn leaves dependent
         REFLECTION centroids untouched.
 
+        **Same asynchronous-completion shape as the auto-embed above, closed
+        differently.** Like :meth:`_auto_embed_thought`, this runs outside
+        :attr:`_write_lock` (:meth:`update_thought` releases it before
+        either call), so two members of the same REFLECTION updated close
+        together can each trigger a rebind of that one REFLECTION
+        concurrently. Unlike the provider call above, though, nothing here
+        is slow, arbitrary network I/O — every step reading a member vector
+        is a local, in-process database read — so each reflection's whole
+        read-recompute-store span is wrapped in one :attr:`_write_lock`
+        acquisition instead of using a captured-then-compared identity. That
+        makes the span atomic with respect to every other guarded write,
+        including a concurrent rebind of the same REFLECTION: whichever
+        rebind actually runs always reads the member vectors as they stand
+        at that moment, not a snapshot captured earlier, so there is no
+        window in which an earlier-read, now-superseded centroid can land
+        after a later one already installed a fresher vector.
+
         Args:
             source_id: UUID of the source thought that was just re-embedded.
 
@@ -9702,24 +9762,25 @@ class SqliteEngravaCore:
 
         rebound = 0
         for reflection_id in reflection_ids:
-            member_ids = await self.consolidated_member_ids(reflection_id)
-            member_vectors: list[list[float]] = []
-            for member_id in member_ids:
-                embedding = await self.get_embedding(member_id)
-                if embedding is None:
+            async with self._write_lock:
+                member_ids = await self.consolidated_member_ids(reflection_id)
+                member_vectors: list[list[float]] = []
+                for member_id in member_ids:
+                    embedding = await self.get_embedding(member_id)
+                    if embedding is None:
+                        continue
+                    member_vectors.append(
+                        list(struct.unpack(f"{embedding.dimension}f", embedding.vector_blob)),
+                    )
+                if not member_vectors:
                     continue
-                member_vectors.append(
-                    list(struct.unpack(f"{embedding.dimension}f", embedding.vector_blob)),
+                centroid = compute_centroid(member_vectors)
+                await self.store_embedding(
+                    reflection_id,
+                    centroid,
+                    model_name=CENTROID_MODEL_NAME,
                 )
-            if not member_vectors:
-                continue
-            centroid = compute_centroid(member_vectors)
-            await self.store_embedding(
-                reflection_id,
-                centroid,
-                model_name=CENTROID_MODEL_NAME,
-            )
-            rebound += 1
+                rebound += 1
         return rebound
 
     # ------------------------------------------------------------------
