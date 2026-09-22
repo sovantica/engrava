@@ -1135,3 +1135,49 @@ class TestMaxPerUnitComposition:
         assert len(refl_in_final) <= 1
         # No duplicate ids across the retention + cap backfill stages.
         assert len(returned) == len(set(returned))
+
+
+# ---------------------------------------------------------------------------
+# Query-less fallback honours collapse_key too
+# ---------------------------------------------------------------------------
+
+
+class TestFallbackCollapse:
+    """The all-signals-off fallback must collapse by unit exactly like an
+    ordinary FTS/vector-active search — a fallback result is still a result.
+    """
+
+    async def test_fallback_collapses_repeated_unit_fragments(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        """No query text, no vector: still one keeper per unit, backfilled."""
+        # Distinct single-fragment units first, unit u1's many fragments last —
+        # with every row tied on the fallback's flat score, the query-less
+        # window is ordered most-recently-written first, so u1's fragments
+        # alone would fill (and, pre-fix, do fill) the top-5 window.
+        for u in range(2, 6):
+            await store.create_thought(
+                _thought(f"u{u}", essence="upsilon", metadata={"unit": f"u{u}"})
+            )
+        for i in range(6):
+            await store.create_thought(
+                _thought(f"u1-{i}", essence="upsilon", metadata={"unit": "u1"})
+            )
+        # Empty query_text + no vector + no priority/recency arm -> the
+        # query-less fallback (neither FTS nor vector active).
+        result = await store.search_hybrid(
+            "",
+            top_k=5,
+            collapse_key="$.unit",
+            priority_weight=0.0,
+        )
+        assert "fts5" not in result.backends_used
+        assert "vector" not in result.backends_used
+        returned = _ids(result.results)
+        units_seen = [tid.split("-")[0] for tid in returned]
+        # Exactly one u1 survivor; the rest are distinct backfilled units —
+        # TODAY (pre-fix) this instead returns 5 raw u1-* fragments, since the
+        # fallback returns directly without ever reaching collapse-by-unit.
+        assert units_seen.count("u1") == 1
+        assert set(units_seen) == {"u1", "u2", "u3", "u4", "u5"}
+        assert len(returned) == 5

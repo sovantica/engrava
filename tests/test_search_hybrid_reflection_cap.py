@@ -509,3 +509,40 @@ class TestReflectionsEvictedField:
         result = await store_cap1.search_hybrid(query_text="zephyr", top_k=10)
 
         assert result.reflections_evicted == 0
+
+
+class TestFallbackReflectionCap:
+    """The all-signals-off fallback must enforce ``reflection_topk_cap``
+    exactly like an ordinary FTS/vector-active search — a fallback result is
+    still a result.
+    """
+
+    async def test_fallback_enforces_cap(self, store: SqliteEngravaCore) -> None:
+        """No query text, no vector: REFLECTIONs still capped at cap * top_k.
+
+        8 REFLECTIONs (ranked first via a higher ``updated_cycle``) and 12
+        OBSERVATIONs (ranked after, with enough depth to fully backfill the
+        evicted slots). With ``top_k=10`` and the fixture's
+        ``reflection_topk_cap=0.3``, at most 3 REFLECTION slots are allowed —
+        TODAY (pre-fix) the fallback returns directly without ever reaching
+        the cap, so the top-10 is REFLECTION-flooded (8 of them).
+        """
+        for i in range(8):
+            await store.create_thought(
+                _reflection(f"refl-{i}", essence="reflection flood", created_cycle=10)
+            )
+        for i in range(12):
+            await store.create_thought(_obs(f"obs-{i}", essence="obs flood", created_cycle=0))
+
+        result = await store.search_hybrid("", top_k=10, priority_weight=0.0)
+
+        assert "fts5" not in result.backends_used
+        assert "vector" not in result.backends_used
+        refl_in_result = [tid for tid, _ in result.results if tid.startswith("refl-")]
+        obs_in_result = [tid for tid, _ in result.results if tid.startswith("obs-")]
+        # cap=0.3 * top_k=10 -> at most 3 reflection slots.
+        assert len(refl_in_result) <= 3
+        # The freed slots are backfilled from off-list OBSERVATIONs, filling
+        # the window back up to top_k.
+        assert len(refl_in_result) + len(obs_in_result) == 10
+        assert len(result.results) == 10

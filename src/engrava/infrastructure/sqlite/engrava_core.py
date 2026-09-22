@@ -11957,6 +11957,163 @@ class SqliteEngravaCore:
             unit_keys[thought_id] = None if any(c is None for c in components) else components
         return unit_keys
 
+    async def _apply_reflection_filter_boost(
+        self,
+        *,
+        combined: dict[str, float],
+        include_reflections: bool,
+        resolved_reflection_boost: float,
+        needs_reflection_ids: bool,
+    ) -> set[str]:
+        """Resolve REFLECTION ids for ``combined`` and apply filter/boost.
+
+        Shared by the FTS/vector-active fusion path and the query-less
+        fallback: both need the same REFLECTION id lookup, the same
+        ``include_reflections=False`` hard filter, and the same
+        ``reflection_boost`` scaling before either path computes its own
+        (path-specific) ranked order.
+
+        Args:
+            combined: Candidate ``thought_id -> score`` map, mutated in
+                place — REFLECTION ids are popped (``include_reflections``
+                ``False``) or score-scaled (``resolved_reflection_boost !=
+                1.0``).
+            include_reflections: When ``False``, REFLECTION ids are removed
+                from ``combined``.
+            resolved_reflection_boost: The already-resolved boost factor
+                (see ``search_hybrid``'s ``reflection_boost`` argument).
+            needs_reflection_ids: Whether a REFLECTION id lookup is needed
+                at all (``False`` short-circuits the query — neither the
+                filter, the boost, nor the caller's ``reflection_topk_cap``
+                check requires it).
+
+        Returns:
+            The resolved REFLECTION id set (empty when none matched or
+            ``needs_reflection_ids`` was ``False``).
+
+        """
+        reflection_ids: set[str] = set()
+        if needs_reflection_ids and combined:
+            candidate_ids = list(combined)
+            placeholders = ", ".join("?" for _ in candidate_ids)
+            cursor = await self._db.execute(
+                f"SELECT thought_id FROM thought"  # noqa: S608
+                f" WHERE thought_type = 'REFLECTION'"
+                f" AND thought_id IN ({placeholders})",
+                candidate_ids,
+            )
+            rows = await cursor.fetchall()
+            reflection_ids = {str(r["thought_id"]) for r in rows}
+
+        if not include_reflections:
+            for rid in reflection_ids:
+                combined.pop(rid, None)
+        elif resolved_reflection_boost != 1.0 and reflection_ids:
+            for rid in reflection_ids:
+                if rid in combined:
+                    combined[rid] = combined[rid] * resolved_reflection_boost
+        return reflection_ids
+
+    async def _apply_collapse_and_topk_cap(
+        self,
+        *,
+        ranked: list[tuple[str, float]],
+        collapse_paths: tuple[str, ...] | None,
+        collapse_max_per_unit: int | None,
+        reflection_ids: set[str],
+        resolved_reflection_topk_cap: float,
+        include_reflections: bool,
+        top_k: int,
+    ) -> tuple[list[tuple[str, float]], int]:
+        """Apply collapse-by-unit retention, then ``reflection_topk_cap``.
+
+        ``ranked`` must already be in the caller's deterministic total
+        order (score descending, under whatever tie-break rule that path
+        uses). Shared by the FTS/vector-active fusion path and the
+        query-less fallback, so a caller-requested ``collapse_key`` /
+        ``reflection_topk_cap`` is honoured identically regardless of which
+        arms produced the candidates.
+
+        Args:
+            ranked: Candidates already sorted into the caller's total
+                order.
+            collapse_paths: Validated de-fragmentation unit-key paths, or
+                ``None`` to leave ``ranked`` unchanged.
+            collapse_max_per_unit: Intra-unit retention depth (see
+                ``search_hybrid``'s docstring); inert unless
+                ``collapse_paths`` is also set.
+            reflection_ids: REFLECTION ids among ``ranked`` (from
+                :meth:`_apply_reflection_filter_boost`).
+            resolved_reflection_topk_cap: The already-resolved cap fraction.
+            include_reflections: When ``False`` the cap step is skipped —
+                REFLECTIONs were already removed upstream.
+            top_k: Maximum number of final results.
+
+        Returns:
+            The ``(final_results, reflections_evicted)`` pair.
+
+        """
+        # --- De-fragmentation retention-by-unit + backfill ---
+        # Runs AFTER fusion/ranking and REFLECTION boost, BEFORE the
+        # ``[:top_k]`` truncation and BEFORE reflection_topk_cap — the same
+        # locus and shape as the cap's evict-and-backfill. It touches no
+        # score and no candidate set: it only removes surplus lower-ranked
+        # members of the same caller-defined unit so deeper distinct units
+        # in ``ranked[top_k:]`` flow up into the window. ``collapse_max_per_unit``
+        # sets how many members of a unit are kept: ``None`` => 1
+        # (single-keeper collapse), an integer keeps that many.
+        if collapse_paths is not None and ranked:
+            unit_keys = await self._fetch_collapse_unit_keys(
+                thought_ids=[tid for tid, _ in ranked],
+                paths=collapse_paths,
+            )
+            ranked = _retain_ranked_by_unit(
+                ranked,
+                unit_keys,
+                max_per_unit=1 if collapse_max_per_unit is None else collapse_max_per_unit,
+            )
+        final = ranked[:top_k]
+
+        # --- reflection_topk_cap enforcement ---
+        # Runs on the (possibly collapsed) ``ranked`` so the single backfill
+        # source is the collapsed off-list pool — no unit is double-counted.
+        reflections_evicted = 0
+        if include_reflections and resolved_reflection_topk_cap < 1.0 and reflection_ids:
+            _max_ref_slots = max(0, int(top_k * resolved_reflection_topk_cap))
+            _ref_in_final = [
+                (i, tid, s) for i, (tid, s) in enumerate(final) if tid in reflection_ids
+            ]
+            if len(_ref_in_final) > _max_ref_slots:
+                _excess = len(_ref_in_final) - _max_ref_slots
+                _to_evict = {
+                    tid for _, tid, _ in sorted(_ref_in_final, key=lambda x: x[2])[:_excess]
+                }
+                _off_list_obs = [(tid, s) for tid, s in ranked[top_k:] if tid not in reflection_ids]
+                if len(_off_list_obs) < _excess:
+                    logger.warning(
+                        "reflection_topk_cap: %d excess REFLECTION(s) to evict but only %d "
+                        "off-list non-REFLECTION candidates available — partial enforcement",
+                        _excess,
+                        len(_off_list_obs),
+                    )
+                _fill = _off_list_obs[:_excess]
+                _kept = [(tid, s) for tid, s in final if tid not in _to_evict]
+                final = _sort_scored_descending(_kept + _fill)[:top_k]
+                # ``_to_evict`` REFLECTIONs are removed from the window
+                # unconditionally (independent of how many backfill candidates
+                # were available), so the evicted count is the excess.
+                reflections_evicted = len(_to_evict)
+                logger.info(
+                    "reflection_topk_cap: evicted %d REFLECTION(s) from the top-%d window "
+                    "(cap=%.3f, max reflection slots=%d)",
+                    reflections_evicted,
+                    top_k,
+                    resolved_reflection_topk_cap,
+                    _max_ref_slots,
+                )
+
+        return final, reflections_evicted
+
     async def search_hybrid(  # noqa: C901, PLR0912, PLR0915
         self,
         query_text: str,
@@ -12238,17 +12395,47 @@ class SqliteEngravaCore:
         # never mid-query (reuses the shared metadata path grammar). ``None``
         # keeps the entire candidate/score/order path byte-identical to today's.
         collapse_paths: tuple[str, ...] | None = None
+        collapse_pool_factor = (
+            self._search_config.collapse_pool_factor if self._search_config is not None else 4
+        )
         if collapse_key is not None:
             collapse_paths = _normalize_collapse_key(collapse_key)
             # Bounded candidate-pool widening: when collapsing, fragments of
             # few units can dominate the per-arm budgets, so widen each arm by
             # a small, config-backed factor to give backfill a deeper distinct
             # -unit pool. Bounded (small int) — never unbounded over-fetch.
-            collapse_pool_factor = (
-                self._search_config.collapse_pool_factor if self._search_config is not None else 4
-            )
             fts_top_k = fts_top_k * collapse_pool_factor
             vector_top_k = vector_top_k * collapse_pool_factor
+
+        # Resolve the REFLECTION cap/boost once, up front, so the query-less
+        # fallback below can size its own row window with the same backfill
+        # headroom the FTS/vector arms already get for free from their much
+        # larger ``fts_top_k`` / ``vector_top_k`` defaults.
+        resolved_reflection_boost = (
+            reflection_boost
+            if reflection_boost is not None
+            else (self._search_config.reflection_boost if self._search_config is not None else 1.0)
+        )
+        resolved_reflection_topk_cap = (
+            self._search_config.reflection_topk_cap if self._search_config is not None else 0.3
+        )
+        needs_reflection_ids = (
+            not include_reflections
+            or resolved_reflection_boost != 1.0
+            or resolved_reflection_topk_cap < 1.0
+        )
+
+        # The query-less fallback has no arm to over-fetch from, so give its
+        # own row window the same bounded, config-backed headroom that
+        # collapse-by-unit backfill and reflection_topk_cap eviction-backfill
+        # both need — both draw replacement candidates from beyond ``top_k``.
+        # Only widen when finalization can actually use the extra depth: with
+        # ``collapse_key=None`` and the cap disabled (``>= 1.0``) the fallback
+        # still fetches exactly ``top_k`` rows, byte-identical to before this
+        # widening existed.
+        fallback_fetch_top_k = top_k
+        if collapse_paths is not None or resolved_reflection_topk_cap < 1.0:
+            fallback_fetch_top_k = top_k * collapse_pool_factor
 
         backends_used: set[str] = set()
         (
@@ -12319,7 +12506,7 @@ class SqliteEngravaCore:
             # neutral (flat-score, updated_cycle-ordered) branch, byte-identical
             # to a query with no recency reference.
             fallback = await self._fallback_hybrid_results(
-                top_k=top_k,
+                top_k=fallback_fetch_top_k,
                 current_cycle=current_cycle if recency_active else None,
                 recency_half_life=resolved_recency_half_life,
                 transaction_now=transaction_now if recency_active else None,
@@ -12337,26 +12524,46 @@ class SqliteEngravaCore:
                     for tid, score in fallback
                 ]
                 fallback.sort(key=lambda x: x[1], reverse=True)
-            # --- REFLECTION filter in fallback path ---
-            if not include_reflections and fallback:
-                fb_ids = [tid for tid, _ in fallback]
-                placeholders = ", ".join("?" for _ in fb_ids)
-                cursor = await self._db.execute(
-                    f"SELECT thought_id FROM thought"  # noqa: S608
-                    f" WHERE thought_type = 'REFLECTION'"
-                    f" AND thought_id IN ({placeholders})",
-                    fb_ids,
-                )
-                rows = await cursor.fetchall()
-                ref_set = {str(r["thought_id"]) for r in rows}
-                fallback = [(tid, s) for tid, s in fallback if tid not in ref_set]
+
+            # Route the fallback's raw (tid, score) pairs through the same
+            # REFLECTION filter/boost, collapse-by-unit, and
+            # reflection_topk_cap finalization the FTS/vector-active path
+            # applies below — a fallback result is still a result, and this
+            # path enforces the same per-call limits.
+            fallback_combined = dict(fallback)
+            reflection_ids = await self._apply_reflection_filter_boost(
+                combined=fallback_combined,
+                include_reflections=include_reflections,
+                resolved_reflection_boost=resolved_reflection_boost,
+                needs_reflection_ids=needs_reflection_ids,
+            )
+            # Preserve the fallback's own deterministic order (recency- and
+            # priority-scored, DB pre-order on ties) instead of re-deriving
+            # one from dict/scan order — only the filter/boost step above
+            # needed dict semantics. A stable sort by score alone keeps that
+            # relative order for every tie the boost left untouched, and only
+            # re-positions ids whose score the boost actually changed.
+            ranked = sorted(
+                ((tid, fallback_combined[tid]) for tid, _ in fallback if tid in fallback_combined),
+                key=lambda item: -item[1],
+            )
+            final, reflections_evicted = await self._apply_collapse_and_topk_cap(
+                ranked=ranked,
+                collapse_paths=collapse_paths,
+                collapse_max_per_unit=collapse_max_per_unit,
+                reflection_ids=reflection_ids,
+                resolved_reflection_topk_cap=resolved_reflection_topk_cap,
+                include_reflections=include_reflections,
+                top_k=top_k,
+            )
 
             await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
 
-            self._buffer_accesses([tid for tid, _ in fallback])
+            self._buffer_accesses([tid for tid, _ in final])
             return HybridSearchResult(
-                results=fallback,
+                results=final,
                 backends_used=frozenset(backends_used),
+                reflections_evicted=reflections_evicted,
             )
 
         token = _SUPPRESS_SEARCH_METRICS.set(True)
@@ -12484,106 +12691,28 @@ class SqliteEngravaCore:
             if _added > 0:
                 backends_used.add("graph_expansion")
 
-        # --- REFLECTION filter + boost + top-K cap ---
-        resolved_reflection_boost = (
-            reflection_boost
-            if reflection_boost is not None
-            else (self._search_config.reflection_boost if self._search_config is not None else 1.0)
+        # --- REFLECTION filter + boost + collapse-by-unit + top-K cap ---
+        # Shared with the query-less fallback path above, so both paths
+        # enforce the same per-call limits regardless of which arms produced
+        # ``combined``.
+        reflection_ids = await self._apply_reflection_filter_boost(
+            combined=combined,
+            include_reflections=include_reflections,
+            resolved_reflection_boost=resolved_reflection_boost,
+            needs_reflection_ids=needs_reflection_ids,
         )
-        resolved_reflection_topk_cap = (
-            self._search_config.reflection_topk_cap if self._search_config is not None else 0.3
-        )
-        _needs_reflection_ids = (
-            not include_reflections
-            or resolved_reflection_boost != 1.0
-            or resolved_reflection_topk_cap < 1.0
-        )
-        reflection_ids: set[str] = set()
-        if _needs_reflection_ids and combined:
-            candidate_ids = list(combined)
-            placeholders = ", ".join("?" for _ in candidate_ids)
-            cursor = await self._db.execute(
-                f"SELECT thought_id FROM thought"  # noqa: S608
-                f" WHERE thought_type = 'REFLECTION'"
-                f" AND thought_id IN ({placeholders})",
-                candidate_ids,
-            )
-            rows = await cursor.fetchall()
-            reflection_ids = {str(r["thought_id"]) for r in rows}
-
-        if not include_reflections:
-            for rid in reflection_ids:
-                combined.pop(rid, None)
-        elif resolved_reflection_boost != 1.0 and reflection_ids:
-            for rid in reflection_ids:
-                if rid in combined:
-                    combined[rid] = combined[rid] * resolved_reflection_boost
-
         # Deterministic total order: score descending, canonical thought_id
         # ascending — invariant to dict/scan order.
         ranked = _sort_scored_descending(list(combined.items()))
-
-        # --- De-fragmentation retention-by-unit + backfill ---
-        # Runs AFTER fusion + recency/priority/graph scoring + the
-        # CONSOLIDATED_FROM expansion and reflection boost, BEFORE the
-        # ``[:top_k]`` truncation and BEFORE reflection_topk_cap — the same
-        # locus and shape as the cap's evict-and-backfill. It touches neither
-        # arm's WHERE, no score, and no candidate set: it only removes surplus
-        # lower-ranked members of the same caller-defined unit so deeper
-        # distinct units in ``ranked[top_k:]`` flow up into the window.
-        # ``collapse_max_per_unit`` sets how many members of a unit are kept:
-        # ``None`` => 1 (single-keeper collapse, byte-identical to before), an
-        # integer keeps that many (deeper same-unit rows survive while the freed
-        # slots still backfill distinct units).
-        if collapse_paths is not None and combined:
-            unit_keys = await self._fetch_collapse_unit_keys(
-                thought_ids=list(combined),
-                paths=collapse_paths,
-            )
-            ranked = _retain_ranked_by_unit(
-                ranked,
-                unit_keys,
-                max_per_unit=1 if collapse_max_per_unit is None else collapse_max_per_unit,
-            )
-        final = ranked[:top_k]
-
-        # --- reflection_topk_cap enforcement ---
-        # Runs on the (possibly collapsed) ``ranked`` so the single backfill
-        # source is the collapsed off-list pool — no unit is double-counted.
-        reflections_evicted = 0
-        if include_reflections and resolved_reflection_topk_cap < 1.0 and reflection_ids:
-            _max_ref_slots = max(0, int(top_k * resolved_reflection_topk_cap))
-            _ref_in_final = [
-                (i, tid, s) for i, (tid, s) in enumerate(final) if tid in reflection_ids
-            ]
-            if len(_ref_in_final) > _max_ref_slots:
-                _excess = len(_ref_in_final) - _max_ref_slots
-                _to_evict = {
-                    tid for _, tid, _ in sorted(_ref_in_final, key=lambda x: x[2])[:_excess]
-                }
-                _off_list_obs = [(tid, s) for tid, s in ranked[top_k:] if tid not in reflection_ids]
-                if len(_off_list_obs) < _excess:
-                    logger.warning(
-                        "reflection_topk_cap: %d excess REFLECTION(s) to evict but only %d "
-                        "off-list non-REFLECTION candidates available — partial enforcement",
-                        _excess,
-                        len(_off_list_obs),
-                    )
-                _fill = _off_list_obs[:_excess]
-                _kept = [(tid, s) for tid, s in final if tid not in _to_evict]
-                final = _sort_scored_descending(_kept + _fill)[:top_k]
-                # ``_to_evict`` REFLECTIONs are removed from the window
-                # unconditionally (independent of how many backfill candidates
-                # were available), so the evicted count is the excess.
-                reflections_evicted = len(_to_evict)
-                logger.info(
-                    "reflection_topk_cap: evicted %d REFLECTION(s) from the top-%d window "
-                    "(cap=%.3f, max reflection slots=%d)",
-                    reflections_evicted,
-                    top_k,
-                    resolved_reflection_topk_cap,
-                    _max_ref_slots,
-                )
+        final, reflections_evicted = await self._apply_collapse_and_topk_cap(
+            ranked=ranked,
+            collapse_paths=collapse_paths,
+            collapse_max_per_unit=collapse_max_per_unit,
+            reflection_ids=reflection_ids,
+            resolved_reflection_topk_cap=resolved_reflection_topk_cap,
+            include_reflections=include_reflections,
+            top_k=top_k,
+        )
 
         await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
 
