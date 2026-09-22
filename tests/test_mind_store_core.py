@@ -311,6 +311,103 @@ class TestSqliteEngravaCoreEdge:
         assert len(edges) == 1
         assert edges[0].edge_type == EdgeType.ASSOCIATED
 
+    async def test_get_edges_limit_none_preserves_unbounded_behaviour(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """``limit=None`` (the default) is unchanged: every matching edge is returned."""
+        await store.create_thought(_make_thought("t-a"))
+        async with store.suspend_auto_commit():
+            for i in range(5):
+                await store.create_thought(_make_thought(f"t-n-{i}"))
+                await store.create_edge(
+                    EdgeRecord(
+                        edge_id=f"e-{i}",
+                        from_thought_id="t-a",
+                        to_thought_id=f"t-n-{i}",
+                        edge_type=EdgeType.ASSOCIATED,
+                        weight=(i + 1) / 10,
+                        created_cycle=0,
+                    ),
+                )
+
+        edges = await store.get_edges("t-a", direction="OUT")
+        assert len(edges) == 5
+
+    async def test_get_edges_limit_bounds_result_to_highest_weight(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """A ``limit`` keeps the highest-``weight`` edges, not an arbitrary subset."""
+        await store.create_thought(_make_thought("t-hub"))
+        weights = [0.1, 0.9, 0.5, 0.7, 0.3]
+        async with store.suspend_auto_commit():
+            for i, w in enumerate(weights):
+                await store.create_thought(_make_thought(f"t-hub-n-{i}"))
+                await store.create_edge(
+                    EdgeRecord(
+                        edge_id=f"e-hub-{i}",
+                        from_thought_id="t-hub",
+                        to_thought_id=f"t-hub-n-{i}",
+                        edge_type=EdgeType.ASSOCIATED,
+                        weight=w,
+                        created_cycle=0,
+                    ),
+                )
+
+        edges = await store.get_edges("t-hub", direction="OUT", limit=2)
+        assert len(edges) == 2
+        assert [e.weight for e in edges] == sorted(weights, reverse=True)[:2]
+
+    async def test_get_edges_limit_bounds_rows_read_at_sql_layer(
+        self,
+        store: SqliteEngravaCore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A large adjacency proves the bound is enforced in SQL, not after ``fetchall()``.
+
+        Instruments the actual number of rows the SQLite cursor hands back to
+        Python for the ``get_edges`` call — not just the length of the final
+        returned list — so a regression that reintroduces "fetch everything,
+        then slice in Python" would still fail this even though its *final*
+        result would look identical.
+        """
+        await store.create_thought(_make_thought("t-hub-large"))
+        hub_edge_count = 600
+        async with store.suspend_auto_commit():
+            for i in range(hub_edge_count):
+                await store.create_thought(_make_thought(f"t-hub-large-n-{i}"))
+                await store.create_edge(
+                    EdgeRecord(
+                        edge_id=f"e-hub-large-{i}",
+                        from_thought_id="t-hub-large",
+                        to_thought_id=f"t-hub-large-n-{i}",
+                        edge_type=EdgeType.ASSOCIATED,
+                        weight=(i + 1) / (hub_edge_count + 1),
+                        created_cycle=0,
+                    ),
+                )
+
+        rows_read: list[int] = []
+        real_fetchall = aiosqlite.Cursor.fetchall
+
+        async def _counting_fetchall(self: aiosqlite.Cursor) -> list[aiosqlite.Row]:
+            result = list(await real_fetchall(self))
+            rows_read.append(len(result))
+            return result
+
+        monkeypatch.setattr(aiosqlite.Cursor, "fetchall", _counting_fetchall)
+
+        bound = 10
+        edges = await store.get_edges("t-hub-large", direction="OUT", limit=bound)
+
+        assert len(edges) == bound
+        # Every row the cursor ever handed back across this call sums to
+        # exactly the bound, not the underlying 600-edge adjacency — proving
+        # the LIMIT is enforced in SQL, not by truncating an already-fetched
+        # Python list.
+        assert sum(rows_read) == bound
+
     async def test_delete_edge(self, store: SqliteEngravaCore) -> None:
         await store.create_thought(_make_thought("t-a"))
         await store.create_thought(_make_thought("t-b"))

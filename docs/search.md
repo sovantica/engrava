@@ -269,8 +269,14 @@ not switch off [reflection-source candidate
 expansion](#reflection-source-candidate-expansion), which is controlled
 separately by `graph_expansion_enabled` (default `true`) and reads
 `CONSOLIDATED_FROM` edges whenever a `REFLECTION` ranks among the top
-candidates. When the ranking signal is active, the implementation uses a single
-batch SQL query bounded by `O(top_k × max_neighbors_per_candidate)` rows.
+candidates. When the ranking signal is active, the implementation batches the
+candidate pool into fixed-size ID chunks (one query per chunk, needed to stay
+under SQLite's bound-parameter ceiling once the pool is large) and each
+chunk's query itself is bounded at the SQL layer to at most
+`max_neighbors_per_candidate` rows per candidate — via a ranking window over
+that candidate's edges, not a limit applied in Python after fetching
+everything — so the total rows returned across all chunks is
+`O(top_k × max_neighbors_per_candidate)`, not the size of the full adjacency.
 
 ### Observability
 

@@ -9398,26 +9398,40 @@ class SqliteEngravaCore:
         thought_id: str,
         *,
         direction: str = "BOTH",
+        limit: int | None = None,
     ) -> list[EdgeRecord]:
         """Retrieve edges connected to a thought.
 
         Args:
             thought_id: UUID of the thought.
             direction: 'IN', 'OUT', or 'BOTH'.
+            limit: If given, bound the result to this many edges at the SQL
+                layer, keeping the highest-``weight`` ones first. ``None``
+                (the default) returns every matching edge, unordered, exactly
+                as before this parameter existed — callers that need the
+                complete adjacency (e.g. checking every existing connection
+                before creating a new one) must keep passing ``None``; only
+                pass a bound where the caller's own contract is already
+                "the top-N most relevant neighbours", not "all of them".
 
         Returns:
-            List of matching edge records.
+            List of matching edge records. Ordered by ``weight`` descending
+            when ``limit`` is given, otherwise in storage order.
 
         """
         if direction == "OUT":
             sql = "SELECT * FROM edge WHERE from_thought_id = ?"
-            params: tuple[str, ...] = (thought_id,)
+            params: list[object] = [thought_id]
         elif direction == "IN":
             sql = "SELECT * FROM edge WHERE to_thought_id = ?"
-            params = (thought_id,)
+            params = [thought_id]
         else:
             sql = "SELECT * FROM edge WHERE from_thought_id = ? OR to_thought_id = ?"
-            params = (thought_id, thought_id)
+            params = [thought_id, thought_id]
+
+        if limit is not None:
+            sql += " ORDER BY weight DESC LIMIT ?"
+            params.append(limit)
 
         cursor = await self._db.execute(sql, params)
         rows = await cursor.fetchall()
@@ -11373,53 +11387,83 @@ class SqliteEngravaCore:
             scores[thought_id] = boost_map.get(priority_val, 0.0)
         return scores
 
-    async def _fetch_candidate_edges_deduped(
+    async def _fetch_candidate_adjacency(
         self,
         all_ids: list[str],
-    ) -> list[dict[str, object]]:
-        """Fetch every edge touching any of ``all_ids``, chunked and deduplicated.
+        *,
+        max_neighbors: int,
+    ) -> dict[str, list[tuple[str, float]]]:
+        """Fetch each candidate's top-``max_neighbors`` 1-hop neighbours, bounded in SQL.
 
         The candidate-ID list is queried in 450-wide chunks (SQLite's bound
         parameter ceiling makes one query per chunk necessary once the
-        candidate pool is large). An edge whose two endpoints fall in
-        *different* chunks satisfies both chunks' ``OR`` predicate and is
-        returned once per chunk it touches — this keeps only the first copy
-        by ``edge_id`` so such a cross-chunk edge is never built into both
-        endpoints' adjacency twice, which would double its weight in the
-        boost computed from it.
+        candidate pool is large). Each chunk's query:
+
+        1. Builds every ``(candidate, neighbour, weight)`` triple touching a
+           candidate in that chunk, from either edge direction.
+        2. Ranks each candidate's triples by ``weight`` descending (ties
+           broken by ``edge_id`` for a deterministic order) with a single
+           ``ROW_NUMBER() OVER (PARTITION BY candidate_id ...)`` — one window
+           per candidate across *both* directions combined, not one per
+           direction, so a candidate with strong edges on both sides isn't
+           handed up to ``2 * max_neighbors`` rows.
+        3. Keeps only rows within the per-candidate rank cutoff, so no more
+           than ``max_neighbors`` rows per candidate ever cross back into
+           Python — the SQL layer enforces the bound, not a Python-side
+           ``sorted(...)[:max_neighbors]`` slice applied after everything
+           was already fetched.
+
+        Chunking also fixes cross-chunk double-counting as a structural
+        property rather than a post-hoc deduplication step: a candidate ID
+        belongs to exactly one chunk (the chunks are a strict partition of
+        ``all_ids``), and each chunk's query only ranks/returns rows for
+        *its own* candidates — a candidate's neighbour list is therefore
+        computed by exactly one chunk's query, however many other chunks'
+        `IN` predicates an edge touching it also happens to satisfy.
 
         Args:
             all_ids: Candidate thought IDs to fetch adjacent edges for.
+            max_neighbors: Maximum neighbours kept per candidate, combined
+                across both edge directions.
 
         Returns:
-            Deduplicated edge rows, each a mapping with ``from``, ``to`` and
-            ``weight`` keys.
+            Mapping of candidate thought_id to its bounded, weight-ordered
+            ``(neighbour_id, edge_weight)`` list.
 
         """
         chunk_size = 450
-        edge_rows: list[dict[str, object]] = []
-        seen_edge_ids: set[str] = set()
+        adjacency: dict[str, list[tuple[str, float]]] = {}
         for i in range(0, len(all_ids), chunk_size):
             chunk = all_ids[i : i + chunk_size]
             placeholders = ", ".join("?" for _ in chunk)
             sql = (
-                f"SELECT edge_id, from_thought_id, to_thought_id, weight "  # noqa: S608
-                f"FROM edge WHERE from_thought_id IN ({placeholders}) "
-                f"OR to_thought_id IN ({placeholders}) "
-                f"ORDER BY weight DESC"
+                "WITH matched AS ("  # noqa: S608
+                "  SELECT from_thought_id AS candidate_id, to_thought_id AS neighbour_id, "
+                "         weight, edge_id "
+                f"  FROM edge WHERE from_thought_id IN ({placeholders}) "
+                "  UNION ALL "
+                "  SELECT to_thought_id AS candidate_id, from_thought_id AS neighbour_id, "
+                "         weight, edge_id "
+                f"  FROM edge WHERE to_thought_id IN ({placeholders}) "
+                ") "
+                "SELECT candidate_id, neighbour_id, weight FROM ("
+                "  SELECT candidate_id, neighbour_id, weight, "
+                "         ROW_NUMBER() OVER ("
+                "             PARTITION BY candidate_id ORDER BY weight DESC, edge_id"
+                "         ) AS rn "
+                "  FROM matched "
+                ") WHERE rn <= ? "
+                "ORDER BY candidate_id, weight DESC"
             )
-            params = [*chunk, *chunk]
+            params: list[object] = [*chunk, *chunk, max_neighbors]
             cursor = await self._db.execute(sql, params)
             rows = await cursor.fetchall()
             for r in rows:
-                edge_id = str(r["edge_id"])
-                if edge_id in seen_edge_ids:
-                    continue
-                seen_edge_ids.add(edge_id)
-                edge_rows.append(
-                    {"from": r["from_thought_id"], "to": r["to_thought_id"], "weight": r["weight"]},
-                )
-        return edge_rows
+                candidate_id = str(r["candidate_id"])
+                neighbour_id = str(r["neighbour_id"])
+                weight = float(r["weight"])
+                adjacency.setdefault(candidate_id, []).append((neighbour_id, weight))
+        return adjacency
 
     async def _load_graph_signal(
         self,
@@ -11453,30 +11497,15 @@ class SqliteEngravaCore:
             return {}
 
         all_ids = list(candidate_scores.keys())
-        edge_rows = await self._fetch_candidate_edges_deduped(all_ids)
+        adjacency = await self._fetch_candidate_adjacency(all_ids, max_neighbors=max_neighbors)
 
-        # Build adjacency: candidate → list of (neighbour_id, edge_weight)
-        adjacency: dict[str, list[tuple[str, float]]] = {}
-        candidate_set = set(all_ids)
-        for edge in edge_rows:
-            from_id = str(edge["from"])
-            to_id = str(edge["to"])
-            w = float(edge["weight"])  # type: ignore[arg-type]  # the row's weight column is numeric
-            if from_id in candidate_set:
-                adjacency.setdefault(from_id, []).append((to_id, w))
-            if to_id in candidate_set:
-                adjacency.setdefault(to_id, []).append((from_id, w))
-
-        # Compute boost per candidate (prefer highest-weight neighbours)
+        # Compute boost per candidate — the adjacency fetched above is
+        # already bounded to `max_neighbors` per candidate and ordered by
+        # weight, so no further Python-side sorting or slicing is needed.
         boosts: dict[str, float] = {}
         for cid in all_ids:
-            neighbors = sorted(
-                adjacency.get(cid, []),
-                key=lambda x: x[1],
-                reverse=True,
-            )[:max_neighbors]
             boost = 0.0
-            for neighbour_id, edge_weight in neighbors:
+            for neighbour_id, edge_weight in adjacency.get(cid, []):
                 neighbour_base = candidate_scores.get(neighbour_id, 0.0)
                 boost += edge_weight * neighbour_base * graph_edge_decay
             if boost > 0.0:

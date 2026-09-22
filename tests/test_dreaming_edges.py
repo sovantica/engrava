@@ -655,6 +655,104 @@ class TestGraphRankingChunkedFetch:
 
 
 # ---------------------------------------------------------------------------
+# TestGraphRankingChunkQueryBounded
+# ---------------------------------------------------------------------------
+
+
+class TestGraphRankingChunkQueryBounded:
+    """``_load_graph_signal``'s per-chunk query is bounded at the SQL layer.
+
+    A candidate's neighbour count must not make its per-chunk query return
+    more than ``max_neighbors`` rows for it — the cap has to be enforced by
+    the query itself (a per-candidate ranking window), not by fetching every
+    matching edge and truncating the Python list afterwards.
+    """
+
+    async def test_hub_candidate_adjacency_bounded_at_sql_layer(
+        self,
+        store: SqliteEngravaCore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A hub with far more edges than ``max_neighbors`` reads a bounded row count.
+
+        Instruments the actual rows the SQLite cursor hands back to Python
+        for the chunk query — not just the length of the final adjacency —
+        so a regression that fetches everything and slices in Python
+        afterwards would still fail this even though the *final* adjacency
+        size would look identical.
+        """
+        t_hub = await store.create_thought(_make("t-hub-bound"))
+        t_other = await store.create_thought(_make("t-other-bound"))
+        # A second, lightly-connected candidate in the same chunk, to prove
+        # the bound is per-candidate (both get up to max_neighbors), not a
+        # single shared budget for the whole chunk.
+        t_other_neighbour = await store.create_thought(_make("t-other-neighbour-bound"))
+        await store.create_edge(
+            EdgeRecord(
+                edge_id="e-other-bound",
+                from_thought_id=t_other.thought_id,
+                to_thought_id=t_other_neighbour.thought_id,
+                edge_type=EdgeType.ASSOCIATED,
+                weight=0.42,
+                created_cycle=1,
+            ),
+        )
+
+        hub_edge_count = 600
+        async with store.suspend_auto_commit():
+            for i in range(hub_edge_count):
+                neighbour = await store.create_thought(_make(f"t-hub-bound-n-{i}"))
+                await store.create_edge(
+                    EdgeRecord(
+                        edge_id=f"e-hub-bound-{i}",
+                        from_thought_id=t_hub.thought_id,
+                        to_thought_id=neighbour.thought_id,
+                        edge_type=EdgeType.ASSOCIATED,
+                        weight=(i + 1) / (hub_edge_count + 1),
+                        created_cycle=1,
+                    ),
+                )
+
+        rows_read: list[int] = []
+        real_fetchall = aiosqlite.Cursor.fetchall
+
+        async def _counting_fetchall(self: aiosqlite.Cursor) -> list[aiosqlite.Row]:
+            result = list(await real_fetchall(self))
+            rows_read.append(len(result))
+            return result
+
+        monkeypatch.setattr(aiosqlite.Cursor, "fetchall", _counting_fetchall)
+
+        max_neighbors = 5
+        candidate_scores = {
+            t_hub.thought_id: 0.5,
+            t_other.thought_id: 0.5,
+        }
+        adjacency = await store._fetch_candidate_adjacency(
+            list(candidate_scores.keys()),
+            max_neighbors=max_neighbors,
+        )
+
+        assert len(adjacency[t_hub.thought_id]) == max_neighbors
+        # The hub's kept neighbours are its highest-weight ones — edges
+        # (hub_edge_count - 4) .. (hub_edge_count - 1) got weights
+        # (hub_edge_count - 3)/(hub_edge_count+1) .. hub_edge_count/(hub_edge_count+1).
+        kept_weights = sorted((w for _nid, w in adjacency[t_hub.thought_id]), reverse=True)
+        expected_top_weights = sorted(
+            ((hub_edge_count - k) / (hub_edge_count + 1) for k in range(max_neighbors)),
+            reverse=True,
+        )
+        assert kept_weights == pytest.approx(expected_top_weights)
+
+        assert len(adjacency[t_other.thought_id]) == 1
+
+        # Two candidates, each capped to max_neighbors: the query must never
+        # hand Python more than 2 * max_neighbors rows total for this chunk —
+        # nowhere near the hub's real 600-edge degree.
+        assert sum(rows_read) <= 2 * max_neighbors
+
+
+# ---------------------------------------------------------------------------
 # TestEdgeCreationConfig
 # ---------------------------------------------------------------------------
 
