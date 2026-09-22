@@ -4903,6 +4903,16 @@ class SqliteEngravaCore:
         cancelled before its first write) does not issue a pointless commit or
         rollback call on a connection with nothing open.
 
+        **A failed commit ends its own transaction, one way or another.** The
+        clean-exit commit above goes through :meth:`_commit_or_recover`, not a
+        bare ``self._db.commit()``: a ``COMMIT`` can itself fail (e.g. a
+        concurrent reader still holding a lock when ``busy_timeout`` expires)
+        while leaving the write transaction open on the connection. Left
+        alone, that open transaction would sit there until some later,
+        unrelated write on the same connection committed it too — publishing
+        this window's work despite the reported failure. See
+        :meth:`_commit_or_recover` for the recovery this now performs.
+
         Yields:
             None — the store operates in deferred-commit mode.
 
@@ -4918,7 +4928,7 @@ class SqliteEngravaCore:
                 raise
             else:
                 if is_outermost and self._db.in_transaction:
-                    await self._db.commit()
+                    await self._commit_or_recover()
             finally:
                 self._skip_auto_commit_depth -= 1
 
@@ -5314,6 +5324,69 @@ class SqliteEngravaCore:
             self._quarantine_close_task = close_task
             close_task.add_done_callback(self._consume_quarantine_close)
 
+    async def _commit_or_recover(self) -> None:
+        """Commit the current transaction; unwind or quarantine when the commit itself fails.
+
+        Both runtime commit call sites — this one (via :meth:`_maybe_commit`)
+        and :meth:`suspend_auto_commit`'s own clean-exit commit — go through
+        this method rather than a bare ``self._db.commit()``. A ``COMMIT`` can
+        fail on its own account (most concretely: a concurrent connection
+        still holding a read lock when ``busy_timeout`` expires, reported as
+        ``SQLITE_BUSY``) while the write transaction stays open on the
+        connection — SQLite does not roll a transaction back just because its
+        ``COMMIT`` failed. Left alone, that open transaction would sit there
+        until some later, unrelated write on the *same* connection committed
+        it too, silently publishing the failed operation's changes alongside
+        its own.
+
+        On a commit failure, a rollback of the now-known-bad transaction is
+        attempted:
+
+        * If the transaction already closed on its own (``self._db.in_transaction``
+          is already ``False`` — some commit failures do end it, e.g. a
+          trigger-raised ``RAISE(ROLLBACK)`` surfacing at commit time), there is
+          nothing left to unwind and the commit failure propagates unchanged.
+        * If the rollback succeeds, the transaction is gone and the commit
+          failure propagates — nothing from this window can become durable via
+          a later commit.
+        * If the rollback *also* fails, the connection's state cannot be
+          trusted, so it is quarantined via :meth:`_quarantine_connection` —
+          mirroring :meth:`_write_readback_savepoint`'s own unwind-failure
+          handling — so every later write fails fast with
+          :class:`ConnectionQuarantinedError` instead of ever reaching a
+          commit that could flush the orphaned transaction. A cancellation
+          raised by the rollback itself always outranks the commit failure it
+          was trying to recover from, exactly as in
+          :meth:`_write_readback_savepoint`.
+
+        Not weakened, and deliberately not retried: no application-level retry
+        is added here, so a caller sees the real failure instead of it being
+        silently absorbed — ``PRAGMA busy_timeout`` has already given SQLite
+        every chance to succeed before this runs at all.
+
+        Raises:
+            BaseException: The original commit failure (chained to the
+                rollback failure, via ``__cause__``, when the rollback also
+                fails), or a cancellation raised by the rollback itself.
+
+        """
+        try:
+            await self._db.commit()
+        except BaseException as exc:
+            if not self._db.in_transaction:
+                raise
+            try:
+                await self._db.rollback()
+            except BaseException as rollback_exc:
+                await self._quarantine_connection(
+                    f"commit failed and the compensating rollback also failed: "
+                    f"{exc!r}; rollback error: {rollback_exc!r}"
+                )
+                if isinstance(rollback_exc, asyncio.CancelledError):
+                    raise
+                raise exc from rollback_exc
+            raise
+
     async def _maybe_commit(self) -> None:
         """Commit if auto-commit is not suspended.
 
@@ -5321,6 +5394,12 @@ class SqliteEngravaCore:
         check is the fast path for the common commit; the hard backstop is the
         ``_QuarantinedConnection`` proxy on ``self._db`` — even a commit that
         skipped this check would raise on ``self._db.commit()``.
+
+        The commit itself goes through :meth:`_commit_or_recover`, so a commit
+        that fails on its own account (rather than the transaction body having
+        already raised) is unwound — rolled back, or the connection quarantined
+        if the rollback also fails — instead of leaving an open transaction for
+        a later, unrelated commit on this connection to publish by accident.
 
         **Write-lock classification: relies on every caller, not on its own
         body.** Every one of this method's call sites is the last step of a
@@ -5339,12 +5418,13 @@ class SqliteEngravaCore:
         write lock itself.
 
         Raises:
-            ConnectionQuarantinedError: When the connection has been quarantined.
+            ConnectionQuarantinedError: When the connection has been quarantined
+                (already, or by this call's own failed-commit recovery).
 
         """
         self._ensure_connection_usable()
         if not self._skip_auto_commit:
-            await self._db.commit()
+            await self._commit_or_recover()
 
     # ------------------------------------------------------------------
     # Row -> Domain mappers (template methods — override in subclasses)
