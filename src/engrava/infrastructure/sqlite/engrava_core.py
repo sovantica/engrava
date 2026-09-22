@@ -4925,7 +4925,14 @@ class SqliteEngravaCore:
         ``self._db.in_transaction`` — read fresh at that point rather than
         assumed — so a window that happened to do no writes at all (or one
         cancelled before its first write) does not issue a pointless commit or
-        rollback call on a connection with nothing open.
+        rollback call on a connection with nothing open. That guard is skipped
+        entirely when :attr:`_connection_quarantined` is already set: a guarded
+        write inside the window (e.g. :meth:`_write_readback_savepoint`) can
+        itself quarantine the connection while unwinding its own unit, and
+        `self._db` is by then a terminal proxy on which even reading
+        ``.in_transaction`` raises — checking the flag first, before touching
+        `self._db` again, is what keeps that from replacing the original error
+        or cancellation with :class:`ConnectionQuarantinedError`.
 
         **A failed commit ends its own transaction, one way or another.** The
         clean-exit commit above goes through :meth:`_commit_or_recover`, not a
@@ -4947,6 +4954,16 @@ class SqliteEngravaCore:
             try:
                 yield
             except BaseException:
+                if self._connection_quarantined:
+                    # A guarded write inside this window already quarantined
+                    # the connection while unwinding its own unit and left
+                    # `self._db` a terminal proxy — touching it again here
+                    # (even just reading `.in_transaction`) would replace the
+                    # in-flight exception or cancellation with
+                    # ConnectionQuarantinedError instead of letting it
+                    # propagate. See _write_readback_savepoint for the same
+                    # guard.
+                    raise
                 if is_outermost and self._db.in_transaction:
                     await self._db.rollback()
                 raise
@@ -4958,16 +4975,19 @@ class SqliteEngravaCore:
 
     @contextlib.asynccontextmanager
     async def _write_readback_savepoint(self, name: str) -> AsyncIterator[None]:
-        """Make a write, its confirming read-back and its journal entry one unit.
+        """Make a journaled write one failure-atomic unit, with its journal entry.
 
-        ``update_thought``, ``restore_thought``, ``update_edge`` and
-        ``update_action`` all write a row, then re-read it to report and
-        journal the state actually stored, and only then decide whether to
-        commit. Without this wrapper, a read-back failure (the row vanished,
-        a driver error, the row mapper rejecting a stored value) propagated
-        while the write itself stayed pending in the connection's
-        transaction — a later, unrelated commit on the same connection would
-        then publish a mutation whose own operation had reported failure.
+        The store's journaled insert, update and delete paths use this to
+        make their own row write(s) and their own journal append recover
+        together. ``update_thought``, ``restore_thought``, ``update_edge``
+        and ``update_action`` additionally re-read the row to report and
+        journal the state actually stored, so for those the unit also covers
+        that read-back. Without this wrapper, a failure inside the unit (a
+        vanished row, a driver error, the row mapper rejecting a stored
+        value, a failed or cancelled journal append) propagated while the
+        write itself stayed pending in the connection's transaction — a
+        later, unrelated commit on the same connection would then publish a
+        mutation whose own operation had reported failure.
 
         The journal append runs inside this same block, not after it, for
         the identical reason: ``JournalWriter.append`` awaits a chain-tail
@@ -5046,6 +5066,14 @@ class SqliteEngravaCore:
             # released", not "the write never happened".
             await self._db.execute(f"RELEASE {name}")
         except BaseException as exc:
+            if self._connection_quarantined:
+                # A unit this block wraps (e.g. _delete_thought_atomic) already
+                # quarantined the connection while unwinding its own nested
+                # savepoint and left `self._db` a terminal proxy — see that
+                # method's docstring. Touching `self._db` again here — even
+                # just reading `.in_transaction` — would replace `exc` with
+                # ConnectionQuarantinedError instead of letting it propagate.
+                raise
             if not self._db.in_transaction:
                 # A RAISE(ROLLBACK) trigger already ended the whole
                 # transaction (savepoint included). Nothing is left open to
@@ -5813,6 +5841,11 @@ class SqliteEngravaCore:
         step, rather than depending on a caller several frames up to notice a
         write it cannot see.
 
+        **The write, its confirming read-back, and its journal entry are one
+        failure-atomic unit**, via :meth:`_write_readback_savepoint` — see
+        :meth:`update_thought` for what that protects against. A failed or
+        cancelled journal append here unwinds this call's own ``UPDATE`` too.
+
         Args:
             existing: The thought already in the database.
 
@@ -5828,25 +5861,26 @@ class SqliteEngravaCore:
         """
         now_iso = datetime.datetime.now(datetime.UTC).isoformat()
 
-        cursor = await self._db.execute(
-            "UPDATE thought SET confirmation_count = confirmation_count + 1, "
-            "updated_at = ? WHERE thought_id = ?",
-            (now_iso, existing.thought_id),
-        )
-        if cursor.rowcount == 0:
-            raise ThoughtNotFoundError(existing.thought_id)
-
-        after = await self._read_back_thought(existing.thought_id)
-
-        if self._journal is not None:
-            await self._journal.append(
-                mutation_type="UPDATE_THOUGHT",
-                target_id=existing.thought_id,
-                delta={
-                    "before": existing.model_dump(mode="json"),
-                    "after": after.model_dump(mode="json"),
-                },
+        async with self._write_readback_savepoint("increment_confirmation"):
+            cursor = await self._db.execute(
+                "UPDATE thought SET confirmation_count = confirmation_count + 1, "
+                "updated_at = ? WHERE thought_id = ?",
+                (now_iso, existing.thought_id),
             )
+            if cursor.rowcount == 0:
+                raise ThoughtNotFoundError(existing.thought_id)
+
+            after = await self._read_back_thought(existing.thought_id)
+
+            if self._journal is not None:
+                await self._journal.append(
+                    mutation_type="UPDATE_THOUGHT",
+                    target_id=existing.thought_id,
+                    delta={
+                        "before": existing.model_dump(mode="json"),
+                        "after": after.model_dump(mode="json"),
+                    },
+                )
 
         await self._maybe_commit()
         return after
@@ -6019,6 +6053,14 @@ class SqliteEngravaCore:
                 await self._begin_dedup_write_lock(operation=operation)
             yield
         except BaseException:
+            if self._connection_quarantined:
+                # The dedup write inside this window (e.g. _insert_new_thought_row,
+                # _increment_confirmation) already quarantined the connection
+                # while unwinding its own unit and left `self._db` a terminal
+                # proxy — touching it again here would replace the in-flight
+                # exception with ConnectionQuarantinedError instead of letting
+                # it propagate. See _write_readback_savepoint for the same guard.
+                raise
             if took_lock and not self._skip_auto_commit and self._db.in_transaction:
                 await self._db.rollback()
             raise
@@ -6523,6 +6565,13 @@ class SqliteEngravaCore:
         cannot land between the existence probe and the insert, or between the
         insert and its commit.
 
+        **The insert and its journal entry are one failure-atomic unit**, via
+        :meth:`_write_readback_savepoint` — see :meth:`update_thought` for what
+        that protects against. A failed or cancelled journal append here
+        unwinds the insert too, rather than leaving it pending for a later,
+        unrelated commit to publish without the journal entry that documents
+        it.
+
         Args:
             thought: The thought record to create.
             expires_after_seconds: Optional relative TTL in seconds; overrides
@@ -6567,14 +6616,15 @@ class SqliteEngravaCore:
                     {**thought.model_dump(), **updates},
                 )
 
-            await self._db.execute(self._CORE_INSERT_SQL, self._thought_to_core_params(thought))
+            async with self._write_readback_savepoint("insert_new_thought_row"):
+                await self._db.execute(self._CORE_INSERT_SQL, self._thought_to_core_params(thought))
 
-            if self._journal is not None:
-                await self._journal.append(
-                    mutation_type="INSERT_THOUGHT",
-                    target_id=thought.thought_id,
-                    delta={"before": None, "after": thought.model_dump(mode="json")},
-                )
+                if self._journal is not None:
+                    await self._journal.append(
+                        mutation_type="INSERT_THOUGHT",
+                        target_id=thought.thought_id,
+                        delta={"before": None, "after": thought.model_dump(mode="json")},
+                    )
 
             await self._maybe_commit()
         return thought
@@ -8392,80 +8442,97 @@ class SqliteEngravaCore:
                 row["thought_id"] for row in expired_rows if row["thought_id"] != exclude_id
             ]
 
-            for tid in expired_ids:
-                if strategy is CleanupStrategy.ARCHIVE:
-                    before_row = (
-                        await self._get_thought_row(tid) if self._journal is not None else None
-                    )
-                    changes_before = self._db.total_changes
-                    await self._db.execute(
-                        "UPDATE thought SET lifecycle_status = ?, expires_at = NULL, "
-                        "archived_at_cycle = NULL, archived_at = NULL, "
-                        "revision = revision + 1 "
-                        "WHERE thought_id = ?",
-                        (LifecycleStatus.ARCHIVED.value, tid),
-                    )
-                    if self._journal is not None and before_row is not None:
-                        before = self._row_to_thought(before_row)
-                        after = before.evolve(
-                            lifecycle_status=LifecycleStatus.ARCHIVED.value,
-                            expires_at=None,
-                            archived_at_cycle=None,
-                            archived_at=None,
+            # The whole batch is one failure-atomic unit, via
+            # _write_readback_savepoint (see update_thought for what that
+            # protects against): a failed or cancelled journal append on any
+            # one candidate unwinds every write this call has made so far in
+            # the batch, not just that candidate's own -- a partial batch
+            # commit on a later, unrelated write would otherwise publish some
+            # candidates' mutations without the journal entries that document
+            # them. This loop makes no nested public write of its own (each
+            # candidate's own commit is deferred to the single
+            # ``wrote_anything`` / ``opened_transaction`` finalization below,
+            # unchanged), so nothing inside it can end the unit early.
+            # ``_delete_thought_atomic`` nests inside this unit unchanged: this
+            # block already opens the transaction (when one is not already
+            # open) before the first candidate runs, so that call's own
+            # `opened_transaction` sample sees one already open and never ends
+            # it on the veto path itself.
+            async with self._write_readback_savepoint("cleanup_expired"):
+                for tid in expired_ids:
+                    if strategy is CleanupStrategy.ARCHIVE:
+                        before_row = (
+                            await self._get_thought_row(tid) if self._journal is not None else None
                         )
-                        await self._journal.append(
-                            mutation_type="UPDATE_THOUGHT",
-                            target_id=tid,
-                            delta={
-                                "before": before.model_dump(mode="json"),
-                                "after": after.model_dump(mode="json"),
-                            },
+                        changes_before = self._db.total_changes
+                        await self._db.execute(
+                            "UPDATE thought SET lifecycle_status = ?, expires_at = NULL, "
+                            "archived_at_cycle = NULL, archived_at = NULL, "
+                            "revision = revision + 1 "
+                            "WHERE thought_id = ?",
+                            (LifecycleStatus.ARCHIVED.value, tid),
                         )
-                    # Sampled last, after the journal append -- not right
-                    # after the UPDATE. Not unconditionally ``True`` either:
-                    # a ``BEFORE UPDATE`` trigger can veto the archive with
-                    # ``RAISE(IGNORE)``, which leaves its own rowcount (and
-                    # any naive "the UPDATE ran" assumption) saying a write
-                    # happened when the row was left untouched -- and a
-                    # comparison taken right there would also miss that the
-                    # journal append below it is a real row insert of its
-                    # own, on a genuinely vetoed archive, that a comparison
-                    # taken before it can never see. Reading `total_changes`
-                    # only now, after everything this iteration could have
-                    # written, is what closes both gaps at once.
-                    wrote_anything = (self._db.total_changes > changes_before) or wrote_anything
-                else:
-                    # DELETE strategy.
-                    before_row = (
-                        await self._get_thought_row(tid) if self._journal is not None else None
-                    )
-                    # Capture the embedding rowid before the delete drops the
-                    # embedding row; the vec0 vector is not FK-reachable and
-                    # would otherwise linger as a ghost.
-                    vec_rowid = await self._embedding_rowid_for_thought(tid)
-                    # Parent delete and explicit child deletes as one atomic
-                    # unit — see _delete_thought_atomic for why. Its return
-                    # value must be honoured, not ignored: a RAISE(IGNORE)
-                    # trigger (or any future silent veto) reports False with
-                    # the row still there, and a purge or journal append for
-                    # a parent that still exists would purge a live vector
-                    # and record false history.
-                    result = await self._delete_thought_atomic(tid)
-                    wrote_anything = result.wrote_anything or wrote_anything
-                    if not result.deleted:
-                        continue
-                    await self._purge_orphan_vector(vec_rowid)
-                    if self._journal is not None and before_row is not None:
-                        await self._journal.append(
-                            mutation_type="DELETE_THOUGHT",
-                            target_id=tid,
-                            delta={
-                                "before": self._row_to_thought(before_row).model_dump(
-                                    mode="json",
-                                ),
-                                "after": None,
-                            },
+                        if self._journal is not None and before_row is not None:
+                            before = self._row_to_thought(before_row)
+                            after = before.evolve(
+                                lifecycle_status=LifecycleStatus.ARCHIVED.value,
+                                expires_at=None,
+                                archived_at_cycle=None,
+                                archived_at=None,
+                            )
+                            await self._journal.append(
+                                mutation_type="UPDATE_THOUGHT",
+                                target_id=tid,
+                                delta={
+                                    "before": before.model_dump(mode="json"),
+                                    "after": after.model_dump(mode="json"),
+                                },
+                            )
+                        # Sampled last, after the journal append -- not right
+                        # after the UPDATE. Not unconditionally ``True`` either:
+                        # a ``BEFORE UPDATE`` trigger can veto the archive with
+                        # ``RAISE(IGNORE)``, which leaves its own rowcount (and
+                        # any naive "the UPDATE ran" assumption) saying a write
+                        # happened when the row was left untouched -- and a
+                        # comparison taken right there would also miss that the
+                        # journal append below it is a real row insert of its
+                        # own, on a genuinely vetoed archive, that a comparison
+                        # taken before it can never see. Reading `total_changes`
+                        # only now, after everything this iteration could have
+                        # written, is what closes both gaps at once.
+                        wrote_anything = (self._db.total_changes > changes_before) or wrote_anything
+                    else:
+                        # DELETE strategy.
+                        before_row = (
+                            await self._get_thought_row(tid) if self._journal is not None else None
                         )
+                        # Capture the embedding rowid before the delete drops the
+                        # embedding row; the vec0 vector is not FK-reachable and
+                        # would otherwise linger as a ghost.
+                        vec_rowid = await self._embedding_rowid_for_thought(tid)
+                        # Parent delete and explicit child deletes as one atomic
+                        # unit — see _delete_thought_atomic for why. Its return
+                        # value must be honoured, not ignored: a RAISE(IGNORE)
+                        # trigger (or any future silent veto) reports False with
+                        # the row still there, and a purge or journal append for
+                        # a parent that still exists would purge a live vector
+                        # and record false history.
+                        result = await self._delete_thought_atomic(tid)
+                        wrote_anything = result.wrote_anything or wrote_anything
+                        if not result.deleted:
+                            continue
+                        await self._purge_orphan_vector(vec_rowid)
+                        if self._journal is not None and before_row is not None:
+                            await self._journal.append(
+                                mutation_type="DELETE_THOUGHT",
+                                target_id=tid,
+                                delta={
+                                    "before": self._row_to_thought(before_row).model_dump(
+                                        mode="json",
+                                    ),
+                                    "after": None,
+                                },
+                            )
 
             if wrote_anything:
                 await self._maybe_commit()
@@ -9025,21 +9092,36 @@ class SqliteEngravaCore:
             # explicitly rather than trusting ON DELETE CASCADE (a store on
             # a pre-core-12 schema, or a connection with enforcement off,
             # has no cascade to trust).
-            result = await self._delete_thought_atomic(thought_id)
-            deleted = result.deleted
+            #
+            # The delete, the vector purge and the journal entry are one
+            # further failure-atomic unit on top of that, via
+            # _write_readback_savepoint (see update_thought for what that
+            # protects against): a failed or cancelled journal append here
+            # unwinds the delete too, rather than leaving it pending in the
+            # open transaction with no savepoint left to protect it —
+            # _delete_thought_atomic's own savepoint has already released by
+            # the time this call reaches its append. _delete_thought_atomic
+            # nests inside this unit unchanged: since this block already opens
+            # the transaction (when one is not already open) before that call
+            # runs, its own `opened_transaction` sample sees one already open
+            # and never ends it on the veto path itself, leaving that to this
+            # unit as usual.
+            async with self._write_readback_savepoint("delete_thought"):
+                result = await self._delete_thought_atomic(thought_id)
+                deleted = result.deleted
 
-            if deleted:
-                await self._purge_orphan_vector(vec_rowid)
+                if deleted:
+                    await self._purge_orphan_vector(vec_rowid)
 
-            if deleted and self._journal is not None and before_row is not None:
-                await self._journal.append(
-                    mutation_type="DELETE_THOUGHT",
-                    target_id=thought_id,
-                    delta={
-                        "before": self._row_to_thought(before_row).model_dump(mode="json"),
-                        "after": None,
-                    },
-                )
+                if deleted and self._journal is not None and before_row is not None:
+                    await self._journal.append(
+                        mutation_type="DELETE_THOUGHT",
+                        target_id=thought_id,
+                        delta={
+                            "before": self._row_to_thought(before_row).model_dump(mode="json"),
+                            "after": None,
+                        },
+                    )
 
             if result.wrote_anything:
                 # A real write happened — the thought itself, an orphan sweep
@@ -9095,69 +9177,75 @@ class SqliteEngravaCore:
         """
         _validate_metadata(edge.metadata)
         async with self._write_lock:
-            try:
-                await self._db.execute(
-                    "INSERT INTO edge "
-                    "(edge_id, from_thought_id, to_thought_id, edge_type, weight, "
-                    " created_cycle, source, decay_multiplier, valid_from, valid_until, "
-                    " metadata_json) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        edge.edge_id,
-                        edge.from_thought_id,
-                        edge.to_thought_id,
-                        edge.edge_type.value,
-                        edge.weight,
-                        edge.created_cycle,
-                        edge.source.value,
-                        edge.decay_multiplier,
-                        edge.valid_from,
-                        edge.valid_until,
-                        json.dumps(edge.metadata, ensure_ascii=False),
-                    ),
-                )
-            except aiosqlite.IntegrityError as exc:
-                # Classify structurally by the extended result code BEFORE any
-                # existence probe: a FOREIGN KEY failure maps to the domain
-                # wrapper, and only a UNIQUE / PRIMARY KEY failure is a
-                # candidate duplicate. A CHECK / NOT NULL / trigger abort (even
-                # one whose message mentions "foreign key") is neither and
-                # propagates unchanged.
-                if _is_foreign_key_violation(exc):
-                    column, referenced = await self._identify_orphan_endpoint(edge)
-                    raise ReferentialIntegrityError(
-                        entity_type="edge",
-                        column=column,
-                        referenced_id=referenced,
-                    ) from exc
-                if _is_unique_violation(exc):
-                    # Confirm the collision is the directed-endpoint + type
-                    # identity (the conflict-as-reuse case) rather than another
-                    # UNIQUE constraint, such as a caller-supplied duplicate
-                    # ``edge_id``, which keeps its own contract and propagates.
-                    duplicate_cursor = await self._db.execute(
-                        "SELECT 1 FROM edge "
-                        "WHERE from_thought_id = ? AND to_thought_id = ? AND edge_type = ? "
-                        "LIMIT 1",
-                        (edge.from_thought_id, edge.to_thought_id, edge.edge_type.value),
-                    )
-                    if await duplicate_cursor.fetchone() is not None:
-                        raise DuplicateEdgeError(
+            # The insert and its journal entry are one failure-atomic unit,
+            # via _write_readback_savepoint (see update_thought for what that
+            # protects against): a failed or cancelled journal append here
+            # unwinds the insert too, instead of leaving it pending with no
+            # savepoint of its own protecting it.
+            async with self._write_readback_savepoint("create_edge"):
+                try:
+                    await self._db.execute(
+                        "INSERT INTO edge "
+                        "(edge_id, from_thought_id, to_thought_id, edge_type, weight, "
+                        " created_cycle, source, decay_multiplier, valid_from, valid_until, "
+                        " metadata_json) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            edge.edge_id,
                             edge.from_thought_id,
                             edge.to_thought_id,
                             edge.edge_type.value,
+                            edge.weight,
+                            edge.created_cycle,
+                            edge.source.value,
+                            edge.decay_multiplier,
+                            edge.valid_from,
+                            edge.valid_until,
+                            json.dumps(edge.metadata, ensure_ascii=False),
+                        ),
+                    )
+                except aiosqlite.IntegrityError as exc:
+                    # Classify structurally by the extended result code BEFORE any
+                    # existence probe: a FOREIGN KEY failure maps to the domain
+                    # wrapper, and only a UNIQUE / PRIMARY KEY failure is a
+                    # candidate duplicate. A CHECK / NOT NULL / trigger abort (even
+                    # one whose message mentions "foreign key") is neither and
+                    # propagates unchanged.
+                    if _is_foreign_key_violation(exc):
+                        column, referenced = await self._identify_orphan_endpoint(edge)
+                        raise ReferentialIntegrityError(
+                            entity_type="edge",
+                            column=column,
+                            referenced_id=referenced,
                         ) from exc
-                # Preserve every other integrity failure (a non-duplicate
-                # UNIQUE, a CHECK, NOT NULL, or trigger abort) for its own
-                # contract.
-                raise
+                    if _is_unique_violation(exc):
+                        # Confirm the collision is the directed-endpoint + type
+                        # identity (the conflict-as-reuse case) rather than another
+                        # UNIQUE constraint, such as a caller-supplied duplicate
+                        # ``edge_id``, which keeps its own contract and propagates.
+                        duplicate_cursor = await self._db.execute(
+                            "SELECT 1 FROM edge "
+                            "WHERE from_thought_id = ? AND to_thought_id = ? AND edge_type = ? "
+                            "LIMIT 1",
+                            (edge.from_thought_id, edge.to_thought_id, edge.edge_type.value),
+                        )
+                        if await duplicate_cursor.fetchone() is not None:
+                            raise DuplicateEdgeError(
+                                edge.from_thought_id,
+                                edge.to_thought_id,
+                                edge.edge_type.value,
+                            ) from exc
+                    # Preserve every other integrity failure (a non-duplicate
+                    # UNIQUE, a CHECK, NOT NULL, or trigger abort) for its own
+                    # contract.
+                    raise
 
-            if self._journal is not None:
-                await self._journal.append(
-                    mutation_type="INSERT_EDGE",
-                    target_id=edge.edge_id,
-                    delta={"before": None, "after": edge.model_dump(mode="json")},
-                )
+                if self._journal is not None:
+                    await self._journal.append(
+                        mutation_type="INSERT_EDGE",
+                        target_id=edge.edge_id,
+                        delta={"before": None, "after": edge.model_dump(mode="json")},
+                    )
 
             await self._maybe_commit()
         return edge
@@ -9440,6 +9528,14 @@ class SqliteEngravaCore:
     async def delete_edge(self, edge_id: str) -> bool:
         """Delete an edge by its ID.
 
+        **The delete and its journal entry are one failure-atomic unit**, via
+        :meth:`_write_readback_savepoint` — see :meth:`update_thought` for what
+        that protects against. This call commits only when its own ``DELETE``
+        actually removed a row; on a missing id it rolls back only a
+        transaction it opened itself, exactly like :meth:`delete_thought` —
+        it never commits a caller's already-open transaction for a call that
+        deleted nothing.
+
         Args:
             edge_id: UUID of the edge to delete.
 
@@ -9448,22 +9544,34 @@ class SqliteEngravaCore:
 
         """
         async with self._write_lock:
+            # Sampled before anything below touches the connection — same
+            # ownership test as delete_thought.
+            opened_transaction = not self._db.in_transaction
+
             before_row = await self._get_edge_row(edge_id) if self._journal is not None else None
 
-            cursor = await self._db.execute("DELETE FROM edge WHERE edge_id = ?", (edge_id,))
-            deleted = cursor.rowcount > 0
+            async with self._write_readback_savepoint("delete_edge"):
+                cursor = await self._db.execute("DELETE FROM edge WHERE edge_id = ?", (edge_id,))
+                deleted = cursor.rowcount > 0
 
-            if deleted and self._journal is not None and before_row is not None:
-                await self._journal.append(
-                    mutation_type="DELETE_EDGE",
-                    target_id=edge_id,
-                    delta={
-                        "before": dict(before_row),
-                        "after": None,
-                    },
-                )
+                if deleted and self._journal is not None and before_row is not None:
+                    await self._journal.append(
+                        mutation_type="DELETE_EDGE",
+                        target_id=edge_id,
+                        delta={
+                            "before": dict(before_row),
+                            "after": None,
+                        },
+                    )
 
-            await self._maybe_commit()
+            if deleted:
+                await self._maybe_commit()
+            elif opened_transaction and self._db.in_transaction:
+                # Nothing was written — the id never matched a row — so this
+                # call has nothing of its own to make durable. Close only a
+                # transaction this call itself opened, never one a caller
+                # already held: see delete_thought for the same reasoning.
+                await self._db.rollback()
         return deleted
 
     async def list_edges(
@@ -13993,6 +14101,13 @@ class SqliteEngravaCore:
         only-in-flight — store never writes an outcome score and stays
         byte-identical to one built before this feature.
 
+        **The action write and the recompute's write + journal entry are one
+        failure-atomic unit**, via :meth:`_write_readback_savepoint` — see
+        :meth:`update_thought` for what that protects against. The action's
+        own ``INSERT`` is not itself journaled (a separate, tracked gap), but
+        a failed or cancelled recompute append still unwinds it: wrapping only
+        the recompute would leave the action row pending after a failed call.
+
         Args:
             action: The action record to create.
 
@@ -14001,23 +14116,24 @@ class SqliteEngravaCore:
 
         """
         async with self._write_lock:
-            await self._db.execute(
-                "INSERT INTO action "
-                "(action_id, source_thought_id, action_type, intent, "
-                " status, verification_status, raw_metrics_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    action.action_id,
-                    action.source_thought_id,
-                    action.action_type.value,
-                    action.intent,
-                    action.status.value,
-                    action.verification_status.value,
-                    action.raw_metrics_json,
-                ),
-            )
-            if action.status in _TERMINAL_ACTION_STATUSES:
-                await self._recompute_action_outcome(action.source_thought_id)
+            async with self._write_readback_savepoint("create_action"):
+                await self._db.execute(
+                    "INSERT INTO action "
+                    "(action_id, source_thought_id, action_type, intent, "
+                    " status, verification_status, raw_metrics_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        action.action_id,
+                        action.source_thought_id,
+                        action.action_type.value,
+                        action.intent,
+                        action.status.value,
+                        action.verification_status.value,
+                        action.raw_metrics_json,
+                    ),
+                )
+                if action.status in _TERMINAL_ACTION_STATUSES:
+                    await self._recompute_action_outcome(action.source_thought_id)
             await self._maybe_commit()
         return action
 
@@ -14180,16 +14296,21 @@ class SqliteEngravaCore:
                         },
                     )
 
-            # Outcome-affecting iff the change lands a terminal status, or
-            # changes verification on an already-terminal action. Because the
-            # aggregate reads both status and verification, a verification
-            # change on a terminal action IS outcome-affecting.
-            lands_terminal = status_changes and persisted.status in _TERMINAL_ACTION_STATUSES
-            verifies_terminal = (
-                verification_changes and persisted.status in _TERMINAL_ACTION_STATUSES
-            )
-            if lands_terminal or verifies_terminal:
-                await self._recompute_action_outcome(persisted.source_thought_id)
+                # Outcome-affecting iff the change lands a terminal status, or
+                # changes verification on an already-terminal action. Because
+                # the aggregate reads both status and verification, a
+                # verification change on a terminal action IS
+                # outcome-affecting. Run inside the same unit as the action's
+                # own write and journal entry above: a failed or cancelled
+                # recompute append must unwind the action write too, not just
+                # its own score write, so wrapping only the recompute is not
+                # enough on its own.
+                lands_terminal = status_changes and persisted.status in _TERMINAL_ACTION_STATUSES
+                verifies_terminal = (
+                    verification_changes and persisted.status in _TERMINAL_ACTION_STATUSES
+                )
+                if lands_terminal or verifies_terminal:
+                    await self._recompute_action_outcome(persisted.source_thought_id)
 
             await self._maybe_commit()
         return persisted
