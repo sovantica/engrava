@@ -10873,10 +10873,16 @@ class SqliteEngravaCore:
         first_dimension = int(rows[0]["dimension"])
         if len(query_vector) != first_dimension:
             # Typed rejection instead of an opaque numpy ``matmul`` ValueError.
-            # Reached only when the store declares no dimension at the boundary
-            # (no vector backend and no embedding provider), so ``search_similar``
-            # cannot check the length up front and the mismatch would otherwise
-            # surface as an untyped shape error from the dot product below.
+            # Reached whenever no vector backend is configured, whether or not
+            # an embedding provider is: ``search_similar``'s boundary guard
+            # compares ``query_vector`` against ``_declared_embedding_dimension()``
+            # — the provider's *current* dimension, not what a corpus's rows
+            # actually stored — so it lets a query through here whenever it
+            # matches the provider's current setting even if the stored rows
+            # were embedded at a different dimension. This check compares
+            # against the *stored* dimension instead, so it is what actually
+            # catches a corpus written under one dimension being queried after
+            # the provider's own has since changed.
             raise VectorDimensionMismatchError(expected=first_dimension, actual=len(query_vector))
         expected_bytes = first_dimension * 4
         blobs = [row["vector_blob"] for row in rows]
