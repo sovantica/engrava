@@ -46,6 +46,12 @@
       }
     ],
     [
+      "@semantic-release/exec",
+      {
+        "prepareCmd": "bash scripts/run_schema_release_gate.sh ${nextRelease.version}"
+      }
+    ],
+    [
       "@semantic-release/changelog",
       {
         "changelogFile": "CHANGELOG.md",

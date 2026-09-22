@@ -1477,7 +1477,9 @@ async def _read_embedding_lock(conn: aiosqlite.Connection) -> tuple[str, int] | 
             "The target's stored embedding_dimension "
             f"({dim_row[0]!r}) is not a valid integer; its _metadata is "
             "corrupt. Repair the target's _metadata directly, or restore "
-            "with --clear to reset it, before restoring again."
+            "with --clear --clear-identity to reset it, before restoring "
+            "again -- plain --clear alone preserves the existing identity "
+            "metadata and will not resolve this."
         )
         raise click.ClickException(msg) from exc
     return model_name, dimension
@@ -1779,6 +1781,37 @@ async def _reembed_thoughts(
     return count
 
 
+async def _delete_embedding_identity_metadata(conn: aiosqlite.Connection) -> None:
+    """Delete every ``_metadata`` key that makes up a target's embedding identity.
+
+    Removes the stored model name, dimension, document-prefix fingerprint,
+    and query-prefix pairing, leaving the target with no embedding lock at
+    all. Shared by the post-re-embed identity replacement (which reinserts a
+    fresh identity right after) and by ``restore --clear --clear-identity``
+    (which does not -- see :func:`_import_records_to_db`), so that a
+    genuinely corrupt ``embedding_dimension`` value cannot survive either
+    path.
+
+    Args:
+        conn: Restore connection with an active transaction.
+
+    """
+    from engrava.infrastructure.sqlite.engrava_core import (  # noqa: PLC0415
+        _METADATA_DOCUMENT_PREFIX_FINGERPRINT,
+        _METADATA_QUERY_PREFIX,
+    )
+
+    await conn.execute(
+        "DELETE FROM _metadata WHERE key IN (?, ?, ?, ?)",
+        (
+            "embedding_model_name",
+            "embedding_dimension",
+            _METADATA_DOCUMENT_PREFIX_FINGERPRINT,
+            _METADATA_QUERY_PREFIX,
+        ),
+    )
+
+
 async def _replace_embedding_model_metadata(
     conn: aiosqlite.Connection,
     embedding_provider: EmbeddingProviderProtocol | None,
@@ -1799,15 +1832,7 @@ async def _replace_embedding_model_metadata(
         _role_prefixes,
     )
 
-    await conn.execute(
-        "DELETE FROM _metadata WHERE key IN (?, ?, ?, ?)",
-        (
-            "embedding_model_name",
-            "embedding_dimension",
-            _METADATA_DOCUMENT_PREFIX_FINGERPRINT,
-            _METADATA_QUERY_PREFIX,
-        ),
-    )
+    await _delete_embedding_identity_metadata(conn)
     if embedding_provider is None:
         return
 
@@ -2159,6 +2184,7 @@ async def _import_records_to_db(
     input_path: Path,
     *,
     clear: bool = False,
+    clear_identity: bool = False,
     skip_embeddings: bool = False,
     re_embed: bool = False,
     embedding_provider: EmbeddingProviderProtocol | None = None,
@@ -2221,6 +2247,14 @@ async def _import_records_to_db(
         conn: Open aiosqlite connection with schema applied.
         input_path: Path to the JSONL snapshot file.
         clear: Delete existing data before import.
+        clear_identity: Also delete the target's stored embedding identity
+            (model name, dimension, and prefix metadata) while clearing.
+            Only meaningful when ``clear`` is also set -- the caller
+            (``restore()``) rejects it otherwise before this function is
+            ever reached. Exists to recover a target whose stored
+            ``embedding_dimension`` is corrupt: plain ``clear`` deletes the
+            core tables but deliberately preserves an existing lock (see
+            :func:`_read_embedding_lock`), so it cannot clear a corrupt one.
         skip_embeddings: Skip embedding records during import.
         re_embed: Re-embed thoughts via the embedding provider after import.
         embedding_provider: ``EmbeddingProviderProtocol`` for re-embedding.
@@ -2262,6 +2296,8 @@ async def _import_records_to_db(
             # rows removed.
             journal_cursor = await conn.execute("DELETE FROM journal_entry")
             journal_entries_cleared = journal_cursor.rowcount
+            if clear_identity:
+                await _delete_embedding_identity_metadata(conn)
         # The journalled-merge collision gate's three-part condition,
         # evaluated once, before the insert loop below. `clear` short-circuits
         # the query entirely -- a `--clear` restore has already emptied
@@ -2328,6 +2364,7 @@ async def _restore_service_snapshot(
     effective_service: str,
     input_path: str,
     clear: bool,
+    clear_identity: bool,
     skip_embeddings: bool,
     re_embed: bool,
     orphan_journal_entries: bool,
@@ -2384,6 +2421,7 @@ async def _restore_service_snapshot(
             store._db,  # noqa: SLF001
             Path(input_path),
             clear=clear,
+            clear_identity=clear_identity,
             skip_embeddings=skip_embeddings,
             re_embed=re_embed,
             embedding_provider=emb_provider,
@@ -2403,6 +2441,7 @@ async def _restore_single_db(
     *,
     input_path: str,
     clear: bool,
+    clear_identity: bool,
     skip_embeddings: bool,
     re_embed: bool,
     orphan_journal_entries: bool,
@@ -2459,6 +2498,7 @@ async def _restore_single_db(
             conn,
             Path(input_path),
             clear=clear,
+            clear_identity=clear_identity,
             skip_embeddings=skip_embeddings,
             re_embed=re_embed,
             embedding_provider=emb_provider,
@@ -2472,6 +2512,17 @@ async def _restore_single_db(
 @cli.command()
 @click.option("-i", "--input", "input_path", required=True, help="JSONL snapshot file to restore.")
 @click.option("--clear", is_flag=True, help="Clear existing data before restore.")
+@click.option(
+    "--clear-identity",
+    is_flag=True,
+    help=(
+        "Also clear the target's stored embedding identity (model name, "
+        "dimension, and prefix metadata) while clearing. Requires --clear. "
+        "Use this to recover a target whose stored embedding_dimension is "
+        "corrupt -- plain --clear alone preserves an existing identity, "
+        "corrupt or not."
+    ),
+)
 @click.option(
     "--skip-embeddings",
     is_flag=True,
@@ -2504,6 +2555,7 @@ def restore(
     input_path: str,
     *,
     clear: bool,
+    clear_identity: bool,
     skip_embeddings: bool,
     re_embed: bool,
     orphan_journal_entries: bool,
@@ -2527,6 +2579,10 @@ def restore(
         click.echo("Error: --re-embed and --skip-embeddings are mutually exclusive.", err=True)
         sys.exit(1)
 
+    if clear_identity and not clear:
+        click.echo("Error: --clear-identity requires --clear.", err=True)
+        sys.exit(1)
+
     # Resolve default service from config if --service not given.
     effective_service = service_name
     if effective_service is None and services_cfg is not None:
@@ -2545,6 +2601,7 @@ def restore(
                 effective_service=effective_service,
                 input_path=input_path,
                 clear=clear,
+                clear_identity=clear_identity,
                 skip_embeddings=skip_embeddings,
                 re_embed=re_embed,
                 orphan_journal_entries=orphan_journal_entries,
@@ -2556,6 +2613,7 @@ def restore(
             await _restore_single_db(
                 input_path=input_path,
                 clear=clear,
+                clear_identity=clear_identity,
                 skip_embeddings=skip_embeddings,
                 re_embed=re_embed,
                 orphan_journal_entries=orphan_journal_entries,

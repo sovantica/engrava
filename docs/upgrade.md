@@ -193,7 +193,7 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 
 | From | To | Supported | Notes |
 |---|---|---|---|
-| 0.2.0 | 0.3.0 | Yes | No schema change (`user_version` unchanged). **No `0.2.2` release exists** — `git tag`, `CHANGELOG.md` (whose 0.3.0 entry compares directly against `v0.2.0`), and the upgrade-path CI spec (which pins `engrava==0.5.0`, not `0.2.2`) all agree there is no intermediate release; go directly from `0.2.0` to `0.3.0` |
+| 0.2.0 | 0.3.0 | Yes | No schema change (`user_version` unchanged). **No `0.2.2` release exists** — `git tag`, `CHANGELOG.md` (whose 0.3.0 entry compares directly against `v0.2.0`), and the upgrade-path CI spec (which pins the immediately-preceding released version, not `0.2.2`) all agree there is no intermediate release; go directly from `0.2.0` to `0.3.0` |
 | 0.3.0 | 0.3.1 | Yes | Patch-level upgrade; no schema change (`user_version` unchanged) — safe to roll across workers |
 | 0.3.x | 0.4.0 | Yes | **Schema-changing** minor upgrade — adds the valid-time columns (additive, zero data loss). Back up first and follow the [rolling-upgrades](#rolling-upgrades-multiple-workers) note |
 | 0.4.x | 0.5.0 | Yes | **Schema-changing** minor upgrade (`user_version` 14 → 18), although the library API is drop-in. **Breaking for MCP-server users only:** the `engrava[mcp]` extra and the in-engrava `engrava-mcp` command are removed — the server moved to the standalone [`engrava-mcp`](https://github.com/sovantica/engrava-mcp) package (see the 0.4 → 0.5 note) |
@@ -1975,10 +1975,10 @@ against one database file.
 ### 0.2.0 -> 0.3.0
 
 - Extension schema migration tracking is now part of the upgrade path.
-- Upgrade-path CI validates the previous release against the current working
-  tree, not a fixed version pair — `ENGRAVA_UPGRADE_FROM_SPEC` is bumped on
-  every release (currently `engrava==0.5.0`) so the job always exercises
-  last-released -> `HEAD`.
+- Upgrade-path CI validates the previous release against the actual candidate
+  wheel `HEAD` would publish, not a fixed version pair or an editable
+  checkout — `ENGRAVA_UPGRADE_FROM_SPEC` is bumped on every release so the
+  job always exercises last-released -> `HEAD`.
 - Release notes and `CHANGELOG.md` now carry a dedicated `Database Changes`
   section for schema-affecting releases.
 

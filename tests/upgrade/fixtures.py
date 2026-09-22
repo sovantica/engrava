@@ -92,9 +92,33 @@ def install_package(
     *,
     editable: bool,
     cwd: Path | None = None,
+    force_reinstall: bool = False,
 ) -> None:
-    """Install a package spec into the given virtual environment."""
+    """Install a package spec into the given virtual environment.
+
+    Args:
+        python_executable: Interpreter of the target virtual environment.
+        package_spec: A PEP 508 requirement, a local path, or (for the
+            candidate build this upgrade path installs second) a built
+            wheel's path.
+        editable: Pass ``-e`` to pip.
+        cwd: Working directory for the ``pip install`` subprocess.
+        force_reinstall: Pass ``--force-reinstall``. Load-bearing for the
+            candidate wheel: this repository's version bump happens inside
+            the release pipeline itself, so a wheel built from an
+            unreleased working tree carries the *same* version number as
+            the last published release until that pipeline actually runs.
+            Without ``--force-reinstall``, pip treats that version match as
+            "nothing to do" -- confirmed via ``pip install`` printing
+            "engrava is already installed with the same version as the
+            provided wheel" -- and silently keeps the previously installed
+            (real PyPI) build instead of installing this one, which would
+            make the upgrade path a no-op upgrade to itself.
+
+    """
     command = pip_command(python_executable, "install")
+    if force_reinstall:
+        command.append("--force-reinstall")
     if editable:
         command.extend(["-e", package_spec])
     else:
@@ -102,13 +126,21 @@ def install_package(
     run_command(command, cwd=cwd)
 
 
-def _populate_fixture_script(db_path: Path) -> str:
+def _populate_fixture_script(
+    db_path: Path, pre_snapshot_path: Path, pre_journal_state_path: Path
+) -> str:
     return textwrap.dedent(
         f"""
         import asyncio
+        import json
+        from pathlib import Path
+
         import aiosqlite
 
         from engrava import (
+            ActionRecord,
+            ActionStatus,
+            ActionType,
             EdgeRecord,
             EdgeType,
             LifecycleStatus,
@@ -116,9 +148,13 @@ def _populate_fixture_script(db_path: Path) -> str:
             SqliteEngravaCore,
             ThoughtRecord,
             ThoughtType,
+            VerificationStatus,
         )
+        from engrava.cli.main import _export_db_to_jsonl
 
         DB_PATH = r"{db_path}"
+        PRE_SNAPSHOT_PATH = r"{pre_snapshot_path}"
+        PRE_JOURNAL_STATE_PATH = r"{pre_journal_state_path}"
 
         async def main() -> None:
             # Closed in a finally: for the same reason as the verifier. aiosqlite
@@ -129,7 +165,11 @@ def _populate_fixture_script(db_path: Path) -> str:
             conn = await aiosqlite.connect(DB_PATH)
             try:
                 conn.row_factory = aiosqlite.Row
-                store = SqliteEngravaCore(conn)
+                # Journaling on so the upgrade path has a real hash chain to
+                # preserve, not just the four core tables -- see verify_data()
+                # in _verify_upgraded_db_script, which checks the chain survives
+                # the migration unchanged rather than only the row counts.
+                store = SqliteEngravaCore(conn, journal_enabled=True)
                 await store.ensure_schema()
 
                 for index in range(6):
@@ -159,7 +199,37 @@ def _populate_fixture_script(db_path: Path) -> str:
                 )
                 await store.create_edge(edge)
 
+                action = ActionRecord(
+                    action_id="action-001",
+                    source_thought_id="thought-000",
+                    action_type=ActionType.CLI_OUTPUT,
+                    intent="Representative upgrade fixture action",
+                    status=ActionStatus.CONFIRMED,
+                    verification_status=VerificationStatus.PENDING,
+                )
+                await store.create_action(action)
+
                 await conn.commit()
+
+                # Capture the pre-upgrade content and journal chain state, still
+                # on the FROM release, for verify_data() to diff against after
+                # the upgrade -- reusing the same export function `snapshot`
+                # itself calls, rather than inventing a second dump format.
+                await _export_db_to_jsonl(conn, Path(PRE_SNAPSHOT_PATH))
+
+                integrity = await store.verify_journal()
+                journal_state = {{
+                    "valid": integrity.valid,
+                    "entries_checked": integrity.entries_checked,
+                }}
+                if store.journal is not None:
+                    entries = await store.journal.get_entries(limit=1000)
+                    if entries:
+                        last = max(entries, key=lambda e: e.sequence_number)
+                        journal_state["last_sequence_number"] = last.sequence_number
+                        journal_state["last_entry_hash"] = last.entry_hash
+                with open(PRE_JOURNAL_STATE_PATH, "w", encoding="utf-8") as f:
+                    json.dump(journal_state, f)
             finally:
                 await conn.close()
 
@@ -168,27 +238,115 @@ def _populate_fixture_script(db_path: Path) -> str:
     )
 
 
-def populate_fixture_db(python_executable: Path, db_path: Path) -> None:
-    """Create a representative fixture database using the installed package."""
-    run_command([str(python_executable), "-c", _populate_fixture_script(db_path)])
+def populate_fixture_db(
+    python_executable: Path,
+    db_path: Path,
+    pre_snapshot_path: Path,
+    pre_journal_state_path: Path,
+) -> None:
+    """Create a representative fixture database using the installed package.
+
+    Also captures a pre-upgrade content snapshot and journal chain state at
+    ``pre_snapshot_path`` / ``pre_journal_state_path`` -- still on the FROM
+    release -- for :func:`verify_upgraded_db` to diff against once the
+    upgrade has run, so the upgrade path is checked for content and chain
+    preservation, not only for post-upgrade row counts.
+    """
+    run_command(
+        [
+            str(python_executable),
+            "-c",
+            _populate_fixture_script(db_path, pre_snapshot_path, pre_journal_state_path),
+        ]
+    )
 
 
-def _verify_upgraded_db_script(db_path: Path, snapshot_path: Path) -> str:
+#: Maps each snapshot ``_type`` to the column identifying one of its records,
+#: shared between the pre- and post-upgrade snapshot so records can be paired
+#: up regardless of row order.
+_SNAPSHOT_PRIMARY_KEYS = {
+    "thought": "thought_id",
+    "edge": "edge_id",
+    "embedding": "embedding_id",
+    "action": "action_id",
+}
+
+
+def _verify_upgraded_db_script(
+    db_path: Path,
+    snapshot_path: Path,
+    pre_snapshot_path: Path,
+    pre_journal_state_path: Path,
+) -> str:
     return textwrap.dedent(
         f"""
         import asyncio
         import json
         import subprocess
         import sys
+        from pathlib import Path
 
         import aiosqlite
 
         from engrava import SqliteEngravaCore
+        from engrava.cli.main import _export_db_to_jsonl
         from engrava.config import DreamingConfig, DreamingGates, EdgeCreationConfig
         from engrava.extensions.dreaming import DreamingExtension
 
         DB_PATH = r"{db_path}"
         SNAPSHOT_PATH = r"{snapshot_path}"
+        PRE_SNAPSHOT_PATH = r"{pre_snapshot_path}"
+        PRE_JOURNAL_STATE_PATH = r"{pre_journal_state_path}"
+        POST_MIGRATION_SNAPSHOT_PATH = str(Path(SNAPSHOT_PATH).with_suffix(".post-migration.jsonl"))
+
+        _SNAPSHOT_PRIMARY_KEYS = {_SNAPSHOT_PRIMARY_KEYS!r}
+
+        def _load_snapshot_records(path):
+            \"\"\"Return ``{{table: {{record_id: fields}}}}`` from a snapshot JSONL file.\"\"\"
+            records = {{table: {{}} for table in _SNAPSHOT_PRIMARY_KEYS}}
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    row = json.loads(line)
+                    table = row.get("_type")
+                    key_field = _SNAPSHOT_PRIMARY_KEYS.get(table)
+                    if key_field is None:
+                        continue
+                    data = row["data"]
+                    records[table][data[key_field]] = data
+            return records
+
+        def _assert_content_preserved(pre_path, post_path) -> None:
+            \"\"\"Every pre-upgrade record must still be present, byte-identical
+            on every field the pre-upgrade snapshot itself declared.
+
+            A field that only exists in the post-upgrade snapshot (e.g. a
+            migration-added column with a default value) is not compared --
+            the pre-upgrade snapshot could not have declared an opinion about
+            it. This asserts preservation, not that nothing was ever added.
+            \"\"\"
+            pre = _load_snapshot_records(pre_path)
+            post = _load_snapshot_records(post_path)
+            for table, pre_rows in pre.items():
+                if not pre_rows:
+                    continue
+                post_rows = post[table]
+                for record_id, pre_fields in pre_rows.items():
+                    if record_id not in post_rows:
+                        raise AssertionError(
+                            f"{{table}} {{record_id}} present before the upgrade "
+                            "is missing after it"
+                        )
+                    post_fields = post_rows[record_id]
+                    for field, pre_value in pre_fields.items():
+                        post_value = post_fields.get(field)
+                        if post_value != pre_value:
+                            raise AssertionError(
+                                f"{{table}} {{record_id}} field {{field!r}} changed "
+                                f"across the upgrade: {{pre_value!r}} -> {{post_value!r}}"
+                            )
 
         async def verify_data() -> None:
             # aiosqlite runs its connection on a NON-daemon thread that only
@@ -200,7 +358,10 @@ def _verify_upgraded_db_script(db_path: Path, snapshot_path: Path) -> str:
             conn = await aiosqlite.connect(DB_PATH)
             try:
                 conn.row_factory = aiosqlite.Row
-                store = SqliteEngravaCore(conn)
+                # journal_enabled=True only to read the chain via store.journal
+                # below (verify_journal() itself works regardless) -- it does
+                # not change what the migration above already wrote.
+                store = SqliteEngravaCore(conn, journal_enabled=True)
                 await store.ensure_schema()
 
                 metrics = await store.metrics()
@@ -216,6 +377,42 @@ def _verify_upgraded_db_script(db_path: Path, snapshot_path: Path) -> str:
                 fts_results = await store.search_fts("Upgrade")
                 if not fts_results:
                     raise AssertionError("expected FTS results after upgrade")
+
+                # Captured here -- after the migration ensure_schema() just ran,
+                # before dreaming consolidation below deliberately changes the
+                # store -- so this is a clean "did the migration itself
+                # preserve everything" snapshot, not confounded by later,
+                # unrelated writes.
+                await _export_db_to_jsonl(conn, Path(POST_MIGRATION_SNAPSHOT_PATH))
+
+                post_integrity = await store.verify_journal()
+                with open(PRE_JOURNAL_STATE_PATH, encoding="utf-8") as f:
+                    pre_journal_state = json.load(f)
+                if not post_integrity.valid:
+                    raise AssertionError(
+                        f"journal chain no longer verifies after upgrade: "
+                        f"{{post_integrity.error_message}}"
+                    )
+                if post_integrity.entries_checked != pre_journal_state["entries_checked"]:
+                    raise AssertionError(
+                        "journal entry count changed across the upgrade: "
+                        f"{{pre_journal_state['entries_checked']}} -> "
+                        f"{{post_integrity.entries_checked}}"
+                    )
+                if "last_entry_hash" in pre_journal_state and store.journal is not None:
+                    post_entries = await store.journal.get_entries(limit=1000)
+                    post_last = max(post_entries, key=lambda e: e.sequence_number)
+                    if post_last.sequence_number != pre_journal_state["last_sequence_number"]:
+                        raise AssertionError(
+                            "journal chain tail sequence number changed across "
+                            f"the upgrade: {{pre_journal_state['last_sequence_number']}} -> "
+                            f"{{post_last.sequence_number}}"
+                        )
+                    if post_last.entry_hash != pre_journal_state["last_entry_hash"]:
+                        raise AssertionError(
+                            "journal chain tail hash changed across the upgrade "
+                            "-- same sequence number, different chain"
+                        )
 
                 dreaming = DreamingExtension(
                     config=DreamingConfig(
@@ -235,6 +432,8 @@ def _verify_upgraded_db_script(db_path: Path, snapshot_path: Path) -> str:
                 await conn.close()
 
         asyncio.run(verify_data())
+
+        _assert_content_preserved(PRE_SNAPSHOT_PATH, POST_MIGRATION_SNAPSHOT_PATH)
 
         snapshot_cmd = [
             sys.executable,
@@ -265,9 +464,32 @@ def _verify_upgraded_db_script(db_path: Path, snapshot_path: Path) -> str:
     )
 
 
-def verify_upgraded_db(python_executable: Path, db_path: Path, snapshot_path: Path) -> None:
-    """Verify upgraded DB behavior using the installed target package."""
-    run_command([str(python_executable), "-c", _verify_upgraded_db_script(db_path, snapshot_path)])
+def verify_upgraded_db(
+    python_executable: Path,
+    db_path: Path,
+    snapshot_path: Path,
+    pre_snapshot_path: Path,
+    pre_journal_state_path: Path,
+) -> None:
+    """Verify upgraded DB behavior using the installed target package.
+
+    Checks the post-upgrade counts/FTS/CLI behaviour the same as before, and
+    also diffs the migration's own effect against ``pre_snapshot_path`` /
+    ``pre_journal_state_path`` (captured by :func:`populate_fixture_db`
+    while still on the FROM release): every pre-upgrade thought, edge,
+    embedding and action must still be present with its pre-upgrade field
+    values intact, and the journal chain must still verify with the same
+    entry count and the same chain tail.
+    """
+    run_command(
+        [
+            str(python_executable),
+            "-c",
+            _verify_upgraded_db_script(
+                db_path, snapshot_path, pre_snapshot_path, pre_journal_state_path
+            ),
+        ]
+    )
 
 
 def run_upgrade_path(
@@ -279,6 +501,8 @@ def run_upgrade_path(
     to_editable: bool,
     db_path: Path,
     snapshot_path: Path,
+    pre_snapshot_path: Path,
+    pre_journal_state_path: Path,
 ) -> None:
     """Run an end-to-end upgrade validation in an isolated virtual environment."""
     with tempfile.TemporaryDirectory(prefix="engrava-upgrade-") as temp_dir:
@@ -290,11 +514,18 @@ def run_upgrade_path(
             editable=from_editable,
             cwd=repository_root,
         )
-        populate_fixture_db(python_executable, db_path)
+        populate_fixture_db(python_executable, db_path, pre_snapshot_path, pre_journal_state_path)
         install_package(
             python_executable,
             to_spec,
             editable=to_editable,
             cwd=repository_root,
+            # See install_package's docstring: the candidate build can carry
+            # the same version number as the FROM release until the release
+            # pipeline itself bumps it, so this must force the reinstall
+            # rather than let pip treat a version match as a no-op.
+            force_reinstall=True,
         )
-        verify_upgraded_db(python_executable, db_path, snapshot_path)
+        verify_upgraded_db(
+            python_executable, db_path, snapshot_path, pre_snapshot_path, pre_journal_state_path
+        )

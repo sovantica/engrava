@@ -59,36 +59,42 @@ def _build_populated_db(db_path: Path) -> None:
     """Build the exact two-thought, one-edge database the goldens were captured against."""
 
     async def _setup() -> None:
+        # Everything from schema setup through the commit runs under conn, so
+        # it all belongs inside the try/finally below -- a failure partway
+        # through (schema setup, either create call) would otherwise leak the
+        # connection's non-daemon worker thread instead of closing it.
         conn = await aiosqlite.connect(str(db_path))
-        conn.row_factory = aiosqlite.Row
-        store = SqliteEngravaCore(conn, journal_enabled=True)
-        await store.ensure_schema()
-        for i, tid in enumerate(("t-old-0", "t-old-1")):
-            await store.create_thought(
-                ThoughtRecord(
-                    thought_id=tid,
-                    essence=f"Essence for {tid}",
-                    content=f"Content for {tid}",
-                    thought_type=ThoughtType.OBSERVATION,
-                    source="test",
-                    lifecycle_status=LifecycleStatus.ACTIVE,
-                    priority=Priority.P2,
-                    created_cycle=i + 1,
-                    updated_cycle=i + 1,
+        try:
+            conn.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(conn, journal_enabled=True)
+            await store.ensure_schema()
+            for i, tid in enumerate(("t-old-0", "t-old-1")):
+                await store.create_thought(
+                    ThoughtRecord(
+                        thought_id=tid,
+                        essence=f"Essence for {tid}",
+                        content=f"Content for {tid}",
+                        thought_type=ThoughtType.OBSERVATION,
+                        source="test",
+                        lifecycle_status=LifecycleStatus.ACTIVE,
+                        priority=Priority.P2,
+                        created_cycle=i + 1,
+                        updated_cycle=i + 1,
+                    )
+                )
+            await store.create_edge(
+                EdgeRecord(
+                    edge_id="edge-001",
+                    from_thought_id="t-old-0",
+                    to_thought_id="t-old-1",
+                    edge_type=EdgeType.ASSOCIATED,
+                    weight=0.9,
+                    created_cycle=1,
                 )
             )
-        await store.create_edge(
-            EdgeRecord(
-                edge_id="edge-001",
-                from_thought_id="t-old-0",
-                to_thought_id="t-old-1",
-                edge_type=EdgeType.ASSOCIATED,
-                weight=0.9,
-                created_cycle=1,
-            )
-        )
-        await conn.commit()
-        await conn.close()
+            await conn.commit()
+        finally:
+            await conn.close()
 
     asyncio.run(_setup())
 

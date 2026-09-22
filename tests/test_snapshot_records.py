@@ -1721,3 +1721,77 @@ class TestEmbeddingIdentityInvariant:
         assert "embedding_dimension" in result.output
         assert "not-a-number" in result.output
         assert asyncio.run(_dump_table(target, "thought")) == []
+
+    def test_clear_identity_without_clear_is_rejected(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """``--clear-identity`` alone is refused -- it only makes sense
+        alongside ``--clear``, which is what actually empties the core
+        tables before the identity is dropped as well.
+        """
+        target = tmp_path / "target.db"
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(_thought_line(_minimal_thought_data("t-1")) + "\n", encoding="utf-8")
+
+        result = runner.invoke(
+            cli, ["--db", str(target), "restore", "-i", str(snap), "--clear-identity"]
+        )
+
+        assert result.exit_code != 0
+        assert "--clear-identity requires --clear" in result.output
+
+    def test_clear_with_clear_identity_recovers_a_corrupt_lock_dimension(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """Following the corrupt-identity error message's own recommended
+        recovery command must actually resolve the corrupt state: plain
+        ``--clear`` alone preserves ``_metadata`` (see
+        ``test_clear_preserves_the_lock_and_rejects_a_mismatched_import``
+        above), so it cannot fix a corrupt ``embedding_dimension`` on its
+        own -- only ``--clear --clear-identity`` does.
+        """
+        target = tmp_path / "target.db"
+
+        async def _corrupt_dimension() -> None:
+            from engrava import SqliteEngravaCore
+
+            conn = await aiosqlite.connect(str(target))
+            try:
+                store = SqliteEngravaCore(conn)
+                await store.ensure_schema()
+                await conn.execute(
+                    "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
+                    ("embedding_model_name", "model-A"),
+                )
+                await conn.execute(
+                    "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
+                    ("embedding_dimension", "not-a-number"),
+                )
+                await conn.commit()
+            finally:
+                await conn.close()
+
+        asyncio.run(_corrupt_dimension())
+
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(_thought_line(_minimal_thought_data("t-new")) + "\n", encoding="utf-8")
+
+        # Plain --clear alone does not resolve it -- confirm the failure mode
+        # the error message warns about before trusting the fix below.
+        plain_clear = runner.invoke(
+            cli, ["--db", str(target), "restore", "-i", str(snap), "--clear"]
+        )
+        assert plain_clear.exit_code != 0
+        assert "not-a-number" in plain_clear.output
+
+        # The exact recovery command the error message now recommends.
+        result = runner.invoke(
+            cli,
+            ["--db", str(target), "restore", "-i", str(snap), "--clear", "--clear-identity"],
+        )
+
+        assert result.exit_code == 0
+        assert asyncio.run(_dump_table(target, "thought"))
+        metadata = asyncio.run(_metadata_map(target))
+        assert "embedding_dimension" not in metadata
+        assert "embedding_model_name" not in metadata

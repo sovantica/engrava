@@ -174,6 +174,15 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# An unhandled exception on a worker thread, or an exception raised where
+# nothing can propagate it (e.g. inside `__del__`), is a resource-lifecycle
+# bug even when the test using that thread still passes on its own assertions
+# -- pytest only warns by default, so such a bug can sit in a green suite
+# indefinitely. Promote both to hard failures instead.
+filterwarnings = [
+    "error::pytest.PytestUnhandledThreadExceptionWarning",
+    "error::pytest.PytestUnraisableExceptionWarning",
+]
 
 [tool.coverage.run]
 # Measure coverage of the package only. Without this, a bare ``--cov`` (as the
@@ -184,6 +193,13 @@ testpaths = ["tests"]
 # invocations measuring exactly the same thing, so there is a single source of
 # truth and the ``--cov-fail-under=90`` floor guards the package, not the repo.
 source = ["src/engrava"]
+# Branch coverage in addition to line coverage, so a critical-path branch that
+# is never taken (e.g. only the happy side of a lifecycle/transaction guard)
+# cannot hide behind a line that is merely executed once for either outcome.
+# Does not raise the existing --cov-fail-under=90 floor, which stays a
+# line-coverage gate; this only makes branch data available to it and to
+# --cov-report.
+branch = true
 
 [tool.coverage.report]
 # No blanket excludes. Coverage's built-in default already omits the narrow,

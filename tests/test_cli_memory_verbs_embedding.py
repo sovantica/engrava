@@ -8,12 +8,16 @@ test asserts the **positive** — ``backends_used`` actually contains the
 ``"vector"`` arm — rather than only that a config-driven and a bare call
 agree, since two silent lexical-only routes would agree with each other too.
 
-Uses the real ``sentence-transformer`` provider (``all-MiniLM-L12-v2``,
-already cached locally by the wider test suite) rather than a mock, because
-the point is that the CLI reaches the *actual* configured provider through
-``from_config()`` — a mock would only prove the CLI can call a mock.
+Uses the real ``sentence-transformer`` provider, with the package's own
+default model (``all-MiniLM-L12-v2``, see
+``SentenceTransformerProvider``'s default) rather than a mock, because the
+point is that the CLI reaches the *actual* configured provider through
+``from_config()`` — a mock would only prove the CLI can call a mock. CI warms
+this model into the HuggingFace cache alongside ``all-MiniLM-L6-v2`` before
+this file's job runs (see ``warm-hf-cache`` in ``.github/workflows/ci.yml``).
 Skipped when the package or its cached weights are not available, e.g. a
-minimal install without the ``embeddings-local`` extra.
+minimal install without the ``embeddings-local`` extra -- never for any other
+failure, which is left to surface as a real test error.
 """
 
 from __future__ import annotations
@@ -55,9 +59,21 @@ sentence_transformers = pytest.importorskip(
 
 
 def _model_available() -> bool:
+    """Whether ``all-MiniLM-L12-v2`` is already cached locally.
+
+    ``local_files_only=True`` makes both ``sentence-transformers`` and the
+    underlying ``huggingface_hub`` resolve entirely from the local cache and
+    raise an ``OSError`` (directly, or a ``LocalEntryNotFoundError`` --
+    itself an ``OSError`` subclass -- wrapped in one) when a required file is
+    missing from it, never anything else. Catching only ``OSError`` keeps
+    this a genuine "not cached locally" check: an unrelated bug in model
+    loading (a bad config value, an incompatible package version) raises a
+    different exception type and is left to fail the test instead of being
+    absorbed into a silent skip.
+    """
     try:
         sentence_transformers.SentenceTransformer("all-MiniLM-L12-v2", local_files_only=True)
-    except Exception:  # noqa: BLE001 -- any failure means "not usable offline here"
+    except OSError:
         return False
     return True
 

@@ -526,6 +526,17 @@ class TestDeleteThoughtChildrenAtomicity:
         with pytest.raises(ConnectionQuarantinedError):
             await store.create_thought(_make_thought("unrelated-after-quarantine"))
 
+        # Quarantine's own physical close is deliberately detached (see the
+        # docstring above) so *safety* never depends on it, but that leaves
+        # its task still in flight when this test function returns -- and
+        # pytest-asyncio closes this test's event loop immediately after.
+        # Awaiting it here (never done in production, where the loop keeps
+        # running) lets the close finish on the loop it was scheduled on,
+        # instead of leaking aiosqlite's non-daemon worker thread to call
+        # back into a now-closed loop from some unrelated, later test.
+        if store._quarantine_close_task is not None:
+            await store._quarantine_close_task
+
     async def test_cancellation_during_unwind_wins_over_the_original_error(
         self,
     ) -> None:
@@ -582,6 +593,13 @@ class TestDeleteThoughtChildrenAtomicity:
         assert store._connection_quarantined is True
         with pytest.raises(ConnectionQuarantinedError):
             await store.create_thought(_make_thought("unrelated-after-quarantine"))
+
+        # See the previous test's closing comment: awaiting quarantine's
+        # detached close task here keeps it from outliving this test's event
+        # loop, which production code never has to do because its own loop
+        # keeps running past this point.
+        if store._quarantine_close_task is not None:
+            await store._quarantine_close_task
 
 
 class TestParentDeleteSeesChildrenBeforeTheyAreGone:
@@ -3151,6 +3169,15 @@ class TestDeletionOnAPreCascadeSchema:
         try:
             await TestMigrationV11ToV12._bootstrap_v11_schema(db)
             store = SqliteEngravaCore(db, embedding_provider=None, auto_embed=False)
+            # store.close() below is a no-op on the connection unless the
+            # store is told it owns it (see SqliteEngravaCore.close()'s own
+            # docstring: "No-op on the connection when it is caller-managed").
+            # Without this, `db`'s connection -- and its non-daemon aiosqlite
+            # worker thread -- is never actually closed here, only relies on
+            # `__del__` for cleanup; confirmed via a leaked-thread repro that
+            # this is exactly what happened. `_delete_then_reconcile` above
+            # already sets this for the same reason.
+            store._owns_connection = True
             await store._configure_vector_backend(
                 backend_name="sqlite-vec",
                 embedding_dimension=_PRE_CASCADE_DIMENSION,

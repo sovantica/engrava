@@ -583,6 +583,7 @@ Restores a database from a JSONL snapshot produced by `snapshot`.
 |---|---|---|---|
 | `-i`, `--input` | path | **required** | JSONL snapshot file to restore. |
 | `--clear` | flag | off | Clear existing data before restoring. |
+| `--clear-identity` | flag | off | Also clear the target's stored embedding identity (model name, dimension, prefix metadata). Requires `--clear`. Recovers a target whose stored `embedding_dimension` is corrupt -- `--clear` alone preserves an existing identity, corrupt or not. |
 | `--skip-embeddings` | flag | off | Import without embedding records. |
 | `--re-embed` | flag | off | Re-embed all thoughts via the target provider, ignoring source embeddings. Requires `--config` with top-level or per-service embeddings. |
 | `--orphan-journal-entries` | flag | off | Allow a merge restore (no `--clear`) into a target whose `journal_entry` table is non-empty to replace a colliding row anyway. Without it, such a collision is refused. |

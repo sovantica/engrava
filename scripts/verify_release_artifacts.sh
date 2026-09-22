@@ -34,6 +34,16 @@
 # build that silently drifted from what was meant to ship is caught here
 # rather than shipped.
 #
+# Everything above inspects the built wheel's archive metadata — its file
+# listing, its embedded version — never whether it actually runs once
+# installed. scripts/verify_wheel_execution.py closes that gap: it installs
+# this exact wheel (never rebuilding it) into a fresh virtual environment
+# outside this checkout and runs a real CLI smoke sequence against it, for
+# both the base dependency set and the embeddings-local/vec extras lane, so
+# a packaging defect only visible after install (a missing file, a broken
+# console-script entry point, a broken extras resolution) is caught before
+# the tag and the GitHub Release exist, not after.
+#
 # dist/SHA256SUMS, written last, is the byte-identity record the publish job
 # checks before it uploads: the publish job never rebuilds, it only verifies
 # that what it is about to ship still hashes to what this script verified.
@@ -72,6 +82,9 @@ python scripts/verify_dist_cardinality.py
 
 echo "== Verify the built artefacts embed the version being tagged =="
 python scripts/verify_artifact_version.py "$EXPECTED_VERSION"
+
+echo "== Install the built wheel into a fresh environment and run it =="
+python scripts/verify_wheel_execution.py
 
 echo "== twine check on the artefacts that will ship =="
 python -m twine check dist/*

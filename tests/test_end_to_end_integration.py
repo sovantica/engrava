@@ -162,18 +162,26 @@ async def test_full_pipeline_derive_embed_recall(
     over unrelated noise while the source survives.
     """
     db_path = tmp_path / "pipeline.db"
+    # conn is opened outside the try/finally below on purpose: aiosqlite starts
+    # the connection's non-daemon worker thread only once connect() itself has
+    # succeeded, so there is nothing yet to close if that call is what raises.
+    # Everything from here on runs under the connection, so it all belongs
+    # inside the guard -- setup included, not just the assertions below it --
+    # or a failure during schema setup or backend wiring leaks the connection
+    # exactly like a failure in the test body would.
     conn = await aiosqlite.connect(str(db_path))
-    conn.row_factory = aiosqlite.Row
-    await conn.execute("PRAGMA foreign_keys = ON")
-    store = SqliteEngravaCore(
-        conn,
-        hooks=StructuralSplitProducer(),
-        embedding_provider=real_minilm_provider,
-        auto_embed=True,
-        derive_gates=DeriveGates(enabled=True),
-    )
-    await store.ensure_schema()
     try:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA foreign_keys = ON")
+        store = SqliteEngravaCore(
+            conn,
+            hooks=StructuralSplitProducer(),
+            embedding_provider=real_minilm_provider,
+            auto_embed=True,
+            derive_gates=DeriveGates(enabled=True),
+        )
+        await store.ensure_schema()
+
         # The gold fact lives ONLY in paragraph A; paragraph B is filler. The
         # split derives one child per paragraph, so the gold answer becomes its
         # own retrievable derived thought.
@@ -314,72 +322,84 @@ async def test_reopen_is_noop_and_query_is_identical(
     db_path = tmp_path / f"durable-{backend}.db"
 
     # --- Session 1: bootstrap, ingest, embed, capture the ranked list. --------
+    # Everything from setup through the final recall runs under conn1, so it
+    # all belongs inside the try/finally below -- not just the recall itself --
+    # or a failure partway through (schema setup, embedding, or the vec0
+    # backend load) leaks the connection's non-daemon worker thread instead of
+    # closing it.
     conn1 = await aiosqlite.connect(str(db_path))
-    conn1.row_factory = aiosqlite.Row
-    await conn1.execute("PRAGMA foreign_keys = ON")
-    store1 = SqliteEngravaCore(
-        conn1,
-        embedding_provider=real_minilm_provider,
-        auto_embed=True,
-    )
-    await store1.ensure_schema()
-    for thought_id, essence, content in _DURABILITY_CORPUS:
-        await store1.create_thought(_thought(thought_id, essence=essence, content=content))
+    try:
+        conn1.row_factory = aiosqlite.Row
+        await conn1.execute("PRAGMA foreign_keys = ON")
+        store1 = SqliteEngravaCore(
+            conn1,
+            embedding_provider=real_minilm_provider,
+            auto_embed=True,
+        )
+        await store1.ensure_schema()
+        for thought_id, essence, content in _DURABILITY_CORPUS:
+            await store1.create_thought(_thought(thought_id, essence=essence, content=content))
 
-    sample = await store1.get_embedding("d-car")
-    assert sample is not None
-    dimension = sample.dimension
-    # ``_configure_vector_backend`` is the only in-test seam that swaps the real
-    # vec0 backend onto a manually-constructed store: the public path
-    # (``from_config``) is YAML-only and would both re-own the connection and
-    # subsume the discrete ``ensure_schema`` no-op this reopen test observes.
-    # This mirrors the established real-vec0 pattern in ``test_sqlite_vec.py``.
-    await store1._configure_vector_backend(backend_name=backend, embedding_dimension=dimension)
+        sample = await store1.get_embedding("d-car")
+        assert sample is not None
+        dimension = sample.dimension
+        # ``_configure_vector_backend`` is the only in-test seam that swaps the
+        # real vec0 backend onto a manually-constructed store: the public path
+        # (``from_config``) is YAML-only and would both re-own the connection
+        # and subsume the discrete ``ensure_schema`` no-op this reopen test
+        # observes. This mirrors the established real-vec0 pattern in
+        # ``test_sqlite_vec.py``.
+        await store1._configure_vector_backend(backend_name=backend, embedding_dimension=dimension)
 
-    corpus_size = len(_DURABILITY_CORPUS)
-    version_session1 = await _user_version(conn1)
-    embedding_count_session1 = await _scalar_count(conn1, "SELECT COUNT(*) FROM embedding")
-    created_at_session1 = await _embedding_created_at(store1, _DURABILITY_IDS)
-    if backend == "sqlite-vec":
-        vec_count_session1 = await _scalar_count(conn1, "SELECT COUNT(*) FROM embedding_vec")
+        corpus_size = len(_DURABILITY_CORPUS)
+        version_session1 = await _user_version(conn1)
+        embedding_count_session1 = await _scalar_count(conn1, "SELECT COUNT(*) FROM embedding")
+        created_at_session1 = await _embedding_created_at(store1, _DURABILITY_IDS)
+        if backend == "sqlite-vec":
+            vec_count_session1 = await _scalar_count(conn1, "SELECT COUNT(*) FROM embedding_vec")
 
-    ranked_session1 = (await store1.recall(_DURABILITY_QUERY, top_k=corpus_size)).results
-    assert "d-car" in {thought_id for thought_id, _ in ranked_session1}
-    await conn1.close()
+        ranked_session1 = (await store1.recall(_DURABILITY_QUERY, top_k=corpus_size)).results
+        assert "d-car" in {thought_id for thought_id, _ in ranked_session1}
+    finally:
+        await conn1.close()
 
     # --- Session 2: reopen a fresh store on the same file. --------------------
     conn2 = await aiosqlite.connect(str(db_path))
-    conn2.row_factory = aiosqlite.Row
-    await conn2.execute("PRAGMA foreign_keys = ON")
-    store2 = SqliteEngravaCore(
-        conn2,
-        embedding_provider=real_minilm_provider,
-        auto_embed=True,
-    )
-
-    # ensure_schema is a genuine no-op on an already-head database.
-    version_before_ensure = await _user_version(conn2)
-    await store2.ensure_schema()
-    version_after_ensure = await _user_version(conn2)
-    assert version_before_ensure == version_after_ensure == version_session1
-    # No extension migration re-ran (there are none registered).
-    assert await _scalar_count(conn2, "SELECT COUNT(*) FROM extension_schema_versions") == 0
-
-    # Reconfigure the same backend on the reopened store (see the session-1 note
-    # on why the private seam is the only in-test path to the real vec0 backend).
-    await store2._configure_vector_backend(backend_name=backend, embedding_dimension=dimension)
-
-    # Nothing was re-embedded: identical row count and identical per-row
-    # created_at fingerprints survive the reopen.
-    assert await _scalar_count(conn2, "SELECT COUNT(*) FROM embedding") == embedding_count_session1
-    assert await _embedding_created_at(store2, _DURABILITY_IDS) == created_at_session1
-    if backend == "sqlite-vec":
-        # The vec0 index persisted on disk and was reused, not rebuilt/duplicated.
-        vec_count_session2 = await _scalar_count(conn2, "SELECT COUNT(*) FROM embedding_vec")
-        assert vec_count_session2 == vec_count_session1
-
-    ranked_session2 = (await store2.recall(_DURABILITY_QUERY, top_k=corpus_size)).results
     try:
+        conn2.row_factory = aiosqlite.Row
+        await conn2.execute("PRAGMA foreign_keys = ON")
+        store2 = SqliteEngravaCore(
+            conn2,
+            embedding_provider=real_minilm_provider,
+            auto_embed=True,
+        )
+
+        # ensure_schema is a genuine no-op on an already-head database.
+        version_before_ensure = await _user_version(conn2)
+        await store2.ensure_schema()
+        version_after_ensure = await _user_version(conn2)
+        assert version_before_ensure == version_after_ensure == version_session1
+        # No extension migration re-ran (there are none registered).
+        assert await _scalar_count(conn2, "SELECT COUNT(*) FROM extension_schema_versions") == 0
+
+        # Reconfigure the same backend on the reopened store (see the
+        # session-1 note on why the private seam is the only in-test path to
+        # the real vec0 backend).
+        await store2._configure_vector_backend(backend_name=backend, embedding_dimension=dimension)
+
+        # Nothing was re-embedded: identical row count and identical per-row
+        # created_at fingerprints survive the reopen.
+        assert (
+            await _scalar_count(conn2, "SELECT COUNT(*) FROM embedding") == embedding_count_session1
+        )
+        assert await _embedding_created_at(store2, _DURABILITY_IDS) == created_at_session1
+        if backend == "sqlite-vec":
+            # The vec0 index persisted on disk and was reused, not
+            # rebuilt/duplicated.
+            vec_count_session2 = await _scalar_count(conn2, "SELECT COUNT(*) FROM embedding_vec")
+            assert vec_count_session2 == vec_count_session1
+
+        ranked_session2 = (await store2.recall(_DURABILITY_QUERY, top_k=corpus_size)).results
         # The identical ranked list: exact thought-id order, scores within a
         # tight absolute tolerance.
         assert [tid for tid, _ in ranked_session2] == [tid for tid, _ in ranked_session1]
@@ -455,26 +475,32 @@ async def test_multi_extension_load_order_converges(tmp_path: Path) -> None:
     isolated runners miss.
     """
     db_path = tmp_path / "multi_extension.db"
+    # Everything from setup through the final assertions runs under conn, so
+    # it all belongs inside the try/finally below -- a failure during schema
+    # setup or the vec0 backend load leaks the connection's non-daemon worker
+    # thread exactly like a failure in the test body would.
     conn = await aiosqlite.connect(str(db_path))
-    conn.row_factory = aiosqlite.Row
-    await conn.execute("PRAGMA foreign_keys = ON")
-
-    provider = CallbackProvider(_topic_embed, dimension=3, model_name="topic-3")
-    store = SqliteEngravaCore(
-        conn,
-        hooks=StructuralSplitProducer(),
-        embedding_provider=provider,
-        auto_embed=True,
-        derive_gates=DeriveGates(enabled=True),
-    )
-    await store.ensure_schema()
-    head_version = await _user_version(conn)
-    # ``_configure_vector_backend`` is the only in-test seam to the real vec0
-    # backend here: the public ``from_config`` path is YAML-only and cannot wire
-    # the runtime ``CallbackProvider`` this deterministic cluster relies on. Same
-    # established real-vec0 pattern as ``test_sqlite_vec.py``.
-    await store._configure_vector_backend(backend_name="sqlite-vec", embedding_dimension=3)
     try:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA foreign_keys = ON")
+
+        provider = CallbackProvider(_topic_embed, dimension=3, model_name="topic-3")
+        store = SqliteEngravaCore(
+            conn,
+            hooks=StructuralSplitProducer(),
+            embedding_provider=provider,
+            auto_embed=True,
+            derive_gates=DeriveGates(enabled=True),
+        )
+        await store.ensure_schema()
+        head_version = await _user_version(conn)
+        # ``_configure_vector_backend`` is the only in-test seam to the real
+        # vec0 backend here: the public ``from_config`` path is YAML-only and
+        # cannot wire the runtime ``CallbackProvider`` this deterministic
+        # cluster relies on. Same established real-vec0 pattern as
+        # ``test_sqlite_vec.py``.
+        await store._configure_vector_backend(backend_name="sqlite-vec", embedding_dimension=3)
+
         # Two co-topic alpha sources cluster; a beta source stays isolated. One
         # alpha source carries two paragraphs so the split derives two children.
         await store.create_thought(
