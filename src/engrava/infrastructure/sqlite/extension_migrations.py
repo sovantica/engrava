@@ -16,6 +16,7 @@ up to date as a convenience lookup for the latest applied migration.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import importlib.resources
@@ -440,6 +441,11 @@ class ExtensionMigrationRunner:
                 transaction-control migration SQL shape, SQL execution failure
                 (the savepoint is rolled back so the database is left unchanged),
                 or an unresolvable relative path.
+            asyncio.CancelledError: If cancelled while a migration step's
+                savepoint is open. The savepoint is rolled back first, exactly
+                as for a SQL execution failure, and the cancellation then
+                propagates unwrapped so the caller's own cancellation handling
+                still runs.
 
         """
         if not manifest.schema_migrations:
@@ -501,12 +507,24 @@ class ExtensionMigrationRunner:
                     (manifest.name, step.index, applied_at, step.basename, manifest.version),
                 )
                 await db.execute(f"RELEASE SAVEPOINT {savepoint}")
-            except Exception as exc:
+            except (Exception, asyncio.CancelledError) as exc:
                 # Roll the failed step back; suppress any secondary cleanup error
-                # so the typed migration error is what surfaces to the caller.
+                # so the typed migration error (or, for a cancellation, the
+                # cancellation itself) is what surfaces to the caller.
+                # ``asyncio.CancelledError`` is a ``BaseException`` subclass
+                # (not ``Exception``, since Python 3.8), so it is named
+                # explicitly here rather than relying on a bare ``except:`` --
+                # that would also swallow ``SystemExit``/``KeyboardInterrupt``,
+                # which must keep propagating unimpeded.
                 with contextlib.suppress(Exception):
                     await db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                     await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+                if isinstance(exc, asyncio.CancelledError):
+                    # Not a migration failure -- the savepoint is unwound the
+                    # same way, but the cancellation itself propagates
+                    # unwrapped so the caller's own cancellation handling
+                    # still runs.
+                    raise
                 msg = f"SQL execution failed: {exc}"
                 raise ExtensionMigrationError(
                     manifest.name, msg, migration_file=step.basename
