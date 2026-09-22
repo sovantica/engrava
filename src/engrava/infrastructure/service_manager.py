@@ -416,7 +416,7 @@ class EngravaManager:
             except asyncio.CancelledError as exc:
                 pending_cancellation = exc
                 continue
-            except Exception:  # noqa: BLE001 -- one failed creation must not abort waiting for the rest
+            except Exception:  # one failed creation must not abort waiting for the rest
                 # The creation failed and already reported that failure to
                 # its own ``get_store()`` caller -- it never reached the
                 # cache, so there is nothing here to close. Logged here too
@@ -436,7 +436,7 @@ class EngravaManager:
                 await store.close()
             except asyncio.CancelledError as exc:
                 pending_cancellation = exc
-            except Exception:  # noqa: BLE001 -- one store's close failure must not abort closing the rest
+            except Exception:  # one store's close failure must not abort closing the rest
                 logger.warning("Error closing store %r", name, exc_info=True)
             finally:
                 async with self._lock:
