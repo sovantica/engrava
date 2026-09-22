@@ -214,9 +214,9 @@ class DreamingGates:
             transform in floating-point arithmetic, and changes which
             side of this threshold several non-finite and overflowing
             input shapes land on (in both directions) relative to the
-            pre-0.8 raw dot product — see ``cluster_cohesion_score`` in
+            pre-0.7 raw dot product — see ``cluster_cohesion_score`` in
             ``engrava.extensions.dreaming_cluster_quality`` for the
-            executed cases and the 0.7 -> 0.8 upgrade note for what to
+            executed cases and the 0.6 -> 0.7 upgrade note for what to
             check if this threshold was tuned before that change.
         cluster_quality_external_homogeneity_threshold: External-source
             homogeneity threshold passed to

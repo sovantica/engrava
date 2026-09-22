@@ -27,7 +27,7 @@ Gate inventory (priority order — first failure rejects the cluster):
    threshold several non-finite and overflowing input shapes land on,
    in both directions, relative to the pre-fix formula — see
    :func:`cluster_cohesion_score` for exactly which, executed, and the
-   0.7 -> 0.8 upgrade note for the gate-level effect.
+   0.6 -> 0.7 upgrade note for the gate-level effect.
 5. :func:`is_external_source_homogeneous` — at least the configured
    fraction of members come from external sources per the self-anchored
    ``metadata.source.is_self`` semantic.  Belt-and-suspenders over the
@@ -478,7 +478,7 @@ def is_low_cohesion(
         ``False`` for any threshold, so a ``nan`` cohesion reports
         ``is_loose=False`` — the cluster is treated as *not* low-cohesion
         and admitted. That comparison itself is pre-existing behaviour,
-        unchanged by this function — but as of the 0.7 -> 0.8 change,
+        unchanged by this function — but as of the 0.6 -> 0.7 change,
         which inputs actually produce ``nan`` (and are therefore admitted
         by this comparison) versus ``0.0`` (and are therefore rejected)
         is not the same as before: see :func:`cluster_cohesion_score`'s

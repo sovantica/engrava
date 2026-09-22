@@ -304,7 +304,7 @@ class TestClusterCohesion:
         assert cluster_cohesion_score([unit_a, unit_b]) == pytest.approx(0.96)
 
     def test_already_normalised_pair_pinned_exact_not_approx(self) -> None:
-        # Regression pin for claim 5 of the 0.7 -> 0.8 fix ("byte-identical
+        # Regression pin for claim 5 of the 0.6 -> 0.7 fix ("byte-identical
         # behaviour" / "this release changes nothing for you" on an
         # already-normalising provider): [0.7071067811865475]*2 is, to
         # float64 precision, a unit vector, but its norm computes to
@@ -378,7 +378,7 @@ class TestIsLowCohesion:
         assert score == pytest.approx(1.0)
 
     def test_nan_paired_with_zero_vector_now_rejects_not_admits(self) -> None:
-        # Regression pin for a 0.7 -> 0.8 side-effect that the upgrade
+        # Regression pin for a 0.6 -> 0.7 side-effect that the upgrade
         # note now documents: a member vector containing nan, paired with
         # a member vector whose own norm is exactly zero, scored nan
         # under the pre-fix raw-dot-product formula (nan * 0.0 is nan;
