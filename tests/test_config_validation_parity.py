@@ -1022,6 +1022,10 @@ _NON_CONFIG_CLASSES: dict[str, str] = {
     "engrava.cli.main.RestoreImportResult": (
         "what one restore did -- records imported and journal entries discarded"
     ),
+    "engrava.cli.main.StreamInsertResult": (
+        "one record-stream insert's outcome -- rows written and any embedding rowids it "
+        "replaced, not settings"
+    ),
     "engrava.cli.store_resolution.ResolvedStore": (
         "a resolution outcome -- which database an invocation picked and why, not settings"
     ),
