@@ -90,8 +90,11 @@ Operational consequences:
 Engrava supports **one writing store per database file**. For multi-worker app
 servers (Gunicorn/Uvicorn workers, etc.):
 
-- **Reads scale freely** under WAL — many readers and one writer coexist, across
-  processes as well as within one.
+- **WAL lets many readers and one writer coexist**, across processes as well
+  as within one. Reads issued through one store instance still serialise on
+  that store's single connection (see
+  [Concurrency](concurrency.md#many-async-tasks-one-store)); it is separate
+  store instances, including across processes, that read concurrently.
 - **Route every write to one process.** Two workers writing one file is not a
   contention trade-off you can tune with `busy_timeout`. A guarded update
   whose read-to-write window another writer's guarded write lands in raises
@@ -130,22 +133,27 @@ only closes a connection it **owns**:
   close the connection you created:
 
   ```python
-  conn = await aiosqlite.connect("engrava.db")
-  conn.row_factory = aiosqlite.Row
-  store = SqliteEngravaCore(conn)
-  try:
-      ...
-  except BaseException:
-      # A failure above is what the caller needs to see; a close failure in
-      # this cleanup is secondary, so it is reported rather than allowed to
-      # replace it.
+  import aiosqlite
+  from engrava import SqliteEngravaCore
+
+
+  async def run_with_manual_connection() -> None:
+      conn = await aiosqlite.connect("engrava.db")
+      conn.row_factory = aiosqlite.Row
+      store = SqliteEngravaCore(conn)
       try:
-          await conn.close()
-      except Exception as exc:  # noqa: BLE001 - never replace the real error
-          print(f"warning: failed to close the database connection: {exc}")
-      raise
-  else:
-      await conn.close()  # the caller owns and closes the connection
+          ...
+      except BaseException:
+          # A failure above is what the caller needs to see; a close failure in
+          # this cleanup is secondary, so it is reported rather than allowed to
+          # replace it.
+          try:
+              await conn.close()
+          except Exception as exc:  # noqa: BLE001 - never replace the real error
+              print(f"warning: failed to close the database connection: {exc}")
+          raise
+      else:
+          await conn.close()  # the caller owns and closes the connection
   ```
 
   A bare `async with aiosqlite.connect(...) as conn:` looks like a shortcut

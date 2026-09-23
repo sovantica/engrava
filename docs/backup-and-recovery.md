@@ -9,12 +9,15 @@ data** — both are explained below.
 
 | Method | What it captures | Portable across versions? |
 |---|---|---|
-| **Logical snapshot** (`engrava snapshot`) | Thoughts, edges, embeddings, and actions as JSONL records | Yes — it's data, not file format |
+| **Logical snapshot** (`engrava snapshot`) | Thoughts, edges, embeddings, and actions as JSONL records | Data, not file format — but restore validates every record against a fixed column set per table, so it is portable only to a build whose recognized tables accept the same columns |
 | **Physical file backup** | The exact database file(s) — *everything*, including the audit journal | Tied to the SQLite file format (very stable) |
 
-Pick the logical snapshot for portability and selective restore; pick a physical
-backup when you need a byte-exact copy (including the journal) or point-in-time
-file recovery.
+Pick the logical snapshot for selective restore across compatible schema
+versions; pick a physical backup when you need the audit journal preserved or
+point-in-time file recovery. A filesystem-level copy of the complete file set
+can be byte-exact; `VACUUM INTO` and the Online Backup API instead produce a
+consistent logical copy that is not guaranteed byte-identical to the source
+(see below).
 
 ## Logical snapshot and restore
 
@@ -24,7 +27,11 @@ engrava --db fresh.db   restore  -i backup.jsonl   # import into a fresh db
 ```
 
 The snapshot is JSONL: a metadata header line, then one record per
-thought / edge / embedding / action.
+thought / edge / embedding / action. The export reads the metadata header and
+all four tables inside one read transaction opened before the first read
+(`src/engrava/cli/main.py:1241`), so the snapshot is a consistent point-in-time
+view rather than four independent scans that a concurrent writer could
+interleave with.
 
 > **A snapshot does NOT include the audit journal.** The `journal_entry` table —
 > the tamper-evident hash chain — is **not** exported by `engrava snapshot`, and
@@ -86,7 +93,9 @@ thought / edge / embedding / action.
 > [Audit Trail](audit-trail.md).
 
 `restore` options worth knowing (see the [CLI reference](cli.md#restore) for the
-full list): `--clear` to wipe the target first, `--skip-embeddings` / `--re-embed`
+full list): `--clear` to empty the target's four core tables and its journal
+first (not `_metadata`, `extension_schema_versions`, or extension-owned
+tables — see above), `--skip-embeddings` / `--re-embed`
 to control embedding handling, `--orphan-journal-entries` to allow a merge that
 would otherwise be refused by the collision gate above, and `--service` for
 multi-service targets. When `--clear` encounters a persisted sqlite-vec index,
@@ -150,8 +159,8 @@ The general `--clear` sqlite-vec reset described above also protects this path.
 `restore` is designed for **snapshots you produced yourself** with `engrava
 snapshot` — your own trusted backups. That is the supported input boundary.
 
-Restore does not blindly trust the file. Every line must be a JSON object, and
-each record targeting a known table (thought, edge, embedding, action) is
+Restore does not blindly trust the file. Every non-blank line must be a JSON
+object — blank lines are skipped — and each record targeting a known table (thought, edge, embedding, action) is
 validated against a fixed, code-owned schema: its columns must be a known subset
 of that table's columns, the required columns must be present and non-null, and
 each value must match its column's type (an imported embedding vector must be
@@ -205,14 +214,30 @@ the `-wal`/`-shm` files.
 ### If you can stop or quiesce writers
 
 When you can take the database offline (or guarantee no writes for the duration),
-a file copy is safe — preferably after folding the WAL back into the main file:
+a file copy is safe once it captures every committed change. Committed changes
+can still sit in the `-wal` file, so either copy the main file only after a
+checkpoint has folded the WAL back into it, or copy the whole file set (below).
+Stopping writers alone does not guarantee the checkpoint completes: an existing
+reader can still pin WAL frames, so check its result before copying rather than
+copying unconditionally.
 
-**Checkpoint, then copy the single file:**
+**Checkpoint, then copy the single file only if the checkpoint fully completed:**
 
 ```bash
-# with no writers active:
-sqlite3 engrava.db "PRAGMA wal_checkpoint(TRUNCATE);"
-cp engrava.db engrava.db.bak
+# With no writers (and, ideally, no readers) active. The PRAGMA prints
+# busy|log_frames|checkpointed_frames. busy = 0 means the checkpoint
+# completed, so the main file alone holds every committed change. A non-zero
+# busy means it did not complete (an open reader is a common cause), and the
+# main file may then lack changes still in the WAL. `test -f` comes first
+# because the sqlite3 CLI creates an empty database at a path that does not
+# exist. The copy goes to a temporary name and replaces the backup only once
+# complete, so a failed copy leaves an earlier backup intact. Each step runs
+# only if the one before it succeeded.
+test -f engrava.db &&
+  [ "$(sqlite3 engrava.db 'PRAGMA wal_checkpoint(TRUNCATE);' | cut -d'|' -f1)" = "0" ] &&
+  cp engrava.db engrava.db.bak.tmp &&
+  mv engrava.db.bak.tmp engrava.db.bak ||
+  { echo "no backup made: missing file, incomplete checkpoint, or failed copy" >&2; false; }
 ```
 
 **Or copy the file set** (`engrava.db` + `-wal` + `-shm`) **as one atomic unit** —

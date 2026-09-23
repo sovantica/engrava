@@ -349,7 +349,7 @@ vector dimension lives under `extensions.vector.dimension`, not here.
 | `provider` | `str` | `null` | Provider type: `"sentence-transformer"`, `"openai-compatible"`, `"ollama"`, `"huggingface"` |
 | `model` | `str` | `null` | Model name or identifier |
 | `auto_embed` | `bool` | `false` | Auto-embed on `create_thought` / `update_thought` |
-| `require_embedding` | `bool` | `false` | Turn an auto-embed provider failure into a hard error. With the default `false`, a failure logs a `WARNING` naming the thought and re-raises the provider's own error. If the call does not own the outermost transaction — nested inside the caller's own `suspend_auto_commit()` window — nothing is durable yet, on any path: that window's exit decides. If the call does own it, the path decides: `create_thought` and `update_thought` have already committed by the time embedding runs, so the failure cannot undo them; a standalone `bulk_store` has not — its inserts and the single trailing embed call share one transaction, so the failure rolls the whole batch back. What is left behind is path-specific: `create_thought` leaves no embedding row at all, so the row stays unfindable by vector search; `update_thought` leaves any embedding the row already had in place — if the update committed, that embedding is now stale and the row stays findable by vector search against it, but if the row had no embedding before, it still has none and remains unfindable; a rolled-back standalone `bulk_store` leaves nothing behind. Set `true` to instead raise a typed `EmbeddingGenerationError`, the explicit fail-fast an operator opts into. No effect unless `auto_embed` is on |
+| `require_embedding` | `bool` | `false` | Turn an auto-embed provider failure into a hard error. With the default `false`, a failure logs a `WARNING` naming the thought and re-raises the provider's own error. If the call does not own the outermost transaction — nested inside the caller's own `suspend_auto_commit()` window — nothing is durable yet, on any path: that window's exit decides. If the call does own it, the path decides: `create_thought` and `update_thought` have already committed by the time embedding runs, so the failure cannot undo them; a standalone `bulk_store` has not — its inserts and the single trailing embed call share one transaction, so the failure rolls the whole batch back. What is left behind is path-specific: `create_thought` leaves no embedding row at all, so the row stays unfindable by vector search; `update_thought` leaves any embedding the row already had in place — if the update committed, that embedding is now stale and the row stays findable by vector search against it, but if the row had no embedding before, it still has none and remains unfindable; a rolled-back standalone `bulk_store` leaves nothing behind. Set `true` to instead raise a typed `EmbeddingGenerationError`, the explicit fail-fast an operator opts into. No effect unless `auto_embed` is on. A derived child's own embedding failure is a separate path: under the default derivation `on_error="log"` gate it is logged and derivation continues instead of raising here |
 | `device` | `str` | `"cpu"` | Compute device for local providers (`"cpu"`, `"cuda"`) |
 | `batch_size` | `int` | `32` | Batch encoding size for local providers |
 | `base_url` | `str` | `null` | Base URL for remote providers |
@@ -504,7 +504,7 @@ Time-to-live / auto-expiry of thoughts. See the
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `strategy` | `str` | `"archive"` | What `cleanup_expired` does to expired thoughts: `"archive"` (soft, marks `ARCHIVED`) or `"delete"` (hard) |
-| `check_every_n_operations` | `int` | `0` | Run auto-cleanup every *N* store operations (`0` = manual only, via `cleanup_expired()` / `engrava gc --expired`) |
+| `check_every_n_operations` | `int` | `0` | Run auto-cleanup after every *N* thought create/update calls (`0` = manual only, via `cleanup_expired()` / `engrava gc --expired`); other store operations do not advance this counter |
 | `default_ttl_seconds` | `int \| null` | `null` | Default TTL applied to new thoughts with no explicit `expires_at` (`null` = no default) |
 
 ```yaml
@@ -516,9 +516,11 @@ ttl:
 
 ### `hygiene_policy`
 
-The rule-based [Memory Hygiene](memory-hygiene.md) forgetting loop — a no-LLM
-pass that archives cold, low-value thoughts and, separately opt-in,
-garbage-collects them after a restore window. **Absent or `enabled: false` (the
+The rule-based [Memory Hygiene](memory-hygiene.md) forgetting loop — built-in
+scoring makes no LLM calls; a configured custom `on_retrieve` or
+`decay_function` hook can — archives cold, low-value thoughts and, separately
+opt-in, garbage-collects them after a restore window. **Absent or
+`enabled: false` (the
 default) ⇒ the loop never runs and no read/write path changes.** Distinct from
 [`ttl`](#ttl): TTL expires by wall-clock `expires_at`; hygiene forgets by a
 signal-derived keep-score.
@@ -530,12 +532,12 @@ signal-derived keep-score.
 | `protected_priorities` | `list[str]` | `["P1"]` | Priorities never auto-archived or auto-GC'd. Set to `[]` for more aggressive hygiene. (Pinning is the hard never-forget marker.) |
 | `signal_weights` | `map[str, float]` | see below | Keep-score weights over the reusable signals. A partial map merges onto the defaults. |
 | `check_every_n_cycles` | `int` | `1` | Cadence for the convenience pass from `consolidate()` only — an explicit `run_hygiene` bypasses it. |
-| `max_evictions_per_run` | `int` | `100` | Caps **each** stage per run (≤ N archived and ≤ N GC'd). |
+| `max_evictions_per_run` | `int` | `100` | Caps **each** stage per run (≤ N archived and ≤ N GC'd). Does not cap the orphan-reflection sweep that runs before GC, which is uncapped and counted separately. |
 | `auto_gc_enabled` | `bool` | `false` | Whether Stage 2 (physical delete) runs. Enabling hygiene never implicitly enables deletion. |
 | `gc_min_archive_age_cycles` | `int` | `10` | Cycle restore window: a hygiene-archived thought is GC-eligible only after this many cycles. `0` makes this window always pass (disabled), symmetric with `gc_restore_window_seconds: 0`. |
 | `gc_restore_window_seconds` | `int` | `2592000` | Wall-clock restore window (seconds), required **in addition to** the cycle window, before GC may delete a hygiene-archived thought. Default `2592000` (30 days). `0` disables the wall-clock window (cycle-only). |
 | `min_inactivity_age_seconds` | `int` | `604800` | Minimum wall-clock inactivity (seconds) before a thought is archivable — a cold-start guard measured from last contact. Default `604800` (7 days). `0` disables the gate. |
-| `dry_run` | `bool` | `false` | Preview mode — compute the would-archive set (returned with reasons) without mutating or journaling. |
+| `dry_run` | `bool` | `false` | Preview mode — compute the would-archive set (returned with reasons) without mutating the database or journaling. Candidate collection and scoring still run, so a configured `on_retrieve` or `decay_function` hook still executes. |
 
 Default `signal_weights`: `recency 0.30`, `frequency 0.25`, `confirmation 0.20`,
 `confidence 0.15`, `staleness 0.10`. (`confidence` contributes to the keep-score
@@ -576,12 +578,17 @@ frequency (with access tracking enabled), confirmation, or action outcome.
 These two gates prevent cycle/ingest order alone from classifying fresh imports
 as disposable.
 
-Memory Hygiene is rule-based and does not call an LLM, but a run is reproducible
-only for a fixed store, full configuration, `current_cycle`, **and `now`** (and
-only when custom hooks are themselves deterministic). Calling `run_hygiene()`
-without `now=` reads the current UTC wall time once for the run; that instant
-controls both the inactivity gate and the wall-clock GC window. Pass a fixed
-timezone-aware `datetime` as `now=` when replaying or benchmarking a selection.
+Memory Hygiene's built-in scoring does not call an LLM (a configured
+`on_retrieve` or `decay_function` hook can). The fixed store, full
+configuration, `current_cycle`, and `now` (and deterministic custom hooks)
+fix the inactivity gate and the wall-clock GC window for the run, and the
+selection is reproducible on those boundaries alone. Calling `run_hygiene()`
+without `now=` reads the current UTC wall time once for those boundaries.
+Candidate collection is separate: it pages through `list_thoughts()`, whose
+own default expiry filter reads real wall-clock time on every call regardless
+of `now`, so a thought's expiry crossing during a long pass can still change
+which candidates are collected. Pass a fixed timezone-aware `datetime` as
+`now=` when replaying or benchmarking a selection.
 
 ### `ingest`
 

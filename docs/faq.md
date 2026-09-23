@@ -6,12 +6,15 @@ Short answers to the questions that come up most. For "something is broken" see
 
 ## Does Engrava call an LLM? Do I need an API key?
 
-No. Engrava never calls a language model and needs no API key to run. It stores
-and retrieves what your agent gives it; deciding *what* to remember (extraction,
+No, not on its own, and no API key is needed to run it. It stores and
+retrieves what your agent gives it; deciding *what* to remember (extraction,
 summarisation) is your agent's job, above the storage layer. The one feature
-that synthesises new thoughts — [dreaming](dreaming.md) — is purely structural
-(clustering, centroids, keyword counts), with no LLM involved. See
-[Non-goals](positioning.md#non-goals).
+that synthesises new thoughts — [dreaming](dreaming.md) — scores candidates
+via its default signals (no LLM calls) and builds `REFLECTION` content with
+a deterministic structural function (clustering, centroids, keyword counts),
+with no LLM involved in either. A custom scoring signal you register runs
+whatever code it contains, including a call to an LLM, if you write one that
+does. See [Non-goals](positioning.md#non-goals).
 
 An API key is only relevant if **you** choose a remote embedding provider (e.g.
 an OpenAI-compatible endpoint) — and that's for embeddings, not for any
@@ -33,23 +36,26 @@ egress is unacceptable. See [Security](security.md).
 
 ## Are embeddings required?
 
-No. Without an embedding provider, search runs on FTS5/BM25 (keyword), priority,
-and recency signals — semantic vector matching is simply skipped. Add a provider
-(local or remote) when you want semantic retrieval. See the
+No. Without an embedding provider and without an explicit `query_vector`,
+search runs on FTS5/BM25 (keyword), priority, and recency signals — semantic
+vector matching is skipped. A caller-supplied `query_vector` still activates
+it with no provider configured. Add a provider (local or remote) when you
+want the store to generate vectors for you. See the
 [Embeddings guide](guides/embeddings.md). Note that storing on write only embeds
 when you set both `embedding_provider=...` **and** `auto_embed=True`.
 
 ## How large a corpus can it handle?
 
-The default vector backend brute-forces cosine similarity in Python, which works
-well up to roughly **100k embeddings**. Beyond that, install the `sqlite-vec`
-backend (`pip install 'engrava[vec]'`, then `extensions.vector.backend:
-sqlite-vec`) for its compact compiled `vec0` storage and lower constant factor.
-The pinned sqlite-vec 0.1.x backend still performs an **exhaustive linear KNN
-scan**, not an approximate or sub-linear vector index, so measure your own p95
-latency rather than treating 100k as a hard boundary. FTS5 scales well
-independently. See [Performance](performance.md#the-brute-force-ceiling-and-how-to-pass-it)
-and [Known Limitations](known-limitations.md#sqlite-vec-pre-v1-status).
+The default vector backend is a brute-force cosine scan done with NumPy: cost
+grows with the eligible embedding population. Install the `sqlite-vec` backend
+(`pip install 'engrava[vec]'`, then `extensions.vector.backend: sqlite-vec`)
+for its compact compiled `vec0` storage. The pinned sqlite-vec 0.1.x backend
+still performs an **exhaustive linear KNN scan**, not an approximate or
+sub-linear vector index, so measure your own p95 latency for your data and
+hardware rather than assuming a fixed corpus-size threshold. FTS5's own cost
+depends on query shape, term frequency, and match count. See
+[Performance](performance.md#the-brute-force-ceiling-and-how-to-pass-it) and
+[Known Limitations](known-limitations.md#sqlite-vec-pre-v1-status).
 
 ## Can multiple processes or tasks use the same store at once?
 

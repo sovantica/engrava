@@ -41,7 +41,7 @@ async with await SqliteEngravaCore.from_config("engrava.yaml") as store:
 | `search_config` | `SearchConfig \| None` | `None` | Default hybrid-search weights, recency half-lives, graph expansion, reflection handling, and bounded candidate-pool settings |
 | `journal_enabled` | `bool` | `False` | Record mutations in the hash-chain journal |
 | `ttl_strategy` | `str` | `"archive"` | Expiry action: `"archive"` or `"delete"` |
-| `ttl_check_every_n` | `int` | `0` | Automatic expiry-cleanup cadence in store operations; `0` disables automatic cleanup |
+| `ttl_check_every_n` | `int` | `0` | Automatic expiry-cleanup cadence, counted in thought create/update calls, not every store operation; `0` disables automatic cleanup |
 | `ttl_default_seconds` | `int \| None` | `None` | Default relative TTL for new thoughts |
 | `metrics_config` | `MetricsConfig \| None` | `None` | Metrics enablement and latency-window settings |
 | `manifests` | `Sequence[ExtensionManifest]` | `()` | Extension manifests whose schema migrations are applied by `ensure_schema()` |
@@ -83,7 +83,7 @@ keyword arguments and does **not** return a UUID string.
 | `await bulk_store(thoughts, *, deduplicate=False)` | `list[ThoughtRecord]` | Transactional batch insert: the whole list commits **once**. Called on its own, any row error rolls the whole batch back and nothing is persisted. Nested inside the caller's own `suspend_auto_commit()` window, a row error still aborts the batch's inserts, but only the outermost window's exit decides commit/rollback — if the caller catches the error and that outer window then exits cleanly, the batch's successful prefix commits along with the rest of the window's work. Order preserved. Under `auto_embed`, all thoughts are embedded in one batch provider call. `deduplicate` applies per row. |
 | `await get_thought(thought_id)` | `ThoughtRecord \| None` | Retrieve by ID; `None` if not found |
 | `await update_thought(thought_id, **changes)` | `ThoughtRecord` | Partial update: writes only the fields named in `changes` (plus the `updated_at` stamp), so columns another writer changed meanwhile are preserved; returns the row read back after the write. Raises `ThoughtNotFoundError` if the thought is missing when the call starts. Raises `StaleDataError` when the guarded write matches no row — any other guarded write bumped the row's `revision` in between (which rejects this update whatever field it touched), or deleted the row — see [Concurrency](concurrency.md#optimistic-concurrency-and-staledataerror) |
-| `await restore_thought(thought_id, *, current_cycle=None)` | `ThoughtRecord` | Un-archive: transition an `ARCHIVED` thought back to `ACTIVE`, clearing both hygiene markers (`archived_at_cycle` and `archived_at`) so an archive round-trips with no data loss. The reversible counterpart to the memory-hygiene / TTL / manual archive paths, journaled as an `UPDATE_THOUGHT`. Raises `ThoughtNotFoundError` if missing, `InvalidTransitionError` if the thought is not currently `ARCHIVED`, `StaleDataError` if the guarded write matches no row — another guarded write bumped `revision` in between, or deleted the row (see `update_thought` for what that guard does and does not catch). This is the **canonical** un-archive path; a raw `update_thought(lifecycle_status=...)` back to `ACTIVE` does not manage those markers. |
+| `await restore_thought(thought_id, *, current_cycle=None)` | `ThoughtRecord` | Un-archive: transition an `ARCHIVED` thought back to `ACTIVE`, clearing both hygiene markers (`archived_at_cycle` and `archived_at`). It does not restore `expires_at`: an expiry cleared during hygiene archival stays cleared after restore. The reversible counterpart to the memory-hygiene / TTL / manual archive paths, journaled as an `UPDATE_THOUGHT`. Raises `ThoughtNotFoundError` if missing, `InvalidTransitionError` if the thought is not currently `ARCHIVED`, `StaleDataError` if the guarded write matches no row — another guarded write bumped `revision` in between, or deleted the row (see `update_thought` for what that guard does and does not catch). This is the **canonical** un-archive path; a raw `update_thought(lifecycle_status=...)` back to `ACTIVE` does not manage those markers. |
 | `await list_thoughts(...)` | `list[ThoughtRecord]` | List with filters (keyword-only) |
 | `await count_thoughts(...)` | `int` | Count with filters (keyword-only) |
 | `await delete_thought(thought_id)` | `bool` | Hard delete; `True` if a row was removed. Deleting a thought also deletes every edge for which it is either endpoint, its embedding, and its linked actions — deleted explicitly, on every schema version, not only via the `ON DELETE CASCADE` the core-12 migration adds to `edge`, `embedding` and `action`. A vector is owned by the thought it belongs to, enforced the same way in reconciliation, the vector-index purge, and search, so the deleted identifier cannot be returned by a later vector query even on a database still below core-12. See [Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated) for a database that already accumulated damage under an older engrava build. |
@@ -511,8 +511,8 @@ copy). Do not use it for `ThoughtRecord` lifecycle or timestamp changes.
 | `metadata` | `dict[str, MetadataValue]` | Caller-supplied structured attributes (default `{}`) |
 | `provenance` | `ProvenanceContext \| None` | Optional bounded write-time provenance; an untrusted query hint, never identity or authorization |
 | `pinned` | `bool` | Hard keep-intent for Memory Hygiene; pinned thoughts are never auto-archived or auto-GC'd (default `False`) |
-| `archived_at_cycle` | `int \| None` | Cognitive cycle stamped only by hygiene archival and cleared by `restore_thought`; gates cycle-based GC eligibility |
-| `archived_at` | `str \| None` | UTC ISO-8601 instant stamped only by hygiene archival and cleared by `restore_thought`; gates wall-clock GC eligibility |
+| `archived_at_cycle` | `int \| None` | Cognitive cycle stamped by hygiene archival and cleared by `restore_thought`; gates cycle-based GC eligibility. A generic `update_thought(lifecycle_status=ARCHIVED)` call leaves a previously-set value in place instead of refreshing or clearing it, so a non-null value is not by itself proof this archival episode was hygiene's |
+| `archived_at` | `str \| None` | UTC ISO-8601 instant stamped by hygiene archival and cleared by `restore_thought`; gates wall-clock GC eligibility, with the same caveat as `archived_at_cycle` above for a generic lifecycle write |
 
 #### `metadata` field
 
@@ -763,7 +763,7 @@ All enums are `StrEnum` — JSON-serializable and stored as strings.
 |------|--------|
 | `ThoughtType` | `TASK`, `OBSERVATION`, `BELIEF`, `REFLECTION`, `OUTPUT_DRAFT`, `NOTE` |
 | `Priority` | `P1`, `P2`, `P3`, `P4` (P1 highest) |
-| `LifecycleStatus` | `CREATED`, `ACTIVE`, `DONE`, `ARCHIVED` (forward state machine `CREATED → ACTIVE → DONE → ARCHIVED`, plus reversible `ARCHIVED → ACTIVE`) |
+| `LifecycleStatus` | `CREATED`, `ACTIVE`, `DONE`, `ARCHIVED` — allowed transitions are `CREATED → ACTIVE`, `ACTIVE → DONE`, `ACTIVE → ARCHIVED` (direct, without passing through `DONE`), `DONE → ARCHIVED`, and the reverse `ARCHIVED → ACTIVE` |
 | `EdgeType` | `ASSOCIATED`, `DEPENDS_ON`, `DERIVED_FROM`, `MESSAGE_OF`, `BRIDGE`, `CONSOLIDATED_FROM`, `CONTESTED_BY` |
 | `ActionType` | `CLI_OUTPUT`, `TOOL_CALL`, `MESSAGE`, `STATE_UPDATE` |
 | `ActionStatus` | `PLANNED`, `EXECUTING`, `CONFIRMED`, `FAILED`, `BLOCKED` |

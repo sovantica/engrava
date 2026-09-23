@@ -120,8 +120,11 @@ The exclusion is **reversible**:
 > **Behaviour change.** Marking a thought `ARCHIVED` — including via the TTL
 > `archive` strategy — now removes it from default retrieval; previously an
 > archived thought still surfaced in search. It is still counted by
-> `count_thoughts()` / `list_thoughts()` (those are not ranked retrieval); to
-> exclude it there, filter on `lifecycle_status` yourself. The retired-reflection
+> `count_thoughts()` / `list_thoughts()` (those are not ranked retrieval),
+> provided it is not also expired — both methods default to excluding expired
+> rows regardless of lifecycle status, so an archived-and-expired row needs
+> `include_expired=True` too. To exclude an archived row deliberately, filter
+> on `lifecycle_status` yourself. The retired-reflection
 > freshness floor is independent — a retired `REFLECTION` stays excluded even under
 > `include_archived=True`. See [Data lifecycle](data-lifecycle.md#lifecycle-states)
 > and [Known Limitations](known-limitations.md#archived-thoughts-and-default-retrieval).

@@ -20,8 +20,10 @@ questions. Keep them apart:
 | `valid_from` / `valid_until` | **valid time** | "During what real-world period is this fact *true*?" | **you** (optional) |
 | `created_cycle` / `updated_cycle` | **logical clock** | "At which agent *tick* did this appear?" | you (your cycle counter) |
 
-- **Transaction time** is bookkeeping: it never moves backwards and you don't
-  manage it. It tells you the order in which your system learned things.
+- **Transaction time** is bookkeeping: Engrava supplies it when you omit it,
+  ordinarily reflecting the order in which your system learned things. Both
+  fields are caller-settable, though, and an explicit update is not checked
+  against the previous value.
 - **Valid time** is about the world, not your database. "The user lived in
   Berlin from January to June" is a statement about reality — it is true for a
   window that has nothing to do with when you happened to write it down. You set
@@ -429,7 +431,9 @@ asyncio.run(main())
 
 If your application only ever asks "what is true *now*", you do not need to do
 anything. Every record is created with `valid_from = None` and
-`valid_until = None`, which means "valid for all time", so:
+`valid_until = None`, which the point-in-time predicates below treat as
+"valid for all time" (`valid_between` is the deliberate exception — see
+[The four query predicates](#the-four-query-predicates)), so:
 
 - you never have to set a timestamp,
 - queries that use no temporal predicate are unchanged, and

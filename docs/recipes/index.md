@@ -201,7 +201,9 @@ stamped cycle `0`, so a writer that never advanced the clock has nothing to
 recover.
 
 See [Cycle (the agent clock)](../concepts.md#cycle-the-agent-clock) for why this
-matters (a frozen clock disables recency and stalls dreaming).
+matters (a frozen clock stops cycle-based recency from advancing and can stop
+a cadence-based consolidation call from becoming due, though a direct call
+still runs).
 
 ## Next
 

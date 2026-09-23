@@ -44,8 +44,9 @@ download (~550+ MB on the PyPI Linux/x86_64 wheel for Python 3.11; see
 for the exact, platform-scoped numbers) — plus a further encoder model
 download on first use. The encoder is **not** a language model: it
 turns text into a fixed-size vector. There are no API keys, and there
-is no network traffic after the first download. Engrava itself does
-not call any LLM at any time.
+is no network traffic after the first download. Engrava's built-in path
+does not call any LLM; a custom Dreaming signal or Memory Hygiene hook you
+register runs whatever code it contains, including a call to one.
 
 ## Run the bundled walkthrough
 

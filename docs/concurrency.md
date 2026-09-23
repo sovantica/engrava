@@ -8,17 +8,29 @@ which writer topologies are supported.
 ## WAL: many readers, one writer
 
 File databases opened via `from_config` use **WAL** (write-ahead logging) mode
-**by default** — it is the `database.wal_mode` setting, and setting it to `false`
-leaves the connection on SQLite's rollback journal, where none of the guarantees
-in this section apply. Under WAL:
+**by default** — it is the `database.wal_mode` setting. Setting it to `false`
+skips this pragma: a brand-new database then keeps SQLite's own default
+rollback journal, but an existing database that is already in WAL mode stays
+in WAL mode, since engrava issues no pragma to change it back. Outside WAL,
+readers and a writer can block each other — an open read keeps a writer from
+committing — so the first guarantee below is WAL-specific; the second — only
+one writer at a time — is an ordinary SQLite property and holds under either
+journal mode.
+Under WAL:
 
 - **Readers don't block the writer and the writer doesn't block readers.** A
   read sees a consistent snapshot while a write is in progress.
-- **There is still only one writer at a time.** Two writes are serialised; the
-  second waits for the first to finish.
+- **There is still only one writer at a time.** SQLite serialises writes; an
+  Engrava-owned connection waits up to the configured busy timeout (five
+  seconds by default) for the first to finish and then raises rather than
+  waiting indefinitely — see [Busy timeout](#busy-timeout) below.
 
-This is ideal for read-heavy agent-memory workloads: retrieval (the hot path) is
-all reads and scales freely; writes are comparatively infrequent.
+This is ideal for read-heavy agent-memory workloads: retrieval (the hot path)
+avoids per-result writes, and writes are comparatively infrequent. Calls
+sharing one store still serialise their SQLite statements (see
+[Many async tasks, one store](#many-async-tasks-one-store) below), and with
+access tracking enabled, retrieval can buffer telemetry for a later write
+([Deployment](deployment.md#graceful-shutdown)).
 
 ## Many async tasks, one store
 
@@ -594,8 +606,9 @@ single store object and stops at its boundary:
    second store has a second connection and therefore a different lock — in
    another process, where no lock could be shared at all, but equally in this
    one. Two stores journaling the same database can race the journal's monotonic
-   `sequence_number`. The writer retries on the resulting `UNIQUE` collision up to
-   **5 times**; if contention persists it raises:
+   `sequence_number`. The writer makes at most **five total attempts** — the
+   first plus up to four retries on a `UNIQUE` collision; if contention
+   persists past that it raises:
 
    ```
    RuntimeError: Failed to append journal entry after 5 retries due to sequence contention

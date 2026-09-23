@@ -1,8 +1,8 @@
 # Positioning — what Engrava is (and isn't)
 
 Engrava is a **standalone embedded database for AI-agent memory**. It is built on
-SQLite and runs in-process: one `pip install`, no server, no LLM, no external
-services. It gives an agent a durable thought-graph with hybrid retrieval
+SQLite and runs in-process: one `pip install`, no server, no LLM required, no
+external services. It gives an agent a durable thought-graph with hybrid retrieval
 (full-text + vector + recency + priority + graph) and an optional tamper-evident
 hash-chain journal.
 
@@ -28,14 +28,17 @@ relates to the other memory options you might be choosing between.
   [Embeddings guide](guides/embeddings.md).
 - **You want memory that maintains itself.** Engrava models both halves of memory
   maintenance: [Dreaming](dreaming.md) (consolidation) keeps and strengthens what
-  matters, and [Forgetting](memory-hygiene.md) (opt-in, reversible memory hygiene)
-  lets cold, low-signal memories fade rather than being kept indefinitely. The
+  matters, and [Forgetting](memory-hygiene.md) (opt-in memory hygiene, whose
+  default archive action is reversible; its separately opt-in garbage
+  collection is not) lets cold, low-signal memories fade rather than being
+  kept indefinitely. The
   built-in mechanisms use no LLM; reproducibility requires fixed inputs and
   deterministic custom hooks/signals, and Forgetting additionally requires a
   fixed wall-clock `now`.
-- **Small-to-medium corpora.** The default backend brute-forces vector search in
-  Python and works well up to roughly 100k embeddings; beyond that, switch to
-  the `sqlite-vec` backend. See
+- **Small-to-medium corpora.** The default backend is a brute-force cosine
+  scan done with NumPy; cost grows with the eligible embedding population.
+  For larger corpora, switch to the `sqlite-vec` backend and measure your own
+  latency. See
   [Known Limitations](known-limitations.md#sqlite-vec-pre-v1-status).
 
 ## When Engrava is *not* a good fit

@@ -1,8 +1,9 @@
 # Dreaming — Memory Consolidation
 
 Engrava's **dreaming** extension provides periodic memory consolidation:
-it evaluates stored thoughts, scores them against configurable signals,
-and promotes the most important ones by setting their priority to **P1**.
+it evaluates eligible candidate thoughts, scores them against configurable
+signals, and — when the corresponding gates, thresholds, and caps permit —
+may promote qualifying ones by setting their priority to **P1**.
 
 Dreaming runs **outside** the normal CRUD path — the consumer decides
 when to invoke `run_consolidation()` (after N cycles, in a cron job,
@@ -151,9 +152,10 @@ unconditional.
 
 ## Gates
 
-Before a thought is scored against the promotion threshold, it must
-pass all active **gates**.  Gates are cheap boolean checks that filter
-out clearly ineligible candidates.
+A thought is scored against the promotion threshold regardless; it must pass
+all active **gates** to be **promoted**. Gates are cheap boolean checks that
+filter out clearly ineligible candidates before a passing score can result in
+a promotion.
 
 | Gate | Field | Default | Description |
 |------|-------|---------|-------------|

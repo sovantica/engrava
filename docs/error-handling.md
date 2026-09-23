@@ -144,11 +144,15 @@ Provider behavior is deliberately provider-specific:
   Their dependency/provider exceptions propagate.
 - Local, callback, and third-party providers define their own failure behavior.
 
-Once provider attempts are exhausted, auto-embedding never swallows the error.
-With `require_embedding=true`, Engrava wraps it in
-`EmbeddingGenerationError`; otherwise the provider's original exception is
-re-raised. Strict mode changes the exception type, **not** the single-item
-commit boundary.
+Once provider attempts are exhausted, auto-embedding on the thought a caller
+explicitly created or updated never swallows the error. With
+`require_embedding=true`, Engrava wraps it in `EmbeddingGenerationError`;
+otherwise the provider's original exception is re-raised. Strict mode changes
+the exception type, **not** the single-item commit boundary. A derived
+child's own embedding failure is a separate path: under the default
+`on_error="log"` derivation gate, it is logged and derivation continues, so
+the call that created or updated the source does not see it — see
+[Derived records](#derived-records).
 
 For a search that only failed while generating its query vector, retrying the
 search after a transient provider recovery does not replay a graph write. For a
@@ -172,8 +176,11 @@ Consequences:
   vector search.
 - An `on_store` or derivation failure does not roll back the source. Depending on
   where derivation failed, earlier derived children may already be committed.
-- Retrying `create_thought()` with the same ID raises `ValueError`; retrying
-  `remember()` creates another random ID. Neither is a recovery strategy.
+- Retrying `create_thought()` with the same ID raises `ValueError`. Retrying
+  `remember()` with the default `deduplicate=False` creates another random
+  ID; with `deduplicate=True`, a byte-identical existing row is reused and
+  its `confirmation_count` is incremented instead. Neither the default call
+  nor the deduplicated one is a repair for a failed embedding.
 
 Use strict embedding mode when callers need the typed thought ID for repair:
 

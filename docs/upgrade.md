@@ -96,15 +96,19 @@ the schema.
 These steps are recommended, not required:
 
 ```bash
-# Checkpoint the WAL first so the copy is complete, then back up.
-sqlite3 my-data.db "PRAGMA wal_checkpoint(TRUNCATE);"
-cp my-data.db my-data.db.bak
-pip install --upgrade engrava
+# Back up, then upgrade. The sqlite3 CLI's .backup command uses SQLite's
+# online backup API, so the copy is consistent and includes changes still
+# in the WAL. `test -f` comes first because the sqlite3 CLI creates an
+# empty database at a path that does not exist. Each step runs only if the
+# one before it succeeded.
+test -f my-data.db &&
+  sqlite3 my-data.db ".backup my-data.db.bak" &&
+  pip install --upgrade engrava
 ```
 
 - Create a copy of the SQLite database file before the upgrade. In WAL mode a
-  bare `cp` of just the `.db` can miss data still in the `-wal` file — checkpoint
-  first (above), or copy `my-data.db` together with `my-data.db-wal` and
+  bare `cp` of just the `.db` can miss data still in the `-wal` file — use
+  `.backup` (above), or copy `my-data.db` together with `my-data.db-wal` and
   `my-data.db-shm`. See [Backup & Recovery](backup-and-recovery.md) for all the
   WAL-safe options.
 - Review [CHANGELOG.md](../CHANGELOG.md) for breaking changes and database notes.
@@ -123,9 +127,10 @@ engrava --db my-data.db migrate
 - `engrava info` confirms the database is readable and reports current counts.
 - `engrava migrate` is safe to run after upgrade; it re-checks that schema is up to date.
 - `engrava gc` is optional if you want to remove archived or expired data after
-  the upgrade. Note that `gc` deletes rows but does **not** shrink the database
-  file — freed pages return to SQLite's free-list. To reclaim file size, run
-  `VACUUM`. See [Data lifecycle → reclaiming disk space](data-lifecycle.md#reclaiming-disk-space).
+  the upgrade. Note that under SQLite's default `auto_vacuum=NONE`, `gc`
+  deletes rows but does **not** shrink the database file — freed pages return
+  to SQLite's free-list. To reclaim file size, run `VACUUM`. See
+  [Data lifecycle → reclaiming disk space](data-lifecycle.md#reclaiming-disk-space).
 
   **If the upgraded install dropped the vector extra, `gc` will refuse rather
   than run.** A database that carries an `embedding_vec` table from an earlier

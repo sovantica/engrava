@@ -21,7 +21,7 @@ retrieved. Think *headline*. See
 ### Content
 
 The **full** source text of a thought, retained for full-text search and
-provenance — as long as you like. Think *article* (to the essence's *headline*).
+provenance. Think *article* (to the essence's *headline*).
 See [Core Concepts → essence vs content](concepts.md#essence-vs-content-two-text-fields-on-purpose).
 
 ### Edge
@@ -35,38 +35,47 @@ A typed, weighted, directional link between two thoughts — what makes Engrava 
 ### Embedding
 
 The vector representation of a thought that powers semantic (meaning-based)
-search. Embeddings are optional — without a provider, search falls back to the
-lexical (FTS5) index and the vector signal is skipped. See the
-[Embeddings guide](guides/embeddings.md).
+search. Embeddings are optional — without a provider and without an explicit
+`query_vector`, vector retrieval is skipped and search falls back to the
+lexical (FTS5) index; a caller-supplied `query_vector` still works with no
+provider configured. See the [Embeddings guide](guides/embeddings.md).
 
 ### Reflection
 
-A higher-order summary thought (`ThoughtType.REFLECTION`) created by **dreaming**:
-Engrava clusters semantically related thoughts and writes a centroid-embedded
-summary node, linked back to its members by `CONSOLIDATED_FROM` edges. You don't
-create reflections by hand. See [Core Concepts → Reflection](concepts.md#reflection)
-and [Dreaming](dreaming.md).
+A higher-order summary thought (`ThoughtType.REFLECTION`). Reflections that
+**dreaming** creates are centroid-embedded and carry lineage edges: Engrava
+clusters semantically related thoughts and writes a summary node, linked back
+to its members by `CONSOLIDATED_FROM` edges. See
+[Core Concepts → Reflection](concepts.md#reflection) and [Dreaming](dreaming.md).
 
 ### Dreaming
 
 The periodic, off-the-hot-path consolidation process you invoke with
-`run_consolidation()`: it scores stored thoughts, **promotes** the important ones,
-links related ones with edges, and clusters them into reflections. No LLM is
-involved — it is purely structural. See [Dreaming](dreaming.md).
+`run_consolidation()`: it scores eligible candidate thoughts and, when the
+corresponding gates, thresholds, caps, embeddings, and feature settings
+permit, may **promote** important ones, link related ones with edges, and
+cluster them into reflections. The default scoring signals make no LLM
+calls, and reflection content is built by a deterministic structural
+function — but a custom signal you register (`DreamingExtension`'s
+`custom_signals`) runs whatever code it contains, including a call to an
+LLM. See [Dreaming](dreaming.md).
 
 ### Consolidation
 
-Another name for what dreaming does in a single pass — evaluating candidates and
-producing promotions, edges, and reflections via `run_consolidation()`. See
-[Dreaming](dreaming.md).
+Another name for what dreaming does in a single pass — evaluating candidates
+and, conditionally, producing promotions, edges, and reflections via
+`run_consolidation()`. See [Dreaming](dreaming.md).
 
 ### Forgetting
 
 The **subtractive** counterpart to [dreaming](#dreaming) — the two halves of
-memory maintenance. An **opt-in, reversible**, no-LLM loop (mechanism:
-[Memory Hygiene](#memory-hygiene)) that lets cold, low-signal thoughts fade by
-**archiving** them, and — as a *separately* opted-in step — garbage-collects
-archived rows after cycle + wall-clock restore windows. OFF by default. See
+memory maintenance. An **opt-in** loop (mechanism:
+[Memory Hygiene](#memory-hygiene), built-in scoring makes no LLM calls) that
+lets cold, low-signal thoughts fade by **archiving** them — the default
+action, reversible via `restore_thought` — and, as a *separately* opted-in
+step, garbage-collects archived rows after cycle + wall-clock restore
+windows. Garbage collection physically deletes rows and is **not** reversible
+the way archiving is. OFF by default. See
 [Forgetting (Memory Hygiene)](memory-hygiene.md).
 
 ### Memory Hygiene
@@ -82,9 +91,11 @@ concept-over-mechanism layering as Dreaming over `consolidate()`. See
 ### Promotion
 
 The act, during consolidation, of marking an important thought by setting its
-priority to **P1** so it surfaces more readily in search. Whether a candidate is
-promoted depends on the [gates](#gate) and the `promote_threshold`. See
-[Dreaming](dreaming.md).
+priority to **P1**. With a positive priority weight, that gives an
+already-retrieved candidate the largest priority boost in hybrid search;
+priority does not itself add a thought to the candidate set. Whether a
+candidate is promoted depends on the [gates](#gate) and the
+`promote_threshold`. See [Dreaming](dreaming.md).
 
 ### Cycle
 
@@ -93,8 +104,10 @@ advance* (typically one cycle per agent turn). It is not wall-clock time and not
 a stored row; Engrava never increments it for you. It drives the recency signal
 and dreaming's age gates. With no explicit recency reference and no configured
 cycle provider, recency is inactive; an explicit `recency_now` instead selects
-transaction-time recency. Freezing a cognitive cycle at a constant makes that
-axis useless and stalls dreaming. See
+transaction-time recency. Freezing a cognitive cycle at a constant stops
+cycle-based age and recency from advancing, and can stop a cadence-based
+`run_if_due()` call from becoming due — but does not stop a direct
+`run_consolidation()` call from executing and mutating memory. See
 [Core Concepts → Cycle](concepts.md#cycle-the-agent-clock).
 
 ### Valid time
@@ -105,16 +118,19 @@ opposed to **transaction time** (when Engrava recorded it — `created_at` /
 carried by two optional, nullable ISO-8601 fields,
 `valid_from` and `valid_until`, on both `ThoughtRecord` and `EdgeRecord`. They
 describe a half-open interval (`valid_until` is exclusive); a `None` bound means
-*open* (±∞), so an un-annotated record is "valid for all time". Queried through
-the `valid_now` / `valid_at` / `valid_within` / `valid_between` MindQL predicates.
-See [The Bi-temporal Model](bitemporal.md).
+*open* (±∞) for the NULL-tolerant predicates `valid_now` / `valid_at` /
+`valid_within`, so an un-annotated record is "valid for all time" under those.
+`valid_between` is the exception: it requires a real (non-`None`) value on
+both stored bounds and excludes a record where either is open. See
+[The Bi-temporal Model](bitemporal.md).
 
 ### Transaction time
 
 When Engrava *recorded or last changed* a fact — the `created_at` / `updated_at`
-bookkeeping timestamps it sets automatically. It never moves backwards and you do
-not manage it; contrast with [valid time](#valid-time) (the real-world axis you
-set) and the [cycle](#cycle) (the logical agent clock). See
+bookkeeping timestamps. Engrava supplies these when you omit them, but both are
+caller-settable fields, and updating one explicitly is not checked against the
+previous value; contrast with [valid time](#valid-time) (the real-world axis
+you set) and the [cycle](#cycle) (the logical agent clock). See
 [The Bi-temporal Model](bitemporal.md).
 
 ### Signal
@@ -126,21 +142,26 @@ similarity, recency, priority, and graph. A signal whose prerequisite is missing
 
 ### Gate
 
-A cheap boolean check in dreaming that a candidate must pass *before* it is scored
-for promotion — e.g. `min_age_cycles` (the thought must be old enough) and the
-confirmation gate. Gates filter out clearly ineligible thoughts. See
+A cheap boolean check in dreaming that a candidate must pass to be **promoted**
+— e.g. `min_age_cycles` (the thought must be old enough) and the confirmation
+gate. Gates filter out clearly ineligible thoughts. See
 [Dreaming → Gates](dreaming.md#gates).
 
 ### Priority
 
 A thought's importance level, `P1` (highest) to `P4` (lowest). It is one of the
-hybrid-search signals, so higher-priority thoughts surface more readily; dreaming
-**promotes** thoughts to `P1`. See [Core Concepts → Priority](concepts.md#priority).
+hybrid-search signals: when priority weighting is enabled and positive, a
+higher-priority thought already in a hybrid-search candidate set scores higher;
+dreaming **promotes** thoughts to `P1`. See
+[Core Concepts → Priority](concepts.md#priority).
 
 ### Lifecycle
 
-The small state machine a thought moves through: `CREATED → ACTIVE → DONE →
-ARCHIVED` (`LifecycleStatus`, with transitions enforced). `ARCHIVED` is a
+The small state machine a thought moves through (`LifecycleStatus`, with
+transitions enforced): `CREATED → ACTIVE`, `ACTIVE → DONE`, `ACTIVE → ARCHIVED`
+(direct, without passing through `DONE`), `DONE → ARCHIVED`, and the reverse
+`ARCHIVED → ACTIVE`; a record can also be constructed with an initial
+lifecycle value directly. `ARCHIVED` is a
 soft-retired state — the row and its content remain until garbage-collected, but
 an archived thought is **excluded from default ranked retrieval** (reversible via
 `restore_thought` / `include_archived`). See
@@ -168,10 +189,11 @@ clarification task. See [Evidence and conflicts](evidence-and-conflicts.md).
 
 ### Confirmation
 
-`confirmation_count` — a counter of how many times a thought has been
-independently re-encountered or validated over time (grows via `deduplicate=True`
-or your own logic). Distinct from `confidence`, the static belief-strength you
-assign at creation. Dreaming reads them as separate signals. See
+`confirmation_count` — a counter of deduplication hash hits (grows via
+`deduplicate=True`) or your own logic; Engrava does not establish that a hit is
+an independent re-encounter. Distinct from `confidence`, a belief-strength you
+assign that may be supplied at creation and changed later. Dreaming reads them
+as separate signals. See
 [Core Concepts → confidence vs confirmation_count](concepts.md#reliability-confidence-vs-confirmation_count).
 
 ### Visibility
@@ -206,8 +228,8 @@ the agent *takes in*. See [Building a memory-backed agent](guides/agent-memory.m
 
 ### Utterance
 
-In the agent loop, the agent's own outgoing reply, stored as an `OUTPUT_DRAFT`
-thought. It is what the agent *produces*. See
+In the agent loop, the agent's own outgoing reply, typically stored as an
+`OUTPUT_DRAFT` thought. It is what the agent *produces*. See
 [Building a memory-backed agent](guides/agent-memory.md).
 
 ## See also

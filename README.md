@@ -2,7 +2,7 @@
 
 > The memory database for AI agents.
 >
-> Graph memory, hybrid search, and a tamper-evident thought/edge journal — one `pip install`, no server, no LLM.
+> Graph memory, hybrid search, and a tamper-evident thought/edge journal — one `pip install`, no server, no LLM required.
 
 [![CI](https://github.com/sovantica/engrava/actions/workflows/ci.yml/badge.svg)](https://github.com/sovantica/engrava/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/engrava.svg)](https://pypi.org/project/engrava/)
@@ -16,7 +16,9 @@ system — all in a single package with zero external service dependencies.
 
 Benchmark results are published, and the runs are reproducible from a separate repository. Every
 published run is Group A — `memory_pipeline_llms: []`, no language model anywhere in the memory
-layer. That is a property of the architecture rather than a measurement, so it holds across releases.
+layer's built-in path. That is a property of the architecture's default signals and hooks rather
+than a measurement, unless a custom Dreaming signal or Memory Hygiene hook is configured to call
+one.
 
 - **[Benchmark results](https://engrava.ai/benchmarks/)** — the live table: every published row with the comparability segment it belongs to.
 - **[engrava-benchmark](https://github.com/sovantica/engrava-benchmark)** — the runner. Clone it and reproduce a result against the package from PyPI. MIT.
@@ -203,21 +205,26 @@ called by core.
 ### Dreaming / Memory Consolidation
 
 Built-in `DreamingExtension` for periodic memory consolidation — scores
-thoughts via configurable signals, promotes high-value entries, and
-creates **REFLECTION thoughts** by clustering semantically related
-thoughts and computing centroid embeddings (no LLM required). Available
-since 0.3.0.
+thoughts via its default signals (no LLM calls), promotes high-value
+entries, and creates **REFLECTION thoughts** by clustering semantically
+related thoughts and computing centroid embeddings through a deterministic
+structural function, not an LLM. A custom signal you register with
+`DreamingExtension` runs whatever code it contains. Available since 0.3.0.
 
 → See [`docs/benchmarks.md`](https://github.com/sovantica/engrava/blob/main/docs/benchmarks.md) for reproducible
 evidence (synthetic benchmark suite runnable in ~5 minutes).
 
 ### Forgetting / Memory Hygiene
 
-The subtractive half of memory maintenance, paired with Dreaming: an **opt-in,
-reversible**, no-LLM loop that **archives** cold, low-signal thoughts — and, as a
-*separately* opted-in step, garbage-collects them only after both a cycle and a
-wall-clock restore window. OFF by default; once enabled, archived thoughts drop out
-of default retrieval and can be restored (`restore_thought` / `include_archived`).
+The subtractive half of memory maintenance, paired with Dreaming: an **opt-in**
+loop whose built-in scoring makes no LLM calls, that **archives** cold,
+low-signal thoughts — the default action, reversible via `restore_thought` —
+and, as a *separately* opted-in step, garbage-collects them (not reversible)
+once both restore windows have elapsed under their non-zero defaults — a
+cycle count and a wall-clock duration, either of which can be configured to
+`0` to disable that window. OFF by default; once enabled, archived thoughts
+drop out of default retrieval and can be restored (`restore_thought` /
+`include_archived`).
 
 → See [`docs/memory-hygiene.md`](https://github.com/sovantica/engrava/blob/main/docs/memory-hygiene.md) for the
 loop, protection, restore windows, and the honest deletion posture.

@@ -4,7 +4,7 @@ Common symptoms, their cause, and the fix. Each entry shows the error (or the
 surprising behaviour) you actually see, then what to change.
 
 If your problem is a platform constraint rather than a mistake (macOS extension
-loading, the ~100k brute-force ceiling, FTS5 availability), see
+loading, the NumPy brute-force vector fallback, FTS5 availability), see
 [Known Limitations](known-limitations.md) instead.
 
 ## `AttributeError: 'tuple' object has no attribute 'keys'` on read
@@ -187,9 +187,9 @@ See [Dreaming](dreaming.md) for the full gate-and-signal model.
 either immediately or after a few seconds of retrying.
 
 **Cause / what to expect.** `OpenAICompatibleProvider` retries a request with
-bounded exponential backoff on a *transient* failure — a read timeout or network
-blip, or a transient HTTP status (`408`, `409`, `425`, `429`, `500`, `502`, `503`,
-`504`). Two outcomes:
+bounded linear backoff (`base_retry_delay_s * attempt_number`) on a
+*transient* failure — a read timeout or network blip, or a transient HTTP
+status (`408`, `409`, `425`, `429`, `500`, `502`, `503`, `504`). Two outcomes:
 
 - **A transient failure that persists across every attempt** is raised as a
   `RuntimeError` once `max_attempts` is exhausted (it never loops forever). If you

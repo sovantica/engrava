@@ -226,7 +226,7 @@ EXEMPT_BASH_BLOCKS: tuple[tuple[str, str, ExemptionReason], ...] = (
     ),
     (
         "docs/upgrade.md",
-        'sqlite3 my-data.db "PRAGMA wal_checkpoint(TRUNCATE);"',
+        'sqlite3 my-data.db ".backup my-data.db.bak"',
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
     ),
     (

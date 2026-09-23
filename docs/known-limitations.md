@@ -25,10 +25,13 @@ for soft, in-file partitioning.
 
 ## Dreaming / consolidation: mechanism, not a proven retrieval lift
 
-The built-in `DreamingExtension` performs no-LLM consolidation (promotion →
-priority boost, association edges, reflections). With a fixed store,
-configuration, cycle, embedding inputs, and deterministic custom signals, its
-result is reproducible. Those are real
+The built-in `DreamingExtension`'s default signals make no LLM calls, and
+reflection content is built by a deterministic structural function; a custom
+signal registered via `custom_signals` runs whatever code it contains,
+including a call to an LLM. Consolidation is: scoring, and, conditional on
+gates, thresholds, and caps, promotion to priority boost, association edges,
+and reflections. With a fixed store, configuration, cycle, embedding inputs,
+and deterministic custom signals, its result is reproducible. Those are real
 **mechanical** ranking effects, but Engrava makes **no claim that enabling
 dreaming improves retrieval accuracy. The v0.5/v0.6-candidate frozen synthetic
 snapshot measured aggregate recall@5 at `0.80` with Dreaming off and `0.70` with
@@ -137,13 +140,15 @@ The [sqlite-vec](https://github.com/asg017/sqlite-vec) extension is pre-v1.
 engrava pins `>=0.1.0,<0.2.0` to avoid breaking changes. When sqlite-vec
 reaches 1.0, the pin will be relaxed.
 
-Without the `vec` extra, engrava falls back to brute-force cosine similarity
-search in Python. This works well for databases up to ~100k embeddings. For
-larger collections, run `pip install 'engrava[vec]'` to use the compact compiled `vec0`
-backend, but note that the pinned sqlite-vec 0.1.x line still performs an
-**exhaustive linear KNN scan**. It reduces the constant factor and memory
-overhead; it is not an approximate or sub-linear index. Measure your own p95
-latency and see [Performance](performance.md#the-brute-force-ceiling-and-how-to-pass-it).
+Without the `vec` extra, engrava falls back to a brute-force cosine scan done
+with NumPy: cost grows with the eligible embedding population. Run
+`pip install 'engrava[vec]'` to use the compact compiled `vec0` backend
+instead, but note that the pinned sqlite-vec 0.1.x line still performs an
+**exhaustive linear KNN scan** over a tightly packed columnar store — it is
+not an approximate or sub-linear index. Relative latency and memory use
+between the two backends depend on your data and hardware; measure your own
+p95 latency and see
+[Performance](performance.md#the-brute-force-ceiling-and-how-to-pass-it).
 
 ## FTS5 Availability
 

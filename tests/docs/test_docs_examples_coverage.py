@@ -561,7 +561,7 @@ COMPILE_ONLY: tuple[tuple[str, str, CompileOnlyReason, str], ...] = (
     ),
     (
         "docs/memory-hygiene.md",
-        'from_config("engrava.yaml") as store:\n    result = await store.run_hygiene',
+        'from_config("engrava.yaml") as store:\n        result = await store.run_hygiene',
         CompileOnlyReason.REQUIRES_ON_DISK_ARTIFACT,
         "requires an on-disk engrava.yaml; run_hygiene asserted in the hygiene test",
     ),

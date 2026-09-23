@@ -26,9 +26,13 @@ conflict.
 otherwise byte-distinct claims therefore coexist, even when they concern the
 same entity and cannot both be true.
 
-Content-hash deduplication is opt-in with `deduplicate=True`, and only
-byte-identical `content` matches. A match returns the existing thought and
-increments its `confirmation_count`; it does not compare meaning. Likewise,
+Content-hash deduplication is opt-in with `deduplicate=True`, and matches on
+the stored SHA-256 `content_hash`. `update_thought()` never rewrites that
+column, so editing a thought's `content` leaves its stored hash pointing at
+the superseded text: a later deduplication hit on that row's hash does not
+guarantee the row's *current* content is byte-identical to what you are
+deduplicating against. A match returns the existing thought and increments
+its `confirmation_count`; it does not compare meaning. Likewise,
 `upsert_by_hash()` only updates a row with the same content hash. Engrava never
 uses either operation to overwrite a semantic conflict.
 
@@ -40,7 +44,7 @@ conflict resolution are separate concerns. See [Hybrid Search](search.md) and
 ## A practical graph convention
 
 Engrava does not prescribe an ontology. The following convention keeps entity,
-claim, and evidence responsibilities explicit while using only the v0.6 public
+claim, and evidence responsibilities explicit while using only the public
 API.
 
 | Concept | Recommended representation |
@@ -68,9 +72,11 @@ incompatible. See [The Bi-temporal Model](bitemporal.md).
 Keep these reliability signals distinct:
 
 - `confidence` is the caller's nullable `0.0-1.0` estimate for one thought;
-- `confirmation_count` records independent re-encounters of byte-identical
-  content when the caller opts into deduplication, or confirmations maintained
-  by caller logic; and
+- `confirmation_count` counts successful deduplication hash hits when the
+  caller opts into deduplication, or confirmations maintained by caller logic;
+  Engrava does not establish that those hits are independent re-encounters,
+  and, per the stale-hash caveat above, a hit's own `content_hash` can lag the
+  row's current `content`; and
 - `EdgeRecord.weight` is the caller's strength for the relationship, not a
   probability that either endpoint is true.
 
@@ -87,8 +93,13 @@ OBSERVATIONs with a propagated score, regardless of what any other edge type
 means. And once a search config sets `graph_weight > 0`, the 1-hop graph
 signal builds adjacency from **every** edge in the pool in both directions,
 type-agnostic — a `CONTESTED_BY` edge boosts a neighbour's score exactly like
-any other. Both of these are separate from the `workflow behavior` an edge
-type has no automatic hand in.
+any other. Both of these are separate from ranking's absence of edge-type
+awareness above: specific edge types do drive specific non-ranking workflow
+behavior elsewhere — an outgoing `DERIVED_FROM` edge marks a thought as
+already derived, so `derive_existing()` skips it, and `CONSOLIDATED_FROM`
+edges are what the graph-expansion traversal above and orphan-reflection
+retirement both follow. Neither is general-purpose ontology reasoning; each
+is a specific subsystem interpreting a specific label.
 
 For `CONTESTED_BY`, choose and document one direction. This guide uses:
 
@@ -415,9 +426,14 @@ The word *provenance* can refer to different guarantees. Keep them separate:
    made. Their meaning is established by the application's schema and trust
    policy; Engrava does not verify the external source.
 3. **Mutation provenance.** With journaling enabled, the hash-chain journal
-   records thought and edge inserts, updates, and deletes as before/after
-   deltas. It can show that a conflict edge was added and detect inconsistent
-   retained journal rows within its documented threat model. It does not
+   records explicit thought and edge inserts, updates, and deletes as
+   before/after deltas — not every database mutation: buffered access
+   telemetry (`access_count` / `last_accessed_at`) is intentionally
+   unjournaled, and a cascaded edge delete (see above) does not get its own
+   `DELETE_EDGE` entry. See [Audit Trail](audit-trail.md) for the exact
+   coverage. It can show that a conflict edge was added and detect
+   inconsistent retained journal rows within its documented threat model. It
+   does not
    reconcile live claim/edge rows against the journal, prove that either claim
    is true, authenticate an external document, or replace semantic evidence.
    See [Audit Trail](audit-trail.md).

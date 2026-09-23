@@ -42,7 +42,7 @@ Every thought carries **two** texts, and the split is deliberate:
   (1–200 characters, enforced). This is the text you inject into an LLM prompt
   when this memory is retrieved. Keep it short and self-contained.
 - **`content`** — the **full** source text, retained for full-text search and
-  provenance. It can be as long as you like.
+  provenance.
 
 > Why it matters: when you retrieve memories to build a prompt, you want the
 > tight `essence`, not the whole `content`. Putting the same long text in both
@@ -53,9 +53,12 @@ Every thought carries **two** texts, and the split is deliberate:
 A thought also carries two optional, nullable timestamps — `valid_from` and
 `valid_until` — that record **when the fact is true in the world**, a separate
 axis from when Engrava stored it (`created_at`) and from the [cycle](#cycle-the-agent-clock).
-Both default to `None` (an open interval = "valid for all time"), so you can
-ignore them entirely until you need point-in-time history. The same two fields
-exist on an [edge](#edge). See [The Bi-temporal Model](bitemporal.md) for the full
+Both default to `None`, which the point-in-time predicates (`valid_now`,
+`valid_at`) treat as an open interval = "valid for all time" — the interval
+predicate `valid_between` is the exception and requires real bounds on both
+ends — so you can ignore them entirely until you need point-in-time history.
+The same two fields exist on an [edge](#edge). See
+[The Bi-temporal Model](bitemporal.md) for the full
 semantics and the query predicates.
 
 ### Thought types
@@ -79,8 +82,9 @@ behaviour.
 ### Priority
 
 `Priority` is `P1` (highest) … `P4` (lowest). It is one of the signals that
-hybrid search fuses into a ranking, so higher-priority thoughts surface more
-readily. Set it to reflect how important a memory is to keep at hand.
+hybrid search fuses into a ranking: when priority weighting is enabled and
+positive, a higher-priority thought already in the candidate set scores
+higher. Set it to reflect how important a memory is to keep at hand.
 
 ### Lifecycle
 
@@ -167,12 +171,12 @@ docs for the provider options.
 
 ## Reflection
 
-A **reflection** is a `ThoughtType.REFLECTION` thought created by **dreaming**:
-Engrava clusters semantically related thoughts and writes a higher-order summary
-node, linked back to its members by `CONSOLIDATED_FROM` edges, with a centroid
-embedding. Reflections are how a pile of individual observations becomes
-fewer, more retrievable, higher-level memories over an agent's lifetime. You do
-not create reflections by hand — dreaming makes them. See
+A **reflection** is a `ThoughtType.REFLECTION` thought. A reflection that
+**dreaming** creates is centroid-embedded and carries lineage: Engrava
+clusters semantically related thoughts and writes a higher-order summary
+node, linked back to its members by `CONSOLIDATED_FROM` edges. Reflections
+are how a pile of individual observations becomes fewer, more retrievable,
+higher-level memories over an agent's lifetime. See
 [Dreaming](dreaming.md).
 
 ## Cycle (the agent clock)
@@ -368,12 +372,14 @@ boundary between what the agent knows and what it's allowed to say.
 A thought carries **two different** notions of how much to trust it, and they
 feed dreaming as separate signals:
 
-- **`confidence`** — a static `0.0–1.0` belief-strength **you assign** at
-  creation (nullable; treated as `0.5` when unset). "How sure am I of this?"
-- **`confirmation_count`** — a counter of how many times the thought has been
-  **independently re-encountered / validated** over time. It grows via
-  `deduplicate=True` on `create_thought` (identical content bumps the count) or
-  your own logic. "How many times has reality re-confirmed this?"
+- **`confidence`** — a `0.0–1.0` belief-strength **you assign**, at creation
+  or a later update (nullable; treated as `0.5` when unset). "How sure am I of
+  this?"
+- **`confirmation_count`** — a counter that grows on a deduplication hash hit
+  via `deduplicate=True` on `create_thought` (identical content bumps the
+  count), or via your own logic. Engrava counts the hits; it does not
+  establish that they are independent re-encounters. "How many times has a
+  matching write recurred?"
 
 Dreaming's `ConfidenceSignal` reads the first and `ConfirmationSignal` reads the
 second, so they tune consolidation in different ways. (Relatedly,

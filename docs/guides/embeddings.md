@@ -85,17 +85,20 @@ window's exit decides — caught and exited cleanly, the row commits; uncaught,
 it rolls back with the rest of that window. This is surfaced two ways:
 
 - An `Exception` that escapes the guarded embed call (`provider.embed()` /
-  `embed_batch()`, or their role-aware equivalents) is never silent: a
-  `WARNING` naming the thought id and the provider error is always logged,
-  then the provider's own exception propagates (unchanged default
-  behaviour). That guarantee is scoped to that one call, not to provider
-  failures in general — a provider whose `model_name` property raises (read
-  right after a successful embed, to store alongside the vector) skips the
-  logging and typing entirely, regardless of `require_embedding` or
-  exception type. A provider that raises `asyncio.CancelledError` (or any
-  other `BaseException` that is not an `Exception`) from inside the guarded
-  embed call also skips it — it propagates directly, with no `WARNING` and
-  without ever becoming `EmbeddingGenerationError`.
+  `embed_batch()`, or their role-aware equivalents) is never silent for the
+  thought a caller directly created or updated: a `WARNING` naming the
+  thought id and the provider error is always logged, then the provider's
+  own exception propagates (unchanged default behaviour). That guarantee is
+  scoped to that one call, not to provider failures in general — a provider
+  whose `model_name` property raises (read right after a successful embed,
+  to store alongside the vector) skips the logging and typing entirely,
+  regardless of `require_embedding` or exception type. A provider that
+  raises `asyncio.CancelledError` (or any other `BaseException` that is not
+  an `Exception`) from inside the guarded embed call also skips it — it
+  propagates directly, with no `WARNING` and without ever becoming
+  `EmbeddingGenerationError`. A derived child's own embed failure does not
+  reach the originating call at all: under the default derivation
+  `on_error="log"` gate, it is logged and derivation continues.
 - Set `require_embedding: true` (config) or `require_embedding=True` (constructor)
   to turn that failure into a typed `EmbeddingGenerationError` — the explicit
   fail-fast for operators who would rather the write raise loudly than leave an

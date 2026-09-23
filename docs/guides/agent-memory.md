@@ -127,8 +127,8 @@ ones actually contributed to the ranking.
 
 ## Step 3 — build the prompt and call your LLM
 
-This is the only step that touches your model. Engrava is LLM-free; you own the
-call:
+This is the only step that touches your model. Engrava's built-in path doesn't
+call an LLM for you here; you own the call:
 
 ```python
 prompt = "Context:\n" + "\n".join(f"- {c}" for c in context)
