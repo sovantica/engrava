@@ -3043,6 +3043,19 @@ class SqliteEngravaCore:
         still issues then run in whatever transaction state the connection
         was already in when this step started, not necessarily autocommit.
 
+        **Why the per-step transaction opens with ``BEGIN IMMEDIATE``.** Most
+        steps' first statement is a postcondition-style presence check
+        (:meth:`_table_exists`, :meth:`_column_exists` via
+        :meth:`_add_column_if_absent`, :meth:`_index_exists`) before their
+        first DDL/DML — a read, inside the transaction, ahead of the write.
+        Under a deferred ``BEGIN`` that read takes a WAL snapshot the later
+        write then has to upgrade; if another connection holds the write
+        lock, SQLite refuses the upgrade with ``SQLITE_BUSY`` and never
+        invokes the busy handler, so a contending migration would fail at
+        once instead of waiting out ``PRAGMA busy_timeout`` like every other
+        write unit in this module. ``BEGIN IMMEDIATE`` takes the write lock
+        up front, through the busy handler, before any step gets to read.
+
         Args:
             current_version: The database's current ``user_version``. It is at
                 or above the bootstrap floor; the fresh-bootstrap path is
@@ -3057,7 +3070,7 @@ class SqliteEngravaCore:
                 await self._db.execute(f"PRAGMA user_version = {target_version}")
                 await self._db.commit()
                 continue
-            await self._db.execute("BEGIN")
+            await self._db.execute("BEGIN IMMEDIATE")
             try:
                 await migrate()
                 await self._db.execute(f"PRAGMA user_version = {target_version}")
@@ -5075,8 +5088,19 @@ class SqliteEngravaCore:
         in :meth:`_delete_thought_children_explicit` /
         :meth:`_delete_thought_atomic`: a transaction is opened first only
         when :attr:`self._db.in_transaction <aiosqlite.Connection.in_transaction>`
-        is not already ``True`` (tracked as ``opened_transaction``), the body
-        runs inside a named ``SAVEPOINT``, and on any failure it is unwound
+        is not already ``True`` (tracked as ``opened_transaction``), and
+        opened with ``BEGIN IMMEDIATE`` rather than a deferred ``BEGIN``.
+        This matters because the guarded body reads before it writes — an
+        FTS5 trigger reading its own config counts, on top of whatever the
+        caller's own body does — and a deferred transaction's read takes a
+        WAL snapshot that the later write must then upgrade; SQLite refuses
+        that upgrade while another connection holds the write lock and
+        returns ``SQLITE_BUSY`` without ever invoking the busy handler, so
+        the unit would fail at once under contention instead of waiting out
+        ``PRAGMA busy_timeout`` like an ordinary write. ``BEGIN IMMEDIATE``
+        takes the write lock up front, through the busy handler, before
+        anything in this body gets to read. The body then runs inside a
+        named ``SAVEPOINT``, and on any failure it is unwound
         with ``ROLLBACK TO`` + ``RELEASE`` — undoing only what this call
         itself wrote — before the original exception propagates. Only when
         this call is also the one that opened the transaction does it end
@@ -5120,7 +5144,7 @@ class SqliteEngravaCore:
         """
         opened_transaction = not self._db.in_transaction
         if opened_transaction:
-            await self._db.execute("BEGIN")
+            await self._db.execute("BEGIN IMMEDIATE")
         await self._db.execute(f"SAVEPOINT {name}")
         try:
             yield
@@ -10188,6 +10212,18 @@ class SqliteEngravaCore:
         and, on failure, closed again only if this call is the one that
         opened it; a transaction the caller already held stays exactly as
         open as it was, with only this method's own three deletes undone.
+        When this call is the one opening it, it opens with ``BEGIN
+        IMMEDIATE`` rather than a deferred ``BEGIN``, mirroring
+        :meth:`_write_readback_savepoint` and :meth:`_delete_thought_atomic`:
+        a write unit that could still end up reading before it writes must
+        never rely on a deferred transaction's snapshot, which a later write
+        would have to upgrade and SQLite refuses to upgrade while another
+        connection holds the write lock — that refusal surfaces as
+        ``SQLITE_BUSY`` without ever invoking the busy handler, so the unit
+        fails at once under contention instead of waiting out ``PRAGMA
+        busy_timeout``. ``BEGIN IMMEDIATE`` takes the write lock up front,
+        through the busy handler, closing that gap regardless of what order
+        this call's own body happens to read and write in.
 
         **A trigger using ``RAISE(ROLLBACK, ...)`` is a real limitation of
         installing one, not a defect this method can close.**
@@ -10268,7 +10304,7 @@ class SqliteEngravaCore:
         """
         opened_transaction = not self._db.in_transaction
         if opened_transaction:
-            await self._db.execute("BEGIN")
+            await self._db.execute("BEGIN IMMEDIATE")
         await self._db.execute("SAVEPOINT delete_thought_children")
         try:
             # `total_changes` (not each cursor's own `rowcount`) is what
@@ -10433,7 +10469,17 @@ class SqliteEngravaCore:
         ``DELETE`` — the same instant several callers already fetch a
         ``before_row`` for their journal entry, but done here, unconditionally
         and independently of whether a journal is attached, so every caller
-        gets the discrimination regardless. Reliable under a concurrent
+        gets the discrimination regardless. That ``SELECT`` is exactly why,
+        when this call is the one opening the transaction, it opens with
+        ``BEGIN IMMEDIATE`` rather than a deferred ``BEGIN``: a read inside a
+        deferred transaction takes a WAL snapshot that the ``DELETE`` right
+        after it would then have to upgrade, and SQLite refuses that upgrade
+        while another connection holds the write lock — surfacing
+        ``SQLITE_BUSY`` without ever invoking the busy handler, so this unit
+        would fail at once under contention instead of waiting out
+        ``PRAGMA busy_timeout`` like an ordinary write. ``BEGIN IMMEDIATE``
+        takes the write lock up front, through the busy handler, before this
+        existence check ever runs. Reliable under a concurrent
         writer for the case this fix targets: both statements run back to
         back on this connection, inside one still-open transaction, with
         ``_write_lock`` already held for the whole call, so nothing on *this*
@@ -10513,7 +10559,7 @@ class SqliteEngravaCore:
         """
         opened_transaction = not self._db.in_transaction
         if opened_transaction:
-            await self._db.execute("BEGIN")
+            await self._db.execute("BEGIN IMMEDIATE")
         await self._db.execute("SAVEPOINT delete_thought_atomic")
         try:
             # Established inside this savepoint, immediately before the
