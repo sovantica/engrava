@@ -1042,6 +1042,9 @@ _NON_CONFIG_CLASSES: dict[str, str] = {
         "anything, not settings"
     ),
     "engrava.infrastructure.sqlite.engrava_core._DerivationOutcome": "one derivation's outcome",
+    "engrava.infrastructure.sqlite.engrava_core._HygieneGcOutcome": (
+        "one hygiene GC stage's outcome -- what it deleted, retired and wrote, not settings"
+    ),
     "engrava.infrastructure.sqlite.extension_migrations._AppliedMigration": (
         "a migration ledger row"
     ),
