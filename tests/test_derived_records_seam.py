@@ -1071,6 +1071,309 @@ async def test_caller_suspend_rollback_does_not_derive(
 
 
 # ---------------------------------------------------------------------------
+# R2-2b — the derivation gate is asked of the current task's own window only,
+# never of another task's, or a window this task's marker no longer names.
+# ---------------------------------------------------------------------------
+
+
+class _PausingOnStoreProducer(DefaultEngravaHooks):
+    """Pauses ``on_store`` for one thought id; signals when ``derive_records`` runs."""
+
+    def __init__(self) -> None:
+        self.pause_for: str | None = None
+        self.paused = asyncio.Event()
+        self.release = asyncio.Event()
+        self.derive_called = asyncio.Event()
+        self.calls = 0
+        self.source_ids: list[str] = []
+
+    async def on_store(self, thought: ThoughtRecord) -> ThoughtRecord:
+        if thought.thought_id == self.pause_for:
+            self.paused.set()
+            await self.release.wait()
+        return thought
+
+    async def derive_records(
+        self,
+        thought: ThoughtRecord,
+        ctx: DeriveContext,
+    ) -> Sequence[DerivedRecord]:
+        self.calls += 1
+        self.source_ids.append(ctx.source_thought_id)
+        self.derive_called.set()
+        return [_child(f"derived from {thought.thought_id}")]
+
+
+async def test_foreign_window_does_not_skip_derivation(db: aiosqlite.Connection) -> None:
+    """Another task's open ``suspend_auto_commit`` window must not blind derivation.
+
+    Task A's create commits and then pauses inside ``on_store``. While paused,
+    task B opens its own ``suspend_auto_commit`` window on the SAME store and
+    holds it open. A resumes and finishes ``on_store`` while B's window is
+    still open. The derivation gate must consult only A's own task-local
+    window marker (``None`` — A never opened a window of its own), not the
+    store-wide fact that *some* window happens to be open, so A's producer is
+    called even while B's window is still open.
+
+    Persisting the derived child then legitimately blocks on the write lock
+    B's window holds for its whole duration (a genuinely different task's
+    guarded write), so this test observes the producer call BEFORE releasing
+    B, then releases B, then awaits both tasks — the order the corrected
+    behaviour requires: awaiting A first (or releasing B before observing the
+    call) would either race the assertion or deadlock A's derivation against
+    B's own window.
+    """
+    producer = _PausingOnStoreProducer()
+    producer.pause_for = "src-a"
+    store = _make_store(db, producer, DeriveGates(enabled=True))
+
+    task_a = asyncio.create_task(store.create_thought(_source("src-a", content="Body for A.")))
+    try:
+        await asyncio.wait_for(producer.paused.wait(), timeout=5.0)
+
+        entered = asyncio.Event()
+        leave = asyncio.Event()
+
+        async def _hold_foreign_window() -> None:
+            async with store.suspend_auto_commit():
+                entered.set()
+                await leave.wait()
+
+        task_b = asyncio.create_task(_hold_foreign_window())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5.0)
+
+            producer.release.set()
+            # RED (today's code): the producer is never called while a
+            # foreign window is open, so this times out -- that timeout IS
+            # the failure, not a hang.
+            await asyncio.wait_for(producer.derive_called.wait(), timeout=5.0)
+
+            # Proves the call happened while B's window was still open, not
+            # because B had already exited by the time we checked.
+            assert not task_b.done()
+
+            leave.set()
+            await asyncio.wait_for(task_b, timeout=5.0)
+        except BaseException:
+            if not task_b.done():
+                task_b.cancel()
+            raise
+        await asyncio.wait_for(task_a, timeout=5.0)
+    except BaseException:
+        if not task_a.done():
+            task_a.cancel()
+        raise
+
+    assert producer.calls == 1
+    assert producer.source_ids == ["src-a"]
+    assert await store.get_thought(_derived_thought_id("derived from src-a")) is not None
+
+
+async def test_nested_window_skips_until_outermost_closes(db: aiosqlite.Connection) -> None:
+    """A create between the inner window's exit and the outer's still skips.
+
+    Each nesting level's own identity is registered on entry and unregistered
+    in its own ``finally``, and the task-local marker is restored to the
+    enclosing level's identity on the inner exit (a plain ``ContextVar.reset``)
+    -- so a create made after the inner window has exited, but before the
+    outer one has, still sees an open window of its own task's and skips.
+    Once both have closed, the marker is back to ``None`` and a create derives
+    normally again.
+    """
+    producer = ListProducer([_child("nested-child")])
+    store = _make_store(db, producer, DeriveGates(enabled=True))
+
+    async with store.suspend_auto_commit():
+        await store.create_thought(_source("inner-src", content="Inside the inner window."))
+        async with store.suspend_auto_commit():
+            await store.create_thought(_source("innermost-src", content="Inside both windows."))
+        # The inner window has exited; the outer one is still open.
+        await store.create_thought(_source("after-inner-src", content="After inner, in outer."))
+
+    assert producer.calls == 0
+    # Both identities were discarded on their own `finally`, not merely
+    # shadowed by the marker reset.
+    assert store._open_auto_commit_windows == set()
+
+    # Both windows are closed now -- an ordinary create derives again.
+    await store.create_thought(_source("after-both-src", content="After both windows."))
+    assert producer.calls == 1
+    assert producer.source_ids == ["after-both-src"]
+
+
+async def test_two_stores_one_task_window_isolation() -> None:
+    """A window on store B must not overwrite store A's own marker for this task.
+
+    The task-local marker is a ``ContextVar`` created per store instance, not
+    at module level, precisely so one task holding windows on two different
+    stores keeps each store's identity independent. A create on A still skips
+    while A's own window is open, regardless of B's window nested inside it; a
+    create on B skips while B's own window is open; and a create on either
+    store, once both windows have exited, derives normally.
+    """
+    conn_a = await aiosqlite.connect(":memory:")
+    conn_a.row_factory = aiosqlite.Row
+    conn_b = await aiosqlite.connect(":memory:")
+    conn_b.row_factory = aiosqlite.Row
+    try:
+        producer_a = ListProducer([_child("child-of-a")])
+        producer_b = ListProducer([_child("child-of-b")])
+        store_a = _make_store(conn_a, producer_a, DeriveGates(enabled=True))
+        store_b = _make_store(conn_b, producer_b, DeriveGates(enabled=True))
+        await store_a.ensure_schema()
+        await store_b.ensure_schema()
+
+        async with store_a.suspend_auto_commit():
+            await store_a.create_thought(_source("a-1", content="On A, in A's window."))
+            async with store_b.suspend_auto_commit():
+                await store_a.create_thought(_source("a-2", content="On A, B's window nested."))
+                await store_b.create_thought(_source("b-1", content="On B, in B's window."))
+            # B's window has exited; A's own window is still open.
+            await store_a.create_thought(_source("a-3", content="On A, after B's window closed."))
+
+        assert producer_a.calls == 0
+        assert producer_b.calls == 0
+        assert store_a._open_auto_commit_windows == set()
+        assert store_b._open_auto_commit_windows == set()
+
+        # Both stores' windows are closed now -- ordinary creates derive.
+        await store_a.create_thought(_source("a-4", content="On A, after both windows closed."))
+        await store_b.create_thought(_source("b-2", content="On B, after both windows closed."))
+        assert producer_a.source_ids == ["a-4"]
+        assert producer_b.source_ids == ["b-2"]
+    finally:
+        await conn_a.close()
+        await conn_b.close()
+
+
+async def test_spawned_task_create_after_window_closes_derives_normally(
+    db: aiosqlite.Connection,
+) -> None:
+    """A task spawned inside a window derives once the window it copied has closed.
+
+    ``asyncio.create_task`` copies the current ``contextvars.Context``, so a
+    task spawned from inside a ``suspend_auto_commit`` window starts with that
+    window's identity as its own marker too. But the window's ``_write_lock``
+    hold is task-scoped, not context-scoped: the spawned task is a genuinely
+    different task, so its own create blocks on that lock until the window
+    closes. By the time it resumes, the window's identity is no longer in the
+    open set, so the spawned task's create derives normally -- exactly like
+    any ordinary create made after the window.
+    """
+    producer = ListProducer([_child("spawned-child")])
+    store = _make_store(db, producer, DeriveGates(enabled=True))
+
+    entered = asyncio.Event()
+    leave = asyncio.Event()
+    spawned: asyncio.Task[ThoughtRecord] | None = None
+
+    async def _hold_window_and_spawn() -> None:
+        nonlocal spawned
+        async with store.suspend_auto_commit():
+            spawned = asyncio.create_task(
+                store.create_thought(_source("spawned-src", content="Spawned body.")),
+            )
+            entered.set()
+            await leave.wait()
+
+    holder = asyncio.create_task(_hold_window_and_spawn())
+    await asyncio.wait_for(entered.wait(), timeout=5.0)
+    assert spawned is not None
+    # Let the spawned task actually start and block on the write lock.
+    await asyncio.sleep(0)
+    assert not spawned.done()
+
+    leave.set()
+    await asyncio.wait_for(holder, timeout=5.0)
+    await asyncio.wait_for(spawned, timeout=5.0)
+
+    assert producer.calls == 1
+    assert producer.source_ids == ["spawned-src"]
+
+
+async def test_cancellation_inside_window_unregisters_and_resets_marker(
+    db: aiosqlite.Connection,
+) -> None:
+    """A real ``task.cancel()`` delivered inside a window still resets the marker.
+
+    ``suspend_auto_commit`` already catches ``BaseException`` — which is why a
+    cancellation lands in the same ``finally`` as any other exception — so the
+    window's identity must be unregistered AND this task's marker reset there
+    too, exactly like a clean exit. A faulty cleanup that unregisters the
+    identity but leaves the marker stale would still make a later create look
+    correct from a *different* task (the marker check requires the marker to
+    equal a specific window id, and a different task's marker was never set in
+    the first place) -- so this test checks the marker directly, and checks it
+    from **inside** the cancelled task itself, where the reset actually
+    happens.
+
+    The window runs in its own spawned task, genuinely cancelled via
+    ``task.cancel()`` while parked on an event that never fires -- not a
+    ``CancelledError`` raised inline -- so the delivery is the real thing.
+    ``asyncio.create_task`` copies the current ``contextvars.Context``, so the
+    cancelled task's own marker is a value the *parent* task's context never
+    shares: the parent's marker reads ``None`` throughout regardless of
+    whether cleanup ran correctly. The cancelled task therefore records its
+    own observations, in a ``finally`` around the window, and re-raises so the
+    parent still sees the propagated ``CancelledError``.
+    """
+    producer = ListProducer([_child("post-cancel-child")])
+    store = _make_store(db, producer, DeriveGates(enabled=True))
+
+    entered = asyncio.Event()
+    unobserved: object = object()
+    observed_marker: object | None = unobserved
+    observed_open_windows: frozenset[object] | None = None
+
+    async def _window_cancelled_from_outside() -> None:
+        nonlocal observed_marker, observed_open_windows
+        try:
+            async with store.suspend_auto_commit():
+                await store.create_thought(_source("in-window", content="Body inside window."))
+                entered.set()
+                await asyncio.Event().wait()  # never set; only cancellation ends this
+        finally:
+            # Observed from INSIDE the cancelled task, after
+            # suspend_auto_commit's own `finally` has already run (its
+            # `async with` block has exited by the time control reaches
+            # here) -- this task's own contextvars.Context, not the parent's
+            # copy of it.
+            observed_marker = store._current_auto_commit_window.get()
+            observed_open_windows = frozenset(store._open_auto_commit_windows)
+
+    task = asyncio.create_task(_window_cancelled_from_outside())
+    await asyncio.wait_for(entered.wait(), timeout=5.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5.0)
+
+    # What the cancelled task itself observed, right after its own window's
+    # cleanup ran.
+    assert observed_marker is None, "the cancelled task's own marker was left stale"
+    assert observed_open_windows == frozenset(), (
+        "the cancelled window's identity was not unregistered"
+    )
+
+    assert not db.in_transaction
+    assert producer.calls == 0  # the in-window create rolled back with the cancellation
+    assert store._open_auto_commit_windows == set()
+
+    # The parent task's own marker -- trivially `None` even under a faulty
+    # cleanup, since a child task's context is a copy, never the parent's own.
+    # Kept because it documents that fact rather than because it discriminates
+    # anything on its own.
+    assert store._current_auto_commit_window.get() is None
+
+    # Still the parent task: a later create must derive, proving the
+    # (now-finished) cancelled task's window identity was actually
+    # unregistered store-wide, not merely invisible to the parent's marker.
+    await store.create_thought(_source("post-cancel", content="After cancellation."))
+    assert producer.calls == 1
+    assert producer.source_ids == ["post-cancel"]
+
+
+# ---------------------------------------------------------------------------
 # R2-3 — conflict-as-reuse enrichment targets the STORED row, never producer content
 # ---------------------------------------------------------------------------
 

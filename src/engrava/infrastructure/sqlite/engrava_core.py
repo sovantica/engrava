@@ -999,11 +999,11 @@ _SUPPRESS_SEARCH_METRICS: contextvars.ContextVar[bool] = contextvars.ContextVar(
 #: duration of its archive+GC unit so a nested public write it makes itself
 #: (``retire_orphan_reflections`` -> ``update_thought``) does not end that
 #: unit early with its own commit. Deliberately **not** the instance-wide
-#: ``_skip_auto_commit_depth``: that counter has a second reader
-#: (``_dispatch_derivation``, which treats it as "the source is not durable
-#: yet" and skips derivation) and is shared by every task on the store, so
-#: raising it for the length of a hygiene pass would make an unrelated task's
-#: already-committed create silently skip its own derivation. A ``ContextVar``
+#: ``_skip_auto_commit_depth``: that counter is shared by every task on the
+#: store, so raising it for the length of a hygiene pass would make an
+#: unrelated task's guarded write see a foreign window as its own — the same
+#: shape of bug ``_dispatch_derivation`` used to have before it gained its own
+#: task-local marker (see ``_current_auto_commit_window``). A ``ContextVar``
 #: keeps the suppression visible only to the task running the pass, exactly
 #: like ``_IN_DERIVATION`` / ``_SUPPRESS_SEARCH_METRICS`` above.
 _SUPPRESS_NESTED_AUTO_COMMIT: contextvars.ContextVar[bool] = contextvars.ContextVar(
@@ -1717,6 +1717,29 @@ class SqliteEngravaCore:
         # below). Only the outermost `suspend_auto_commit` call ever commits,
         # rolls back, or brings this back to 0.
         self._skip_auto_commit_depth: int = 0
+        # Every open `suspend_auto_commit` window (nested or not) registers a
+        # fresh identity here for its duration — see `suspend_auto_commit` and
+        # `_dispatch_derivation`. Paired with `_current_auto_commit_window`
+        # below, this lets the derivation gate ask "is *this task's own*
+        # window still open?" instead of "is *some* window open on this
+        # store?", which `_skip_auto_commit_depth` alone cannot answer: that
+        # counter is instance-wide, so a task with no window of its own would
+        # otherwise read another task's open window as if it were its own.
+        self._open_auto_commit_windows: set[object] = set()
+        # Task-local marker naming the innermost `suspend_auto_commit` window
+        # THIS task currently has open on THIS store, or `None` if it has none
+        # open. A `contextvars.ContextVar`, created per-instance rather than
+        # at module level — the same choice already made for
+        # `_suppress_access_tracking` below — so a task holding windows on two
+        # different store instances at once keeps each store's marker
+        # independent: opening a window on store B must not overwrite store
+        # A's own still-open window's identity for a task that holds both.
+        # Set with a token at each window's entry and reset in its `finally`,
+        # where the identity is also unregistered from
+        # `_open_auto_commit_windows` — see `suspend_auto_commit`.
+        self._current_auto_commit_window: contextvars.ContextVar[object | None] = (
+            contextvars.ContextVar("engrava_current_auto_commit_window", default=None)
+        )
         # Terminal quarantine state. Set only when a per-child compensating
         # rollback in the derived-records seam did not cleanly complete (raised
         # or was cancelled), so the long-lived connection may still hold an open
@@ -5001,6 +5024,12 @@ class SqliteEngravaCore:
         async with self._write_lock:
             self._skip_auto_commit_depth += 1
             is_outermost = self._skip_auto_commit_depth == 1
+            # Fresh identity for THIS window (nested or not) — see
+            # `_open_auto_commit_windows` / `_current_auto_commit_window` for
+            # why this is separate from `_skip_auto_commit_depth`.
+            window_id = object()
+            self._open_auto_commit_windows.add(window_id)
+            window_token = self._current_auto_commit_window.set(window_id)
             try:
                 yield
             except BaseException:
@@ -5022,6 +5051,12 @@ class SqliteEngravaCore:
                     await self._commit_or_recover()
             finally:
                 self._skip_auto_commit_depth -= 1
+                # Unregister this window's identity and restore the marker
+                # this task had before this window opened (the enclosing
+                # window's identity, if nested, else `None`) — on every exit
+                # path, including cancellation: see `_dispatch_derivation`.
+                self._open_auto_commit_windows.discard(window_id)
+                self._current_auto_commit_window.reset(window_token)
 
     @contextlib.asynccontextmanager
     async def _write_readback_savepoint(self, name: str) -> AsyncIterator[None]:
@@ -7560,11 +7595,16 @@ class SqliteEngravaCore:
         journal) — it does at most a single cheap capability/enabled check before
         returning, not zero extra work.
 
-        When called while auto-commit is suspended it returns without dispatching:
-        the source is not yet durable and derivation must never run inside a
-        transaction. ``bulk_store`` instead dispatches derivation locally, per
-        newly-created record, *after* its batch commits; a caller writing inside
-        its own ``suspend_auto_commit`` window triggers derivation via an explicit
+        When called while **the current task's own** auto-commit window is still
+        open it returns without dispatching: that source is not yet durable and
+        derivation must never run inside a transaction. This is asked of the
+        current task only — via a task-local marker, not the instance-wide
+        ``_skip_auto_commit_depth`` — so a *different* task's open window (which
+        holds no transaction this source's insert belongs to) is invisible here;
+        see ``_current_auto_commit_window`` and ``_open_auto_commit_windows``.
+        ``bulk_store`` instead dispatches derivation locally, per newly-created
+        record, *after* its batch commits; a caller writing inside its own
+        ``suspend_auto_commit`` window triggers derivation via an explicit
         re-run/backfill (ADR D8 — recoverability, not automatic recovery). A
         dedup / hash hit never reaches this method (those return before the
         dispatch call in ``create_thought``), so only genuine inserts derive (D5).
@@ -7582,8 +7622,11 @@ class SqliteEngravaCore:
             return
         if _IN_DERIVATION.get():
             return
-        if self._skip_auto_commit:
-            # Not yet durable (inside a suspended-commit window). Do not dispatch
+        window_id = self._current_auto_commit_window.get()
+        if window_id is not None and window_id in self._open_auto_commit_windows:
+            # Not yet durable inside THIS TASK's own suspended-commit window —
+            # asked of the current task only (see `_current_auto_commit_window`),
+            # so another task's open window never trips this. Do not dispatch
             # and do not buffer — bulk_store dispatches locally post-commit, and
             # a caller-held transaction triggers derivation via explicit backfill.
             return
