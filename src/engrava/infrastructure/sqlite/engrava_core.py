@@ -251,6 +251,39 @@ class _DeleteAtomicResult:
     wrote_anything: bool
 
 
+@dataclass(frozen=True)
+class _HygieneGcOutcome:
+    """Outcome of :meth:`SqliteEngravaCore._hygiene_gc`, for ``run_hygiene``'s finalization.
+
+    ``run_hygiene`` decides whether its archive+GC unit has a surviving write
+    to commit from signals the stages report themselves — never from
+    ``self._db.total_changes``, which is monotonic and still counts a write a
+    savepoint later undid (see ``run_hygiene``'s own docstring). This carries
+    the two signals :meth:`_hygiene_gc` alone can report, beyond the plain
+    count already in :class:`~engrava.infrastructure.sqlite.hygiene.HygieneResult`.
+
+    Attributes:
+        gc_count: The number of thoughts physically deleted this stage —
+            identical to the value ``run_hygiene`` puts on the public
+            ``HygieneResult``.
+        retired_count: How many orphan REFLECTIONs
+            ``retire_orphan_reflections`` retired before any delete ran. A
+            retirement is its own surviving write even when every GC
+            candidate that follows it is vetoed or absent (``gc_count == 0``).
+        wrote_anything: Whether any GC candidate's own
+            :meth:`SqliteEngravaCore._delete_thought_atomic` call reported
+            ``wrote_anything`` — its orphan-sweep case, which can be ``True``
+            even for a candidate this stage does not count in ``gc_count``
+            (``deleted`` is ``False``). Tracked the same way
+            ``cleanup_expired`` already tracks it across its own delete loop.
+
+    """
+
+    gc_count: int
+    retired_count: int
+    wrote_anything: bool
+
+
 #: Fixed namespaces for the deterministic identities the derived-records seam
 #: assigns. A derived thought's ``thought_id`` is ``uuid5`` over its content, so
 #: byte-identical derived content maps to one stored thought and re-running
@@ -958,6 +991,23 @@ _VEC0_OVERFETCH_CAP = 500
 _SQLITE_MAX_VARS = 999
 _SUPPRESS_SEARCH_METRICS: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "engrava_suppress_search_metrics",
+    default=False,
+)
+
+#: Task-local suppression for a nested write's own auto-commit, read only by
+#: :meth:`SqliteEngravaCore._maybe_commit`. ``run_hygiene`` sets this for the
+#: duration of its archive+GC unit so a nested public write it makes itself
+#: (``retire_orphan_reflections`` -> ``update_thought``) does not end that
+#: unit early with its own commit. Deliberately **not** the instance-wide
+#: ``_skip_auto_commit_depth``: that counter has a second reader
+#: (``_dispatch_derivation``, which treats it as "the source is not durable
+#: yet" and skips derivation) and is shared by every task on the store, so
+#: raising it for the length of a hygiene pass would make an unrelated task's
+#: already-committed create silently skip its own derivation. A ``ContextVar``
+#: keeps the suppression visible only to the task running the pass, exactly
+#: like ``_IN_DERIVATION`` / ``_SUPPRESS_SEARCH_METRICS`` above.
+_SUPPRESS_NESTED_AUTO_COMMIT: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "engrava_suppress_nested_auto_commit",
     default=False,
 )
 
@@ -5469,13 +5519,21 @@ class SqliteEngravaCore:
         and does not call this method at all. This method never acquires the
         write lock itself.
 
+        **Nested-commit suppression, task-local.** ``run_hygiene`` sets
+        :data:`_SUPPRESS_NESTED_AUTO_COMMIT` for the duration of its
+        archive+GC unit so a nested public write it makes itself
+        (``retire_orphan_reflections`` -> ``update_thought``) does not end
+        that unit early with its own commit here — see that ContextVar's
+        module-level docstring for why it is task-local rather than the
+        instance-wide :attr:`_skip_auto_commit_depth`.
+
         Raises:
             ConnectionQuarantinedError: When the connection has been quarantined
                 (already, or by this call's own failed-commit recovery).
 
         """
         self._ensure_connection_usable()
-        if not self._skip_auto_commit:
+        if not self._skip_auto_commit and not _SUPPRESS_NESTED_AUTO_COMMIT.get():
             await self._commit_or_recover()
 
     # ------------------------------------------------------------------
@@ -13286,6 +13344,9 @@ class SqliteEngravaCore:
                 explicit ``current_cycle`` nor a configured ``cycle_provider``.
             CycleProviderError: When a configured provider returns an invalid
                 value (not an ``int``, a ``bool``, or negative).
+            ConnectionQuarantinedError: When the connection has been
+                quarantined (already, or by this call's own failed-unwind
+                recovery inside its archive+GC unit).
 
         """
         policy = self._hygiene_policy
@@ -13363,23 +13424,71 @@ class SqliteEngravaCore:
                 flat_signals=flat_signals,
             )
 
-        # Archive + GC share one critical section and one commit:
-        # both stages' guarded writes run under `_write_lock`, so a different
-        # task's guarded write cannot land between the archive stage's last
-        # write and the GC stage's first, or ride along with this pass's commit.
+        # Archive + GC share one failure-atomic unit, not just one critical
+        # section: both stages' guarded writes run under `_write_lock` (so a
+        # different task's guarded write cannot land between the archive
+        # stage's last write and the GC stage's first), and both run inside
+        # one `_write_readback_savepoint` unit, so a failed or cancelled
+        # journal append anywhere in either stage unwinds every write the
+        # pass has made so far -- not just the write it failed on. A nested
+        # public write inside that unit -- `retire_orphan_reflections` writes
+        # through `update_thought`, whose own `_maybe_commit()` commits --
+        # would otherwise release the unit's savepoint right along with it;
+        # suppressing nested commits for the unit's duration (task-locally,
+        # via `_SUPPRESS_NESTED_AUTO_COMMIT` -- see that ContextVar's
+        # docstring for why not the instance-wide `_skip_auto_commit_depth`)
+        # keeps the whole pass inside the one savepoint instead.
         async with self._write_lock:
-            archived_count = await self._hygiene_archive(
-                would_evict, policy=policy, current_cycle=current_cycle, now=now
-            )
+            # Sampled before the unit below touches the connection, mirroring
+            # delete_thought / cleanup_expired / delete_edge: whether this
+            # call is the one that opened the transaction it may need to
+            # close once the unit exits cleanly with nothing to commit.
+            opened_transaction = not self._db.in_transaction
 
             gc_count = 0
-            if policy.auto_gc_enabled:
-                gc_count = await self._hygiene_gc(
-                    policy=policy, current_cycle=current_cycle, now=now
-                )
+            retired_count = 0
+            gc_wrote_anything = False
+            async with self._write_readback_savepoint("run_hygiene"):
+                suppress_token = _SUPPRESS_NESTED_AUTO_COMMIT.set(True)
+                try:
+                    archived_count = await self._hygiene_archive(
+                        would_evict, policy=policy, current_cycle=current_cycle, now=now
+                    )
 
-            if archived_count or gc_count:
+                    if policy.auto_gc_enabled:
+                        gc_outcome = await self._hygiene_gc(
+                            policy=policy, current_cycle=current_cycle, now=now
+                        )
+                        gc_count = gc_outcome.gc_count
+                        retired_count = gc_outcome.retired_count
+                        gc_wrote_anything = gc_outcome.wrote_anything
+                finally:
+                    # Reset before the exception (if any) leaves this block,
+                    # so a nested write made by the *unwind* itself (there is
+                    # none today, but the invariant is the unit's, not this
+                    # call's) never sees a stale suppression left behind.
+                    _SUPPRESS_NESTED_AUTO_COMMIT.reset(suppress_token)
+
+            # Finalization is decided by what survived, reported by the
+            # stages themselves -- never by `self._db.total_changes`, which
+            # is monotonic and still counts a write a savepoint later undid.
+            # Concretely: a GC candidate silently vetoed by a `BEFORE DELETE`
+            # trigger that writes an audit row and then `RAISE(IGNORE)`s
+            # advances `total_changes` for that audit insert even though
+            # `_delete_thought_atomic` rolls it back and reports
+            # `wrote_anything=False` -- a `total_changes`-keyed finalization
+            # would misread that as a surviving write and commit a caller's
+            # unrelated pending work along with it.
+            wrote_anything = (
+                archived_count > 0 or gc_count > 0 or retired_count > 0 or gc_wrote_anything
+            )
+            if wrote_anything:
                 await self._maybe_commit()
+            elif opened_transaction and self._db.in_transaction:
+                # Nothing this pass made survived -- close only a transaction
+                # this call itself opened, never one a caller already held:
+                # see delete_thought for the same reasoning.
+                await self._db.rollback()
 
         return HygieneResult(
             archived_count=archived_count,
@@ -13687,7 +13796,7 @@ class SqliteEngravaCore:
         policy: HygienePolicyConfig,
         current_cycle: int,
         now: datetime.datetime,
-    ) -> int:
+    ) -> _HygieneGcOutcome:
         """Physically delete hygiene-archived thoughts past both restore windows.
 
         **Write-lock classification: under the lock via its caller.** Called
@@ -13695,6 +13804,17 @@ class SqliteEngravaCore:
         ``_hygiene_archive``'s call and this one. Its own call to
         ``retire_orphan_reflections`` (which writes via ``update_thought``)
         is reentrant-safe on the same task for the same reason.
+
+        **Reports what it did, not just the delete count.** ``run_hygiene``
+        decides whether its unit has anything to commit from what actually
+        survived, not from a per-call count alone — a retirement can be the
+        only surviving write in an otherwise-empty pass, and a vetoed
+        delete's own trigger-driven write must not count even though
+        ``self._db.total_changes`` would still show it. The returned
+        :class:`_HygieneGcOutcome` carries the retirement count and the
+        per-candidate ``wrote_anything`` signal alongside the delete count for
+        exactly that decision; ``run_hygiene`` still reports only the delete
+        count on the public :class:`~engrava.infrastructure.sqlite.hygiene.HygieneResult`.
 
         Stage 2 — runs only when ``auto_gc_enabled``. A thought is GC-eligible
         only when it was archived **by hygiene** (``archived_at_cycle IS NOT
@@ -13723,28 +13843,40 @@ class SqliteEngravaCore:
                 deterministic.
 
         Returns:
-            The number of thoughts physically deleted.
+            A :class:`_HygieneGcOutcome` with the number of thoughts
+            physically deleted, the number of orphan REFLECTIONs retired, and
+            whether any candidate's own delete wrote something even where it
+            did not count toward the delete total.
 
         """
         eligible = await self._hygiene_gc_eligible(
             policy=policy, current_cycle=current_cycle, now=now
         )
         if not eligible:
-            return 0
+            return _HygieneGcOutcome(gc_count=0, retired_count=0, wrote_anything=False)
 
         # Retire orphan REFLECTIONs *before* any delete so a synthesis never
         # outlives its whole source cluster with a dangling edge.
-        await self.retire_orphan_reflections()
+        retired_count = await self.retire_orphan_reflections()
 
         gc_count = 0
+        wrote_anything = False
         for thought in eligible:
             before_row = await self._get_thought_row(thought.thought_id)
             if before_row is None:
                 continue
             vec_rowid = await self._embedding_rowid_for_thought(thought.thought_id)
             # Parent delete and explicit child deletes as one atomic unit —
-            # see _delete_thought_atomic for why.
+            # see _delete_thought_atomic for why. Its own ``wrote_anything``
+            # is folded in unconditionally (mirroring cleanup_expired's
+            # DELETE-strategy loop), not gated on ``deleted``: a candidate a
+            # trigger silently vetoes reports ``wrote_anything=False`` here
+            # (its own savepoint rolled the veto's own writes back too), but
+            # a future orphan-sweep-only case reporting ``True`` here must
+            # still count as a surviving write for run_hygiene's own
+            # finalization, even though it does not advance ``gc_count``.
             result = await self._delete_thought_atomic(thought.thought_id)
+            wrote_anything = result.wrote_anything or wrote_anything
             if not result.deleted:
                 continue
             await self._purge_orphan_vector(vec_rowid)
@@ -13766,7 +13898,9 @@ class SqliteEngravaCore:
                         },
                     },
                 )
-        return gc_count
+        return _HygieneGcOutcome(
+            gc_count=gc_count, retired_count=retired_count, wrote_anything=wrote_anything
+        )
 
     async def _hygiene_gc_eligible(
         self,
