@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from importlib import resources
 from itertools import islice
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, NoReturn, Self
+from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn, Self
 
 import aiosqlite
 import numpy as np
@@ -5052,8 +5052,120 @@ class SqliteEngravaCore:
                 self._open_auto_commit_windows.discard(window_id)
                 self._current_auto_commit_window.reset(window_token)
 
+    async def _open_write_unit(
+        self, name: str, *, begin: Literal["DEFERRED", "IMMEDIATE"], opened_transaction: bool
+    ) -> None:
+        """Open :meth:`_write_readback_savepoint`'s own transaction and ``SAVEPOINT``.
+
+        Split out of that method purely to keep its own cyclomatic
+        complexity in check — no behavior lives here that method's callers
+        need to know about separately.
+
+        **What this recovers from, precisely.** ``BEGIN`` and ``SAVEPOINT``
+        are each awaited separately. This recovers from a cancellation that
+        surfaces *after* SQLite has already executed one of those two
+        statements for real — on a worker thread this coroutine's own
+        cancellation cannot reach — but *before* this call's own ``await``
+        returns control here, and only when this call is also the one that
+        opened the transaction (``opened_transaction`` is ``True``). In
+        that case, on any failure, this checks live connection state
+        (``self._db.in_transaction``), never whether the awaited call was
+        observed to complete: only a plain ``rollback()`` — never
+        ``ROLLBACK TO {name}``, since this call cannot prove the
+        ``SAVEPOINT`` itself was ever created, whichever of the two
+        statements actually failed. Already-quarantined is a no-op here,
+        the same guard :meth:`_write_readback_savepoint`'s own unwind
+        applies to itself: touching ``self._db`` again would replace the
+        original exception with :class:`ConnectionQuarantinedError` instead
+        of letting it propagate. A failed rollback quarantines the
+        connection, mirroring every other compensating-rollback failure in
+        this class.
+
+        **Two related gaps exist and are deliberately not covered here.**
+        Both belong to aiosqlite's own execution model — the same class of
+        gap exists at every other call site in this class that awaits a
+        single ``self._db.execute(...)`` and predates this method — so
+        neither is patched locally; both are tracked as a separate,
+        codebase-wide backlog item instead of being half-fixed in one call
+        site:
+
+        (a) If the statement is still *queued* on aiosqlite's worker thread
+            — not yet actually executed — when the cancellation lands,
+            ``self._db.in_transaction`` can read ``False`` at the moment
+            this checks it, correctly reflecting that nothing has run yet.
+            But the worker thread does not know its queued job was
+            cancelled at the Python level, and executes it anyway once it
+            gets to it — opening a real transaction on the connection after
+            this method has already concluded there was nothing to roll
+            back, and returned. Nothing here can observe that after the
+            fact.
+        (b) If this call enters with a transaction *already* open
+            (``opened_transaction`` is ``False``) and the ``SAVEPOINT``
+            itself executes before the cancellation surfaces, that
+            savepoint is never released: the rollback above is gated on
+            ``opened_transaction`` precisely because a caller-held
+            transaction must not be ended by this call's own failure, so
+            nothing here ends it, or the savepoint nested inside it,
+            either. A transaction a caller already held is **not**
+            guaranteed to be left exactly as it was in this case — only
+            that this call never ends it and never touches any write the
+            caller made before or after this call's own attempt.
+
+        A compensating ``RELEASE {name}`` for (b) — issued only when the
+        ``SAVEPOINT`` is known to have executed before a later failure —
+        was considered and left out: the exception raised from
+        ``await self._db.execute(f"SAVEPOINT {name}")`` looks identical
+        whether that statement genuinely created the savepoint and then
+        raced with a cancellation, or never created anything because the
+        statement itself failed outright, and nothing observable here
+        distinguishes the two. Issuing ``RELEASE {name}`` on the strength
+        of a guess is not the trivially-safe addition it would need to be:
+        ``RELEASE`` targets the innermost, most-recently-created savepoint
+        with that literal name, so if this call's own ``SAVEPOINT`` never
+        actually existed, that statement would instead release some
+        unrelated, older, still-legitimate savepoint the caller's own
+        transaction happens to carry under the same name — a worse outcome
+        than the leak it would be trying to close. Left undone; this is
+        that "otherwise leave it and say so".
+
+        Args:
+            name: Savepoint name — see :meth:`_write_readback_savepoint`.
+            begin: ``"IMMEDIATE"`` or ``"DEFERRED"`` — see
+                :meth:`_write_readback_savepoint`.
+            opened_transaction: Whether this call is the one opening the
+                transaction, sampled by the caller before either statement
+                below ran.
+
+        Raises:
+            BaseException: The original failure (``asyncio.CancelledError``
+                included), or a cancellation raised by the rollback itself,
+                which always outranks it.
+
+        """
+        try:
+            if opened_transaction:
+                await self._db.execute(f"BEGIN {begin}")
+            await self._db.execute(f"SAVEPOINT {name}")
+        except BaseException as exc:
+            if self._connection_quarantined:
+                raise
+            if opened_transaction and self._db.in_transaction:
+                try:
+                    await self._db.rollback()
+                except BaseException as unwind_exc:
+                    await self._quarantine_connection(
+                        f"{name} could not roll back after failing to open its own "
+                        f"unit: {exc!r}: {unwind_exc!r}"
+                    )
+                    if isinstance(unwind_exc, asyncio.CancelledError):
+                        raise
+                    raise exc from unwind_exc
+            raise
+
     @contextlib.asynccontextmanager
-    async def _write_readback_savepoint(self, name: str) -> AsyncIterator[None]:
+    async def _write_readback_savepoint(
+        self, name: str, *, begin: Literal["DEFERRED", "IMMEDIATE"]
+    ) -> AsyncIterator[None]:
         """Make a journaled write one failure-atomic unit, with its journal entry.
 
         The store's journaled insert, update and delete paths use this to
@@ -5088,31 +5200,101 @@ class SqliteEngravaCore:
         in :meth:`_delete_thought_children_explicit` /
         :meth:`_delete_thought_atomic`: a transaction is opened first only
         when :attr:`self._db.in_transaction <aiosqlite.Connection.in_transaction>`
-        is not already ``True`` (tracked as ``opened_transaction``), and
-        opened with ``BEGIN IMMEDIATE`` rather than a deferred ``BEGIN``.
-        This matters because the guarded body reads before it writes — an
-        FTS5 trigger reading its own config counts, on top of whatever the
-        caller's own body does — and a deferred transaction's read takes a
-        WAL snapshot that the later write must then upgrade; SQLite refuses
-        that upgrade while another connection holds the write lock and
-        returns ``SQLITE_BUSY`` without ever invoking the busy handler, so
-        the unit would fail at once under contention instead of waiting out
-        ``PRAGMA busy_timeout`` like an ordinary write. ``BEGIN IMMEDIATE``
-        takes the write lock up front, through the busy handler, before
-        anything in this body gets to read. The body then runs inside a
-        named ``SAVEPOINT``, and on any failure it is unwound
-        with ``ROLLBACK TO`` + ``RELEASE`` — undoing only what this call
-        itself wrote — before the original exception propagates. Only when
-        this call is also the one that opened the transaction does it end
-        that transaction (with a rollback, never a commit); a transaction a
-        caller already held stays open, with only this call's own write
-        undone.
+        is not already ``True`` (tracked as ``opened_transaction``).
+
+        **``begin`` is required, with no default, precisely because the two
+        modes serve different, incompatible contracts, and a call site must
+        say which one it means rather than inherit a silent house default:**
+
+        * ``"IMMEDIATE"`` — for a body that reads before it writes (an FTS5
+          trigger reading its own config on insert, an existence check
+          before a delete, a before-image or a vector rowid a caller
+          deliberately reads after taking this lock). A deferred
+          transaction's read takes a WAL snapshot that the later write must
+          then upgrade; SQLite refuses that upgrade while another connection
+          holds the write lock and returns ``SQLITE_BUSY`` *without ever
+          invoking the busy handler*, so the unit would fail at once under
+          contention instead of waiting out ``PRAGMA busy_timeout`` like an
+          ordinary write. ``BEGIN IMMEDIATE`` takes the write lock up front,
+          through the busy handler, before anything in the body gets to
+          read — correctness, not a documented retry contract, is what this
+          buys. Used by every create and delete path, and by the two delete
+          paths that read their before-image / vector rowid after taking
+          this same lock.
+        * ``"DEFERRED"`` — for the four ``revision``-guarded update paths
+          (:meth:`update_thought`, :meth:`restore_thought`,
+          :meth:`update_edge`, :meth:`update_action`), which read *before*
+          opening this unit. Their guarded ``UPDATE`` is always typed via
+          :meth:`_execute_revision_guarded_write`, but **not all four settle
+          the same way, and neither settles literally "at once" in
+          general** — that shape is narrower than it looks:
+
+          * :meth:`update_thought` alone can fail within milliseconds,
+            without the busy handler ever running: a content-changing
+            update fires the FTS5 sync trigger, which reads its own config
+            as part of the *same* ``UPDATE`` statement, so the write-lock
+            upgrade that read forces is refused at once
+            (``SQLITE_BUSY``, no wait) while another connection holds the
+            lock.
+          * :meth:`restore_thought`, :meth:`update_edge` and
+            :meth:`update_action` carry no such trigger. Their guarded
+            ``UPDATE`` contends through the *ordinary* busy handler and
+            waits up to ``PRAGMA busy_timeout`` like any other write. If the
+            other writer is still holding the lock once that wait is
+            exhausted, this surfaces as typed
+            :class:`WriteContentionError`, same as the first case. But if
+            the other writer instead commits *while this call is still
+            waiting*, the guarded ``UPDATE`` proceeds once the lock frees,
+            and finds a genuinely changed ``revision`` — raising
+            ``StaleDataError``, correctly, exactly as it would have before
+            a write-opening unit ever used ``BEGIN IMMEDIATE`` at all. That
+            is not a regression this fix removes; it is the documented
+            optimistic-concurrency contract these three have always had.
+
+          What ``DEFERRED`` actually buys, for all four uniformly, is
+          narrower and does not depend on which of the two shapes above
+          applies: the read that determines ``expected_revision`` happens
+          *before* this unit ever competes for the write lock, never after
+          waiting for it. Reading only after such a wait — which an
+          ``IMMEDIATE`` unit here would do — lets a write guard a revision
+          it read *after* another process's edit had already landed,
+          rejecting a disjoint-column edit as falsely stale instead of the
+          lost update the guard exists to catch. That was measured as a
+          regression in engrava-validation's full multiprocess suite when
+          this unit read under the lock for these four paths.
+
+        The body then runs inside a named ``SAVEPOINT``, and on any failure
+        it is unwound with ``ROLLBACK TO`` + ``RELEASE`` — undoing only what
+        this call itself wrote — before the original exception propagates.
+        Only when this call is also the one that opened the transaction does
+        it end that transaction (with a rollback, never a commit); a
+        transaction a caller already held stays open, with only this call's
+        own write undone.
 
         Cancellation is handled the same way: caught alongside every other
         exception (``except BaseException``, not ``except Exception``) so a
         cancellation delivered mid-body still unwinds the savepoint rather
         than leaving it — and the write it guards — dangling on the
         connection.
+
+        **Entry itself is guarded too, not just the body — within limits.**
+        ``BEGIN`` and ``SAVEPOINT`` are each awaited separately by
+        :meth:`_open_write_unit`, and a cancellation can be delivered after
+        SQLite has already executed one of them but before that ``await``
+        returns control here — the statement still ran, on a worker thread
+        this coroutine's own cancellation cannot reach. When this call is
+        the one that opened the transaction, a failure at either point
+        rolls that transaction back (checked via live connection state,
+        never via whether the awaited call was seen to complete) with a
+        plain ``rollback()`` — never ``ROLLBACK TO`` a savepoint this call
+        cannot prove was ever created, whichever of the two statements
+        actually failed — and the original exception always propagates
+        unchanged. When a caller already held the transaction, this never
+        ends it or touches the caller's own writes either way, but a
+        ``SAVEPOINT`` that raced a cancellation right after really
+        executing can be left behind, unreleased, on that caller's
+        transaction: see :meth:`_open_write_unit`'s own docstring for
+        exactly which two gaps entry does not close, and why.
 
         **When the unwind itself cannot be trusted, this refuses rather than
         guesses.** If a ``RAISE(ROLLBACK)`` trigger already ended the whole
@@ -5131,6 +5313,9 @@ class SqliteEngravaCore:
                 fixed literal at every call site, never caller-controlled —
                 interpolated directly into the SQL since SQLite does not
                 accept savepoint names as bound parameters).
+            begin: ``"IMMEDIATE"`` or ``"DEFERRED"`` — see above. Required,
+                with no default, so every call site states its own contract
+                rather than inheriting one.
 
         Yields:
             None. The caller performs its write, read-back, and journal
@@ -5143,9 +5328,7 @@ class SqliteEngravaCore:
 
         """
         opened_transaction = not self._db.in_transaction
-        if opened_transaction:
-            await self._db.execute("BEGIN IMMEDIATE")
-        await self._db.execute(f"SAVEPOINT {name}")
+        await self._open_write_unit(name, begin=begin, opened_transaction=opened_transaction)
         try:
             yield
             # The release lives inside this guarded region, deliberately —
@@ -5240,6 +5423,65 @@ class SqliteEngravaCore:
             if not _is_busy_error(exc):
                 raise
             raise WriteContentionError(operation=operation, attempts=1) from exc
+
+    async def _rollback_self_opened_transaction(
+        self, *, opened_transaction: bool, exc: BaseException
+    ) -> None:
+        """Undo a transaction this call itself opened, on a failure before any write.
+
+        ``delete_thought`` and ``delete_edge`` each open their own ``BEGIN
+        IMMEDIATE`` *before* reading their journal before-image (and, for
+        ``delete_thought``, the embedding rowid the vector purge needs) — see
+        those methods' docstrings for why the write lock is taken before that
+        read. A failure raised while performing that read strikes before
+        :meth:`_write_readback_savepoint`'s own ``SAVEPOINT`` is ever
+        created, so there is nothing to unwind with ``ROLLBACK TO`` — only
+        the transaction itself, and only when this call is the one that
+        opened it. A transaction a caller already held when this call
+        started (``opened_transaction`` is ``False``) is left exactly as it
+        was.
+
+        Deliberately a plain ``rollback()``, not the savepoint-aware unwind
+        :meth:`_write_readback_savepoint` uses: at this point nothing has
+        been written, so undoing the whole transaction and undoing "only
+        this call's own write" are the same thing. Mirrors that method's own
+        compensating-rollback failure handling: when the rollback itself
+        fails, the connection's state cannot be trusted, so it is
+        quarantined via :meth:`_quarantine_connection` instead of leaving an
+        indeterminate transaction for a later, unrelated commit to publish.
+        Already-quarantined is also a no-op here — :meth:`_write_readback_savepoint`
+        may have quarantined the connection on its own unwind failure before
+        this ever runs, and touching ``self._db`` again would replace ``exc``
+        with :class:`ConnectionQuarantinedError` instead of letting it
+        propagate, the same guard that method's own handler applies to
+        itself.
+
+        Args:
+            opened_transaction: Whether this call is the one that opened the
+                active transaction, sampled before this call touched the
+                connection.
+            exc: The exception that triggered this cleanup — chained onto a
+                rollback failure, or left untouched when the rollback
+                succeeds (the caller re-raises it unchanged either way).
+
+        Raises:
+            BaseException: A cancellation raised by the rollback itself,
+                which always outranks ``exc``.
+
+        """
+        if self._connection_quarantined:
+            return
+        if not opened_transaction or not self._db.in_transaction:
+            return
+        try:
+            await self._db.rollback()
+        except BaseException as rollback_exc:
+            await self._quarantine_connection(
+                f"rollback after {exc!r} also failed: {rollback_exc!r}"
+            )
+            if isinstance(rollback_exc, asyncio.CancelledError):
+                raise
+            raise exc from rollback_exc
 
     def _ensure_connection_usable(self) -> None:
         """Fail fast when the connection has been quarantined.
@@ -5959,7 +6201,7 @@ class SqliteEngravaCore:
         """
         now_iso = datetime.datetime.now(datetime.UTC).isoformat()
 
-        async with self._write_readback_savepoint("increment_confirmation"):
+        async with self._write_readback_savepoint("increment_confirmation", begin="IMMEDIATE"):
             cursor = await self._db.execute(
                 "UPDATE thought SET confirmation_count = confirmation_count + 1, "
                 "updated_at = ? WHERE thought_id = ?",
@@ -6714,7 +6956,7 @@ class SqliteEngravaCore:
                     {**thought.model_dump(), **updates},
                 )
 
-            async with self._write_readback_savepoint("insert_new_thought_row"):
+            async with self._write_readback_savepoint("insert_new_thought_row", begin="IMMEDIATE"):
                 await self._db.execute(self._CORE_INSERT_SQL, self._thought_to_core_params(thought))
 
                 if self._journal is not None:
@@ -8064,7 +8306,7 @@ class SqliteEngravaCore:
 
         """
         async with self._write_lock:
-            async with self._write_readback_savepoint("insert_derived_row"):
+            async with self._write_readback_savepoint("insert_derived_row", begin="IMMEDIATE"):
                 try:
                     await self._db.execute(
                         self._CORE_INSERT_SQL,
@@ -8127,7 +8369,7 @@ class SqliteEngravaCore:
             source=KnowledgeSource.EXPERIENCE,
         )
         async with self._write_lock:
-            async with self._write_readback_savepoint("insert_derived_edge"):
+            async with self._write_readback_savepoint("insert_derived_edge", begin="IMMEDIATE"):
                 try:
                     await self._db.execute(
                         "INSERT INTO edge "
@@ -8500,7 +8742,7 @@ class SqliteEngravaCore:
             # open) before the first candidate runs, so that call's own
             # `opened_transaction` sample sees one already open and never ends
             # it on the veto path itself.
-            async with self._write_readback_savepoint("cleanup_expired"):
+            async with self._write_readback_savepoint("cleanup_expired", begin="IMMEDIATE"):
                 for tid in expired_ids:
                     if strategy is CleanupStrategy.ARCHIVE:
                         before_row = (
@@ -8721,7 +8963,7 @@ class SqliteEngravaCore:
             _validate_provenance(updated.provenance)
 
             columns = self._thought_update_columns(current, updated)
-            async with self._write_readback_savepoint("update_thought_readback"):
+            async with self._write_readback_savepoint("update_thought_readback", begin="DEFERRED"):
                 cursor = await self._execute_revision_guarded_write(
                     _build_update_sql(
                         "thought", columns, self._CORE_UPDATE_GUARD, bump_column="revision"
@@ -8856,7 +9098,7 @@ class SqliteEngravaCore:
             updated = current.evolve(**changes)
 
             columns = self._thought_update_columns(current, updated)
-            async with self._write_readback_savepoint("restore_thought_readback"):
+            async with self._write_readback_savepoint("restore_thought_readback", begin="DEFERRED"):
                 cursor = await self._execute_revision_guarded_write(
                     _build_update_sql(
                         "thought", columns, self._CORE_UPDATE_GUARD, bump_column="revision"
@@ -9091,6 +9333,21 @@ class SqliteEngravaCore:
     async def delete_thought(self, thought_id: str) -> bool:
         """Delete a thought by its ID.
 
+        **The write lock is taken before the journal before-image and the
+        embedding rowid are read, not after.** This call opens its own
+        ``BEGIN IMMEDIATE`` first (unless a transaction is already open — a
+        caller's :meth:`suspend_auto_commit` window, or a raw ``BEGIN``), so
+        a concurrent holder of the write lock is waited out first, and only
+        then does this call read the before-image and the rowid the delete
+        depends on — instead of a snapshot taken before that wait, which
+        could carry a since-superseded before-image or target a since-freed
+        rowid. There is no ``revision`` guard here to preserve either way: a
+        delete has nothing to compare a stale read against, only a row to
+        remove, so reading fresh is a pure correctness improvement, not a
+        contract change. A failure while reading either value rolls back a
+        transaction this call itself opened, never a caller's, via
+        :meth:`_rollback_self_opened_transaction`.
+
         Args:
             thought_id: UUID of the thought to delete.
 
@@ -9113,57 +9370,81 @@ class SqliteEngravaCore:
         async with self._write_lock:
             # Sampled before anything below touches the connection — see
             # _delete_thought_atomic's docstring for the ownership test this
-            # mirrors. Nothing between this line and that call is anything but
-            # a read, so this and that method's own sample cannot disagree.
+            # mirrors. Nothing between this line and the BEGIN IMMEDIATE
+            # right after it is anything but a read, so this and that
+            # method's own sample cannot disagree.
             opened_transaction = not self._db.in_transaction
+            try:
+                # Taken before either read below, not after — see this
+                # method's docstring. "Already open" also covers a
+                # same-task call already inside its own unit (the
+                # task-reentrant write lock allows that) — this never
+                # begins a second transaction there. Inside the try, not
+                # before it: a cancellation delivered after SQLite has
+                # executed this BEGIN but before the ``await`` itself
+                # returns must still reach the ``except`` below and roll
+                # this transaction back, not leave it open.
+                if opened_transaction:
+                    await self._db.execute("BEGIN IMMEDIATE")
 
-            before_row = (
-                await self._get_thought_row(thought_id) if self._journal is not None else None
-            )
+                before_row = (
+                    await self._get_thought_row(thought_id) if self._journal is not None else None
+                )
 
-            # Capture the embedding rowid *before* the delete removes the row:
-            # the vec0 vector table is not reachable by the embedding FK's
-            # ON DELETE CASCADE, so the vector must be purged explicitly to
-            # avoid a ghost.
-            vec_rowid = await self._embedding_rowid_for_thought(thought_id)
+                # Capture the embedding rowid *before* the delete removes the
+                # row: the vec0 vector table is not reachable by the
+                # embedding FK's ON DELETE CASCADE, so the vector must be
+                # purged explicitly to avoid a ghost.
+                vec_rowid = await self._embedding_rowid_for_thought(thought_id)
 
-            # Parent delete and explicit child deletes as one atomic unit —
-            # see _delete_thought_atomic for why the parent goes first (a
-            # user's own BEFORE DELETE trigger must still see the children
-            # when it checks for them) and why the child deletes still run
-            # explicitly rather than trusting ON DELETE CASCADE (a store on
-            # a pre-core-12 schema, or a connection with enforcement off,
-            # has no cascade to trust).
-            #
-            # The delete, the vector purge and the journal entry are one
-            # further failure-atomic unit on top of that, via
-            # _write_readback_savepoint (see update_thought for what that
-            # protects against): a failed or cancelled journal append here
-            # unwinds the delete too, rather than leaving it pending in the
-            # open transaction with no savepoint left to protect it —
-            # _delete_thought_atomic's own savepoint has already released by
-            # the time this call reaches its append. _delete_thought_atomic
-            # nests inside this unit unchanged: since this block already opens
-            # the transaction (when one is not already open) before that call
-            # runs, its own `opened_transaction` sample sees one already open
-            # and never ends it on the veto path itself, leaving that to this
-            # unit as usual.
-            async with self._write_readback_savepoint("delete_thought"):
-                result = await self._delete_thought_atomic(thought_id)
-                deleted = result.deleted
+                # Parent delete and explicit child deletes as one atomic
+                # unit — see _delete_thought_atomic for why the parent goes
+                # first (a user's own BEFORE DELETE trigger must still see
+                # the children when it checks for them) and why the child
+                # deletes still run explicitly rather than trusting ON
+                # DELETE CASCADE (a store on a pre-core-12 schema, or a
+                # connection with enforcement off, has no cascade to trust).
+                #
+                # The delete, the vector purge and the journal entry are one
+                # further failure-atomic unit on top of the reads above, via
+                # _write_readback_savepoint (see update_thought for what
+                # that protects against): a failed or cancelled journal
+                # append here unwinds the delete too, rather than leaving it
+                # pending in the open transaction with no savepoint left to
+                # protect it — _delete_thought_atomic's own savepoint has
+                # already released by the time this call reaches its
+                # append. _delete_thought_atomic nests inside this unit
+                # unchanged: since this block already opened the
+                # transaction (when one was not already open) before that
+                # call runs, its own `opened_transaction` sample sees one
+                # already open and never ends it on the veto path itself,
+                # leaving that to this call's own cleanup below as usual.
+                # A failure here — including inside the savepoint unit —
+                # is caught below, which is why that unit's own unwind does
+                # not also need to close this call's outer transaction: it
+                # sees one already open (`opened_transaction` is `False`
+                # there) and correctly leaves that to this `except`.
+                async with self._write_readback_savepoint("delete_thought", begin="IMMEDIATE"):
+                    result = await self._delete_thought_atomic(thought_id)
+                    deleted = result.deleted
 
-                if deleted:
-                    await self._purge_orphan_vector(vec_rowid)
+                    if deleted:
+                        await self._purge_orphan_vector(vec_rowid)
 
-                if deleted and self._journal is not None and before_row is not None:
-                    await self._journal.append(
-                        mutation_type="DELETE_THOUGHT",
-                        target_id=thought_id,
-                        delta={
-                            "before": self._row_to_thought(before_row).model_dump(mode="json"),
-                            "after": None,
-                        },
-                    )
+                    if deleted and self._journal is not None and before_row is not None:
+                        await self._journal.append(
+                            mutation_type="DELETE_THOUGHT",
+                            target_id=thought_id,
+                            delta={
+                                "before": self._row_to_thought(before_row).model_dump(mode="json"),
+                                "after": None,
+                            },
+                        )
+            except BaseException as exc:
+                await self._rollback_self_opened_transaction(
+                    opened_transaction=opened_transaction, exc=exc
+                )
+                raise
 
             if result.wrote_anything:
                 # A real write happened — the thought itself, an orphan sweep
@@ -9224,7 +9505,7 @@ class SqliteEngravaCore:
             # protects against): a failed or cancelled journal append here
             # unwinds the insert too, instead of leaving it pending with no
             # savepoint of its own protecting it.
-            async with self._write_readback_savepoint("create_edge"):
+            async with self._write_readback_savepoint("create_edge", begin="IMMEDIATE"):
                 try:
                     await self._db.execute(
                         "INSERT INTO edge "
@@ -9382,7 +9663,7 @@ class SqliteEngravaCore:
                 for name, value in _edge_to_core_columns(updated).items()
                 if before[name] != value
             }
-            async with self._write_readback_savepoint("update_edge_readback"):
+            async with self._write_readback_savepoint("update_edge_readback", begin="DEFERRED"):
                 # Sampled *inside* the savepoint, immediately after its own
                 # ``SAVEPOINT`` statement -- not before it. A caller-owned
                 # transaction with its own pending write to an FTS-indexed
@@ -9570,10 +9851,23 @@ class SqliteEngravaCore:
     async def delete_edge(self, edge_id: str) -> bool:
         """Delete an edge by its ID.
 
-        **The delete and its journal entry are one failure-atomic unit**, via
-        :meth:`_write_readback_savepoint` — see :meth:`update_thought` for what
-        that protects against. This call commits only when its own ``DELETE``
-        actually removed a row; on a missing id it rolls back only a
+        **The write lock is taken before the before-image is read, not
+        after.** This call opens its own ``BEGIN IMMEDIATE`` first (unless a
+        transaction is already open), so a concurrent holder of the write
+        lock is waited out first, and only then does this call read the
+        before-image the journal records — instead of a snapshot taken
+        before that wait, which could carry a since-superseded before-image.
+        There is no ``revision`` guard here to preserve: a delete has
+        nothing to compare a stale read against, only a row to remove, so
+        reading fresh is a pure correctness improvement. A failure while
+        reading the before-image rolls back a transaction this call itself
+        opened, never a caller's, via
+        :meth:`_rollback_self_opened_transaction`.
+
+        **The delete and its journal entry are then a further failure-atomic
+        unit**, via :meth:`_write_readback_savepoint`. This call commits
+        only when its own ``DELETE`` actually removed a row; on a missing
+        id, or on a failure reading the before-image, it rolls back only a
         transaction it opened itself, exactly like :meth:`delete_thought` —
         it never commits a caller's already-open transaction for a call that
         deleted nothing.
@@ -9589,22 +9883,40 @@ class SqliteEngravaCore:
             # Sampled before anything below touches the connection — same
             # ownership test as delete_thought.
             opened_transaction = not self._db.in_transaction
+            try:
+                # Taken before the read, not after it — see this method's
+                # docstring. Inside the try, not before it: a cancellation
+                # delivered after SQLite has executed this BEGIN but before
+                # the ``await`` itself returns must still reach the
+                # ``except`` below and roll this transaction back, not
+                # leave it open.
+                if opened_transaction:
+                    await self._db.execute("BEGIN IMMEDIATE")
 
-            before_row = await self._get_edge_row(edge_id) if self._journal is not None else None
+                before_row = (
+                    await self._get_edge_row(edge_id) if self._journal is not None else None
+                )
 
-            async with self._write_readback_savepoint("delete_edge"):
-                cursor = await self._db.execute("DELETE FROM edge WHERE edge_id = ?", (edge_id,))
-                deleted = cursor.rowcount > 0
-
-                if deleted and self._journal is not None and before_row is not None:
-                    await self._journal.append(
-                        mutation_type="DELETE_EDGE",
-                        target_id=edge_id,
-                        delta={
-                            "before": dict(before_row),
-                            "after": None,
-                        },
+                async with self._write_readback_savepoint("delete_edge", begin="IMMEDIATE"):
+                    cursor = await self._db.execute(
+                        "DELETE FROM edge WHERE edge_id = ?", (edge_id,)
                     )
+                    deleted = cursor.rowcount > 0
+
+                    if deleted and self._journal is not None and before_row is not None:
+                        await self._journal.append(
+                            mutation_type="DELETE_EDGE",
+                            target_id=edge_id,
+                            delta={
+                                "before": dict(before_row),
+                                "after": None,
+                            },
+                        )
+            except BaseException as exc:
+                await self._rollback_self_opened_transaction(
+                    opened_transaction=opened_transaction, exc=exc
+                )
+                raise
 
             if deleted:
                 await self._maybe_commit()
@@ -10110,7 +10422,7 @@ class SqliteEngravaCore:
             # unwinds the same way, leaving nothing pending in the
             # connection's open transaction for a later, unrelated commit to
             # publish. See :meth:`_write_readback_savepoint`.
-            async with self._write_readback_savepoint("store_embedding"):
+            async with self._write_readback_savepoint("store_embedding", begin="IMMEDIATE"):
                 await self._ensure_embedding_model_lock(model_name, dimension, commit=False)
                 cursor = await self._db.execute(
                     "SELECT rowid FROM embedding WHERE embedding_id = ?",
@@ -13454,7 +13766,7 @@ class SqliteEngravaCore:
             gc_count = 0
             retired_count = 0
             gc_wrote_anything = False
-            async with self._write_readback_savepoint("run_hygiene"):
+            async with self._write_readback_savepoint("run_hygiene", begin="IMMEDIATE"):
                 suppress_token = _SUPPRESS_NESTED_AUTO_COMMIT.set(True)
                 try:
                     archived_count = await self._hygiene_archive(
@@ -14256,7 +14568,7 @@ class SqliteEngravaCore:
 
         """
         async with self._write_lock:
-            async with self._write_readback_savepoint("create_action"):
+            async with self._write_readback_savepoint("create_action", begin="IMMEDIATE"):
                 await self._db.execute(
                     "INSERT INTO action "
                     "(action_id, source_thought_id, action_type, intent, "
@@ -14400,7 +14712,7 @@ class SqliteEngravaCore:
             if verification_changes:
                 columns["verification_status"] = updated.verification_status.value
 
-            async with self._write_readback_savepoint("update_action_readback"):
+            async with self._write_readback_savepoint("update_action_readback", begin="DEFERRED"):
                 cursor = await self._execute_revision_guarded_write(
                     _build_update_sql(
                         "action",

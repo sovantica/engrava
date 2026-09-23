@@ -12,7 +12,12 @@ with a raw "database is locked" instead of waiting out
 before anything in the guarded body gets to read. Not every write path reads
 before it writes, though -- see
 :func:`test_write_unit_waits_for_a_busy_lock`'s own docstring for exactly
-which of the six operations exercised here were actually affected.
+which of the five operations exercised here were actually affected.
+``update_thought`` is deliberately not one of them: a later workstream
+reverted its own unit to a deferred ``BEGIN`` on purpose, restoring a
+documented fail-fast-under-contention contract these five never had — see
+``tests/test_begin_immediate_contention_is_typed.py`` for that path's own,
+now-opposite pinning.
 
 This module races real ``multiprocessing.Process`` workers (not asyncio
 tasks or a second connection in the same process, which shares the
@@ -58,7 +63,7 @@ if TYPE_CHECKING:
 #: acquires the lock). Long enough that a contender which merely got lucky
 #: with scheduling could not be mistaken for one that actually waited out
 #: contention; short enough to keep this module's total run time reasonable
-#: across six parametrized operations.
+#: across five parametrized operations.
 _HOLD_SECONDS = 1.0
 
 #: The contender's own ``PRAGMA busy_timeout``, comfortably above
@@ -106,7 +111,6 @@ _FORCE_STOP_GRACE_SECONDS = 5.0
 # and neither does this test's own seeding.
 _SEED_THOUGHT_A = "seed-thought-a"
 _SEED_THOUGHT_B = "seed-thought-b"
-_SEED_THOUGHT_TO_UPDATE = "seed-thought-to-update"
 _SEED_THOUGHT_TO_DELETE = "seed-thought-to-delete"
 _SEED_THOUGHT_ACTION_SOURCE = "seed-thought-action-source"
 _SEED_EDGE = "seed-edge"
@@ -115,15 +119,15 @@ _NEW_THOUGHT_ID = "contender-created-thought"
 _NEW_EDGE_ID = "contender-created-edge"
 _NEW_ACTION_ID = "contender-created-action"
 
-_UPDATED_CONTENT = "updated by the contender"
-
 #: Every operation the workstream's acceptance criteria names.
+#: ``update_thought`` was here too until a later workstream reverted its own
+#: unit to a deferred ``BEGIN`` on purpose, restoring a documented
+#: fail-fast-under-contention contract — see the module docstring.
 _OPERATIONS = (
     "create_thought",
     "delete_thought",
     "create_edge",
     "delete_edge",
-    "update_thought",
     "create_action",
 )
 
@@ -429,8 +433,6 @@ async def _contender_async(  # noqa: PLR0917 - called positionally, mirroring _c
                 if not deleted:
                     msg = "delete_edge reported no row deleted"
                     raise AssertionError(msg)
-            elif op == "update_thought":
-                await store.update_thought(_SEED_THOUGHT_TO_UPDATE, content=_UPDATED_CONTENT)
             elif op == "create_action":
                 await store.create_action(
                     ActionRecord(
@@ -502,7 +504,6 @@ async def _bootstrap_and_seed(path: str) -> None:
     for thought_id in (
         _SEED_THOUGHT_A,
         _SEED_THOUGHT_B,
-        _SEED_THOUGHT_TO_UPDATE,
         _SEED_THOUGHT_TO_DELETE,
         _SEED_THOUGHT_ACTION_SOURCE,
     ):
@@ -558,12 +559,6 @@ def _assert_durable(path: str, op: str) -> None:
         elif op == "delete_edge":
             row = conn.execute("SELECT 1 FROM edge WHERE edge_id = ?", (_SEED_EDGE,)).fetchone()
             assert row is None, "delete_edge's delete is not durable"
-        elif op == "update_thought":
-            row = conn.execute(
-                "SELECT content FROM thought WHERE thought_id = ?", (_SEED_THOUGHT_TO_UPDATE,)
-            ).fetchone()
-            assert row is not None
-            assert row[0] == _UPDATED_CONTENT, "update_thought's write is not durable"
         elif op == "create_action":
             row = conn.execute(
                 "SELECT 1 FROM action WHERE action_id = ?", (_NEW_ACTION_ID,)
@@ -580,25 +575,38 @@ def _assert_durable(path: str, op: str) -> None:
 def test_write_unit_waits_for_a_busy_lock(db_path: str, op: str) -> None:
     """A contending write waits out the holder's lock instead of failing at once.
 
-    Before the fix, ``create_thought``, ``delete_thought`` and
-    ``update_thought`` failed at once under contention: each one's write path
-    reads before it writes, inside the transaction that
-    ``_write_readback_savepoint`` (``create_thought`` via
-    ``_insert_new_thought_row``'s FTS5 sync trigger reading its own config on
-    insert, and ``update_thought`` the same trigger firing on a
-    content-changing update) or ``_delete_thought_atomic`` (its own
-    existence-check ``SELECT``) opened with a deferred ``BEGIN``. That read
-    took a WAL snapshot the write then had to upgrade, and SQLite refused the
-    upgrade while the holder process held the lock: ``SQLITE_BUSY`` at once,
-    without the busy handler ever running -- confirmed by running this test
-    against the pre-fix tree, where these three failed in ~2 ms.
-    ``create_edge``, ``delete_edge`` and ``create_action`` already waited and
-    succeeded even before the fix: nothing reads inside their unit before
-    its write, so a deferred ``BEGIN`` never had a snapshot to upgrade there
-    in the first place. With every write-opening unit now using
+    Before the fix, ``create_thought`` and ``delete_thought`` failed at once
+    under contention: each one's write path reads before it writes, inside
+    the transaction that ``_write_readback_savepoint`` (``create_thought``
+    via ``_insert_new_thought_row``'s FTS5 sync trigger reading its own
+    config on insert) or ``_delete_thought_atomic`` (its own existence-check
+    ``SELECT``) opened with a deferred ``BEGIN``. That read took a WAL
+    snapshot the write then had to upgrade, and SQLite refused the upgrade
+    while the holder process held the lock: ``SQLITE_BUSY`` at once, without
+    the busy handler ever running -- confirmed by running this test against
+    the pre-fix tree, where these two failed in ~2 ms. ``create_edge``,
+    ``delete_edge`` and ``create_action`` already waited and succeeded even
+    before the fix: nothing reads inside their unit before its write, so a
+    deferred ``BEGIN`` never had a snapshot to upgrade there in the first
+    place. With every one of these five write-opening units now using
     ``BEGIN IMMEDIATE``, the write lock is taken up front, through the busy
-    handler, for all six -- so every operation parametrized here waits out
-    the hold and succeeds.
+    handler -- so every operation parametrized here waits out the hold and
+    succeeds.
+
+    ``update_thought`` originally belonged to the first group (its own
+    content-changing update fires the same FTS5 sync trigger
+    ``create_thought``'s insert does) and, for one workstream, waited here
+    too. A later, narrower-scoped workstream reverted ``update_thought``'s
+    own unit to a deferred ``BEGIN`` on purpose: measured against
+    engrava-validation's full multiprocess suite, having it wait here turned
+    a *documented* fail-fast-under-contention contract (a caller retries a
+    typed ``WriteContentionError``) into a wait that could read a revision
+    before another process's disjoint-column edit and reject it as falsely
+    stale. ``update_thought`` is intentionally absent from
+    :data:`_OPERATIONS` now; see
+    ``tests/test_begin_immediate_contention_is_typed.py`` for its own,
+    opposite pinning — contention fails fast there, typed, not this
+    module's "waits and succeeds".
     """
     ctx = multiprocessing.get_context("spawn")
     holding = ctx.Event()
