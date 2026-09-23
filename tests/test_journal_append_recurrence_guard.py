@@ -40,6 +40,8 @@ from engrava.infrastructure.sqlite import engrava_core
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    import pytest
+
 # The wrapper every append site must nest inside, directly or transitively
 # through a registered helper. Matches ``self._write_readback_savepoint(...)``
 # used as an ``async with`` context expression.
@@ -69,21 +71,18 @@ _HELPER_FUNCTIONS = frozenset(
 # contains -- a count mismatch (a second, unrelated append added beside the
 # recorded one) fails the guard just as an entirely new, unregistered site
 # would. Keyed by fully qualified name, same reasoning as `_HELPER_FUNCTIONS`.
-_EXEMPTIONS: dict[str, tuple[str, int]] = {
-    "SqliteEngravaCore._insert_derived_row": (
-        (
-            "Recovers through _compensate_child_rollback's full-transaction, "
-            "shielded, quarantine-on-failed-unwind rollback instead -- a "
-            "documented contract for derivation inside a caller's suspend_auto_commit "
-            "window (see _write_readback_savepoint's callers list)."
-        ),
-        1,
-    ),
-    "SqliteEngravaCore._insert_derived_edge": (
-        "Same compensating-rollback contract as _insert_derived_row.",
-        1,
-    ),
-}
+#
+# Empty on the real tree: `_insert_derived_row` and `_insert_derived_edge`
+# used to be registered here (their appends recovered through a full-
+# transaction compensating rollback instead of their own savepoint unit).
+# Both are now wrapped in their own `_write_readback_savepoint` block like
+# every other journaled insert, so neither needs an exemption any more --
+# the guard protects them lexically instead. Kept as a real, empty registry
+# (not deleted) so the exemption machinery below still has a home; the
+# scratch mutations further down register their own synthetic entries via
+# `monkeypatch` to keep exercising that machinery without a real function on
+# the exemption table.
+_EXEMPTIONS: dict[str, tuple[str, int]] = {}
 
 
 @dataclass(frozen=True)
@@ -444,38 +443,6 @@ def _insert_before_first_match(source: str, needle: str, insertion: str) -> str:
     raise AssertionError(msg)
 
 
-def _remove_journal_append_call_in_function(source: str, def_needle: str) -> str:
-    """Delete the (first) ``await self._journal.append(...)`` statement inside one function.
-
-    Scoped by scanning forward from the ``def`` line matching ``def_needle``
-    to that function's own first append call, then removing exactly that
-    statement -- balancing parens across its multi-line argument list -- and
-    replacing it with ``pass`` so its enclosing ``if self._journal is not
-    None:`` guard is not left with an empty (syntactically invalid) body.
-    """
-    lines = source.splitlines(keepends=True)
-    func_start = next((i for i, line in enumerate(lines) if def_needle in line), None)
-    if func_start is None:
-        msg = f"needle not found: {def_needle!r}"
-        raise AssertionError(msg)
-    append_start = next(
-        (i for i in range(func_start, len(lines)) if "await self._journal.append(" in lines[i]),
-        None,
-    )
-    if append_start is None:
-        msg = f"no journal.append() call found after {def_needle!r}"
-        raise AssertionError(msg)
-    depth = 0
-    append_end = append_start
-    for i in range(append_start, len(lines)):
-        depth += lines[i].count("(") - lines[i].count(")")
-        if depth == 0:
-            append_end = i
-            break
-    indent = lines[append_start][: len(lines[append_start]) - len(lines[append_start].lstrip())]
-    return "".join([*lines[:append_start], f"{indent}pass\n", *lines[append_end + 1 :]])
-
-
 class TestRecurrenceGuardCatchesAnUnprotectedAppend:
     def test_a_new_unprotected_append_on_an_already_registered_method(self) -> None:
         """(a) A second, unguarded append added inside an already-wrapped method.
@@ -506,23 +473,38 @@ class TestRecurrenceGuardCatchesAnUnprotectedAppend:
         violations = check_recurrence_guard(mutated)
         assert any("_scratch_mutation_new_unguarded_append" in v for v in violations), violations
 
-    def test_a_new_unprotected_append_next_to_an_exempt_functions_existing_one(self) -> None:
-        """(c) A second append added beside the one recorded exemption count expects.
+    def test_a_new_unprotected_append_next_to_an_exempt_functions_existing_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """(c) A second append added beside the one an exemption's recorded count expects.
 
-        ``_insert_derived_row`` is exempt with an exact recorded count of
-        ``1``; a second append call node there must trip the count check even
-        though the function is exempt, not merely be waved through because
-        the function's name is on the exemption table at all.
+        A registered exemption's append count must be exact: a second append
+        call node added beside the one it was recorded for must trip the count
+        check even though the function is still exempt, not merely be waved
+        through because the function's name is on the exemption table at all.
+        No function on the real tree is exempt any more (``_insert_derived_row``
+        and ``_insert_derived_edge`` moved to their own savepoint units), so
+        this registers a scratch function as a synthetic exemption instead of
+        depending on one of the real tree's own functions to stay exempt.
         """
         source = _engrava_core_source()
-        assert source.count("async def _insert_derived_row(") == 1
-        mutated = _insert_after_first_match(
-            source,
-            "    async def _insert_derived_row(",
-            _UNPROTECTED_APPEND_STATEMENT,
+        scratch_method = (
+            "\n"
+            "    async def _scratch_mutation_exempt_with_extra_append(self) -> None:\n"
+            '        """Scratch mutation (c): a registered exemption gains a second append."""\n'
+            + _UNPROTECTED_APPEND_STATEMENT
+            + _UNPROTECTED_APPEND_STATEMENT
+        )
+        mutated = _insert_after_first_match(source, "class SqliteEngravaCore:", scratch_method)
+        monkeypatch.setitem(
+            _EXEMPTIONS,
+            "SqliteEngravaCore._scratch_mutation_exempt_with_extra_append",
+            ("scratch exemption for this test", 1),
         )
         violations = check_recurrence_guard(mutated)
-        assert any("_insert_derived_row" in v and "exempt" in v for v in violations), violations
+        assert any(
+            "_scratch_mutation_exempt_with_extra_append" in v and "exempt" in v for v in violations
+        ), violations
 
 
 # ---------------------------------------------------------------------------
@@ -536,31 +518,57 @@ class TestRecurrenceGuardCatchesAnUnprotectedAppend:
 
 
 class TestRecurrenceGuardCatchesAStaleOrMisscopedRegistration:
-    def test_exempt_function_with_its_only_append_removed(self) -> None:
-        """(i) Deleting `_insert_derived_edge`'s one append must still be a count mismatch.
+    def test_exempt_function_with_its_only_append_removed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """(i) An exempt function whose only append is gone must still be a count mismatch.
 
         Before this was fixed, the guard only ever looked at functions that
         still had at least one append call node (keyed off `by_function`), so
         a function registered as exempt with count 1 that dropped to 0 simply
         never got checked at all -- it fell out of the scan, not just out of
-        the count.
+        the count. No function on the real tree is exempt any more, so this
+        registers a scratch function -- with no append at all -- as a
+        synthetic exemption instead.
         """
         source = _engrava_core_source()
-        mutated = _remove_journal_append_call_in_function(
-            source, "    async def _insert_derived_edge("
+        scratch_method = (
+            "\n"
+            "    async def _scratch_mutation_exempt_now_empty(self) -> None:\n"
+            '        """Scratch mutation (i): a registered exemption\'s append is gone."""\n'
+            "        pass\n"
+        )
+        mutated = _insert_after_first_match(source, "class SqliteEngravaCore:", scratch_method)
+        monkeypatch.setitem(
+            _EXEMPTIONS,
+            "SqliteEngravaCore._scratch_mutation_exempt_now_empty",
+            ("scratch exemption for this test", 1),
         )
         violations = check_recurrence_guard(mutated)
-        assert any("_insert_derived_edge" in v and "0 found" in v for v in violations), violations
-
-    def test_renamed_exempt_function_no_longer_exists(self) -> None:
-        """(ii) A rename leaves the exemption table pointing at a name nobody defines."""
-        source = _engrava_core_source()
-        assert source.count("_insert_derived_row") >= 2  # def + at least one call site
-        mutated = source.replace("_insert_derived_row", "_insert_derived_row_renamed")
-        assert "_insert_derived_row_renamed" in mutated
-        violations = check_recurrence_guard(mutated)
         assert any(
-            "_insert_derived_row" in v and "no function by that name is defined" in v
+            "_scratch_mutation_exempt_now_empty" in v and "0 found" in v for v in violations
+        ), violations
+
+    def test_renamed_exempt_function_no_longer_exists(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """(ii) A stale registration pointing at a function nobody defines must be caught.
+
+        No function on the real tree is exempt any more, so this registers a
+        synthetic exemption for a name that is never defined anywhere in the
+        (unmodified) source -- the same stale-registration shape a rename
+        would produce, without depending on a real function to rename.
+        """
+        source = _engrava_core_source()
+        monkeypatch.setitem(
+            _EXEMPTIONS,
+            "SqliteEngravaCore._scratch_mutation_exempt_renamed_away",
+            ("scratch exemption for this test", 1),
+        )
+        violations = check_recurrence_guard(source)
+        assert any(
+            "_scratch_mutation_exempt_renamed_away" in v
+            and "no function by that name is defined" in v
             for v in violations
         ), violations
 

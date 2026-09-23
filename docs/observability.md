@@ -272,12 +272,15 @@ as typed exceptions for the caller to handle rather than logging them.
 
 The one departure: when the derived-records extension is enabled
 (`derive.enabled=True`, off by default, and only reachable with a producer
-capability configured) and a per-child rollback fails after its source has
-already committed, that failure logs at `ERROR` (`derive.on_error="log"`, the
-default for that setting) and the remaining children are abandoned without
-raising — the source is already durable, so under the default policy this must
-not escape as a caller-visible exception. This is the library's only `ERROR`
-call site. Configure it like any library logger:
+capability configured) and a derived child's own failed write cannot be
+unwound — quarantining the connection — after its source has already
+committed, that failure logs at `ERROR` (`derive.on_error="log"`, the default
+for that setting) and then still propagates: a quarantined connection can no
+longer be trusted for the remaining children, so even under the default
+policy this is not swallowed. An ordinary per-child failure that unwinds
+cleanly stays at the usual `WARNING` level and does not raise under `"log"`.
+This is the library's only `ERROR` call site. Configure it like any library
+logger:
 
 ```python
 import logging

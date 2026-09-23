@@ -63,7 +63,6 @@ from engrava.embeddings.callback import CallbackProvider
 from engrava.infrastructure.sqlite.engrava_core import (
     _DERIVED_ESSENCE_MAX_CHARS,
     _build_embed_input,
-    _DerivationRollbackError,
     _derived_edge_id,
     _derived_thought_id,
     _essence_from_content,
@@ -1539,6 +1538,54 @@ def _patch_journal_to_fail(
     monkeypatch.setattr(store._journal, "append", _flaky_append)
 
 
+def _patch_unwind_to_fail(
+    store: SqliteEngravaCore,
+    monkeypatch: pytest.MonkeyPatch,
+    savepoint_name: str,
+    unwind_exc: BaseException,
+) -> None:
+    """Make a ``_write_readback_savepoint`` unit's own ``ROLLBACK TO`` fail.
+
+    Patches the store's connection so the literal ``ROLLBACK TO
+    <savepoint_name>`` statement raises ``unwind_exc`` instead of running --
+    simulating an unwind whose own recovery cannot be trusted -- while every
+    other statement (including the failing write that triggers the unwind in
+    the first place) executes normally.
+    """
+    real_execute = store._db.execute
+    target_sql = f"ROLLBACK TO {savepoint_name}"
+
+    async def _wrapper(sql: str, *args: object, **kwargs: object) -> object:
+        if sql == target_sql:
+            raise unwind_exc
+        return await real_execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(store._db, "execute", _wrapper)
+
+
+def _spy_on_insert_derived_row(
+    store: SqliteEngravaCore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[str]:
+    """Record every child id actually passed to ``_insert_derived_row``.
+
+    A row's own absence after a failure proves the write was undone, but not
+    that a *later* child was never attempted at all (an attempt can fail
+    before writing anything). Wrapping the store's own bound method observes
+    every call this instance makes, in order, regardless of whether that call
+    goes on to write, fail, or never even reach the database.
+    """
+    seen: list[str] = []
+    original = store._insert_derived_row
+
+    async def _spy(child: ThoughtRecord) -> bool:
+        seen.append(child.thought_id)
+        return await original(child)
+
+    monkeypatch.setattr(store, "_insert_derived_row", _spy)
+    return seen
+
+
 async def test_child_insert_journal_failure_log_leaves_no_orphan(
     db: aiosqlite.Connection,
     monkeypatch: pytest.MonkeyPatch,
@@ -1670,35 +1717,30 @@ async def test_cancellation_during_pending_child_insert_rolls_back(
     assert (await store.verify_journal()).valid
 
 
-async def test_failed_rollback_aborts_derivation_raise_propagates(
+async def test_failed_unwind_aborts_derivation_raise_propagates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Under ``on_error="raise"`` a failed per-child rollback propagates + quarantines.
+    """Under ``on_error="raise"`` a failed per-child unwind propagates + quarantines.
 
-    A rollback failure leaves the transaction indeterminate, so the dispatch
-    aborts (``_DerivationRollbackError`` under the raise policy) AND — (#1) any
-    non-clean compensating rollback quarantines the store, whether or not a
-    cancellation was involved — the connection is hard-invalidated so a later
-    op can never flush the orphan. The source + earlier child committed before
-    the failure stay durable on disk (verified via a fresh connection).
+    ``_insert_derived_row``'s own ``_write_readback_savepoint`` unit unwinds a
+    failed insert with ``ROLLBACK TO`` + ``RELEASE``; when that unwind itself
+    fails, recovery cannot be proven, so the connection is quarantined and the
+    child's *original* error (not a wrapper) propagates. The source + earlier
+    child committed before the failure stay durable on disk (verified via a
+    fresh connection).
     """
     db_path = tmp_path / "seam.db"
     store, conn = await _file_journaled_seam_store(db_path, "raise")
     poison = _derived_thought_id(_SEGMENTS[1])  # the 2nd of three children
     _patch_journal_to_fail(store, monkeypatch, mutation_type="INSERT_THOUGHT", target_id=poison)
+    _patch_unwind_to_fail(store, monkeypatch, "insert_derived_row", RuntimeError("rollback down"))
 
-    async def _bad_rollback() -> None:
-        msg = "rollback down"
-        raise RuntimeError(msg)
-
-    monkeypatch.setattr(store._db, "rollback", _bad_rollback)
-
-    with pytest.raises(_DerivationRollbackError):
+    with pytest.raises(RuntimeError, match="journal down"):
         await store.create_thought(_source(content=_THREE_PARAS))
 
-    # (#1) The store is quarantined and any subsequent op fails fast — reverting
-    # the quarantine-on-non-cancel fix leaves the store usable and this fails.
+    # The store is quarantined and any subsequent op fails fast — reverting the
+    # quarantine-on-failed-unwind fix leaves the store usable and this fails.
     assert store._connection_quarantined is True
     with pytest.raises(ConnectionQuarantinedError):
         await store.get_thought("src-1")
@@ -1714,33 +1756,35 @@ async def test_failed_rollback_aborts_derivation_raise_propagates(
     await conn.close()  # already closed by quarantine; double close is a no-op
 
 
-async def test_failed_rollback_aborts_derivation_log_does_not_raise(
+async def test_failed_unwind_aborts_derivation_log_propagates_after_logging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Under ``on_error="log"`` a failed per-child rollback aborts WITHOUT raising.
+    """Under ``on_error="log"`` a failed per-child unwind still propagates.
 
-    The source is already durably committed, so a ``_DerivationRollbackError``
-    must never escape a ``"log"`` policy as a caller-visible raise (fail-open,
-    ADR D10). But a rollback failure is indeterminate, so (#1) the store is still
-    quarantined even under ``"log"`` — precisely to stop the log-and-continue
-    caller from later flushing the orphan on the same store.
+    A quarantined connection cannot be trusted for the remaining children under
+    either policy, so this is the one case where the fail-open ``"log"`` policy
+    does not swallow the failure: it logs at ``ERROR`` first — naming the
+    source, so an operator can find which one was orphaned — then still raises.
+    This replaces the old ``_DerivationRollbackError`` rule, which quarantined
+    the same way but stopped silently under ``"log"`` instead of propagating.
     """
     db_path = tmp_path / "seam.db"
     store, conn = await _file_journaled_seam_store(db_path, "log")
     poison = _derived_thought_id(_SEGMENTS[1])  # the 2nd of three children
     _patch_journal_to_fail(store, monkeypatch, mutation_type="INSERT_THOUGHT", target_id=poison)
+    _patch_unwind_to_fail(store, monkeypatch, "insert_derived_row", RuntimeError("rollback down"))
 
-    async def _bad_rollback() -> None:
-        msg = "rollback down"
-        raise RuntimeError(msg)
+    with (
+        caplog.at_level(logging.ERROR, logger=core_module.__name__),
+        pytest.raises(RuntimeError, match="journal down"),
+    ):
+        await store.create_thought(_source(content=_THREE_PARAS))
+    assert any(record.levelno == logging.ERROR for record in caplog.records)
+    assert any("src-1" in record.getMessage() for record in caplog.records)
 
-    monkeypatch.setattr(store._db, "rollback", _bad_rollback)
-
-    # No exception escapes to the caller under the log policy (F2 preserved).
-    await store.create_thought(_source(content=_THREE_PARAS))
-
-    # (#1) But the store is quarantined and a subsequent op fails fast.
+    # The store is quarantined and a subsequent op fails fast.
     assert store._connection_quarantined is True
     with pytest.raises(ConnectionQuarantinedError):
         await store.get_thought("src-1")
@@ -1753,15 +1797,15 @@ async def test_failed_rollback_aborts_derivation_log_does_not_raise(
     await conn.close()
 
 
-async def test_cancellation_with_failed_rollback_still_propagates_cancelled(
+async def test_cancelled_child_with_failed_unwind_still_propagates_cancelled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A cancelled child whose rollback also fails propagates CancelledError + quarantines.
+    """A cancelled child whose unwind also fails propagates CancelledError + quarantines.
 
-    D10 requires ``CancelledError`` to always propagate. Even when the
-    compensating rollback itself raises an ordinary exception, the cancellation —
-    not the rollback error — is what escapes; and (#1) the failed rollback still
+    ``CancelledError`` always propagates. Even when the unit's own unwind
+    raises an ordinary exception trying to recover from it, the cancellation —
+    not the unwind's own error — is what escapes; and the failed unwind still
     quarantines the store.
     """
     db_path = tmp_path / "seam.db"
@@ -1780,12 +1824,9 @@ async def test_cancellation_with_failed_rollback_still_propagates_cancelled(
             raise asyncio.CancelledError
         return await original_append(mutation_type=mutation_type, target_id=target_id, delta=delta)
 
-    async def _bad_rollback() -> None:
-        msg = "rollback down"
-        raise RuntimeError(msg)
-
     monkeypatch.setattr(store._journal, "append", _cancel_append)
-    monkeypatch.setattr(store._db, "rollback", _bad_rollback)
+    _patch_unwind_to_fail(store, monkeypatch, "insert_derived_row", RuntimeError("rollback down"))
+    attempted = _spy_on_insert_derived_row(store, monkeypatch)
 
     with pytest.raises(asyncio.CancelledError):
         await store.create_thought(_source(content=_THREE_PARAS))
@@ -1794,120 +1835,63 @@ async def test_cancellation_with_failed_rollback_still_propagates_cancelled(
     with pytest.raises(ConnectionQuarantinedError):
         await store.get_thought("src-1")
 
+    # The never-processed third child was never even attempted -- a row's own
+    # absence would not by itself rule out a failed attempt at it.
+    assert _derived_thought_id(_SEGMENTS[2]) not in attempted
+    assert attempted == [_derived_thought_id(_SEGMENTS[0]), poison]
+
+    # It is absent on disk too: a quarantined connection is non-continuable,
+    # so the dispatch must never reach it.
     await _reopen_and_verify_durable(
         db_path,
         present=["src-1", _derived_thought_id(_SEGMENTS[0])],
-        absent=[poison],
+        absent=[poison, _derived_thought_id(_SEGMENTS[2])],
     )
     await conn.close()
 
 
-async def test_repeated_cancellation_during_rollback_still_completes_it(
-    db: aiosqlite.Connection,
+async def test_cancelled_unwind_itself_still_propagates_cancelled_and_quarantines(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The shielded compensating rollback completes despite repeated cancellation.
+    """A cancellation landing during the unwind itself still quarantines + propagates.
 
-    A child fails (ordinary error) and enters the compensating rollback, which
-    runs as a shielded task. The caller is then cancelled *twice* while awaiting
-    it. Because the rollback task is shielded, neither cancellation aborts it: it
-    runs to completion, so ``in_transaction`` is ``False`` and the poison child's
-    pending insert is discarded — while ``CancelledError`` still propagates.
-
-    Reverting the hardening (the old ``suppress`` + unshielded retry) lets the
-    repeated cancellation abort the rollback, leaving the connection
-    mid-transaction (``in_transaction`` stays ``True``), which this test catches.
+    Distinct from the previous test: there the *child's own write* was
+    cancelled and the unwind's *recovery attempt* failed with an ordinary
+    error; here the child's own write fails with an ordinary error and it is
+    the unwind's ``ROLLBACK TO`` itself that is cancelled. Either shape must
+    quarantine the connection (recovery cannot be proven either way), let the
+    ``CancelledError`` win, and never reach the never-processed third child —
+    checked on disk via a fresh connection, since quarantine hard-closes this
+    one (an in-memory database would simply lose its data at that point).
     """
-    store = _journaled_seam_store(db, "log")
-    poison = _derived_thought_id(_SEGMENTS[1])  # the 2nd of three children
-    # Make the poison child's INSERT_THOUGHT journal append fail (ordinary error)
-    # so the child enters the compensating-rollback path.
-    _patch_journal_to_fail(store, monkeypatch, mutation_type="INSERT_THOUGHT", target_id=poison)
-
-    real_rollback = store._db.rollback
-    started = asyncio.Event()
-    release = asyncio.Event()
-    completed = {"done": False}
-
-    async def _slow_rollback() -> None:
-        # Signal it has started, block until released (so the caller can be
-        # cancelled mid-rollback), then run the real rollback to completion.
-        started.set()
-        await release.wait()
-        await real_rollback()
-        completed["done"] = True
-
-    monkeypatch.setattr(store._db, "rollback", _slow_rollback)
-
-    task = asyncio.create_task(store.create_thought(_source(content=_THREE_PARAS)))
-    await started.wait()  # the shielded rollback task is running
-    task.cancel()  # cancel the caller while it awaits the rollback
-    await asyncio.sleep(0)
-    task.cancel()  # a repeated cancellation must not abort the shielded rollback
-    await asyncio.sleep(0)
-    release.set()  # let the shielded rollback finish
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    # The shielded rollback ran to completion despite the repeated cancellation:
-    # no open transaction leaks and the poison child's pending insert is gone.
-    assert completed["done"] is True
-    assert store._db.in_transaction is False
-    assert store._connection_quarantined is False  # a clean rollback never quarantines
-    assert await store.get_thought(poison) is None
-    assert await store.get_thought("src-1") is not None
-    assert await store.get_thought(_derived_thought_id(_SEGMENTS[0])) is not None
-    assert (await store.verify_journal()).valid
-
-
-async def test_rollback_failure_during_cancellation_quarantines_store(
-    db: aiosqlite.Connection,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A rollback that ultimately fails under cancellation quarantines the store.
-
-    When a cancellation is in flight and the compensating rollback ultimately
-    *fails*, the long-lived connection may still hold an open transaction. The
-    store must be quarantined so a subsequent public operation fails fast with a
-    typed ``ConnectionQuarantinedError`` rather than silently running on /able
-    to flush the indeterminate transaction. The cancellation still propagates.
-
-    Reverting the quarantine leaves the store usable, so the follow-up operation
-    would run on the open transaction instead of failing — which this test
-    catches.
-    """
-    store = _journaled_seam_store(db, "log")
+    db_path = tmp_path / "seam.db"
+    store, conn = await _file_journaled_seam_store(db_path, "log")
     poison = _derived_thought_id(_SEGMENTS[1])
     _patch_journal_to_fail(store, monkeypatch, mutation_type="INSERT_THOUGHT", target_id=poison)
+    _patch_unwind_to_fail(store, monkeypatch, "insert_derived_row", asyncio.CancelledError())
+    attempted = _spy_on_insert_derived_row(store, monkeypatch)
 
-    started = asyncio.Event()
-    release = asyncio.Event()
-
-    async def _slow_failing_rollback() -> None:
-        started.set()
-        await release.wait()
-        msg = "rollback truly failed"
-        raise RuntimeError(msg)
-
-    monkeypatch.setattr(store._db, "rollback", _slow_failing_rollback)
-
-    task = asyncio.create_task(store.create_thought(_source(content=_THREE_PARAS)))
-    await started.wait()
-    task.cancel()  # cancel the caller while it awaits the rollback
-    await asyncio.sleep(0)
-    release.set()  # the shielded rollback now runs to completion — and fails
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await store.create_thought(_source(content=_THREE_PARAS))
 
-    # The rollback ultimately failed while a cancellation was in flight, so the
-    # connection may still hold an open transaction: the store is quarantined and
-    # every subsequent public operation fails fast rather than running on it.
     assert store._connection_quarantined is True
     with pytest.raises(ConnectionQuarantinedError):
         await store.get_thought("src-1")
     with pytest.raises(ConnectionQuarantinedError):
         await store.create_thought(_source("src-2", content="unrelated body"))
-    await _drain_quarantine_close(store)
+
+    # The never-processed third child was never even attempted -- a row's own
+    # absence would not by itself rule out a failed attempt at it.
+    assert _derived_thought_id(_SEGMENTS[2]) not in attempted
+    assert attempted == [_derived_thought_id(_SEGMENTS[0]), poison]
+
+    await _reopen_and_verify_durable(
+        db_path,
+        present=["src-1", _derived_thought_id(_SEGMENTS[0])],
+        absent=[poison, _derived_thought_id(_SEGMENTS[2])],
+    )
+    await conn.close()  # already closed by quarantine; double close is a no-op
 
 
 async def test_quarantined_store_commit_backstop_refuses(
@@ -2114,12 +2098,10 @@ async def test_close_cancellation_does_not_corpse_the_physical_close(
     Draining under ``_drain_shielded`` closes this off structurally rather
     than papering over it: it re-shields on every repeated cancellation and
     never returns until the task is genuinely done, so the physical close
-    always runs to real completion. This mirrors the already-proven pattern
-    for the compensating-rollback flow
-    (``test_repeated_cancellation_during_rollback_still_completes_it``),
-    reused here for the same reason: a single cancellation is easy for a
-    coroutine to absorb by accident; a *repeated* one is what actually
-    exercises whether the shield holds.
+    always runs to real completion. This is the same ``_drain_shielded``
+    helper used elsewhere for the identical reason (see its own docstring):
+    a single cancellation is easy for a coroutine to absorb by accident; a
+    *repeated* one is what actually exercises whether the shield holds.
     """
     conn = await aiosqlite.connect(":memory:")
     conn.row_factory = aiosqlite.Row
@@ -2685,26 +2667,27 @@ async def test_close_bound_covers_the_access_buffer_flush_too() -> None:
         )
 
 
-async def test_cancelled_rollback_task_quarantines_and_propagates_cancelled(
+async def test_cancelled_unwinds_own_closing_rollback_quarantines_and_propagates(
     db: aiosqlite.Connection,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """(#2) A cancelled compensating-rollback task quarantines + propagates cancel.
+    """A cancellation on the unwind's own closing ``rollback()`` quarantines + propagates.
 
-    If the rollback task is cancelled, ``rollback_task.exception()`` would raise
-    ``CancelledError`` — which, unguarded, escapes *before* the quarantine runs.
-    Checking ``cancelled()`` first treats it as non-clean completion: the store
-    is quarantined and a ``CancelledError`` still propagates. Reverting the
-    ``cancelled()`` guard skips the quarantine, so the flag assertion fails.
+    Distinct from ``test_cancelled_unwind_itself_still_propagates_cancelled_and_quarantines``:
+    that one cancels the unwind's ``ROLLBACK TO`` (the savepoint step); this one
+    cancels the plain ``rollback()`` the unit calls afterward to close the
+    transaction it opened for the failing insert. Both are statements inside
+    the same unwind ``try`` block in ``_write_readback_savepoint``, and either
+    one raising -- cancellation or not -- must quarantine the connection and
+    let the ``CancelledError`` win.
     """
     store = _journaled_seam_store(db, "log")
     poison = _derived_thought_id(_SEGMENTS[1])
-    # The child fails with an ordinary error so it enters the rollback path...
+    # The child fails with an ordinary error so it enters the unwind path...
     _patch_journal_to_fail(store, monkeypatch, mutation_type="INSERT_THOUGHT", target_id=poison)
 
     async def _cancelled_rollback() -> None:
-        # ...and the compensating rollback itself is cancelled (its task raises
-        # CancelledError → the task ends in the cancelled state).
+        # ...and the unwind's own closing rollback() is what gets cancelled.
         raise asyncio.CancelledError
 
     monkeypatch.setattr(store._db, "rollback", _cancelled_rollback)

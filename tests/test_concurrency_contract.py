@@ -1154,19 +1154,18 @@ class TestInProcessCriticalSection:
         store: SqliteEngravaCore,
         db: aiosqlite.Connection,
     ) -> None:
-        """A failed derived-child insert's rollback must not release the lock first.
+        """A failed derived-child insert's unwind must not release the lock first.
 
-        ``_insert_derived_row`` used to hold ``_write_lock`` only for its own
-        attempt, in its own ``async with`` block; when its journal append
-        failed, that block's exit released the lock *before*
-        ``_persist_derived_child``'s outer handler ran the compensating
-        rollback. A different, waiting task could acquire the lock in that
-        gap, join the still-open transaction, and have its own successful
-        write discarded once the rollback finally ran — the exact cross-task
-        exposure the write lock exists to close, reopened for exactly this
-        one failure path. The insert attempt and its compensating rollback
-        now share one lock acquisition; this pins that a waiting task's write
-        still cannot land in the gap.
+        ``_insert_derived_row`` wraps its insert and journal append in its own
+        ``_write_readback_savepoint`` unit, and that whole call — attempt and,
+        on failure, the unit's own ``ROLLBACK TO`` / ``RELEASE`` unwind — runs
+        inside one ``async with self._write_lock:`` acquisition. If the unwind
+        instead ran under a *fresh* acquisition taken after the failing
+        attempt's own lock had already released, a different, waiting task
+        could acquire the lock in that gap, join the still-open transaction,
+        and have its own successful write discarded once the unwind finally
+        ran — the exact cross-task exposure the write lock exists to close.
+        This pins that a waiting task's write still cannot land in that gap.
         """
         producer = ListProducer([_child("derived content")])
         store_with_producer = SqliteEngravaCore(
@@ -1206,8 +1205,8 @@ class TestInProcessCriticalSection:
             held = _write_lock_is_held(store_with_producer)
             if held is not None:
                 assert held, (
-                    "the derived child's compensating rollback must still hold "
-                    "_write_lock when a different task tries to acquire it"
+                    "the derived child's insert unit must still hold _write_lock "
+                    "while it unwinds, when a different task tries to acquire it"
                 )
             writer_task = asyncio.ensure_future(
                 store_with_producer.create_thought(
@@ -1220,9 +1219,9 @@ class TestInProcessCriticalSection:
         _, writer_result = await asyncio.gather(_derive(), _unrelated_writer())
 
         assert writer_result.thought_id == "t-other"
-        # The failed derived child never landed (its insert was rolled back);
-        # the source and the unrelated writer's row are both present and
-        # unaffected by that rollback.
+        # The failed derived child never landed (its insert was unwound); the
+        # source and the unrelated writer's row are both present and
+        # unaffected by that unwind.
         assert set(await _thought_ids(db)) == {"src-1", "t-other"}
 
     async def test_derived_child_embed_failure_rolls_back_and_writer_survives(
@@ -1232,24 +1231,21 @@ class TestInProcessCriticalSection:
     ) -> None:
         """An embedding failure *after* the row is written must not corrupt a writer.
 
-        The embed phase used to run with no enclosing ``_write_lock`` at all:
-        ``store_embedding()`` took the lock itself, wrote the embedding row,
-        and released the lock the moment an exception propagated out of it
-        (e.g. a realistic post-DML failure such as a vec0 write failing right
-        after the ``embedding`` table row is already written) -- *before*
-        ``_persist_derived_child``'s handler ever called
-        ``_compensate_child_rollback``, which then took a fresh acquisition of
-        its own. A writer already queued in that gap could acquire first, join
-        the still-open transaction, and either lose its own write to the
-        rollback that ran afterwards or have the broken embedding partial ride
-        along into its own commit. The embed phase now holds one continuous
-        ``_write_lock`` acquisition spanning the embed attempt and its
-        compensating rollback, so a waiting writer cannot land in that gap
-        either.
+        A realistic post-DML failure here (a vec0 write failing right after the
+        ``embedding`` table row is already written) unwinds through
+        ``store_embedding``'s own ``_write_readback_savepoint`` unit -- no
+        compensation of any kind runs in ``_persist_derived_child`` itself for
+        the embed step (see its docstring). ``_persist_derived_child`` still
+        holds one continuous ``_write_lock`` acquisition spanning the whole
+        embed step, and ``store_embedding``'s own acquisition nests inside it
+        as a free re-entrant no-op (:class:`_TaskReentrantLock`), so that unit's
+        unwind runs under the *same* lock hold the failing write did, without
+        any special-casing: a waiting writer cannot land in the gap between the
+        failing write and its unwind.
 
         This pins both required outcomes: the writer's row survives, and the
-        connection is left with no open transaction (the rollback actually
-        ran to completion rather than being skipped or raced).
+        connection is left with no open transaction (the unwind actually ran
+        to completion rather than being skipped or raced).
         """
 
         class _WorkingEmbeddingProvider:
@@ -1305,8 +1301,9 @@ class TestInProcessCriticalSection:
             held = _write_lock_is_held(store_with_producer)
             if held is not None:
                 assert held, (
-                    "the embed phase's compensating rollback must still hold "
-                    "_write_lock when a different task tries to acquire it"
+                    "the embed phase's store_embedding unit must still hold "
+                    "_write_lock while it unwinds, when a different task tries "
+                    "to acquire it"
                 )
             writer_task = asyncio.ensure_future(
                 store_with_producer.create_thought(
@@ -1319,14 +1316,14 @@ class TestInProcessCriticalSection:
         _, writer_result = await asyncio.gather(_derive(), _unrelated_writer())
 
         assert writer_result.thought_id == "t-other"
-        # The rollback actually completed -- not skipped by a timeout on a
-        # fresh acquisition, and not raced by the writer's own commit closing
-        # the transaction first.
+        # The unwind actually completed -- not skipped by a timeout on a fresh
+        # acquisition, and not raced by the writer's own commit closing the
+        # transaction first.
         assert not db.in_transaction
         # Per-child transaction isolation (D10): the derived child's *row*
         # already committed as its own durable unit in the insert phase --
         # that is unaffected by a later embed-phase failure and correctly
-        # survives. What the embed phase's rollback discards is only its own
+        # survives. What store_embedding's own unit unwinds is only its own
         # not-yet-committed work: the embedding row never lands. The source
         # and the unrelated writer's row are both present.
         thought_ids = set(await _thought_ids(db))
@@ -1339,7 +1336,7 @@ class TestInProcessCriticalSection:
             "SELECT 1 FROM embedding WHERE owner_id = ?", (child_id,)
         )
         assert await embedding_cursor.fetchone() is None, (
-            "the derived child's embedding must not have survived the rolled-back embed phase"
+            "the derived child's embedding must not have survived the unwound embed phase"
         )
 
 

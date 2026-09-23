@@ -506,26 +506,6 @@ _DEDUP_BEGIN_MAX_ATTEMPTS: Final = 3
 _DEDUP_BEGIN_RETRY_BASE_SECONDS: Final = 0.05
 
 
-class _DerivationRollbackError(Exception):
-    """Internal: a per-child rollback itself failed during derivation.
-
-    Signals that after a child persistence failure the compensating
-    ``rollback()`` also raised, leaving the transaction state indeterminate (the
-    failed child's pending insert/edge may still be open and could be flushed by
-    a later child's commit). The derivation dispatch must therefore abort
-    immediately — this exception is **non-continuable** and is never swallowed by
-    the ``on_error="log"`` continue branch. The original child failure is chained
-    as ``__cause__``. Private to this module; not part of the public API.
-
-    Args:
-        rollback_error: The exception raised by the failed ``rollback()``.
-
-    """
-
-    def __init__(self, rollback_error: BaseException) -> None:
-        super().__init__(f"rollback failed after a derived-child error: {rollback_error}")
-
-
 class _QuarantinedConnection:
     """Terminal stand-in installed on a quarantined store's ``_db`` slot.
 
@@ -1740,10 +1720,11 @@ class SqliteEngravaCore:
         self._current_auto_commit_window: contextvars.ContextVar[object | None] = (
             contextvars.ContextVar("engrava_current_auto_commit_window", default=None)
         )
-        # Terminal quarantine state. Set only when a per-child compensating
-        # rollback in the derived-records seam did not cleanly complete (raised
-        # or was cancelled), so the long-lived connection may still hold an open
-        # transaction. Quarantine is terminal by construction:
+        # Terminal quarantine state. Set only when a guarded write's own unit
+        # (e.g. ``_write_readback_savepoint``, including a derived child's row
+        # or edge insert) could not unwind its savepoint after it failed
+        # (raised or was cancelled), so the long-lived connection may still
+        # hold an open transaction. Quarantine is terminal by construction:
         #   * the flag makes guarded entry points + ``_maybe_commit`` fail fast;
         #   * ``_db`` is swapped for a ``_QuarantinedConnection`` proxy so every
         #     core-initiated op raises regardless of physical close; and
@@ -7501,17 +7482,36 @@ class SqliteEngravaCore:
         ``DERIVED_FROM`` edge) is never re-derived.
 
         Unlike :meth:`_dispatch_derivation` it does **not** early-return inside a
-        caller-held ``suspend_auto_commit`` window: the source is already durable
-        (stored by a prior committed call), so there is no source-durability reason
-        to defer. If a caller wraps it in an open transaction, the children simply
-        join that transaction like any other write and the caller owns their
-        durability. Consequently, inside such a window with
-        ``DeriveGates.on_error="raise"`` a derived-child failure rolls back that
-        **whole** transaction — the caller's unrelated writes included — which is
-        simply ``suspend_auto_commit``'s normal atomicity (the caller who opens the
-        window owns its rollback semantics), not a behaviour unique to backfill;
-        the already-committed **source thought is unaffected**. Outside a suspend
-        window each child commits as its own durable unit (per-child isolation).
+        caller-held ``suspend_auto_commit`` window (or a caller-held raw
+        ``BEGIN``): the source is already durable (stored by a prior committed
+        call), so there is no source-durability reason to defer. If a caller
+        wraps it in an open transaction, the children simply join that
+        transaction like any other write — but who then decides *when* that
+        becomes durable depends on which kind of transaction it is. A
+        ``suspend_auto_commit`` window suppresses every write's own
+        auto-commit for its whole duration, so the caller genuinely owns the
+        children's durability: nothing commits until the window's own single,
+        final commit. A raw ``BEGIN`` does **not** suppress it: a child's own
+        successful step still calls its own ``_maybe_commit()``, which — since
+        nothing told it to defer — actually commits the shared transaction
+        (the caller's own pending write included) as soon as that step
+        succeeds, well before the caller's own explicit commit. See
+        :meth:`_insert_derived_row` and :meth:`_insert_derived_edge` for the
+        two steps that can trigger this.
+
+        **A failed child undoes only itself, in every transaction context** — see
+        :meth:`_persist_derived_child` for exactly what a failing step leaves
+        behind. Under ``DeriveGates.on_error="log"`` the dispatch logs the
+        failure and continues with the next child; the caller's other pending
+        writes in the same transaction are never touched. Under
+        ``on_error="raise"`` the error propagates after that per-step undo: if
+        the caller lets it escape an open ``suspend_auto_commit`` window
+        uncaught, the window rolls back everything it holds — its own normal
+        atomicity, not a behaviour unique to backfill — but if the caller
+        catches it inside the window, the window's other writes survive. The
+        already-committed **source thought is unaffected either way**. Outside a
+        suspend window each child commits as its own durable unit (per-child
+        isolation), unchanged from before.
 
         Args:
             thought_id: The already-stored source thought to derive from.
@@ -7700,6 +7700,16 @@ class SqliteEngravaCore:
         children continue; under ``on_error="raise"`` the error re-raises after
         the source is safe, aborting the remaining children.
 
+        **A quarantined connection is non-continuable under either policy.**
+        Persisting a child uses failure-atomic units (:meth:`_write_readback_savepoint`
+        via :meth:`_insert_derived_row`, :meth:`_insert_derived_edge` and
+        :meth:`store_embedding`); when a unit's own unwind cannot be trusted it
+        quarantines the connection and re-raises the child's original error. Seeing
+        the connection quarantined after a child failure means every later write
+        would fail fast anyway, so the remaining children are never attempted and
+        the original error always propagates — logged first under ``"log"``, since
+        that policy would otherwise swallow it.
+
         Args:
             producer: The derived-record producer capability.
             source: The committed source thought.
@@ -7724,24 +7734,22 @@ class SqliteEngravaCore:
                 inserted = await self._persist_derived_child(source, record, ctx)
             except asyncio.CancelledError:
                 raise
-            except _DerivationRollbackError:
-                # Non-continuable: a per-child rollback failed, so the
-                # transaction state is indeterminate. Aborting the remaining
-                # children is mandatory regardless of ``on_error`` — a later
-                # child's commit could flush the failed child's pending work.
-                # But the source is already durably committed, so this must not
-                # escape a ``"log"`` policy as a caller-visible raise (fail-open,
-                # ADR D10): under ``"raise"`` propagate; under ``"log"`` log at
-                # error level and stop without re-raising. ``CancelledError`` is
-                # handled by its own branch above and always propagates.
-                if on_error == "raise":
-                    raise
-                logger.exception(
-                    "derived-record rollback failed for source %s; aborting remaining children",
-                    ctx.source_thought_id,
-                )
-                return _DerivationOutcome(created=created, reused=reused, skipped=skipped)
             except Exception:
+                if self._connection_quarantined:
+                    # Non-continuable regardless of on_error: a unit's own
+                    # unwind failed while persisting this child (see
+                    # _write_readback_savepoint), so the connection can no
+                    # longer be trusted and every later write would fail fast
+                    # anyway. Abort the remaining children and let the
+                    # original error through -- logged first under "log",
+                    # which would otherwise swallow it.
+                    if on_error == "log":
+                        logger.exception(
+                            "derived-record persistence quarantined the connection "
+                            "for source %s; aborting remaining children",
+                            ctx.source_thought_id,
+                        )
+                    raise
                 if on_error == "raise":
                     raise
                 logger.warning(
@@ -7846,14 +7854,17 @@ class SqliteEngravaCore:
         Per-child transaction isolation: a child's **row** commits as its own
         durable unit; its enrichment (embedding, ``DERIVED_FROM`` edge) completes
         afterward, so a child may be durably present yet not-yet-enriched — a
-        recoverable partial state (D10), not atomic enrichment. If any step
-        (insert, its journal append, embed, or edge insert) fails after writing
-        but before that step's own commit, the child's uncommitted mutations are
-        rolled back before the error propagates — so no half-written row/edge
-        (e.g. a row whose journal append failed) can be flushed by a later
-        child's commit, and the journal chain stays consistent. Earlier children
-        and the source are already committed, so the rollback discards only this
-        child's pending work.
+        recoverable partial state (D10), not atomic enrichment. **A failed step
+        undoes only itself, in every transaction context — including inside a
+        caller's own ``suspend_auto_commit`` window or raw ``BEGIN``.** The row
+        insert and its journal append (:meth:`_insert_derived_row`) are one
+        :meth:`_write_readback_savepoint` unit; the ``DERIVED_FROM`` edge insert
+        and its append (:meth:`_insert_derived_edge`) are another. The embed step
+        needs no unit of its own: a provider failure writes nothing, and a failed
+        :meth:`store_embedding` unwinds through that method's own unit. Either
+        way, a failure there never touches the row step 1 already wrote. No step
+        ever rolls back more than its own pending write — never an earlier
+        child's work, and never a caller's other writes in the same transaction.
 
         Args:
             source: The committed source thought.
@@ -7872,6 +7883,9 @@ class SqliteEngravaCore:
                 pre-existing row whose stored content differs from the derived
                 record (a foreign-identity collision — no provenance edge is
                 attached and the collision is surfaced per ``on_error``).
+            ConnectionQuarantinedError: When a step's own unit could not unwind
+                its failure and quarantined the connection (see
+                :meth:`_write_readback_savepoint`).
 
         """
         child_id = _derived_thought_id(record.content)
@@ -7883,63 +7897,39 @@ class SqliteEngravaCore:
             )
         child = self._build_derived_thought(record, child_id, ctx, source)
         reused_foreign = False
-        # Every lockable step below (the row insert, the embed, the edge
-        # insert) pairs its own attempt with its own compensating rollback
-        # *inside one continuous `_write_lock` acquisition that starts before
-        # the attempt and is never released until compensation has run*.
-        #
-        # THE GENERAL RULE: a compensating rollback must run under the same
-        # acquisition as the write it compensates, never a fresh one. A fresh
-        # acquisition taken *after* the failing write's own lock has already
-        # released opens a window where a different, waiting task can acquire
-        # first, join the still-open transaction, and either have its own
-        # successful write discarded when the rollback finally runs, or —if
-        # that task commits first — leave this failed child's broken partial
-        # silently made durable by someone else's unrelated commit. A fresh
-        # acquisition can also itself time out (`WriteLockTimeoutError`),
-        # which would raise *before* the rollback/quarantine logic below ever
-        # ran, defeating the very backstop meant to make failures
-        # attributable. Holding one continuous acquisition across the
-        # attempt and its compensation removes both failure modes at once:
-        # `store_embedding()` (called by the embed step) and
-        # `_insert_derived_row` / `_insert_derived_edge` each take
-        # `_write_lock` themselves too, but since this task already holds it
-        # here, those are free re-entrant no-ops, not fresh acquisitions —
-        # and `_compensate_child_rollback` deliberately does *not* acquire
-        # the lock itself; it requires the caller to already hold it (see its
-        # own docstring).
-        #
-        # The embed step is genuine network I/O held under the lock for its
-        # whole duration — the same cost already accepted for `bulk_store`'s
-        # batch embedding, covered by the same configurable bound.
+        # Each step below undoes only itself on failure — no compensating
+        # rollback here at all. `_insert_derived_row` and `_insert_derived_edge`
+        # each wrap their own insert + journal append in their own
+        # `_write_readback_savepoint` unit (see their docstrings), so a failure
+        # unwinds exactly that step's pending write, in every transaction
+        # context, including inside a caller's own `suspend_auto_commit` window
+        # or raw `BEGIN`. The embed step below needs no unit of its own: a
+        # provider failure raises before writing anything, and a failed
+        # `store_embedding` unwinds through that method's own unit. Every
+        # `async with self._write_lock:` here is a re-entrant no-op once
+        # acquired (`_insert_derived_row` / `_insert_derived_edge` /
+        # `store_embedding` each take it themselves too), so a failing step's
+        # own unwind always runs under the same lock hold its write did.
         async with self._write_lock:
-            try:
-                inserted = await self._insert_derived_row(child)
-            except BaseException as original:
-                await self._compensate_child_rollback(original)
-                raise
+            inserted = await self._insert_derived_row(child)
         async with self._write_lock:
-            try:
-                # Re-read the stored row once: it is both the enrichment
-                # target (its own content, never the producer's) and the
-                # basis for the provenance identity-collision check below. On
-                # a conflict-as-reuse hit it may be a foreign row a caller
-                # pre-created at this deterministic id.
-                stored_row = await self._get_thought_row(child_id)
-                if (
-                    self._auto_embed
-                    and self._embedding_provider is not None
-                    and not self._suppress_auto_embed
-                    and stored_row is not None
-                    and await self.get_embedding(child_id) is None
-                ):
-                    # Embed the persisted row's actual content — not the
-                    # producer's — so a reused foreign row never receives a
-                    # producer-content vector.
-                    await self._auto_embed_thought(self._row_to_thought(stored_row))
-            except BaseException as original:
-                await self._compensate_child_rollback(original)
-                raise
+            # Re-read the stored row once: it is both the enrichment
+            # target (its own content, never the producer's) and the
+            # basis for the provenance identity-collision check below. On
+            # a conflict-as-reuse hit it may be a foreign row a caller
+            # pre-created at this deterministic id.
+            stored_row = await self._get_thought_row(child_id)
+            if (
+                self._auto_embed
+                and self._embedding_provider is not None
+                and not self._suppress_auto_embed
+                and stored_row is not None
+                and await self.get_embedding(child_id) is None
+            ):
+                # Embed the persisted row's actual content — not the
+                # producer's — so a reused foreign row never receives a
+                # producer-content vector.
+                await self._auto_embed_thought(self._row_to_thought(stored_row))
         if record.attach_provenance_edge:
             # Provenance guard: only attach the ``DERIVED_FROM`` edge when the
             # stored row's content actually matches the derived record. A
@@ -7953,124 +7943,24 @@ class SqliteEngravaCore:
                 reused_foreign = True
             else:
                 async with self._write_lock:
-                    try:
-                        await self._insert_derived_edge(
-                            child_id,
-                            source.thought_id,
-                            ctx.cycle_at_derivation,
-                        )
-                    except BaseException as original:
-                        await self._compensate_child_rollback(original)
-                        raise
+                    await self._insert_derived_edge(
+                        child_id,
+                        source.thought_id,
+                        ctx.cycle_at_derivation,
+                    )
         if reused_foreign:
             # Foreign-identity collision: the conflict-as-reuse hit landed on a
             # pre-existing row whose content differs from this derived record, so
-            # no provenance edge was attached. Surface it outside the
-            # compensating-rollback path — no uncommitted mutation is pending (the
-            # reuse insert aborted cleanly and any stored-row embedding already
-            # committed) — so ``_run_derivation`` applies ``on_error``
-            # (log→skip this child / raise→abort remaining), exactly like the
-            # source-id collision.
+            # no provenance edge was attached. Surface it outside any unwind path
+            # — no uncommitted mutation is pending (the reuse insert aborted
+            # cleanly and any stored-row embedding already committed) — so
+            # ``_run_derivation`` applies ``on_error`` (log→skip this child /
+            # raise→abort remaining), exactly like the source-id collision.
             raise DerivedRecordError(
                 source.thought_id,
                 "derived record identity collides with an unrelated stored thought",
             )
         return inserted
-
-    async def _compensate_child_rollback(self, original: BaseException) -> None:
-        """Roll back a failed derived child's uncommitted partial, cancel-safely.
-
-        **Contract: the caller must already hold ``_write_lock`` — this method
-        deliberately does not acquire it.** A compensating rollback must run
-        under the *same* acquisition as the write it compensates, never a
-        fresh one: a fresh acquisition taken after the failing write's own
-        lock has already released opens a window where a different, waiting
-        task can get the lock first, join the still-open transaction, and
-        either have its own successful write discarded by this rollback, or
-        (if that task's own commit lands first) leave this failed child's
-        broken partial silently made durable by someone else's unrelated
-        commit — the withdrawn-guarantee exposure this lock exists to close.
-        A fresh acquisition can also itself hit
-        :class:`~engrava.domain.exceptions.WriteLockTimeoutError`, which would
-        raise *before* the quarantine/precedence logic below ever runs,
-        defeating the backstop that is supposed to make failures attributable.
-        Every call site in this file wraps its attempt and this call in one
-        continuous ``async with self._write_lock:`` block, so this method
-        always runs as a free re-entrant no-op on the lock — never a wait,
-        never a timeout.
-
-        Runs the compensating ``rollback`` as an independent task and awaits it
-        under :func:`asyncio.shield`, so a cancellation of *our* awaiting frame
-        never aborts the rollback itself. A half-completed rollback would leave
-        the long-lived connection mid-transaction — an orphaned partial that a
-        later operation could flush, or run atop as indeterminate state. If the
-        caller is cancelled during it, the still-running shielded task is awaited
-        to completion before the cancellation is honored; the cancellation is
-        never swallowed and always wins over ``original``.
-
-        The task's outcome is inspected structurally — :meth:`asyncio.Task.cancelled`
-        is checked *before* :meth:`asyncio.Task.exception` (which raises on a
-        cancelled task) — so a rollback failure is always detected, never let to
-        throw and bypass the quarantine/precedence logic.
-
-        Quarantine on *any* non-clean rollback: whenever the compensating
-        rollback does not cleanly complete (raised **or** cancelled), the
-        transaction is indeterminate regardless of whether the caller was
-        cancelled, so the connection is quarantined and hard-invalidated
-        (:meth:`_quarantine_connection`) before anything is surfaced. A clean
-        rollback never quarantines. This closes the hole where a non-cancelled
-        rollback failure (esp. under ``on_error="log"``, which logs and aborts)
-        would otherwise leave the store usable for a later, orphan-flushing
-        commit.
-
-        Args:
-            original: The child failure that triggered the compensating rollback.
-
-        Raises:
-            asyncio.CancelledError: When a cancellation (the caller's, or the
-                rollback task's own) is the outcome. The connection is
-                quarantined first if the rollback did not cleanly complete.
-            _DerivationRollbackError: When, on the non-cancelled path, the
-                rollback itself failed and ``original`` was not a cancellation —
-                a non-continuable abort of the whole dispatch (post-quarantine).
-
-        """
-        # Run the rollback as an independent, shielded task and drain it to
-        # completion, capturing any cancellation of our await. No lock
-        # acquisition here — see the docstring's contract above.
-        rollback_task: asyncio.Task[None] = asyncio.ensure_future(self._db.rollback())
-        cancel_error = await self._drain_shielded(rollback_task)
-        # (#2) A cancelled rollback task would make ``exception()`` raise, so
-        # check ``cancelled()`` first and treat it as non-clean completion.
-        rollback_cancelled = rollback_task.cancelled()
-        rollback_exc = None if rollback_cancelled else rollback_task.exception()
-
-        # (#1) Any non-clean rollback → the transaction is indeterminate →
-        # quarantine before surfacing, whether or not the caller was
-        # cancelled. A clean rollback never quarantines.
-        # ``_quarantine_connection`` is synchronous-effect (detached close)
-        # so it cannot swallow ``cancel_error``.
-        if rollback_cancelled or rollback_exc is not None:
-            await self._quarantine_connection(
-                f"compensating rollback did not cleanly complete: "
-                f"{rollback_exc if rollback_exc is not None else 'cancelled'}",
-            )
-
-        if cancel_error is not None:
-            # The caller's cancellation is the visible outcome and takes precedence.
-            raise cancel_error from original
-        if rollback_cancelled:
-            # The rollback task itself was cancelled (its coroutine raised
-            # ``CancelledError``) → propagate a cancellation, never a
-            # ``_DerivationRollbackError``; ``original`` is chained as context.
-            raise asyncio.CancelledError from original
-        if rollback_exc is not None:
-            # Non-cancelled path: the rollback itself failed → abort the dispatch
-            # non-continuably (F2). A CancelledError ``original`` still wins.
-            if isinstance(original, asyncio.CancelledError):
-                raise original from rollback_exc
-            raise _DerivationRollbackError(rollback_exc) from original
-        # Clean rollback, no cancellation → the caller re-raises ``original``.
 
     def _build_derived_thought(
         self,
@@ -8123,8 +8013,19 @@ class SqliteEngravaCore:
         ``UNIQUE`` / primary-key violation is caught and treated as reuse.
         Enrichment of a reused row is handled by the caller against the stored
         row's own content. The conflicting ``INSERT`` statement is aborted by
-        SQLite (its own changes rolled back, the transaction preserved), so the
-        reuse early-return leaves no pending uncommitted mutation behind.
+        SQLite itself (its own changes rolled back, the transaction preserved),
+        so the reuse early-return leaves no pending uncommitted mutation behind:
+        it still runs inside the savepoint unit below (the ``INSERT`` is what
+        raises), but exits that unit normally — a clean ``RELEASE``, never an
+        unwind — because nothing of this attempt is left for the unit to undo.
+
+        **The insert and its journal entry are one failure-atomic unit**, via
+        :meth:`_write_readback_savepoint` — see :meth:`update_thought` for what
+        that protects against. A failed or cancelled journal append here unwinds
+        the insert too, in every transaction context (including inside a
+        caller's ``suspend_auto_commit`` window or raw ``BEGIN``), instead of
+        leaving it pending for a later, unrelated commit to publish without the
+        journal entry that documents it.
 
         Args:
             child: The derived thought to persist.
@@ -8134,23 +8035,27 @@ class SqliteEngravaCore:
             with the same content-addressed identity was reused (conflict-as-
             reuse). The caller uses this to tally created vs reused children.
 
+        Raises:
+            ConnectionQuarantinedError: When the connection has been quarantined.
+
         """
         async with self._write_lock:
-            try:
-                await self._db.execute(
-                    self._CORE_INSERT_SQL,
-                    self._thought_to_core_params(child),
-                )
-            except aiosqlite.IntegrityError as exc:
-                if not _is_unique_violation(exc):
-                    raise
-                return False
-            if self._journal is not None:
-                await self._journal.append(
-                    mutation_type="INSERT_THOUGHT",
-                    target_id=child.thought_id,
-                    delta={"before": None, "after": child.model_dump(mode="json")},
-                )
+            async with self._write_readback_savepoint("insert_derived_row"):
+                try:
+                    await self._db.execute(
+                        self._CORE_INSERT_SQL,
+                        self._thought_to_core_params(child),
+                    )
+                except aiosqlite.IntegrityError as exc:
+                    if not _is_unique_violation(exc):
+                        raise
+                    return False
+                if self._journal is not None:
+                    await self._journal.append(
+                        mutation_type="INSERT_THOUGHT",
+                        target_id=child.thought_id,
+                        delta={"before": None, "after": child.model_dump(mode="json")},
+                    )
             await self._maybe_commit()
             return True
 
@@ -8165,16 +8070,27 @@ class SqliteEngravaCore:
         Records content-level provenance (derived → source). The edge is
         conflict-safe on both its deterministic id and the ``(from, to, type)``
         unique constraint, so a re-run or a concurrent derivation reuses the
-        existing edge rather than failing; SQLite aborts the conflicting
+        existing edge rather than failing; SQLite itself aborts the conflicting
         ``INSERT`` (rolling back only its own changes), so the reuse early-return
-        leaves no pending uncommitted mutation. A failure of the journal append
-        after the edge insert propagates to the caller, which rolls back this
-        child's pending edge insert (per-child isolation).
+        leaves no pending uncommitted mutation: it still runs inside the
+        savepoint unit below (the ``INSERT`` is what raises), but exits that
+        unit normally — a clean ``RELEASE``, never an unwind — because nothing
+        of this attempt is left for the unit to undo.
+
+        **The insert and its journal entry are one failure-atomic unit**, via
+        :meth:`_write_readback_savepoint` — see :meth:`update_thought` for what
+        that protects against. A failed or cancelled journal append here unwinds
+        the edge insert too, in every transaction context (including inside a
+        caller's ``suspend_auto_commit`` window or raw ``BEGIN``): the child's
+        row (and any embedding) survives untouched, per-child isolation.
 
         Args:
             from_thought_id: The derived child id (edge origin).
             to_thought_id: The source thought id (edge target).
             cycle: The cycle to stamp on the edge.
+
+        Raises:
+            ConnectionQuarantinedError: When the connection has been quarantined.
 
         """
         edge = EdgeRecord(
@@ -8187,45 +8103,46 @@ class SqliteEngravaCore:
             source=KnowledgeSource.EXPERIENCE,
         )
         async with self._write_lock:
-            try:
-                await self._db.execute(
-                    "INSERT INTO edge "
-                    "(edge_id, from_thought_id, to_thought_id, edge_type, weight, "
-                    " created_cycle, source, decay_multiplier, valid_from, valid_until, "
-                    " metadata_json) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        edge.edge_id,
-                        edge.from_thought_id,
-                        edge.to_thought_id,
-                        edge.edge_type.value,
-                        edge.weight,
-                        edge.created_cycle,
-                        edge.source.value,
-                        edge.decay_multiplier,
-                        edge.valid_from,
-                        edge.valid_until,
-                        # Derived edges never carry caller metadata, so bind the
-                        # empty ``'{}'`` object literal rather than serializing
-                        # the in-memory record. This provenance-only path
-                        # therefore cannot smuggle unvalidated (e.g. non-finite)
-                        # metadata into the column — it bypasses
-                        # ``_validate_metadata`` by writing a trivially valid
-                        # empty object, matching the fresh-DDL / ALTER
-                        # ``DEFAULT '{}'``.
-                        "{}",
-                    ),
-                )
-            except aiosqlite.IntegrityError as exc:
-                if not _is_unique_violation(exc):
-                    raise
-                return
-            if self._journal is not None:
-                await self._journal.append(
-                    mutation_type="INSERT_EDGE",
-                    target_id=edge.edge_id,
-                    delta={"before": None, "after": edge.model_dump(mode="json")},
-                )
+            async with self._write_readback_savepoint("insert_derived_edge"):
+                try:
+                    await self._db.execute(
+                        "INSERT INTO edge "
+                        "(edge_id, from_thought_id, to_thought_id, edge_type, weight, "
+                        " created_cycle, source, decay_multiplier, valid_from, valid_until, "
+                        " metadata_json) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            edge.edge_id,
+                            edge.from_thought_id,
+                            edge.to_thought_id,
+                            edge.edge_type.value,
+                            edge.weight,
+                            edge.created_cycle,
+                            edge.source.value,
+                            edge.decay_multiplier,
+                            edge.valid_from,
+                            edge.valid_until,
+                            # Derived edges never carry caller metadata, so bind the
+                            # empty ``'{}'`` object literal rather than serializing
+                            # the in-memory record. This provenance-only path
+                            # therefore cannot smuggle unvalidated (e.g. non-finite)
+                            # metadata into the column — it bypasses
+                            # ``_validate_metadata`` by writing a trivially valid
+                            # empty object, matching the fresh-DDL / ALTER
+                            # ``DEFAULT '{}'``.
+                            "{}",
+                        ),
+                    )
+                except aiosqlite.IntegrityError as exc:
+                    if not _is_unique_violation(exc):
+                        raise
+                    return
+                if self._journal is not None:
+                    await self._journal.append(
+                        mutation_type="INSERT_EDGE",
+                        target_id=edge.edge_id,
+                        delta={"before": None, "after": edge.model_dump(mode="json")},
+                    )
             await self._maybe_commit()
 
     async def _batch_embed_thoughts(self, inserted: list[ThoughtRecord]) -> None:

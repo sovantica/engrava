@@ -255,6 +255,17 @@ print(result.thought_id, result.created, result.reused, result.skipped)
   identity collision) under `on_error="raise"`.
 - A source that is itself a derived record (it carries an outgoing `DERIVED_FROM`
   edge) is never re-derived.
+- Unlike the automatic on-store trigger, `derive_existing` does not defer inside
+  a caller-held `suspend_auto_commit()` window (or a raw `BEGIN`): the source is
+  already durable, so the children simply join that transaction. A failed child
+  undoes only its own failing step (its row, its edge, or an embedding attempt)
+  — never an earlier child's work, and never the caller's other pending writes
+  in the same transaction, under either `on_error` policy. Who decides *when*
+  that becomes durable differs by transaction kind: a `suspend_auto_commit()`
+  window suppresses every write's own auto-commit, so nothing commits before
+  the window's own single, final commit; a raw `BEGIN` does not, so a child's
+  own successful step still commits the shared transaction — the caller's
+  pending write included — as soon as that step succeeds.
 
 `SplitMode`, `DeriveResult`, and `SourceThoughtNotFoundError` are public API under
 the same `X.Y.x` stability guarantee.

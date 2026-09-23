@@ -816,15 +816,16 @@ recency_now must be ISO-8601
 class ConnectionQuarantinedError(EngravaError):
     """Raised when the store's connection has been quarantined and is unusable.
 
-    A long-lived SQLite connection is quarantined when a compensating rollback
-    could not be guaranteed to complete — most critically when a cancellation
-    interrupted a per-child rollback in the derived-records seam and the
-    rollback ultimately failed, so the connection may still hold an open
-    transaction. Continuing to use such a connection could flush an orphaned
-    partial write or run later operations on an indeterminate transaction, so
-    every public operation fails fast with this error instead. The condition is
-    terminal for the store instance: a new store over a fresh connection must
-    be constructed to recover.
+    A long-lived SQLite connection is quarantined when a guarded write's own
+    savepoint could not be unwound after it failed — most critically when a
+    cancellation interrupted the unwind (``ROLLBACK TO`` + ``RELEASE``) of an
+    insert/update/delete unit, including a derived child's row or edge insert
+    in the derived-records seam, and the unwind ultimately failed, so the
+    connection may still hold an open transaction. Continuing to use such a
+    connection could flush an orphaned partial write or run later operations on
+    an indeterminate transaction, so every public operation fails fast with
+    this error instead. The condition is terminal for the store instance: a new
+    store over a fresh connection must be constructed to recover.
 
     Scope: quarantine revokes *admission* — every NEW operation on the store or
     its journal fails fast with this error, so no write/commit can flush an

@@ -274,9 +274,14 @@ The source is durable before automatic derivation. Each derived child's row is
 then committed as its own unit before its embedding and `DERIVED_FROM` edge are
 completed. Re-running `derive_existing(source_id)` reuses deterministic children
 and edges and fills missing enrichment, provided the producer obeys the
-deterministic content contract. A failed compensating rollback of a derived
-child terminally quarantines the connection; that is one of several causes,
-listed under [Terminal connection quarantine](#terminal-connection-quarantine).
+deterministic content contract. A failed child undoes only its own failing
+step — the row and its journal entry, the edge and its journal entry, or an
+embedding attempt — never an earlier child's work, and never a caller's other
+pending writes when `derive_existing` runs inside the caller's own
+`suspend_auto_commit()` window or a raw `BEGIN`. When a step's own unwind
+cannot itself be trusted to have completed, it terminally quarantines the
+connection; that is one of several causes, listed under
+[Terminal connection quarantine](#terminal-connection-quarantine).
 
 ## Transaction context behavior
 
@@ -427,9 +432,9 @@ reported. The old connection may have an indeterminate open transaction, so the
 store revokes all new operations and replaces its internal connection with a
 failing proxy. This state never clears. Any of these triggers it:
 
-- the compensating rollback for a derived child did not cleanly complete;
 - the savepoint unwind of a guarded write (`update_thought`,
-  `restore_thought`, `update_edge`, `update_action`) failed;
+  `restore_thought`, `update_edge`, `update_action`, a derived child's row
+  insert or edge insert) failed;
 - the savepoint unwind of a `delete_thought` failed, including a delete made
   through the TTL delete strategy or hygiene garbage collection — an ordinary
   error such as a trigger veto can cause this, not only a cancellation, and the
