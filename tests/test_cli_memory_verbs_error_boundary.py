@@ -2336,7 +2336,13 @@ def _raise_watched_boundary(*_args: object, **_kwargs: object) -> NoReturn:
     _raise_watched_traceback_read("boundary")
 
 
-async def _raise_watched_close(_self: SqliteEngravaCore) -> None:
+_REAL_CLOSE = SqliteEngravaCore.close
+
+
+async def _raise_watched_close(self: SqliteEngravaCore) -> None:
+    # Release the connection first: a close that only raises would leave its
+    # worker thread alive past this test, to fail a later one at random.
+    await _REAL_CLOSE(self)
     _raise_watched_traceback_read("cleanup")
 
 
