@@ -129,6 +129,43 @@ though a rising `fts_match_failure_count` is how you see it happening. See
 [Keyword query syntax (FTS)](search.md#keyword-query-syntax-fts) and
 [Observability signals](observability.md#observability-signals).
 
+## Keyword search returns a thought after restore that does not contain the word
+
+**Symptom.** After `restore` (a plain merge or `--clear`), `search_fts` /
+`recall` returns a thought whose essence and content plainly do not contain
+the word you searched for.
+
+**Cause.** `restore` inserts every record with `INSERT OR REPLACE`. Before
+this was fixed, a record that collided with an existing row on a primary key
+or `UNIQUE` constraint made SQLite delete the old row and re-insert it
+internally to resolve the conflict — and because nothing in engrava sets
+`PRAGMA recursive_triggers` (SQLite's default is off), the FTS delete trigger
+never fires for a row removed this way, only the insert trigger for its
+replacement. The old, stale index entry survived, pointing at a rowid the
+`thought` table could later hand to a completely unrelated row (a later
+`--clear` restore, for instance) — at which point a keyword search for the
+original word resolved to that unrelated thought instead.
+
+**Fix.** `restore` now rebuilds the full-text index unconditionally, inside
+its own transaction, after every merge or `--clear`, so a build carrying this
+fix cannot leave a stale entry behind this way.
+
+**Repair a database an older build already restored into.** Rebuild its
+index directly with the SQLite CLI:
+
+```bash
+sqlite3 engrava.db "INSERT INTO thought_fts(thought_fts) VALUES('rebuild');"
+```
+
+This is FTS5's own index-rebuild command: it reconstructs `thought_fts` from
+the `thought` table's current rows, using the table's already-configured
+tokenizer. Verified directly against a database carrying stale entries built
+this way: afterward, a `MATCH` for each of that database's thoughts named only
+rows that actually contain the term, every column of every `thought` row came
+back unchanged (not just which ids survived), and the `journal_entry` row
+count was unchanged, and `engrava verify` afterward reported the journal valid
+with that same number of entries.
+
 ## Dreaming promotes nothing (consolidation is inert)
 
 **Symptom.** `run_consolidation(...)` returns `promoted_count == 0` every time.

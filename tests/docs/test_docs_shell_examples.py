@@ -225,6 +225,11 @@ EXEMPT_BASH_BLOCKS: tuple[tuple[str, str, ExemptionReason], ...] = (
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
     ),
     (
+        "docs/troubleshooting.md",
+        "sqlite3 engrava.db",
+        ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+    ),
+    (
         "docs/upgrade.md",
         'sqlite3 my-data.db ".backup my-data.db.bak"',
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,

@@ -197,6 +197,53 @@ def _write_journalled_thoughts(db_path: Path, thought_ids: list[str]) -> None:
     asyncio.run(_setup())
 
 
+def _write_plain_thoughts(db_path: Path, thought_ids: list[str]) -> None:
+    """Create a database holding only plain (non-journalled) thoughts.
+
+    Distinct from both ``populated_db`` (whose thoughts carry embeddings and
+    one edge) and ``journalled_db``/``_write_journalled_thoughts`` (journal
+    enabled): no foreign key references these thoughts at all, so a raw
+    ``INSERT OR REPLACE`` collision against one of them (see
+    ``_corrupt_fts_with_raw_replace``) cascades onto nothing else, keeping the
+    reproduced corruption isolated to ``thought``/``thought_fts``.
+
+    Args:
+        db_path: Path to create the database at. Must not already exist.
+        thought_ids: The thought ids to create, in order.
+
+    """
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+
+    async def _setup() -> None:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = await aiosqlite.connect(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        await store.ensure_schema()
+        for i, thought_id in enumerate(thought_ids):
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id=thought_id,
+                    essence=f"Essence for {thought_id}",
+                    content=f"Content for {thought_id}",
+                    thought_type=ThoughtType.OBSERVATION,
+                    source="test",
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    priority=Priority.P2,
+                    created_cycle=i + 1,
+                    updated_cycle=i + 1,
+                )
+            )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_setup())
+
+
 def _write_journalled_thought_pair_with_edge(db_path: Path) -> None:
     """Create two journalled thoughts (``t-old-0``, ``t-old-1``) joined by a journalled edge.
 
@@ -350,6 +397,19 @@ def journalled_db_with_edge(tmp_path: Path) -> Path:
     """
     db_path = tmp_path / "journalled_with_edge.db"
     _write_journalled_thought_pair_with_edge(db_path)
+    return db_path
+
+
+@pytest.fixture
+def plain_thoughts_db(tmp_path: Path) -> Path:
+    """Two plain thoughts (``p-0``, ``p-1``), no journal, no edges, no embeddings.
+
+    Backs the "already damaged by an older build" acceptance case: unlike
+    ``populated_db``, nothing here cascades when ``_corrupt_fts_with_raw_replace``
+    forces a raw primary-key collision on one of these thoughts.
+    """
+    db_path = tmp_path / "plain.db"
+    _write_plain_thoughts(db_path, ["p-0", "p-1"])
     return db_path
 
 
@@ -727,6 +787,211 @@ def _thought_fts_match_count(db_path: Path, term: str) -> int:
             "SELECT COUNT(*) FROM thought_fts WHERE thought_fts MATCH ?", (term,)
         ).fetchone()
         return int(row[0])
+    finally:
+        conn.close()
+
+
+def _fts_match_rowids(db_path: Path, term: str) -> set[int]:
+    """Return the real ``thought_fts`` rowids matching ``term`` via a ``MATCH`` query.
+
+    Companion to :func:`_thought_fts_match_count`: the count alone cannot say
+    *which* rowids a stale entry belongs to, which
+    :func:`_assert_fts_index_matches_live_thoughts` needs to compare against
+    the ``thought`` rows that currently, actually contain the term.
+
+    ``term`` is always sent as a quoted phrase, never a bare word: FTS5's
+    *query grammar* (not the configured tokenizer) treats an unquoted ``-``
+    as its own ``NOT``/column-filter syntax regardless of the table's
+    ``tokenchars '-_'`` setting -- a bare ``p-0`` raises ``OperationalError:
+    no such column: 0`` even though ``-`` is an ordinary token character to
+    the tokenizer once it is inside a quoted phrase. Callers that need to
+    identify one hyphenated id among several (e.g. ``t-old-0``) rely on this;
+    a plain word (``"alpha"``, ``"content"``) behaves identically quoted or
+    not, since a single-token phrase matches exactly like the bare term.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        quoted_term = '"' + term.replace('"', '""') + '"'
+        rows = conn.execute(
+            "SELECT rowid FROM thought_fts WHERE thought_fts MATCH ?", (quoted_term,)
+        ).fetchall()
+        return {int(row[0]) for row in rows}
+    finally:
+        conn.close()
+
+
+def _live_thought_rowids_containing(db_path: Path, term: str) -> set[int]:
+    """Return the rowids of ``thought`` rows whose essence or content literally contains ``term``.
+
+    Ground truth independent of FTS5 entirely -- "what a fresh re-index would
+    produce" restated as a plain substring check over the table restore is
+    supposed to be indexing right now. Every fixture used with this helper
+    picks terms (``"alpha"``, ``"zulu"``, an id like ``"t-old-0"``, ...) that
+    appear as whole, unambiguous substrings of exactly the rows they are meant
+    to describe, so a literal ``in`` check is exact here, not an approximation
+    -- except for case: the ``unicode61`` tokenizer folds case before indexing,
+    so ``thought_fts`` cannot distinguish ``"Content"`` from ``"content"`` and
+    this ground truth must not either, or a fixture whose column happens to
+    capitalize the term (``"Content for ..."``) would wrongly read as an entry
+    the index is missing.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute("SELECT rowid, essence, content FROM thought").fetchall()
+    finally:
+        conn.close()
+    term_lower = term.lower()
+    return {
+        int(rowid)
+        for rowid, essence, content in rows
+        if term_lower in essence.lower() or term_lower in content.lower()
+    }
+
+
+def _assert_fts_index_matches_live_thoughts(db_path: Path, term: str) -> None:
+    """Assert ``thought_fts``'s real ``MATCH`` rowids for ``term`` are exactly the live rows.
+
+    This is the acceptance criterion the WS states directly: "per-term MATCH
+    results equal a fresh re-index of the thought rows". A rowid ``MATCH``
+    returns that :func:`_live_thought_rowids_containing` does not is a stale
+    entry FTS5 never cleaned up (the defect this WS fixes); a rowid the other
+    way around is a row the index is missing entirely. Either is a failure.
+    """
+    actual = _fts_match_rowids(db_path, term)
+    expected = _live_thought_rowids_containing(db_path, term)
+    assert actual == expected, (
+        f"thought_fts MATCH {term!r} = {sorted(actual)}, but the thought rows that "
+        f"actually contain {term!r} right now are {sorted(expected)} "
+        f"(stale extra: {sorted(actual - expected)}, missing: {sorted(expected - actual)})"
+    )
+
+
+def _snapshot_line_types(snapshot_path: Path) -> set[str]:
+    """Return every distinct ``_type`` value present across a snapshot's lines.
+
+    Used to confirm a snapshot is genuinely metadata-only (``{"metadata"}``,
+    no ``thought``/``edge``/``embedding``/``action`` record at all) rather than
+    happening to contain zero of the one core-table type a test cares about.
+    """
+    lines = [json.loads(line) for line in snapshot_path.read_text(encoding="utf-8").splitlines()]
+    return {line.get("_type") for line in lines}
+
+
+def _corrupt_fts_with_raw_replace(db_path: Path, thought_id: str) -> None:
+    """Reproduce, at the raw-SQL level, exactly what an unfixed restore left behind.
+
+    An ``INSERT OR REPLACE`` colliding on ``thought_id``'s primary key deletes
+    the existing row and re-inserts it, internally, as part of resolving the
+    conflict. Nothing under ``src/`` sets ``PRAGMA recursive_triggers`` (it
+    defaults to off), so SQLite fires ``thought_fts_insert`` for the freshly
+    assigned rowid but never fires ``thought_fts_delete`` for the rowid this
+    removed -- schema_core.sql's trigger only runs for a ``DELETE`` a caller
+    actually issues, not one SQLite performs to satisfy a conflicting
+    ``REPLACE``. The old entry survives, stale, pointing at a rowid ``thought``
+    no longer uses.
+
+    This calls no engrava code at all: it exists to build a database "already
+    carrying stale FTS rows produced by the 0.6.0 behaviour" (the WS's own
+    acceptance wording) without going through ``restore``, which -- once this
+    fix lands -- can no longer produce that state itself.
+
+    Args:
+        db_path: Path to a database already holding a thought with this id.
+        thought_id: The colliding primary key. Its own essence/content/etc.
+            are read back and reinserted unchanged, so the only effect is the
+            rowid churn described above -- no value actually changes.
+
+    Raises:
+        AssertionError: If no thought with this id exists yet.
+
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT thought_type, essence, content, priority, lifecycle_status, "
+            "created_cycle, updated_cycle, source FROM thought WHERE thought_id = ?",
+            (thought_id,),
+        ).fetchone()
+        assert row is not None, f"no thought {thought_id!r} to corrupt"
+        (
+            thought_type,
+            essence,
+            content,
+            priority,
+            lifecycle_status,
+            created_cycle,
+            updated_cycle,
+            source,
+        ) = row
+        conn.execute(
+            "INSERT OR REPLACE INTO thought "
+            "(thought_id, thought_type, essence, content, priority, lifecycle_status, "
+            "created_cycle, updated_cycle, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                thought_id,
+                thought_type,
+                essence,
+                content,
+                priority,
+                lifecycle_status,
+                created_cycle,
+                updated_cycle,
+                source,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _full_thought_table_snapshot(db_path: Path) -> list[tuple[object, ...]]:
+    """Read every column of every ``thought`` row, in a stable order.
+
+    Ground truth for "the repair command changes no thought row at all" --
+    stronger than comparing just the surviving id set (``_stored_core_ids``),
+    which cannot see a column that changed on an id that survives untouched.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM thought ORDER BY thought_id").fetchall()
+        return [tuple(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def _assert_recall_never_returns_a_mismatch(runner: CliRunner, db_path: Path, term: str) -> None:
+    """Assert ``recall(term)`` never returns a thought whose live content lacks ``term``.
+
+    This is the WS's acceptance wording taken literally ("recall never
+    returns a thought missing the query term"), so every acceptance case in
+    :class:`TestRestoreRebuildsFtsIndex` checks it, not just the merge-then-
+    ``--clear`` case the defect was originally measured on. Checked against
+    each returned thought's *live* essence and content read directly from
+    the database -- not just ``recall --json``'s own payload, which surfaces
+    only ``essence`` -- and case-insensitively, matching the ``unicode61``
+    tokenizer's casefolding (the same reason :func:`_live_thought_rowids_containing`
+    lowercases both sides).
+    """
+    recall_result = runner.invoke(cli, ["--db", str(db_path), "recall", term, "--json"])
+    assert recall_result.exit_code == 0, recall_result.output
+    payload = json.loads(recall_result.output)
+    term_lower = term.lower()
+    conn = sqlite3.connect(db_path)
+    try:
+        for row in payload["results"]:
+            live_row = conn.execute(
+                "SELECT essence, content FROM thought WHERE thought_id = ?",
+                (row["thought_id"],),
+            ).fetchone()
+            assert live_row is not None, (
+                f"recall({term!r}) returned thought_id {row['thought_id']!r}, "
+                "which no longer exists in `thought` at all"
+            )
+            essence, content = live_row
+            assert term_lower in essence.lower() or term_lower in content.lower(), (
+                f"recall({term!r}) returned a thought that does not contain the word: {row}"
+            )
     finally:
         conn.close()
 
@@ -2456,6 +2721,371 @@ class TestJournalledMergeCollisionGate:
             standalone_mode=False,
         )
         assert result.exit_code == 0, result.output
+
+
+class TestRestoreRebuildsFtsIndex:
+    """A restore never leaves ``thought_fts`` carrying a stale entry.
+
+    Without ``PRAGMA recursive_triggers`` (unset anywhere under ``src/``, so it
+    stays at SQLite's default of off), an ``INSERT OR REPLACE`` that resolves a
+    primary-key or ``UNIQUE`` collision by deleting the existing row and
+    re-inserting it fires ``thought_fts_insert`` for the new rowid but never
+    fires ``thought_fts_delete`` for the one it removed -- that trigger only
+    runs for a ``DELETE`` a caller actually issues, never for one SQLite
+    performs internally to resolve a conflicting ``REPLACE``. The stale entry
+    then survives, keyed to a rowid ``thought`` may hand to a completely
+    unrelated row later, at which point a keyword search for the old content
+    resolves to that unrelated row instead.
+
+    Each test below is one case from the WS acceptance list, asserting via
+    :func:`_assert_fts_index_matches_live_thoughts` that ``thought_fts``'s real
+    ``MATCH`` rowids equal a fresh re-index of ``thought``'s current rows --
+    never a bare ``SELECT COUNT(*) FROM thought_fts``, which reads straight
+    through to ``thought`` on this external-content table and cannot observe
+    any of this (see :func:`_thought_fts_match_count`'s own docstring).
+    """
+
+    def test_merge_restore_into_its_own_source_leaves_no_stale_row(
+        self,
+        runner: CliRunner,
+        tmp_path: Path,
+    ) -> None:
+        """Case 1: an ordinary merge restore (no journal) of a DB's own snapshot into itself.
+
+        Reproduces the WS's own measurement directly
+        (``scratch/audit-070/cli/fts_stale_repro.sh``): both thoughts collide
+        on their own unchanged primary key, and the pre-fix behaviour left 4
+        real index entries for "alpha" over 2 live thought rows.
+        """
+        db = tmp_path / "alpha.db"
+        r1 = runner.invoke(cli, ["--db", str(db), "remember", "alpha apples orchard"])
+        assert r1.exit_code == 0, r1.output
+        r2 = runner.invoke(cli, ["--db", str(db), "remember", "alpha avocado grove"])
+        assert r2.exit_code == 0, r2.output
+        assert _journal_entry_count(db) == 0
+
+        snap = tmp_path / "alpha.jsonl"
+        result = runner.invoke(cli, ["--db", str(db), "snapshot", "-o", str(snap)])
+        assert result.exit_code == 0, result.output
+
+        result = runner.invoke(cli, ["--db", str(db), "restore", "-i", str(snap)])
+        assert result.exit_code == 0, result.output
+
+        assert _thought_fts_match_count(db, "alpha") == 2
+        _assert_fts_index_matches_live_thoughts(db, "alpha")
+        _assert_recall_never_returns_a_mismatch(runner, db, "alpha")
+
+    def test_journalled_merge_restore_under_the_override_leaves_no_stale_row(
+        self,
+        runner: CliRunner,
+        journalled_db: Path,
+        identical_snapshot_of_journalled_db: Path,
+    ) -> None:
+        """Case 2: the same, on a journalled database, forced via ``--orphan-journal-entries``.
+
+        Without the override this restore is refused outright by the
+        journalled-merge collision gate (see
+        ``test_identical_restore_is_refused_and_rowids_never_move``), which is
+        exactly why the gate closes this class of damage for the common case
+        -- this test covers the caller who explicitly opts back into the old
+        merge behaviour and still must not get a stale index out of it.
+        """
+        assert _journal_entry_count(journalled_db) == 3
+        assert _thought_fts_match_count(journalled_db, "content") == 3
+
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(journalled_db),
+                "restore",
+                "-i",
+                str(identical_snapshot_of_journalled_db),
+                "--orphan-journal-entries",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+        assert _thought_fts_match_count(journalled_db, "content") == 3
+        _assert_fts_index_matches_live_thoughts(journalled_db, "content")
+        _assert_recall_never_returns_a_mismatch(runner, journalled_db, "content")
+        # The rebuild only ever rewrites thought_fts -- the journal itself is
+        # untouched, and still verifies clean.
+        assert _journal_entry_count(journalled_db) == 3
+        verify_result = runner.invoke(
+            cli, ["--db", str(journalled_db), "--format", "json", "verify"]
+        )
+        assert verify_result.exit_code == 0, verify_result.output
+        verify_data = json.loads(verify_result.output)
+        assert verify_data["valid"] is True
+        assert verify_data["entries_checked"] == 3
+
+    def test_clear_restore_after_a_merge_never_lets_recall_return_the_wrong_thought(
+        self,
+        runner: CliRunner,
+        tmp_path: Path,
+    ) -> None:
+        """Case 3: case 1's merge, followed by a ``--clear`` restore of unrelated data.
+
+        This is the WS's own headline defect: pre-fix, the merge above leaves
+        a stale "alpha" entry at a freed rowid, ``--clear`` empties the table,
+        and the very next insert (the first "zulu" thought) is handed that
+        same freed rowid by SQLite's ordinary rowid allocation -- so
+        ``recall "alpha"`` resolves the stale entry straight to a "zulu"
+        thought that does not contain the word at all.
+        """
+        db = tmp_path / "alpha.db"
+        r1 = runner.invoke(cli, ["--db", str(db), "remember", "alpha apples orchard"])
+        assert r1.exit_code == 0, r1.output
+        r2 = runner.invoke(cli, ["--db", str(db), "remember", "alpha avocado grove"])
+        assert r2.exit_code == 0, r2.output
+        snap = tmp_path / "alpha.jsonl"
+        assert runner.invoke(cli, ["--db", str(db), "snapshot", "-o", str(snap)]).exit_code == 0
+        result = runner.invoke(cli, ["--db", str(db), "restore", "-i", str(snap)])
+        assert result.exit_code == 0, result.output
+
+        zulu_db = tmp_path / "zulu.db"
+        assert (
+            runner.invoke(cli, ["--db", str(zulu_db), "remember", "zulu zebra stripes"]).exit_code
+            == 0
+        )
+        assert (
+            runner.invoke(cli, ["--db", str(zulu_db), "remember", "zulu zinc metal"]).exit_code == 0
+        )
+        zulu_snap = tmp_path / "zulu.jsonl"
+        assert (
+            runner.invoke(cli, ["--db", str(zulu_db), "snapshot", "-o", str(zulu_snap)]).exit_code
+            == 0
+        )
+
+        result = runner.invoke(cli, ["--db", str(db), "restore", "-i", str(zulu_snap), "--clear"])
+        assert result.exit_code == 0, result.output
+
+        assert _thought_fts_match_count(db, "alpha") == 0
+        _assert_fts_index_matches_live_thoughts(db, "alpha")
+        _assert_fts_index_matches_live_thoughts(db, "zulu")
+        _assert_recall_never_returns_a_mismatch(runner, db, "alpha")
+
+    def test_merge_restore_heals_stale_rows_an_older_build_already_left_behind(
+        self,
+        runner: CliRunner,
+        plain_thoughts_db: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Case 4a: a merge restore into an already-damaged database comes out consistent.
+
+        The damage is built directly at the SQL level
+        (:func:`_corrupt_fts_with_raw_replace`), reproducing exactly what an
+        unfixed restore left behind without going through ``restore`` at all
+        -- which, with this fix, can no longer produce that state itself. A
+        per-row-delete-before-REPLACE alternative would not heal this: the
+        damage already happened in the past, on a row this restore's own
+        snapshot never even mentions, so it has nothing to key a delete on.
+        Only an unconditional, full rebuild reaches it.
+        """
+        _corrupt_fts_with_raw_replace(plain_thoughts_db, "p-0")
+        # Sanity: the corruption landed -- a stale entry plus a fresh one.
+        assert len(_fts_match_rowids(plain_thoughts_db, "p-0")) == 2
+
+        source_db = tmp_path / "disjoint-source.db"
+        assert runner.invoke(cli, ["--db", str(source_db), "migrate"]).exit_code == 0
+
+        import asyncio
+
+        import aiosqlite
+
+        from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+
+        async def _seed() -> None:
+            conn = await aiosqlite.connect(str(source_db))
+            conn.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(conn)
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id="p-disjoint",
+                    essence="Essence for p-disjoint",
+                    content="Content for p-disjoint",
+                    thought_type=ThoughtType.OBSERVATION,
+                    source="test",
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    priority=Priority.P2,
+                    created_cycle=1,
+                    updated_cycle=1,
+                )
+            )
+            await conn.commit()
+            await conn.close()
+
+        asyncio.run(_seed())
+        disjoint_snap = tmp_path / "disjoint.jsonl"
+        disjoint_snap_result = runner.invoke(
+            cli, ["--db", str(source_db), "snapshot", "-o", str(disjoint_snap)]
+        )
+        assert disjoint_snap_result.exit_code == 0, disjoint_snap_result.output
+
+        result = runner.invoke(
+            cli, ["--db", str(plain_thoughts_db), "restore", "-i", str(disjoint_snap)]
+        )
+        assert result.exit_code == 0, result.output
+
+        assert len(_fts_match_rowids(plain_thoughts_db, "p-0")) == 1
+        _assert_fts_index_matches_live_thoughts(plain_thoughts_db, "p-0")
+        _assert_fts_index_matches_live_thoughts(plain_thoughts_db, "p-disjoint")
+        _assert_recall_never_returns_a_mismatch(runner, plain_thoughts_db, "p-0")
+        _assert_recall_never_returns_a_mismatch(runner, plain_thoughts_db, "p-disjoint")
+
+    def test_clear_restore_heals_stale_rows_an_older_build_already_left_behind(
+        self,
+        runner: CliRunner,
+        plain_thoughts_db: Path,
+        unrelated_snapshot: Path,
+    ) -> None:
+        """Case 4b: same as above, through the ``--clear`` path instead of a plain merge."""
+        _corrupt_fts_with_raw_replace(plain_thoughts_db, "p-0")
+        assert len(_fts_match_rowids(plain_thoughts_db, "p-0")) == 2
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(plain_thoughts_db), "restore", "-i", str(unrelated_snapshot), "--clear"],
+        )
+        assert result.exit_code == 0, result.output
+
+        # --clear discards p-0 itself along with everything else, so "p-0" now
+        # matches nothing at all -- not even the stale leftover.
+        assert len(_fts_match_rowids(plain_thoughts_db, "p-0")) == 0
+        _assert_fts_index_matches_live_thoughts(plain_thoughts_db, "p-0")
+        _assert_fts_index_matches_live_thoughts(plain_thoughts_db, "t-src")
+        _assert_recall_never_returns_a_mismatch(runner, plain_thoughts_db, "p-0")
+        _assert_recall_never_returns_a_mismatch(runner, plain_thoughts_db, "t-src")
+
+    def test_documented_repair_command_heals_a_damaged_journalled_database(
+        self,
+        journalled_db: Path,
+    ) -> None:
+        """Case 5: the documented repair command, run directly against an already-damaged,
+        journalled database.
+
+        Builds the same standalone damage as the merge-restore cases above,
+        then executes the exact SQL documented in ``docs/troubleshooting.md``
+        directly against the file -- never through ``engrava`` -- and checks
+        it leaves the index consistent while touching neither ``thought`` nor
+        the journal: SQLite's own FTS5 ``'rebuild'`` command reconstructs the
+        index purely from ``thought``'s current rows and the table's own
+        already-configured tokenizer, so it has no reason to write to either.
+
+        ``journalled_db`` holds exactly three thoughts (``t-old-0..2``), each
+        with its own id embedded in its essence/content -- checking all three
+        terms below, not just the one that was corrupted, is a complete sweep
+        of every row this database holds, matching what the documentation
+        claims ("every `MATCH` result... names only rows that actually
+        contain the term"). Comparing full rows
+        (:func:`_full_thought_table_snapshot`), not just the surviving id set,
+        is what backs the documentation's separate claim that `thought`'s rows
+        are left unchanged: an id-only comparison cannot see a column that
+        changed on a row whose id happens to survive.
+        """
+        _corrupt_fts_with_raw_replace(journalled_db, "t-old-0")
+        assert len(_fts_match_rowids(journalled_db, "t-old-0")) == 2
+
+        before_journal_count = _journal_entry_count(journalled_db)
+        assert before_journal_count == 3
+        before_thought_rows = _full_thought_table_snapshot(journalled_db)
+        assert len(before_thought_rows) == 3
+
+        conn = sqlite3.connect(journalled_db)
+        try:
+            conn.execute("INSERT INTO thought_fts(thought_fts) VALUES('rebuild');")
+            conn.commit()
+        finally:
+            conn.close()
+
+        assert len(_fts_match_rowids(journalled_db, "t-old-0")) == 1
+        runner = CliRunner()
+        for term in ("t-old-0", "t-old-1", "t-old-2"):
+            _assert_fts_index_matches_live_thoughts(journalled_db, term)
+            _assert_recall_never_returns_a_mismatch(runner, journalled_db, term)
+        assert _full_thought_table_snapshot(journalled_db) == before_thought_rows
+        assert _journal_entry_count(journalled_db) == before_journal_count
+
+        verify_result = runner.invoke(
+            cli, ["--db", str(journalled_db), "--format", "json", "verify"]
+        )
+        assert verify_result.exit_code == 0, verify_result.output
+        verify_data = json.loads(verify_result.output)
+        assert verify_data["valid"] is True
+        assert verify_data["entries_checked"] == before_journal_count
+
+    def test_merge_restore_with_no_thought_records_still_heals_stale_rows(
+        self,
+        runner: CliRunner,
+        plain_thoughts_db: Path,
+        tmp_path: Path,
+    ) -> None:
+        """A restore whose snapshot carries no thought record still heals prior damage.
+
+        Every other case in this class restores a snapshot that happens to
+        carry at least one thought record, which a narrower, wrong fix --
+        rebuilding only when the import actually touched a thought (gated on,
+        say, ``stream_result.total_records`` or "did this stream include a
+        THOUGHT record") -- would satisfy by accident and pass every one of
+        them anyway. This restores a metadata-only snapshot (exported from a
+        freshly migrated, otherwise empty database: ``engrava snapshot``
+        writes exactly one metadata header line and nothing else for it) into
+        an already-damaged target, so a conditional rebuild has nothing to
+        trigger on and the damage would survive under it.
+        """
+        _corrupt_fts_with_raw_replace(plain_thoughts_db, "p-0")
+        assert len(_fts_match_rowids(plain_thoughts_db, "p-0")) == 2
+
+        empty_source = tmp_path / "empty-source.db"
+        assert runner.invoke(cli, ["--db", str(empty_source), "migrate"]).exit_code == 0
+        empty_snap = tmp_path / "empty.jsonl"
+        snap_result = runner.invoke(
+            cli, ["--db", str(empty_source), "snapshot", "-o", str(empty_snap)]
+        )
+        assert snap_result.exit_code == 0, snap_result.output
+        # Sanity: genuinely no thought (or any other core-table) record here.
+        assert _snapshot_line_types(empty_snap) == {"metadata"}
+
+        result = runner.invoke(
+            cli, ["--db", str(plain_thoughts_db), "restore", "-i", str(empty_snap)]
+        )
+        assert result.exit_code == 0, result.output
+
+        assert len(_fts_match_rowids(plain_thoughts_db, "p-0")) == 1
+        _assert_fts_index_matches_live_thoughts(plain_thoughts_db, "p-0")
+        _assert_recall_never_returns_a_mismatch(runner, plain_thoughts_db, "p-0")
+
+    def test_clear_restore_with_no_thought_records_still_heals_stale_rows(
+        self,
+        runner: CliRunner,
+        plain_thoughts_db: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Same guard as above, through ``--clear`` -- which also discards ``p-0`` itself."""
+        _corrupt_fts_with_raw_replace(plain_thoughts_db, "p-0")
+        assert len(_fts_match_rowids(plain_thoughts_db, "p-0")) == 2
+
+        empty_source = tmp_path / "empty-source-2.db"
+        assert runner.invoke(cli, ["--db", str(empty_source), "migrate"]).exit_code == 0
+        empty_snap = tmp_path / "empty-2.jsonl"
+        snap_result = runner.invoke(
+            cli, ["--db", str(empty_source), "snapshot", "-o", str(empty_snap)]
+        )
+        assert snap_result.exit_code == 0, snap_result.output
+        assert _snapshot_line_types(empty_snap) == {"metadata"}
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(plain_thoughts_db), "restore", "-i", str(empty_snap), "--clear"],
+        )
+        assert result.exit_code == 0, result.output
+
+        # --clear discards p-0 itself along with everything else, so "p-0" now
+        # matches nothing at all -- not even the stale leftover.
+        assert len(_fts_match_rowids(plain_thoughts_db, "p-0")) == 0
+        _assert_fts_index_matches_live_thoughts(plain_thoughts_db, "p-0")
+        _assert_recall_never_returns_a_mismatch(runner, plain_thoughts_db, "p-0")
 
 
 class _FakeRollbackConnection:

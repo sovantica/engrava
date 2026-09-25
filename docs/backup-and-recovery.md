@@ -102,6 +102,12 @@ multi-service targets. When `--clear` encounters a persisted sqlite-vec index,
 restore drops the derived table transactionally and the next configured open
 rebuilds it. Keep `engrava[vec]` installed for that virtual-table reset.
 
+Every restore — merge or `--clear` — also rebuilds the full-text search index
+from the target's `thought` rows before committing, so a colliding record
+restore replaces can never leave keyword search matching stale content behind.
+See [Troubleshooting](troubleshooting.md#keyword-search-returns-a-thought-after-restore-that-does-not-contain-the-word)
+if you restored with an older build before this was unconditional.
+
 ### Embedding handling during restore
 
 A normal restore imports the embedding rows carried by the snapshot.
