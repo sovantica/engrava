@@ -29,9 +29,13 @@ engrava --db fresh.db   restore  -i backup.jsonl   # import into a fresh db
 The snapshot is JSONL: a metadata header line, then one record per
 thought / edge / embedding / action. The export reads the metadata header and
 all four tables inside one read transaction opened before the first read
-(`src/engrava/cli/main.py:1241`), so the snapshot is a consistent point-in-time
+(`src/engrava/cli/main.py:1466`), so the snapshot is a consistent point-in-time
 view rather than four independent scans that a concurrent writer could
-interleave with.
+interleave with. It writes that content to a temporary file next to `-o` and
+publishes it there only once the read transaction has closed successfully, so
+a write that fails part-way never disturbs an existing file at `-o` — see
+[CLI Reference](cli.md#snapshot) for the full guarantee and the `-wal`/`-shm`
+output restriction.
 
 > **A snapshot does NOT include the audit journal.** The `journal_entry` table —
 > the tamper-evident hash chain — is **not** exported by `engrava snapshot`, and

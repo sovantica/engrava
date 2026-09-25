@@ -361,7 +361,7 @@ def _verify_upgraded_db_script(
         import aiosqlite
 
         from engrava import SqliteEngravaCore
-        from engrava.cli.main import _export_db_to_jsonl
+        from engrava.cli.main import _export_db_to_jsonl, _publish_atomic_replacement
         from engrava.config import DreamingConfig, DreamingGates, EdgeCreationConfig
         from engrava.extensions.dreaming import DreamingExtension
 
@@ -600,7 +600,10 @@ def _verify_upgraded_db_script(
                 # store -- so this is a clean "did the migration itself
                 # preserve everything" snapshot, not confounded by later,
                 # unrelated writes.
-                await _export_db_to_jsonl(conn, Path(POST_MIGRATION_SNAPSHOT_PATH))
+                _, post_migration_tmp_path, post_migration_real_out = await _export_db_to_jsonl(
+                    conn, Path(POST_MIGRATION_SNAPSHOT_PATH), db_path=Path(DB_PATH)
+                )
+                _publish_atomic_replacement(post_migration_tmp_path, post_migration_real_out)
 
                 post_integrity = await store.verify_journal()
                 with open(PRE_JOURNAL_STATE_PATH, encoding="utf-8") as f:

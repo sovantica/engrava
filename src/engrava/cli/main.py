@@ -22,6 +22,7 @@ import datetime
 import json
 import logging
 import os
+import secrets
 import sqlite3
 import sys
 from contextlib import asynccontextmanager
@@ -55,7 +56,7 @@ from engrava.infrastructure.sqlite.engrava_core import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+    from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, Mapping, Sequence
     from typing import TextIO
 
     import aiosqlite
@@ -1114,6 +1115,204 @@ def query(ctx: click.Context, mql: str) -> None:
 
 
 # ------------------------------------------------------------------
+# Atomic output writing (shared by snapshot and export)
+# ------------------------------------------------------------------
+#
+# Both writers used to open their `-o` path directly (`open("w")` /
+# `Path.write_text`), which truncates whatever was already there before a
+# single byte of the new output exists. A write that fails part-way -- a
+# full disk, a cancelled task, a `KeyboardInterrupt` -- left the previous
+# good file destroyed and replaced by a truncated one, and `restore`
+# accepted the wreckage as a valid (if short) snapshot. The shared fix
+# below writes to a temporary file in *the target's own directory* first,
+# flushes and fsyncs it, and only publishes it onto the real path with
+# `os.replace` once every read it depends on has completed successfully.
+# `os.replace` is only guaranteed atomic across a *rename*, not a copy, and
+# only when both paths share a filesystem -- a system-wide temp directory
+# cannot promise that, which is why the temporary file is created next to
+# its target instead. Everything up to a successful `os.replace` can fail
+# without disturbing an existing target and always removes the temporary
+# file; nothing after a successful replace runs except reporting the result.
+
+
+def _resolve_real_output_path(out: Path) -> Path:
+    """Resolve *out* to its real, symlink-followed filesystem path.
+
+    The temporary file and the final publish both target this, not *out*
+    itself: ``os.replace`` on a symlink destination replaces the link's own
+    directory entry, not the file it points to, so publishing straight onto
+    a symlinked ``-o`` would silently sever it and leave the old target file
+    it pointed to untouched and orphaned. Resolving first, and then writing
+    and replacing the real file underneath the link, is what keeps a
+    symlinked ``-o`` path pointing at the (now-updated) real file, matching
+    what the old in-place writers did.
+
+    A plain sync helper — not inlined in the async writers that call it — so
+    ``os.path.realpath``'s blocking filesystem lookup happens in one place
+    outside their coroutine bodies, matching this module's other blocking
+    path helpers (:func:`_refuse_output_onto_live_database`,
+    :func:`_open_same_directory_tempfile`).
+
+    Args:
+        out: The user-requested output path, not yet resolved.
+
+    Returns:
+        The real path *out* resolves to. A hard-linked ``-o`` has no
+        distinct "real path" to resolve to beyond itself — replacing it
+        necessarily creates a new file under a shared name, leaving any
+        other hard link to the old one holding the old content.
+
+    """
+    return Path(os.path.realpath(out))
+
+
+def _refuse_output_onto_live_database(out: Path, db_path: Path) -> None:
+    """Exit cleanly if *out* would publish over the live database or its WAL/SHM files.
+
+    The atomic replace below is unconditional -- it does not inspect what it
+    is about to overwrite -- so without this guard, pointing ``-o`` at the
+    very database being read (directly, through a relative spelling, or
+    through a symlink) would silently swap the live database for a
+    snapshot/export of itself the moment the replace lands. The database's
+    ``-wal`` / ``-shm`` companions are refused the same way: replacing either
+    out from under a WAL-mode connection corrupts it exactly as replacing the
+    main file would.
+
+    Both paths are resolved (``Path.resolve()``) before comparison, which
+    already catches a relative spelling and a symlink to the same file --
+    resolving follows symlinks and normalizes the result. ``Path.samefile``
+    is checked too, for the same-inode cases resolution alone can miss (e.g.
+    a hard link), whenever both paths exist to ask it about.
+
+    Args:
+        out: The user-requested output path, not yet resolved.
+        db_path: The database file this command is reading from.
+
+    """
+    resolved_out = out.resolve()
+    resolved_db = db_path.resolve()
+    protected = (resolved_db, Path(f"{resolved_db}-wal"), Path(f"{resolved_db}-shm"))
+
+    def _names_the_same_file(candidate: Path) -> bool:
+        if resolved_out == candidate:
+            return True
+        try:
+            return resolved_out.exists() and candidate.exists() and resolved_out.samefile(candidate)
+        except OSError:
+            return False
+
+    for candidate in protected:
+        if _names_the_same_file(candidate):
+            click.echo(
+                f"Refusing to write output to {out}: it names the live "
+                f"database ({db_path}) or one of its -wal/-shm files. Choose "
+                "a different --output path.",
+                err=True,
+            )
+            sys.exit(1)
+
+
+# Bounded so a persistent name collision can't retry forever -- with a
+# 64-bit random suffix, exhausting this is not expected to happen in
+# practice; it exists so a pathological directory fails loudly instead of
+# hanging.
+_MAX_TEMP_NAME_ATTEMPTS = 10
+
+
+def _open_same_directory_tempfile(out: Path) -> tuple[Path, TextIO]:
+    """Open a temporary file in *out*'s own directory, ready to become *out*.
+
+    Same directory, never a shared temp directory -- see this section's own
+    docstring above for why. Created with ``os.open(..., O_CREAT | O_EXCL,
+    0o666)`` under a randomly-suffixed name, rather than ``tempfile.mkstemp``:
+    the kernel applies the process umask to that ``0o666`` exactly as a plain
+    ``open(path, "w")`` would, so a fresh output file comes out with the
+    permissions the old in-place writers gave it, not ``mkstemp``'s always-
+    ``0o600``. Reading the umask to replicate that ourselves would mean
+    flipping it to ``0`` and back -- process-wide state, so any other thread
+    creating a file in that window would get an unintended, unrestricted
+    mode. When *out* already exists, it keeps its permission bits (read,
+    write and execute for user, group and other), copied onto the new file
+    with ``os.fchmod`` instead: a replace must not silently widen or narrow
+    permissions on an existing file.
+
+    Args:
+        out: The path this temporary file is standing in for.
+
+    Returns:
+        The temporary file's path and its already-open text-mode handle.
+
+    Raises:
+        FileExistsError: If a unique name could not be found within
+            :data:`_MAX_TEMP_NAME_ATTEMPTS` tries.
+
+    """
+    directory = out.parent
+    for _attempt in range(_MAX_TEMP_NAME_ATTEMPTS):
+        tmp_path = directory / f".{out.name}.{secrets.token_hex(8)}.tmp"
+        try:
+            fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        except FileExistsError:
+            continue
+        break
+    else:
+        msg = (
+            f"could not create a unique temporary file next to {out} after "
+            f"{_MAX_TEMP_NAME_ATTEMPTS} attempts"
+        )
+        raise FileExistsError(msg)
+
+    try:
+        try:
+            target_mode = out.stat().st_mode & 0o777
+        except FileNotFoundError:
+            pass
+        else:
+            os.fchmod(fd, target_mode)
+        f = os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        # `f` (the `fdopen` wrapper) never came into being on this path --
+        # `fd` has no owner yet, so it's closed directly rather than leaked
+        # along with the file it names. This covers a failing `fchmod` and a
+        # failing `fdopen` itself alike: both leave `fd` unwrapped.
+        os.close(fd)
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return tmp_path, f
+
+
+def _discard_atomic_temp(tmp_path: Path) -> None:
+    """Best-effort removal of a temporary file that must not be published."""
+    tmp_path.unlink(missing_ok=True)
+
+
+def _publish_atomic_replacement(tmp_path: Path, out: Path) -> None:
+    """Publish *tmp_path* onto *out* -- the guarantee's boundary.
+
+    Before a successful call, any failure here leaves an existing *out*
+    byte-identical and removes *tmp_path*. After it, *out* holds the
+    complete new output, and nothing that follows may undo that -- this must
+    be the last operation that can fail before the caller reports success.
+
+    Args:
+        tmp_path: The fully-written temporary file, in the same directory as
+            *out*.
+        out: The publication target.
+
+    """
+    try:
+        # `os.replace` explicitly, not `Path.replace`: this is the exact
+        # publication call the acceptance tests patch to inject a
+        # publication-boundary failure, and the one thing standing between
+        # this whole module and a `shutil.copy`-shaped implementation that
+        # would silently drop the atomicity this section exists for.
+        os.replace(tmp_path, out)  # noqa: PTH105
+    except BaseException:
+        _discard_atomic_temp(tmp_path)
+        raise
+
+
+# ------------------------------------------------------------------
 # snapshot (export to JSONL)
 # ------------------------------------------------------------------
 
@@ -1210,53 +1409,171 @@ async def _stream_table_records(conn: Any, f: TextIO, table: CoreTable) -> int: 
     return written
 
 
-async def _export_db_to_jsonl(conn: Any, out: Path) -> int:  # noqa: ANN401
+async def _export_db_to_jsonl(
+    conn: Any,  # noqa: ANN401
+    out: Path,
+    *,
+    db_path: Path,
+) -> tuple[int, Path, Path]:
     """Export all core tables from a connection to a JSONL file.
 
-    Writes metadata header, then thought/edge/embedding/action records.
+    Writes metadata header, then thought/edge/embedding/action records, into
+    a temporary file next to *out*'s real target -- see the "Atomic output
+    writing" section above. **Does not publish.** Publication (``os.replace``)
+    is the caller's job, once the caller has finished closing whatever it
+    used to read *conn* (a `commit()`, a connection close, a manager
+    teardown) -- only the caller knows when that is fully done, and a
+    failure in any of it must still discard the temporary file this
+    function created rather than let a partially-closed read publish
+    anyway. Every failure from here through a successful return -- opening
+    the read transaction, streaming rows, closing it -- leaves an existing
+    *out* byte-identical and removes the temporary file itself.
+
+    **Precondition:** the caller has exclusive use of *conn* for the
+    duration of this call -- no other task issues statements on it while
+    this call is in flight. Every caller satisfies this today: the
+    single-database ``snapshot`` path's own ``_opened_db`` connection, the
+    ``--service`` path's store connection (opened fresh for that one
+    command), and the upgrade-path verification script's own connection are
+    each used by nothing else for as long as the call is running. The
+    rollback rule below reads *conn*'s transaction state once, before this
+    call touches it at all, and relies on nothing else changing that state
+    concurrently -- a transaction opened by some other task on the same
+    connection between that read and this call's own ``BEGIN`` would not be
+    this function's to roll back, and nothing here could tell the two
+    apart.
 
     Args:
-        conn: Open aiosqlite connection.
-        out: Output file path.
+        conn: Open aiosqlite connection, exclusively owned by the caller
+            for the duration of this call -- see the precondition above.
+        out: Output file path. A symlink is followed to its real target,
+            which is what actually gets written and later replaced -- the
+            symlink itself is never touched, so it keeps pointing at the
+            (now-replaced) real file.
+        db_path: The database file *conn* is reading. Refused as an output
+            target, along with its ``-wal``/``-shm`` companions -- see
+            :func:`_refuse_output_onto_live_database`.
 
     Returns:
-        Total number of records exported.
+        The total number of records exported, the fully-written,
+        not-yet-published temporary file's path, and the real (symlink-
+        resolved) path it must be published onto -- pass both to
+        :func:`_publish_atomic_replacement` once every closing step that can
+        fail has completed.
 
     """
     total = 0
+    _refuse_output_onto_live_database(out, db_path)
+    real_out = _resolve_real_output_path(out)
+    tmp_path, f = _open_same_directory_tempfile(real_out)
 
-    # Open the transaction explicitly, before any read, so the metadata
-    # header and all four table scans below observe one consistent database
-    # state -- the same before-or-after state relative to any concurrent
-    # writer, for the whole export -- rather than each `await
-    # conn.execute(...)` running as its own independent implicit read. A
-    # writer committing a new thought and its edge between two scans could
-    # otherwise leave the edge in the snapshot while the thought it
-    # references never made it in, which restore later refuses as a
-    # dangling foreign key. This mirrors how `_import_records_to_db` opens
-    # its own explicit `BEGIN` rather than depending on the driver's
-    # implicit-transaction default -- read-only here, so the transaction is
-    # closed with a `commit()` (equivalent to `rollback()` for a read, but
-    # matches the pattern the write path already uses) rather than left open.
-    await conn.execute("BEGIN")
+    # Read before this call touches `conn` at all -- see the `except` block
+    # for why that matters more than tracking whether our own `await
+    # conn.execute("BEGIN")` below returned successfully.
+    caller_in_transaction = conn.in_transaction
     try:
-        meta_record = await _snapshot_metadata_record(conn)
-        with out.open("w", encoding="utf-8") as f:
+        try:
+            # Opening the transaction is inside this same discard-on-failure
+            # region: a failing or cancelled `BEGIN` must still remove the
+            # temporary file this function already created, not leak it
+            # along with `f`'s file handle.
+            #
+            # Opened explicitly, before any read, so the metadata header and
+            # all four table scans below observe one consistent database
+            # state -- the same before-or-after state relative to any
+            # concurrent writer, for the whole export -- rather than each
+            # `await conn.execute(...)` running as its own independent
+            # implicit read. A writer committing a new thought and its edge
+            # between two scans could otherwise leave the edge in the
+            # snapshot while the thought it references never made it in,
+            # which restore later refuses as a dangling foreign key. This
+            # mirrors how `_import_records_to_db` opens its own explicit
+            # `BEGIN` rather than depending on the driver's
+            # implicit-transaction default -- read-only here, so the
+            # transaction is closed with a `commit()` (equivalent to
+            # `rollback()` for a read, but matches the pattern the write
+            # path already uses) rather than left open.
+            await conn.execute("BEGIN")
+            meta_record = await _snapshot_metadata_record(conn)
             f.write(json.dumps(meta_record, ensure_ascii=False) + "\n")
             total += 1
             for table in _CORE_TABLES:
                 total += await _stream_table_records(conn, f, table)
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            f.close()
+        # The transaction closes only after the temporary file's content is
+        # fully written and durable on disk -- a failing or cancelled
+        # `commit()` here must still leave `out` untouched, which it can
+        # only do while nothing has been published onto it yet.
         await conn.commit()
     except BaseException:
-        # A read-only transaction has nothing to lose from a rollback -- this
-        # only exists so a failure here (a disk error writing `out`, a
-        # cancellation) leaves the connection out of an open transaction for
-        # its caller, the same guarantee `_import_records_to_db` gives its
-        # own caller on failure.
-        await _rollback_quietly(conn)
+        # Roll back only when `conn` had no transaction open before this
+        # call touched it -- at that point any transaction found now is
+        # necessarily ours, whether or not our own `await
+        # conn.execute("BEGIN")` above ever returned to us. aiosqlite runs
+        # `BEGIN` on its worker thread: a cancellation arriving after that
+        # thread has already executed it, but before the `await` resumes
+        # here, would leave a flag set only on a *successful return* still
+        # false, while the transaction it was meant to track is very much
+        # open -- checking the connection's state up front instead of
+        # trusting our own control flow to have observed it is what closes
+        # that gap. `conn` can also arrive already inside a transaction it
+        # did not start -- SQLite then refuses this function's own `BEGIN`
+        # with "cannot start a transaction within a transaction", and an
+        # unconditional rollback here would discard the *caller's*
+        # uncommitted writes, which this function never touched and has no
+        # business undoing. `_rollback_quietly` on a connection with no
+        # transaction open is already a documented no-op, so this never
+        # needs to guess which case it is in.
+        if not caller_in_transaction:
+            await _rollback_quietly(conn)
+        _discard_atomic_temp(tmp_path)
         raise
 
-    return total
+    return total, tmp_path, real_out
+
+
+async def _run_export_then_discard_on_failure(
+    body: Callable[[list[Path]], Coroutine[Any, Any, tuple[int, Path, Path]]],
+) -> tuple[int, Path, Path]:
+    """Call *body*, discarding its temporary file if anything about the call failed.
+
+    *body* is expected to read the database, call :func:`_export_db_to_jsonl`,
+    and finish every step needed to close its own read (a connection close,
+    a service manager's ``close_all()``) before returning -- see
+    :func:`_export_db_to_jsonl`'s own docstring for why that ordering
+    matters. Publication is still the caller's job, once this returns.
+
+    *body* takes one argument: a list to append the temporary file's path to
+    as soon as it has one, before doing anything else that can fail (in
+    particular, before its own connection/manager teardown). A closing step
+    that fails *after* :func:`_export_db_to_jsonl` already returned
+    successfully raises from inside the very statement that would otherwise
+    return that result -- the return value itself is never handed back, so
+    nothing at the call site here could otherwise learn what temporary file
+    needs discarding. Recording it into a mutable list *body* already holds
+    a reference to, rather than trying to recover it from a raised
+    exception or a return value that failure prevented, is what lets this
+    function discard it regardless of which step inside *body* failed.
+
+    Args:
+        body: The full per-mode export body (single-database or
+            per-service), already bound to its own connection/config.
+
+    Returns:
+        Whatever *body* returned: the record count, the temporary file, and
+        its real publication target.
+
+    """
+    produced: list[Path] = []
+    try:
+        return await body(produced)
+    except BaseException:
+        if produced:
+            _discard_atomic_temp(produced[0])
+        raise
 
 
 @cli.command()
@@ -1309,41 +1626,83 @@ def snapshot(ctx: click.Context, output_path: str | None, service_name: str | No
                     err=True,
                 )
                 sys.exit(1)
-            try:
-                # snapshot is read-classified, so a behind target is warned
-                # about and attempted rather than refused — but attempting
-                # must not itself migrate the service database, which calling
-                # manager.get_store() on a behind target would. peek_schema_version()
-                # reads the stamped version without migrating it.
-                existing_version = await manager.peek_schema_version(effective_service)
-                if existing_version is not None:
-                    _apply_read_schema_gate_for_version(existing_version, command="snapshot")
-                # service_exists() above already confirmed this service has a
-                # database, so migrate=False opens it exactly as stored —
-                # never a silent implicit migration on a behind target.
-                store = await manager.get_store(effective_service, migrate=False)
-                db = store._db  # noqa: SLF001
-                out = (
-                    Path(output_path)
-                    if output_path
-                    else data_dir / f"{effective_service}.snapshot.jsonl"
-                )
-                total = await _export_db_to_jsonl(db, out)
-                click.echo(f"Exported {total} records from service {effective_service!r} to {out}")
-            finally:
-                await manager.close_all()
+            service_db_path = manager._service_db_path(effective_service)  # noqa: SLF001
+            out = (
+                Path(output_path)
+                if output_path
+                else data_dir / f"{effective_service}.snapshot.jsonl"
+            )
+            # Checked here, before `get_store()` below opens a connection and
+            # (via `ensure_schema`'s own WAL setup) stamps the database file's
+            # own header -- an output path this refuses must leave that file
+            # exactly as it was, not just refuse to publish a snapshot onto it.
+            _refuse_output_onto_live_database(out, service_db_path)
+
+            async def _service_export_body(produced: list[Path]) -> tuple[int, Path, Path]:
+                try:
+                    # snapshot is read-classified, so a behind target is
+                    # warned about and attempted rather than refused — but
+                    # attempting must not itself migrate the service
+                    # database, which calling manager.get_store() on a
+                    # behind target would. peek_schema_version() reads the
+                    # stamped version without migrating it.
+                    existing_version = await manager.peek_schema_version(effective_service)
+                    if existing_version is not None:
+                        _apply_read_schema_gate_for_version(existing_version, command="snapshot")
+                    # service_exists() above already confirmed this service
+                    # has a database, so migrate=False opens it exactly as
+                    # stored — never a silent implicit migration on a behind
+                    # target.
+                    store = await manager.get_store(effective_service, migrate=False)
+                    db = store._db  # noqa: SLF001
+                    result = await _export_db_to_jsonl(db, out, db_path=service_db_path)
+                    # Recorded before `close_all()` below runs -- a failure
+                    # there must still find this. See
+                    # `_run_export_then_discard_on_failure`'s own docstring.
+                    produced.append(result[1])
+                finally:
+                    # `close_all()` can itself fail -- it must finish, along
+                    # with everything above, before publication runs.
+                    # `_run_export_then_discard_on_failure` discards
+                    # `produced`'s temporary file if it does.
+                    await manager.close_all()
+                return result
+
+            total, tmp_path, real_out = await _run_export_then_discard_on_failure(
+                _service_export_body
+            )
+            _publish_atomic_replacement(tmp_path, real_out)
+            click.echo(f"Exported {total} records from service {effective_service!r} to {out}")
         else:
             if not cfg.db_path.exists():
                 click.echo(f"Database not found: {cfg.db_path}")
                 sys.exit(1)
 
-            async with _opened_db(cfg) as conn:
-                await _apply_read_schema_gate(conn, command="snapshot")
-                out = (
-                    Path(output_path) if output_path else cfg.db_path.with_suffix(".snapshot.jsonl")
-                )
-                total = await _export_db_to_jsonl(conn, out)
-                click.echo(f"Exported {total} records to {out}")
+            out = Path(output_path) if output_path else cfg.db_path.with_suffix(".snapshot.jsonl")
+            # Checked here, before `_opened_db` below opens a connection and
+            # stamps the database file's own header (WAL mode) -- an output
+            # path this refuses must leave that file exactly as it was, not
+            # just refuse to publish a snapshot onto it.
+            _refuse_output_onto_live_database(out, cfg.db_path)
+
+            async def _single_db_export_body(produced: list[Path]) -> tuple[int, Path, Path]:
+                async with _opened_db(cfg) as conn:
+                    await _apply_read_schema_gate(conn, command="snapshot")
+                    result = await _export_db_to_jsonl(conn, out, db_path=cfg.db_path)
+                    # Recorded before this `async with` block exits below --
+                    # a close failure there must still find this. See
+                    # `_run_export_then_discard_on_failure`'s own docstring.
+                    produced.append(result[1])
+                # `_opened_db`'s own exit has now closed the connection
+                # successfully -- a close failure above propagates from this
+                # call exactly like a failure reading the database would.
+                return result
+
+            total, tmp_path, real_out = await _run_export_then_discard_on_failure(
+                _single_db_export_body
+            )
+            _publish_atomic_replacement(tmp_path, real_out)
+            click.echo(f"Exported {total} records to {out}")
 
     _run_command(
         _snapshot(),
@@ -3256,40 +3615,66 @@ def export_cmd(ctx: click.Context, output_path: str | None, status_filter: str |
             click.echo(f"Database not found: {cfg.db_path}")
             sys.exit(1)
 
-        async with _opened_db(cfg) as conn:
-            await _apply_read_schema_gate(conn, command="export")
-            # Fetch thoughts
-            if status_filter:
-                cursor = await conn.execute(
-                    "SELECT * FROM thought WHERE lifecycle_status = ?", (status_filter,)
-                )
-            else:
-                cursor = await conn.execute("SELECT * FROM thought")
-            keys = [desc[0] for desc in cursor.description] if cursor.description else []
-            thoughts = [dict(zip(keys, row, strict=True)) for row in await cursor.fetchall()]
+        out = Path(output_path) if output_path else cfg.db_path.with_suffix(".export.json")
+        _refuse_output_onto_live_database(out, cfg.db_path)
+        real_out = _resolve_real_output_path(out)
+        tmp_path, f = _open_same_directory_tempfile(real_out)
 
-            # Fetch edges
-            cursor = await conn.execute("SELECT * FROM edge")
-            edge_keys = [desc[0] for desc in cursor.description] if cursor.description else []
-            edges = [dict(zip(edge_keys, row, strict=True)) for row in await cursor.fetchall()]
+        try:
+            try:
+                async with _opened_db(cfg) as conn:
+                    await _apply_read_schema_gate(conn, command="export")
+                    # Fetch thoughts
+                    if status_filter:
+                        cursor = await conn.execute(
+                            "SELECT * FROM thought WHERE lifecycle_status = ?", (status_filter,)
+                        )
+                    else:
+                        cursor = await conn.execute("SELECT * FROM thought")
+                    keys = [desc[0] for desc in cursor.description] if cursor.description else []
+                    thoughts = [
+                        dict(zip(keys, row, strict=True)) for row in await cursor.fetchall()
+                    ]
 
-            export_data = {
-                "format": "engrava-export",
-                "version": "0.1.0",
-                "thoughts": thoughts,
-                "edges": edges,
-                "stats": {
-                    "thought_count": len(thoughts),
-                    "edge_count": len(edges),
-                },
-            }
+                    # Fetch edges
+                    cursor = await conn.execute("SELECT * FROM edge")
+                    edge_keys = (
+                        [desc[0] for desc in cursor.description] if cursor.description else []
+                    )
+                    edges = [
+                        dict(zip(edge_keys, row, strict=True)) for row in await cursor.fetchall()
+                    ]
 
-            out = Path(output_path) if output_path else cfg.db_path.with_suffix(".export.json")
-            out.write_text(
-                json.dumps(export_data, indent=2, default=str, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            click.echo(f"Exported {len(thoughts)} thoughts, {len(edges)} edges to {out}")
+                    export_data = {
+                        "format": "engrava-export",
+                        "version": "0.1.0",
+                        "thoughts": thoughts,
+                        "edges": edges,
+                        "stats": {
+                            "thought_count": len(thoughts),
+                            "edge_count": len(edges),
+                        },
+                    }
+
+                    f.write(json.dumps(export_data, indent=2, default=str, ensure_ascii=False))
+                    f.flush()
+                    os.fsync(f.fileno())
+                    # `_opened_db`'s own exit closes the connection right
+                    # here, once this `async with` block returns -- after the
+                    # temporary file's content is fully written and durable,
+                    # before publication. `export` has no explicit read
+                    # transaction of its own to commit (unlike `snapshot`),
+                    # so this close is its real "the reads are done" boundary:
+                    # a failure here must still leave `out` untouched, which
+                    # only holds while nothing has been published onto it yet.
+            finally:
+                f.close()
+        except BaseException:
+            _discard_atomic_temp(tmp_path)
+            raise
+
+        _publish_atomic_replacement(tmp_path, real_out)
+        click.echo(f"Exported {len(thoughts)} thoughts, {len(edges)} edges to {out}")
 
     _run_command(_export(), command="export", db_path=cfg.db_path)
 

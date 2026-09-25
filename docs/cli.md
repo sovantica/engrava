@@ -575,6 +575,22 @@ engrava --config engrava.yaml snapshot --service tenant_a   # data_dir from conf
 > [Backup & Recovery](backup-and-recovery.md) for what this means and when to use
 > a physical file backup instead.
 
+> **Failure safety.** `snapshot` writes to a temporary file next to `-o` and
+> publishes it there only once every row has been read and the export's own
+> read transaction has closed. On an exception or a cancelled run, an
+> existing file at `-o` stays byte-identical rather than being replaced by a
+> truncated one, and the temporary file is removed. A hard kill (`SIGKILL`)
+> cannot run that cleanup, so `-o` then holds either the previous file or
+> the complete new one, never a partial one, and a temporary file can be
+> left behind and is safe to delete by hand. `-o` may not name the
+> database currently open for `--db`, or that database's `-wal` / `-shm`
+> companion files; pointing it there is refused
+> before anything is written. An `-o` that is a symlink is followed to its
+> real target, which is written and replaced, so the symlink itself is left
+> pointing at the (now-updated) file; an `-o` that is a hard link instead
+> becomes a new, separate file, so any other hard link to the old one keeps
+> its old content.
+
 ### `restore`
 
 Restores a database from a JSONL snapshot produced by `snapshot`.
@@ -769,6 +785,18 @@ indented JSON document and can be filtered by lifecycle status.
 engrava --db engrava.db export -o thoughts.json
 engrava --db engrava.db export --status ACTIVE
 ```
+
+> **Failure safety.** Like `snapshot`, `export` writes to a temporary file
+> next to `-o` and publishes it there only once every read has completed. On
+> an exception or a cancelled run, an existing file at `-o` stays
+> byte-identical and the temporary file is removed. A hard kill (`SIGKILL`)
+> cannot run that cleanup, so `-o` then holds either the previous file or
+> the complete new one, never a partial one, and a temporary file can be
+> left behind and is safe to delete by hand. `-o` may not
+> name the database currently open for `--db`, or that database's `-wal` /
+> `-shm` companion files. A symlinked `-o` is followed and its real target
+> replaced, leaving the link itself pointing at the new content; a
+> hard-linked `-o` becomes a new, separate file instead.
 
 ## Journal verification
 

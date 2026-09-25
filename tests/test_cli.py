@@ -6,6 +6,7 @@ Tests all subcommands against an in-memory (temp file) SQLite database.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -15,14 +16,17 @@ import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
+from unittest import mock
 
 import click
 import pytest
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
+    from typing import TextIO
 from click.testing import CliRunner
 
+import engrava.cli.main as cli_main
 from engrava.cli.config import EngravaCLIConfig
 from engrava.cli.main import (
     _close_quietly,
@@ -1341,6 +1345,196 @@ class TestQuery:
         assert data[0]["count"] == 3
 
 
+# ------------------------------------------------------------------
+# Snapshot/export publish atomically
+# ------------------------------------------------------------------
+#
+# Both `snapshot` (`_export_db_to_jsonl`) and `export` (`export_cmd`) write
+# into a same-directory temporary file and publish it onto the real `-o`
+# path with `os.replace` only once every read they depend on has completed
+# successfully -- see `engrava.cli.main`'s own "Atomic output writing"
+# section. The helpers below give the acceptance tests for both writers
+# (`TestSnapshotAtomicReplace`, `TestExportAtomicReplace`) a uniform way to
+# inject a failure at each boundary of that mechanism and check what it
+# left on disk.
+
+
+def _atomic_temp_debris_in(directory: Path) -> list[Path]:
+    """List any leftover atomic-write temporary file in *directory*.
+
+    Matches `_open_same_directory_tempfile`'s naming (a leading dot and a
+    trailing ``.tmp``) broadly, rather than tying it to one particular
+    target name -- a guard-refusal test fails before any `out` is ever
+    settled, so it checks the whole directory rather than one file's name.
+    """
+    return [p for p in directory.glob(".*.tmp") if p.is_file()]
+
+
+@contextlib.contextmanager
+def _temporary_umask(mask: int) -> Iterator[None]:
+    """Set the process umask to *mask* for the block, then restore whatever it was.
+
+    The umask is process-global state, so this only works because the test
+    suite runs single-threaded; it still restores in a ``finally`` so a
+    failing assertion inside the block never leaks a changed umask into
+    later tests.
+    """
+    old_mask = os.umask(mask)
+    try:
+        yield
+    finally:
+        os.umask(old_mask)
+
+
+def _assert_fd_was_closed(fd: int, original_identity: os.stat_result) -> None:
+    """Assert *fd* no longer refers to the file whose identity was captured earlier.
+
+    A closed fd usually makes any further ``os.fstat`` raise ``OSError``
+    (``EBADF``) -- but the fd *number* can be reused by something else in
+    the same process before this check runs, which would make a bare "does
+    fstat still succeed" check a false negative. Comparing ``(st_dev,
+    st_ino)`` against the identity captured before the close is what closes
+    that gap: a reused fd number almost certainly names a different inode.
+
+    Args:
+        fd: The file descriptor that should have been closed.
+        original_identity: ``os.fstat(fd)``, captured while *fd* still named
+            the temporary file -- before the production code's own cleanup
+            could have closed it out from under a later check.
+
+    """
+    try:
+        current_identity = os.fstat(fd)
+    except OSError:
+        return
+    assert (current_identity.st_dev, current_identity.st_ino) != (
+        original_identity.st_dev,
+        original_identity.st_ino,
+    )
+
+
+class _FailAfterNWrites:
+    """A text-file stand-in whose ``write`` raises after *n* successful calls.
+
+    Wraps a real, already-open file handle so the bytes that do get through
+    before the injected failure land on the real temporary file on disk --
+    exactly what a genuine partial write (a full disk mid-stream) leaves
+    behind for the atomic-replace machinery to discard.
+    """
+
+    def __init__(self, real: TextIO, calls_before_failure: int, exc: OSError) -> None:
+        self._real = real
+        self._calls_before_failure = calls_before_failure
+        self._exc = exc
+        self._count = 0
+
+    def write(self, data: str) -> int:
+        if self._count >= self._calls_before_failure:
+            raise self._exc
+        self._count += 1
+        return self._real.write(data)
+
+    def flush(self) -> None:
+        self._real.flush()
+
+    def fileno(self) -> int:
+        return self._real.fileno()
+
+    def close(self) -> None:
+        self._real.close()
+
+
+def _fail_atomic_write_after(
+    monkeypatch: pytest.MonkeyPatch, calls_before_failure: int, exc: OSError
+) -> None:
+    """Make the next atomic write (snapshot or export) fail part-way through.
+
+    Wraps the real ``_open_same_directory_tempfile`` rather than replacing
+    it, so the temporary file it creates -- the one these tests check for
+    afterward -- is the genuine article the production code itself made,
+    not a stand-in this patch invents.
+    """
+    real_open = cli_main._open_same_directory_tempfile
+
+    def _wrapped(out: Path) -> tuple[Path, TextIO]:
+        tmp_path, f = real_open(out)
+        return tmp_path, cast("TextIO", _FailAfterNWrites(f, calls_before_failure, exc))
+
+    monkeypatch.setattr(cli_main, "_open_same_directory_tempfile", _wrapped)
+
+
+def _fail_publication(monkeypatch: pytest.MonkeyPatch, exc: OSError) -> None:
+    """Make the next ``os.replace`` publication call fail."""
+
+    def _raise(*_args: object, **_kwargs: object) -> None:
+        raise exc
+
+    monkeypatch.setattr(cli_main.os, "replace", _raise)
+
+
+def _spy_on_publication(monkeypatch: pytest.MonkeyPatch) -> mock.Mock:
+    """Wrap the real ``os.replace`` so a test can assert it was the publisher.
+
+    A copy-over-the-target implementation (read the temp file, write its
+    bytes into ``out``) would never call this -- the spy's call count is
+    what tells the two apart.
+    """
+    spy = mock.Mock(wraps=cli_main.os.replace)
+    monkeypatch.setattr(cli_main.os, "replace", spy)
+    return spy
+
+
+class _FailAfterNChars:
+    """A text-file stand-in whose ``write`` writes a prefix then raises.
+
+    ``export`` serializes its whole document with one ``f.write(big_string)``
+    call, so ``_FailAfterNWrites`` above (which fails whole calls) can only
+    ever fail that one call before anything lands on disk -- not a genuine
+    part-way failure. This instead lets the first *chars_before_failure*
+    characters of that one call reach the real file before raising, so the
+    temporary file the atomic-replace machinery has to discard is a real
+    partial write, the same shape a full disk mid-write would leave.
+    """
+
+    def __init__(self, real: TextIO, chars_before_failure: int, exc: OSError) -> None:
+        self._real = real
+        self._chars_before_failure = chars_before_failure
+        self._exc = exc
+
+    def write(self, data: str) -> int:
+        prefix = data[: self._chars_before_failure]
+        if prefix:
+            self._real.write(prefix)
+            self._real.flush()
+        raise self._exc
+
+    def flush(self) -> None:
+        self._real.flush()
+
+    def fileno(self) -> int:
+        return self._real.fileno()
+
+    def close(self) -> None:
+        self._real.close()
+
+
+def _fail_atomic_write_partway_through(
+    monkeypatch: pytest.MonkeyPatch, chars_before_failure: int, exc: OSError
+) -> None:
+    """Make the next atomic write fail after *chars_before_failure* characters land on disk.
+
+    See :class:`_FailAfterNChars`: for a writer with only one ``write()``
+    call (``export``), this is what a genuine part-way failure looks like.
+    """
+    real_open = cli_main._open_same_directory_tempfile
+
+    def _wrapped(out: Path) -> tuple[Path, TextIO]:
+        tmp_path, f = real_open(out)
+        return tmp_path, cast("TextIO", _FailAfterNChars(f, chars_before_failure, exc))
+
+    monkeypatch.setattr(cli_main, "_open_same_directory_tempfile", _wrapped)
+
+
 class TestSnapshot:
     """Tests for ``engrava snapshot``."""
 
@@ -1513,12 +1707,18 @@ async def _export_with_commit_interleaved_before_edge_scan(populated_db: Path, o
     setattr(export_conn, "execute", _tracking_execute)  # noqa: B010 -- see store patch above for why setattr, not a subclass
 
     try:
-        await asyncio.gather(
+        _, (_total, tmp_path, real_out) = await asyncio.gather(
             _concurrent_writer_commit_after(populated_db, paused, resume),
-            _export_db_to_jsonl(export_conn, out),
+            _export_db_to_jsonl(export_conn, out, db_path=populated_db),
         )
     finally:
         await export_conn.close()
+    # `_export_db_to_jsonl` no longer publishes on its own -- it hands back
+    # the fully-written temporary file for the caller to publish once its
+    # own connection handling is done, which is exactly what just happened
+    # above (`export_conn.close()`). This test reads `out` afterward, so it
+    # has to publish here the same way `snapshot` itself now does.
+    cli_main._publish_atomic_replacement(tmp_path, real_out)
 
 
 class TestSnapshotObservesOneConsistentState:
@@ -1591,6 +1791,586 @@ class TestSnapshotObservesOneConsistentState:
             f"restore of a snapshot with no dangling edge must succeed cleanly, got: "
             f"{result.output!r}"
         )
+
+
+class TestSnapshotAtomicReplace:
+    """``snapshot`` must never destroy a good file at `-o` on a failed write.
+
+    `_export_db_to_jsonl` used to open `-o` with `open("w")`,
+    truncating it before a single byte of the new snapshot existed. These
+    tests show an existing target survives byte-identical whenever the
+    write, the read-transaction close, or the publish itself fails; that a
+    successful run still publishes the full snapshot; and that `-o` cannot
+    be pointed at the live database or its WAL/SHM companions.
+    """
+
+    def test_write_failure_leaves_existing_target_untouched(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        out = tmp_path / "existing.jsonl"
+        good_content = "a byte-identical earlier good backup\n"
+        out.write_text(good_content, encoding="utf-8")
+
+        _fail_atomic_write_after(monkeypatch, 2, OSError(27, "File too large"))
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(out)])
+
+        assert result.exit_code != 0
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_transaction_close_failure_leaves_existing_target_untouched(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failing `commit()` after every row was written must still discard the temp file.
+
+        An implementation that publishes *before* closing the read
+        transaction would still report failure here, but would have already
+        replaced the good content -- so this specifically checks the target
+        bytes, not just the exit code.
+        """
+        import aiosqlite
+
+        out = tmp_path / "existing.jsonl"
+        good_content = "a byte-identical earlier good backup\n"
+        out.write_text(good_content, encoding="utf-8")
+
+        async def _raise_on_commit(_self: aiosqlite.Connection) -> None:
+            msg = "simulated commit failure after every row was written"
+            raise OSError(28, msg)
+
+        monkeypatch.setattr(aiosqlite.Connection, "commit", _raise_on_commit)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(out)])
+
+        assert result.exit_code != 0
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_begin_failure_leaves_existing_target_untouched_and_no_leak(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failing `BEGIN` -- before any row is read -- must not leak the temp file or its handle.
+
+        `BEGIN` runs after the temporary file is already open. An
+        implementation that only starts discarding on failure *after*
+        `BEGIN` succeeds would leak both the file and its handle here.
+        """
+        import aiosqlite
+
+        out = tmp_path / "existing.jsonl"
+        good_content = "a byte-identical earlier good backup\n"
+        out.write_text(good_content, encoding="utf-8")
+
+        real_execute = aiosqlite.Connection.execute
+
+        async def _raise_on_begin(
+            self: aiosqlite.Connection, sql: str, *args: object, **kwargs: object
+        ) -> object:
+            if sql == "BEGIN":
+                msg = "simulated BEGIN failure"
+                raise OSError(5, msg)
+            return await real_execute(self, sql, *args, **kwargs)
+
+        monkeypatch.setattr(aiosqlite.Connection, "execute", _raise_on_begin)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(out)])
+
+        assert result.exit_code != 0
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    async def test_a_failing_begin_does_not_roll_back_the_callers_transaction(
+        self, populated_db: Path, tmp_path: Path
+    ) -> None:
+        """A `BEGIN` that fails because the caller already has one open must not roll it back.
+
+        `_export_db_to_jsonl` opens its own read transaction with `BEGIN`.
+        Calling it on a connection that already has an *uncommitted*
+        transaction open -- not one this function started -- makes SQLite
+        refuse with "cannot start a transaction within a transaction".
+        Rolling back unconditionally on any failure here would discard
+        writes this function never made and has no business undoing;
+        called directly (not through the CLI, which always closes its own
+        connection and so cannot tell a real rollback apart from the
+        implicit one that closing gives for free) on a connection kept open
+        across the call, so only an explicit, unconditional rollback could
+        account for the loss.
+        """
+        import aiosqlite
+
+        conn = await aiosqlite.connect(str(populated_db))
+        conn.row_factory = aiosqlite.Row
+        try:
+            # An explicit `BEGIN` plus a raw insert, not `create_thought` --
+            # the store's own write path commits internally, which would
+            # leave `conn.in_transaction` false again before this test ever
+            # gets to the scenario it means to set up.
+            await conn.execute("BEGIN")
+            await conn.execute(
+                "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    "t-uncommitted",
+                    "OBSERVATION",
+                    "uncommitted essence",
+                    "uncommitted content",
+                    "P2",
+                ),
+            )
+            assert conn.in_transaction
+
+            out = tmp_path / "out.jsonl"
+            with pytest.raises(sqlite3.OperationalError, match="transaction"):
+                await _export_db_to_jsonl(conn, out, db_path=populated_db)
+
+            assert conn.in_transaction
+            cursor = await conn.execute(
+                "SELECT COUNT(*) FROM thought WHERE thought_id = ?", ("t-uncommitted",)
+            )
+            row = await cursor.fetchone()
+            assert row[0] == 1
+            assert _atomic_temp_debris_in(out.parent) == []
+        finally:
+            await conn.rollback()
+            await conn.close()
+
+    async def test_a_cancellation_after_begin_executes_leaves_no_open_transaction(
+        self, populated_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cancellation arriving after `BEGIN` ran, before the `await` resumes, must not leak it.
+
+        aiosqlite runs `BEGIN` on its worker thread. If the awaiting task is
+        cancelled after that thread has already executed it but before the
+        `await` returns control here, a flag set only on a *successful
+        return* from that `await` would never see it -- leaving this
+        function's own transaction open forever, on a connection whose
+        caller had none before this call. Simulated by making
+        `execute("BEGIN")` run the real statement and then raise
+        `CancelledError`, which reproduces exactly that ordering without
+        needing a real scheduler race.
+        """
+        import aiosqlite
+
+        real_execute = aiosqlite.Connection.execute
+
+        async def _begin_then_cancel(
+            self: aiosqlite.Connection, sql: str, *args: object, **kwargs: object
+        ) -> object:
+            if sql == "BEGIN":
+                await real_execute(self, sql, *args, **kwargs)
+                raise asyncio.CancelledError
+            return await real_execute(self, sql, *args, **kwargs)
+
+        monkeypatch.setattr(aiosqlite.Connection, "execute", _begin_then_cancel)
+
+        conn = await aiosqlite.connect(str(populated_db))
+        conn.row_factory = aiosqlite.Row
+        try:
+            assert not conn.in_transaction
+
+            out = tmp_path / "out.jsonl"
+            with pytest.raises(asyncio.CancelledError):
+                await _export_db_to_jsonl(conn, out, db_path=populated_db)
+
+            assert not conn.in_transaction
+            assert _atomic_temp_debris_in(out.parent) == []
+        finally:
+            await conn.rollback()
+            await conn.close()
+
+    async def test_a_cancellation_while_begin_is_still_queued_leaves_no_open_transaction(
+        self, populated_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cancellation before `BEGIN`'s own call has even run must not leak a transaction either.
+
+        The complementary race to the sibling test above: here the
+        cancellation arrives *before* `BEGIN`'s underlying call has run at
+        all, not after. `execute("BEGIN")` fires the real call off as a
+        background task -- scheduled, not started -- and raises
+        `CancelledError` immediately, so this function's `except` block
+        reads `conn.in_transaction` while it is still `False`: the
+        transaction the pending `BEGIN` will eventually open does not exist
+        yet. The fix does not depend on that read reflecting the future --
+        it decides from the state captured *before* `BEGIN` was ever
+        attempted, and issues the rollback unconditionally in that case.
+        That rollback is itself a queued call on the same
+        aiosqlite connection, so it lands on the same serial worker-thread
+        queue behind the still-pending `BEGIN` and -- per aiosqlite's own
+        FIFO ordering, which still runs a queued call even once the future
+        awaiting it has been cancelled -- always executes after it, closing
+        the transaction the pending `BEGIN` opens.
+
+        An implementation that instead reads `conn.in_transaction` *inside*
+        the `except` block would see the same `False` at that instant and
+        conclude there is nothing to roll back -- then the pending `BEGIN`
+        runs anyway, moments later, and nothing ever closes it.
+        """
+        import aiosqlite
+
+        real_execute = aiosqlite.Connection.execute
+        begin_task: list[asyncio.Task[object]] = []
+
+        async def _begin_queued_then_cancel(
+            self: aiosqlite.Connection, sql: str, *args: object, **kwargs: object
+        ) -> object:
+            if sql == "BEGIN":
+                begin_task.append(asyncio.ensure_future(real_execute(self, sql, *args, **kwargs)))
+                raise asyncio.CancelledError
+            return await real_execute(self, sql, *args, **kwargs)
+
+        monkeypatch.setattr(aiosqlite.Connection, "execute", _begin_queued_then_cancel)
+
+        conn = await aiosqlite.connect(str(populated_db))
+        conn.row_factory = aiosqlite.Row
+        try:
+            assert not conn.in_transaction
+
+            out = tmp_path / "out.jsonl"
+            with pytest.raises(asyncio.CancelledError):
+                await _export_db_to_jsonl(conn, out, db_path=populated_db)
+
+            # The queued BEGIN (and, on a correct implementation, the
+            # rollback queued behind it) may still be finishing on
+            # aiosqlite's worker thread -- let it actually complete before
+            # reading `conn.in_transaction`.
+            assert begin_task, "the patched execute('BEGIN') never ran -- test setup is broken"
+            await begin_task[0]
+
+            assert not conn.in_transaction
+            assert _atomic_temp_debris_in(out.parent) == []
+        finally:
+            await conn.rollback()
+            await conn.close()
+
+    def test_fdopen_failure_leaves_existing_target_untouched_and_no_leak(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failing `os.fdopen` must not leak the raw fd or the temp file it names.
+
+        `_open_same_directory_tempfile` creates the file and (when `-o`
+        already exists) `fchmod`s it before wrapping the raw fd with
+        `os.fdopen` -- a failure in that last step must still close the fd
+        and remove the file, the same as a failing `fchmod` already does.
+        """
+        out = tmp_path / "existing.jsonl"
+        good_content = "a byte-identical earlier good backup\n"
+        out.write_text(good_content, encoding="utf-8")
+
+        captured_fd: list[int] = []
+        captured_identity: list[os.stat_result] = []
+
+        def _raise_fdopen(fd: int, *_args: object, **_kwargs: object) -> TextIO:
+            # Captured before raising -- and before the production code's
+            # own cleanup can close `fd` out from under this test -- so the
+            # assertion below has the temp file's real identity to compare
+            # against, not just a bare "did fstat raise" check a reused fd
+            # number could pass by coincidence. Deliberately does not close
+            # `fd` itself: that is exactly what production is being tested
+            # for.
+            captured_fd.append(fd)
+            captured_identity.append(os.fstat(fd))
+            msg = "simulated fdopen failure"
+            raise OSError(msg)
+
+        monkeypatch.setattr(cli_main.os, "fdopen", _raise_fdopen)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(out)])
+
+        assert result.exit_code != 0
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+        _assert_fd_was_closed(captured_fd[0], captured_identity[0])
+
+    def test_connection_close_failure_leaves_existing_target_untouched(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A single-database close failure, after publish-eligible reads, must not publish.
+
+        `snapshot`'s single-database path publishes only after `_opened_db`
+        closes its connection. If that close fails, the export must not
+        have already replaced the target -- `_export_db_to_jsonl` itself
+        never publishes, only its caller does, once closing is done.
+        """
+        import aiosqlite
+
+        out = tmp_path / "existing.jsonl"
+        good_content = "a byte-identical earlier good backup\n"
+        out.write_text(good_content, encoding="utf-8")
+
+        real_close = aiosqlite.Connection.close
+
+        async def _raise_after_real_close(self: aiosqlite.Connection) -> None:
+            # Runs the real close first, so nothing outlives this test --
+            # same technique as `test_cli_memory_verbs_error_boundary.py`'s
+            # patched close.
+            await real_close(self)
+            msg = "simulated close failure once every read had completed"
+            raise OSError(5, msg)
+
+        monkeypatch.setattr(aiosqlite.Connection, "close", _raise_after_real_close)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(out)])
+
+        assert result.exit_code != 0
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_service_connection_close_failure_leaves_existing_target_untouched(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A `--service` close failure (`manager.close_all()`) must not publish either.
+
+        `close_all()` deliberately swallows an ordinary per-store close
+        failure (logged, not raised) so one bad store does not abort closing
+        the rest -- see its own docstring in `service_manager.py`. A
+        cancellation is the one failure it does not swallow: it finishes the
+        real close first (same contract `SqliteEngravaCore.close` documents,
+        and the same technique the pre-existing
+        `test_cli_memory_verbs_error_boundary.py` uses for a store's own
+        close), then re-raises once every store has had its close attempt.
+        That is the reachable "close_all() itself fails" case this tests.
+        """
+        import shutil
+
+        from engrava import SqliteEngravaCore
+
+        real_core_close = SqliteEngravaCore.close
+
+        async def _raise_after_real_core_close(self: SqliteEngravaCore) -> None:
+            await real_core_close(self)
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(SqliteEngravaCore, "close", _raise_after_real_core_close)
+
+        data_dir = tmp_path / "services"
+        data_dir.mkdir()
+        service_db_path = data_dir / "svc.db"
+        shutil.copy(populated_db, service_db_path)
+
+        out = data_dir / "existing.jsonl"
+        good_content = "a byte-identical earlier good backup\n"
+        out.write_text(good_content, encoding="utf-8")
+
+        # `CliRunner.invoke()` only converts `SystemExit`/`Exception` into a
+        # clean `Result` -- `asyncio.CancelledError` is a `BaseException` it
+        # does not catch, so it propagates out of `invoke()` itself here
+        # rather than showing up as a non-zero `result.exit_code`.
+        with pytest.raises(asyncio.CancelledError):
+            runner.invoke(
+                cli,
+                [
+                    "--db",
+                    str(data_dir / "unused.db"),
+                    "snapshot",
+                    "--service",
+                    "svc",
+                    "-o",
+                    str(out),
+                ],
+                catch_exceptions=False,
+            )
+
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_publication_failure_leaves_existing_target_untouched(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        out = tmp_path / "existing.jsonl"
+        good_content = "a byte-identical earlier good backup\n"
+        out.write_text(good_content, encoding="utf-8")
+
+        _fail_publication(monkeypatch, OSError(30, "simulated replace failure"))
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(out)])
+
+        assert result.exit_code != 0
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_publishes_with_os_replace(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A copy-over-the-target publication (never calling `os.replace`) must fail this test."""
+        out = tmp_path / "snap.jsonl"
+        spy = _spy_on_publication(monkeypatch)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(out)])
+
+        assert result.exit_code == 0
+        assert spy.call_count == 1
+        tmp_arg, out_arg = spy.call_args.args
+        assert Path(out_arg) == out
+        assert Path(tmp_arg).parent == out.parent
+        assert not Path(tmp_arg).exists()
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_success_holds_full_valid_output(
+        self, runner: CliRunner, populated_db: Path, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "snap.jsonl"
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(out)])
+
+        assert result.exit_code == 0
+        lines = out.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) >= 3
+        for line in lines:
+            record = json.loads(line)
+            assert "_type" in record
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_new_output_gets_the_umask_adjusted_default_mode(
+        self, runner: CliRunner, populated_db: Path, tmp_path: Path
+    ) -> None:
+        """A fresh `-o` comes out `open(path, "w")`-shaped, not `mkstemp`'s always-``0o600``.
+
+        ``0o027`` is deliberately unusual: neither a default mode nor a
+        stray ``0o600`` from an unpatched ``mkstemp`` could pass this by
+        coincidence the way a common umask like ``0o022`` might.
+        """
+        out = tmp_path / "fresh.jsonl"
+
+        with _temporary_umask(0o027):
+            result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(out)])
+
+        assert result.exit_code == 0
+        assert out.stat().st_mode & 0o777 == 0o640
+
+    def test_existing_output_mode_survives_a_successful_replace(
+        self, runner: CliRunner, populated_db: Path, tmp_path: Path
+    ) -> None:
+        """An existing `-o`'s permission bits are copied onto the replacement, not narrowed
+        to ``0o600``.
+
+        ``0o604`` is deliberately unusual for the same reason as the sibling
+        test above.
+        """
+        out = tmp_path / "existing.jsonl"
+        out.write_text("old content\n", encoding="utf-8")
+        out.chmod(0o604)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(out)])
+
+        assert result.exit_code == 0
+        assert out.stat().st_mode & 0o777 == 0o604
+
+    @pytest.mark.parametrize(
+        "output_for",
+        [
+            str,
+            lambda db_path: f"{db_path.parent}/../{db_path.parent.name}/{db_path.name}",
+        ],
+        ids=["same-path", "relative-spelling"],
+    )
+    def test_refuses_output_naming_the_live_database(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        output_for: Callable[[Path], str],
+    ) -> None:
+        before = populated_db.read_bytes()
+
+        result = runner.invoke(
+            cli, ["--db", str(populated_db), "snapshot", "-o", output_for(populated_db)]
+        )
+
+        assert result.exit_code != 0
+        assert "Refusing to write output" in result.stderr
+        assert populated_db.read_bytes() == before
+        assert _atomic_temp_debris_in(populated_db.parent) == []
+
+    def test_refuses_output_naming_a_symlink_to_the_live_database(
+        self, runner: CliRunner, populated_db: Path, tmp_path: Path
+    ) -> None:
+        link = tmp_path / "link-to-live.db"
+        link.symlink_to(populated_db)
+        before = populated_db.read_bytes()
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(link)])
+
+        assert result.exit_code != 0
+        assert "Refusing to write output" in result.stderr
+        assert populated_db.read_bytes() == before
+        assert _atomic_temp_debris_in(populated_db.parent) == []
+
+    @pytest.mark.parametrize("companion_suffix", ["-wal", "-shm"])
+    def test_refuses_output_naming_a_wal_or_shm_companion(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        companion_suffix: str,
+    ) -> None:
+        """A guard that checks only the database path (not -wal/-shm) must fail this test."""
+        companion = Path(f"{populated_db}{companion_suffix}")
+        before = populated_db.read_bytes()
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(companion)])
+
+        assert result.exit_code != 0
+        assert "Refusing to write output" in result.stderr
+        assert populated_db.read_bytes() == before
+        assert _atomic_temp_debris_in(populated_db.parent) == []
+
+    def test_output_symlink_is_followed_and_kept_pointing_at_new_content(
+        self, runner: CliRunner, populated_db: Path, tmp_path: Path
+    ) -> None:
+        """`-o` naming a symlink writes through it, and the symlink itself survives.
+
+        `os.replace` on a symlinked destination replaces the link's own
+        directory entry, not the file it points to -- publishing straight
+        onto the symlink would sever it. The real target is written and
+        replaced instead, so the link keeps resolving to the same file, now
+        holding the new snapshot.
+        """
+        real_target = tmp_path / "actual.jsonl"
+        real_target.write_text("old content\n", encoding="utf-8")
+        link = tmp_path / "link.jsonl"
+        link.symlink_to(real_target)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(link)])
+
+        assert result.exit_code == 0
+        assert link.is_symlink()
+        assert os.path.realpath(link) == os.path.realpath(real_target)
+        lines = real_target.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) >= 3
+        for line in lines:
+            record = json.loads(line)
+            assert "_type" in record
+        assert _atomic_temp_debris_in(real_target.parent) == []
 
 
 class TestRestore:
@@ -3247,6 +4027,280 @@ class TestExport:
         assert result.exit_code == 0
         default_out = populated_db.with_suffix(".export.json")
         assert default_out.exists()
+
+
+class TestExportAtomicReplace:
+    """``export`` must never destroy a good file at `-o` on a failed write.
+
+    `export_cmd` used to write `-o` with `Path.write_text`,
+    truncating it before a single byte of the new export existed. Same
+    shape of tests as `TestSnapshotAtomicReplace`, but `export`'s "closes or
+    completes its reads" boundary is its database connection's own close
+    (via `_opened_db`), not a `commit()` -- `export` has no read
+    transaction of its own to close.
+    """
+
+    def test_write_failure_leaves_existing_target_untouched(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        out = tmp_path / "existing.json"
+        good_content = '{"format": "a byte-identical earlier good export"}'
+        out.write_text(good_content, encoding="utf-8")
+
+        # `export` writes its whole document in one `f.write()` call, so a
+        # genuine part-way failure has to let some of that call's characters
+        # land before raising -- failing the call outright (0 chars) would
+        # only prove a failure *before* any write, not one *during* it.
+        _fail_atomic_write_partway_through(monkeypatch, 10, OSError(27, "File too large"))
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(out)])
+
+        assert result.exit_code != 0
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_fdopen_failure_leaves_existing_target_untouched_and_no_leak(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failing `os.fdopen` must not leak the raw fd or the temp file it names.
+
+        Same shared-helper boundary as `TestSnapshotAtomicReplace`'s
+        equivalent test -- `_open_same_directory_tempfile` is common to both
+        writers.
+        """
+        out = tmp_path / "existing.json"
+        good_content = '{"format": "a byte-identical earlier good export"}'
+        out.write_text(good_content, encoding="utf-8")
+
+        captured_fd: list[int] = []
+        captured_identity: list[os.stat_result] = []
+
+        def _raise_fdopen(fd: int, *_args: object, **_kwargs: object) -> TextIO:
+            captured_fd.append(fd)
+            captured_identity.append(os.fstat(fd))
+            msg = "simulated fdopen failure"
+            raise OSError(msg)
+
+        monkeypatch.setattr(cli_main.os, "fdopen", _raise_fdopen)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(out)])
+
+        assert result.exit_code != 0
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+        _assert_fd_was_closed(captured_fd[0], captured_identity[0])
+
+    def test_connection_close_failure_leaves_existing_target_untouched(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`export` has no `commit()`; its real boundary is the connection's own close.
+
+        The patched close runs the real close first and then raises -- the
+        same technique this suite's ``test_cli_memory_verbs_error_boundary.py``
+        uses for a store's own close -- so the underlying aiosqlite worker
+        thread is never leaked past this test.
+        """
+        import aiosqlite
+
+        out = tmp_path / "existing.json"
+        good_content = '{"format": "a byte-identical earlier good export"}'
+        out.write_text(good_content, encoding="utf-8")
+
+        real_close = aiosqlite.Connection.close
+
+        async def _raise_after_real_close(self: aiosqlite.Connection) -> None:
+            await real_close(self)
+            msg = "simulated close failure once every read had completed"
+            raise OSError(5, msg)
+
+        monkeypatch.setattr(aiosqlite.Connection, "close", _raise_after_real_close)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(out)])
+
+        assert result.exit_code != 0
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_publication_failure_leaves_existing_target_untouched(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        out = tmp_path / "existing.json"
+        good_content = '{"format": "a byte-identical earlier good export"}'
+        out.write_text(good_content, encoding="utf-8")
+
+        _fail_publication(monkeypatch, OSError(30, "simulated replace failure"))
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(out)])
+
+        assert result.exit_code != 0
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_publishes_with_os_replace(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A copy-over-the-target publication (never calling `os.replace`) must fail this test."""
+        out = tmp_path / "export.json"
+        spy = _spy_on_publication(monkeypatch)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(out)])
+
+        assert result.exit_code == 0
+        assert spy.call_count == 1
+        tmp_arg, out_arg = spy.call_args.args
+        assert Path(out_arg) == out
+        assert Path(tmp_arg).parent == out.parent
+        assert not Path(tmp_arg).exists()
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_success_holds_full_valid_output(
+        self, runner: CliRunner, populated_db: Path, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "export.json"
+        result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(out)])
+
+        assert result.exit_code == 0
+        data = json.loads(out.read_text(encoding="utf-8"))
+        assert data["format"] == "engrava-export"
+        assert len(data["thoughts"]) == 3
+        assert len(data["edges"]) == 1
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_new_output_gets_the_umask_adjusted_default_mode(
+        self, runner: CliRunner, populated_db: Path, tmp_path: Path
+    ) -> None:
+        """A fresh `-o` comes out `open(path, "w")`-shaped, not `mkstemp`'s always-``0o600``.
+
+        ``0o027`` is deliberately unusual: neither a default mode nor a
+        stray ``0o600`` from an unpatched ``mkstemp`` could pass this by
+        coincidence the way a common umask like ``0o022`` might.
+        """
+        out = tmp_path / "fresh.json"
+
+        with _temporary_umask(0o027):
+            result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(out)])
+
+        assert result.exit_code == 0
+        assert out.stat().st_mode & 0o777 == 0o640
+
+    def test_existing_output_mode_survives_a_successful_replace(
+        self, runner: CliRunner, populated_db: Path, tmp_path: Path
+    ) -> None:
+        """An existing `-o`'s permission bits are copied onto the replacement, not narrowed
+        to ``0o600``.
+
+        ``0o604`` is deliberately unusual for the same reason as the sibling
+        test above.
+        """
+        out = tmp_path / "existing.json"
+        out.write_text('{"old": "content"}', encoding="utf-8")
+        out.chmod(0o604)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(out)])
+
+        assert result.exit_code == 0
+        assert out.stat().st_mode & 0o777 == 0o604
+
+    @pytest.mark.parametrize(
+        "output_for",
+        [
+            str,
+            lambda db_path: f"{db_path.parent}/../{db_path.parent.name}/{db_path.name}",
+        ],
+        ids=["same-path", "relative-spelling"],
+    )
+    def test_refuses_output_naming_the_live_database(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        output_for: Callable[[Path], str],
+    ) -> None:
+        before = populated_db.read_bytes()
+
+        result = runner.invoke(
+            cli, ["--db", str(populated_db), "export", "-o", output_for(populated_db)]
+        )
+
+        assert result.exit_code != 0
+        assert "Refusing to write output" in result.stderr
+        assert populated_db.read_bytes() == before
+        assert _atomic_temp_debris_in(populated_db.parent) == []
+
+    def test_refuses_output_naming_a_symlink_to_the_live_database(
+        self, runner: CliRunner, populated_db: Path, tmp_path: Path
+    ) -> None:
+        link = tmp_path / "link-to-live.db"
+        link.symlink_to(populated_db)
+        before = populated_db.read_bytes()
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(link)])
+
+        assert result.exit_code != 0
+        assert "Refusing to write output" in result.stderr
+        assert populated_db.read_bytes() == before
+        assert _atomic_temp_debris_in(populated_db.parent) == []
+
+    @pytest.mark.parametrize("companion_suffix", ["-wal", "-shm"])
+    def test_refuses_output_naming_a_wal_or_shm_companion(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        companion_suffix: str,
+    ) -> None:
+        """A guard that checks only the database path (not -wal/-shm) must fail this test."""
+        companion = Path(f"{populated_db}{companion_suffix}")
+        before = populated_db.read_bytes()
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(companion)])
+
+        assert result.exit_code != 0
+        assert "Refusing to write output" in result.stderr
+        assert populated_db.read_bytes() == before
+        assert _atomic_temp_debris_in(populated_db.parent) == []
+
+    def test_output_symlink_is_followed_and_kept_pointing_at_new_content(
+        self, runner: CliRunner, populated_db: Path, tmp_path: Path
+    ) -> None:
+        """`-o` naming a symlink writes through it, and the symlink itself survives.
+
+        Same rationale as `TestSnapshotAtomicReplace`'s equivalent test:
+        `os.replace` on a symlinked destination replaces the link itself, so
+        the real target is written and replaced instead of the link.
+        """
+        real_target = tmp_path / "actual.json"
+        real_target.write_text('{"old": "content"}', encoding="utf-8")
+        link = tmp_path / "link.json"
+        link.symlink_to(real_target)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(link)])
+
+        assert result.exit_code == 0
+        assert link.is_symlink()
+        assert os.path.realpath(link) == os.path.realpath(real_target)
+        data = json.loads(real_target.read_text(encoding="utf-8"))
+        assert data["format"] == "engrava-export"
+        assert len(data["thoughts"]) == 3
+        assert _atomic_temp_debris_in(real_target.parent) == []
 
 
 # ------------------------------------------------------------------
