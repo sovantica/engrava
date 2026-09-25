@@ -11517,7 +11517,7 @@ class SqliteEngravaCore:
                 (normalized_query, now_iso, *filter_params, top_k),
             )
             rows = await cursor.fetchall()
-        except OperationalError:
+        except OperationalError as exc:
             # The primary MATCH is invalid FTS5. This branch is REACHABLE by
             # real input, by design: a *balanced* quoted phrase carrying
             # adjacent hazardous punctuation (e.g. ``"forum"?``) classifies as
@@ -11532,11 +11532,22 @@ class SqliteEngravaCore:
             # AND/OR/NOT phrase-quoted so FTS5 cannot read it as an operator) —
             # and retry the MATCH once with it.
             self._fts_match_failure_count += 1
+            # No query text and no ``exc_info``: SQLite's own FTS5 syntax error
+            # names the offending token (e.g. ``fts5: syntax error near
+            # "AND"``), which can quote content straight out of the query. A
+            # digest was considered and rejected: an unsalted hash of a short,
+            # low-entropy search query (often one or two words) is a
+            # dictionary lookup away from the plaintext, not a one-way
+            # fingerprint. Log only non-content facts -- length, the
+            # exception's type, and SQLite's own error name -- so an operator
+            # still sees that a fallback happened, how often, and what kind of
+            # error caused it.
             logger.warning(
-                "FTS MATCH failed for normalized query %r; retrying via "
-                "sanitized bare-mode fallback",
-                normalized_query,
-                exc_info=True,
+                "FTS MATCH failed for a query of length %d; retrying via "
+                "sanitized bare-mode fallback [error type=%s, sqlite error=%s]",
+                len(normalized_query),
+                type(exc).__name__,
+                getattr(exc, "sqlite_errorname", None),
             )
             fallback_query = _normalize_fts_query_bare(query)
             if not fallback_query:
@@ -11548,7 +11559,7 @@ class SqliteEngravaCore:
                     (fallback_query, now_iso, *filter_params, top_k),
                 )
                 rows = await cursor.fetchall()
-            except OperationalError:  # pragma: no cover - unreachable for real input
+            except OperationalError as exc:  # pragma: no cover - unreachable for real input
                 # Effectively unreachable for real input — unlike the primary
                 # failure above, which is a designed, counted recovery. The bare
                 # path emits only sanitized, wildcard-collapsed, operator-quoted
@@ -11557,10 +11568,18 @@ class SqliteEngravaCore:
                 # that reaches here). This is defense-in-depth against an
                 # unforeseen residual only: degrade to no FTS hits rather than
                 # propagate.
+                #
+                # Same content discipline as the primary failure above: no
+                # query text, no ``exc_info`` (SQLite's own error message can
+                # quote the offending token), and no digest either -- an
+                # unsalted hash of a short query is reversible by dictionary
+                # lookup. Length, exception type and SQLite's error name only.
                 logger.warning(
-                    "FTS bare-mode fallback also failed for %r; returning no FTS results",
-                    fallback_query,
-                    exc_info=True,
+                    "FTS bare-mode fallback also failed for a query of length %d; "
+                    "returning no FTS results [error type=%s, sqlite error=%s]",
+                    len(fallback_query),
+                    type(exc).__name__,
+                    getattr(exc, "sqlite_errorname", None),
                 )
                 await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
                 return []
