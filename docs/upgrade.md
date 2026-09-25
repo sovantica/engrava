@@ -203,7 +203,7 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 | 0.3.x | 0.4.0 | Yes | **Schema-changing** minor upgrade — adds the valid-time columns (additive, zero data loss). Back up first and follow the [rolling-upgrades](#rolling-upgrades-multiple-workers) note |
 | 0.4.x | 0.5.0 | Yes | **Schema-changing** minor upgrade (`user_version` 14 → 18), although the library API is drop-in. **Breaking for MCP-server users only:** the `engrava[mcp]` extra and the in-engrava `engrava-mcp` command are removed — the server moved to the standalone [`engrava-mcp`](https://github.com/sovantica/engrava-mcp) package (see the 0.4 → 0.5 note) |
 | 0.5.0 | 0.6.0 | Yes | **Schema-changing** minor upgrade (`user_version` 18 → 20), with two additive columns. Default retrieval now excludes archived thoughts, and wrong-dimension query vectors raise a typed error. An edge `decay_multiplier` of `0.0` no longer reads back as `1.0`, and a later update no longer rewrites it to `1.0` — values a 0.5.x update already overwrote stay overwritten. Back up, quiesce shared-store workers, migrate once, and review the [0.5 → 0.6 notes](#05---06) |
-| 0.6.x | 0.7.0 | Yes | **Schema-changing** minor upgrade (`user_version` 20 → 21): every `thought` / `edge` / `action` row gains a `revision INTEGER NOT NULL DEFAULT 0` column; `EngravaMetrics.schema_version` separately moves `1 → 2`; and `engrava --format json info` loses its `schema_version` key in favor of `metrics_schema_version` + `database_schema_version` (see below). `update_thought`, `restore_thought`, `update_edge` and `update_action` now check and increment `revision` atomically on every guarded write, so a write that lands after another guarded write touched the same row — including from a second connection or process — raises `StaleDataError` instead of silently overwriting; `update_edge` and `update_action` could never raise it before. No public method signature changed. **Behaviour change:** when the resolved recency weight is `0.0` **and** a cognitive-cycle reference (`current_cycle`, explicit or via `cycle_provider`) is present, the query-less fallback path now treats recency as fully off instead of still decaying by cycle — which can change result order for stores with heterogeneous thought priorities. `recency_now` (transaction-time) callers are unaffected; that axis was already correct. Also in this release: three new `EngravaError` subclasses (`WriteContentionError`, `WriteLockTimeoutError`, `DedupLockReentryError`) can now come out of the dedup and guarded-write paths; a new public override seam, `prepare_thought_for_insert()`, restores pre-insert customization that `get_or_create()` / `upsert_by_hash()` had silently stopped routing through an overridden `create_thought()`; `gc --dry-run` now names everything the real run deletes (edges, embeddings, and actions, not only orphaned edges); a deleted thought's vector can no longer resurface through search on a database that has not run the core-12 migration; a corrupt or truncated database file now makes the CLI exit with an error instead of hanging; and `restore` now refuses an `embedding` row with an empty `owner_type`/`owner_id`, a non-ISO-8601 `created_at`, or a non-positive `dimension` — every such row was already invalid on every prior release, so this only ever rejects a snapshot that already carried a broken record; and a merge restore (no `--clear`) into a target whose `journal_entry` table is non-empty now refuses any record that collides with an existing row and rolls the whole restore back instead of replacing it, unless `--orphan-journal-entries` is also given — journaling is opt-in and the CLI never enables it, so this only reaches a target that already has journaling on. Also in this release, the dreaming clustering cohesion gate (`cluster_quality_cohesion_threshold`) now divides by both vectors' norms instead of using a raw dot product, moving the score for most non-unit-vector providers. Review the [0.6 → 0.7 notes](#06---07) |
+| 0.6.x | 0.7.0 | Yes | **Schema-changing** minor upgrade (`user_version` 20 → 21): every `thought` / `edge` / `action` row gains a `revision INTEGER NOT NULL DEFAULT 0` column, and stored timestamps are rewritten into one canonical UTC form with no instant changed; `EngravaMetrics.schema_version` separately moves `1 → 2`; and `engrava --format json info` loses its `schema_version` key in favor of `metrics_schema_version` + `database_schema_version` (see below). `update_thought`, `restore_thought`, `update_edge` and `update_action` now check and increment `revision` atomically on every guarded write, so a write that lands after another guarded write touched the same row — including from a second connection or process — raises `StaleDataError` instead of silently overwriting; `update_edge` and `update_action` could never raise it before. No public method signature changed. **Behaviour change:** when the resolved recency weight is `0.0` **and** a cognitive-cycle reference (`current_cycle`, explicit or via `cycle_provider`) is present, the query-less fallback path now treats recency as fully off instead of still decaying by cycle — which can change result order for stores with heterogeneous thought priorities. `recency_now` (transaction-time) callers are unaffected; that axis was already correct. Also in this release: three new `EngravaError` subclasses (`WriteContentionError`, `WriteLockTimeoutError`, `DedupLockReentryError`) can now come out of the dedup and guarded-write paths; a new public override seam, `prepare_thought_for_insert()`, restores pre-insert customization that `get_or_create()` / `upsert_by_hash()` had silently stopped routing through an overridden `create_thought()`; `gc --dry-run` now names everything the real run deletes (edges, embeddings, and actions, not only orphaned edges); a deleted thought's vector can no longer resurface through search on a database that has not run the core-12 migration; a corrupt or truncated database file now makes the CLI exit with an error instead of hanging; and `restore` now refuses an `embedding` row with an empty `owner_type`/`owner_id`, a non-ISO-8601 `created_at`, or a non-positive `dimension` — every such row was already invalid on every prior release, so this only ever rejects a snapshot that already carried a broken record; and a merge restore (no `--clear`) into a target whose `journal_entry` table is non-empty now refuses any record that collides with an existing row and rolls the whole restore back instead of replacing it, unless `--orphan-journal-entries` is also given — journaling is opt-in and the CLI never enables it, so this only reaches a target that already has journaling on. Also in this release, the dreaming clustering cohesion gate (`cluster_quality_cohesion_threshold`) now divides by both vectors' norms instead of using a raw dot product, moving the score for most non-unit-vector providers. Review the [0.6 → 0.7 notes](#06---07) |
 
 For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 `0.x.*` line do not change the schema and are low-risk; **minor** upgrades
@@ -1703,6 +1703,54 @@ method) — a caller cannot yet assert "reject this write unless the row is
 still exactly the one I read"; only the engine's own automatic bump is
 enforced. `create_thought` / `create_edge` / `create_action` are unaffected:
 a newly inserted row simply starts at `revision = 0`.
+
+**Stored timestamps are rewritten into one canonical UTC form.** The same
+`user_version` 20 → 21 migration also rewrites stored timestamp text; it adds no
+column of its own.
+
+**What changed.** Engrava now stores every timestamp it accepts in one form,
+`2026-07-01T00:00:00+00:00`: a value with an offset is converted to UTC, and a
+value without one is read as UTC. On 0.6.x a value without an offset was stored
+exactly as written and compared as text, so `2026-07-01 00:00:00` sorted before
+every `2026-07-01T…` value of the same day, and a basic-format
+(`20260701T000000`) or week-date (`2026-W27-3`) value sorted after every
+extended value of the same year. An `expires_at` in those forms expired early, or
+not until the next calendar year, and valid-time comparisons could match the
+wrong rows.
+
+**What the upgrade does.** The migration reads the stored values in
+`thought.created_at`, `updated_at`, `last_accessed_at`, `expires_at`,
+`valid_from`, `valid_until` and `archived_at`, and in `edge.valid_from` and
+`valid_until`, that are not already in the canonical shape, and rewrites each
+one it can read as an instant into that form. No instant changes, only the
+text. A value that already has the canonical shape is not re-read, even if it
+names an impossible date. Of the values it reads, one that cannot be read as an
+ISO-8601 instant is left as it is and counted in one warning from the
+`engrava.infrastructure.sqlite.engrava_core` logger, which names the affected
+columns and their counts but not the values. The rewrite does not bump
+`revision`, does not re-stamp `updated_at`, and writes no journal entry, so the
+journal's hash chain still verifies.
+
+**The same form applies to timestamps you pass in.** `cleanup_expired(now=...)`
+and the journal's `get_entries(since=...)` compare their argument by instant,
+reading a value without an offset as UTC, and raise `ValueError` for a value
+they cannot read as a UTC instant; on 0.6.x the argument was compared as text.
+MindQL `valid_at` / `valid_within` / `valid_between` literals are read the same
+way (see [Bi-temporal model](bitemporal.md)). `engrava restore` writes a
+snapshot's thought and edge timestamps in the canonical form, so a snapshot taken
+on 0.6.x restores into the same form the upgrade produces; a value it cannot read
+is restored as it was.
+
+**Who is affected.** Anyone who stored timestamps without an offset or in a
+non-extended ISO-8601 form: after the upgrade, expiry and valid-time comparisons
+follow the real instant, with no action needed. Anyone who reads the database
+file directly, or compares stored timestamp text outside engrava, now sees the
+canonical form. Anyone passing a `now=` or `since=` value that cannot be read as
+a UTC instant now gets `ValueError`.
+
+**What to do.** Nothing, for the upgrade itself. If the warning above appears,
+find the values in the named columns that are not ISO-8601 timestamps and repair
+them.
 
 **`store_embedding()`'s base row write and its vector-index update are now one
 failure-atomic unit, and the embedding-identity check now runs on every call

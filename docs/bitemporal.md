@@ -109,14 +109,17 @@ The upper bound is **exclusive** (`valid_until` is the first instant the fact is
 | `valid_between '2025-01-01...' '2026-12-31...'` | match | `[Jan, Jul)` is fully inside the range |
 | `valid_between '2026-02-01...' '2026-12-31...'` | no match | starts before the range's lower bound |
 
-**Timestamps must carry an explicit UTC offset (`+00:00` / `Z`).** Normalisation to
-UTC only happens for offset-aware strings; a naive literal (no offset) is compared
-as plain text against already-normalised, offset-aware stored values, and
-`"...T00:00:00"` sorts lexicographically *before* `"...T00:00:00+00:00"`. That
-shifts both boundary rules above by one boundary for that literal only — an
-offset-less `valid_at` at the exact lower bound stops matching, and one at the
-exact upper bound starts matching. Every example on this page carries an
-explicit offset for this reason; do the same in your own queries.
+**A timestamp without an offset is read as UTC.** Every valid-time value you
+store, and every timestamp you give a temporal predicate, is first converted to
+one canonical UTC form (`2026-07-01T00:00:00+00:00`): an offset-aware value is
+converted to UTC, and a value with no offset is taken to be UTC already. Stored
+values and query timestamps are compared in that form, so `'2026-07-01T00:00:00'`,
+`'2026-07-01 00:00:00'` and `'2026-07-01T00:00:00+00:00'` are the same instant and
+the boundary rules above hold for each of them. For a time in another zone, give
+its offset (`'2026-07-01T02:00:00+02:00'`); without one, it is read as that clock
+time in UTC. Upgrading a database written by an earlier version converts its
+stored values once; the [upgrade notes](upgrade.md#06---07) say which values it
+leaves as they are.
 
 And for a fact with an **open** upper bound — valid `[2026-01-01, ∞)`:
 

@@ -199,6 +199,45 @@ def _populate_fixture_script(
                 )
                 await store.create_edge(edge)
 
+                # Timestamps without an offset, in shapes the FROM release's
+                # validator accepted and stored exactly as written: one
+                # non-canonical value in every column the upgrade normalises.
+                # A release that already normalises on write stores them
+                # canonical instead; verify_data() reads which case this was
+                # from the pre-upgrade snapshot.
+                await store.create_thought(
+                    ThoughtRecord(
+                        thought_id="thought-naive-timestamps",
+                        essence="Upgrade thought with naive timestamps",
+                        content="Timestamps written without an offset, in several shapes",
+                        thought_type=ThoughtType.OBSERVATION,
+                        source="upgrade-fixture",
+                        lifecycle_status=LifecycleStatus.ACTIVE,
+                        priority=Priority.P2,
+                        created_cycle=6,
+                        updated_cycle=6,
+                        created_at="2026-01-02 03:04:05",
+                        updated_at="20260102T030405",
+                        last_accessed_at="2026-W01-5T03:04:05",
+                        expires_at="2099-12-31 23:00:00.5",
+                        valid_from="2026-01-01",
+                        valid_until="2099-07-01T00:00:00",
+                        archived_at="2026-09-25 12:00:00",
+                    )
+                )
+                await store.create_edge(
+                    EdgeRecord(
+                        edge_id="edge-naive-timestamps",
+                        from_thought_id="thought-001",
+                        to_thought_id="thought-002",
+                        edge_type=EdgeType.ASSOCIATED,
+                        weight=0.5,
+                        created_cycle=2,
+                        valid_from="2026-01-01 00:00:00",
+                        valid_until="20990701T000000",
+                    )
+                )
+
                 action = ActionRecord(
                     action_id="action-001",
                     source_thought_id="thought-000",
@@ -271,6 +310,37 @@ _SNAPSHOT_PRIMARY_KEYS = {
     "action": "action_id",
 }
 
+#: The timestamp columns the v20 -> v21 upgrade rewrites into the canonical UTC
+#: form. A value in one of them may change its text across the upgrade, but
+#: never its instant.
+_NORMALISED_TIMESTAMP_COLUMNS = {
+    "thought": (
+        "created_at",
+        "updated_at",
+        "last_accessed_at",
+        "expires_at",
+        "valid_from",
+        "valid_until",
+        "archived_at",
+    ),
+    "edge": ("valid_from", "valid_until"),
+}
+
+#: The last schema version whose write path could store a non-canonical
+#: timestamp: the upgrade from it is the one that normalises them.
+_LAST_NON_CANONICAL_SCHEMA_VERSION = 20
+
+#: Tables whose structure the migrated database must share with a fresh one.
+_SCHEMA_PARITY_TABLES = (
+    "thought",
+    "edge",
+    "embedding",
+    "action",
+    "_metadata",
+    "journal_entry",
+    "extension_schema_versions",
+)
+
 
 def _verify_upgraded_db_script(
     db_path: Path,
@@ -281,7 +351,9 @@ def _verify_upgraded_db_script(
     return textwrap.dedent(
         f"""
         import asyncio
+        import datetime
         import json
+        import re
         import subprocess
         import sys
         from pathlib import Path
@@ -300,6 +372,124 @@ def _verify_upgraded_db_script(
         POST_MIGRATION_SNAPSHOT_PATH = str(Path(SNAPSHOT_PATH).with_suffix(".post-migration.jsonl"))
 
         _SNAPSHOT_PRIMARY_KEYS = {_SNAPSHOT_PRIMARY_KEYS!r}
+        _NORMALISED_TIMESTAMP_COLUMNS = {_NORMALISED_TIMESTAMP_COLUMNS!r}
+        _LAST_NON_CANONICAL_SCHEMA_VERSION = {_LAST_NON_CANONICAL_SCHEMA_VERSION!r}
+        _SCHEMA_PARITY_TABLES = {_SCHEMA_PARITY_TABLES!r}
+
+        # What ``datetime.isoformat()`` writes for a UTC instant, and nothing
+        # else. Written here rather than imported, so the check shares no code
+        # with the build under test.
+        _CANONICAL_SHAPE = re.compile(
+            r"[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T[0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}}"
+            r"(\\.[0-9]{{6}})?\\+00:00"
+        )
+
+        def _is_canonical(value) -> bool:
+            if not isinstance(value, str) or _CANONICAL_SHAPE.fullmatch(value) is None:
+                return False
+            try:
+                return datetime.datetime.fromisoformat(value).isoformat() == value
+            except ValueError:
+                return False
+
+        def _utc_instant(value):
+            parsed = datetime.datetime.fromisoformat(value)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=datetime.timezone.utc)
+            return parsed.astimezone(datetime.timezone.utc)
+
+        def _snapshot_schema_version(path) -> int:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    row = json.loads(line)
+                    if row.get("_type") == "metadata":
+                        return int(row["schema_version"])
+            raise AssertionError(f"no metadata header in {{path}}")
+
+        def _norm_sql(sql: str) -> str:
+            return re.sub(r"\\s*([(),])\\s*", r"\\1", " ".join(sql.split()))
+
+        async def _schema_shape(conn):
+            \"\"\"Column definitions, foreign keys, index and trigger DDL, FTS config.
+
+            Column order is not compared: ALTER ... ADD COLUMN can only append,
+            and the fresh DDL declares migration-added columns last for that
+            reason, but the order is not what this check is about.
+            \"\"\"
+            shape = {{}}
+            for table in _SCHEMA_PARITY_TABLES:
+                cursor = await conn.execute(f"PRAGMA table_info({{table}})")
+                shape["columns", table] = sorted(
+                    (str(r[1]), str(r[2]), int(r[3]), None if r[4] is None else str(r[4]),
+                     int(r[5]))
+                    for r in await cursor.fetchall()
+                )
+                cursor = await conn.execute(f"PRAGMA foreign_key_list({{table}})")
+                shape["foreign keys", table] = sorted(
+                    (str(r[2]), str(r[3]), str(r[4]), str(r[6])) for r in await cursor.fetchall()
+                )
+            cursor = await conn.execute(
+                "SELECT type, name, sql FROM sqlite_master "
+                "WHERE type IN ('index', 'trigger') AND sql IS NOT NULL"
+            )
+            shape["indexes and triggers"] = sorted(
+                (str(r[0]), str(r[1]), _norm_sql(str(r[2]))) for r in await cursor.fetchall()
+            )
+            cursor = await conn.execute("SELECT sql FROM sqlite_master WHERE name = 'thought_fts'")
+            shape["fts"] = [_norm_sql(str(r[0])) for r in await cursor.fetchall()]
+            return shape
+
+        async def _assert_schema_equals_a_fresh_one(conn) -> None:
+            fresh = await aiosqlite.connect(":memory:")
+            try:
+                await SqliteEngravaCore(fresh).ensure_schema()
+                expected = await _schema_shape(fresh)
+            finally:
+                await fresh.close()
+            actual = await _schema_shape(conn)
+            differing = sorted(str(k) for k in expected.keys() | actual.keys()
+                               if expected.get(k) != actual.get(k))
+            if differing:
+                raise AssertionError(
+                    f"migrated schema differs from a fresh bootstrap in: {{differing}}"
+                )
+
+        async def _assert_timestamps_canonical(conn, pre_records, pre_version) -> None:
+            \"\"\"Every stored value in a normalised column is canonical after the upgrade.
+
+            From a release whose write path stored values as written, the fixture
+            planted a non-canonical value in every such column; that is checked
+            too, so the canonical check cannot pass on a fixture with nothing to
+            normalise.
+            \"\"\"
+            for table, columns in _NORMALISED_TIMESTAMP_COLUMNS.items():
+                key = _SNAPSHOT_PRIMARY_KEYS[table]
+                for column in columns:
+                    cursor = await conn.execute(
+                        f"SELECT {{key}}, {{column}} FROM {{table}} WHERE {{column}} IS NOT NULL"
+                    )
+                    offenders = [
+                        (row[0], row[1])
+                        for row in await cursor.fetchall()
+                        if not _is_canonical(row[1])
+                    ]
+                    if offenders:
+                        raise AssertionError(
+                            f"{{table}}.{{column}} holds non-canonical timestamps after "
+                            f"the upgrade: {{offenders!r}}"
+                        )
+                    if pre_version > _LAST_NON_CANONICAL_SCHEMA_VERSION:
+                        continue
+                    planted = [
+                        fields[column]
+                        for fields in pre_records[table].values()
+                        if fields.get(column) is not None and not _is_canonical(fields[column])
+                    ]
+                    if not planted:
+                        raise AssertionError(
+                            f"the fixture left no non-canonical value in {{table}}.{{column}} "
+                            "before the upgrade, so the check above proves nothing"
+                        )
 
         def _load_snapshot_records(path):
             \"\"\"Return ``{{table: {{record_id: fields}}}}`` from a snapshot JSONL file.\"\"\"
@@ -326,6 +516,10 @@ def _verify_upgraded_db_script(
             migration-added column with a default value) is not compared --
             the pre-upgrade snapshot could not have declared an opinion about
             it. This asserts preservation, not that nothing was ever added.
+
+            The one exception is a timestamp column the upgrade normalises: its
+            text may change into the canonical form, but it must still name
+            the same instant.
             \"\"\"
             pre = _load_snapshot_records(pre_path)
             post = _load_snapshot_records(post_path)
@@ -333,6 +527,7 @@ def _verify_upgraded_db_script(
                 if not pre_rows:
                     continue
                 post_rows = post[table]
+                normalised = _NORMALISED_TIMESTAMP_COLUMNS.get(table, ())
                 for record_id, pre_fields in pre_rows.items():
                     if record_id not in post_rows:
                         raise AssertionError(
@@ -342,11 +537,19 @@ def _verify_upgraded_db_script(
                     post_fields = post_rows[record_id]
                     for field, pre_value in pre_fields.items():
                         post_value = post_fields.get(field)
-                        if post_value != pre_value:
-                            raise AssertionError(
-                                f"{{table}} {{record_id}} field {{field!r}} changed "
-                                f"across the upgrade: {{pre_value!r}} -> {{post_value!r}}"
-                            )
+                        if post_value == pre_value:
+                            continue
+                        if (
+                            field in normalised
+                            and isinstance(pre_value, str)
+                            and _is_canonical(post_value)
+                            and _utc_instant(pre_value) == _utc_instant(post_value)
+                        ):
+                            continue
+                        raise AssertionError(
+                            f"{{table}} {{record_id}} field {{field!r}} changed "
+                            f"across the upgrade: {{pre_value!r}} -> {{post_value!r}}"
+                        )
 
         async def verify_data() -> None:
             # aiosqlite runs its connection on a NON-daemon thread that only
@@ -363,6 +566,20 @@ def _verify_upgraded_db_script(
                 # not change what the migration above already wrote.
                 store = SqliteEngravaCore(conn, journal_enabled=True)
                 await store.ensure_schema()
+
+                pre_records = _load_snapshot_records(PRE_SNAPSHOT_PATH)
+                for table, pre_rows in pre_records.items():
+                    cursor = await conn.execute(f"SELECT COUNT(*) FROM {{table}}")
+                    (count,) = await cursor.fetchone()
+                    if count != len(pre_rows):
+                        raise AssertionError(
+                            f"{{table}} row count changed across the upgrade: "
+                            f"{{len(pre_rows)}} -> {{count}}"
+                        )
+                await _assert_timestamps_canonical(
+                    conn, pre_records, _snapshot_schema_version(PRE_SNAPSHOT_PATH)
+                )
+                await _assert_schema_equals_a_fresh_one(conn)
 
                 metrics = await store.metrics()
                 if metrics.thoughts.total < 6:
@@ -460,7 +677,7 @@ def _verify_upgraded_db_script(
         migrate_result = subprocess.run(migrate_cmd, check=True, capture_output=True, text=True)
         if "Schema up to date" not in migrate_result.stdout:
             raise AssertionError(f"unexpected migrate output: {{migrate_result.stdout!r}}")
-        """
+        """  # noqa: S608 - a generated test script; it interpolates only this module's constants and temp paths
     )
 
 

@@ -61,8 +61,8 @@ class TestValidateIso8601Nullable:
     def test_none_passes_through(self) -> None:
         assert validate_iso8601_nullable(None) is None
 
-    def test_naive_returned_unchanged(self) -> None:
-        assert validate_iso8601_nullable("2026-01-01T00:00:00") == "2026-01-01T00:00:00"
+    def test_naive_read_as_utc(self) -> None:
+        assert validate_iso8601_nullable("2026-01-01T00:00:00") == "2026-01-01T00:00:00+00:00"
 
     def test_positive_offset_normalised_to_utc(self) -> None:
         assert validate_iso8601_nullable("2026-04-12T15:00:00+02:00") == "2026-04-12T13:00:00+00:00"
@@ -152,8 +152,8 @@ class TestThoughtValidTime:
             valid_from="2026-01-01T00:00:00",
             valid_until="2026-12-31T00:00:00",
         )
-        assert thought.valid_from == "2026-01-01T00:00:00"
-        assert thought.valid_until == "2026-12-31T00:00:00"
+        assert thought.valid_from == "2026-01-01T00:00:00+00:00"
+        assert thought.valid_until == "2026-12-31T00:00:00+00:00"
 
     def test_tz_aware_normalised_to_utc(self) -> None:
         thought = _make_thought(
@@ -182,7 +182,7 @@ class TestThoughtValidTime:
             valid_from="2026-01-01T00:00:00",
             valid_until="2026-01-01T00:00:00",
         )
-        assert thought.valid_from == thought.valid_until == "2026-01-01T00:00:00"
+        assert thought.valid_from == thought.valid_until == "2026-01-01T00:00:00+00:00"
 
     def test_equal_across_offsets_accepted(self) -> None:
         # AC-2: equal instants expressed with differing offsets normalise equal.
@@ -199,13 +199,13 @@ class TestThoughtValidTime:
             valid_from="2026-06-01T10:00:00+00:00",
             valid_until="2026-06-01T10:00:00",
         )
-        assert thought.valid_until == "2026-06-01T10:00:00"
+        assert thought.valid_from == thought.valid_until == "2026-06-01T10:00:00+00:00"
 
     @pytest.mark.parametrize(
         ("valid_from", "valid_until"),
         [
-            ("2026-01-01T00:00:00", None),
-            (None, "2026-01-01T00:00:00"),
+            ("2026-01-01T00:00:00+00:00", None),
+            (None, "2026-01-01T00:00:00+00:00"),
             (None, None),
         ],
     )
@@ -232,8 +232,8 @@ class TestEdgeValidTime:
             valid_from="2026-01-01T00:00:00",
             valid_until="2026-12-31T00:00:00",
         )
-        assert edge.valid_from == "2026-01-01T00:00:00"
-        assert edge.valid_until == "2026-12-31T00:00:00"
+        assert edge.valid_from == "2026-01-01T00:00:00+00:00"
+        assert edge.valid_until == "2026-12-31T00:00:00+00:00"
 
     def test_tz_aware_normalised_to_utc(self) -> None:
         edge = _make_edge(
@@ -262,7 +262,7 @@ class TestEdgeValidTime:
             valid_from="2026-01-01T00:00:00",
             valid_until="2026-01-01T00:00:00",
         )
-        assert edge.valid_from == edge.valid_until == "2026-01-01T00:00:00"
+        assert edge.valid_from == edge.valid_until == "2026-01-01T00:00:00+00:00"
 
     def test_equal_across_offsets_accepted(self) -> None:
         # AC-2: equal instants expressed with differing offsets normalise equal.
@@ -279,13 +279,13 @@ class TestEdgeValidTime:
             valid_from="2026-06-01T10:00:00+00:00",
             valid_until="2026-06-01T10:00:00",
         )
-        assert edge.valid_until == "2026-06-01T10:00:00"
+        assert edge.valid_from == edge.valid_until == "2026-06-01T10:00:00+00:00"
 
     @pytest.mark.parametrize(
         ("valid_from", "valid_until"),
         [
-            ("2026-01-01T00:00:00", None),
-            (None, "2026-01-01T00:00:00"),
+            ("2026-01-01T00:00:00+00:00", None),
+            (None, "2026-01-01T00:00:00+00:00"),
             (None, None),
         ],
     )

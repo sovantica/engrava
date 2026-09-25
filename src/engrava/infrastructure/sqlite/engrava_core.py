@@ -85,6 +85,8 @@ from engrava.domain.exceptions import (
     WriteLockTimeoutError,
 )
 from engrava.domain.models._temporal import (
+    canonical_timestamp,
+    canonical_timestamp_or_none,
     parse_iso8601_to_utc,
     validate_interval_ordering,
     validate_iso8601_nullable,
@@ -198,6 +200,47 @@ _CORE_TABLE_NAMES = (
     "journal_entry",
     "extension_schema_versions",
 )
+
+#: The columns :func:`~engrava.domain.models._temporal.validate_iso8601_nullable`
+#: covers, per table, as they stand at core-21: the ones the ``v20 -> v21`` step
+#: rewrites once into the canonical UTC form (see
+#: :meth:`SqliteEngravaCore._normalise_stored_timestamps`). Pinned to that
+#: schema version on purpose — a migration must keep doing what it did when it
+#: shipped, so a column validated in some later version is not added here.
+_CANONICAL_TIMESTAMP_COLUMNS: Final = (
+    (
+        "thought",
+        (
+            "created_at",
+            "updated_at",
+            "last_accessed_at",
+            "expires_at",
+            "valid_from",
+            "valid_until",
+            "archived_at",
+        ),
+    ),
+    ("edge", ("valid_from", "valid_until")),
+)
+
+#: SQLite ``GLOB`` patterns for the canonical UTC form: what
+#: ``datetime.isoformat()`` writes for an aware UTC instant — a whole second, or
+#: a six-digit fraction that is never ``.000000`` (``isoformat`` omits a zero
+#: fraction). A stored value matching them already has the canonical shape and is
+#: not read back, even if it names an impossible date; everything else in a
+#: migrated column is.
+_CANONICAL_WHOLE_SECOND_GLOB: Final = (
+    "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]+00:00"
+)
+_CANONICAL_FRACTION_GLOB: Final = (
+    "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]"
+    ".[0-9][0-9][0-9][0-9][0-9][0-9]+00:00"
+)
+_ZERO_FRACTION_GLOB: Final = "*.000000+00:00"
+
+#: Rows read per page while the ``v20 -> v21`` step rewrites values without the
+#: canonical shape, so a large store is never held in memory at once.
+_TIMESTAMP_NORMALISATION_BATCH_SIZE: Final = 500
 
 
 @dataclass(frozen=True)
@@ -4250,11 +4293,19 @@ class SqliteEngravaCore:
         await self._require_column(20, "thought", "archived_at")
 
     async def _migrate_core_v20_to_v21(self) -> None:
-        """Add the row-version guard column ``revision`` (core-21).
+        """Add the row-version guard column and canonicalise stored timestamps (core-21).
 
-        Purely additive: ``thought``, ``edge`` and ``action`` each gain
+        Two parts, run in the one transaction the migration loop opens for the
+        step. First, ``thought``, ``edge`` and ``action`` each gain
         ``revision INTEGER NOT NULL DEFAULT 0``. Not ``embedding`` — it is a
         carrier owned by its thought, not an independently updatable entity.
+        Second, the stored values in the timestamp columns the shared validator
+        covers that are not already in the canonical shape are read once, and
+        each one that can be read as an instant is rewritten into the canonical
+        UTC form that validator now returns — see
+        :meth:`_normalise_stored_timestamps`. That second part
+        changes row values only, never a table's shape, so it does not need a
+        schema version of its own.
 
         ``NOT NULL DEFAULT 0`` makes a separate backfill step unnecessary: every
         pre-existing row reads back ``revision = 0`` the instant the column
@@ -4302,6 +4353,143 @@ class SqliteEngravaCore:
         if await self._table_exists("action"):
             await self._add_column_if_absent("action", "revision", "INTEGER NOT NULL DEFAULT 0")
             await self._require_column(21, "action", "revision")
+
+        await self._normalise_stored_timestamps()
+
+    async def _normalise_stored_timestamps(self) -> None:
+        # Write-lock classification: bucket 2 (schema bootstrap) -- see ensure_schema.
+        """Rewrite stored timestamps without the canonical shape into the canonical UTC form.
+
+        Before core-21 the shared validator returned a naive timestamp exactly
+        as the caller wrote it, so a v20 database can hold values such as
+        ``2026-01-02 03:04:05``, ``20260102T030405`` or ``2026-W01-5`` in a
+        column the store compares as TEXT — against
+        ``datetime.now(UTC).isoformat()`` for expiry, against MindQL literals for
+        valid time. Such a value sorts in the wrong place: a space separator
+        makes a still-live row read as expired, basic format or a week date
+        makes an expired one read as live. This rewrites each of them that can
+        be read as an instant into the form the validator returns now (a naive
+        value is read as UTC), so it orders by its instant.
+
+        Covers the columns in :data:`_CANONICAL_TIMESTAMP_COLUMNS`. Only rows
+        whose value does not already have the canonical shape are read back
+        (selected in SQL with ``GLOB``), a page at a time, so a large store that
+        is already canonical is scanned but not rewritten. A value that already
+        has the canonical shape is not re-read, even if it names an impossible
+        date. The rewrite changes no instant and is not an edit: ``revision`` is
+        not bumped, ``updated_at`` is not re-stamped (its own value is only put
+        into canonical form, like every covered column), and no journal entry is
+        written — the journal keeps its own copies of what was written, so its
+        hash chain still verifies. Of the values read back, one that cannot be
+        read as an ISO-8601 instant is left untouched; the count of such values
+        is logged, never the values themselves.
+
+        An ``edge`` table absent in a partial bootstrap (a thought-only
+        database) is skipped, as the ``revision`` part of this step skips it.
+
+        Raises:
+            CoreMigrationError: If a rewritten column still holds a value
+                without the canonical shape that is not one of the values left
+                untouched.
+
+        """
+        left_untouched: dict[str, int] = {}
+        for table, columns in _CANONICAL_TIMESTAMP_COLUMNS:
+            if not await self._table_exists(table):
+                continue
+            for column in columns:
+                untouched = await self._normalise_timestamp_column(table, column)
+                if untouched:
+                    left_untouched[f"{table}.{column}"] = untouched
+        if left_untouched:
+            logger.warning(
+                "Upgrading the core schema to version 21 left %d stored timestamp "
+                "value(s) unchanged because they cannot be read as an ISO-8601 "
+                "instant (%s)",
+                sum(left_untouched.values()),
+                ", ".join(f"{name}: {count}" for name, count in left_untouched.items()),
+            )
+
+    async def _normalise_timestamp_column(self, table: str, column: str) -> int:
+        # Write-lock classification: bucket 2 (schema bootstrap) -- see ensure_schema.
+        """Rewrite one column's values that lack the canonical shape.
+
+        See :meth:`_normalise_stored_timestamps` for what is rewritten and why.
+
+        Pages through the rows whose value lacks the canonical shape by
+        ``rowid`` (keyset pagination), so a value left untouched is never read
+        twice and a rewritten one never comes back: after its rewrite it matches
+        the canonical ``GLOB`` and is no longer selected. The ``SELECT`` of each
+        page is fully read before that page's ``UPDATE`` runs, so no statement
+        reads a table another one on this connection is changing. Then checks
+        its own postcondition.
+
+        Args:
+            table: A table from :data:`_CANONICAL_TIMESTAMP_COLUMNS`.
+            column: One of that table's columns there. Both are drawn from that
+                fixed constant, never caller input, so the f-string
+                interpolation below cannot carry anything it did not name.
+
+        Returns:
+            How many of the values read back (those without the canonical
+            shape) were left untouched because they cannot be read as an
+            ISO-8601 instant. A value with the canonical shape is never read, so
+            it is never counted.
+
+        Raises:
+            CoreMigrationError: If, after the rewrite, the number of values
+                without the canonical shape is not exactly the number left
+                untouched.
+
+        """
+        not_canonical = (
+            f"{column} IS NOT NULL AND NOT ({column} GLOB ? "
+            f"OR ({column} GLOB ? AND {column} NOT GLOB ?))"
+        )
+        globs = (_CANONICAL_WHOLE_SECOND_GLOB, _CANONICAL_FRACTION_GLOB, _ZERO_FRACTION_GLOB)
+        first_page = (
+            f"SELECT rowid, {column} FROM {table} "  # noqa: S608 - fixed identifiers, see Args
+            f"WHERE {not_canonical} ORDER BY rowid LIMIT ?"
+        )
+        next_page = (
+            f"SELECT rowid, {column} FROM {table} "  # noqa: S608 - fixed identifiers, see Args
+            f"WHERE rowid > ? AND {not_canonical} ORDER BY rowid LIMIT ?"
+        )
+        rewrite = f"UPDATE {table} SET {column} = ? WHERE rowid = ?"  # noqa: S608 - fixed identifiers
+
+        untouched = 0
+        cursor = await self._db.execute(first_page, (*globs, _TIMESTAMP_NORMALISATION_BATCH_SIZE))
+        while True:
+            rows = list(await cursor.fetchall())
+            rewrites: list[tuple[str, int]] = []
+            for row in rows:
+                canonical = canonical_timestamp_or_none(row[1])
+                if canonical is None:
+                    untouched += 1
+                else:
+                    rewrites.append((canonical, int(row[0])))
+            if rewrites:
+                await self._db.executemany(rewrite, rewrites)
+            if len(rows) < _TIMESTAMP_NORMALISATION_BATCH_SIZE:
+                break
+            cursor = await self._db.execute(
+                next_page, (int(rows[-1][0]), *globs, _TIMESTAMP_NORMALISATION_BATCH_SIZE)
+            )
+
+        # Postcondition: only the values left untouched may still lack the
+        # canonical shape.
+        cursor = await self._db.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE {not_canonical}",  # noqa: S608 - fixed identifiers
+            globs,
+        )
+        remaining = await cursor.fetchone()
+        if remaining is None or int(remaining[0]) != untouched:
+            raise CoreMigrationError(
+                21,
+                f"{table}.{column} still holds values without the canonical shape "
+                "after the rewrite",
+            )
+        return untouched
 
     async def _fk_present(self, table: str, column: str) -> bool:
         """Return whether ``column`` has the required thought-cascade foreign key.
@@ -8680,19 +8868,35 @@ class SqliteEngravaCore:
         Mutations are recorded in the journal when journaling is enabled.
 
         Args:
-            now: Optional ISO-8601 UTC timestamp to use as "current time".
-                Defaults to ``datetime.now(UTC).isoformat()`` when omitted.
-                Useful for deterministic testing.
+            now: Optional ISO-8601 timestamp to use as "current time", in any
+                form the timestamp validator accepts; a value without an offset
+                is read as UTC. It is compared in the canonical UTC form, so a
+                row is taken exactly when its ``expires_at`` instant is at or
+                before this one. Defaults to ``datetime.now(UTC).isoformat()``
+                when omitted. Useful for deterministic testing.
             exclude_id: Optional thought ID to skip during cleanup.
                 Used by auto-cleanup to protect a just-written thought.
 
         Returns:
             A ``CleanupResult`` with the count of processed thoughts, the
-            strategy that was applied, and a UTC timestamp.
+            strategy that was applied, and the canonical UTC form of the
+            instant it cleaned up to.
+
+        Raises:
+            ValueError: If ``now`` is not a valid ISO-8601 timestamp, or has no
+                UTC form within the supported ``datetime`` range. Nothing is
+                read or written in that case.
 
         """
-        if now is None:
-            now = datetime.datetime.now(datetime.UTC).isoformat()
+        # A caller's ``now`` is compared as TEXT against canonical stored
+        # ``expires_at`` values, so it is put into the same canonical UTC form
+        # first -- otherwise a space separator, basic format, a week date or an
+        # offset would select rows by string order instead of by instant.
+        now = (
+            datetime.datetime.now(datetime.UTC).isoformat()
+            if now is None
+            else canonical_timestamp(now)
+        )
 
         strategy = CleanupStrategy(self._ttl_strategy)
 
@@ -9162,7 +9366,8 @@ class SqliteEngravaCore:
                 cycle stamp or a delete (see :meth:`update_thought`).
             ValueError: If ``valid_until`` is not a valid ISO-8601 timestamp,
                 or is earlier than the thought's existing ``valid_from`` (an
-                inverted validity interval).
+                inverted validity interval), or either bound has no UTC form
+                within the supported ``datetime`` range.
 
         """
         normalized = validate_iso8601_nullable(valid_until)
@@ -9785,7 +9990,9 @@ class SqliteEngravaCore:
         Raises:
             ValueError: If the edge does not exist, ``valid_until`` is not a
                 valid ISO-8601 timestamp, or ``valid_until`` is earlier than the
-                edge's existing ``valid_from`` (an inverted validity interval).
+                edge's existing ``valid_from`` (an inverted validity interval),
+                or either bound has no UTC form within the supported
+                ``datetime`` range.
             StaleDataError: If the guarded write matches no row — see
                 :meth:`update_edge`, which this delegates to.
             WriteContentionError: The guarded write could not proceed because
@@ -15773,7 +15980,10 @@ def _parse_recency_now(value: str) -> datetime.datetime:
 
     Raises:
         InvalidRecencyArgumentError: If ``value`` is not a valid ISO-8601
-            timestamp (the underlying parser error is chained as ``__cause__``).
+            timestamp, or is one whose instant has no UTC form within the
+            supported ``datetime`` range (an aware value at the range limits,
+            such as ``0001-01-01T00:00:00+01:00``). The underlying error is
+            chained as ``__cause__``.
 
     """
     try:
@@ -15781,29 +15991,35 @@ def _parse_recency_now(value: str) -> datetime.datetime:
     except (ValueError, TypeError) as exc:
         msg = f"recency_now must be an ISO-8601 timestamp, got {value!r}"
         raise InvalidRecencyArgumentError(msg) from exc
+    except OverflowError as exc:
+        msg = f"recency_now {value!r} has no UTC form within the supported datetime range"
+        raise InvalidRecencyArgumentError(msg) from exc
 
 
 def _parse_row_timestamp(value: object) -> datetime.datetime | None:
     """Parse a stored transaction-time row timestamp, tolerating bad data.
 
     Returns the UTC-normalised instant, or ``None`` when the stored value is
-    missing (SQL ``NULL``) or malformed (a legacy / imported row). Callers map a
-    ``None`` result to the deterministic minimum recency score — the row is
-    treated as maximally old — so bad row data never crashes the ranking path
-    and never triggers a host-clock read.
+    missing (SQL ``NULL``), malformed (a legacy / imported row), or valid
+    ISO-8601 with no UTC form within the supported ``datetime`` range — a value
+    the core-21 upgrade leaves untouched because it cannot put it into the
+    canonical UTC form. Callers map a ``None`` result to the deterministic
+    minimum recency score — the row is treated as maximally old — so bad row
+    data never crashes the ranking path and never triggers a host-clock read.
 
     Args:
         value: The raw ``updated_at`` / ``created_at`` column value.
 
     Returns:
-        The parsed instant, or ``None`` when the value is missing or malformed.
+        The parsed instant, or ``None`` when the value is missing, malformed or
+        has no UTC form.
 
     """
     if not isinstance(value, str):
         return None
     try:
         return parse_iso8601_to_utc(value)
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
 
 

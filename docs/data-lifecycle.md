@@ -85,6 +85,14 @@ deterministic: the `expires_after_seconds` argument wins, then the record's own
 `expires_at`, then the configured store default. The default is used only when
 neither per-call nor per-record expiry was supplied.
 
+`expires_at` is stored in one canonical UTC form (`2026-07-01T00:00:00+00:00`),
+whichever ISO-8601 form you pass: an offset-aware value is converted to UTC, and
+a value with no offset is read as UTC. Expiry compares that stored value with the
+current UTC time, so `2026-07-01 00:00:00`, `20260701T000000` and
+`2026-07-01T02:00:00+02:00` all expire at the same instant. Upgrading a database
+written by an earlier version converts its stored values once; the
+[upgrade notes](upgrade.md#06---07) say which values it leaves as they are.
+
 Expiry is **not** automatic on a timer. Expired thoughts remain until a cleanup
 pass runs (see [running cleanup](#running-cleanup) below). By default, expired
 thoughts are **excluded** from `count_thoughts(...)` and `list_thoughts(...)` —

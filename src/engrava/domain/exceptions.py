@@ -790,8 +790,9 @@ class RecencyModeConflictError(EngravaError):
 class InvalidRecencyArgumentError(EngravaError):
     """Raised when a transaction-time recency argument is malformed.
 
-    Covers a ``recency_now`` that is not a valid ISO-8601 timestamp and a
-    non-positive ``recency_now_half_life``. It is raised at the ``search_hybrid``
+    Covers a ``recency_now`` that is not a valid ISO-8601 timestamp or has no
+    UTC form within the supported ``datetime`` range, and a non-positive
+    ``recency_now_half_life``. It is raised at the ``search_hybrid``
     / ``recall`` call boundary (never mid-ranking), a typed sibling of
     :class:`RecencyModeConflictError` so callers can catch a specific engrava
     error rather than a bare ``ValueError``. For a malformed timestamp the

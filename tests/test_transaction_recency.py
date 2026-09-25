@@ -33,6 +33,7 @@ from engrava import (
     InvalidRecencyArgumentError,
     LifecycleStatus,
     Priority,
+    ReadOnlyEngrava,
     RecencyModeConflictError,
     SearchConfig,
     SqliteEngravaCore,
@@ -98,6 +99,12 @@ class _CountingClock(_REAL_DATETIME):
         _CountingClock.calls += 1
         return _REAL_DATETIME(2026, 7, 16, 12, 0, 0)
 
+
+#: Valid ISO-8601, but converting either to UTC leaves the ``datetime`` range.
+_NO_UTC_FORM = (
+    pytest.param("0001-01-01T00:00:00+01:00", id="below year 1 in UTC"),
+    pytest.param("9999-12-31T23:59:59-01:00", id="above year 9999 in UTC"),
+)
 
 # A fixed caller "now" — every transaction-recency assertion is anchored to this
 # instant, never the host clock, so the tests are fully replayable.
@@ -478,6 +485,61 @@ class TestFailurePaths:
             thought_ids={"garbled"}, now=_NOW_DT, half_life_seconds=604800.0
         )
         assert scores["garbled"] == _MIN_RECENCY_SCORE
+
+    @pytest.mark.parametrize("entry_point", ["search_hybrid", "recall"])
+    @pytest.mark.parametrize("read_only", [False, True], ids=["store", "read-only view"])
+    @pytest.mark.parametrize("bad_now", _NO_UTC_FORM)
+    async def test_recency_now_with_no_utc_form_raises_typed_error(
+        self, store: SqliteEngravaCore, entry_point: str, read_only: bool, bad_now: str
+    ) -> None:
+        # Valid ISO-8601, but the UTC conversion leaves the datetime range: the
+        # same typed boundary error as a malformed value, never OverflowError.
+        await store.create_thought(_thought("a", updated_at=_NOW))
+        target = ReadOnlyEngrava(store) if read_only else store
+        call = getattr(target, entry_point)
+        with pytest.raises(
+            InvalidRecencyArgumentError, match="has no UTC form within the supported datetime range"
+        ) as exc_info:
+            await call("alpha", recency_now=bad_now)
+        assert type(exc_info.value) is InvalidRecencyArgumentError
+        assert isinstance(exc_info.value.__cause__, OverflowError)
+
+    @pytest.mark.parametrize("column", ["updated_at", "created_at"])
+    @pytest.mark.parametrize("planted", _NO_UTC_FORM)
+    async def test_row_timestamp_with_no_utc_form_ranks_as_oldest(
+        self, store: SqliteEngravaCore, column: str, planted: str
+    ) -> None:
+        # The upgrade to core-21 leaves a stored value like this untouched (it
+        # cannot be put into UTC form), so recency ranking has to tolerate it.
+        await store.create_thought(_thought("new", updated_at="2026-07-16T11:59:00+00:00"))
+        await store.create_thought(_thought("old", updated_at="2026-01-01T00:00:00+00:00"))
+        await store.create_thought(_thought("planted", updated_at=_NOW))
+        if column == "updated_at":
+            await store._db.execute(
+                "UPDATE thought SET updated_at = ? WHERE thought_id = 'planted'", (planted,)
+            )
+        else:
+            # created_at is only read when updated_at is NULL.
+            await store._db.execute(
+                "UPDATE thought SET updated_at = NULL, created_at = ? WHERE thought_id = 'planted'",
+                (planted,),
+            )
+
+        scores = await store._load_transaction_recency_scores(
+            thought_ids={"new", "old", "planted"}, now=_NOW_DT, half_life_seconds=604800.0
+        )
+        fused = await store.search_hybrid(
+            "alpha", recency_now=_NOW, recency_weight=1.0, priority_weight=0.0
+        )
+        fallback = await store.search_hybrid(
+            "", recency_now=_NOW, recency_weight=1.0, priority_weight=0.0
+        )
+
+        assert scores["planted"] == _MIN_RECENCY_SCORE
+        assert scores["new"] > scores["old"] > _MIN_RECENCY_SCORE
+        assert [tid for tid, _ in fused.results] == ["new", "old", "planted"]
+        assert [tid for tid, _ in fallback.results] == ["new", "old", "planted"]
+        assert dict(fallback.results)["planted"] == _MIN_RECENCY_SCORE
 
     @pytest.mark.parametrize("bad_half_life", [0, -1, -604800])
     async def test_non_positive_half_life_rejected(

@@ -185,7 +185,7 @@ deletions = await store.journal.get_entries(
 |---|---|---|
 | `target_id` | `None` | Filter by the affected entity ID |
 | `mutation_type` | `None` | Filter by mutation type string |
-| `since` | `None` | ISO-8601 lower bound on `created_at` (inclusive) |
+| `since` | `None` | ISO-8601 lower bound on `created_at` (inclusive), compared by instant; a value without an offset is read as UTC, and a value that cannot be read as a UTC instant raises `ValueError` |
 | `limit` | `100` | Maximum entries returned |
 
 > **`since=` is a convenience filter, not an audit boundary.** It compares

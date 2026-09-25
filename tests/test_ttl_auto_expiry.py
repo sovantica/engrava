@@ -975,10 +975,10 @@ class TestTimezoneNormalization:
         t = _make_thought(expires_at="2026-04-12T13:00:00+00:00")
         assert t.expires_at == "2026-04-12T13:00:00+00:00"
 
-    def test_naive_timestamp_preserved(self) -> None:
-        """Naive timestamps (no timezone info) are left as-is."""
+    def test_naive_timestamp_read_as_utc(self) -> None:
+        """Naive timestamps (no timezone info) are read as UTC and stored canonical."""
         t = _make_thought(expires_at="2026-04-12T13:00:00")
-        assert t.expires_at == "2026-04-12T13:00:00"
+        assert t.expires_at == "2026-04-12T13:00:00+00:00"
 
     def test_created_at_normalized(self) -> None:
         """created_at also benefits from normalization."""

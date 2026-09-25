@@ -168,6 +168,28 @@ class TestEvolveTimestamps:
         t2 = t.evolve(created_at=now)
         assert t2.created_at == now
 
+    @pytest.mark.parametrize(
+        "restated",
+        [
+            "2026-01-02T03:04:05",  # the naive value the caller first passed
+            "2026-01-02 03:04:05",
+            "2026-01-02T05:04:05+02:00",
+        ],
+    )
+    def test_evolve_created_at_same_instant_in_another_form_ok(self, restated: str) -> None:
+        # created_at is stored canonical; re-stating the same instant in the form
+        # the caller first used, or with another offset, is not a change.
+        t = _make(created_at="2026-01-02T03:04:05")
+        assert t.created_at == "2026-01-02T03:04:05+00:00"
+        t2 = t.evolve(created_at=restated)
+        assert t2.created_at == "2026-01-02T03:04:05+00:00"
+
+    @pytest.mark.parametrize("attempted", ["2026-01-02T03:04:06", "garbage", 42])
+    def test_evolve_created_at_other_instant_or_invalid_rejected(self, attempted: object) -> None:
+        t = _make(created_at="2026-01-02T03:04:05")
+        with pytest.raises(ValueError, match="created_at is immutable"):
+            t.evolve(created_at=attempted)
+
     def test_evolve_created_at_from_none_ok(self) -> None:
         t = _make()  # created_at=None
         now = datetime.datetime.now(datetime.UTC).isoformat()

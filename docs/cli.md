@@ -602,6 +602,12 @@ config is loaded); omitted with a services config falls back to
 `services.default_service`; omitted with no services config restores into the
 single `--db` database.
 
+Thought and edge timestamps are written in the canonical UTC form engrava stores
+(`2026-07-01T00:00:00+00:00`; a value without an offset is read as UTC), so a
+snapshot taken by an earlier version, which may hold other ISO-8601 forms,
+restores with its timestamps compared by instant. A value that cannot be read
+as an ISO-8601 instant is restored as it was.
+
 `--skip-embeddings` and `--re-embed` are **mutually exclusive** — passing both
 fails with:
 
