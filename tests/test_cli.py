@@ -32,6 +32,7 @@ from engrava.cli.main import (
     _close_quietly,
     _export_db_to_jsonl,
     _import_records_to_db,
+    _read_thoughts_and_edges_in_one_transaction,
     _rollback_quietly,
     cli,
 )
@@ -3989,6 +3990,380 @@ class TestMigrate:
         assert result.exit_code == 0
         assert "Schema up to date" in result.output
         assert new_db.exists()
+
+
+@pytest.fixture
+def two_thought_one_edge_db(db_path: Path) -> Path:
+    """A DB with exactly thoughts T1, T2 and edge E0 (T1 -> T2).
+
+    Deliberately just these three rows -- unlike ``populated_db``'s three
+    thoughts and one edge -- so the consistency test below has nothing else
+    to account for when it asserts the export equals this pre-commit state
+    exactly.
+    """
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import (
+        EdgeRecord,
+        EdgeType,
+        LifecycleStatus,
+        Priority,
+        SqliteEngravaCore,
+        ThoughtRecord,
+        ThoughtType,
+    )
+
+    async def _setup() -> None:
+        conn = await aiosqlite.connect(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        await store.ensure_schema()
+        for thought_id in ("T1", "T2"):
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id=thought_id,
+                    essence=f"Essence for {thought_id}",
+                    content=f"Content for {thought_id}",
+                    thought_type=ThoughtType.OBSERVATION,
+                    source="test",
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    priority=Priority.P2,
+                    created_cycle=1,
+                    updated_cycle=1,
+                )
+            )
+        await store.create_edge(
+            EdgeRecord(
+                edge_id="E0",
+                from_thought_id="T1",
+                to_thought_id="T2",
+                edge_type=EdgeType.ASSOCIATED,
+                weight=0.9,
+                created_cycle=1,
+            )
+        )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_setup())
+    return db_path
+
+
+async def _insert_t3_and_delete_e0_after(
+    db_path: Path, paused: asyncio.Event, resume: asyncio.Event
+) -> None:
+    """Insert T3 with edge E3 (T1 -> T3), and delete E0, as one committed transaction.
+
+    Stands in for "the one supported concurrent writer" the same way
+    ``_concurrent_writer_commit_after`` does above for the snapshot test: a
+    second ``SqliteEngravaCore`` on the same file, not a mock. Waits for
+    ``paused`` (set by the caller once the read side has scanned ``thought``
+    and is about to scan ``edge``), commits, then sets ``resume`` so the
+    paused read continues.
+
+    The insert and the delete land as **one** transaction via
+    ``suspend_auto_commit`` -- a plain ``create_thought`` / ``create_edge`` /
+    ``delete_edge`` sequence would each commit on its own, which would not
+    exercise "a second connection commits one transaction" the way the spec
+    for this test calls for.
+
+    Args:
+        db_path: Path to the database both connections share.
+        paused: Set by the caller once the read has reached the point
+            between its thought-table and edge-table scans.
+        resume: Set here once the commit lands, to let the read continue.
+
+    """
+    import aiosqlite
+
+    from engrava import (
+        EdgeRecord,
+        EdgeType,
+        LifecycleStatus,
+        Priority,
+        SqliteEngravaCore,
+        ThoughtRecord,
+        ThoughtType,
+    )
+
+    await paused.wait()
+    writer_conn = await aiosqlite.connect(str(db_path))
+    writer_conn.row_factory = aiosqlite.Row
+    await writer_conn.execute("PRAGMA foreign_keys = ON")
+    writer_store = SqliteEngravaCore(writer_conn)
+    async with writer_store.suspend_auto_commit():
+        await writer_store.create_thought(
+            ThoughtRecord(
+                thought_id="T3",
+                essence="written mid-export",
+                content="written mid-export",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=99,
+                updated_cycle=99,
+            )
+        )
+        await writer_store.create_edge(
+            EdgeRecord(
+                edge_id="E3",
+                from_thought_id="T1",
+                to_thought_id="T3",
+                edge_type=EdgeType.ASSOCIATED,
+                weight=0.5,
+                created_cycle=99,
+            )
+        )
+        deleted = await writer_store.delete_edge("E0")
+        assert deleted, "E0 must exist to be deleted -- fixture drifted"
+    await writer_conn.close()
+    resume.set()
+
+
+async def _read_with_commit_interleaved_before_edge_scan(
+    db_path: Path,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Call ``_read_thoughts_and_edges_in_one_transaction`` while a writer commits mid-scan.
+
+    Pauses the reading connection right before its ``SELECT * FROM edge`` --
+    after the thought-table scan, before the edge-table one -- starts the
+    concurrent writer (:func:`_insert_t3_and_delete_e0_after`), and resumes
+    once it has committed. Same technique as
+    ``_export_with_commit_interleaved_before_edge_scan`` above (itself
+    borrowed from ``TestInProcessCriticalSection`` in
+    ``test_concurrency_contract.py``): a genuine ``asyncio.Task``, paused and
+    resumed via an ``asyncio.Event`` handshake, never a sleep or a mock.
+
+    Args:
+        db_path: Path to the source database.
+
+    Returns:
+        The ``(thoughts, edges)`` pair ``_read_thoughts_and_edges_in_one_
+        transaction`` returned.
+
+    """
+    import aiosqlite
+
+    conn = await aiosqlite.connect(str(db_path))
+    conn.row_factory = aiosqlite.Row
+    # Matches how the real CLI opens a connection for `export` (`_open_db`
+    # in `engrava.cli.main`) -- WAL mode is what makes a concurrent writer's
+    # commit non-blocking against an open reader, which is what lets this
+    # test observe the race rather than have the writer simply wait out the
+    # reader's lock.
+    await conn.execute("PRAGMA journal_mode = WAL")
+    await conn.execute("PRAGMA foreign_keys = ON")
+
+    paused = asyncio.Event()
+    resume = asyncio.Event()
+    original_execute = conn.execute
+    edge_scan_seen = False
+
+    async def _tracking_execute(sql: str, *args: object, **kwargs: object) -> object:
+        nonlocal edge_scan_seen
+        if sql == "SELECT * FROM edge" and not edge_scan_seen:
+            edge_scan_seen = True
+            paused.set()
+            await resume.wait()
+        return await original_execute(sql, *args, **kwargs)
+
+    setattr(conn, "execute", _tracking_execute)  # noqa: B010 -- see snapshot's own patch above for why setattr, not a subclass
+
+    try:
+        _, (thoughts, edges) = await asyncio.gather(
+            _insert_t3_and_delete_e0_after(db_path, paused, resume),
+            _read_thoughts_and_edges_in_one_transaction(conn, status_filter=None),
+        )
+    finally:
+        await conn.close()
+    return thoughts, edges
+
+
+class TestExportObservesOneConsistentState:
+    """``export`` must not read the thought and edge tables as two independent scans.
+
+    ``export_cmd`` used to run ``SELECT * FROM thought`` and
+    ``SELECT * FROM edge`` with nothing enclosing them, so each was its own
+    implicit read. A writer that commits a new thought and its edge, and
+    deletes an existing edge, between the two scans could leave the export
+    holding an edge referencing a thought it never scanned, while also
+    missing an edge that existed at the moment export started. This does not
+    need a mocked writer to show: it uses the one supported concurrent
+    writer (a second ``SqliteEngravaCore`` on the same file), paused and
+    resumed with a genuine ``asyncio.Task`` at the exact point between the
+    two scans -- the same technique ``TestSnapshotObservesOneConsistentState``
+    above uses for ``snapshot``.
+    """
+
+    def test_export_survives_a_commit_between_the_thought_and_edge_scans(
+        self,
+        two_thought_one_edge_db: Path,
+    ) -> None:
+        """Export must equal the pre-commit state exactly: thoughts {T1, T2}, edge {E0}.
+
+        The pre-commit state is thoughts {T1, T2} and edge {E0} (T1 -> T2).
+        Mid-export, a concurrent writer inserts T3 with edge E3 (T1 -> T3)
+        and deletes E0, as one transaction. Export's read transaction,
+        opened before the thought scan and closed after the edge scan, takes
+        its snapshot no later than the thought scan -- strictly before the
+        writer's commit lands -- so it must see neither the new T3/E3 pair
+        nor the deletion of E0.
+
+        This assertion is chosen so that a wrong fix which filters exported
+        edges down to those whose endpoints are both exported still fails
+        it: that fix would drop E3 (correctly, but for the wrong reason —
+        the transaction never lets it become visible in the first place),
+        and would also miss E0, which was deleted before the edge scan but
+        must still appear because the deletion was never part of the
+        transaction's own consistent snapshot.
+        """
+        thoughts, edges = asyncio.run(
+            _read_with_commit_interleaved_before_edge_scan(two_thought_one_edge_db)
+        )
+
+        thought_ids = {t["thought_id"] for t in thoughts}
+        edge_ids = {e["edge_id"] for e in edges}
+
+        assert thought_ids == {"T1", "T2"}, (
+            f"export's thought scan must equal the pre-commit state exactly, got {thought_ids!r}"
+        )
+        assert edge_ids == {"E0"}, (
+            f"export's edge scan must equal the pre-commit state exactly, got "
+            f"{edge_ids!r} -- it must still carry E0 (deleted only after export's "
+            "transaction had already fixed its view of the database) and must not "
+            "carry E3 (committed only after that same point)"
+        )
+
+
+def _sync_writer_insert_t3_and_delete_e0(db_path: str) -> None:
+    """Insert T3 with edge E3 (T1 -> T3), and delete E0, via a plain stdlib connection.
+
+    Deliberately synchronous, plain :mod:`sqlite3`, not ``aiosqlite`` -- this
+    runs from inside the CLI export's own patched ``execute``, on the
+    export's own event loop. ``export_cmd`` drives its own ``asyncio.run()``
+    (via ``_run_command``), which cannot host a second concurrent
+    ``asyncio.Task`` the way the lower-level helper test above does with
+    ``asyncio.gather`` -- there is only one loop here, and it belongs to the
+    command under test. Blocking it synchronously for the duration of this
+    call is fine: the export side is, by construction, paused waiting for
+    this call to return before it can proceed.
+
+    Requires WAL mode already active on ``db_path`` -- asserted here rather
+    than assumed. In the default rollback-journal mode this connection's own
+    ``COMMIT`` would block on export's still-open read transaction (or fail
+    outright with "database is locked"), turning a silent precondition
+    violation into a hang or a confusing unrelated failure instead of a
+    clear one. The real CLI already runs every command in WAL mode
+    (``_open_db``), so this holds for the connection under test by the time
+    this function runs -- it only confirms that, not forces it.
+
+    Args:
+        db_path: Path to the database the CLI's own connection is reading.
+
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        (mode,) = conn.execute("PRAGMA journal_mode").fetchone()
+        assert mode.lower() == "wal", (
+            f"expected the database to already be in WAL mode by the time export "
+            f"reaches its edge scan, so this commit can land without blocking on "
+            f"export's still-open read transaction; got journal_mode={mode!r}"
+        )
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("BEGIN")
+        conn.execute(
+            "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("T3", "OBSERVATION", "written mid-export", "written mid-export", "P2"),
+        )
+        conn.execute(
+            "INSERT INTO edge (edge_id, from_thought_id, to_thought_id, edge_type) "
+            "VALUES (?, ?, ?, ?)",
+            ("E3", "T1", "T3", "ASSOCIATED"),
+        )
+        deleted = conn.execute("DELETE FROM edge WHERE edge_id = ?", ("E0",)).rowcount
+        assert deleted == 1, "E0 must exist to be deleted -- fixture drifted"
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestExportCLIObservesOneConsistentState:
+    """``export_cmd`` must actually route through the one-transaction helper.
+
+    ``TestExportObservesOneConsistentState`` above proves
+    ``_read_thoughts_and_edges_in_one_transaction`` itself is correct, but it
+    calls that helper directly -- it cannot tell whether ``export_cmd``
+    actually uses it. A wrong fix that defines the helper but never wires it
+    into ``export_cmd``, or a later refactor that quietly inlines the reads
+    again, passes that test (and every other test in this file) unchanged.
+
+    This test drives the real CLI command instead
+    (``CliRunner().invoke(cli, [..., "export", ...])``) and forces the same
+    interleaving from *inside* ``export_cmd``'s own event loop, rather than a
+    second one: patching ``aiosqlite.Connection.execute`` so that the moment
+    it is asked to run ``SELECT * FROM edge``, a plain synchronous stdlib
+    ``sqlite3`` connection commits the concurrent change first
+    (:func:`_sync_writer_insert_t3_and_delete_e0`), then delegates to the
+    real read. No second ``asyncio`` loop or task is needed.
+    """
+
+    def test_export_cli_survives_a_commit_between_the_thought_and_edge_scans(
+        self,
+        runner: CliRunner,
+        two_thought_one_edge_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Export via the real CLI must equal the pre-commit state exactly.
+
+        Same pre-commit state and same concurrent change as the
+        helper-level test above (thoughts {T1, T2}, edge {E0}; a writer
+        inserts T3 with edge E3 and deletes E0), but exercised through
+        ``engrava export`` itself so a bypass -- the helper defined but
+        never called by ``export_cmd`` -- cannot pass silently.
+        """
+        import aiosqlite
+
+        edge_scan_seen = False
+        real_execute = aiosqlite.Connection.execute
+
+        async def _tracking_execute(
+            self: aiosqlite.Connection, sql: str, *args: object, **kwargs: object
+        ) -> object:
+            nonlocal edge_scan_seen
+            if sql == "SELECT * FROM edge" and not edge_scan_seen:
+                edge_scan_seen = True
+                _sync_writer_insert_t3_and_delete_e0(str(two_thought_one_edge_db))
+            return await real_execute(self, sql, *args, **kwargs)
+
+        monkeypatch.setattr(aiosqlite.Connection, "execute", _tracking_execute)
+
+        out = tmp_path / "export.json"
+        result = runner.invoke(
+            cli,
+            ["--db", str(two_thought_one_edge_db), "export", "-o", str(out)],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert edge_scan_seen, "the patched `SELECT * FROM edge` never ran -- test setup is wrong"
+
+        data = json.loads(out.read_text(encoding="utf-8"))
+        thought_ids = {t["thought_id"] for t in data["thoughts"]}
+        edge_ids = {e["edge_id"] for e in data["edges"]}
+
+        assert thought_ids == {"T1", "T2"}, (
+            f"export must equal the pre-commit state exactly, got thoughts {thought_ids!r}"
+        )
+        assert edge_ids == {"E0"}, (
+            f"export must equal the pre-commit state exactly, got edges {edge_ids!r} -- it "
+            "must still carry E0 (deleted only after export's transaction had already "
+            "fixed its view of the database) and must not carry E3 (committed only after "
+            "that same point)"
+        )
 
 
 class TestExport:

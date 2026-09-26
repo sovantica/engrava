@@ -3602,6 +3602,69 @@ def migrate(ctx: click.Context) -> None:
 # ------------------------------------------------------------------
 
 
+async def _read_thoughts_and_edges_in_one_transaction(
+    conn: Any,  # noqa: ANN401
+    *,
+    status_filter: str | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Read the ``thought`` and ``edge`` tables from one consistent point in time.
+
+    Opened explicitly, before either scan, so both observe one consistent
+    database state -- the same before-or-after state relative to any
+    concurrent writer -- rather than each ``await conn.execute(...)``
+    running as its own independent implicit read. A writer committing a new
+    thought and its edge between the two scans could otherwise leave the
+    edge in the export while the thought it references never made it in.
+    Mirrors :func:`_export_db_to_jsonl`'s own ``BEGIN``, but without that
+    function's caller-supplied-transaction handling -- see the precondition
+    below for why.
+
+    ``status_filter`` narrows ``thought`` only. An exported edge can still
+    reference a thought the filter excluded -- that is a property of the
+    filter, not a defect of the transaction this function opens.
+
+    **Precondition:** every caller of this function today is ``export_cmd``'s
+    own ``_opened_db`` connection, freshly opened for that command alone and
+    used by nothing else, so it can never already be inside a transaction
+    this call did not itself start -- the unconditional rollback on any
+    failure below is always this call's own transaction, never a caller's.
+
+    Args:
+        conn: Open aiosqlite connection, exclusively owned by the caller for
+            the duration of this call -- see the precondition above.
+        status_filter: Optional ``lifecycle_status`` value to filter
+            ``thought`` rows by; ``None`` reads every thought.
+
+    Returns:
+        The thought rows, then the edge rows, each as a list of
+        column-name-to-value dicts, both read from the same transaction.
+
+    """
+    try:
+        await conn.execute("BEGIN")
+        if status_filter:
+            cursor = await conn.execute(
+                "SELECT * FROM thought WHERE lifecycle_status = ?", (status_filter,)
+            )
+        else:
+            cursor = await conn.execute("SELECT * FROM thought")
+        keys = [desc[0] for desc in cursor.description] if cursor.description else []
+        thoughts = [dict(zip(keys, row, strict=True)) for row in await cursor.fetchall()]
+
+        cursor = await conn.execute("SELECT * FROM edge")
+        edge_keys = [desc[0] for desc in cursor.description] if cursor.description else []
+        edges = [dict(zip(edge_keys, row, strict=True)) for row in await cursor.fetchall()]
+
+        # Closed here, before the caller writes any output, so the read
+        # lock is not held during the file write -- matches
+        # `_export_db_to_jsonl`'s own ordering.
+        await conn.commit()
+    except BaseException:
+        await _rollback_quietly(conn)
+        raise
+    return thoughts, edges
+
+
 @cli.command(name="export")
 @click.option("-o", "--output", "output_path", default=None, help="Output JSON file path.")
 @click.option("--status", "status_filter", default=None, help="Filter by lifecycle_status.")
@@ -3624,26 +3687,9 @@ def export_cmd(ctx: click.Context, output_path: str | None, status_filter: str |
             try:
                 async with _opened_db(cfg) as conn:
                     await _apply_read_schema_gate(conn, command="export")
-                    # Fetch thoughts
-                    if status_filter:
-                        cursor = await conn.execute(
-                            "SELECT * FROM thought WHERE lifecycle_status = ?", (status_filter,)
-                        )
-                    else:
-                        cursor = await conn.execute("SELECT * FROM thought")
-                    keys = [desc[0] for desc in cursor.description] if cursor.description else []
-                    thoughts = [
-                        dict(zip(keys, row, strict=True)) for row in await cursor.fetchall()
-                    ]
-
-                    # Fetch edges
-                    cursor = await conn.execute("SELECT * FROM edge")
-                    edge_keys = (
-                        [desc[0] for desc in cursor.description] if cursor.description else []
+                    thoughts, edges = await _read_thoughts_and_edges_in_one_transaction(
+                        conn, status_filter=status_filter
                     )
-                    edges = [
-                        dict(zip(edge_keys, row, strict=True)) for row in await cursor.fetchall()
-                    ]
 
                     export_data = {
                         "format": "engrava-export",
@@ -3662,11 +3708,12 @@ def export_cmd(ctx: click.Context, output_path: str | None, status_filter: str |
                     # `_opened_db`'s own exit closes the connection right
                     # here, once this `async with` block returns -- after the
                     # temporary file's content is fully written and durable,
-                    # before publication. `export` has no explicit read
-                    # transaction of its own to commit (unlike `snapshot`),
-                    # so this close is its real "the reads are done" boundary:
-                    # a failure here must still leave `out` untouched, which
-                    # only holds while nothing has been published onto it yet.
+                    # before publication. The read transaction
+                    # `_read_thoughts_and_edges_in_one_transaction` opened is
+                    # already committed by this point, so this close is only
+                    # about releasing the connection itself: a failure here
+                    # must still leave `out` untouched, which only holds
+                    # while nothing has been published onto it yet.
             finally:
                 f.close()
         except BaseException:

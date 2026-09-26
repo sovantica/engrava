@@ -786,9 +786,14 @@ engrava --db engrava.db export -o thoughts.json
 engrava --db engrava.db export --status ACTIVE
 ```
 
-> **Failure safety.** Like `snapshot`, `export` writes to a temporary file
-> next to `-o` and publishes it there only once every read has completed. On
-> an exception or a cancelled run, an existing file at `-o` stays
+> **Failure safety.** `export` reads the `thought` and `edge` tables from one
+> consistent point in time -- without `--status`, that means a commit
+> landing between the two scans can never leave an edge in the export whose
+> thought is missing; with `--status`, an exported edge can still reference
+> a thought the filter itself excluded, which is the filter's doing, not a
+> gap in the transaction. Like `snapshot`, it writes to a temporary file
+> next to `-o` and publishes it there only once every read has completed.
+> On an exception or a cancelled run, an existing file at `-o` stays
 > byte-identical and the temporary file is removed. A hard kill (`SIGKILL`)
 > cannot run that cleanup, so `-o` then holds either the previous file or
 > the complete new one, never a partial one, and a temporary file can be
