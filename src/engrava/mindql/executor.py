@@ -140,6 +140,12 @@ _TEMPORAL_TABLES: frozenset[str] = frozenset({"thought", "edge"})
 # they aggregate and never materialise the row set.
 DEFAULT_FIND_LIMIT = 100
 
+# SQLite's largest representable integer. A LIMIT/OFFSET above this cannot be
+# stored by SQLite at all and would otherwise reach it as raw interpolated
+# SQL text, surfacing as ``sqlite3.IntegrityError: datatype mismatch`` instead
+# of the MindQL error this guard exists to raise.
+_SQLITE_MAX_INTEGER = 2**63 - 1
+
 
 def _guard_table(table: object) -> str:
     """Resolve the target table of a query and validate the identifier.
@@ -253,8 +259,11 @@ def _guard_row_bound(value: object, clause: str) -> int:
     subclasses ``int``, passes a type checker, and reaches SQLite as the
     keyword ``True``/``False``. Negative values are rejected because SQLite
     reads ``LIMIT -1`` as "no limit" — silently removing the row cap — and a
-    negative ``OFFSET`` as zero. The bound is rebuilt as a plain ``int`` so
-    that an ``int`` subclass cannot emit arbitrary text from ``__format__``.
+    negative ``OFFSET`` as zero. A value above :data:`_SQLITE_MAX_INTEGER` is
+    rejected too: SQLite cannot store it, and it would otherwise reach the
+    database as raw interpolated SQL text instead of this error. The bound is
+    rebuilt as a plain ``int`` so that an ``int`` subclass cannot emit
+    arbitrary text from ``__format__``.
 
     Args:
         value: The requested bound.
@@ -264,12 +273,19 @@ def _guard_row_bound(value: object, clause: str) -> int:
         The validated bound, as a plain ``int``.
 
     Raises:
-        MindQLParseError: If the value is not a non-negative, non-boolean int.
+        MindQLParseError: If the value is not a non-negative, non-boolean int
+            no greater than :data:`_SQLITE_MAX_INTEGER`.
 
     """
     bound = int(value) if isinstance(value, int) and not isinstance(value, bool) else None
     if bound is None or bound < 0:
         msg = f"{clause} must be a non-negative integer, got {value!r}"
+        raise MindQLParseError(msg)
+    if bound > _SQLITE_MAX_INTEGER:
+        msg = (
+            f"{clause} must be a non-negative integer no greater than "
+            f"{_SQLITE_MAX_INTEGER} (SQLite's largest integer), got {value!r}"
+        )
         raise MindQLParseError(msg)
     return bound
 

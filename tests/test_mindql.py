@@ -2619,6 +2619,121 @@ class TestExecutorRowBoundValidation:
         assert [row["thought_id"] for row in result.rows] == ["t-002", "t-003"]
 
 
+# SQLite cannot store an integer past this; interpolating one raises a raw
+# ``sqlite3.IntegrityError`` instead of the ``MindQLParseError`` the guard
+# owes its caller. Values strictly above it must be rejected.
+_ROW_BOUND_OVER_SQLITE_MAX = (2**63, 2**64)
+
+
+def _ceiling_match(clause: str) -> str:
+    """Return the start of the error an out-of-range *clause* must raise, naming the range."""
+    return f"{clause} must be a non-negative integer no greater than {2**63 - 1} "
+
+
+class TestExecutorRowBoundSqliteCeiling:
+    """LIMIT/OFFSET are also bounded above, at SQLite's largest integer.
+
+    SQLite cannot hold an integer past ``2**63 - 1``: a bound above it is
+    interpolated into the SQL text same as any other, and reaches the
+    database as a raw ``sqlite3.IntegrityError`` instead of this module's
+    own ``MindQLParseError``. Covered both through ``parse()`` and through a
+    directly constructed ``MindQLQuery``, which is not type-checked at
+    runtime.
+    """
+
+    async def test_limit_at_sqlite_max_is_accepted_via_parse(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        query = parse(f"FIND thoughts LIMIT {2**63 - 1}")
+
+        result = await store.execute_mindql(query)
+
+        assert len(result.rows) == 5
+
+    async def test_offset_at_sqlite_max_is_accepted_via_parse(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        query = parse(f"FIND thoughts OFFSET {2**63 - 1}")
+
+        result = await store.execute_mindql(query)
+
+        assert result.rows == []
+
+    async def test_limit_at_sqlite_max_is_accepted_via_direct_query(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        query = MindQLQuery(command=MindQLCommand.FIND, table="thought", limit=2**63 - 1)
+
+        result = await store.execute_mindql(query)
+
+        assert len(result.rows) == 5
+
+    async def test_offset_at_sqlite_max_is_accepted_via_direct_query(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        query = MindQLQuery(command=MindQLCommand.FIND, table="thought", offset=2**63 - 1)
+
+        result = await store.execute_mindql(query)
+
+        assert result.rows == []
+
+    @pytest.mark.parametrize("value", _ROW_BOUND_OVER_SQLITE_MAX, ids=["2**63", "2**64"])
+    async def test_limit_past_sqlite_max_is_rejected_via_parse(
+        self,
+        populated_db: aiosqlite.Connection,
+        value: int,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        query = parse(f"FIND thoughts LIMIT {value}")
+
+        with pytest.raises(MindQLParseError, match=_ceiling_match("LIMIT")):
+            await store.execute_mindql(query)
+
+    @pytest.mark.parametrize("value", _ROW_BOUND_OVER_SQLITE_MAX, ids=["2**63", "2**64"])
+    async def test_offset_past_sqlite_max_is_rejected_via_parse(
+        self,
+        populated_db: aiosqlite.Connection,
+        value: int,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        query = parse(f"FIND thoughts OFFSET {value}")
+
+        with pytest.raises(MindQLParseError, match=_ceiling_match("OFFSET")):
+            await store.execute_mindql(query)
+
+    @pytest.mark.parametrize("value", _ROW_BOUND_OVER_SQLITE_MAX, ids=["2**63", "2**64"])
+    async def test_limit_past_sqlite_max_is_rejected_via_direct_query(
+        self,
+        populated_db: aiosqlite.Connection,
+        value: int,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        query = MindQLQuery(command=MindQLCommand.FIND, table="thought", limit=value)
+
+        with pytest.raises(MindQLParseError, match=_ceiling_match("LIMIT")):
+            await store.execute_mindql(query)
+
+    @pytest.mark.parametrize("value", _ROW_BOUND_OVER_SQLITE_MAX, ids=["2**63", "2**64"])
+    async def test_offset_past_sqlite_max_is_rejected_via_direct_query(
+        self,
+        populated_db: aiosqlite.Connection,
+        value: int,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        query = MindQLQuery(command=MindQLCommand.FIND, table="thought", offset=value)
+
+        with pytest.raises(MindQLParseError, match=_ceiling_match("OFFSET")):
+            await store.execute_mindql(query)
+
+
 class TestExecutorBooleanJoinerValidation:
     """The WHERE tree's boolean joiner is interpolated, so it is validated."""
 

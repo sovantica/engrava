@@ -82,7 +82,9 @@ returns a scalar) and is not used with the raw `SELECT` passthrough.
 #### OFFSET / pagination
 
 `FIND` accepts an `OFFSET <n>` clause (`n >= 0`) for pagination, combined with
-`LIMIT` and `ORDER BY`:
+`LIMIT` and `ORDER BY`. Both `LIMIT` and `OFFSET` accept a non-negative
+integer up to 2^63 - 1 (SQLite's largest integer); a value outside that range
+raises `MindQLParseError`.
 
 ```
 FIND thoughts ORDER BY created_cycle DESC LIMIT 20 OFFSET 40
