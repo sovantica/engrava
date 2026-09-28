@@ -416,12 +416,54 @@ def _leaf_ast_node_types() -> list[type[ast.AST]]:
     Filters out the abstract grouping bases (``ast.expr``, ``ast.stmt``,
     ``ast.operator``, ...), which are never a node's own ``type()`` -- only
     one of their concrete subclasses ever is.
+
+    Also filters out the five specific, by-now-removed-from-the-grammar
+    ``ast.Constant`` alias subclasses (``Bytes``, ``Ellipsis``,
+    ``NameConstant``, ``Num``, ``Str``) before the leaf/non-leaf split runs.
+    A type is excluded only if both its name is one of those five and it
+    subclasses ``ast.Constant`` -- matching by name as well as by base class
+    means a genuinely new ``ast.Constant`` subclass a future Python adds is
+    not swept up by this exclusion; it still has to reach one of the
+    reviewed buckets below or fail the census. Order matters too: on a
+    Python where one of the five is still an ordinary module attribute,
+    leaving it in while computing which types are leaves makes ``Constant``
+    look like a non-leaf base class and drops it from the result -- even
+    though ``ast.parse`` produces a ``Constant`` node for scalar literals
+    (numbers, strings, bytes, ``None``/``True``/``False``, ``...``), so it
+    is a real node type the census must cover, and none of the five aliases
+    has been produced as a node's own class since Python 3.8.
     """
+    deprecated_constant_alias_names = frozenset(
+        {"Bytes", "Ellipsis", "NameConstant", "Num", "Str"},
+    )
     all_types = {
         obj for obj in vars(ast).values() if isinstance(obj, type) and issubclass(obj, ast.AST)
     }
+    deprecated_constant_aliases = {
+        cls
+        for cls in all_types
+        if cls.__name__ in deprecated_constant_alias_names and issubclass(cls, ast.Constant)
+    }
+    all_types -= deprecated_constant_aliases
     has_subclass = {base for cls in all_types for base in cls.__mro__[1:] if base in all_types}
     return sorted(all_types - has_subclass, key=lambda cls: cls.__name__)
+
+
+def test_leaf_ast_node_types_includes_constant() -> None:
+    """Regression guard: ``ast.Constant`` must survive the leaf computation.
+
+    ``ast.Constant`` is the node type ``ast.parse`` produces for scalar
+    literals (numbers, strings, bytes, ``None``/``True``/``False``,
+    ``...``), so it is a real node type the census must cover. A
+    leaf/non-leaf split that runs before its deprecated alias subclasses
+    (``Bytes``, ``Num``, ...) are removed from the candidate set would
+    wrongly treat ``Constant`` as a non-leaf base class of whichever alias
+    is still a plain module attribute on the running Python, silently
+    dropping it from the census below -- which only ever looks at whatever
+    this function returns, so a dropped type is never reviewed rather than
+    failing loudly.
+    """
+    assert ast.Constant in _leaf_ast_node_types()
 
 
 # Every leaf ast node type that is neither `Import`/`ImportFrom` (the two
@@ -435,6 +477,11 @@ def _leaf_ast_node_types() -> list[type[ast.AST]]:
 # `_STATEMENT_BODY_CONTAINERS` by a failing test, rather than silently
 # falling into "presumably harmless" the way an unlisted construct hid a real
 # hole in the (out of scope) attribute resolver's history.
+#
+# The deprecated `ast.Constant` aliases (`Bytes`, `Ellipsis`, `NameConstant`,
+# `Num`, `Str`) are not on this list: `_leaf_ast_node_types()` excludes them
+# before this list is ever consulted, since which of them even reach it
+# varies by Python version.
 _CANNOT_HOLD_A_NESTED_STATEMENT: frozenset[str] = frozenset(
     {
         "Add",
@@ -455,13 +502,13 @@ _CANNOT_HOLD_A_NESTED_STATEMENT: frozenset[str] = frozenset(
         "Break",
         "Call",
         "Compare",
+        "Constant",
         "Continue",
         "Del",
         "Delete",
         "Dict",
         "DictComp",
         "Div",
-        "Ellipsis",
         "Eq",
         "Expr",
         "Expression",
