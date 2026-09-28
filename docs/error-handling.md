@@ -258,9 +258,11 @@ unchanged and assume that doing so re-embeds: an update that no longer changes
 embeddings run inside one `suspend_auto_commit()` transaction. Called on its
 own, any exception during that phase, including a provider exception or a task
 cancellation, rolls the batch back and nothing from it is persisted. The
-`require_embedding` option controls whether that provider failure is wrapped as
-`EmbeddingGenerationError`; it does not change the rollback. The one window the
-rollback does not cover is a cancellation that lands during the final commit,
+`require_embedding` option controls whether a failure of the provider's embed
+call is wrapped as `EmbeddingGenerationError`; it does not change the rollback
+(see [Embeddings](guides/embeddings.md#when-auto-embed-fails-the-honest-boundary)
+for what that covers). The one window the rollback does not cover is a
+cancellation that lands during the final commit,
 described under transaction contexts below.
 
 Nested inside a caller's own `suspend_auto_commit()` window, the batch shares
