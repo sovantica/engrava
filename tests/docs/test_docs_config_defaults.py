@@ -11,11 +11,10 @@ This module used to close that gap for five hand-picked fields out of the
 fifty-four across ``SearchConfig``, ``DreamingGates``, ``HygienePolicyConfig``
 and ``TTLConfig`` — the five involved in the incidents that prompted the
 check. It now derives the set of checked fields from the documentation
-itself, via ``tests.docs._documented_defaults_scan``: every place ``README.md``
-or a file under ``docs/`` states a default for one of these fields is found,
-resolved against the shipped dataclass, and checked. See that module's
-docstring for how a "documented default" is recognised and why some
-statements are counted as unresolved rather than compared.
+itself, via ``tests.docs._documented_defaults_scan``, which finds where
+``README.md`` or a file under ``docs/`` states a default for one of these
+fields. See that module's docstring for which statements it compares against
+the shipped dataclass and which it records separately.
 
 The expected value is always read from the *code* (``ClassName().field``),
 never hard-coded in this file, so the code stays the single source of truth
@@ -37,6 +36,7 @@ from tests.docs._documented_defaults_scan import (
     Claim,
     ResolvedClaim,
     ScanResult,
+    UnparseableClause,
     derive_ambiguous_names,
     derive_field_owner,
     derive_section_aliases,
@@ -75,88 +75,248 @@ _ORIGINAL_FIVE: frozenset[tuple[str, str]] = frozenset(
     }
 )
 
+# A clause is keyed by (doc, the clause text the scanner reports --
+# ``UnparseableClause.context``), never by its line number or the fields it
+# names, so the key survives lines shifting elsewhere in the doc. The fields
+# alone are not unique within a doc: docs/memory-hygiene.md names
+# `protected_priorities` in two different clauses, and docs/search.md names
+# `collapse_pool_factor` in two.
+# See ``_clause_key`` / ``_keyed_unparseable_clauses``.
+#
+# What this catches and what it does not:
+# - This test does not check the values inside an allowlisted clause. Only a
+#   dedicated test does, such as
+#   ``test_min_and_max_cluster_size_defaults_match_docs``.
+# - A change to a clause's words or values, including a value the scanner
+#   cannot read, changes its key, so the test fails until someone re-reads
+#   the clause and re-keys or removes the entry.
+_ClauseKey = tuple[str, str]
+
 # Clauses the scanner names a field in but cannot pair positionally with a
 # value (see ``ScanResult.unparseable_clauses``): the count of field mentions
 # and value-shaped tokens in the clause disagree, so it is dropped rather
 # than compared. Each entry here says why *that* clause's count disagrees, so
 # a doc edit that starts producing an unparseable clause somewhere else is
-# not silently swallowed the same way -- see
-# ``test_every_unparseable_clause_is_on_a_reasoned_allowlist``.
-_UNPARSEABLE_ALLOWLIST: dict[tuple[str, int], str] = {
-    ("docs/architecture.md", 169): (
-        "names `include_reflections` (default `True`), a `search_hybrid()` keyword that "
-        "is not a tracked field, alongside `reflection_boost`; its own value is the "
-        "per-call default `None`, not the field's shipped default -- 3 value-shaped "
-        "tokens against 1 field"
-    ),
-    ("docs/configuration.md", 277): (
-        "the edge type name `CONSOLIDATED_FROM` and the per-call keyword `graph_weight` "
-        "are picked up as value-shaped tokens alongside the two real defaults -- "
-        "3 values against 2 fields"
-    ),
-    ("docs/configuration.md", 542): (
-        "`signal_weights` is a dict; each key's share is written as a compound token "
-        "(`recency 0.30`) rather than a bare value, so none register as a value token"
-    ),
-    ("docs/data-lifecycle.md", 79): (
-        "names `default_ttl_seconds` while describing its effect in prose, with no "
-        "value-shaped token in the clause at all"
-    ),
-    ("docs/dreaming.md", 205): (
-        "`max_cluster_size` is named twice in the same clause (once paired with "
-        "`min_cluster_size`, once again explaining its enforcement order), so the "
-        "positional pairing counts 3 field mentions against 2 values -- "
-        "checked directly instead, see "
-        "``test_min_and_max_cluster_size_defaults_match_docs``"
-    ),
-    ("docs/dreaming.md", 395): (
-        "the edge type name `CONSOLIDATED_FROM` is picked up as a value-shaped token "
-        "alongside the real default `true` -- 2 values against 1 field"
-    ),
-    ("docs/evidence-and-conflicts.md", 88): (
-        "the type name `EdgeType` and the edge type name `CONSOLIDATED_FROM` are picked "
-        "up as value-shaped tokens alongside the real default `True` -- "
+# a live failure -- see ``test_every_unparseable_clause_is_on_a_reasoned_allowlist``.
+_UNPARSEABLE_ALLOWLIST: dict[_ClauseKey, str] = {
+    (
+        "docs/architecture.md",
+        (
+            "`search_hybrid()` `include_reflections` (default `True`) and `reflection_boost` "
+            "(default `None` → uses config)"
+        ),
+    ): (
+        "value tokens: `include_reflections`, `True`, `None` -- `include_reflections` is a "
+        "`search_hybrid()` keyword, not a tracked field, and `reflection_boost`'s own value "
+        "here is the per-call default `None`, not the field's shipped default -- "
         "3 values against 1 field"
     ),
-    ("docs/glossary.md", 215): (
-        'states the default in plain words ("on by default") with no value-shaped '
-        "token in the clause at all"
+    (
+        "docs/configuration.md",
+        (
+            "This is separate from > `graph_expansion_enabled` (default `true`), which "
+            "controls candidate-pool > widening over `CONSOLIDATED_FROM` edges — the "
+            "*ranking* graph signal stays > off until you give `default_graph_weight` (or a "
+            "per-call `graph_weight`) a > non-zero value."
+        ),
+    ): (
+        "value tokens: `true`, `CONSOLIDATED_FROM`, `graph_weight` -- `true` is "
+        "`graph_expansion_enabled`'s own default, the only real default value in this "
+        "clause; the edge type name `CONSOLIDATED_FROM` and the per-call keyword "
+        "`graph_weight` are picked up as value-shaped tokens too, and "
+        "`default_graph_weight`'s own default (`0.0`) is stated in the preceding clause, "
+        "not this one -- 3 values against 2 fields"
     ),
-    ("docs/memory-hygiene.md", 132): (
-        'the value is a tuple literal (`("P1",)`), which is not a bare value token shape'
+    (
+        "docs/configuration.md",
+        (
+            "Default `signal_weights`: `recency 0.30`, `frequency 0.25`, `confirmation 0.20`, "
+            "`confidence 0.15`, `staleness 0.10`"
+        ),
+    ): (
+        "`signal_weights` is a dict; each key's share is written as a compound token "
+        "(`recency 0.30`) rather than a bare value, so none register as a value token -- "
+        "0 values against 1 field"
     ),
-    ("docs/memory-hygiene.md", 155): (
-        "the value is an empty-tuple literal (`()`), which is not a bare value token shape"
+    (
+        "docs/data-lifecycle.md",
+        (
+            "- **A default for the whole store:** `ttl.default_ttl_seconds` in config applies "
+            "a default TTL to new thoughts that don't set their own (see [Configuration "
+            "→ ttl](configuration.md#ttl))."
+        ),
+    ): (
+        "names `ttl.default_ttl_seconds` while describing its effect in prose, with no "
+        "value-shaped token in the clause at all -- 0 values against 1 field"
     ),
-    ("docs/search.md", 21): (
-        "states two contrasting numbers (`0.0`, `0.10`) plus the parameter names "
-        "`search_config` and `recency_weight`, all picked up as value-shaped tokens -- "
+    (
+        "docs/dreaming.md",
+        (
+            "- `min_cluster_size` / `max_cluster_size` (defaults `3` / `200`) reject clusters "
+            "that are too small or too broad — but not symmetrically: `max_cluster_size` "
+            "is applied once, to the **raw** cluster, before eligibility filtering"
+        ),
+    ): (
+        "value tokens: `3`, `200` -- `max_cluster_size` is named twice in the same clause "
+        "(once paired with `min_cluster_size`, once again explaining its enforcement "
+        "order), so the positional pairing counts 3 field mentions against 2 values -- "
+        "checked directly instead, see ``test_min_and_max_cluster_size_defaults_match_docs``"
+    ),
+    (
+        "docs/dreaming.md",
+        (
+            "Candidate-pool expansion over `CONSOLIDATED_FROM` edges is controlled separately "
+            "by `graph_expansion_enabled` (default `true`) and reads those edges only when a "
+            "reflection ranks among the top candidates."
+        ),
+    ): (
+        "value tokens: `CONSOLIDATED_FROM`, `true` -- the edge type name "
+        "`CONSOLIDATED_FROM` is picked up as a value-shaped token alongside the real "
+        "default `true` -- 2 values against 1 field"
+    ),
+    (
+        "docs/evidence-and-conflicts.md",
+        (
+            "`EdgeType` values are persisted labels: they carry no automatic graph reasoning, "
+            "symmetry, transitivity, or conflict propagation. **Ranking is the exception, "
+            "twice over.** `graph_expansion_enabled` (default `True`) traverses "
+            "`CONSOLIDATED_FROM` edges from top-ranked REFLECTIONs to pull in their source "
+            "OBSERVATIONs with a propagated score, regardless of what any other edge type means"
+        ),
+    ): (
+        "value tokens: `EdgeType`, `True`, `CONSOLIDATED_FROM` -- the type name "
+        "`EdgeType` and the edge type name `CONSOLIDATED_FROM` are picked up as "
+        "value-shaped tokens alongside the real default `True` -- 3 values against 1 field"
+    ),
+    (
+        "docs/glossary.md",
+        (
+            "Candidate-pool expansion over consolidation edges is a separate step controlled "
+            "by `graph_expansion_enabled`, which is on by default and reads those edges only "
+            "when a reflection ranks among the top candidates"
+        ),
+    ): (
+        'states the default in plain words ("on by default") with no value-shaped token '
+        "in the clause at all -- 0 values against 1 field"
+    ),
+    (
+        "docs/memory-hygiene.md",
+        '- its **priority** is listed in `protected_priorities` (default: `("P1",)`).',
+    ): (
+        'the value is a tuple literal (`("P1",)`), which is not a bare value token shape '
+        "-- 0 values against 1 field"
+    ),
+    (
+        "docs/memory-hygiene.md",
+        (
+            "`protected_priorities` is a **default, not an invariant**: an operator who wants "
+            "more aggressive hygiene can set it to `()` so even top-priority thoughts are "
+            "eligible"
+        ),
+    ): (
+        "the value is an empty-tuple literal (`()`), which is not a bare value token "
+        "shape -- 0 values against 1 field"
+    ),
+    (
+        "docs/search.md",
+        (
+            "**The table's defaults apply only when a `SearchConfig` is passed to the "
+            "store.** `SqliteEngravaCore(conn, ...)` with no `search_config` argument "
+            "resolves `default_recency_weight` to `0.0`, not `0.10` — the two are "
+            "separate defaults that disagree, and recency is silently inert on a store "
+            "built the plain way until you pass a `SearchConfig` explicitly (or an explicit "
+            "per-call `recency_weight`)."
+        ),
+    ): (
+        "value tokens: `search_config`, `0.0`, `0.10`, `recency_weight` -- two "
+        "contrasting numbers (`0.0`, `0.10`) plus the parameter names `search_config` "
+        "and `recency_weight`, all picked up as value-shaped tokens -- "
         "4 values against 1 field"
     ),
-    ("docs/search.md", 57): (
-        "names several unrelated parameters (`collapse_key`, `top_k`, `fts_top_k`, "
-        "`vector_top_k`) in the same clause as the real default -- 5 values against 1 field"
+    (
+        "docs/search.md",
+        (
+            "When `collapse_key` is set (or the reflection cap is below `1.0`, which the "
+            "default `0.3` is), the fallback also widens its own row window by "
+            "`search.collapse_pool_factor` beyond `top_k`, the same bounded headroom "
+            "collapse and the cap already get from the FTS/vector arms' larger `fts_top_k` "
+            "/ `vector_top_k` budgets — so backfill has distinct candidates to draw from"
+        ),
+    ): (
+        "value tokens: `collapse_key`, `1.0`, `0.3`, `top_k`, `fts_top_k`, "
+        "`vector_top_k` -- `search.collapse_pool_factor` is only named here, with no "
+        "default value of its own in this clause; `1.0` and `0.3` are the reflection "
+        "cap's own comparison threshold and default, and `collapse_key`, `top_k`, "
+        "`fts_top_k`, `vector_top_k` are unrelated parameter names, all picked up as "
+        "value-shaped tokens -- 6 values against 1 field"
     ),
-    ("docs/search.md", 281): (
-        "the edge type name `CONSOLIDATED_FROM` and the type name `REFLECTION` are picked "
-        "up as value-shaped tokens alongside the real default `true` -- "
-        "3 values against 1 field"
+    (
+        "docs/search.md",
+        (
+            "This does not switch off [reflection-source candidate "
+            "expansion](#reflection-source-candidate-expansion), which is controlled "
+            "separately by `graph_expansion_enabled` (default `true`) and reads "
+            "`CONSOLIDATED_FROM` edges whenever a `REFLECTION` ranks among the top candidates"
+        ),
+    ): (
+        "value tokens: `true`, `CONSOLIDATED_FROM`, `REFLECTION` -- the edge type name "
+        "`CONSOLIDATED_FROM` and the type name `REFLECTION` are picked up as "
+        "value-shaped tokens alongside the real default `true` -- 3 values against 1 field"
     ),
-    ("docs/search.md", 478): (
-        "the parameter name `collapse_key` is picked up as a value-shaped token "
-        "alongside the real default `4` -- 2 values against 1 field"
+    (
+        "docs/search.md",
+        (
+            "- To give backfill a deeper pool to draw from, each search arm's candidate "
+            "budget is widened by a small, bounded factor **only while** `collapse_key` is "
+            "set (configurable as `search.collapse_pool_factor`, default `4`)"
+        ),
+    ): (
+        "value tokens: `collapse_key`, `4` -- the parameter name `collapse_key` is "
+        "picked up as a value-shaped token alongside the real default `4` -- "
+        "2 values against 1 field"
     ),
-    ("docs/troubleshooting.md", 181): (
-        "names `confirmation_count`, an attribute the clause discusses but that is not "
-        "a tracked field, as a value-shaped token alongside the two real defaults -- "
+    (
+        "docs/troubleshooting.md",
+        (
+            "2. **The confirmation gate.** Unless `allow_zero_confirmation` is `True` (the "
+            "default), `confirmation_count` must be at least `min_confirmations` (default `2`)"
+        ),
+    ): (
+        "value tokens: `True`, `confirmation_count`, `2` -- `confirmation_count` is an "
+        "attribute the clause discusses but that is not a tracked field, picked up as a "
+        "value-shaped token alongside the two real defaults (`True`, `2`) -- "
         "3 values against 2 fields"
     ),
-    ("docs/upgrade.md", 321): (
-        "the provider class name `SentenceTransformerProvider`, mentioned twice, is "
-        "picked up as a value-shaped token alongside the real default `0.40` -- "
-        "3 values against 1 field"
+    (
+        "docs/upgrade.md",
+        (
+            "**Your `cluster_quality_cohesion_threshold` was tuned against a different "
+            "function, on every provider — check which direction before assuming a "
+            "regression, even on `SentenceTransformerProvider`.** The default (`0.40`) was "
+            "calibrated on `SentenceTransformerProvider` output"
+        ),
+    ): (
+        "value tokens: `SentenceTransformerProvider`, `0.40`, `SentenceTransformerProvider` "
+        "-- the provider class name, mentioned twice, is picked up as a value-shaped "
+        "token alongside the real default `0.40` -- 3 values against 1 field"
     ),
 }
+
+
+def _clause_key(clause: UnparseableClause) -> _ClauseKey:
+    return (clause.doc, clause.context)
+
+
+def _keyed_unparseable_clauses(
+    clauses: tuple[UnparseableClause, ...],
+) -> dict[_ClauseKey, UnparseableClause]:
+    """Map each real clause to its ``(doc, context)`` key.
+
+    Two clauses in the same doc with the same normalised text would collide here
+    (the second silently overwriting the first in the dict) -- see
+    ``test_unparseable_clause_keys_are_unique_per_doc``.
+    """
+    return {_clause_key(clause): clause for clause in clauses}
 
 
 def _scan() -> ScanResult:
@@ -254,31 +414,41 @@ def test_unresolved_fields_are_only_the_dict_valued_ones() -> None:
     )
 
 
-def test_every_unparseable_clause_is_on_a_reasoned_allowlist() -> None:
-    """A clause the scanner could not pair a field with a value is a live gap unless explained.
+def test_unparseable_clause_keys_are_unique_per_doc() -> None:
+    """``(doc, context)`` must not let two different clauses share one entry.
 
-    ``ScanResult.unparseable_clauses`` is otherwise never asserted on anywhere in this
-    module -- a clause landing there is currently indistinguishable from one that was
-    never scanned at all, so a wrong documented default in a clause the scanner cannot
-    pair (for instance because a field name is repeated) never fails anything. Every
-    such clause must be named in ``_UNPARSEABLE_ALLOWLIST`` with a reason, and the
-    allowlist must not outlive the clause it explains.
+    Two clauses in one doc with the same text, as the scanner normalises it,
+    would share one key, and the dict ``_keyed_unparseable_clauses`` builds
+    would keep only one of them. This fails if any two real clauses collide.
     """
-    unexplained = [
-        u for u in _RESULT.unparseable_clauses if (u.doc, u.line) not in _UNPARSEABLE_ALLOWLIST
-    ]
+    keyed = _keyed_unparseable_clauses(_RESULT.unparseable_clauses)
+    assert len(keyed) == len(_RESULT.unparseable_clauses), (
+        "two different unparseable clauses collapsed onto the same "
+        "(doc, context) key -- widen the key"
+    )
+
+
+def test_every_unparseable_clause_is_on_a_reasoned_allowlist() -> None:
+    """Every clause the scanner cannot pair is on the allowlist, with a reason.
+
+    Such a clause is left out of the positional comparison, so that comparison
+    cannot catch a wrong default in it. Each one must be named in
+    ``_UNPARSEABLE_ALLOWLIST`` with a reason, and no entry may outlive its
+    clause. See the comment above the allowlist for how entries are keyed.
+    """
+    keyed = _keyed_unparseable_clauses(_RESULT.unparseable_clauses)
+    unexplained = {key: u for key, u in keyed.items() if key not in _UNPARSEABLE_ALLOWLIST}
     assert not unexplained, [
         f"{u.doc}:{u.line} names {u.fields} against {u.value_count} value token(s) and is "
         f"not on _UNPARSEABLE_ALLOWLIST. Offending text: {u.context!r}"
-        for u in unexplained
+        for u in unexplained.values()
     ]
-    present = {(u.doc, u.line) for u in _RESULT.unparseable_clauses}
-    stale = set(_UNPARSEABLE_ALLOWLIST) - present
+    stale = set(_UNPARSEABLE_ALLOWLIST) - set(keyed)
     assert not stale, f"allowlist entries no longer unparseable -- remove or update: {stale}"
 
 
 def test_min_and_max_cluster_size_defaults_match_docs() -> None:
-    """The one allowlisted clause naming two target fields is still checked directly.
+    """The allowlisted ``min_cluster_size`` / ``max_cluster_size`` clause is checked directly.
 
     ``min_cluster_size`` / ``max_cluster_size`` in ``docs/dreaming.md`` is on
     ``_UNPARSEABLE_ALLOWLIST`` because the general scanner cannot pair it (see the
