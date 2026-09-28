@@ -183,9 +183,14 @@ consequence if either one expires:**
   owned connection.
 - **The physical-close wait's bound expiring** is the one with a lasting
   consequence: the store is left permanently unusable — every further
-  operation on it, including a second `close()`, raises
-  `ConnectionQuarantinedError` — because the worker's last operation never
-  reported and the connection's true state can no longer be trusted.
+  operation on it raises `ConnectionQuarantinedError` — because the worker's
+  last operation never reported and the connection's true state can no
+  longer be trusted. A second `close()` call is the one exception with a
+  timing-dependent outcome: while the abandoned physical close is still
+  pending, it waits out its own bound on that same close and raises
+  `ConnectionQuarantinedError` too, but once that close finishes, a later
+  `close()` call returns normally instead — every other operation on the
+  store still raises.
 
 A worker that never answers at all can therefore make one `close()` call on
 an owned connection wait up to *twice* `close_timeout_seconds` (60 seconds
@@ -196,18 +201,25 @@ store whose worker has stopped responding still gets control back instead
 of hanging forever — just not within a single `close_timeout_seconds`
 window.
 
-Bounding `close()` does not bound the **process**, and the reason is not the
-worker thread. Measurement behind this bound tested that explanation and
-ruled it out: a daemon and a non-daemon worker thread took the same ~20
-seconds to exit, and by the time that residual delay is even observed the
-worker thread has already finished. The delay instead lives inside the
+Bounding `close()` does not bound the ordinary ~20-second residual delay
+measured behind this bound, and for that delay the reason is not the worker
+thread: a daemon and a non-daemon worker thread took the same ~20 seconds to
+exit, and by the time that residual delay is even observed the worker
+thread has already finished. That delay instead lives inside the
 interpreter's own async-runtime shutdown sequence, which runs *after* your
 code — including a returned `close()` — has already handed back control, so
-nothing about how `close()` waits (bounded or not) can shorten it. If a
-clean, prompt process exit matters for your deployment, treat a
-`ConnectionQuarantinedError` from `close()` as a signal to end the process
-explicitly (rather than trusting the ordinary shutdown path) — that is a
-choice about how you exit, not a fix to the underlying delay.
+nothing about how `close()` waits (bounded or not) can shorten it.
+
+That measurement did not test, and does not rule out, a worker that never
+finishes at all. aiosqlite creates its connection's worker thread non-daemon,
+so a genuinely wedged worker leaves that thread running indefinitely even
+after `close()` has abandoned the wait and raised `ConnectionQuarantinedError`
+— and a live non-daemon thread is what keeps a Python process from exiting,
+regardless of the async-runtime delay above. If a clean, prompt process exit
+matters for your deployment, treat a `ConnectionQuarantinedError` from
+`close()` as a signal to end the process explicitly (rather than trusting the
+ordinary shutdown path) — that is a choice about how you exit, not a fix to
+either delay.
 
 ## See also
 

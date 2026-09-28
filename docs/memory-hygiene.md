@@ -96,12 +96,14 @@ scoring signals, normalised by the total active weight — the same library
 
 A signal is dropped, and its weight renormalised over the remaining active
 signals, when **none of the candidates in the pool carries a value at all**
-for its underlying data (for example `frequency` on a store with no access
-history, or `confirmation` with no deduplication) — not when the candidates'
-values merely happen to agree. Activation is presence-based: candidates that
-share the same non-null value still keep the signal active. This keeps the
-keep-score meaningful on sparse stores instead of dragging every score toward
-a constant.
+for its underlying data (for example `confirmation` with no deduplication)
+— not when the candidates' values merely happen to agree. Activation is
+presence-based: candidates that share the same non-null value still keep
+the signal active. `frequency` adds a second condition on top of data
+presence: it is also dropped whenever access tracking is disabled, even if
+candidates already carry a non-zero access count from before tracking was
+turned off. This keeps the keep-score meaningful on sparse stores instead
+of dragging every score toward a constant.
 
 The keep-score is then multiplied by the
 [`decay_function` hook](extension-hooks.md) to produce the **eviction-score**:

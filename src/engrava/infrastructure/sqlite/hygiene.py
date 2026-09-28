@@ -9,11 +9,12 @@ on :class:`~engrava.infrastructure.sqlite.engrava_core.SqliteEngravaCore`.
 
 The keep-score reuses the inward dreaming signal library
 (:mod:`engrava.domain.dreaming`) and the same active-signal redistribution
-the dreaming scorer uses (a signal is dropped and its weight renormalised
-over the active set only when none of the candidates carries a value for
-its data at all — not merely when the candidates' values are identical),
-but carries the hygiene weight vector and threshold so the two loops tune
-independently.
+the dreaming scorer uses for its default signals (a signal is dropped and
+its weight renormalised over the active set when none of the candidates
+carries a value for its data at all — not merely when the candidates'
+values are identical — except ``frequency``, which is also dropped
+whenever access tracking is disabled), but carries the hygiene weight
+vector and threshold so the two loops tune independently.
 """
 
 from __future__ import annotations

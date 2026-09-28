@@ -38,8 +38,9 @@ Usage::
 ``--new-ref`` is optional and defaults to ``HEAD``.
 
 ``--old-tag`` is the last released tag (e.g. resolved in CI via
-``git describe --tags --abbrev=0 HEAD^``, since by the time this script runs
-in the release workflow the new tag already sits at ``HEAD``).
+``git describe --tags --abbrev=0 HEAD``, since this script runs inside the
+`prepare` lifecycle step, before semantic-release commits, tags, or pushes
+anything, so no new tag sits at ``HEAD`` yet).
 ``--new-version`` is the version about to be published. ``--new-ref``
 defaults to ``HEAD`` and exists mainly so this gate's own tests can point it
 at an arbitrary historical commit without touching the working tree.

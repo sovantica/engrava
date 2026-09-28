@@ -43,8 +43,11 @@ download (~550+ MB on the PyPI Linux/x86_64 wheel for Python 3.11; see
 [Configuration → Quick-start profiles](configuration.md#quick-start-profiles)
 for the exact, platform-scoped numbers) — plus a further encoder model
 download on first use. The encoder is **not** a language model: it
-turns text into a fixed-size vector. There are no API keys, and there
-is no network traffic after the first download. Engrava's built-in path
+turns text into a fixed-size vector. There are no API keys, and — once
+`HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` are set — no network traffic
+after the first download (see
+[Configuration → `local`](configuration.md#local--sentence-transformers-offline-after-warm-up)
+for why those two variables are needed). Engrava's built-in path
 does not call any LLM; a custom Dreaming signal or Memory Hygiene hook you
 register runs whatever code it contains, including a call to one.
 

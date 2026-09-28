@@ -2481,10 +2481,13 @@ class SqliteEngravaCore:
         that the real connection was never actually closed. Draining under
         ``_drain_shielded`` closes that off structurally rather than
         detecting it afterwards: it re-shields on every repeated
-        cancellation of the awaiting coroutine and never returns until the
-        task is genuinely ``done()``, so the physical close always runs to
-        real completion — success or a real failure — regardless of how
-        many times this call is cancelled while waiting on it.
+        cancellation of the awaiting coroutine, so this call's own
+        cancellation — however many times it happens — never reaches the
+        task itself. It returns once the task is genuinely ``done()``, or
+        once the bound below expires with the task still pending, whichever
+        comes first; either way, draining never cancels the task, so the
+        physical close keeps running toward real completion — success or a
+        real failure — in the background.
 
         **What differs between the two branches is what happens next, not
         how safely they wait.** When this call is the one that created the
@@ -2549,18 +2552,23 @@ class SqliteEngravaCore:
         expiry is logged instead, and the pending cancellation is what
         propagates.
 
-        **Bounding this wait does not bound how long the process itself may
-        take to exit afterwards, and the reason is not the worker thread.**
-        Measurement behind this bound ruled out the thread's daemon status
-        as the cause: a daemon and a non-daemon worker took the same ~20s to
-        exit, and by the time that residual wait is even observed the worker
-        thread has already finished — the delay lives inside the
-        interpreter's own async-runtime shutdown sequence, which runs
+        **Bounding this wait does not bound the ordinary ~20s residual delay
+        measured behind this bound, and for that delay the reason is not
+        the worker thread.** A daemon and a non-daemon worker took the same
+        ~20s to exit, and by the time that residual wait is even observed
+        the worker thread has already finished — that delay lives inside
+        the interpreter's own async-runtime shutdown sequence, which runs
         *after* this method (and the rest of your code) has already
         returned control, not in anything ``close()`` is waiting on. That
-        residual cost is therefore outside what this method — or any bound
-        it applies — can fix; see ``docs/deployment.md`` for what a caller
-        can do about it.
+        measurement did not test, and does not rule out, a worker that
+        never finishes at all: aiosqlite creates its connection's worker
+        thread non-daemon, so a genuinely wedged worker leaves that thread
+        running indefinitely even after this method has abandoned the wait
+        and raised :class:`ConnectionQuarantinedError` — and a live
+        non-daemon thread is what keeps a Python process from exiting,
+        regardless of the async-runtime delay above. Neither delay is
+        something this method — or any bound it applies — can fix; see
+        ``docs/deployment.md`` for what a caller can do about it.
 
         Raises:
             ConnectionQuarantinedError: When this call's own wait for the
@@ -4885,9 +4893,13 @@ class SqliteEngravaCore:
         **The first-call identity write is committed here only when
         ``commit`` is true.** ``verify_embedding_model`` wants exactly that:
         it establishes identity on an empty corpus on its own account,
-        independent of any write, so its call keeps the default and the
-        identity lands durably the moment this method returns, as it always
-        has. ``store_embedding`` wants the opposite — its call passes
+        independent of any write, so its call keeps the default and this
+        method ends with :meth:`_maybe_commit`. That call commits
+        immediately unless the caller already has a
+        :meth:`suspend_auto_commit` window open on this task, in which case
+        the write joins that window's transaction and only becomes durable
+        when the outer window's own exit commits it. ``store_embedding``
+        wants the opposite — its call passes
         ``commit=False`` and makes the identity write itself, from inside
         the same :meth:`_write_readback_savepoint` span as the base/vec0
         write it exists to gate: a rejected first vector (wrong dimension,
@@ -4900,8 +4912,11 @@ class SqliteEngravaCore:
             dimension: Vector dimensionality from the current provider.
             commit: Whether the first-call identity write commits on its own
                 account. ``True`` (the default, used by
-                ``verify_embedding_model``) commits immediately, exactly as
-                this method always has. ``False`` (used by
+                ``verify_embedding_model``) calls :meth:`_maybe_commit`,
+                which commits immediately unless a caller's own
+                :meth:`suspend_auto_commit` window is already open, in
+                which case the commit is deferred to that window's exit.
+                ``False`` (used by
                 ``store_embedding``) leaves the write pending for the
                 caller's own enclosing savepoint/commit to resolve, so it
                 rolls back together with a failed write it was meant to
@@ -12918,7 +12933,9 @@ class SqliteEngravaCore:
             - If ``priority_weight`` is ``0.0`` → priority skipped.
             - If ``graph_weight`` is ``0.0`` → graph skipped.
             - Disabled weights redistributed proportionally to active signals.
-            - If all signals disabled → fallback to ``list_thoughts(LIMIT top_k)``.
+            - If all signals disabled → fallback to its own query over
+              ``thought`` (see :meth:`_fallback_hybrid_results`), not a call
+              to ``list_thoughts``.
 
         Args:
             query_text: Text query for FTS5 keyword search.
@@ -14686,19 +14703,18 @@ class SqliteEngravaCore:
         Args:
             extension: A consolidator satisfying
                 :class:`~engrava.domain.protocols.dreaming.DreamingConsolidatorProtocol`.
-                A ``runtime_checkable`` protocol verifies only that
-                ``extension`` *has* a ``run_consolidation`` attribute by that
-                name — never that it is callable, that its parameters match,
-                or that it is a coroutine function (mirroring
-                ``_validate_provider_cycle``'s note on ``CycleProvider``). An
-                object with a same-named but wrong-shaped attribute — sync
-                instead of async, a different signature, or not callable at
-                all — passes this check and only fails once :meth:`consolidate`
-                actually calls it.
+                This method checks ``extension`` against that
+                ``runtime_checkable`` protocol (which looks for a
+                ``run_consolidation`` member) and raises below if that check
+                fails. The check does not verify the method's parameters or
+                that it is a coroutine function, so a same-named but
+                wrong-shaped ``run_consolidation`` — sync instead of async, or
+                a different signature — passes this check and only fails
+                once :meth:`consolidate` actually calls it.
 
         Raises:
-            TypeError: When ``extension`` has no ``run_consolidation``
-                attribute at all.
+            TypeError: When ``extension`` fails the ``runtime_checkable``
+                protocol check above.
 
         """
         if not isinstance(extension, DreamingConsolidatorProtocol):

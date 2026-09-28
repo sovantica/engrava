@@ -391,9 +391,14 @@ class DreamingExtension:
         the active set, so flat signals fall out of the denominator instead of
         dragging every score toward a constant.
 
-        Custom signals (registered via ``custom_signals``) have no
-        introspectable data source, so they are always treated as active — the
-        operator opted into them deliberately.
+        A custom signal (registered via ``custom_signals``) under a name that
+        is not one of :data:`DEFAULT_SIGNALS` has no introspectable data
+        source, so it is always treated as active — the operator opted into
+        it deliberately. One that reuses a default name is scored
+        differently: the check below is keyed on the *name*, not on which
+        callable implements it, so it follows that default's own activeness
+        rule (see :func:`~engrava.domain.dreaming.default_signal_active`)
+        even though a different function actually computes its value.
 
         **Degenerate guard.** When no signal is active the returned weights are
         all zero, so every score is ``0.0`` and nothing promotes — the exact

@@ -10,7 +10,10 @@ Linux/x86_64 wheel for Python 3.11; see docs/configuration.md's
 — so vector search has a real ENCODER, plus a further encoder model
 download on first run, then cached locally. The encoder is NOT a
 language model: it turns text into a fixed-size vector and is fully
-local — no API keys and no network after the first download.
+local — no API keys, and no network after the first download once
+``HF_HUB_OFFLINE=1`` and ``TRANSFORMERS_OFFLINE=1`` are set (see
+docs/configuration.md's "local" profile for why those two variables
+are needed).
 
 Run this directly:
     python examples/quickstart.py

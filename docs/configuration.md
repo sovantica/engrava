@@ -66,9 +66,11 @@ one small package:
 1. [Ollama](https://ollama.com) installed and running, reachable at
    `base_url`.
 2. The model pulled into Ollama once: `ollama pull nomic-embed-text`.
-3. The `engrava[embeddings-ollama]` extra — it pulls exactly one additional
-   package, `httpx` (a ~70 KB wheel on PyPI), the sole cost this profile adds
-   to the Python environment. No model file ever touches this process.
+3. The `engrava[embeddings-ollama]` extra — it declares one direct
+   dependency, `httpx` (a ~70 KB wheel on PyPI), which brings in its own
+   dependencies in turn (for example `httpcore`, `h11`); that is the sole
+   cost this profile adds to the Python environment. No model file ever
+   touches this process.
 
 Verified against a live Ollama server: `store.recall()` against this exact
 profile returns `backends_used = {'fts5', 'priority', 'vector'}` — the vector
@@ -380,7 +382,7 @@ operations.
 | `enabled` | `bool` | `false` | Enable dreaming consolidation |
 | `schedule_every_n_cycles` | `int` | `100` | Positive cadence consumed by `DreamingExtension.is_due()` / `run_if_due()`; Engrava does not start a background scheduler. |
 | `promote_threshold` | `float` | `0.7` | Promotion requires a redistributed weighted score strictly greater than this value. |
-| `signals` | `map[str, float]` | see below | Relative promotion-signal weights. A partial YAML map merges onto the defaults. A signal is removed and the active weights renormalised per run only when none of the candidates carries a value for its data at all — not merely when the candidates' values are identical (see [Signals](dreaming.md#signals)). |
+| `signals` | `map[str, float]` | see below | Relative promotion-signal weights. A partial YAML map merges onto the defaults. A default signal is removed and the active weights renormalised per run when none of the candidates carries a value for its data at all — not merely when the candidates' values are identical — except `frequency`, which is also removed whenever `access_tracking_enabled` is `false`, and a custom signal under a new name, which is always treated as active; a custom signal that reuses a default name instead follows that default's own rule (see [Signals](dreaming.md#signals)). |
 | `candidates_limit` | `int` | `200` | Limit for the ACTIVE promotion pool and each agglomerative type query. The LPA path reads the existing dream-edge graph rather than applying this as a graph-edge cap. |
 | `clustering_backend` | `"numpy" \| "python"` | `"numpy"` | Similarity backend for agglomerative clustering. `numpy` uses vectorised/chunked float32 matrix operations; `python` is the much slower O(n²) debugging fallback. |
 | `top_keyphrases_count` | `int` | `3` | Number of TF-IDF keyphrases written to each v2 REFLECTION payload. |

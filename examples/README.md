@@ -16,7 +16,10 @@ for Python 3.11) — plus a further encoder model download on first use.
 See [`docs/configuration.md` → Quick-start profiles](../docs/configuration.md#quick-start-profiles)
 for the exact, platform-scoped numbers. The encoder is a
 vector-producing model, **not** a language model — no API keys are
-needed and there is no network traffic after the first download.
+needed, and — once `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` are set —
+there is no network traffic after the first download (see
+[`docs/configuration.md` → `local`](../docs/configuration.md#local--sentence-transformers-offline-after-warm-up)
+for why those two variables are needed).
 
 ## What is here
 

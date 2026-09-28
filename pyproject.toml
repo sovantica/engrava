@@ -196,9 +196,9 @@ source = ["src/engrava"]
 # Branch coverage in addition to line coverage, so a critical-path branch that
 # is never taken (e.g. only the happy side of a lifecycle/transaction guard)
 # cannot hide behind a line that is merely executed once for either outcome.
-# Does not raise the existing --cov-fail-under=90 floor, which stays a
-# line-coverage gate; this only makes branch data available to it and to
-# --cov-report.
+# The --cov-fail-under=90 floor stays at 90, but coverage.py folds branch
+# counts into the same percentage that floor reads, so an unexercised
+# branch now lowers that number instead of being invisible to it.
 branch = true
 
 [tool.coverage.report]

@@ -117,9 +117,12 @@ This is the supported way to wire an extension onto a manually built store; it
 does not itself construct or configure a `DreamingExtension`. Calling it again
 replaces whatever was attached before — there is no separate error for a
 second call, and no way to detach through this method. `attach_dreaming_extension()`
-rejects any argument that does not implement `run_consolidation(store,
-current_cycle)` with a `TypeError`, rather than letting a malformed extension
-fail later inside a consolidation cycle.
+checks the argument against the `runtime_checkable` `DreamingConsolidatorProtocol`
+(which looks for a `run_consolidation` member) and raises `TypeError` if that
+check fails. It does not check the method's signature or that it is a
+coroutine function, so a same-named but wrong-shaped `run_consolidation`
+(sync instead of async, or a different signature) passes this check and
+fails only once `consolidate()` actually calls it.
 
 ### From YAML config
 
@@ -237,9 +240,19 @@ the `confidence` signal active, because each carries a non-null value; only a
 pool where every candidate's `confidence` is unset (`None`) would drop it.
 `action_outcome` is therefore **inactive** — and its weight falls out of the
 denominator — in any store where no candidate has a recorded action outcome,
-so it never perturbs consolidation until actions are used. The default
-weights sum to more than 1.0 for this reason: they are relative priorities
-renormalised over the active set, not a probability distribution.
+so it never perturbs consolidation until actions are used. `frequency` carries
+a second condition beyond data presence: it is also dropped whenever
+`access_tracking_enabled` is `false`, regardless of whether candidates already
+carry a non-zero `access_count` (see
+[Access tracking](#access-tracking-the-frequency-substrate) below). A custom
+signal registered via `custom_signals` under a new name (not one of the six
+above) is not subject to this rule at all — it has no introspectable data
+source, so it is always treated as active. A custom signal that reuses one
+of the six default names instead follows that name's own activeness rule
+above, because the check is keyed on the name, not on which callable
+computes the value. The default weights sum to more than 1.0 for this
+reason: they are relative priorities renormalised over the active set, not
+a probability distribution.
 
 Custom signals can be provided via `DreamingSignalProtocol`. `custom_signals` only
 supplies the *callable* for a name — the name itself must also carry a weight in
@@ -279,9 +292,12 @@ before scoring so the current cycle sees up-to-date counts. Access tracking is
 deliberately **not** journaled — the counts are regenerable telemetry, not part
 of the tamper-evident chain (see [Audit Trail](audit-trail.md)).
 
-Set `access_tracking_enabled: false` to leave `access_count` untouched (the
-`frequency` signal then stays inactive and its weight is redistributed over the
-remaining active signals, exactly as with any other inactive signal).
+Set `access_tracking_enabled: false` to stop counting new accesses. With it
+`false`, the `frequency` signal is always dropped and its weight redistributed
+over the remaining active signals — even on a store where candidates already
+carry a non-zero `access_count` from before tracking was turned off, since
+`access_tracking_enabled` gates the signal on its own, independent of any
+stored value.
 
 ## Priority signal in search
 
@@ -595,11 +611,16 @@ duplicate REFLECTIONs.
 REFLECTION creation embeds the synthesis text itself (when the store has
 auto-embed configured) before the extension stores its own centroid vector.
 If that embedding attempt fails — a transient provider timeout, a rate
-limit — the attempt is rolled back in full: no REFLECTION, no centroid, no
-`CONSOLIDATED_FROM` edges are left behind for that cluster. The cluster's
-content-hash is therefore never recorded either, so the next consolidation
-pass processes it exactly like it was never attempted, rather than skipping
-it as "already exists" forever.
+limit — the extension attempts to delete the reflection thought it had
+already inserted, rather than rolling the transaction back; no centroid and
+no `CONSOLIDATED_FROM` edges are created for that cluster, because those
+steps only run after the reflection thought is created successfully. If the
+deletion attempt itself fails, or finds nothing to remove, the reflection
+thought remains with its content-hash recorded, and the next consolidation
+pass skips the cluster instead of retrying it. When the deletion succeeds,
+no thought carrying the cluster's hash remains, so the next pass processes
+the cluster as new; with journaling enabled, the journal still holds both
+the insert and the deletion.
 
 ### Configuration
 

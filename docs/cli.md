@@ -174,7 +174,7 @@ command-specific options.
 ```bash
 engrava --db engrava.db info
 # Database: engrava.db
-# Metrics schema version: 2 (database schema version: 20)
+# Metrics schema version: 2 (database schema version: 21)
 # Thoughts: 128 ({'OBSERVATION': 100, 'REFLECTION': 28})
 # ...
 ```

@@ -123,11 +123,14 @@ jobs:
 
   # End-to-end pip-install upgrade validation: install the last released
   # engrava from PyPI, populate a database with it, then upgrade in place to
-  # the actual candidate wheel this workflow would publish and assert data +
-  # core CLI commands still work. Unlike the offline `test` matrix this job
-  # MUST reach the network (it pip-installs a released wheel from PyPI into a
-  # throwaway venv), so it is scoped to only the upgrade suite and sets the
-  # opt-in gate the test keeps for local runs.
+  # a wheel built from HEAD and assert data + core CLI commands still work.
+  # That wheel still carries HEAD's own pyproject.toml version — the release
+  # pipeline bumps the version later, in its own separate build — so it is
+  # not the exact wheel that gets published, only the same source tree.
+  # Unlike the offline `test` matrix this job MUST reach the network (it
+  # pip-installs a released wheel from PyPI into a throwaway venv), so it is
+  # scoped to only the upgrade suite and sets the opt-in gate the test keeps
+  # for local runs.
   #
   # ENGRAVA_UPGRADE_FROM_SPEC pins the previous release; bump it on every
   # release so the job always exercises the real previous-release -> HEAD path

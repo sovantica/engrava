@@ -61,12 +61,13 @@ What that means for a rolling deploy:
   rule the project followed, checked by nothing. Old and new workers are
   expected to run side by side on a patch upgrade on that basis.
 
-  Two limits worth knowing. The gate blocks the **publish**, not the tag: a
-  release violating the rule can still leave a git tag and a GitHub Release
-  behind, so judge by what is on PyPI. And it covers the recorded **core**
-  schema version only. If you want certainty rather than a policy before
-  rolling workers across a release, compare `PRAGMA user_version` before and
-  after the upgrade yourself.
+  One limit worth knowing: it covers the recorded **core** schema version
+  only. The gate itself runs inside the release pipeline's `prepare` step,
+  before the git tag, the push, and the GitHub Release are created, so a
+  release that violates the rule is refused before any of those exist. If
+  you want certainty rather than a policy before rolling workers across a
+  release, compare `PRAGMA user_version` before and after the upgrade
+  yourself.
   `ensure_schema()` also applies any pending **extension** schema migrations,
   tracked separately in `extension_schema_migrations`, which a `user_version`
   comparison does not reveal; check an installed extension's own migration
@@ -555,7 +556,7 @@ alongside it.
 number [Schema-version checks](cli.md#schema-version-checks) gates on) as two
 separate keys; `schema_version` itself is gone. The text output's `Schema
 version:` line is now `Metrics schema version: 2 (database schema version:
-20)` — both numbers named and shown, never one number under an ambiguous
+21)` — both numbers named and shown, never one number under an ambiguous
 label.
 
 **Who is affected.** Any script that parses `engrava --format json info` and
@@ -1772,8 +1773,9 @@ while pointing it at a rotating or growing set of embedding models or
 dimensions, relying on the mismatch check never firing again after the first
 successful write. The next write with a different model name, dimension, or
 document prefix now raises `EmbeddingModelMismatchError` instead of being
-accepted silently. Anyone using a single model/dimension per store instance
-sees no behaviour change from the identity check.
+accepted silently, except the internal `dreaming-centroid` write, which is
+exempt from this check. Anyone using a single model/dimension per store
+instance sees no behaviour change from the identity check.
 
 **What to do.** If a store instance is intentionally reused across different
 embedding configurations, construct a new store instance (or a new database)
@@ -2028,10 +2030,13 @@ against one database file.
 ### 0.2.0 -> 0.3.0
 
 - Extension schema migration tracking is now part of the upgrade path.
-- Upgrade-path CI validates the previous release against the actual candidate
-  wheel `HEAD` would publish, not a fixed version pair or an editable
-  checkout — `ENGRAVA_UPGRADE_FROM_SPEC` is bumped on every release so the
-  job always exercises last-released -> `HEAD`.
+- Upgrade-path CI validates the previous release against a wheel built from
+  `HEAD`, not a fixed version pair or an editable checkout. That wheel still
+  carries `HEAD`'s own `pyproject.toml` version — the release pipeline bumps
+  the version later, in its own separate build — so it is not the exact
+  wheel that gets published, only the same source tree.
+  `ENGRAVA_UPGRADE_FROM_SPEC` is bumped on every release so the job always
+  exercises last-released -> `HEAD`.
 - Release notes and `CHANGELOG.md` now carry a dedicated `Database Changes`
   section for schema-affecting releases.
 

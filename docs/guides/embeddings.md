@@ -215,8 +215,10 @@ provider = SentenceTransformerProvider(
 )
 ```
 
-No API key, no network after the first model download. Best default for
-self-hosting.
+No API key, and no network after the first model download once
+`HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` are set (see
+[Configuration → `local`](../configuration.md#local--sentence-transformers-offline-after-warm-up)
+for why those two variables are needed). Best default for self-hosting.
 
 On load, this provider raises the model's `max_seq_length` to the architecture's
 true maximum when the shipped checkpoint reports a conservatively-low value — the
