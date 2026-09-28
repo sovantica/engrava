@@ -5,8 +5,9 @@ syntactically valid Python. It says nothing about whether the modules and
 names a block *imports* actually exist: ``from engrava import DoesNotExist``
 compiles just as cleanly as ``from engrava import SqliteEngravaCore``. This
 module closes that specific gap: it walks every ``import`` and
-``from ... import`` statement in a block, and for every one that names an
-``engrava``-owned module, resolves it against the real, installed package.
+``from ... import`` statement in a block, and for every absolute import that
+names an ``engrava``-owned module, resolves it against the real, installed
+package. Every relative import is reported unresolvable (see below).
 
 What this module deliberately does NOT do
 ------------------------------------------
@@ -29,18 +30,11 @@ Only ``engrava``-owned imports are resolved. A block's ``import asyncio`` or
 ``from pathlib import Path`` is out of scope: this check protects the surface
 the documentation is actually about.
 
-A relative import -- ``from .engrava import X`` or ``from ..engrava.config
-import Y``, i.e. ``ast.ImportFrom.level > 0`` -- names a module using the
-same dotted text this module matches against the ``engrava`` prefix, but a
-relative import resolves against the *enclosing package*, not the top-level
-installed distribution. A documentation code block is run standalone, with
-no enclosing package, so a relative import raises ``ImportError: attempted
-relative import with no known parent package`` before Python ever looks at
-what ``engrava`` provides. This module reports every such import as
-unresolvable rather than probing the installed absolute ``engrava`` package
-as if the leading dot were not there -- doing that would bless a statement
-that cannot run in the exact setting this check exists to protect (a reader
-copying the block into a fresh script).
+A relative import (``ast.ImportFrom.level > 0``, e.g. ``from . import X`` or
+``from ..engrava.config import Y``) resolves against an enclosing package. A
+documentation block read as a standalone script has none, so a relative
+import in it can never resolve. This module reports every relative import as
+unresolvable, whatever it names, without looking up any package.
 
 Scope, not flow
 -----------------
@@ -136,7 +130,12 @@ def _from_import_target_exists(module: object, module_name: str, symbol_name: st
 
 @dataclass(frozen=True)
 class DeadImport:
-    """An import naming an ``engrava`` module or attribute that does not exist."""
+    """An import that cannot resolve.
+
+    Either an absolute import naming an ``engrava`` module or attribute that
+    does not exist, or any relative import, which can never resolve in a
+    block read as a standalone script.
+    """
 
     source: str
     name: str
@@ -159,9 +158,7 @@ class ImportResolution:
             package, plus two shapes that are reported dead without ever
             appearing in ``checked``: a star import (``from x import *``)
             whose named module itself does not exist, and any relative
-            import naming an ``engrava``-prefixed module (which can never
-            resolve against the installed package regardless of what it
-            provides -- see the module docstring).
+            import, whatever it names -- see the module docstring.
 
     """
 
@@ -226,19 +223,19 @@ class _ImportWalker(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-        module_name = node.module
-        if module_name is None or not _is_engrava_module(module_name):
-            self.generic_visit(node)
-            return
         if node.level > 0:
-            # A relative import can never resolve against the installed,
-            # absolute `engrava` distribution -- see the module docstring.
-            # Report every name it binds as dead without probing the
-            # top-level package at all: doing that would silently treat the
-            # statement as if it had been written without the leading dot.
-            source = f"{'.' * node.level}{module_name}"
+            # A relative import can never resolve when a documentation block
+            # is run standalone -- see the module docstring. Report each
+            # imported name, or `*` for a star import, as dead, whatever
+            # module it names: being relative already rules out resolving it
+            # here, so the engrava-only filter below does not apply to it.
+            source = f"{'.' * node.level}{node.module or ''}"
             for alias in node.names:
                 self.dead.append(DeadImport(source=source, name=alias.name))
+            self.generic_visit(node)
+            return
+        module_name = node.module
+        if module_name is None or not _is_engrava_module(module_name):
             self.generic_visit(node)
             return
         module = _import_engrava_module(module_name)

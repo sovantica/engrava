@@ -4,9 +4,10 @@ The compile layer (Layer 2) proves every fenced ``python`` block is valid
 Python; its phantom-API guard there catches a small, hand-maintained denylist
 of *specific* known-bad tokens from past drift. This module raises the floor
 for one whole *class* of that defect, independent of that denylist: it
-resolves every ``import`` and ``from ... import`` statement a block makes
-against the real, installed ``engrava`` package, and fails on any that name a
-module or attribute that does not exist.
+resolves each absolute ``engrava`` import a block makes against the real,
+installed package and fails on any that names a module or attribute that does
+not exist. It also fails on any relative import, which can never resolve in a
+block read as a standalone script.
 
 See ``tests/docs/_import_resolution.py`` for the resolution rule itself and,
 importantly, for what it does **not** cover: an import that resolves cleanly
@@ -49,9 +50,11 @@ def test_doc_block_imports_resolve(block: CodeBlock) -> None:
     if resolution.has_dead_imports:
         offenders = [f"from {dead.source} import {dead.name}" for dead in resolution.dead]
         pytest.fail(
-            f"Documentation block at {block.location} imports a non-existent "
-            f"engrava symbol: {', '.join(offenders)}. Fix the snippet in the "
-            f"source Markdown file or the real API, whichever is wrong.",
+            f"Documentation block at {block.location} has an import that "
+            f"cannot resolve: {', '.join(offenders)}. A relative import can "
+            f"never run in a standalone block; an absolute one may name a "
+            f"nonexistent engrava symbol. Fix the snippet in the source "
+            f"Markdown file or the real API, whichever is wrong.",
         )
 
 
@@ -237,6 +240,74 @@ def test_rule_flags_a_two_level_relative_import_too() -> None:
     resolution = resolve_imports(block)
     assert resolution.has_dead_imports
     assert resolution.dead == (DeadImport(source="..engrava", name="SqliteEngravaCore"),)
+
+
+def test_rule_flags_a_bare_relative_import_naming_no_module() -> None:
+    """``from . import engrava`` names no module at all, only dots -- still relative, still dead.
+
+    ``node.module`` is ``None`` for this shape, but ``node.level`` is still
+    greater than zero: it is exactly as unable to run standalone as
+    ``from .engrava import X``, and the source is the dots alone (``.``),
+    not ``.engrava`` -- ``engrava`` here is the bound name, not the module.
+    """
+    block = _synthetic_block("from . import engrava\n")
+    resolution = resolve_imports(block)
+    assert resolution.has_dead_imports
+    assert resolution.dead == (DeadImport(source=".", name="engrava"),)
+
+    # CONTROL, the absolute equivalent of the same bound name stays clean.
+    absolute = _synthetic_block("import engrava\n")
+    assert not resolve_imports(absolute).has_dead_imports
+
+
+def test_rule_flags_a_two_level_bare_relative_import_too() -> None:
+    """The two-dot form of the same module-less shape (``from .. import engrava``)."""
+    block = _synthetic_block("from .. import engrava\n")
+    resolution = resolve_imports(block)
+    assert resolution.has_dead_imports
+    assert resolution.dead == (DeadImport(source="..", name="engrava"),)
+
+
+def test_rule_flags_a_bare_relative_star_import_without_crashing() -> None:
+    """``from . import *`` is legal syntax with no module name; it must not crash the visitor."""
+    block = _synthetic_block("from . import *\n")
+    resolution = resolve_imports(block)
+    assert resolution.has_dead_imports
+    assert resolution.dead == (DeadImport(source=".", name="*"),)
+
+
+def test_rule_flags_every_name_of_a_multi_name_relative_import() -> None:
+    """Each name a relative import lists is reported, not only the first."""
+    block = _synthetic_block("from . import alpha, beta\n")
+    resolution = resolve_imports(block)
+    assert resolution.dead == (
+        DeadImport(source=".", name="alpha"),
+        DeadImport(source=".", name="beta"),
+    )
+
+
+def test_rule_flags_a_relative_import_naming_a_non_engrava_module() -> None:
+    """A relative import is dead regardless of whether its module looks engrava-owned.
+
+    ``from .pathlib import Path`` names a module that is not engrava at all,
+    but being relative already means it cannot resolve in a standalone
+    documentation block -- see the module docstring. A fix that special-cased
+    only the module-less shape (``node.module is None``) while keeping the
+    engrava-prefix filter for a named relative module would still miss this
+    case; it must be caught the same way as an engrava-named relative import.
+    """
+    block = _synthetic_block("from .pathlib import Path\n")
+    resolution = resolve_imports(block)
+    assert resolution.has_dead_imports
+    assert resolution.dead == (DeadImport(source=".pathlib", name="Path"),)
+
+
+def test_rule_flags_a_two_level_relative_import_of_a_non_engrava_module_too() -> None:
+    """The two-dot form of the same non-engrava-named shape (``from ..other import thing``)."""
+    block = _synthetic_block("from ..other import thing\n")
+    resolution = resolve_imports(block)
+    assert resolution.has_dead_imports
+    assert resolution.dead == (DeadImport(source="..other", name="thing"),)
 
 
 def test_rule_resolves_an_unimported_submodule_named_via_from_import() -> None:
