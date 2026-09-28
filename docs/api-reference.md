@@ -207,7 +207,7 @@ already exists.
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `await create_edge(edge)` | `EdgeRecord` | Persist an `EdgeRecord`; raises `ReferentialIntegrityError` on a missing endpoint or `DuplicateEdgeError` for an existing `(from, to, type)` relationship |
-| `await get_edges(thought_id, *, direction='BOTH')` | `list[EdgeRecord]` | Edges for a thought (`direction` is `'IN'`/`'OUT'`/`'BOTH'`, keyword-only) |
+| `await get_edges(thought_id, *, direction='BOTH', limit=None)` | `list[EdgeRecord]` | Edges for a thought (`direction` is `'IN'`/`'OUT'`/`'BOTH'`, keyword-only); `limit` must be `None` or an integer `>= 0` and keeps the highest-`weight` edges, `0` returns an empty list, `None` returns every edge unordered. Raises `ValueError` if `limit` is negative or a `bool` |
 | `await list_edges(*, edge_type=None, source=None, filters=None, limit=5000)` | `list[EdgeRecord]` | List edges with optional filters (`filters` is a typed `MetadataFilter` over the edge `metadata`; see the [`metadata` field](#metadata-field-edges) note) |
 | `await update_edge(edge_id, **changes)` | `EdgeRecord` | Update edge fields — only those that actually change (a no-op writes nothing). Raises `ValueError` if the edge does not exist at the initial read. Raises `StaleDataError` on a real change whose guarded write matches no row — another guarded write bumped `revision` in between, or deleted the row — see [Concurrency](concurrency.md#optimistic-concurrency-and-staledataerror) |
 | `await delete_edge(edge_id)` | `bool` | Hard delete; `True` if a row was removed |

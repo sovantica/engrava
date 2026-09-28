@@ -7,6 +7,7 @@ These tests use only engrava types and SqliteEngravaCore.
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -407,6 +408,114 @@ class TestSqliteEngravaCoreEdge:
         # the LIMIT is enforced in SQL, not by truncating an already-fetched
         # Python list.
         assert sum(rows_read) == bound
+
+    async def test_get_edges_rejects_negative_limit(
+        self,
+        store: SqliteEngravaCore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A negative ``limit`` is rejected before it reaches SQL.
+
+        SQLite reads a negative ``LIMIT`` as "no limit", so an unvalidated
+        negative value would silently return every edge instead of raising.
+        The message must name both the argument and the offending value — an
+        unanchored search for the value's ``repr`` is not enough: ``-1`` is a
+        substring of ``-1000000``, so a fix that always reported
+        ``-1000000`` would still satisfy a bare ``match`` on ``-1``'s
+        ``repr``. Anchoring the pattern at the end of the message (the value
+        is always the last thing in it) rules that out.
+
+        "Before it reaches SQL" is checked, not just claimed: the
+        connection's own ``execute`` is replaced with a function that fails
+        the test if it is ever invoked, so a fix that ran the query and only
+        then raised the same ``ValueError`` would still be caught, not just
+        one that never runs the query at all.
+        """
+        await store.create_thought(_make_thought("t-hub-neg"))
+        async with store.suspend_auto_commit():
+            for i in range(3):
+                await store.create_thought(_make_thought(f"t-hub-neg-n-{i}"))
+                await store.create_edge(
+                    EdgeRecord(
+                        edge_id=f"e-hub-neg-{i}",
+                        from_thought_id="t-hub-neg",
+                        to_thought_id=f"t-hub-neg-n-{i}",
+                        edge_type=EdgeType.ASSOCIATED,
+                        weight=(i + 1) / 10,
+                        created_cycle=0,
+                    ),
+                )
+
+        execute_called = False
+
+        async def _fail_if_executed(*_args: object, **_kwargs: object) -> object:
+            nonlocal execute_called
+            execute_called = True
+            msg = "get_edges ran a query before validating a negative limit"
+            raise AssertionError(msg)
+
+        monkeypatch.setattr(store._db, "execute", _fail_if_executed)
+
+        for bad_limit in (-1, -1_000_000):
+            with pytest.raises(
+                ValueError,
+                match=rf"limit.*{re.escape(repr(bad_limit))}$",
+            ):
+                await store.get_edges("t-hub-neg", direction="OUT", limit=bad_limit)
+            assert not execute_called
+
+    async def test_get_edges_limit_zero_returns_empty_list(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """``limit=0`` is a valid bound: it returns no edges, not every edge."""
+        await store.create_thought(_make_thought("t-hub-zero"))
+        await store.create_thought(_make_thought("t-hub-zero-n"))
+        await store.create_edge(
+            EdgeRecord(
+                edge_id="e-hub-zero",
+                from_thought_id="t-hub-zero",
+                to_thought_id="t-hub-zero-n",
+                edge_type=EdgeType.ASSOCIATED,
+                weight=0.5,
+                created_cycle=0,
+            ),
+        )
+
+        edges = await store.get_edges("t-hub-zero", direction="OUT", limit=0)
+        assert edges == []
+
+    async def test_get_edges_rejects_bool_limit(
+        self,
+        store: SqliteEngravaCore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``bool`` is an ``int`` subclass but never a meaningful edge count.
+
+        As in :meth:`test_get_edges_rejects_negative_limit`, the message must
+        name the offending value, anchored at the end, not just the
+        argument, and the rejection must happen before any query runs —
+        checked the same way, by failing the test if ``execute`` is called.
+        """
+        await store.create_thought(_make_thought("t-hub-bool"))
+
+        execute_called = False
+
+        async def _fail_if_executed(*_args: object, **_kwargs: object) -> object:
+            nonlocal execute_called
+            execute_called = True
+            msg = "get_edges ran a query before validating a boolean limit"
+            raise AssertionError(msg)
+
+        monkeypatch.setattr(store._db, "execute", _fail_if_executed)
+
+        for bad_limit in (True, False):
+            with pytest.raises(
+                ValueError,
+                match=rf"limit.*{re.escape(repr(bad_limit))}$",
+            ):
+                await store.get_edges("t-hub-bool", direction="OUT", limit=bad_limit)
+            assert not execute_called
 
     async def test_delete_edge(self, store: SqliteEngravaCore) -> None:
         await store.create_thought(_make_thought("t-a"))

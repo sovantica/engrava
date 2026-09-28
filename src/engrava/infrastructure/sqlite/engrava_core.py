@@ -10024,19 +10024,31 @@ class SqliteEngravaCore:
             thought_id: UUID of the thought.
             direction: 'IN', 'OUT', or 'BOTH'.
             limit: If given, bound the result to this many edges at the SQL
-                layer, keeping the highest-``weight`` ones first. ``None``
-                (the default) returns every matching edge, unordered, exactly
-                as before this parameter existed — callers that need the
-                complete adjacency (e.g. checking every existing connection
-                before creating a new one) must keep passing ``None``; only
-                pass a bound where the caller's own contract is already
-                "the top-N most relevant neighbours", not "all of them".
+                layer, keeping the highest-``weight`` ones first. Must be
+                ``0`` or a positive integer; ``0`` returns an empty list.
+                ``None`` (the default) returns every matching edge, unordered,
+                exactly as before this parameter existed — callers that need
+                the complete adjacency (e.g. checking every existing
+                connection before creating a new one) must keep passing
+                ``None``; only pass a bound where the caller's own contract is
+                already "the top-N most relevant neighbours", not "all of
+                them".
 
         Returns:
             List of matching edge records. Ordered by ``weight`` descending
             when ``limit`` is given, otherwise in storage order.
 
+        Raises:
+            ValueError: If ``limit`` is a ``bool`` or is negative. ``bool``
+                is rejected even though it subclasses ``int``: it is never a
+                meaningful edge count, only a type mismatch a type checker
+                would miss.
+
         """
+        if limit is not None and (isinstance(limit, bool) or limit < 0):
+            msg = f"limit must be a non-negative integer, got {limit!r}"
+            raise ValueError(msg)
+
         if direction == "OUT":
             sql = "SELECT * FROM edge WHERE from_thought_id = ?"
             params: list[object] = [thought_id]
