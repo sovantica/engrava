@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import re
 from typing import TYPE_CHECKING
 
 import pytest
@@ -73,6 +74,89 @@ _ORIGINAL_FIVE: frozenset[tuple[str, str]] = frozenset(
         ("DreamingGates", "min_age_cycles"),
     }
 )
+
+# Clauses the scanner names a field in but cannot pair positionally with a
+# value (see ``ScanResult.unparseable_clauses``): the count of field mentions
+# and value-shaped tokens in the clause disagree, so it is dropped rather
+# than compared. Each entry here says why *that* clause's count disagrees, so
+# a doc edit that starts producing an unparseable clause somewhere else is
+# not silently swallowed the same way -- see
+# ``test_every_unparseable_clause_is_on_a_reasoned_allowlist``.
+_UNPARSEABLE_ALLOWLIST: dict[tuple[str, int], str] = {
+    ("docs/architecture.md", 169): (
+        "names `include_reflections` (default `True`), a `search_hybrid()` keyword that "
+        "is not a tracked field, alongside `reflection_boost`; its own value is the "
+        "per-call default `None`, not the field's shipped default -- 3 value-shaped "
+        "tokens against 1 field"
+    ),
+    ("docs/configuration.md", 277): (
+        "the edge type name `CONSOLIDATED_FROM` and the per-call keyword `graph_weight` "
+        "are picked up as value-shaped tokens alongside the two real defaults -- "
+        "3 values against 2 fields"
+    ),
+    ("docs/configuration.md", 542): (
+        "`signal_weights` is a dict; each key's share is written as a compound token "
+        "(`recency 0.30`) rather than a bare value, so none register as a value token"
+    ),
+    ("docs/data-lifecycle.md", 79): (
+        "names `default_ttl_seconds` while describing its effect in prose, with no "
+        "value-shaped token in the clause at all"
+    ),
+    ("docs/dreaming.md", 205): (
+        "`max_cluster_size` is named twice in the same clause (once paired with "
+        "`min_cluster_size`, once again explaining its enforcement order), so the "
+        "positional pairing counts 3 field mentions against 2 values -- "
+        "checked directly instead, see "
+        "``test_min_and_max_cluster_size_defaults_match_docs``"
+    ),
+    ("docs/dreaming.md", 395): (
+        "the edge type name `CONSOLIDATED_FROM` is picked up as a value-shaped token "
+        "alongside the real default `true` -- 2 values against 1 field"
+    ),
+    ("docs/evidence-and-conflicts.md", 88): (
+        "the type name `EdgeType` and the edge type name `CONSOLIDATED_FROM` are picked "
+        "up as value-shaped tokens alongside the real default `True` -- "
+        "3 values against 1 field"
+    ),
+    ("docs/glossary.md", 215): (
+        'states the default in plain words ("on by default") with no value-shaped '
+        "token in the clause at all"
+    ),
+    ("docs/memory-hygiene.md", 132): (
+        'the value is a tuple literal (`("P1",)`), which is not a bare value token shape'
+    ),
+    ("docs/memory-hygiene.md", 155): (
+        "the value is an empty-tuple literal (`()`), which is not a bare value token shape"
+    ),
+    ("docs/search.md", 21): (
+        "states two contrasting numbers (`0.0`, `0.10`) plus the parameter names "
+        "`search_config` and `recency_weight`, all picked up as value-shaped tokens -- "
+        "4 values against 1 field"
+    ),
+    ("docs/search.md", 57): (
+        "names several unrelated parameters (`collapse_key`, `top_k`, `fts_top_k`, "
+        "`vector_top_k`) in the same clause as the real default -- 5 values against 1 field"
+    ),
+    ("docs/search.md", 281): (
+        "the edge type name `CONSOLIDATED_FROM` and the type name `REFLECTION` are picked "
+        "up as value-shaped tokens alongside the real default `true` -- "
+        "3 values against 1 field"
+    ),
+    ("docs/search.md", 478): (
+        "the parameter name `collapse_key` is picked up as a value-shaped token "
+        "alongside the real default `4` -- 2 values against 1 field"
+    ),
+    ("docs/troubleshooting.md", 181): (
+        "names `confirmation_count`, an attribute the clause discusses but that is not "
+        "a tracked field, as a value-shaped token alongside the two real defaults -- "
+        "3 values against 2 fields"
+    ),
+    ("docs/upgrade.md", 321): (
+        "the provider class name `SentenceTransformerProvider`, mentioned twice, is "
+        "picked up as a value-shaped token alongside the real default `0.40` -- "
+        "3 values against 1 field"
+    ),
+}
 
 
 def _scan() -> ScanResult:
@@ -167,6 +251,55 @@ def test_unresolved_fields_are_only_the_dict_valued_ones() -> None:
     assert unresolved_fields <= dict_valued, (
         f"unresolved for a non-dict-valued field (unexpected — should have matched or been "
         f"a known dict exception): {sorted(unresolved_fields - dict_valued)}"
+    )
+
+
+def test_every_unparseable_clause_is_on_a_reasoned_allowlist() -> None:
+    """A clause the scanner could not pair a field with a value is a live gap unless explained.
+
+    ``ScanResult.unparseable_clauses`` is otherwise never asserted on anywhere in this
+    module -- a clause landing there is currently indistinguishable from one that was
+    never scanned at all, so a wrong documented default in a clause the scanner cannot
+    pair (for instance because a field name is repeated) never fails anything. Every
+    such clause must be named in ``_UNPARSEABLE_ALLOWLIST`` with a reason, and the
+    allowlist must not outlive the clause it explains.
+    """
+    unexplained = [
+        u for u in _RESULT.unparseable_clauses if (u.doc, u.line) not in _UNPARSEABLE_ALLOWLIST
+    ]
+    assert not unexplained, [
+        f"{u.doc}:{u.line} names {u.fields} against {u.value_count} value token(s) and is "
+        f"not on _UNPARSEABLE_ALLOWLIST. Offending text: {u.context!r}"
+        for u in unexplained
+    ]
+    present = {(u.doc, u.line) for u in _RESULT.unparseable_clauses}
+    stale = set(_UNPARSEABLE_ALLOWLIST) - present
+    assert not stale, f"allowlist entries no longer unparseable -- remove or update: {stale}"
+
+
+def test_min_and_max_cluster_size_defaults_match_docs() -> None:
+    """The one allowlisted clause naming two target fields is still checked directly.
+
+    ``min_cluster_size`` / ``max_cluster_size`` in ``docs/dreaming.md`` is on
+    ``_UNPARSEABLE_ALLOWLIST`` because the general scanner cannot pair it (see the
+    allowlist entry). Being unparseable is not being unchecked: the two values are
+    extracted from that exact clause and compared to the shipped defaults by hand, so
+    a wrong number here still fails.
+    """
+    text = (REPO_ROOT / "docs" / "dreaming.md").read_text(encoding="utf-8")
+    match = re.search(
+        r"`min_cluster_size` / `max_cluster_size` \(defaults `(\d+)` / `(\d+)`\)", text
+    )
+    assert match is not None, "expected min_cluster_size/max_cluster_size clause not found"
+    documented_min, documented_max = (int(g) for g in match.groups())
+    gates = DreamingGates()
+    assert documented_min == gates.min_cluster_size, (
+        f"docs/dreaming.md documents DreamingGates.min_cluster_size as {documented_min}, "
+        f"but the shipped default is {gates.min_cluster_size}"
+    )
+    assert documented_max == gates.max_cluster_size, (
+        f"docs/dreaming.md documents DreamingGates.max_cluster_size as {documented_max}, "
+        f"but the shipped default is {gates.max_cluster_size}"
     )
 
 

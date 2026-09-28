@@ -49,6 +49,12 @@ EXAMPLES_README = EXAMPLES_DIR / "README.md"
 # is not a general markdown parser, just this one page's link structure.
 _LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
 
+# A Markdown table row: a line that both opens and closes with `|`. Matches a
+# table's own header-separator row (`|---|---|`) too, which is excluded
+# separately below rather than relied on to simply carry no link.
+_TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
+_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?[\s:|-]+\|?\s*$")
+
 # `python examples/<file>` printed as a runnable invocation line, on a line by
 # itself inside a fenced block (the page's own convention for these).
 _INVOCATION_RE = re.compile(r"(?m)^\s*python\s+examples/(\S+\.py)\s*$")
@@ -59,6 +65,16 @@ _INVOCATION_RE = re.compile(r"(?m)^\s*python\s+examples/(\S+\.py)\s*$")
 # directory, register it here explicitly rather than excluding it by a
 # guessed pattern.
 _NOT_INVENTORY: frozenset[str] = frozenset({"README.md"})
+
+# A shipped file's index entry is a row of one of the page's tables (`Script
+# | What it shows`, `File | Profile | What you get`, `File | For`) -- a link
+# named in running prose is not the same claim, and counting it the same way
+# would let a file quietly drop out of its table (demoted to a passing
+# mention) without the census noticing. `config.yaml` is the one deliberate
+# exception: the paragraph right after the profiles table narrates it by
+# name precisely because it is *not* a fourth profile, so it is indexed in
+# prose on purpose rather than by omission.
+_PROSE_INDEXED_EXCEPTIONS: frozenset[str] = frozenset({"config.yaml"})
 
 
 def _local_link_targets(text: str) -> list[str]:
@@ -71,6 +87,16 @@ def _local_link_targets(text: str) -> list[str]:
         if target:
             targets.append(target)
     return targets
+
+
+def _table_row_link_targets(text: str) -> list[str]:
+    """Every non-``http(s)``/``mailto`` link target inside a Markdown table row."""
+    row_lines = [
+        line
+        for line in text.splitlines()
+        if _TABLE_ROW_RE.match(line) and not _TABLE_SEPARATOR_RE.match(line)
+    ]
+    return _local_link_targets("\n".join(row_lines))
 
 
 @dataclass(frozen=True)
@@ -129,12 +155,16 @@ def compute_census(examples_dir: Path, readme_path: Path) -> ExamplesCensus:
     )
     text = readme_path.read_text(encoding="utf-8")
 
+    unresolved = [
+        target for target in _local_link_targets(text) if not (examples_dir / target).exists()
+    ]
+
     indexed: dict[str, int] = {}
-    unresolved: list[str] = []
-    for target in _local_link_targets(text):
-        if not (examples_dir / target).exists():
-            unresolved.append(target)
+    for target in _table_row_link_targets(text):
         if "/" not in target:
+            indexed[target] = indexed.get(target, 0) + 1
+    for target in _local_link_targets(text):
+        if target in _PROSE_INDEXED_EXCEPTIONS and "/" not in target:
             indexed[target] = indexed.get(target, 0) + 1
 
     dangling = [

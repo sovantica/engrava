@@ -79,15 +79,20 @@ def _headings_in(path: Path) -> set[str]:
 
 
 def _cross_file_doc_anchor_links() -> list[tuple[str, int, str, str]]:
-    """Return ``(source_name, line_no, target_name, fragment)`` for every in-scope link."""
+    """Return ``(source_name, line_no, target_name, fragment)`` for every in-scope link.
+
+    Every link matching the in-scope shape is returned, whether or not
+    ``target_name`` names a file that actually exists in ``docs/`` --
+    dropping a link here because its target is missing would hide exactly
+    the defect (a stale or mistyped file name) this module exists to catch.
+    """
     links: list[tuple[str, int, str, str]] = []
     for source_path in sorted(DOCS_DIR.glob("*.md")):
         for line_no, line in enumerate(
             source_path.read_text(encoding="utf-8").splitlines(), start=1
         ):
             for target_name, fragment in _CROSS_FILE_ANCHOR_LINK.findall(line):
-                if (DOCS_DIR / target_name).is_file():
-                    links.append((source_path.name, line_no, target_name, fragment))
+                links.append((source_path.name, line_no, target_name, fragment))
     return links
 
 
@@ -98,7 +103,11 @@ def _cross_file_doc_anchor_links() -> list[tuple[str, int, str, str]]:
 def test_cross_file_doc_anchor_resolves(
     source_name: str, line_no: int, target_name: str, fragment: str
 ) -> None:
-    target_headings = _headings_in(DOCS_DIR / target_name)
+    target_path = DOCS_DIR / target_name
+    assert target_path.is_file(), (
+        f"docs/{source_name}:{line_no} links to {target_name}, which does not exist in docs/"
+    )
+    target_headings = _headings_in(target_path)
     assert fragment in target_headings, (
         f"docs/{source_name}:{line_no} links to {target_name}#{fragment}, but no "
         f"heading in docs/{target_name} slugs to {fragment!r}"

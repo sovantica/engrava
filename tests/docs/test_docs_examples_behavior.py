@@ -33,6 +33,7 @@ from engrava import (
     ActionStatus,
     ActionType,
     CallbackProvider,
+    ConsolidationResult,
     DefaultEngravaHooks,
     DeriveContext,
     DerivedRecord,
@@ -701,8 +702,26 @@ async def test_dreaming_attach_dreaming_extension_wires_consolidate() -> None:
     nothing wired and raises (the same guard proven by the from_config-less
     case above); after ``store.attach_dreaming_extension(ext)``, ``consolidate()``
     runs that attached extension and returns its real ``ConsolidationResult``
-    rather than merely accepting the call.
+    rather than merely accepting the call. A spy wrapping the real extension
+    proves the run actually happened -- with the store and cycle it should
+    have received -- and that the returned result is the extension's own
+    object, not merely a same-shaped value ``consolidate()`` could have
+    produced without calling anything.
     """
+
+    class _RecordingDreamingExtension:
+        def __init__(self, wrapped: DreamingExtension) -> None:
+            self._wrapped = wrapped
+            self.calls: list[tuple[SqliteEngravaCore, int]] = []
+            self.returned: ConsolidationResult | None = None
+
+        async def run_consolidation(
+            self, store: SqliteEngravaCore, current_cycle: int
+        ) -> ConsolidationResult:
+            self.calls.append((store, current_cycle))
+            self.returned = await self._wrapped.run_consolidation(store, current_cycle)
+            return self.returned
+
     async with aiosqlite.connect(":memory:") as conn:
         store = await _fresh_store(conn)
         await store.create_thought(_observation())
@@ -713,9 +732,12 @@ async def test_dreaming_attach_dreaming_extension_wires_consolidate() -> None:
         ext = DreamingExtension(
             config=DreamingConfig(enabled=True, promote_threshold=0.55),
         )
-        store.attach_dreaming_extension(ext)
+        spy = _RecordingDreamingExtension(ext)
+        store.attach_dreaming_extension(spy)
 
         result = await store.consolidate(current_cycle=2)
+        assert spy.calls == [(store, 2)]
+        assert result is spy.returned
         assert isinstance(result.promoted_count, int)
         assert isinstance(result.edges_created, int)
         assert isinstance(result.reflections_created, int)

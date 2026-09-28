@@ -2090,6 +2090,58 @@ async def test_populated_sub_floor_database_under_a_different_case_still_refuses
     assert await _user_version(fresh_db) == 0, "a refusal must not stamp any version"
 
 
+@pytest.mark.parametrize("table", ["edge", "action"])
+async def test_v21_revision_column_reaches_a_differently_cased_table(
+    fresh_db: aiosqlite.Connection,
+    table: str,
+) -> None:
+    """The v20->v21 ``revision`` rung must still find ``edge``/``action`` under any case.
+
+    The case-variant coverage above starts below the bootstrap floor, so
+    ``ensure_schema`` refuses inside ``_has_any_core_table`` before the
+    ``_table_exists`` guard that ``_migrate_core_v20_to_v21`` uses to decide
+    whether to add ``revision`` to ``edge`` / ``action`` is ever reached.
+    This is the case that does reach it: a real v20 database, at or above the
+    floor, whose ``edge`` (or ``action``) table happens to be registered
+    under a different case. If ``_table_exists`` ever regressed to a
+    case-sensitive lookup, this guard would read the table as absent, skip
+    adding the column *and* skip the postcondition that would have caught
+    the omission (both live inside the same ``if``), and the migration loop
+    would still stamp the database v21 -- silently missing the column that
+    guards every write to that table.
+    """
+    await _bootstrap_core_at_version(fresh_db, 20)
+    await _seed_legacy_rows(fresh_db)
+    if table == "action":
+        await fresh_db.execute(
+            "INSERT INTO action (action_id, source_thought_id, action_type, intent) "
+            "VALUES ('a-1', 't-1', 'SEARCH', 'look something up')"
+        )
+        await fresh_db.commit()
+
+    # SQLite resolves table names case-insensitively even for a rename's own
+    # conflict check, so renaming straight to the upper-case spelling of the
+    # same name ("edge" -> "EDGE") reads as a collision with itself. A
+    # distinctly-named hop clears that: "edge" -> "edge_case_swap" -> "EDGE".
+    upper = table.upper()
+    await fresh_db.execute(f"ALTER TABLE {table} RENAME TO {table}_case_swap")
+    await fresh_db.execute(f"ALTER TABLE {table}_case_swap RENAME TO {upper}")
+    await fresh_db.commit()
+
+    store = SqliteEngravaCore(fresh_db)
+    await store.ensure_schema()
+
+    assert await _user_version(fresh_db) == _HEAD_VERSION
+
+    cursor = await fresh_db.execute(f"PRAGMA table_info({upper})")
+    column_names = {row["name"] for row in await cursor.fetchall()}
+    assert "revision" in column_names, (
+        f"{upper}.revision is missing even though ensure_schema() reached "
+        f"v{_HEAD_VERSION} -- the v20->v21 step's table-existence guard did not "
+        "find the renamed table"
+    )
+
+
 async def test_newer_than_head_database_refuses_to_open(
     fresh_db: aiosqlite.Connection,
 ) -> None:
