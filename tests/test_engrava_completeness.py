@@ -343,7 +343,7 @@ class TestSearchHybrid:
         self,
         store: SqliteEngravaCore,
     ) -> None:
-        # Fusion-level regression for the degenerate min-max corner (D9).
+        # Fusion-level regression for the degenerate min-max corner.
         # "only-fts" is the sole FTS match for a rare term (hi == lo → the
         # degenerate branch) with an orthogonal, zero-cosine embedding;
         # "only-vec" is not an FTS match but has a moderate cosine (0.4).

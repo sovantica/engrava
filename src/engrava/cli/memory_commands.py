@@ -243,20 +243,20 @@ def _error_boundary(*, as_json: bool, command: str) -> Iterator[_ResolvedDatabas
     library underneath raised it or what it raised.
 
     This replaces enumerating exception types one ``except`` clause at a
-    time. Two review rounds each found more types escaping that enumeration
-    — a malformed ``--filter`` path, a directory or corrupt file given as
-    ``--db``, an unreadable or non-UTF-8 ``--config``, an uninitialised
-    database — because "everything a library this CLI touches might raise"
-    is not a set these functions can enumerate correctly, and ``mypy`` gives
+    time: that enumeration keeps missing types — a malformed ``--filter``
+    path, a directory or corrupt file given as ``--db``, an unreadable or
+    non-UTF-8 ``--config``, an uninitialised database — because "everything
+    a library this CLI touches might raise" is not a set these functions can
+    enumerate correctly, and ``mypy`` gives
     no help either: nothing in ``resolve_hooks()`` or ``aiosqlite.connect()``'s
     signature says what they raise. Catching ``Exception`` once, here, closes
     the *class* of defect instead of chasing its latest instance.
 
     **This is also the only place that writes a failure's output, and it
-    does so only after everything it wraps has finished unwinding.** A
-    third review round found that the previous shape -- ``_fail`` itself
-    calling ``click.echo`` and ``sys.exit()`` at the point of detection --
-    let cleanup still running *underneath* that call corrupt the output
+    does so only after everything it wraps has finished unwinding.** The
+    previous shape -- ``_fail`` itself calling ``click.echo`` and
+    ``sys.exit()`` at the point of detection -- let cleanup still running
+    *underneath* that call corrupt the output
     that had already been written: a database's ``close()`` failing during
     the ``async with`` unwind either printed a stray line after the
     documented final JSON object, or (worse, on a ``--config`` store, whose
@@ -292,15 +292,14 @@ def _error_boundary(*, as_json: bool, command: str) -> Iterator[_ResolvedDatabas
     do -- is not safe. Each call site checks ``type(exc) is ...``: a
     *subclass* keeps the same documented kind and exit code -- the class
     hierarchy is trustworthy even when its attributes are not -- but its
-    message is a fixed literal instead, with nothing read off it at all: a
-    later review round found that even the hardened, generic
-    :func:`_describe_exception` was not safe enough for this case, since it
-    still includes ``str(exc)``, which the subclass fully controls, and a
-    subclass built to return a believable-looking fabricated diagnosis
-    would have that fabrication reported as if this CLI had produced it. An
-    *exact* instance is not thereby safe to format directly either -- its
-    own fields can still hold a hostile or unexpected value (a still later
-    review round demonstrated this for both classes) -- so each field is
+    message is a fixed literal instead, with nothing read off it at all:
+    even the hardened, generic :func:`_describe_exception` is not safe
+    enough for this case, since it still includes ``str(exc)``, which the
+    subclass fully controls, and a subclass built to return a
+    believable-looking fabricated diagnosis would have that fabrication
+    reported as if this CLI had produced it. An *exact* instance is not
+    thereby safe to format directly either -- its own fields can still hold
+    a hostile or unexpected value, for both classes -- so each field is
     read once and validated (an exact ``str`` type, and, for
     ``ReferentialIntegrityError``, a real column name whose value matches
     this invocation's own endpoint) before it is used anywhere; a field
@@ -567,9 +566,9 @@ async def _opened_full_store(
             # `finally: await store.close()` cannot make that distinction --
             # a close exception raised inside a `finally` silently replaces
             # whatever was already propagating, which is exactly how a
-            # deliberate exit 4 (`missing_thought`) turned into an
-            # undocumented second error object at exit 1 during review. Same
-            # split _opened_db makes for the bare tier above, and the same
+            # deliberate exit 4 (`missing_thought`) would turn into an
+            # undocumented second error object at exit 1. Same split
+            # _opened_db makes for the bare tier above, and the same
             # convention `engrava.infrastructure.sqlite.engrava_core`'s own
             # `_close_quietly` uses for a bare connection -- not reused
             # directly here since that helper is typed for an
@@ -578,8 +577,8 @@ async def _opened_full_store(
             # own cancellation-safety internally, so this does not need the
             # same explicit shield-and-redrain ceremony.
             #
-            # Deliberately not `logger.warning(..., exc_info=True)`: a review
-            # round proved that renders more than this close exception. This
+            # Deliberately not `logger.warning(..., exc_info=True)`: that
+            # renders more than this close exception. This
             # `except BaseException` block is already handling the original,
             # still-propagating exception, so Python sets it as this close
             # exception's own `__context__` -- and `exc_info=True` asks the
@@ -593,11 +592,11 @@ async def _opened_full_store(
             # secondary close failure whose original exception carried an
             # exception group with one child: one call the fixed code
             # below makes of the close exception's own formatter, not zero:
-            # a later review round found that dropping it entirely (as an
-            # earlier shape of this fix did, alongside the original
-            # exception a second time, the group, and the child, all of
-            # which stay at zero) was itself a diagnostic regression -- a
-            # frame-only stack says *where* closing failed, never *why*, so
+            # dropping it entirely (as an earlier shape of this fix did,
+            # alongside the original exception a second time, the group, and
+            # the child, all of which stay at zero) would be a diagnostic
+            # regression -- a frame-only stack says *where* closing failed,
+            # never *why*, so
             # an ordinary `PermissionError`, a full disk, or a locked file
             # were all indistinguishable. `_describe_exception` is called
             # here exactly once, on the close exception, which is the same
@@ -624,9 +623,9 @@ async def _opened_full_store(
                     _describe_exception(close_exc),
                     _frame_only_stack(close_exc),
                 )
-                # A later round found a real OS SIGINT delivered here -- after
-                # the warning above was already logged -- absorbed instead of
-                # aborting. `asyncio.run()`'s own SIGINT handler (see
+                # A real OS SIGINT delivered here -- after the warning above
+                # was already logged -- would otherwise be absorbed instead
+                # of aborting. `asyncio.run()`'s own SIGINT handler (see
                 # `asyncio.runners.Runner`) does not raise anything into this
                 # coroutine: on the first Ctrl-C it only calls the main
                 # task's `cancel()`, which *requests* a `CancelledError` but
@@ -691,12 +690,12 @@ def _resolve_for_command(
     ``ConfigError`` is a public library class (see its own docstring), so a
     third-party subclass is realistic, not theoretical -- and a subclass can
     override anything this function would otherwise read off it before
-    ``str(exc)`` is even called. A review round built one whose accessor
-    raised and found it silently downgraded to ``unexpected_error`` (losing
-    the specific diagnosis this branch exists to give and the exit code
-    ``docs/cli.md`` promises categorically for it), and another whose
-    accessor raised ``SystemExit`` and found it escaped with no error object
-    at all. An earlier fix checked ``type(exc) is ConfigError`` before
+    ``str(exc)`` is even called. Reading from a subclass whose accessor
+    raises would silently downgrade it to ``unexpected_error`` (losing the
+    specific diagnosis this branch exists to give and the exit code
+    ``docs/cli.md`` promises categorically for it); reading from one whose
+    accessor raises ``SystemExit`` would escape with no error object at
+    all. An earlier fix checked ``type(exc) is ConfigError`` before
     reading anything off it and re-raised a subclass otherwise, sending it
     through :func:`_error_boundary`'s generic branch instead -- which kept
     the failure path from corrupting, but also silently downgraded the
@@ -707,9 +706,9 @@ def _resolve_for_command(
     not: a ``ConfigError`` subclass genuinely *is* a configuration failure,
     so it keeps ``invalid_config`` / exit ``2`` either way. Only *how the
     message is built* differs -- a subclass gets a fixed literal message
-    instead, with nothing read off it at all. A later review round found
-    that even the hardened, generic :func:`_describe_exception` was not
-    enough here: it still includes ``str(exc)``, which the subclass fully
+    instead, with nothing read off it at all. Even the hardened, generic
+    :func:`_describe_exception` is not enough here: it still includes
+    ``str(exc)``, which the subclass fully
     controls, and a subclass built to return a believable-looking
     fabricated diagnosis would have that fabrication reported as if this
     CLI had produced it. Trading the subclass's detail for a fixed, honest
@@ -719,9 +718,9 @@ def _resolve_for_command(
     can still be hostile.** ``type(exc) is ConfigError`` rules out an
     overridden ``__str__`` on the exception itself, but ``.message`` is
     still whatever value was assigned to it, and nothing stops that value
-    from being something other than a plain ``str`` (a review round found
-    exactly this: an exact ``ConfigError`` carrying a ``str`` subclass whose
-    own formatting misbehaved). So this function reads ``.message`` once
+    from being something other than a plain ``str`` (an exact ``ConfigError``
+    carrying a ``str`` subclass whose own formatting misbehaved is exactly
+    this case). So this function reads ``.message`` once
     and checks ``type(message) is str`` *before* using it anywhere -- a
     type check never calls the value's own methods, unlike ``str(...)`` or
     an f-string interpolation. A message that passes is used directly and
@@ -762,8 +761,7 @@ def _resolve_for_command(
         # keeps the same kind and exit code. The message is a fixed literal
         # instead, with nothing read off the subclass at all -- not even
         # through the hardened describer -- because a believable-looking
-        # fabricated detail (a review round produced exactly that) would be
-        # worse than no detail.
+        # fabricated detail would be worse than no detail.
         _fail(
             as_json=as_json,
             kind="invalid_config",
@@ -1113,26 +1111,26 @@ def link(
                     # engrava.domain.exceptions), so a third-party subclass is
                     # realistic, not theoretical -- and .column /
                     # .referenced_id are as subclass-overridable as any other
-                    # attribute. A review round found a subclass whose
-                    # accessor raised silently downgraded to
-                    # unexpected_error (losing the exit code docs/cli.md
-                    # promises categorically for a missing FROM/TO), and one
-                    # raising SystemExit escaped with no error object at
-                    # all. The class hierarchy is still trustworthy even
-                    # when a subclass's own attributes are not: a
+                    # attribute. Reading from a subclass whose accessor
+                    # raises would silently downgrade it to unexpected_error
+                    # (losing the exit code docs/cli.md promises
+                    # categorically for a missing FROM/TO); reading from one
+                    # raising SystemExit would escape with no error object
+                    # at all. The class hierarchy is still trustworthy
+                    # even when a subclass's own attributes are not: a
                     # ReferentialIntegrityError subclass genuinely *is* a
                     # missing-reference failure, so it keeps
                     # missing_thought / exit 4 either way -- a subclass gets
                     # a fixed literal message, with nothing read off it at
                     # all -- not even through the hardened describer --
                     # because a believable-looking fabricated column or id
-                    # (a review round produced exactly that) would be worse
-                    # than not naming which endpoint is missing.
+                    # would be worse than not naming which endpoint is
+                    # missing.
                     #
                     # An *exact* instance is not automatically safe either --
                     # .column and .referenced_id are still whatever values
-                    # were assigned to them, exact-type or not (a review
-                    # round found a hostile value in exactly this shape).
+                    # were assigned to them, exact-type or not, and either
+                    # can still hold a hostile value in exactly this shape.
                     # So this reads both once and requires each rule below in
                     # order, never comparing or interpolating an unvalidated
                     # value:

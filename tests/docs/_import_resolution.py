@@ -17,10 +17,10 @@ lines later -- is entirely outside what this module checks. A block can
 import only real symbols and still call a method that has never existed on
 any of them; this module reports that block as clean, because it is, by the
 one question this module asks. Verifying attribute access against the type a
-name is bound to is a different, considerably harder problem -- six review
-rounds of an earlier attempt at it (see the version-controlled history this
-module's sibling replaced) kept finding a real Python binding/scoping rule it
-had not modelled, including cases where it stayed silent about a genuine dead
+name is bound to is a different, considerably harder problem -- an earlier
+attempt at it (see the version-controlled history this module's sibling
+replaced) kept finding a real Python binding/scoping rule it had not
+modelled, including cases where it stayed silent about a genuine dead
 symbol. That problem is deliberately out of scope here. Nothing in this
 module infers a name's type from a constructor call, an annotation, or
 anything else -- it looks at import statements and nothing else.
@@ -58,7 +58,7 @@ every node type by hand. ``test_docs_examples_imports.py`` demonstrates that
 directly (a dead import nested inside every kind of statement-body construct
 is still found) and separately proves, from ``ast``'s own grammar, exactly
 which node types could ever legally carry a nested import in the first place
-(``_STATEMENT_BODY_CONTAINERS`` below) -- a review artifact that fails loudly
+(``_STATEMENT_BODY_CONTAINERS`` below) -- a tripwire that fails loudly
 if a future Python version adds a new statement-body construct nobody has
 looked at yet, not a mechanism this module's own correctness depends on.
 """

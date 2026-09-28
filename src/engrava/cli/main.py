@@ -156,19 +156,18 @@ async def _close_quietly(conn: Any) -> None:  # noqa: ANN401
     keeping the event loop alive) open until the real close has actually
     completed, before letting the cancellation propagate.
 
-    **The warning below no longer passes ``exc_info=True``.** A later
-    verification round found this function reached by the memory verbs'
-    own bare/default store tier (``remember`` / ``recall`` / ``link`` with
-    no ``--config``, via ``_opened_db`` above) -- not just the other
-    built-ins this module already owned -- and that ``exc_info=True`` had
-    the same live defect here that a previous round had already fixed at
-    the ``--config``-tier cleanup site in
+    **The warning below no longer passes ``exc_info=True``.** This function
+    is reached by the memory verbs' own bare/default store tier
+    (``remember`` / ``recall`` / ``link`` with no ``--config``, via
+    ``_opened_db`` above) -- not just the other built-ins this module
+    already owned -- and ``exc_info=True`` had the same defect here as the
+    already-fixed ``--config``-tier cleanup site in
     :mod:`engrava.cli.memory_commands`: it asks the standard library's
     traceback formatter to render the close exception through its own
     overridable ``__str__``, and that formatter wraps its own rendering in
     a bare ``except``, so a real OS ``SIGINT`` -- and separately, a
     formatter raising ``SystemExit`` -- arriving during that render was
-    absorbed there instead of propagating, both verified live against this
+    absorbed there instead of propagating, verified live against this
     exact function. Because the close here runs as a separately scheduled,
     shielded task (see above) rather than inline inside the caller's
     ``except`` block, ``exc_info=True``'s chain-walk had nothing to walk
@@ -212,9 +211,9 @@ async def _close_quietly(conn: Any) -> None:  # noqa: ANN401
             _describe_exception(close_exc),
             _frame_only_stack(close_exc),
         )
-        # A later round found a real OS SIGINT delivered here -- after the
-        # warning above was already logged -- absorbed instead of aborting.
-        # `asyncio.run()`'s own SIGINT handler (see `asyncio.runners.Runner`)
+        # A real OS SIGINT delivered here -- after the warning above was
+        # already logged -- would otherwise be absorbed instead of
+        # aborting. `asyncio.run()`'s own SIGINT handler (see `asyncio.runners.Runner`)
         # does not raise anything into this coroutine: on the first Ctrl-C it
         # only calls the main task's `cancel()`, which *requests* a
         # `CancelledError` but only actually throws one in at this

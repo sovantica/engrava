@@ -1855,7 +1855,7 @@ class TestPartialRoleCapabilityFallsBack:
 
 
 class TestDocumentPrefixModelLock:
-    """D3: document-prefix identity and query-prefix pairing in the lock."""
+    """Document-prefix identity and query-prefix pairing in the lock."""
 
     async def test_enabling_document_prefix_on_unprefixed_corpus_raises(
         self,
@@ -2020,7 +2020,7 @@ class TestDocumentPrefixModelLock:
 
 
 class TestPrefixConfigParsing:
-    """D6: config parses the two prefixes and forwards them correctly."""
+    """Config parses the two prefixes and forwards them correctly."""
 
     def test_parse_prefixes(self) -> None:
         cfg = _parse_embeddings(

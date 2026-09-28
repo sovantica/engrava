@@ -606,13 +606,13 @@ class TestTagAncestryUsesTheQualifiedTagRef:
     ref that sits earlier in that order can shadow the real tag entirely.
     ``assert_ref_is_qualified_and_exists`` hardens ``branch`` against exactly
     this ambiguity, but it was never applied to the tag side -- this is the
-    same class of defect three review rounds spent removing from ``--branch``,
-    just on the other argument of the same call.
+    same class of defect already fixed on ``--branch``, just on the other
+    argument of the same call.
 
-    This builds the shape a real reviewer executed: a genuine ``v12.0.0`` tag
-    that is unreachable from ``main``, and a generic ``refs/v12.0.0`` ref
-    (not a tag, not a branch -- a top-level ref under ``refs/``) that *is*
-    reachable from ``main``. ``refs/<name>`` is tried before
+    This builds the shape that reproduces the ambiguity: a genuine
+    ``v12.0.0`` tag that is unreachable from ``main``, and a generic
+    ``refs/v12.0.0`` ref (not a tag, not a branch -- a top-level ref under
+    ``refs/``) that *is* reachable from ``main``. ``refs/<name>`` is tried before
     ``refs/tags/<name>`` in git's search order, so resolving the tag by its
     bare name picks the generic ref instead of the real tag. Before
     qualifying the tag as ``refs/tags/<tag>``, this made the gate report
@@ -679,8 +679,8 @@ class TestListGitTagsSplitsOnlyOnALiteralNewline:
     ``str.splitlines()`` breaks on more than ``"\\n"`` -- it also treats
     U+0085 NEL (among other separators) as a line boundary, and git accepts
     U+0085 inside a tag name (see the module docstring's comment on
-    ``list_git_tags``). A previous review argued that a fragment produced by
-    this fracture was harmless on its own: it would either fail ``TAG_RE``
+    ``list_git_tags``). A tempting argument is that a fragment produced by
+    this fracture is harmless on its own: it would either fail ``TAG_RE``
     or name a ref that does not exist and raise. That argument does not hold
     on its own repository state -- a fragment can still shadow a real,
     lower-numbered release by outranking it in ``newest_version_tag`` and
@@ -734,9 +734,9 @@ class TestListGitTagsIsNotSubjectToPorcelainDisplayConfiguration:
 
     ``git tag -l`` is porcelain -- it formats its output for a human reader
     and honours display configuration that has nothing to do with which
-    tags exist. A reviewer executed this exact shape: with
-    ``column.tag=always`` set and a narrow terminal width (``COLUMNS=20``),
-    ``git tag -l 'v*'`` against a repository with reachable tags up to
+    tags exist. With ``column.tag=always`` set and a narrow terminal width
+    (``COLUMNS=20``), ``git tag -l 'v*'`` against a repository with
+    reachable tags up to
     ``v3.0.0`` and unreachable ``v4.0.0`` and ``v5.0.0`` printed::
 
         v1.0.0  v4.0.0
@@ -1249,11 +1249,11 @@ class TestAssertRefIsQualifiedAndExists:
 
     The previous guard (``assert_ref_is_unambiguous``) tried to enumerate
     git's own name-resolution search order and reject a bare name only when
-    more than one candidate in that order existed. Two review rounds each
-    found a real, executed false green in that enumeration -- a root
-    pseudo-ref colliding with a branch, and an abbreviated object ID
-    colliding with a branch -- because the candidate list was necessarily
-    incomplete. This class pins the replacement: bare names, 'HEAD',
+    more than one candidate in that order existed. That enumeration produced
+    real, executed false greens -- a root pseudo-ref colliding with a
+    branch, and an abbreviated object ID colliding with a branch -- because
+    the candidate list was necessarily incomplete. This class pins the
+    replacement: bare names, 'HEAD',
     abbreviated SHAs, and revision expressions are refused unconditionally,
     regardless of what else they happen to collide with.
     """

@@ -2,19 +2,19 @@
 
 Exercises the core-controlled, per-child, source-first, deferred, non-atomic
 persistence of an extension's derived records against a live
-``SqliteEngravaCore``. Each acceptance criterion of the seam is covered here or
+``SqliteEngravaCore``. Each required behaviour of the seam is covered here or
 in ``tests/domain/test_derived_records_types.py``:
 
-* AC-2  — no demo-consumer / extension import in the core seam.
-* AC-3  — the seam's public types add zero third-party dependencies.
-* AC-4  — ``on_error="log"`` is ordinary logging, no telemetry surface.
-* AC-5  — disabled path is byte-identical (thoughts + edges + journal).
-* AC-6  — hooks without ``derive_records`` run byte-identical (protocol compat).
-* AC-8  — the deterministic structural-split demo consumer.
-* AC-9  — the recursion guard across single / bulk / get-or-create, incl. an
-          adversarial producer that performs a nested public write.
-* AC-10 — fail-open, cancellation propagation, per-family continuation.
-* AC-11 — first-classness (embed/retrieve), conflict-as-reuse, and bounds.
+* no demo-consumer / extension import in the core seam.
+* the seam's public types add zero third-party dependencies.
+* ``on_error="log"`` is ordinary logging, no telemetry surface.
+* disabled path is byte-identical (thoughts + edges + journal).
+* hooks without ``derive_records`` run byte-identical (protocol compat).
+* the deterministic structural-split demo consumer.
+* the recursion guard across single / bulk / get-or-create, incl. an
+  adversarial producer that performs a nested public write.
+* fail-open, cancellation propagation, per-family continuation.
+* first-classness (embed/retrieve), conflict-as-reuse, and bounds.
 
 The explicit ``derive_existing()`` backfill trigger — the on-store seam's
 retroactive counterpart — is covered in its own section at the end of this file
@@ -252,7 +252,7 @@ def _make_store(
 
 
 # ---------------------------------------------------------------------------
-# AC-8 — deterministic structural-split demo consumer
+# Deterministic structural-split demo consumer
 # ---------------------------------------------------------------------------
 
 
@@ -317,7 +317,7 @@ async def test_structural_split_is_idempotent_across_reruns(
 
 
 # ---------------------------------------------------------------------------
-# AC-5 / AC-6 — disabled + protocol-compat byte-identical paths
+# Disabled + protocol-compat byte-identical paths
 # ---------------------------------------------------------------------------
 
 
@@ -377,7 +377,7 @@ async def test_existing_hooks_still_receive_on_store(db: aiosqlite.Connection) -
 
 
 # ---------------------------------------------------------------------------
-# AC-9 — recursion guard (single / bulk / get-or-create + adversarial nested)
+# Recursion guard (single / bulk / get-or-create + adversarial nested)
 # ---------------------------------------------------------------------------
 
 
@@ -439,7 +439,7 @@ async def test_get_or_create_dispatches_on_create_not_on_hit(
 
 
 # ---------------------------------------------------------------------------
-# AC-10 — fail-open, cancellation, continuation
+# Fail-open, cancellation, continuation
 # ---------------------------------------------------------------------------
 
 
@@ -521,7 +521,7 @@ async def test_child_failure_raise_aborts_remaining(
 
 
 # ---------------------------------------------------------------------------
-# AC-11 — first-classness, conflict-as-reuse, bounds
+# First-classness, conflict-as-reuse, bounds
 # ---------------------------------------------------------------------------
 
 
@@ -643,7 +643,7 @@ async def test_lazy_sequence_is_bounded_to_cap_plus_one(
 
 
 # ---------------------------------------------------------------------------
-# AC-2 / AC-3 — surface hygiene (no extension import in core; zero new deps)
+# Surface hygiene (no extension import in core; zero new deps)
 # ---------------------------------------------------------------------------
 
 _ALLOWED_TOP_MODULES = frozenset(
@@ -652,7 +652,7 @@ _ALLOWED_TOP_MODULES = frozenset(
 
 
 def test_seam_types_import_no_third_party_packages() -> None:
-    """The seam's public types module depends only on stdlib + engrava (AC-3)."""
+    """The seam's public types module depends only on stdlib + engrava."""
     source = Path(core_module.__file__).parent.parent.parent
     module_path = source / "domain" / "protocols" / "derived_records.py"
     tree = ast.parse(module_path.read_text(encoding="utf-8"))
@@ -666,7 +666,7 @@ def test_seam_types_import_no_third_party_packages() -> None:
 
 
 def test_core_seam_does_not_import_demo_consumer() -> None:
-    """The core does not import the demo (or any) derived-record producer (AC-2)."""
+    """The core does not import the demo (or any) derived-record producer."""
     core_source = Path(core_module.__file__).read_text(encoding="utf-8")
     assert "structural_split" not in core_source
     assert "StructuralSplitProducer" not in core_source
@@ -983,7 +983,7 @@ def test_dispatch_derivation_has_exactly_two_call_sites() -> None:
 
 
 # ---------------------------------------------------------------------------
-# R2-1 — a dedup / hash hit never dispatches derivation (D5), embeddings OFF
+# A dedup / hash hit never dispatches derivation, embeddings OFF
 # ---------------------------------------------------------------------------
 
 
@@ -1013,7 +1013,7 @@ async def test_bulk_dedup_hit_never_derives_with_embeddings_off(
 
 
 # ---------------------------------------------------------------------------
-# R2-2 — documented contract: a create inside a caller-held transaction does not
+# Documented contract: a create inside a caller-held transaction does not
 # auto-derive; derivation is triggered by an explicit re-run / backfill.
 # ---------------------------------------------------------------------------
 
@@ -1023,7 +1023,7 @@ async def test_create_inside_caller_suspend_does_not_auto_derive(
 ) -> None:
     """A create in a caller-held transaction does not auto-derive; backfill does.
 
-    Documented contract (ADR D8): derivation fires only on a durably
+    Documented contract: derivation fires only on a durably
     auto-committed create. A caller that writes inside its own
     ``suspend_auto_commit`` window owns that transaction, so the source is not
     yet durable and derivation is not dispatched — the caller triggers it with an
@@ -1070,7 +1070,7 @@ async def test_caller_suspend_rollback_does_not_derive(
 
 
 # ---------------------------------------------------------------------------
-# R2-2b — the derivation gate is asked of the current task's own window only,
+# The derivation gate is asked of the current task's own window only,
 # never of another task's, or a window this task's marker no longer names.
 # ---------------------------------------------------------------------------
 
@@ -1373,7 +1373,7 @@ async def test_cancellation_inside_window_unregisters_and_resets_marker(
 
 
 # ---------------------------------------------------------------------------
-# R2-3 — conflict-as-reuse enrichment targets the STORED row, never producer content
+# Conflict-as-reuse enrichment targets the STORED row, never producer content
 # ---------------------------------------------------------------------------
 
 
@@ -1425,7 +1425,7 @@ async def test_reuse_never_attaches_producer_content_vector_to_foreign_row(
 
 
 # ---------------------------------------------------------------------------
-# R2-4 — combining-mark truncation degenerate cases
+# Combining-mark truncation degenerate cases
 # ---------------------------------------------------------------------------
 
 
@@ -2994,13 +2994,13 @@ class BackfillReentrantProducer(DefaultEngravaHooks):
         return [_child("the only child")]
 
 
-# --- AC-4: convergence with the on-store path + idempotency -----------------
+# --- Convergence with the on-store path + idempotency -----------------
 
 
 async def test_backfill_of_on_store_source_is_byte_identical_noop(
     db: aiosqlite.Connection,
 ) -> None:
-    """AC-4 (primary): backfilling an already-derived source is a byte-identical
+    """Backfilling an already-derived source is a byte-identical
     no-op — every child + edge is reused, nothing is created, and a second
     backfill is identical (idempotent)."""
     store = _make_store(db, StructuralSplitProducer(), DeriveGates(enabled=True))
@@ -3022,7 +3022,7 @@ async def test_backfill_of_on_store_source_is_byte_identical_noop(
 
 
 async def test_backfill_children_and_edges_match_on_store_from_scratch() -> None:
-    """AC-4: children + edges created by a from-scratch backfill are byte-
+    """Children + edges created by a from-scratch backfill are byte-
     identical (deterministic fields) to those an on-store write would produce for
     the same content — proving convergence, not merely reuse."""
     content = "Alpha para.\n\nBeta para."
@@ -3058,7 +3058,7 @@ async def test_backfill_children_and_edges_match_on_store_from_scratch() -> None
 
 
 async def test_backfill_is_idempotent_across_reruns(db: aiosqlite.Connection) -> None:
-    """AC-4: the first backfill creates every child; a re-run reuses them all and
+    """The first backfill creates every child; a re-run reuses them all and
     leaves the store unchanged."""
     store = _make_store(db, StructuralSplitProducer(), DeriveGates(enabled=False))
     await store.create_thought(_source(content="One.\n\nTwo.\n\nThree."))
@@ -3077,7 +3077,7 @@ async def test_backfill_is_idempotent_across_reruns(db: aiosqlite.Connection) ->
 async def test_backfill_reuses_preexisting_child_in_counts(
     db: aiosqlite.Connection,
 ) -> None:
-    """AC-4: a child colliding with a pre-existing row is reused (not re-created)
+    """A child colliding with a pre-existing row is reused (not re-created)
     and reported as ``reused`` in the result counts."""
     child_content = "Second para."
     preexisting_id = _derived_thought_id(child_content)
@@ -3103,11 +3103,11 @@ async def test_backfill_reuses_preexisting_child_in_counts(
     assert result == DeriveResult(thought_id="src-1", created=1, reused=1, skipped=0)
 
 
-# --- AC-7: capability-present gating, independent of enabled -----------------
+# --- Capability-present gating, independent of enabled -----------------
 
 
 async def test_backfill_runs_with_seam_disabled(db: aiosqlite.Connection) -> None:
-    """AC-7: backfill runs on capability-present alone — the on-store trigger is
+    """Backfill runs on capability-present alone — the on-store trigger is
     off (``enabled=False``) so only the explicit call derives."""
     store = _make_store(db, StructuralSplitProducer(), DeriveGates(enabled=False))
     await store.create_thought(_source(content="A.\n\nB."))
@@ -3121,7 +3121,7 @@ async def test_backfill_runs_with_seam_disabled(db: aiosqlite.Connection) -> Non
 async def test_backfill_without_producer_is_clean_noop(
     db: aiosqlite.Connection,
 ) -> None:
-    """AC-7: with no producer capability registered, backfill is a clean no-op."""
+    """With no producer capability registered, backfill is a clean no-op."""
     store = _make_store(db, DefaultEngravaHooks(), DeriveGates(enabled=True))
     await store.create_thought(_source(content="A.\n\nB."))
     result = await store.derive_existing("src-1")
@@ -3130,7 +3130,7 @@ async def test_backfill_without_producer_is_clean_noop(
 
 
 async def test_backfill_honors_cap_under_raise(db: aiosqlite.Connection) -> None:
-    """AC-7: backfill honours ``max_derived_per_source`` — an over-cap return is
+    """Backfill honours ``max_derived_per_source`` — an over-cap return is
     rejected before any child write."""
     producer = ListProducer([_child(f"c{i}") for i in range(5)])
     store = _make_store(
@@ -3159,13 +3159,13 @@ async def test_backfill_within_suspended_commit_joins_caller_transaction(
     assert await _count(db, "SELECT COUNT(*) FROM thought") == 3
 
 
-# --- AC-8: not-found (typed error) vs ineligible (clean skip) ----------------
+# --- Not-found (typed error) vs ineligible (clean skip) ----------------
 
 
 async def test_backfill_missing_source_raises_typed_error(
     db: aiosqlite.Connection,
 ) -> None:
-    """AC-8: a missing source id raises the typed error, never a silent no-op."""
+    """A missing source id raises the typed error, never a silent no-op."""
     store = _make_store(db, StructuralSplitProducer(), DeriveGates(enabled=False))
     with pytest.raises(SourceThoughtNotFoundError):
         await store.derive_existing("nonexistent-id")
@@ -3174,7 +3174,7 @@ async def test_backfill_missing_source_raises_typed_error(
 async def test_backfill_does_not_re_derive_a_derived_record(
     db: aiosqlite.Connection,
 ) -> None:
-    """AC-8/AC-5: a source that is itself a derived record is a clean skip — the
+    """A source that is itself a derived record is a clean skip — the
     producer is never invoked on it and no grandchild is created."""
     producer = EchoDeriveProducer()
     store = _make_store(db, producer, DeriveGates(enabled=True))
@@ -3191,13 +3191,13 @@ async def test_backfill_does_not_re_derive_a_derived_record(
     assert await store.get_thought(_derived_thought_id("X [d] [d]")) is None
 
 
-# --- AC-5: recursion guard (depth <= 1, nested writes, nested backfill) ------
+# --- Recursion guard (depth <= 1, nested writes, nested backfill) ------
 
 
 async def test_backfill_recursion_guard_blocks_nested_write(
     db: aiosqlite.Connection,
 ) -> None:
-    """AC-5: a nested public write a producer issues *during backfill* does not
+    """A nested public write a producer issues *during backfill* does not
     re-dispatch — depth stays at most one (no runaway recursion)."""
     producer = NestedWriteProducer()
     store = _make_store(db, producer, DeriveGates(enabled=True))
@@ -3217,8 +3217,9 @@ async def test_backfill_recursion_guard_blocks_nested_write(
 async def test_backfill_nested_derive_existing_is_a_noop(
     db: aiosqlite.Connection,
 ) -> None:
-    """AC-5 (strongest): a ``derive_existing`` invoked from within a derivation is
-    a no-op — it ignores ``enabled``, so *only* the recursion guard stops it."""
+    """The strongest test of the recursion guard: a ``derive_existing`` invoked
+    from within a derivation is a no-op — it ignores ``enabled``, so *only*
+    the recursion guard stops it."""
     producer = BackfillReentrantProducer()
     store = _make_store(db, producer, DeriveGates(enabled=False))
     producer.store = store
@@ -3232,13 +3233,13 @@ async def test_backfill_nested_derive_existing_is_a_noop(
     assert result == DeriveResult(thought_id="src-1", created=1, reused=0, skipped=0)
 
 
-# --- AC-6: fail-open, per-child isolation, cancellation ---------------------
+# --- Fail-open, per-child isolation, cancellation ---------------------
 
 
 async def test_backfill_producer_error_raise_keeps_source_durable(
     db: aiosqlite.Connection,
 ) -> None:
-    """AC-6: ``on_error='raise'`` re-raises, but the source stays durable."""
+    """``on_error='raise'`` re-raises, but the source stays durable."""
     producer = RaisingProducer()
     store = _make_store(db, producer, DeriveGates(enabled=False, on_error="raise"))
     await store.create_thought(_source())
@@ -3251,7 +3252,7 @@ async def test_backfill_producer_error_log_swallows(
     db: aiosqlite.Connection,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """AC-6: ``on_error='log'`` swallows the producer failure with ordinary logging."""
+    """``on_error='log'`` swallows the producer failure with ordinary logging."""
     producer = RaisingProducer()
     store = _make_store(db, producer, DeriveGates(enabled=False, on_error="log"))
     await store.create_thought(_source())
@@ -3267,7 +3268,7 @@ async def test_backfill_cancellation_propagates(
     db: aiosqlite.Connection,
     on_error: str,
 ) -> None:
-    """AC-6: a cancelled ``derive_records`` propagates ``CancelledError`` either way,
+    """A cancelled ``derive_records`` propagates ``CancelledError`` either way,
     leaving the source durable."""
     store = _make_store(
         db,
@@ -3281,7 +3282,7 @@ async def test_backfill_cancellation_propagates(
 
 
 async def test_backfill_child_failure_is_isolated_and_journal_valid() -> None:
-    """AC-6: a per-child failure under ``on_error='log'`` is isolated — it is
+    """A per-child failure under ``on_error='log'`` is isolated — it is
     counted as skipped, the other children commit, the source stays durable, and
     the journal hash-chain remains valid (no orphan / torn transaction)."""
     collide = "poison content"
@@ -3318,7 +3319,7 @@ async def test_backfill_child_failure_is_isolated_and_journal_valid() -> None:
 
 
 async def test_backfill_raise_in_suspend_window_rolls_back_caller_writes_source_survives() -> None:
-    """AC-6: a raising backfill inside a caller transaction rolls the whole window
+    """A raising backfill inside a caller transaction rolls the whole window
     back — the caller's unrelated write included — while the source stays durable.
 
     Under a caller-held ``suspend_auto_commit`` window with ``on_error="raise"`` a
@@ -3381,13 +3382,13 @@ async def test_backfill_raise_in_suspend_window_rolls_back_caller_writes_source_
     await conn.close()
 
 
-# --- AC-10/AC-11: non-LLM demo + first-classness ----------------------------
+# --- Non-LLM demo + first-classness ----------------------------
 
 
 async def test_structural_split_backfill_is_non_llm_demo(
     db: aiosqlite.Connection,
 ) -> None:
-    """AC-10: a deterministic structural-split producer backfilled via
+    """A deterministic structural-split producer backfilled via
     ``derive_existing`` — one linked child per paragraph, no LLM."""
     store = _make_store(db, StructuralSplitProducer(), DeriveGates(enabled=False))
     await store.create_thought(_source(content="One.\n\nTwo.\n\nThree."))
@@ -3403,7 +3404,7 @@ async def test_structural_split_backfill_is_non_llm_demo(
 async def test_backfilled_children_are_embedded_and_retrievable(
     db: aiosqlite.Connection,
 ) -> None:
-    """AC-11: backfilled children run the ordinary lifecycle — embedded + linked."""
+    """Backfilled children run the ordinary lifecycle — embedded + linked."""
     provider = CallbackProvider(_hash_embed, dimension=8, model_name="hash-8")
     store = _make_store(
         db,

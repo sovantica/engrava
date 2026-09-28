@@ -217,7 +217,8 @@ class TestSelfAnchoredMetadata:
 
 
 # ---------------------------------------------------------------------------
-# OFF / ON pair contracts — used by the AC-9 floor and the AC-8 sanity band.
+# OFF / ON pair contracts — used by the synthesis-coverage / direct-neutrality
+# floors and the sanity band.
 # ---------------------------------------------------------------------------
 
 
@@ -283,7 +284,7 @@ class TestOffOnPair:
 
 
 # ---------------------------------------------------------------------------
-# Public-export discipline — AC-14
+# Public-export discipline
 # ---------------------------------------------------------------------------
 
 

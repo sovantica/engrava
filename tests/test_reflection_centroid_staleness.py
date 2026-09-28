@@ -172,7 +172,7 @@ def _cosine(a: list[float], b: list[float]) -> float:
 
 
 # ---------------------------------------------------------------------------
-# D2 — centroid re-bind on essence/content evolve
+# Centroid re-bind on essence/content evolve
 # ---------------------------------------------------------------------------
 
 
@@ -227,7 +227,7 @@ class TestCentroidRebindOnEvolve:
 
 
 # ---------------------------------------------------------------------------
-# D2 guard — metadata-only edits MUST NOT re-bind
+# Guard: metadata-only edits MUST NOT re-bind
 # ---------------------------------------------------------------------------
 
 
@@ -261,7 +261,7 @@ class TestMetadataOnlyDoesNotRebind:
 
 
 # ---------------------------------------------------------------------------
-# D3 / 009 — recall reflects current state; fresh not suppressed
+# Recall reflects current state; fresh not suppressed
 # ---------------------------------------------------------------------------
 
 

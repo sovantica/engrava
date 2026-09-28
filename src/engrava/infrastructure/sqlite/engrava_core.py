@@ -6111,8 +6111,7 @@ class SqliteEngravaCore:
         return await cursor.fetchone()
 
     async def _get_edge_row(self, edge_id: str) -> aiosqlite.Row | None:
-        # Write-lock classification: not a write path at all -- a plain SELECT,
-        # included here only because an earlier review candidate list named it.
+        # Write-lock classification: not a write path at all -- a plain SELECT.
         """Fetch a raw edge row without applying transformations.
 
         Args:
@@ -6502,14 +6501,14 @@ class SqliteEngravaCore:
         batch sees ``in_transaction`` already ``True`` and correctly takes no
         further lock of its own — it is already covered by the one still open.
 
-        **This method commits nothing, on any path.** Three rounds of a
-        separate-LLM review found a new defect every time this guard tried to
-        infer, at its own exit, whether a transaction it saw open was still
-        the one it started: a frozen flag went stale the moment a nested
-        write committed early; a live ``in_transaction`` read could not tell
-        this call's own leftover work apart from a different, genuinely
-        concurrent task's; a per-call token protecting that read then made
-        the guard skip a commit some *other* code still depended on it for.
+        **This method commits nothing, on any path.** Inferring, at this
+        guard's own exit, whether a transaction it saw open was still the
+        one it started produced a new defect each time it was tried: a
+        frozen flag went stale the moment a nested write committed early; a
+        live ``in_transaction`` read could not tell this call's own leftover
+        work apart from a different, genuinely concurrent task's; a per-call
+        token protecting that read then made the guard skip a commit some
+        *other* code still depended on it for.
         The common cause was not any one of those mechanisms — it was asking
         the guard to know something a shared connection does not expose:
         which open transaction is "ours". The fix is to stop asking. Whoever
@@ -7725,7 +7724,7 @@ class SqliteEngravaCore:
         # the batch's own lock acquisition would be invisible to it, so this
         # call's own row could be misclassified as newly-created when it was
         # actually a pre-existing row a dedup hit resolved to — re-embedding
-        # and, worse, re-deriving from it, against the D5 guarantee that a
+        # and, worse, re-deriving from it, against the guarantee that a
         # dedup hit never derives. It is now taken inside
         # ``_bulk_store_inner``'s own ``suspend_auto_commit`` window, which
         # holds ``_write_lock`` for the window's whole duration, so no
@@ -7805,12 +7804,12 @@ class SqliteEngravaCore:
         opening a transaction that was never going to complete. Only
         genuinely-inserted records — those whose id was absent before the
         batch and not inserted earlier in it, i.e. dedup / hash hits excluded
-        (D5) — are collected as ``newly_created``. **After** the batch
+        — are collected as ``newly_created``. **After** the batch
         commits and is durable (the ``async with`` has exited), derivation is
         dispatched locally, per newly-created record, off the batch
         transaction, each child its own guarded durable unit; a
         producer/child failure there can never roll back a committed source
-        or child (D3/D10). There is no shared instance buffer —
+        or child. There is no shared instance buffer —
         ``newly_created`` is a local variable of this call.
 
         Args:
@@ -7853,7 +7852,7 @@ class SqliteEngravaCore:
             # freshly inserted, and thus the ones that need embedding and are
             # eligible for derivation. Taken whenever embedding OR the
             # derived-records seam is active, so a dedup hit never derives
-            # even with auto-embed off (D5).
+            # even with auto-embed off.
             pre_existing_ids: set[str] = set()
             if embed_active or derivation_active:
                 pre_existing_ids = await self._existing_thought_ids()
@@ -8009,7 +8008,7 @@ class SqliteEngravaCore:
         if _IN_DERIVATION.get():
             return DeriveResult(thought_id=thought_id)
         # Capability-present gate — deliberately independent of DeriveGates.enabled
-        # (that master switch governs only the automatic on-store trigger, D4).
+        # (that master switch governs only the automatic on-store trigger).
         if not isinstance(self._hooks, DerivedRecordProducerProtocol):
             return DeriveResult(thought_id=thought_id)
         producer: DerivedRecordProducerProtocol = self._hooks
@@ -8074,9 +8073,9 @@ class SqliteEngravaCore:
         ``bulk_store`` instead dispatches derivation locally, per newly-created
         record, *after* its batch commits; a caller writing inside its own
         ``suspend_auto_commit`` window triggers derivation via an explicit
-        re-run/backfill (ADR D8 — recoverability, not automatic recovery). A
+        re-run/backfill -- recoverability, not automatic recovery. A
         dedup / hash hit never reaches this method (those return before the
-        dispatch call in ``create_thought``), so only genuine inserts derive (D5).
+        dispatch call in ``create_thought``), so only genuine inserts derive.
 
         The recursion guard (:data:`_IN_DERIVATION`) is set for the whole
         dispatch — including any nested public write a (contract-violating)
@@ -8311,7 +8310,7 @@ class SqliteEngravaCore:
         the edge insert is conflict-safe. So a re-run over a child that committed
         but never got enriched — e.g. a crash or cancellation between the child's
         commit and its post-commit embedding/edge — completes the enrichment
-        idempotently (D8/D10 recoverability).
+        idempotently -- recoverability, not atomic enrichment.
 
         Enrichment always targets the **stored** row's own content, never the
         producer's content. On a conflict-as-reuse hit the stored row may differ
@@ -8323,7 +8322,7 @@ class SqliteEngravaCore:
         Per-child transaction isolation: a child's **row** commits as its own
         durable unit; its enrichment (embedding, ``DERIVED_FROM`` edge) completes
         afterward, so a child may be durably present yet not-yet-enriched — a
-        recoverable partial state (D10), not atomic enrichment. **A failed step
+        recoverable partial state, not atomic enrichment. **A failed step
         undoes only itself, in every transaction context — including inside a
         caller's own ``suspend_auto_commit`` window or raw ``BEGIN``.** The row
         insert and its journal append (:meth:`_insert_derived_row`) are one
@@ -14236,8 +14235,8 @@ class SqliteEngravaCore:
         :meth:`cleanup_expired` (an ``UPDATE`` of ``lifecycle_status`` /
         ``expires_at``, not an ``evolve`` transition). Using the direct write is
         deliberate: it lets a ``CREATED`` thought be archived even though the
-        lifecycle state machine only permits ``CREATED -> ACTIVE`` (the ADR's
-        candidate set is ACTIVE **and** CREATED), matching how TTL archival flips
+        lifecycle state machine only permits ``CREATED -> ACTIVE`` (hygiene's
+        eligible candidate set is ACTIVE **and** CREATED), matching how TTL archival flips
         any expired row regardless of its current state. The write also stamps
         ``archived_at_cycle = current_cycle`` and the wall-clock
         ``archived_at = now`` (the two hygiene-archival markers, cleared together
@@ -16128,10 +16127,11 @@ def _retain_ranked_by_unit(
     unit_keys: dict[str, tuple[object, ...] | None],
     max_per_unit: int,
 ) -> list[tuple[str, float]]:
-    """Retain up to ``max_per_unit`` best rows per unit on a D8-ranked list.
+    """Retain up to ``max_per_unit`` best rows per unit on an already-ranked list.
 
-    Walks ``ranked`` top-down (it is already in the D8 total order, so the
-    members of each unit are visited highest-ranked first). A row is admitted
+    Walks ``ranked`` top-down (it is already in the caller's deterministic
+    ranking order, so the members of each unit are visited highest-ranked
+    first). A row is admitted
     unless its unit key has already reached ``max_per_unit`` admitted members,
     in which case the surplus lower-ranked member is dropped. A row whose unit
     key is ``None`` (missing / malformed metadata, or a composite with any-NULL
@@ -16143,17 +16143,20 @@ def _retain_ranked_by_unit(
     relaxation that keeps a unit's deeper members too — the intra-unit
     retention count is the only thing that changes, never which distinct units
     are eligible. The relative order of the surviving rows is preserved from
-    ``ranked`` (already the D8 order), so no re-sort with a new rule is
-    introduced; retention and final order both derive from the single D8 order.
+    ``ranked`` (already in that order), so no re-sort with a new rule is
+    introduced; retention and final order both derive from that single
+    ranking order.
 
     Args:
-        ranked: ``(thought_id, score)`` pairs in D8 total order.
+        ranked: ``(thought_id, score)`` pairs already in the caller's
+            deterministic ranking order.
         unit_keys: Map from ``thought_id`` to its unit-key tuple, or ``None``
             for a key-less row. Missing ids are treated as ``None``.
         max_per_unit: Maximum admitted members per non-None unit (``>= 1``).
 
     Returns:
-        The retained ``(thought_id, score)`` list, D8 order preserved.
+        The retained ``(thought_id, score)`` list, with that ranking order
+        preserved.
 
     """
     unit_counts: dict[tuple[object, ...], int] = {}
@@ -16177,7 +16180,7 @@ def _collapse_ranked_by_unit(
     ranked: list[tuple[str, float]],
     unit_keys: dict[str, tuple[object, ...] | None],
 ) -> list[tuple[str, float]]:
-    """Collapse a D8-ranked candidate list to one best row per unit.
+    """Collapse an already-ranked candidate list to one best row per unit.
 
     The single-keeper special case of :func:`_retain_ranked_by_unit`
     (``max_per_unit=1``): the first (highest-ranked) member of each **non-None**
@@ -16185,12 +16188,14 @@ def _collapse_ranked_by_unit(
     Key-less rows (``None`` unit key) always pass through as their own unit.
 
     Args:
-        ranked: ``(thought_id, score)`` pairs in D8 total order.
+        ranked: ``(thought_id, score)`` pairs already in the caller's
+            deterministic ranking order.
         unit_keys: Map from ``thought_id`` to its unit-key tuple, or ``None``
             for a key-less row. Missing ids are treated as ``None``.
 
     Returns:
-        The collapsed ``(thought_id, score)`` list, D8 order preserved.
+        The collapsed ``(thought_id, score)`` list, with that ranking order
+        preserved.
 
     """
     return _retain_ranked_by_unit(ranked, unit_keys, max_per_unit=1)

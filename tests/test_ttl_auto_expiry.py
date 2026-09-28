@@ -1133,7 +1133,7 @@ class TestSqliteVecExpiredFilter:
         """The all-unresolvable case: dropping every id must not fall back to keeping them.
 
         A degenerate empty-eligible-set result must not be read as "nothing
-        to exclude, return the input unchanged" — the pre-D3 exclusion-form
+        to exclude, return the input unchanged" — the earlier exclusion-form
         query had exactly that shortcut, and inverting the polarity without
         also dropping it would silently keep every phantom hit whenever none
         of them happened to resolve.

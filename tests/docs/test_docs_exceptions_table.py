@@ -84,9 +84,9 @@ is a content check, not a byte-for-byte text-identity check, and an indented
 heading on either side is not worth a red build (see
 ``test_gate_accepts_an_indented_heading_and_indented_terminator``).
 
-This narrow a scope is deliberate and cost something to arrive at. Review kept
-finding a new way a *structural* model of "the table" could be
-fooled — a decoy under a subheading, a commented-out table, a fenced table,
+This narrow a scope is deliberate and cost something to arrive at. A
+*structural* model of "the table" kept being fooled in a new way
+— a decoy under a subheading, a commented-out table, a fenced table,
 indentation edge cases, escaped pipes, a plausible second table with
 plain-text rows, a stale row hiding in the separator's position, a linked
 name, an extra column, a deprecation annotation, a same-shaped header
@@ -532,7 +532,7 @@ def test_real_documentation_table_body_is_nonempty() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Gate-behaviour pins: build every counterexample raised in review as a real
+# Gate-behaviour pins: build every counterexample as a real
 # decoy document (via monkeypatching API_REFERENCE, and where needed
 # _exported_exception_classes) and assert the real production test functions
 # above actually go red — or, for the false-red guards, stay green — on it.

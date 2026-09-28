@@ -508,16 +508,18 @@ class TestRecurrenceGuardCatchesAnUnprotectedAppend:
 
 
 # ---------------------------------------------------------------------------
-# Three more scratch mutations, one per rule the guard was found not to
-# enforce on review: an exempt function whose only append is deleted (so it
-# has zero call nodes and drops out of the by-function scan entirely), an
-# exempt function renamed so its registered name no longer exists, and an
-# append placed inside the savepoint helper's own context expression (so it
-# is evaluated *before* the block it sits under opens).
+# Three more scratch mutations, each a different way an append can be
+# missed or misjudged: a function registered as exempt for one append whose
+# only append is deleted, which must be reported as a count mismatch rather
+# than drop out of the by-function scan (zero call nodes); a registration pointing at a
+# function name that no longer exists; and an append placed inside the
+# savepoint helper's own context expression, which runs before the
+# savepoint opens and so must be judged exactly as if no savepoint were
+# present.
 # ---------------------------------------------------------------------------
 
 
-class TestRecurrenceGuardCatchesAStaleOrMisscopedRegistration:
+class TestRecurrenceGuardCatchesEveryWayAnAppendCanBeMissed:
     def test_exempt_function_with_its_only_append_removed(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -601,10 +603,10 @@ class TestRecurrenceGuardCatchesAStaleOrMisscopedRegistration:
 
 
 # ---------------------------------------------------------------------------
-# Two more scratch mutations for a fourth gap found on review: a registered
-# helper or exemption identified only by bare name would take a same-named
-# method on an unrelated class for the real one, and would miss a real,
-# unwrapped call site of the real one written with an unusual receiver.
+# Two more scratch mutations for a fourth gap: a registered helper or
+# exemption identified only by bare name would take a same-named method on
+# an unrelated class for the real one, and would miss a real, unwrapped
+# call site of the real one written with an unusual receiver.
 # ---------------------------------------------------------------------------
 
 

@@ -15,7 +15,7 @@ surface for one acceptance criterion:
 
 Exit code is ``0`` iff all four binding ACs pass, ``1`` if any
 binding AC fails, ``2`` if the embeddings extras are missing.
-Reference-hardware walltime is ~5 minutes (AC-11 v0.3.0 ceiling is
+Reference-hardware walltime is ~5 minutes (the v0.3.0 ceiling is
 300 seconds; a follow-up evaluator-optimisation workstream tightens
 to 120 seconds).
 

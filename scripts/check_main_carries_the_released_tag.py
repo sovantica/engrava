@@ -101,8 +101,7 @@ def list_git_tags() -> list[str]:
     reachable one is reported as the newest, and the gate passes when it
     should not. ``--no-column`` closes that one report; it was rejected in
     favour of ``for-each-ref`` because column formatting is a property of
-    porcelain commands in general, not a single flag on this one, and a
-    reviewer already spent three rounds on this module discovering that
+    porcelain commands in general, not a single flag on this one, and
     enumerating porcelain behaviour instead of avoiding it keeps being
     incomplete (see :func:`assert_ref_is_qualified_and_exists`). Executed
     checks against git 2.51.0: ``for-each-ref`` output is identical with and
@@ -521,25 +520,15 @@ def _write(stream: TextIO, text: str) -> None:
 
     Every write ``main()`` makes -- on both the success path and the error
     path -- goes through this single function rather than calling
-    ``stream.write`` directly. A previous round only wrapped the one
-    interpolation inside the ``except GateInputError`` branch; that covered
-    the message built from a caught error, but ``run_gate()``'s
-    success-path report also interpolates the checked ``branch`` verbatim
-    into a "branch checked: ..." line, and that write was never routed
-    through any sanitiser -- it went straight to ``sys.stdout.write``. An
-    *existing* branch whose name is not valid UTF-8 passes both validation
-    and the ancestry check without incident and then crashes while the
-    result is being printed.
-
-    Sanitising once here, at the point every write funnels through, was
-    chosen over sanitising each interpolation site individually (the
-    approach the previous round took) because a per-site fix only covers
-    the sites someone remembered to wrap -- which is exactly how the
-    success-path write was missed the first time. A single choke point
-    means a write added later is safe by construction, without depending on
-    its author to know which values can carry an unpaired surrogate, or
-    what encoding the stream it lands on actually has (see
-    :func:`_safe_for_stream`).
+    ``stream.write`` directly, so each one is made safe for the stream's
+    encoding (see :func:`_safe_for_stream`). That includes the success-path
+    report, which interpolates the checked ``branch`` verbatim into a
+    "branch checked: ..." line: an existing branch whose name is not valid
+    UTF-8 passes validation and the ancestry check, and its name reaches
+    that line. Sanitising at the one point every write goes through, rather
+    than at each interpolation site, covers a write added later without its
+    author having to know which values can carry an unpaired surrogate or
+    what encoding the stream has.
     """
     stream.write(_safe_for_stream(text, stream) + "\n")
 

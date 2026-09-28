@@ -2883,7 +2883,7 @@ class TestRestoreRefusesCollisionAgainstAJournalledStore:
 
         ``colliding_snapshot`` carries a thought whose ID (``t-old-0``) matches
         one already in ``journalled_db``, with different essence/content --
-        exactly the mismatch a reviewer once reported as silently accepted.
+        exactly the mismatch that was once silently accepted.
         """
         assert _journal_entry_count(journalled_db) == 3
         before_deltas = _journal_entry_deltas(journalled_db, "t-old-0")
@@ -4941,8 +4941,7 @@ class TestRestoreBootstrapWindowClosesOnFailure:
     connection exactly like the corrupt-file case -- just through a
     different call, with a target file that is itself perfectly valid. The
     ``corrupt_db`` tests above are blind to this: they all fail inside
-    ``_open_db``, which was already closing correctly before this round of
-    fixes even started.
+    ``_open_db``, which was already closing correctly before this fix.
     """
 
     def test_restore_bootstrap_failure_is_not_a_hang(self, tmp_path: Path) -> None:
@@ -5169,8 +5168,8 @@ class _SystemExitOnCloseStrConnection:
 
 
 class TestCliCloseQuietlyDisclosesWhyNotJustWhere:
-    """A verification round found the bare/default store tier's ``_close_quietly``
-    still passing ``exc_info=True`` after the ``--config`` tier's own cleanup log
+    """The bare/default store tier's ``_close_quietly`` was still passing
+    ``exc_info=True`` after the ``--config`` tier's own cleanup log
     (``memory_commands._opened_full_store``) had already been fixed to stop doing
     that. ``exc_info=True`` asks the standard library's traceback formatter to
     render the close exception a second, unguarded way -- and, separately, an

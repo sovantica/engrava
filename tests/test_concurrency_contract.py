@@ -886,8 +886,8 @@ class TestInProcessCriticalSection:
         ``suspend_auto_commit``'s window, which holds ``_write_lock`` for its
         whole duration — so the lock's acquire bound has to clear that
         legitimate, genuinely slow round trip, not just "ordinary" contention.
-        This is the case the fix for the review's F1 follow-up exists to
-        protect: an unrelated task's write must still succeed after waiting
+        This is the case the fix exists to protect: an unrelated task's
+        write must still succeed after waiting
         out a slow-but-real embedding call, never time out on it. The
         embedding provider below is deliberately slower than the store's
         configured bound would be *if it were sized wrong* (a plain
@@ -1320,7 +1320,7 @@ class TestInProcessCriticalSection:
         # acquisition, and not raced by the writer's own commit closing the
         # transaction first.
         assert not db.in_transaction
-        # Per-child transaction isolation (D10): the derived child's *row*
+        # Per-child transaction isolation: the derived child's *row*
         # already committed as its own durable unit in the insert phase --
         # that is unaffected by a later embed-phase failure and correctly
         # survives. What store_embedding's own unit unwinds is only its own

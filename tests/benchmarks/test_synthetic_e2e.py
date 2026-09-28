@@ -8,7 +8,7 @@ Two binding gates land here:
   least 80 % of the synthesis questions.  Measured via
   :func:`measure_synthesis_coverage`, which inspects post-dreaming
   store state directly and is invariant to retrieval-layer ranking
-  knobs.  Retrieval surfacing (AC-9c) is deferred to a follow-up
+  knobs.  Retrieval surfacing is deferred to a follow-up
   workstream.
 
 * ``test_ac8_sanity_with_reflection_boost_off`` — AC-8b binding
@@ -241,7 +241,7 @@ class TestDirectSubsetNeutrality:
 
 
 class TestRunnerWalltimeBudget:
-    """AC-11 v0.3.0 budget on the default CLI invocation.
+    """The v0.3.0 walltime budget on the default CLI invocation.
 
     Opt-in via ``BENCH_SLOW=1`` because the test spawns the CLI as a
     subprocess and pays the full evaluator + dreaming-consolidation
@@ -287,7 +287,7 @@ class TestRunnerWalltimeBudget:
             f"CLI exited {result.returncode} (expected 0).  stderr tail: {result.stderr[-500:]!r}"
         )
         assert elapsed <= 360, (
-            f"AC-11 v0.3.0 walltime budget (360 s) exceeded: "
+            f"The v0.3.0 walltime budget (360 s) exceeded: "
             f"{elapsed:.1f}s.  The v0.4.0 evaluator-optimisation "
             f"workstream tightens this back to 120 s."
         )

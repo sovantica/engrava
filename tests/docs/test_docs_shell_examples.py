@@ -986,7 +986,7 @@ def test_engrava_invocations_match_the_real_cli(block: CodeBlock) -> None:
 
 # ---------------------------------------------------------------------------
 # Failability + controls (not part of the doc census — direct unit checks of
-# the checker logic itself, using the exact mutation strings from the finding)
+# the checker logic itself, using its own exact mutation strings)
 # ---------------------------------------------------------------------------
 
 
@@ -1146,7 +1146,7 @@ def test_checker_finds_an_invocation_that_is_not_the_lines_first_word() -> None:
 
 
 def test_checker_rejects_an_unknown_option_after_help() -> None:
-    """Regression (finding 6): `--help` does not bypass validation of later options.
+    """Regression: `--help` does not bypass validation of later options.
 
     Real click parses the whole line before acting on an eager option like
     `--help`: `engrava --help --nonexistent` exits 2 with `No such option`.
@@ -1158,7 +1158,7 @@ def test_checker_rejects_an_unknown_option_after_help() -> None:
 
 
 def test_checker_rejects_an_unknown_command_option_after_help() -> None:
-    """Regression (finding 6): same as above, at the command level."""
+    """Regression: same as above, at the command level."""
     tokens = _tokenize_shell_line("engrava info --help --nonexistent")
     error = _check_invocation(tokens)
     assert error is not None
@@ -1231,7 +1231,7 @@ def test_checker_does_not_lose_an_invocation_to_a_quoted_env_value() -> None:
 
 
 def test_checker_still_passes_engrava_mentioned_only_as_an_echoed_argument() -> None:
-    """Control (round-4 decoy, re-verified): `echo '|' engrava reindex` is not a boundary restart.
+    """Control (decoy): `echo '|' engrava reindex` is not a boundary restart.
 
     After the `;`, the segment starting with `echo` runs to the end of the
     line (no further unquoted operator), so the `engrava reindex` inside it
@@ -1242,7 +1242,7 @@ def test_checker_still_passes_engrava_mentioned_only_as_an_echoed_argument() -> 
 
 
 def test_checker_still_fails_a_mid_word_hash_prefixed_argument() -> None:
-    """Control (round-4 decoy, re-verified): `demo#tag.db` is one word, and `reindex` is invalid."""
+    """Control (decoy): `demo#tag.db` is one word, and `reindex` is invalid."""
     block = _synthetic_block("engrava --db demo#tag.db reindex")
     errors = block_invocation_errors(block)
     assert len(errors) == 1
@@ -1253,9 +1253,9 @@ def test_checker_reports_a_malformed_line_even_when_first_word_is_not_engrava() 
     """Regression: a fallback keyed on the first word erased this line entirely.
 
     `_naive_first_word` returned `true` (not `engrava`), so the whole line
-    was silently discarded instead of failing -- exactly the second-model
-    shape removed from the pre-filter one round earlier, doing the same
-    damage from a different seat.
+    was silently discarded instead of failing -- the same shape of defect
+    already removed from the pre-filter, doing the same damage from a
+    different place.
     """
     block = _synthetic_block("engrava info\ntrue && engrava reindex 'unterminated\n")
     errors = block_invocation_errors(block)
@@ -1405,7 +1405,7 @@ def test_checker_does_not_insert_whitespace_when_joining_a_continuation() -> Non
 
 
 def test_checker_passes_the_no_space_join_mirror() -> None:
-    """Control (mirror of the finding): joining without inserting a space must still work.
+    """Control (mirrors the no-space join fix above): joining inserts no space.
 
     `engrava in\\` followed by `fo` must become `engrava info`, a valid
     invocation -- not `engrava in fo`, which a space-inserting join would
@@ -1428,7 +1428,7 @@ def test_checker_strips_a_repeated_prompt_on_a_continuation_line() -> None:
 
 
 def test_checker_resets_comment_detection_after_an_operator() -> None:
-    """Regression (finding 1): a comment right after ``;``/``|``/``&`` is still a comment.
+    """Regression: a comment right after ``;``/``|``/``&`` is still a comment.
 
     The comment tracker only reset word-start after whitespace, so
     ``engrava info;# comment`` did not recognise the ``#`` as starting a
@@ -1441,7 +1441,7 @@ def test_checker_resets_comment_detection_after_an_operator() -> None:
 
 
 def test_checker_refuses_an_escaped_trailing_backslash() -> None:
-    """Regression (finding 2a): an even run of backslashes is an escaped, literal one.
+    """Regression: an even run of backslashes is an escaped, literal one.
 
     Bash reads a trailing ``\\\\`` as one escaped backslash ending the
     command, not a continuation marker -- this checker does not model
@@ -1455,7 +1455,7 @@ def test_checker_refuses_an_escaped_trailing_backslash() -> None:
 
 
 def test_checker_refuses_a_backslash_inside_an_open_quote() -> None:
-    """Regression (finding 2b): a quote spanning the join point is not reconstructed.
+    """Regression: a quote spanning the join point is not reconstructed.
 
     Bash keeps both the backslash and the newline as literal content inside
     a single-quoted string; this checker does not model a quote spanning a
@@ -1468,7 +1468,7 @@ def test_checker_refuses_a_backslash_inside_an_open_quote() -> None:
 
 
 def test_checker_treats_an_escaped_trailing_space_as_a_real_boundary() -> None:
-    """Regression (finding 3): a backslash followed by trailing whitespace does not continue.
+    """Regression: a backslash followed by trailing whitespace does not continue.
 
     Checked on the raw, un-stripped line: the backslash is not the literal
     last character, so this is not a continuation at all -- the physical
@@ -1481,7 +1481,7 @@ def test_checker_treats_an_escaped_trailing_space_as_a_real_boundary() -> None:
 
 
 def test_checker_strips_a_dangling_continuation_on_the_last_line() -> None:
-    """Regression (finding 4): a block's final line ending in a real marker is not `info\\`.
+    """Regression: a block's final line ending in a real marker is not `info\\`.
 
     There is no next physical line to join with; a real shell reads the
     same backslash-newline-EOF and simply ends the command there.
@@ -1491,7 +1491,7 @@ def test_checker_strips_a_dangling_continuation_on_the_last_line() -> None:
 
 
 def test_checker_still_joins_and_fails_the_no_space_mirror() -> None:
-    """Control: the ordinary, reconstructable case from a prior round must still work."""
+    """Control: the ordinary, reconstructable case must still work."""
     block = _synthetic_block("engra\\\nva reindex\n")
     errors = block_invocation_errors(block)
     assert len(errors) == 1

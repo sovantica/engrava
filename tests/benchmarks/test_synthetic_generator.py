@@ -67,10 +67,9 @@ class TestDeterminism:
         assert a != b
 
     def test_three_consecutive_runs_byte_identical(self) -> None:
-        # AC-2 precursor — when the runner consumes the frozen JSON
-        # three consecutive default-invocations must agree.  This test
-        # exercises the generator side of that contract; the runner
-        # side lives in C3.
+        # When the runner consumes the frozen JSON, three consecutive
+        # default-invocations must agree.  This test exercises the generator
+        # side of that contract; the runner side lives elsewhere.
         runs = [dataset_to_json(generate_dataset(**_SMALL)) for _ in range(3)]
         assert runs[0] == runs[1] == runs[2]
 
@@ -112,10 +111,10 @@ class TestStructuralInvariants:
         qids = [q.question_id for conv in out for q in conv.questions]
         assert len(qids) == len(set(qids))
 
-    def test_every_turn_carries_adr024_metadata(self) -> None:
-        # AC-10 precursor — every ingested ThoughtRecord must carry
-        # perspective + source.is_self; verify the generator side here,
-        # the evaluator side lands in C3.
+    def test_every_turn_carries_perspective_and_self_metadata(self) -> None:
+        # Every ingested ThoughtRecord must carry perspective +
+        # source.is_self; verify the generator side here, the evaluator
+        # side lands elsewhere.
         out = generate_dataset(**_SMALL)
         for conv in out:
             for turn in conv.turns:
@@ -446,9 +445,9 @@ class TestRecordTypes:
             conv.turns[0].text = "mutated"  # type: ignore[misc]
 
     def test_record_classes_are_classes(self) -> None:
-        # The evaluator (C3) imports these directly; AC-14 forbids new
-        # ``engrava.__all__`` exports, but module-level imports out of
-        # the benchmarks sub-package are free of that constraint.
+        # The evaluator imports these directly; new
+        # ``engrava.__all__`` exports are forbidden, but module-level imports
+        # out of the benchmarks sub-package are free of that constraint.
         assert isinstance(SyntheticConversation, type)
         assert isinstance(SyntheticQuestion, type)
         assert isinstance(SyntheticTurn, type)

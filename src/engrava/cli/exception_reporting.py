@@ -21,11 +21,10 @@ itself be adversarial:
 module, to register the memory verbs as commands -- so neither module can
 define these helpers and have the other import them at module level without
 a cycle. Both import them from here instead: one implementation, not a copy
-per module. A duplicated copy is exactly how this branch has drifted before
--- each previous review round's fix landed in whichever module the round
-happened to be looking at, and the other module's copy (or, before this
-module existed, the other cleanup site's inline ``exc_info=True``) was left
-behind to be found again later.
+per module. A duplicated copy is exactly how this kind of fix drifts: a fix
+applied to one module's copy leaves the other module's copy (or, before this
+module existed, the other cleanup site's inline ``exc_info=True``) behind,
+unfixed.
 
 Both functions below read attributes off an exception they did not raise and
 cannot trust, so both are written to survive one that fights back: a
@@ -33,7 +32,7 @@ cannot trust, so both are written to survive one that fights back: a
 ``KeyboardInterrupt``/``SystemExit`` instead of an ordinary exception, one
 whose result is a hostile ``str`` subclass, and one with an overridden
 ``__getattribute__``. See each function's own docstring for the specific
-review-round findings that shaped its current shape.
+hazards that shape its current form.
 """
 
 from __future__ import annotations
@@ -56,17 +55,17 @@ def _describe_exception(exc: BaseException) -> str:
     property that raises) runs that metaclass's own code instead of
     returning a guaranteed string.
 
-    Obtaining each half safely is not the whole job. A fifth review round
-    found that a *value* which comes back without raising can still not be
-    safe to use: an exception whose ``__str__`` returns a ``str`` subclass
-    instance whose own ``__format__`` raises left this function's earlier
-    shape -- guard the read, then interpolate the result into
-    ``f"{type_name}: {text}"`` unguarded -- exactly as escapable as not
-    guarding the read at all, because the interpolation is where the
-    hostile code actually runs. The same round also found both guards
-    narrowed to ``except Exception``, so a metaclass raising
+    Obtaining each half safely is not the whole job: a value that comes back
+    without raising can still be unsafe to use. An exception whose
+    ``__str__`` returns a ``str`` subclass instance whose own ``__format__``
+    raises would defeat a guard that reads the value safely but then
+    interpolates it into ``f"{type_name}: {text}"`` unguarded -- exactly as
+    escapable as not guarding the read at all, because the interpolation
+    would be where the hostile code actually runs. Narrowing either guard to
+    ``except Exception`` would have the same effect: a metaclass raising
     ``KeyboardInterrupt`` on ``__name__``, or a ``__str__`` raising
-    ``SystemExit``, walked straight through.
+    ``SystemExit``, would walk straight through -- which is why neither
+    guard below is narrowed that way.
 
     The fix is structural, not two more named cases: **no value leaves
     either guarded block except an exact, already-safe ``str``.** Each
@@ -79,19 +78,12 @@ def _describe_exception(exc: BaseException) -> str:
     raising one in the first place -- still converts cleanly, and, still
     inside that same guard, normalizes whatever it obtained with
     :func:`~engrava.config_validation.own_str`, the same primitive the
-    config layer uses to close exactly this gap for a validated value. A
-    sixth review round found this function's own first attempt at that
-    normalization -- ``"".join(...)`` -- was itself unsafe: ``str.join``
-    walks its argument with a plain ``for`` loop, which calls the
-    argument's own ``__iter__``, and a ``str`` subclass can override
-    ``__iter__`` to yield arbitrarily many attacker-selected characters
-    from a short underlying buffer. The review round proved this with a
-    one-byte ``str`` subclass whose ``__iter__`` alone produced 200,000
-    characters through ``"".join(...)``, and then sent this process a real
-    OS ``SIGINT`` while that iterator ran: it was swallowed and turned into
-    an ordinary-looking error object at exit ``1``, not the immediate
-    ``KeyboardInterrupt`` a deliberate Ctrl-C is supposed to be.
-    :func:`~engrava.config_validation.own_str` has neither problem: it is
+    config layer uses to close exactly this gap for a validated value.
+    It uses ``own_str`` rather than ``"".join(...)`` because ``str.join``
+    walks its argument with a plain ``for`` loop, which calls the argument's
+    own ``__iter__``, and a ``str`` subclass can override ``__iter__`` to
+    yield arbitrarily many characters from a short underlying buffer.
+    :func:`~engrava.config_validation.own_str` avoids that: it is
     ``str.__str__`` resolved on the built-in type rather than on the
     instance, so no subclass method -- ``__iter__``, ``__format__``,
     ``__repr__``, or anything else -- ever runs; it reads the real
@@ -135,13 +127,13 @@ def _describe_exception(exc: BaseException) -> str:
     so the second read this paragraph used to describe no longer happens at
     any of the three sites.
 
-    **A later review round found that dropping the description entirely at
-    the two close-failure sites was itself a regression.** Frame metadata
-    alone says *where* closing failed, never *why* -- an ordinary
-    ``PermissionError``, a full disk, or a locked file all look identical in
-    a stack of file names and line numbers, which is a real loss for an
-    ordinary, non-hostile user. Both close-failure warnings now also call
-    this function once, for the close exception itself, and log its result
+    **Dropping the description entirely at the two close-failure sites would
+    be a regression.** Frame metadata alone says *where* closing failed,
+    never *why* -- an ordinary ``PermissionError``, a full disk, or a locked
+    file all look identical in a stack of file names and line numbers, which
+    is a real loss for an ordinary, non-hostile user. Both close-failure
+    warnings also call this function once, for the close exception itself,
+    and log its result
     alongside the frame-only stack. That is not a second render of
     anything: it is the *same* single, guarded, non-absorbing attempt this
     function always made, applied to the close exception the way it was
@@ -211,23 +203,23 @@ def _frame_only_stack(exc: BaseException) -> str:
     formatter to render the exception a second time: its own ``__str__``,
     its ``__cause__``/``__context__`` chain, and (since Python 3.11) any
     exception-group children, all called again, all outside every guard this
-    module builds elsewhere. A review round proved that render is not inert:
-    with a *second*, unrelated failure already propagating (a store's
-    ``close()`` raising while the original exception it is cleaning up after
-    is still in flight), the ``--verbose`` cleanup log's ``exc_info=True``
-    rendered the close exception, the original exception a *second* time,
-    and an attached exception group and its child, all through their own
-    overridable formatters -- and separately, that same standard-library
-    formatter wraps its own rendering in a bare ``except``, so a real OS
-    ``SIGINT`` (or a formatter raising ``SystemExit``) arriving during that
-    render was swallowed before it could reach this module's own guards,
-    leaving the command to still exit ``1`` with an ordinary
-    ``unexpected_error`` object instead of aborting (both verified live). A
-    later round found the same defect, unfixed, at the bare/default store
-    tier's own cleanup site (``main._close_quietly``): a real SIGINT and a
-    real ``SystemExit(37)`` arriving during that tier's ``exc_info=True``
-    render were both absorbed the same way, live, even though the ``--json``
-    error object it produced never mentions ``exc_info`` at all.
+    module builds elsewhere, and that render is not inert: with a *second*,
+    unrelated failure already propagating (a store's ``close()`` raising
+    while the original exception it is cleaning up after is still in
+    flight), the ``--verbose`` cleanup log's ``exc_info=True`` rendered the
+    close exception, the original exception a *second* time, and an attached
+    exception group and its child, all through their own overridable
+    formatters -- and separately, that same standard-library formatter wraps
+    its own rendering in a bare ``except``, so a real OS ``SIGINT`` (or a
+    formatter raising ``SystemExit``) arriving during that render was
+    swallowed before it could reach this module's own guards, leaving the
+    command to still exit ``1`` with an ordinary ``unexpected_error`` object
+    instead of aborting (both verified live). The same defect, unfixed,
+    existed at the bare/default store tier's own cleanup site
+    (``main._close_quietly``): a real SIGINT and a real ``SystemExit(37)``
+    arriving during that tier's ``exc_info=True`` render were both absorbed
+    the same way, live, even though the ``--json`` error object it produced
+    never mentions ``exc_info`` at all.
 
     Each frame contributes only its filename, line number and function
     name -- no source line, no local values, no chained exception, no

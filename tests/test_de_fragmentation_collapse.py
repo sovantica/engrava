@@ -174,8 +174,8 @@ class TestCollapseRankedByUnit:
         # 'b' missing -> own unit, survives.
         assert _collapse_ranked_by_unit(ranked, keys) == ranked
 
-    def test_d8_order_preserved(self) -> None:
-        """Survivor order follows the input D8 order; no re-sort is introduced."""
+    def test_ranking_order_preserved(self) -> None:
+        """Survivor order follows the input ranking order; no re-sort is introduced."""
         ranked = [("z", 0.9), ("y", 0.8), ("x", 0.7)]
         keys: dict[str, tuple[object, ...] | None] = {
             "z": ("u1",),
@@ -234,8 +234,8 @@ class TestRetainRankedByUnit:
         }
         assert _retain_ranked_by_unit(ranked, keys, max_per_unit=5) == ranked
 
-    def test_d8_order_preserved_under_retention(self) -> None:
-        """Survivor order follows the input D8 order under N>1 retention too."""
+    def test_ranking_order_preserved_under_retention(self) -> None:
+        """Survivor order follows the input ranking order under N>1 retention too."""
         ranked = [("z", 0.9), ("y", 0.8), ("x", 0.7), ("w", 0.6)]
         keys: dict[str, tuple[object, ...] | None] = {
             "z": ("u1",),
@@ -368,7 +368,7 @@ class TestBestPerUnitBackfill:
         assert len(returned) == 5
 
     async def test_keeper_is_highest_ranked_member(self, store: SqliteEngravaCore) -> None:
-        """The retained member of a unit is its highest-D8-ranked fragment.
+        """The retained member of a unit is its highest-ranked fragment.
 
         Both fragments share the same essence (equal BM25); the keeper is made
         unambiguous via the priority signal (P1 boosts ``strong`` above

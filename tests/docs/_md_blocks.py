@@ -445,8 +445,7 @@ class CompileOnlyReason(Enum):
     #: guaranteed installed (e.g. ``prometheus_client``) is not a live external system
     #: by itself -- no service, endpoint, credential, or network is involved, only a
     #: package that may be absent. A current entry citing this reason for that alone
-    #: is a known open question for the category-review pass, not a member of what
-    #: this reason actually names.
+    #: is a known open question, not a member of what this reason actually names.
     REQUIRES_LIVE_EXTERNAL_SERVICE = "requires-live-external-service"
 
     #: The block would run cleanly exactly as written -- no undefined collaborator, no

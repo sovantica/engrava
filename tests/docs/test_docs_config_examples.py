@@ -11,7 +11,7 @@ who pastes the documented snippet gets an immediate failure.
 
 Delegating to the real loader, not reimplementing it
 ------------------------------------------------------
-Two earlier versions of this module were both wrong in review-caught ways.
+Two earlier versions of this module were both wrong.
 The first mirrored each section's key set by hand and split a block into
 "stanzas"; the mirror missed real value-level checks and the splitter broke
 comments, ``null``, and anchors/aliases. The second delegated to

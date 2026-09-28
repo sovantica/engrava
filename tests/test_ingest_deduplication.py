@@ -358,7 +358,7 @@ def test_content_hash_not_in_pydantic_model() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Protocol + ReadOnly wrapper contract parity (audit round 1)
+# Protocol + ReadOnly wrapper contract parity
 # ---------------------------------------------------------------------------
 
 
@@ -368,8 +368,7 @@ def test_protocol_create_thought_accepts_deduplicate_kwarg() -> None:
     Without this, ingest-layer code typed against the public protocol
     cannot forward ``IngestConfig.deduplication_enabled`` to the store
     even though the concrete ``SqliteEngravaCore`` implementation
-    accepts it.  Pinned as a regression test against
-    audit-round-1 P2 finding.
+    accepts it.  Pinned as a regression test for that gap.
     """
     import inspect
 
@@ -388,10 +387,9 @@ def test_protocol_create_thought_accepts_deduplicate_kwarg() -> None:
 async def test_readonly_create_thought_signature_parity_and_violation() -> None:
     """``ReadOnlyEngrava.create_thought`` accepts ``deduplicate`` and raises cleanly.
 
-    Pinned as a regression test against audit-round-1 P2 finding —
-    previously calling ``ro.create_thought(t, deduplicate=True)`` would
-    surface a raw ``TypeError`` instead of the documented
-    ``ReadOnlyViolationError``.
+    Pinned as a regression test: previously calling
+    ``ro.create_thought(t, deduplicate=True)`` would surface a raw
+    ``TypeError`` instead of the documented ``ReadOnlyViolationError``.
     """
     from engrava.domain.exceptions import ReadOnlyViolationError
     from engrava.infrastructure.read_only_store import ReadOnlyEngrava

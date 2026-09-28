@@ -2451,7 +2451,7 @@ class TestMinimumInactivityAgeGate:
 
 
 class TestAccessGate:
-    """The run-level access-gate (D4): no usage signal ⇒ archive nothing."""
+    """The run-level access-gate: no usage signal ⇒ archive nothing."""
 
     async def test_aged_never_queried_store_archives_nothing(self) -> None:
         """An aged-but-never-used store archives nothing (recency-of-cycle alone

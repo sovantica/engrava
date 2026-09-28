@@ -432,12 +432,12 @@ class TestParseSearchGraphExpansion:
 
 
 # ---------------------------------------------------------------------------
-# Regression tests for the 4 gaps found in review (2026-04-23)
+# Regression tests for four expansion gaps
 # ---------------------------------------------------------------------------
 
 
 class TestExpansionGapFixes:
-    """Tests that validate each of the 4 review gaps are now correctly fixed."""
+    """Tests that validate each of the four expansion gaps is now correctly fixed."""
 
     # --- Gap 1: top-N REFLECTION ranking must respect combined score ---
 

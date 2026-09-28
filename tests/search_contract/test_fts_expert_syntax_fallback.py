@@ -62,7 +62,7 @@ if TYPE_CHECKING:
 # The reported natural-language query mixes function words with the content
 # words "field", "name", "body", "forum", "mark", "final", "answer". This store
 # holds a thought carrying that vocabulary so the sanitizing fallback produces
-# real BM25 hits (AC3), plus a couple of decoys so retrieval is non-trivial.
+# real BM25 hits, plus a couple of decoys so retrieval is non-trivial.
 
 _REPORTED_CONTENT = (
     "field name between body and forum mark your final answer about machine learning"
@@ -143,7 +143,7 @@ _REPORTED_QUERY = 'field name between "body" and "forum"? Mark your final answer
 
 
 # ---------------------------------------------------------------------------
-# AC2 — curated, human-readable adversarial table
+# Curated, human-readable adversarial table
 # ---------------------------------------------------------------------------
 # (query, expected_expert). Every row must also drive a valid MATCH (directly or
 # via the bare fallback), asserted in TestCuratedAdversarialTable.
@@ -162,7 +162,7 @@ _CURATED_TABLE: tuple[tuple[str, bool], ...] = (
 
 
 # ---------------------------------------------------------------------------
-# AC1 — broad adversarial fuzz corpus (deterministic, enumerated generator)
+# Broad adversarial fuzz corpus (deterministic, enumerated generator)
 # ---------------------------------------------------------------------------
 
 
@@ -324,7 +324,7 @@ _FUZZ_CORPUS: tuple[FuzzCase, ...] = tuple(_build_group_a() + _build_group_b())
 
 
 # ---------------------------------------------------------------------------
-# AC2 — curated adversarial table
+# Curated adversarial table
 # ---------------------------------------------------------------------------
 
 
@@ -349,7 +349,7 @@ class TestCuratedAdversarialTable:
 
 
 # ---------------------------------------------------------------------------
-# AC3 — the concrete reported input now returns hits
+# The concrete reported input now returns hits
 # ---------------------------------------------------------------------------
 
 
@@ -376,14 +376,14 @@ class TestReportedInputRegression:
 
 
 # ---------------------------------------------------------------------------
-# AC4 — failure counter semantics
+# Failure counter semantics
 # ---------------------------------------------------------------------------
 
 
 class TestFailureCounter:
     """The read-only failure counter surfaces primary-MATCH failures.
 
-    "0 across the AC1 corpus" is precise: the counter stays 0 across the
+    "0 across the broad adversarial corpus" is precise: the counter stays 0 across the
     *Group-A* (valid-primary) partition, whose queries never reach the
     fallback. The Group-B partition deliberately exercises the fallback, so its
     per-case delta is exactly 1 by design — that is asserted separately in
@@ -438,7 +438,7 @@ class TestFailureCounter:
 
 
 # ---------------------------------------------------------------------------
-# AC1 — standing safety invariant over the broad adversarial corpus
+# Standing safety invariant over the broad adversarial corpus
 # ---------------------------------------------------------------------------
 
 
@@ -528,14 +528,14 @@ class TestSafetyInvariant:
 
 
 # ---------------------------------------------------------------------------
-# AC1 discriminating power — the invariant fails when a fix is removed
+# Discriminating power — the invariant fails when a fix is removed
 # ---------------------------------------------------------------------------
 
 
 class TestDiscriminatingPower:
     """The safety invariant is only meaningful if removing a fix breaks it.
 
-    These tests reproduce, in-process, the two reverts the WS spec requires and
+    These tests reproduce, in-process, two reverts of specific fixes and
     assert the invariant's per-case predictions change — proving the corpus has
     real discriminating power rather than passing vacuously.
     """

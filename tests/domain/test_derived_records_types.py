@@ -4,7 +4,7 @@ Covers the generic value objects (:class:`DerivedRecord`, :class:`DeriveContext`
 :class:`DeriveGates`) and the capability protocol
 (:class:`DerivedRecordProducerProtocol`) in isolation from the persistence
 engine: field sets, immutability, validation, runtime-checkability, and the
-public-surface stability guarantees (AC-1, AC-7).
+public-surface stability guarantees.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from engrava.domain.protocols.derived_records import (
 )
 
 # ---------------------------------------------------------------------------
-# DerivedRecord — producer-owned fields only (AC-1 / AC-9 field authority)
+# DerivedRecord — exposes only producer-owned fields, never a system-managed one
 # ---------------------------------------------------------------------------
 
 #: The system-managed fields core assigns at persist time. None of them may be
@@ -99,7 +99,7 @@ def test_derived_record_metadata_is_per_instance() -> None:
 
 
 # ---------------------------------------------------------------------------
-# DeriveContext — stable, store-handle-free (AC-1)
+# DeriveContext — stable, store-handle-free
 # ---------------------------------------------------------------------------
 
 
@@ -174,7 +174,7 @@ def test_derive_gates_rejects_non_bool_enabled(bad_enabled: object) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Protocol — runtime-checkable capability detection (AC-1 / D1)
+# Protocol — runtime-checkable capability detection
 # ---------------------------------------------------------------------------
 
 
@@ -197,7 +197,7 @@ def test_producer_protocol_is_runtime_checkable() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Stability + deprecation policy on the public surface (AC-7)
+# Stability + deprecation policy on the public surface
 # ---------------------------------------------------------------------------
 
 

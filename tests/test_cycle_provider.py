@@ -285,7 +285,7 @@ class TestResolveCurrentCycle:
 
 
 # ---------------------------------------------------------------------------
-# max_cycle() high-water accessor (D3)
+# max_cycle() high-water accessor
 # ---------------------------------------------------------------------------
 
 
@@ -346,7 +346,7 @@ class TestMaxCycle:
 
 
 # ---------------------------------------------------------------------------
-# Provider is READ-TIME only — it never stamps writes (D2)
+# Provider is READ-TIME only — it never stamps writes
 # ---------------------------------------------------------------------------
 
 
