@@ -173,8 +173,8 @@ class _RacingStore(SqliteEngravaCore):
     rendezvous immediately after it returns: every racing process is made to
     wait for its siblings to also reach this point *before* any of them acts
     on what the probe saw. This is what actually forces the interleaving the
-    workstream's defect (F4) needs — see the module docstring for why the
-    rendezvous must be bounded rather than a plain barrier.
+    race needs — see the module docstring for why the rendezvous must be
+    bounded rather than a plain barrier.
     """
 
     def __init__(
@@ -376,11 +376,11 @@ def _bulk_race_worker(
     """Process entry point: open a fresh connection, then race ``bulk_store``.
 
     Mirrors ``_race_worker`` exactly, except the guarded call is
-    ``bulk_store(deduplicate=True)`` — the path the workstream's F3 finding
-    identified as entirely unprotected (it never took ``BEGIN IMMEDIATE`` at
-    all, because ``bulk_store`` runs under ``suspend_auto_commit`` and the
-    guard used to key off that flag directly). See ``_race_worker`` for why
-    ``timing`` is read regardless of success or failure.
+    ``bulk_store(deduplicate=True)`` — the path that was entirely unprotected
+    (it never took ``BEGIN IMMEDIATE`` at all, because ``bulk_store`` runs
+    under ``suspend_auto_commit`` and the guard used to key off that flag
+    directly). See ``_race_worker`` for why ``timing`` is read regardless of
+    success or failure.
     """
     timing: dict[str, float] = {}
     try:
@@ -424,11 +424,11 @@ def test_two_processes_racing_bulk_store_dedup_converge_on_one_row(db_path: str)
     """``_FAN_OUT`` processes racing identical content via ``bulk_store`` insert one row.
 
     Same shape as ``test_two_processes_racing_get_or_create_converge_on_one_row``,
-    but through ``bulk_store(deduplicate=True)`` — the F3 finding's path, which
-    shipped with no cross-connection protection at all in the first version of
-    this workstream (it never opened ``BEGIN IMMEDIATE``, because the guard
-    checked ``_skip_auto_commit`` — always ``True`` inside ``bulk_store`` — as
-    part of deciding whether to take the lock). This test is red on that code:
+    but through ``bulk_store(deduplicate=True)`` — a path that had no
+    cross-connection protection at all before the fix (it never opened
+    ``BEGIN IMMEDIATE``, because the guard checked ``_skip_auto_commit`` —
+    always ``True`` inside ``bulk_store`` — as part of deciding whether to
+    take the lock). This test is red on that code:
     every worker's single-row batch takes no write lock, all of them observe
     "no match" together (forced by ``_RacingStore``), and all of them insert.
     """
@@ -480,5 +480,5 @@ def test_two_processes_racing_bulk_store_dedup_converge_on_one_row(db_path: str)
 
     assert total_rows == 1, (
         f"bulk_store(deduplicate=True) left {total_rows} rows across {_FAN_OUT} "
-        "racing processes (expected exactly 1) -- F3 regression"
+        "racing processes (expected exactly 1)"
     )

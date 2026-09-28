@@ -1427,7 +1427,7 @@ class TestEngravaConfigServices:
 
 
 class TestReEmbedRequiresProvider:
-    """Fix 1: --re-embed must fail when no embedding provider is configured."""
+    """``--re-embed`` must fail when no embedding provider is configured."""
 
     def test_re_embed_uses_top_level_provider_for_single_db(
         self,
@@ -1714,7 +1714,7 @@ class TestReEmbedRequiresProvider:
 
 
 class TestSnapshotServiceGuard:
-    """Fix 2: snapshot --service must fail for non-existent service."""
+    """``snapshot --service`` must fail for a non-existent service."""
 
     def test_snapshot_nonexistent_service_fails(
         self,
@@ -1782,7 +1782,7 @@ class TestSnapshotServiceGuard:
 
 
 class TestGetStoreConcurrency:
-    """Fix 3: concurrent get_store calls must not duplicate connections."""
+    """Concurrent ``get_store`` calls must not duplicate connections."""
 
     async def test_concurrent_get_store_same_service(self, tmp_path: Path) -> None:
         data_dir = tmp_path / "concurrent"
@@ -2013,7 +2013,7 @@ class TestManagerLifecycleLockOrdering:
 
 
 class TestDefaultServiceFromConfig:
-    """Fix 4: CLI resolves default_service from engrava.yaml."""
+    """The CLI resolves ``default_service`` from engrava.yaml."""
 
     def test_snapshot_uses_default_service(
         self,

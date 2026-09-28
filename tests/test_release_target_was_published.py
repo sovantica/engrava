@@ -1,4 +1,4 @@
-"""Tests for the release-target-was-published gate (F2: no version was published, silently).
+"""Tests for the release-target tag gate (F2: a declared target with no reachable tag).
 
 Like ``tests/test_release_target_gate.py``, this needs no
 ``TestFailabilityOnRealHistory``-style class guarded by ``skipif``: every
@@ -28,7 +28,7 @@ def gate_module() -> object:
     """Load ``scripts/check_release_target_was_published.py`` as a module for direct testing."""
     spec = importlib.util.spec_from_file_location("check_release_target_was_published", SCRIPT_PATH)
     if spec is None or spec.loader is None:
-        msg = f"could not load release-target-was-published module from {SCRIPT_PATH}"
+        msg = f"could not load the release-target tag gate module from {SCRIPT_PATH}"
         raise RuntimeError(msg)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -428,9 +428,9 @@ class TestIsAncestorAgainstADisposableRepository:
 
 
 class TestClassifyTargetAgainstADisposableRepository:
-    """Exercise the composed ``classify_target`` -- a tag alone is not enough for PUBLISHED."""
+    """Exercise the composed ``classify_target`` -- a tag alone is not enough for REACHABLE."""
 
-    def test_a_tag_on_head_is_published(
+    def test_a_tag_on_head_is_reachable(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         repo = tmp_path / "repo"
@@ -446,7 +446,7 @@ class TestClassifyTargetAgainstADisposableRepository:
         subprocess.run(["git", "tag", "v0.7.0"], cwd=repo, check=True)  # noqa: S607
         monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
         state, commit = gate_module.classify_target("0.7.0")  # type: ignore[attr-defined]
-        assert state is gate_module.TagState.PUBLISHED  # type: ignore[attr-defined]
+        assert state is gate_module.TagState.REACHABLE  # type: ignore[attr-defined]
         assert commit == head
 
     def test_asks_symbolic_ref_exactly_once_on_a_passing_classification(
@@ -478,11 +478,11 @@ class TestClassifyTargetAgainstADisposableRepository:
 
         state, _commit_sha = gate_module.classify_target("0.7.0")  # type: ignore[attr-defined]
 
-        assert state is gate_module.TagState.PUBLISHED  # type: ignore[attr-defined]
+        assert state is gate_module.TagState.REACHABLE  # type: ignore[attr-defined]
         symbolic_ref_calls = [call for call in calls if call[0] == "symbolic-ref"]
         assert len(symbolic_ref_calls) == 1, calls
 
-    def test_a_missing_tag_is_not_published(
+    def test_a_missing_tag_is_not_accepted(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         repo = tmp_path / "repo"
@@ -493,7 +493,7 @@ class TestClassifyTargetAgainstADisposableRepository:
         assert state is gate_module.TagState.NO_TAG  # type: ignore[attr-defined]
         assert commit is None
 
-    def test_a_tag_on_an_unreachable_commit_is_not_published(
+    def test_a_tag_on_an_unreachable_commit_is_not_accepted(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Regression for the finding that a tag existing anywhere in the
@@ -535,7 +535,7 @@ class TestClassifyTargetAgainstADisposableRepository:
         assert state is gate_module.TagState.UNREACHABLE  # type: ignore[attr-defined]
         assert commit == side_commit
 
-    def test_a_tag_on_a_blob_is_not_published(
+    def test_a_tag_on_a_blob_is_not_accepted(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         repo = tmp_path / "repo"
@@ -559,20 +559,20 @@ class TestClassifyTargetAgainstADisposableRepository:
 class TestRunGateWithStubbedReads:
     """Drive run_gate() with monkeypatched module functions -- no git involved."""
 
-    def test_a_published_target_passes(
+    def test_a_reachable_target_passes(
         self, monkeypatch: pytest.MonkeyPatch, gate_module: object
     ) -> None:
         monkeypatch.setattr(gate_module, "read_declared_target", lambda: "0.7.0")  # type: ignore[attr-defined]
         monkeypatch.setattr(  # type: ignore[attr-defined]
             gate_module,
             "classify_target",
-            lambda _version: (gate_module.TagState.PUBLISHED, "deadbeef"),  # type: ignore[attr-defined]
+            lambda _version: (gate_module.TagState.REACHABLE, "deadbeef"),  # type: ignore[attr-defined]
         )
         passed, messages = gate_module.run_gate()  # type: ignore[attr-defined]
         assert passed is True
         assert any("0.7.0" in line and line.startswith("PASS") for line in messages)
 
-    def test_an_unpublished_target_fails(
+    def test_a_target_with_no_reachable_tag_fails(
         self, monkeypatch: pytest.MonkeyPatch, gate_module: object
     ) -> None:
         monkeypatch.setattr(gate_module, "read_declared_target", lambda: "0.7.0")  # type: ignore[attr-defined]
@@ -608,8 +608,12 @@ class TestMainAgainstADisposableRepository:
         captured = capsys.readouterr()
         assert "does not exist" in captured.err
 
-    def test_a_published_target_exits_zero(
-        self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    def test_a_reachable_target_exits_zero(
+        self,
+        gate_module: object,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -618,8 +622,9 @@ class TestMainAgainstADisposableRepository:
         _write_target(repo, "0.7.0")
         monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
         assert gate_module.main([]) == 0  # type: ignore[attr-defined]
+        assert "RELEASE TARGET TAG GATE: PASS" in capsys.readouterr().out
 
-    def test_an_unpublished_target_exits_one(
+    def test_a_target_with_no_reachable_tag_exits_one(
         self,
         gate_module: object,
         tmp_path: Path,
@@ -635,7 +640,7 @@ class TestMainAgainstADisposableRepository:
         assert exit_code == 1
         captured = capsys.readouterr()
         assert "0.7.0" in captured.out
-        assert "FAIL" in captured.out
+        assert "RELEASE TARGET TAG GATE: FAIL" in captured.out
 
     def test_a_tag_on_an_unreachable_commit_exits_one(
         self,
@@ -729,7 +734,7 @@ class TestMainAgainstADisposableRepository:
         captured = capsys.readouterr()
         assert "failed unexpectedly" in captured.err
         assert "no v0.7.0 tag" not in captured.err
-        assert "RELEASE TARGET WAS-PUBLISHED GATE" not in captured.out
+        assert "RELEASE TARGET TAG GATE" not in captured.out
 
     def test_a_malformed_target_file_exits_one(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -809,10 +814,11 @@ class TestMainAgainstADisposableRepository:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        # Fix 5: the three distinct FAIL causes must be told apart. No tag
-        # at all must not be worded like a tag-that-exists-but problem, and
-        # must not speculate about PyPI or an announcement, which this
-        # script cannot know anything about.
+        # A missing tag, a tag that names no commit, and a tag whose commit is
+        # not reachable from HEAD each get their own wording. No tag at all
+        # must not be worded like a tag-that-exists-but problem, and must not
+        # speculate about PyPI or an announcement, which this script cannot
+        # know anything about.
         repo = tmp_path / "repo"
         repo.mkdir()
         _init_disposable_repo(repo)

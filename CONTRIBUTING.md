@@ -91,9 +91,10 @@ from a worktree would repoint every checkout's hooks at that worktree's own
 `.githooks/`, which disappears the moment the worktree is removed.
 
 - **`.githooks/commit-msg`** lints the message of the commit being created —
-  including the commit `git merge --squash` creates, whose message is
-  hand-written and does not exist until the merge runs. It skips only a true
-  merge commit, whose message git writes itself.
+  including the commit you make after `git merge --squash`, whose message is
+  hand-written. It skips the grammar check only for a commit created while a
+  merge is in progress (`MERGE_HEAD` exists), including a merge whose subject
+  was given by hand with `git merge --no-ff -m`.
 - `make install` sets `core.hooksPath` to an **absolute** path, not the
   literal string `.githooks`. A relative value is resolved separately by
   every checkout, so a linked worktree on a branch laid out differently — or
@@ -124,12 +125,14 @@ from a worktree would repoint every checkout's hooks at that worktree's own
 
 **What this does not cover.** A commit created by `git rebase -i` with a
 `squash` action fires no `commit-msg` hook at all — git's own sequencer passes
-`--no-verify` to the `git commit` it runs internally, and there is no way for
-a hook to see that message. On a branch that goes through a pull request, CI's
+`--no-verify` to the `git commit` it runs internally. A `post-rewrite` hook is
+given the rewritten commit ids and can read the squashed message, but it runs
+after the rebase has rewritten the commits and cannot stop it; this repository
+installs none. On a branch that goes through a pull request, CI's
 `commitlint.yml` still lints that commit as an ordinary part of the branch. On
 a branch that never becomes a pull request — such as this project's
 `release/*` branches, which are merged locally — a rebase-squashed commit
-message is inspected by **nothing here or anywhere else**. Prefer
+message is linted by neither the hook nor `commitlint.yml`. Prefer
 `git merge --squash` over `git rebase -i` + `squash` on a branch that will not
 go through a pull request, for exactly this reason.
 

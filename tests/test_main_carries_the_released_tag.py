@@ -160,9 +160,9 @@ class TestNewestVersionTag:
 
 
 class TestRunGateWithStubbedReads:
-    """Drive run_gate() with monkeypatched git calls -- no real repository state involved.
+    """Drive run_gate() with monkeypatched git calls.
 
-    All three reads ``run_gate()`` can make against git are stubbed here,
+    Three of the four reads ``run_gate()`` can make against git are stubbed here,
     including ``assert_ref_is_qualified_and_exists`` -- not just
     ``list_git_tags`` and ``is_ancestor``. That third stub is not
     decorative: ``run_gate()`` calls ``assert_ref_is_qualified_and_exists``
@@ -179,6 +179,12 @@ class TestRunGateWithStubbedReads:
     real assertion below raised ``GateInputError: 'refs/heads/main' does
     not exist in this repository`` there instead of exercising the stubbed
     ``list_git_tags``/``is_ancestor`` behaviour this class exists to check.
+
+    The fourth read, ``_resolves_to_a_local_branch()``, is not stubbed: the
+    failing-ancestry test reaches it, and it runs ``git symbolic-ref``
+    against the real ``REPO_ROOT``. Both FAIL messages it can select between
+    start with the text that test asserts on, so its result does not change
+    the outcome.
     """
 
     def test_branch_containing_the_newest_tag_passes(

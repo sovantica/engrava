@@ -87,7 +87,9 @@ class GateInputError(RuntimeError):
 
 
 def list_git_tags() -> list[str]:
-    """Return every tag name in this repository, in no particular order.
+    """Return the tag names under ``refs/tags/v*``, in no particular order.
+
+    Tags whose names do not start with ``v`` are not returned.
 
     This shells out to ``git for-each-ref``, a plumbing command, rather than
     ``git tag -l``, a porcelain one -- confirmed by execution, not by

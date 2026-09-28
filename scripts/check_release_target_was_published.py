@@ -1,4 +1,4 @@
-"""Check that a declared release target was actually published, not silently skipped.
+"""Check that the declared release target's tag is reachable from ``HEAD``.
 
 ``release-target.json`` names the version this release train intends to
 publish (see ``scripts/check_computed_version_matches_target.py`` for the
@@ -21,27 +21,21 @@ run that needs catching.
 This script is that outside gate. It is invoked as its own step in
 ``release.yml``, unconditionally -- after semantic-release has run and
 after the workflow's own "detect whether a release was published" step,
-but with no ``if:`` guard tying it to that step's result, since the whole
-point is to fail a run the rest of the job considers a clean no-op.
+but with no ``if:`` guard tying it to that step's result, since the run it is
+aimed at is one the rest of the job considers a clean no-op.
 
-The check itself does not need to know whether *this* run was the one that
-published the target, only whether the target has been published by the
-time this step runs: it resolves the declared target's tag
-(``refs/tags/v<version>``) and passes if that tag resolves to a commit git
-reports as reachable from ``HEAD``, whether that happened in this run or an
-earlier one. Tag existence alone is not enough -- a tag naming a blob, a
-tree, or a commit this branch does not contain all fail this check the same
-as no tag at all (see :func:`classify_target`). Treating an *earlier* run's
-tag as sufficient is deliberate, not an oversight, though -- once a target
-has genuinely shipped, every later push to ``dev`` before someone advances
-``release-target.json`` to the next target would otherwise fail this gate
-for a version that was never meant to ship again. On this repository's own
-branching model (``BRANCHING.md``: ``feature/* -> release/vX.Y.Z -> dev ->
-main``, semantic-release firing on the push to ``dev``), every push to
-``dev`` is itself a release-branch merge that was supposed to trigger a
-real release, so treating "the target's tag already resolves to a reachable
-commit" as sufficient is not a loophole for skipping releases quietly -- it
-just avoids re-flagging a target this pipeline already met.
+The check itself reads only what git says about the declared target: it
+resolves the declared target's tag (``refs/tags/v<version>``) and passes if
+that tag resolves to a commit git reports as reachable from ``HEAD``. It does
+not establish that this run published anything. The tag may have been
+created by an earlier run, and once the target's tag is reachable a docs-only
+merge that releases nothing still passes. Tag existence alone is not enough
+-- a tag naming a blob, a tree, or a commit this branch does not contain all
+fail this check the same as no tag at all (see :func:`classify_target`).
+Accepting an *earlier* run's tag is deliberate, not an oversight -- once a
+target has genuinely shipped, every later push to ``dev`` before someone
+advances ``release-target.json`` to the next target would otherwise fail this
+gate for a version that was never meant to ship again.
 
 If ``release-target.json`` itself does not exist, this script fails rather
 than passing. A prior revision treated an absent file as a clean pass,
@@ -303,7 +297,7 @@ def _is_symbolic_ref(ref: str) -> bool:
     ``refs/heads/some-branch`` pointing at ``HEAD``, ``git rev-parse
     --verify --quiet 'refs/tags/v0.7.0^{commit}'`` resolved and printed
     ``HEAD``'s own commit, exiting ``0``, so :func:`resolve_tag_commit`
-    would previously have reported the target as published with no real tag
+    would previously have accepted the target with no real tag
     anywhere in the repository. Any other exit code means git could not
     answer at all and is raised as :class:`GateInputError` rather than
     silently treated as "not symbolic".
@@ -369,7 +363,7 @@ def resolve_tag_commit(version: str, *, is_symbolic_tag_ref: bool | None = None)
     would have confirmed. ``git rev-parse --verify --quiet`` exits ``1``
     both when the ref does not exist at all and when it exists but is the
     wrong type (confirmed by execution against a tag pointing at a blob);
-    either way, "not a published commit" is the correct answer here, so
+    either way, "not a commit" is the correct answer here, so
     both are folded into the same ``None`` result. Any other exit code
     means git could not answer the question at all (a broken repository, an
     unreadable object database) and is raised as :class:`GateInputError`
@@ -420,7 +414,7 @@ class TagState(enum.Enum):
     NO_TAG = "no_tag"
     NON_COMMIT = "non_commit"
     UNREACHABLE = "unreachable"
-    PUBLISHED = "published"
+    REACHABLE = "reachable"
 
 
 def classify_target(version: str) -> tuple[TagState, str | None]:
@@ -428,7 +422,7 @@ def classify_target(version: str) -> tuple[TagState, str | None]:
 
     This is the single source of truth for both the pass/fail decision and
     the FAIL message a reader sees -- there is deliberately no separate
-    boolean function that re-derives "published or not" from its own git
+    boolean function that re-derives "reachable or not" from its own git
     calls. Two independent lookups of the same fact can only ever agree by
     coincidence; keeping one means there is nothing left to disagree.
 
@@ -446,7 +440,7 @@ def classify_target(version: str) -> tuple[TagState, str | None]:
     ``HEAD``'s history fail to establish a PASS, distinctly from each other
     and from no tag existing at all -- :attr:`TagState.NO_TAG`,
     :attr:`TagState.NON_COMMIT`, and :attr:`TagState.UNREACHABLE`
-    respectively; only :attr:`TagState.PUBLISHED` passes.
+    respectively; only :attr:`TagState.REACHABLE` passes.
 
     A symbolic ref standing in for the tag (see :func:`resolve_tag_commit`)
     is reported as :attr:`TagState.NO_TAG`: it is not a real tag object by
@@ -466,7 +460,7 @@ def classify_target(version: str) -> tuple[TagState, str | None]:
         return TagState.NO_TAG, None
 
     if is_ancestor(commit, "HEAD"):
-        return TagState.PUBLISHED, commit
+        return TagState.REACHABLE, commit
     return TagState.UNREACHABLE, commit
 
 
@@ -483,7 +477,7 @@ def run_gate() -> tuple[bool, list[str]]:
     state, commit = classify_target(declared_target)
     messages = [f"declared target ({RELEASE_TARGET_FILENAME}): {declared_target}"]
 
-    if state is TagState.PUBLISHED:
+    if state is TagState.REACHABLE:
         messages.append(
             f"PASS: tag v{declared_target} resolves to a commit that git reports as "
             "reachable from HEAD in this repository. That is what this check reads "
@@ -522,27 +516,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         description=(
             "Fails when release-target.json is missing, or declares a "
             "version whose tag does not resolve to a commit reachable from "
-            "HEAD in this repository -- a declared release target that was "
-            "silently never published."
+            "HEAD in this repository."
         ),
     )
     parser.parse_args(argv)
 
     sys.stdout.write("=" * 60 + "\n")
-    sys.stdout.write("Release-target-was-published gate\n")
+    sys.stdout.write("Release-target tag gate\n")
     sys.stdout.write("=" * 60 + "\n")
 
     try:
         passed, messages = run_gate()
     except GateInputError as exc:
-        sys.stderr.write(f"release target was-published gate: {exc}\n")
+        sys.stderr.write(f"release target tag gate: {exc}\n")
         return EXIT_FAIL
 
     for line in messages:
         sys.stdout.write(line + "\n")
     sys.stdout.write("=" * 60 + "\n")
     verdict = "PASS" if passed else "FAIL"
-    sys.stdout.write(f"RELEASE TARGET WAS-PUBLISHED GATE: {verdict}\n")
+    sys.stdout.write(f"RELEASE TARGET TAG GATE: {verdict}\n")
     sys.stdout.write("=" * 60 + "\n")
 
     return EXIT_OK if passed else EXIT_FAIL

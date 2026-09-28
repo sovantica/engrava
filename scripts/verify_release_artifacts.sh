@@ -49,16 +49,14 @@
 # that what it is about to ship still hashes to what this script verified.
 #
 # The very first thing this script does, ahead of even the smoke gate, is
-# scripts/verify_release_content_scan.sh — the one call site both this gate
-# and this repository's ordinary secret scan use for text the ordinary scan
-# never reads at all: the squash-merge commit message this release was
-# built from, and CHANGELOG.md as @semantic-release/changelog already wrote
-# it to disk (which is, by construction, the same text
-# @semantic-release/git embeds in the release commit message and
-# @semantic-release/github publishes as the Release body — see that script
-# for why scanning the file covers all three). It runs first because it is
-# the cheapest check here and needs none of the build below to have
-# happened.
+# scripts/verify_release_content_scan.sh, which scans text the ordinary
+# secret scan never reads at all: the squash-merge commit message this
+# release was built from, and CHANGELOG.md as @semantic-release/changelog
+# already wrote it to disk. It is called from here and nowhere else;
+# .github/workflows/secret-scan.yml installs gitleaks and runs
+# `gitleaks git`, and does not call it. See that script for what the scan
+# covers. It runs first because it is the cheapest check here and needs none
+# of the build below to have happened.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

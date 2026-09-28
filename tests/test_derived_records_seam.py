@@ -673,7 +673,7 @@ def test_core_seam_does_not_import_demo_consumer() -> None:
 
 
 # ---------------------------------------------------------------------------
-# F4 — core-derived essence (combining-mark-safe truncation)
+# Core-derived essence (combining-mark-safe truncation)
 # ---------------------------------------------------------------------------
 
 
@@ -703,7 +703,7 @@ def test_essence_truncation_does_not_sever_combining_mark() -> None:
 
 
 # ---------------------------------------------------------------------------
-# F2 — producer-sequence iteration failures are fail-open
+# Producer-sequence iteration failures are fail-open
 # ---------------------------------------------------------------------------
 
 
@@ -761,7 +761,7 @@ async def test_sequence_iteration_error_raise_reraises_source_durable(
 
 
 # ---------------------------------------------------------------------------
-# F1 / F3 — bulk_store derivation never rolls a committed source/child back
+# bulk_store derivation never rolls a committed source/child back
 # ---------------------------------------------------------------------------
 
 
@@ -806,7 +806,7 @@ async def test_bulk_derivation_failure_never_rolls_back_committed_state(
 
 
 # ---------------------------------------------------------------------------
-# F6 — durability + recoverability of a committed-yet-unenriched child
+# Durability + recoverability of a committed-yet-unenriched child
 # ---------------------------------------------------------------------------
 
 
@@ -907,7 +907,7 @@ async def test_cancellation_after_child_commit_propagates_and_recovers(
 
 
 # ---------------------------------------------------------------------------
-# F7 — recursion guard across all write entry points; re-materialization paths
+# Recursion guard across all write entry points; re-materialization paths
 # ---------------------------------------------------------------------------
 
 

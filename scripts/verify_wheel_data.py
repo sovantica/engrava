@@ -38,9 +38,10 @@ REQUIRED_DATA_FILES = (
 )
 
 # Repo-root development files that MUST NOT ship inside the published wheel
-# or sdist. The lockfile pins exact dependency versions for a reproducible
-# developer / CI environment; consumers installing via ``pip install engrava``
-# resolve their own versions from the ``pyproject.toml`` constraints, so the
+# or sdist. ``uv.lock`` is not tracked in this repository (``.gitignore``
+# ignores it) and the workflows install with pip, but a developer's checkout
+# can still hold one. Consumers installing via ``pip install engrava``
+# resolve their own versions from the ``pyproject.toml`` constraints, so a
 # lockfile would be dead weight (and a misleading signal) inside the package.
 # A MANIFEST.in change that started shipping it would be a silent regression;
 # this guard fails the build instead.

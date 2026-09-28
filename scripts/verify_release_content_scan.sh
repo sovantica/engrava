@@ -9,26 +9,28 @@
 #
 #   1. The message of the commit a squash merge creates. That commit is
 #      authored in the merge dialog, after the PR's checks (including the
-#      Gitleaks scan) already ran, so nothing has ever read its text. Measured
-#      directly (see the commit that introduced this script): gitleaks' `git`
-#      mode diffs each commit's *changed file content* — it does not inspect
-#      commit messages at all, on any commit, scanned or not. So this is not
-#      a gap that closing races or widening triggers fixes; the tool itself
-#      never looks at this text, in any mode this repository already runs.
+#      Gitleaks scan) already ran, so no check has read its text by then.
+#      Measured directly (see the commit that introduced this script):
+#      gitleaks' `git` mode diffs each commit's *changed file content* — it
+#      does not inspect commit messages at all, on any commit, scanned or
+#      not. So this is not a gap that closing races or widening triggers
+#      fixes; the message has to be handed to gitleaks as text, which is what
+#      the scan below does.
 #
 #   2. `CHANGELOG.md`, written to disk by `@semantic-release/changelog`
 #      before this script runs (see scripts/verify_release_artifacts.sh,
 #      which invokes this script first, ahead of the build). Its released-
 #      version section is generated from the same commit messages, including
-#      the one squash-merge message this repository never scans, so a
+#      the squash-merge message the merge-time scan never reads, so a
 #      secret-shaped value there reaches this file even when the exact same
 #      value in a diff would have been caught. This file ships inside the
-#      sdist (MANIFEST.in), and its content is, by construction, the same
-#      release notes `@semantic-release/git` embeds verbatim in the release
-#      commit message (`.releaserc.json`'s `message` template) and
-#      `@semantic-release/github` publishes verbatim as the GitHub Release
-#      body — one generated text, three destinations. Gating this one file
-#      before it is committed, tagged or announced therefore gates all three;
+#      sdist (MANIFEST.in). It holds the title and every earlier release's
+#      entry; only its newest section is the release notes generated for
+#      this release, and that section is the text `@semantic-release/git`
+#      embeds verbatim in the release commit message (`.releaserc.json`'s
+#      `message` template) and `@semantic-release/github` publishes verbatim
+#      as the GitHub Release body. The scan below reads the whole file, so it
+#      covers that section before it is committed, tagged or announced;
 #      there is no destination-specific scan to add for the other two, since
 #      neither exists as its own artifact before `@semantic-release/git`
 #      commits — checked directly in the commit that added this script,

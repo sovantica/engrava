@@ -559,7 +559,7 @@ class TestDiscriminatingPower:
         await reported_store.search_fts(anchor)
         assert reported_store.fts_match_failure_count == before
 
-        # Revert Fix 2: restore the over-triggering classifier.
+        # Restore the old, over-triggering classifier.
         import engrava.infrastructure.sqlite.engrava_core as core_mod
 
         def _old_is_expert(query: str) -> bool:

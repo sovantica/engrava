@@ -44,9 +44,11 @@
 #     with release-target.json.
 #   - F2, no version being published at all: when every commit types as
 #     no-release, semantic-release's `prepare` step never runs, so there is
-#     no lifecycle step left to hook a check into. See the "Fail if a
-#     declared release target was never published" step below, which runs
-#     unconditionally after semantic-release, not as a plugin.
+#     no lifecycle step left to hook a check into. The "Fail if the
+#     declared release target's tag is not reachable from HEAD" step below
+#     runs unconditionally after semantic-release, not as a plugin. It
+#     fails when no such tag exists in this checkout; it cannot tell this
+#     run's tag from an earlier run's.
 #
 # `dev` is the release-trigger branch (portfolio-wide convention). `main` is a
 # stable mirror — it inherits the tagged release-commit via a separate forward
@@ -71,10 +73,10 @@
 # because it is the one step in this pipeline whose effect cannot be
 # undone.
 #
-# The `pypi` GitHub Environment this job runs under currently has no
-# protection rules configured — no required reviewers, no wait timer.
-# Adding reviewers to that environment later would put a human decision
-# after the tag and the Release already exist, not before them.
+# The publish job runs under the `pypi` GitHub Environment. If that
+# environment requires an approval, the approval is decided after the tag
+# and the Release already exist, not before them. Which protection rules
+# the environment has is set in the repository settings, not here.
 #
 # Only GitHub-owned (actions/*) and verified-publisher (pypa/*) actions are
 # used, to satisfy the repository's "allow select actions" policy. The
@@ -187,14 +189,14 @@ jobs:
           fi
       # No `if:` on steps.detect.outputs.published here — that is the whole
       # point of this step. It runs whether or not a release just happened,
-      # because the failure it exists to catch (F2: release-target.json
-      # declares a version and this run published nothing) is exactly the
-      # case the `detect` step above treats as a clean, green no-op. See
+      # because the case it is aimed at (F2: release-target.json declares a
+      # version and this run published nothing) is one the `detect` step
+      # above treats as a clean, green no-op. See
       # scripts/check_release_target_was_published.py for the check and its
       # documented boundary (it only proves the declared target's tag
       # exists somewhere in this checkout's history, this run or an earlier
       # one — not that this run was the one that produced it).
-      - name: Fail if a declared release target was never published
+      - name: Fail if the declared release target's tag is not reachable from HEAD
         run: python scripts/check_release_target_was_published.py
       # dist/ at this point is exactly what scripts/verify_release_artifacts.sh
       # built and gated inside semantic-release's `prepare` step, before the

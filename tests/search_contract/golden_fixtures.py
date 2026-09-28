@@ -176,9 +176,10 @@ HYBRID_RANKING_QUERIES: tuple[str, ...] = (
 # graph signal is opt-in). Without these two explicit overrides, the recency
 # and graph signals would be structurally silent in this golden regardless of
 # what the corpus contains — corpus variety alone does not activate them. The
-# values chosen (0.10 recency weight, half-life left at its 50-cycle default,
-# 0.1 graph weight, edge decay left at its 0.5 default) match the product's
-# own documented defaults.
+# recency weight (0.10), the half-life (left at its 50-cycle default) and the
+# edge decay (left at its 0.5 default) match the documented defaults. The 0.1
+# graph weight does not: the documented default is 0.0, and 0.1 is an explicit
+# choice that switches the graph signal on for this golden.
 HYBRID_CURRENT_CYCLE = 100
 # Deliberately always positive: a resolved recency weight of ``0.0`` takes a
 # different code path on the query-less fallback (flat scores instead of

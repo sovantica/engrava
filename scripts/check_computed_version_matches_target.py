@@ -7,9 +7,7 @@ commit range on ``dev`` happens to type as (``feat`` -> minor, ``fix``/``perf``
 The release branch name (``release/v0.7.0``), the release record
 (``docs/upgrade.md``'s in-progress compatibility notes), and the GitHub
 milestone all name a version too, but none of them was ever compared to what
-semantic-release actually computes -- reword or drop the one commit a bump
-rests on, and the same branch, with the same content, silently publishes a
-different version.
+semantic-release actually computes.
 
 ``release-target.json`` at the repository root is the fix: a single
 git-tracked file naming the version this release train intends to publish,
@@ -35,8 +33,9 @@ and publishes a GitHub Release after every ``prepare`` plugin has succeeded
 This script does not, and cannot, catch the sibling failure mode: no version
 computed at all, when every commit in the range types as no-release and
 semantic-release's ``prepare`` step never runs because there is no release to
-prepare. ``scripts/check_release_target_was_published.py`` covers that one,
-from outside the plugin lifecycle entirely -- see that script's docstring.
+prepare. ``scripts/check_release_target_was_published.py`` is the gate that
+runs for that one, from outside the plugin lifecycle entirely; what it does
+and does not establish is in that script's docstring.
 
 What a PASS from this script establishes, and only this: the version
 semantic-release is about to tag is textually equal, component by
