@@ -12814,8 +12814,21 @@ class SqliteEngravaCore:
                         len(_off_list_obs),
                     )
                 _fill = _off_list_obs[:_excess]
-                _kept = [(tid, s) for tid, s in final if tid not in _to_evict]
-                final = _sort_scored_descending(_kept + _fill)[:top_k]
+                _survivor_ids = {tid for tid, _ in final if tid not in _to_evict}
+                _survivor_ids.update(tid for tid, _ in _fill)
+                # Rebuild from ``ranked`` — the caller's own total order,
+                # already collapse-retained above — instead of re-sorting the
+                # survivors by ``(score, id)``. For the FTS/vector arms
+                # ``ranked`` already *is* that ``(score desc, id asc)`` order
+                # (built by ``_sort_scored_descending`` at the call site
+                # below), so filtering it reproduces exactly what the re-sort
+                # produced. The query-less fallback's ``ranked`` carries a
+                # different order — recency- or priority-ranked, ties broken
+                # by the DB's own pre-order — which a ``(score, id)`` re-sort
+                # would silently discard in favour of id order. Filtering
+                # ``ranked`` in place keeps whichever order it already
+                # carries, for either caller.
+                final = [item for item in ranked if item[0] in _survivor_ids][:top_k]
                 # ``_to_evict`` REFLECTIONs are removed from the window
                 # unconditionally (independent of how many backfill candidates
                 # were available), so the evicted count is the excess.

@@ -59,13 +59,13 @@ plain way until you pass a `SearchConfig` explicitly (or an explicit per-call
   window exactly as they do to an ordinary FTS/vector-active search — a
   fragmented unit is still collapsed to its best-ranked row(s), and
   REFLECTIONs are still capped at `top_k * reflection_topk_cap`, with the
-  same off-list-candidate backfill. When `collapse_key` is set (or the cap is
-  below its default `0.3`), the fallback also widens its own row window by
-  `search.collapse_pool_factor` beyond `top_k`, the same bounded headroom
-  collapse and the cap already get from the FTS/vector arms' larger
-  `fts_top_k` / `vector_top_k` budgets — so backfill has distinct
-  candidates to draw from. See the "De-fragmentation / collapse" and
-  `reflection_topk_cap` sections below.
+  same off-list-candidate backfill. When `collapse_key` is set (or the
+  reflection cap is below `1.0`, which the default `0.3` is), the fallback
+  also widens its own row window by `search.collapse_pool_factor` beyond
+  `top_k`, the same bounded headroom collapse and the cap already get from
+  the FTS/vector arms' larger `fts_top_k` / `vector_top_k` budgets — so
+  backfill has distinct candidates to draw from. See the "De-fragmentation /
+  collapse" and `reflection_topk_cap` sections below.
 
 The vector arm distinguishes two bad-query-vector cases:
 
