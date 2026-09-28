@@ -2,11 +2,15 @@
 
 Covers the acceptance surface for the new commands: the headline
 store-then-search round trip, ``--type``/``--priority`` on ``remember``,
-``--filter`` narrowing on ``recall``, edge creation and its two failure
-exits, the malformed-``--meta``/``--filter`` usage errors (plain and
-``--json``), stdin input, ``--dedup``, and the absent-database exit codes
-(``3`` for a read, ``0`` **and** file creation for a write) -- plus the exact
-``--json`` schemas (no undocumented fields), nested-parent-directory
+``--filter`` narrowing on ``recall`` (including a dotted key reaching a
+nested metadata field rather than a literal dotted key), edge creation
+(proven through a spy on ``create_edge``, not just the row it leaves
+behind) and its two failure exits, the malformed-``--meta``/``--filter``
+usage errors -- both a missing ``=`` and a ``--filter`` key the metadata
+path grammar itself rejects -- (plain and ``--json``), stdin input,
+``--dedup``, and the absent-database
+exit codes (``3`` for a read, ``0`` **and** file creation for a write) --
+plus the exact ``--json`` schemas (no undocumented fields), nested-parent-directory
 creation, ``--top-k``/``--weight`` range validation ahead of any database
 side effect, and the ``--db``-vs-``--config`` precedence and error-reporting
 rules (an explicit ``--db`` never reads ``--config`` at all; a ``--config``
@@ -26,10 +30,13 @@ from typing import TYPE_CHECKING
 
 from click.testing import CliRunner
 
+from engrava import EdgeRecord, EdgeType, SqliteEngravaCore
 from engrava.cli.main import cli
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import pytest
 
 
 def _last_line(output: str) -> str:
@@ -137,6 +144,49 @@ class TestRememberRecallRoundTrip:
             stored = _stored_thought_row(db, row["thought_id"])
             assert json.loads(stored["metadata_json"])["topic"] == "weather"
 
+    def test_recall_filter_dotted_key_addresses_a_nested_field(self, tmp_path: Path) -> None:
+        """A dotted --filter key reaches a nested field, not a literal "a.b" key.
+
+        ``remember --meta`` can only write a flat string metadata entry, so
+        the two shapes under test are written directly to ``metadata_json``:
+        one thought's metadata is ``{"a": {"b": "x"}}`` (a real nested
+        field), the other's is ``{"a.b": "x"}`` (a single key whose name
+        happens to contain a dot). ``--filter a.b=x`` builds the path
+        ``$.a.b``, which addresses the nested field and not the flat one.
+        """
+        db = tmp_path / "m.db"
+        runner = CliRunner()
+
+        nested_id = _last_line(
+            runner.invoke(cli, ["--db", str(db), "remember", "needle nested metadata"]).output
+        )
+        flat_id = _last_line(
+            runner.invoke(cli, ["--db", str(db), "remember", "needle flat metadata"]).output
+        )
+
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute(
+                "UPDATE thought SET metadata_json = ? WHERE thought_id = ?",
+                (json.dumps({"a": {"b": "x"}}), nested_id),
+            )
+            conn.execute(
+                "UPDATE thought SET metadata_json = ? WHERE thought_id = ?",
+                (json.dumps({"a.b": "x"}), flat_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = json.loads(
+            runner.invoke(
+                cli, ["--db", str(db), "recall", "needle", "--filter", "a.b=x", "--json"]
+            ).output
+        )
+        returned_ids = {row["thought_id"] for row in result["results"]}
+        assert nested_id in returned_ids
+        assert flat_id not in returned_ids
+
     def test_remember_reads_text_from_stdin(self, tmp_path: Path) -> None:
         db = tmp_path / "m.db"
         runner = CliRunner()
@@ -212,9 +262,17 @@ class TestAbsentDatabase:
 
 
 class TestLink:
-    def test_link_persists_type_and_weight_read_back_through_get_edges(
-        self, tmp_path: Path
+    def test_link_calls_create_edge_and_persists_type_and_weight(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """``link`` must go through ``SqliteEngravaCore.create_edge``, not a direct insert.
+
+        Reading the ``edge`` table back afterwards -- even through
+        ``get_edges()`` -- cannot tell those two apart: both leave the same
+        row behind. Wrapping the real method with a spy (and letting it
+        delegate) proves the call actually happened, on top of the row
+        landing with the right values.
+        """
         db = tmp_path / "m.db"
         runner = CliRunner()
         from_id = _last_line(
@@ -224,11 +282,25 @@ class TestLink:
             runner.invoke(cli, ["--db", str(db), "remember", "target thought"]).output
         )
 
+        calls: list[EdgeRecord] = []
+        original_create_edge = SqliteEngravaCore.create_edge
+
+        async def _spy_create_edge(store: SqliteEngravaCore, edge: EdgeRecord) -> EdgeRecord:
+            calls.append(edge)
+            return await original_create_edge(store, edge)
+
+        monkeypatch.setattr(SqliteEngravaCore, "create_edge", _spy_create_edge)
+
         result = runner.invoke(
             cli,
             ["--db", str(db), "link", from_id, to_id, "--type", "DEPENDS_ON", "--weight", "0.42"],
         )
         assert result.exit_code == 0, result.output
+
+        assert len(calls) == 1
+        assert calls[0].from_thought_id == from_id
+        assert calls[0].to_thought_id == to_id
+        assert calls[0].edge_type == EdgeType.DEPENDS_ON
 
         rows = _stored_edge_rows(db)
         assert len(rows) == 1
@@ -354,6 +426,72 @@ class TestMalformedOptions:
         payload = json.loads(_last_line(result.output))
         assert payload["schema"] == "engrava.cli.error.v1"
         assert "not-a-pair" in payload["message"]
+
+    def test_recall_malformed_filter_key_exits_2_naming_the_token(self, tmp_path: Path) -> None:
+        """A key that passes the KEY=VALUE split but fails the metadata path grammar."""
+        db = tmp_path / "m.db"
+        runner = CliRunner()
+        runner.invoke(cli, ["--db", str(db), "remember", "seed thought"])
+        result = runner.invoke(cli, ["--db", str(db), "recall", "seed", "--filter", "bad[=x"])
+        assert result.exit_code == 2
+        assert "bad[=x" in result.stderr
+        assert "bad[=x" not in result.stdout
+
+    def test_recall_malformed_filter_key_json_emits_error_object(self, tmp_path: Path) -> None:
+        db = tmp_path / "m.db"
+        runner = CliRunner()
+        runner.invoke(cli, ["--db", str(db), "remember", "seed thought"])
+        result = runner.invoke(
+            cli, ["--db", str(db), "recall", "seed", "--filter", "bad[=x", "--json"]
+        )
+        assert result.exit_code == 2
+        payload = json.loads(_last_line(result.output))
+        assert payload["schema"] == "engrava.cli.error.v1"
+        assert payload["error"] == "malformed_filter"
+        assert "bad[=x" in payload["message"]
+
+    def test_recall_malformed_filter_key_rejects_a_second_shape(self, tmp_path: Path) -> None:
+        """A second, differently malformed key (consecutive dots) is caught the same way."""
+        db = tmp_path / "m.db"
+        runner = CliRunner()
+        runner.invoke(cli, ["--db", str(db), "remember", "seed thought"])
+        result = runner.invoke(cli, ["--db", str(db), "recall", "seed", "--filter", "a..b=y"])
+        assert result.exit_code == 2
+        assert "a..b=y" in result.stderr
+        assert "a..b=y" not in result.stdout
+
+    def test_recall_malformed_filter_key_second_shape_json_emits_error_object(
+        self, tmp_path: Path
+    ) -> None:
+        db = tmp_path / "m.db"
+        runner = CliRunner()
+        runner.invoke(cli, ["--db", str(db), "remember", "seed thought"])
+        result = runner.invoke(
+            cli, ["--db", str(db), "recall", "seed", "--filter", "a..b=y", "--json"]
+        )
+        assert result.exit_code == 2
+        payload = json.loads(_last_line(result.output))
+        assert payload["schema"] == "engrava.cli.error.v1"
+        assert payload["error"] == "malformed_filter"
+        assert "a..b=y" in payload["message"]
+
+    def test_recall_malformed_filter_key_against_absent_db_exits_3_and_creates_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """The absent-database refusal wins over a key that only fails the path grammar.
+
+        Not "whatever the filter": a token missing its ``=`` fails the
+        KEY=VALUE split before the database is even resolved and exits ``2``,
+        never reaching this check. Only a key that passes that split but
+        fails the path grammar -- checked after the database is confirmed to
+        exist -- loses to the absent-database exit ``3`` here.
+        """
+        missing = tmp_path / "nope.db"
+        runner = CliRunner()
+        result = runner.invoke(cli, ["--db", str(missing), "recall", "seed", "--filter", "bad[=x"])
+        assert result.exit_code == 3
+        assert str(missing) in result.output
+        assert not missing.exists()
 
 
 class TestJsonSchemas:

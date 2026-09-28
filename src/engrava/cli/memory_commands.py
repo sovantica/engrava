@@ -44,6 +44,7 @@ from engrava import (
     EdgeType,
     FieldOp,
     FieldPredicate,
+    InvalidFilterPathError,
     KnowledgeSource,
     LifecycleStatus,
     MetadataFilter,
@@ -901,7 +902,10 @@ def remember(
     "filter_pairs",
     multiple=True,
     metavar="KEY=VALUE",
-    help="Metadata equality filter, key=value (repeatable, AND-combined).",
+    help=(
+        "Metadata equality filter, KEY=VALUE. Repeatable: different keys are "
+        "AND-combined; a repeated key keeps its last value."
+    ),
 )
 @click.option(
     "--json", "as_json", is_flag=True, help="Emit a JSON object instead of formatted rows."
@@ -927,10 +931,12 @@ def recall(
     rather than silently reporting zero hits.
 
     The whole body below runs under :func:`_error_boundary`: a validation
-    failure this function checks for itself keeps its own specific ``error``
-    kind and exit code, but any *other* exception — a malformed ``--filter``
-    path, a corrupt database, an unreadable ``--config`` — becomes the
-    documented error object with a generic kind instead of a traceback.
+    failure this function checks for itself — including a malformed
+    ``--filter`` key rejected by :class:`~engrava.domain.models.filters.FieldPredicate`
+    itself — keeps its own specific ``error`` kind and exit code, but any
+    *other* exception — a corrupt database, an unreadable ``--config`` —
+    becomes the documented error object with a generic kind instead of a
+    traceback.
     """
     with _error_boundary(as_json=as_json, command="recall") as boundary_database:
         if top_k < 1:
@@ -953,13 +959,29 @@ def recall(
                 code=3,
             )
 
-        metadata_filter = (
-            MetadataFilter(
-                [FieldPredicate(f"$.{key}", FieldOp.EQ, value) for key, value in filters.items()]
-            )
-            if filters
-            else None
-        )
+        # _parse_kv_pairs has already confirmed every raw token here contains
+        # "=" and a non-empty key, so recovering a key's own raw token by
+        # re-splitting is safe without repeating that validation. Built from
+        # filter_pairs (not filters.items()) in the same left-to-right order
+        # filters itself was built in, so a repeated key maps to its last
+        # (winning) occurrence -- the same one whose value ended up in
+        # filters, matching _parse_kv_pairs's own override rule.
+        raw_filter_tokens = {raw.partition("=")[0].strip(): raw for raw in filter_pairs}
+
+        predicates: list[FieldPredicate] = []
+        for key, value in filters.items():
+            try:
+                predicates.append(FieldPredicate(f"$.{key}", FieldOp.EQ, value))
+            except InvalidFilterPathError:
+                _fail(
+                    as_json=as_json,
+                    kind="malformed_filter",
+                    message=(
+                        f"Malformed --filter {raw_filter_tokens[key]!r}: not a valid filter path."
+                    ),
+                    code=2,
+                )
+        metadata_filter = MetadataFilter(predicates) if predicates else None
 
         async def _recall() -> None:
             async with _opened_full_store(resolved, cfg, create=False) as store:

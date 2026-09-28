@@ -2,8 +2,8 @@
 
 Two review rounds each found more exception types escaping a hand-enumerated
 ``except`` list in these three commands (see ``engrava.cli.memory_commands``):
-a malformed ``--filter`` path, a directory or corrupt file given as ``--db``,
-an unreadable / non-UTF-8 / directory ``--config``, an uninitialised database.
+a directory or corrupt file given as ``--db``, an unreadable / non-UTF-8 /
+directory ``--config``, an uninitialised database.
 ``_error_boundary`` replaces the enumeration with a single ``except
 Exception`` around each command's entire body, so *every* exception that
 reaches it -- not just the ones this test module happens to name -- becomes
@@ -51,34 +51,6 @@ def _last_line(output: str) -> str:
 
 
 class TestPreviouslyTracebackingCasesNowProduceTheDocumentedObject:
-    def test_recall_malformed_filter_key_is_the_documented_object(self, tmp_path: Path) -> None:
-        db = tmp_path / "m.db"
-        runner = CliRunner()
-        runner.invoke(cli, ["--db", str(db), "remember", "seed"])
-
-        result = runner.invoke(
-            cli, ["--db", str(db), "recall", "seed", "--filter", "bad[=x", "--json"]
-        )
-        assert "Traceback" not in result.output
-        assert result.exit_code == 1
-        payload = json.loads(_last_line(result.output))
-        assert payload["schema"] == "engrava.cli.error.v1"
-        assert payload["error"] == "unexpected_error"
-        assert "InvalidFilterPathError" in payload["message"]
-        assert "bad[" in payload["message"]
-
-    def test_recall_malformed_filter_key_plain_text_is_not_a_traceback(
-        self, tmp_path: Path
-    ) -> None:
-        db = tmp_path / "m.db"
-        runner = CliRunner()
-        runner.invoke(cli, ["--db", str(db), "remember", "seed"])
-
-        result = runner.invoke(cli, ["--db", str(db), "recall", "seed", "--filter", "bad[=x"])
-        assert "Traceback" not in result.output
-        assert result.exit_code == 1
-        assert "InvalidFilterPathError" in result.output
-
     def test_directory_as_db_is_the_documented_object(self, tmp_path: Path) -> None:
         target = tmp_path / "a_directory"
         target.mkdir()

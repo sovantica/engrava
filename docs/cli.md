@@ -470,7 +470,7 @@ substitute for [`query`](#query): `query` runs structural MindQL (`FIND` /
 |---|---|---|---|
 | `QUERY` | positional | required | Natural-language text to search for. |
 | `--top-k` | int | `10` | Maximum results to return. |
-| `--filter` | `KEY=VALUE` | — | Metadata equality filter (repeatable, AND-combined; flat keys only — nested-path filters are a later concern). |
+| `--filter` | `KEY=VALUE` | — | `KEY` is a metadata filter path (a dotted key such as `a.b` addresses a nested field); equality only; repeatable — different keys AND-combine, a repeated key keeps its last value. |
 | `--json` | flag | off | Emit a JSON object (schema `engrava.cli.recall.v1`) instead of a formatted table. |
 
 ```bash
@@ -479,12 +479,13 @@ engrava --db my.db recall "tagged" --filter topic=weather --top-k 5
 engrava --config engrava.yaml recall "concise answers" --json
 ```
 
-A `KEY` missing an `=` is `malformed_filter`, exit `2` (see above). A `KEY`
-present but outside the allowed key grammar (letters, digits, and
-underscore only — no brackets, dots, spaces, `$`, or `..`) is not a
-dedicated kind: it falls through to `unexpected_error`, exit `1`, since it is
-the underlying filter library's own validation rejecting it, not a check
-this command performs itself.
+Three checks run in this order. A `KEY` missing an `=` is `malformed_filter`,
+exit `2`, checked before the database is even resolved. Next, a database
+that does not exist exits `3` (see above), whatever the filter's path
+validity. Only once the database is confirmed to exist does a `KEY` that is
+not a valid metadata filter path — `FieldPredicate`'s own path grammar, not
+a rule this command adds — become `malformed_filter`, exit `2` too: the
+offending `KEY=VALUE` token is named in the message.
 
 `--json` output:
 
