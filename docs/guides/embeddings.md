@@ -87,8 +87,8 @@ it rolls back with the rest of that window. This is surfaced two ways:
 - An `Exception` that escapes the guarded embed call (`provider.embed()` /
   `embed_batch()`, or their role-aware equivalents) is never silent for the
   thought a caller directly created or updated: a `WARNING` naming the
-  thought id and the provider error is always logged, then the provider's
-  own exception propagates (unchanged default behaviour). That guarantee is
+  thought id and the provider error's type is always logged, then the
+  provider's own exception propagates (unchanged default behaviour). That guarantee is
   scoped to that one call, not to provider failures in general — a provider
   whose `model_name` property raises (read right after a successful embed,
   to store alongside the vector) skips the logging and typing entirely,

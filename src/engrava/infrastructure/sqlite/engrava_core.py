@@ -10371,9 +10371,9 @@ class SqliteEngravaCore:
         ``EmbeddingGenerationError`` entries for the fuller treatment. This
         handler makes the certain half of that outcome visible either way:
         it always emits a ``WARNING`` naming the thought id and the
-        provider error, then either re-raises the provider's own exception
-        (default, byte-identical to prior behaviour) or, under
-        ``require_embedding=True``, raises a typed
+        provider error's type — never its message — then either re-raises
+        the provider's own exception (default, byte-identical to prior
+        behaviour) or, under ``require_embedding=True``, raises a typed
         :class:`EmbeddingGenerationError` — the opt-in fail-fast.
 
         Args:
@@ -10392,7 +10392,7 @@ class SqliteEngravaCore:
             "surrounding transaction — see docs/api-reference.md for the "
             "specific outcomes.",
             thought_id,
-            exc,
+            type(exc).__name__,
         )
         if self._require_embedding:
             raise EmbeddingGenerationError(thought_id, str(exc)) from exc
@@ -10410,8 +10410,9 @@ class SqliteEngravaCore:
         An ``Exception`` that escapes the guarded call to
         :func:`_embed_document` below is never silent: it is routed through
         :meth:`_on_auto_embed_failure`, which logs a ``WARNING`` naming the
-        thought and then re-raises the provider error (default) or a typed
-        :class:`EmbeddingGenerationError` (when ``require_embedding=True``).
+        thought and the provider error's type, then re-raises the provider
+        error (default) or a typed :class:`EmbeddingGenerationError` (when
+        ``require_embedding=True``).
         That guarantee is scoped to this one call, not to provider failures
         in general: ``provider.model_name`` is read afterward, outside the
         ``try``/``except``, to pass to :meth:`store_embedding`, so a
