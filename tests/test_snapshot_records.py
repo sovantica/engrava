@@ -1962,23 +1962,33 @@ class TestRestoreExemptsCentroidRowsFromTheIdentityInvariant:
         The incoming snapshot carries a legitimate centroid row (exempt) and
         a provider row that genuinely disagrees with the target's lock (not
         exempt) -- only the latter must be refused.
+
+        The centroid row comes **first**: a wrong fix that resets the running
+        identity reference whenever it sees a centroid (instead of leaving it
+        untouched) would clear the target's lock right here, and the
+        mismatched provider row after it would then silently become the new
+        reference instead of being refused. Putting the mismatch first would
+        never exercise that path, because the mismatch would already have
+        been rejected before the centroid row was ever read.
         """
         target = tmp_path / "target.db"
         asyncio.run(_locked_target(target, model_name="model-A", dimension=3))
+        before_thoughts = asyncio.run(_dump_table(target, "thought"))
+        before_embeddings = asyncio.run(_dump_table(target, "embedding"))
 
         from engrava.domain.dreaming import CENTROID_MODEL_NAME
 
-        mismatched_vector = struct.pack("3f", 0.1, 0.2, 0.3)
         centroid_vector = struct.pack("3f", 0.4, 0.4, 0.4)
+        mismatched_vector = struct.pack("3f", 0.1, 0.2, 0.3)
         snap = tmp_path / "snap.jsonl"
         snap.write_text(
-            _thought_line(_minimal_thought_data("t-mismatch"))
-            + "\n"
-            + _embedding_line("e-mismatch", "t-mismatch", "model-B", 3, mismatched_vector)
-            + "\n"
-            + _thought_line(_minimal_thought_data("t-reflection"))
+            _thought_line(_minimal_thought_data("t-reflection"))
             + "\n"
             + _embedding_line("e-centroid", "t-reflection", CENTROID_MODEL_NAME, 3, centroid_vector)
+            + "\n"
+            + _thought_line(_minimal_thought_data("t-mismatch"))
+            + "\n"
+            + _embedding_line("e-mismatch", "t-mismatch", "model-B", 3, mismatched_vector)
             + "\n",
             encoding="utf-8",
         )
@@ -1988,5 +1998,223 @@ class TestRestoreExemptsCentroidRowsFromTheIdentityInvariant:
         assert result.exit_code != 0
         assert "'model-A' at dimension 3" in result.output
         assert "'model-B' at dimension 3" in result.output
-        # Rejected before any write lands.
+        # Rejected before any write lands: the target's own pre-existing
+        # rows -- there are none here -- are exactly as they were.
+        assert asyncio.run(_dump_table(target, "thought")) == before_thoughts
+        assert asyncio.run(_dump_table(target, "embedding")) == before_embeddings
+
+
+class TestRestoreEnforcesOneVectorWidthAcrossCentroidAndProviderRows:
+    """A centroid row is exempt from the model-name identity check, never
+    from the vector-width check: every embedding row a restore accepts,
+    centroid or provider, must share one width, or the next open with
+    sqlite-vec fails trying to index the odd one out.
+    """
+
+    def test_merge_into_a_locked_target_refuses_a_centroid_of_another_width(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "target.db"
+        asyncio.run(_locked_target(target, model_name="model-A", dimension=3))
+        before_thoughts = asyncio.run(_dump_table(target, "thought"))
+        before_embeddings = asyncio.run(_dump_table(target, "embedding"))
+
+        from engrava.domain.dreaming import CENTROID_MODEL_NAME
+
+        centroid_vector = struct.pack("4f", 0.1, 0.2, 0.3, 0.4)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-reflection"))
+            + "\n"
+            + _embedding_line("e-centroid", "t-reflection", CENTROID_MODEL_NAME, 4, centroid_vector)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert "'model-A' at dimension 3" in result.output
+        assert f"{CENTROID_MODEL_NAME!r} at dimension 4" in result.output
+        assert asyncio.run(_dump_table(target, "thought")) == before_thoughts
+        assert asyncio.run(_dump_table(target, "embedding")) == before_embeddings
+
+    def test_merge_into_an_unlocked_centroid_only_target_refuses_a_provider_of_another_width(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """An unlocked target whose only embedding row is a centroid still
+        carries a corpus-wide width -- a provider row of another width must
+        be refused, or the merge leaves the same sqlite-vec open failure the
+        model-name-only exemption used to allow.
+        """
+        from engrava.domain.dreaming import CENTROID_MODEL_NAME
+
+        target = tmp_path / "target.db"
+        centroid_vector = struct.pack("3f", 0.5, 0.5, 0.5)
+        asyncio.run(
+            _unlocked_target_with_vector(
+                target,
+                model_name=CENTROID_MODEL_NAME,
+                dimension=3,
+                vector_blob=centroid_vector,
+                thought_id="t-reflection",
+            )
+        )
+        before_thoughts = asyncio.run(_dump_table(target, "thought"))
+        before_embeddings = asyncio.run(_dump_table(target, "embedding"))
+        assert before_thoughts  # setup sanity: the pre-existing row is really there
+
+        provider_vector = struct.pack("4f", 0.1, 0.2, 0.3, 0.4)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-new"))
+            + "\n"
+            + _embedding_line("e-new", "t-new", "model-P", 4, provider_vector)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert f"{CENTROID_MODEL_NAME!r} at dimension 3" in result.output
+        assert "'model-P' at dimension 4" in result.output
+        # The target's pre-existing thought row -- not only the absence of
+        # the incoming one -- must survive the refusal unchanged.
+        assert asyncio.run(_dump_table(target, "thought")) == before_thoughts
+        assert asyncio.run(_dump_table(target, "embedding")) == before_embeddings
+
+    def test_merge_into_an_unlocked_centroid_only_target_adopts_a_same_width_provider(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """A centroid never blocks adoption, only a real provider row does.
+
+        The target starts unlocked with only a centroid row -- the same
+        state the previous test refuses a wrong-width provider row into. A
+        *same*-width provider row must merge cleanly, and because the
+        target began this restore with no non-centroid row of its own
+        either, it must end up locked to that provider's identity: the
+        centroid is bookkeeping, not a reason to leave the target unlocked
+        for a later, unrelated ``store_embedding()`` call to lock however it
+        likes.
+        """
+        from engrava.domain.dreaming import CENTROID_MODEL_NAME
+
+        target = tmp_path / "target.db"
+        centroid_vector = struct.pack("3f", 0.5, 0.5, 0.5)
+        asyncio.run(
+            _unlocked_target_with_vector(
+                target,
+                model_name=CENTROID_MODEL_NAME,
+                dimension=3,
+                vector_blob=centroid_vector,
+                thought_id="t-reflection",
+            )
+        )
+        assert "embedding_model_name" not in asyncio.run(_metadata_map(target))
+
+        provider_vector = struct.pack("3f", 0.1, 0.2, 0.3)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-new"))
+            + "\n"
+            + _embedding_line("e-new", "t-new", "model-P", 3, provider_vector)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code == 0, result.output
+        thought_ids = {row["thought_id"] for row in asyncio.run(_dump_table(target, "thought"))}
+        assert {"t-reflection", "t-new"} <= thought_ids
+        metadata = asyncio.run(_metadata_map(target))
+        assert metadata["embedding_model_name"] == "model-P"
+        assert metadata["embedding_dimension"] == "3"
+
+    def test_fresh_target_refuses_a_provider_row_then_a_centroid_of_another_width(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        from engrava.domain.dreaming import CENTROID_MODEL_NAME
+
+        target = tmp_path / "fresh.db"
+        provider_vector = struct.pack("3f", 0.1, 0.2, 0.3)
+        centroid_vector = struct.pack("4f", 0.4, 0.4, 0.4, 0.4)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-src"))
+            + "\n"
+            + _embedding_line("e-src", "t-src", "model-P", 3, provider_vector)
+            + "\n"
+            + _thought_line(_minimal_thought_data("t-reflection"))
+            + "\n"
+            + _embedding_line("e-centroid", "t-reflection", CENTROID_MODEL_NAME, 4, centroid_vector)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert "'model-P' at dimension 3" in result.output
+        assert f"{CENTROID_MODEL_NAME!r} at dimension 4" in result.output
         assert asyncio.run(_dump_table(target, "thought")) == []
+        assert asyncio.run(_dump_table(target, "embedding")) == []
+
+    def test_fresh_target_refuses_a_centroid_then_a_provider_row_of_another_width(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        from engrava.domain.dreaming import CENTROID_MODEL_NAME
+
+        target = tmp_path / "fresh.db"
+        centroid_vector = struct.pack("4f", 0.4, 0.4, 0.4, 0.4)
+        provider_vector = struct.pack("3f", 0.1, 0.2, 0.3)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-reflection"))
+            + "\n"
+            + _embedding_line("e-centroid", "t-reflection", CENTROID_MODEL_NAME, 4, centroid_vector)
+            + "\n"
+            + _thought_line(_minimal_thought_data("t-src"))
+            + "\n"
+            + _embedding_line("e-src", "t-src", "model-P", 3, provider_vector)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert f"{CENTROID_MODEL_NAME!r} at dimension 4" in result.output
+        assert "'model-P' at dimension 3" in result.output
+        assert asyncio.run(_dump_table(target, "thought")) == []
+        assert asyncio.run(_dump_table(target, "embedding")) == []
+
+    def test_fresh_target_refuses_two_centroids_of_different_widths(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        from engrava.domain.dreaming import CENTROID_MODEL_NAME
+
+        target = tmp_path / "fresh.db"
+        centroid_3 = struct.pack("3f", 0.1, 0.1, 0.1)
+        centroid_4 = struct.pack("4f", 0.2, 0.2, 0.2, 0.2)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-reflection-1"))
+            + "\n"
+            + _embedding_line("e-centroid-1", "t-reflection-1", CENTROID_MODEL_NAME, 3, centroid_3)
+            + "\n"
+            + _thought_line(_minimal_thought_data("t-reflection-2"))
+            + "\n"
+            + _embedding_line("e-centroid-2", "t-reflection-2", CENTROID_MODEL_NAME, 4, centroid_4)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert f"{CENTROID_MODEL_NAME!r} at dimension 3" in result.output
+        assert f"{CENTROID_MODEL_NAME!r} at dimension 4" in result.output
+        assert asyncio.run(_dump_table(target, "thought")) == []
+        assert asyncio.run(_dump_table(target, "embedding")) == []

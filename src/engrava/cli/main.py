@@ -1867,6 +1867,57 @@ def _track_embedding_identity(
     raise click.ClickException(msg)
 
 
+def _track_embedding_width(
+    identity: tuple[str, int],
+    reference: tuple[str, int] | None,
+    reference_label: str,
+    *,
+    subject_label: str,
+) -> tuple[str, int]:
+    """Compare one declared embedding row's vector width against the running reference.
+
+    Unlike :func:`_track_embedding_identity`, only the dimension component of
+    ``identity`` is compared. Every embedding row in a restore -- a centroid
+    included -- must declare the same vector width, even though a centroid is
+    exempt from the model-name half of the check (see
+    :func:`_check_embedding_row_before_insert`); ``identity`` and
+    ``reference`` still each carry a model name so the mismatch message can
+    name the row that declared it, centroid or provider alike.
+
+    Args:
+        identity: The ``(model_name, dimension)`` pair just observed.
+        reference: The width reference established so far, together with the
+            model name of whichever row set it, or ``None`` if this is the
+            first embedding row seen.
+        reference_label: A phrase describing where ``reference`` came from
+            (the target's stored model, its existing rows, or an earlier
+            snapshot row), for the mismatch message.
+        subject_label: A phrase describing where ``identity`` came from, for
+            the mismatch message.
+
+    Returns:
+        ``reference`` unchanged when its width already matched, or
+        ``identity`` when no reference was established yet.
+
+    Raises:
+        click.ClickException: If ``identity``'s dimension differs from an
+            already established ``reference``'s dimension.
+
+    """
+    if reference is None:
+        return identity
+    if identity[1] == reference[1]:
+        return reference
+    msg = (
+        f"Embedding model mismatch: {reference_label} declares "
+        f"{_format_embedding_identity(reference)}, but {subject_label} declares "
+        f"{_format_embedding_identity(identity)}. Use --re-embed to regenerate "
+        "embeddings for the target's model, or --skip-embeddings to skip "
+        "importing vectors."
+    )
+    raise click.ClickException(msg)
+
+
 async def _read_embedding_lock(conn: aiosqlite.Connection) -> tuple[str, int] | None:
     """Read the target's stored embedding-model lock, if any.
 
@@ -1919,6 +1970,9 @@ async def _existing_embedding_identities(conn: aiosqlite.Connection) -> list[tup
     reflections legitimately carries both, and comparing the centroid tag
     against the provider identity would refuse that healthy store.
 
+    This is the model-name half only. A centroid row's *width* is not
+    excused the same way -- see :func:`_existing_embedding_rows`.
+
     Args:
         conn: Restore connection with an active transaction.
 
@@ -1935,14 +1989,41 @@ async def _existing_embedding_identities(conn: aiosqlite.Connection) -> list[tup
     return [(str(row[0]), int(row[1])) for row in rows]
 
 
+async def _existing_embedding_rows(conn: aiosqlite.Connection) -> list[tuple[str, int]]:
+    """Return every distinct declared ``(model_name, dimension)`` pair already stored.
+
+    Centroid rows are included.
+
+    Unlike :func:`_existing_embedding_identities`, nothing is excluded: a
+    target's vector width must be consistent across every embedding row it
+    holds, ``dreaming-centroid`` bookkeeping included, or a merge restore can
+    leave a target whose vec0 index cannot be built on its next open (see
+    :func:`_track_embedding_width`). The model-name identity check stays
+    centroid-exempt; only the width half widens to cover every row.
+
+    Args:
+        conn: Restore connection with an active transaction.
+
+    Returns:
+        Distinct ``(model_name, dimension)`` pairs currently stored, in no
+        particular order.
+
+    """
+    cursor = await conn.execute("SELECT DISTINCT model_name, dimension FROM embedding")
+    rows = await cursor.fetchall()
+    return [(str(row[0]), int(row[1])) for row in rows]
+
+
 async def _write_embedding_lock(conn: aiosqlite.Connection, identity: tuple[str, int]) -> None:
     """Adopt a restored corpus's declared identity as the target's new lock.
 
     Used only when the target began this restore with neither a stored model
-    nor any embedding rows of its own. Restore inserts ``embedding`` rows via
-    fixed SQL directly (never through ``store_embedding()``), so nothing else
-    would ever lock a target that starts this way -- it would otherwise end
-    the restore holding vectors under no declared model at all.
+    nor any non-centroid embedding rows of its own -- a target that starts
+    with only centroid rows, or with none at all, is eligible too. Restore
+    inserts ``embedding`` rows via fixed SQL directly (never through
+    ``store_embedding()``), so nothing else would ever lock a target that
+    starts this way -- it would otherwise end the restore holding vectors
+    under no declared model at all.
 
     Writes only ``embedding_model_name`` and ``embedding_dimension``. A
     snapshot carries neither a document-prefix fingerprint nor a query
@@ -1975,8 +2056,8 @@ async def _finalize_embedding_identity(
     """Adopt the restored corpus's declared identity as the target's lock, if eligible.
 
     ``may_adopt_identity`` is only ever ``True`` when the target began the
-    restore with neither a stored model nor any embedding rows (see
-    ``_initial_embedding_state``), so this already implies the identity
+    restore with neither a stored model nor any non-centroid embedding rows
+    (see ``_initial_embedding_state``), so this already implies the identity
     check ran; ``identity_reference`` is ``None`` when no non-centroid
     embedding row was ever inserted -- either because none was inserted at
     all, or because every inserted row was a ``CENTROID_MODEL_NAME`` row,
@@ -1999,8 +2080,8 @@ async def _finalize_embedding_identity(
 
 async def _initial_embedding_state(
     conn: aiosqlite.Connection,
-) -> tuple[tuple[str, int] | None, str, bool]:
-    """Establish the identity every embedding in the target must share, pre-restore.
+) -> tuple[tuple[str, int] | None, str, tuple[str, int] | None, str, bool]:
+    """Establish the identity and width every embedding in the target must share, pre-restore.
 
     Runs unconditionally, regardless of ``--skip-embeddings`` or ``--re-embed``:
     those flags only decide whether the snapshot's own vectors are imported as
@@ -2012,97 +2093,169 @@ async def _initial_embedding_state(
     (criterion: the check covers rows already in the target, not only
     incoming ones), no matter which import flags are given.
 
-    A target with a lock and no vectors, and a target with vectors and no
-    lock, are different states: the former's reference is its lock and never
-    changes; the latter's reference comes from its own rows, and neither is
-    later written back as a fresh lock (see ``_stream_insert``) -- only a
-    target that starts with **neither** a lock nor any embeddings gets its
-    incoming identity adopted.
+    The corpus carries two separate invariants, tracked separately:
+
+    * **Model-name identity** -- covers non-centroid rows only (a centroid is
+      bookkeeping, not a provider's output). Sourced from the stored lock,
+      else the target's existing non-centroid rows, else the first
+      non-centroid row this restore accepts.
+    * **Vector width** -- covers *every* embedding row, centroid included,
+      because a merge that lets a mismatched width in leaves a target whose
+      vec0 index cannot be built on its next open. Sourced from the stored
+      lock, else *every* existing embedding row the target already holds
+      (centroids included), else the first embedding row of any kind this
+      restore accepts.
+
+    A target with a lock and no vectors, and a target with non-centroid
+    vectors and no lock, are different states: the former's reference is its
+    lock and never changes; the latter's reference comes from its own
+    non-centroid rows, and is never written back as a fresh lock (see
+    ``_stream_insert``). A target with **no** lock and **no** non-centroid
+    vectors -- whether it holds no embedding rows at all or only centroid
+    ones -- is a third state: it has no model-name reference yet, so it is
+    eligible to adopt the identity the first incoming non-centroid
+    embedding row declares, once every row has been checked to agree on it.
+    A centroid must never establish the model-name reference,
+    which cuts both ways -- it must not block this adoption either, or a
+    centroid-only target that merges a consistent provider corpus would end
+    the restore still unlocked, leaving a later, unrelated
+    ``store_embedding()`` call free to lock it to whatever it is given. Its
+    width still has to agree, though -- see the width reference above, which
+    a centroid row's own existing width does bind.
 
     Args:
         conn: Restore connection with an active transaction.
 
     Returns:
-        A ``(reference, reference_label, may_adopt)`` triple. ``reference``
-        is the identity every embedding row -- existing and about to be
-        inserted -- must share, or ``None`` when the target starts with
-        neither a lock nor any embedding rows. ``may_adopt`` is ``True``
-        only for that last case: the target started with neither, so it is
-        eligible to have the snapshot's identity written as its new lock
-        once every row has been checked to agree on it.
+        A ``(identity_reference, identity_reference_label, width_reference,
+        width_reference_label, may_adopt)`` tuple. ``identity_reference`` is
+        the ``(model_name, dimension)`` every non-centroid embedding row must
+        share, or ``None`` when the target starts with neither a lock nor any
+        non-centroid embedding rows. ``width_reference`` is the width every
+        embedding row -- centroid included -- must share, or ``None`` when
+        the target starts with neither a lock nor any embedding rows at all.
+        ``may_adopt`` is ``True`` only when the target started with neither a
+        lock nor any non-centroid embedding rows, making it eligible to have
+        the snapshot's identity written as its new lock once every row has
+        been checked to agree on it.
 
     Raises:
         click.ClickException: If the target's own existing embedding rows
             disagree with its stored lock, or with each other when there is
-            no lock.
+            no lock -- on model name (non-centroid rows) or on width (every
+            row).
 
     """
     stored_lock = await _read_embedding_lock(conn)
     existing_identities = await _existing_embedding_identities(conn)
+    existing_rows = await _existing_embedding_rows(conn)
 
     if stored_lock is not None:
-        reference_label = "the target's stored embedding model"
+        identity_reference_label = "the target's stored embedding model"
     elif existing_identities:
-        reference_label = "the target's existing embedding rows"
+        identity_reference_label = "the target's existing embedding rows"
     else:
-        reference_label = "an earlier row in this snapshot"
+        identity_reference_label = "an earlier row in this snapshot"
 
-    reference = stored_lock
+    if stored_lock is not None:
+        width_reference_label = "the target's stored embedding model"
+    elif existing_rows:
+        width_reference_label = "the target's existing embedding rows"
+    else:
+        width_reference_label = "an earlier row in this snapshot"
+
+    identity_reference = stored_lock
     for existing_identity in existing_identities:
-        reference = _track_embedding_identity(
+        identity_reference = _track_embedding_identity(
             existing_identity,
-            reference,
-            reference_label,
+            identity_reference,
+            identity_reference_label,
             subject_label="one of the target's existing embedding rows",
         )
+
+    width_reference = stored_lock
+    for existing_row in existing_rows:
+        width_reference = _track_embedding_width(
+            existing_row,
+            width_reference,
+            width_reference_label,
+            subject_label="one of the target's existing embedding rows",
+        )
+
     may_adopt = stored_lock is None and not existing_identities
-    return reference, reference_label, may_adopt
+    return (
+        identity_reference,
+        identity_reference_label,
+        width_reference,
+        width_reference_label,
+        may_adopt,
+    )
 
 
 async def _check_embedding_row_before_insert(
     record: TableRecord,
     identity_reference: tuple[str, int] | None,
     identity_reference_label: str,
-) -> tuple[str, int] | None:
-    """Validate one about-to-be-inserted embedding row and update the reference.
+    width_reference: tuple[str, int] | None,
+    width_reference_label: str,
+) -> tuple[tuple[str, int] | None, tuple[str, int] | None]:
+    """Validate one about-to-be-inserted embedding row and update both references.
 
     Called only for an ``embedding``-table record that will actually be
     inserted (the caller has already excluded ``--skip-embeddings`` /
-    ``--re-embed``), so this is where both the structural check (dimension
-    vs. blob) and the cross-row identity check happen.
+    ``--re-embed``), so this is where the structural check (dimension vs.
+    blob), the width check, and the model-name identity check all happen.
 
     A row declaring ``model_name == CENTROID_MODEL_NAME`` still gets the
     structural check -- its ``dimension`` must still match its own
-    ``vector_blob`` -- but is exempt from the identity check in both
-    directions: it is never compared against ``identity_reference``, and it
-    never becomes (or updates) that reference for the rows after it. See
+    ``vector_blob`` -- and its width must still agree with
+    ``width_reference``: every embedding row this restore inserts, centroid
+    or provider, shares one vector width, or a later open with sqlite-vec
+    fails trying to index the odd one out. Only the model-name identity
+    check is centroid-exempt, in both directions: a centroid row is never
+    compared against ``identity_reference``, and it never becomes (or
+    updates) that reference for the rows after it. See
     :func:`_existing_embedding_identities` for why -- the same exemption
     already exists at write time and this mirrors it for restore.
 
     Args:
         record: A validated ``embedding``-table record about to be inserted.
-        identity_reference: The identity established so far, or ``None``.
+        identity_reference: The model-name identity established so far, or
+            ``None``.
         identity_reference_label: A phrase describing where
             ``identity_reference`` came from, for a mismatch message.
+        width_reference: The vector width established so far, or ``None``.
+        width_reference_label: A phrase describing where ``width_reference``
+            came from, for a mismatch message.
 
     Returns:
-        The identity every non-centroid embedding row must now agree on --
-        ``identity_reference`` unchanged when this row is a centroid row.
+        The ``(identity_reference, width_reference)`` every later row must
+        now agree on -- ``identity_reference`` unchanged when this row is a
+        centroid row.
 
     Raises:
-        click.ClickException: If the row is structurally invalid, or its
-            declared identity differs from ``identity_reference``.
+        click.ClickException: If the row is structurally invalid, its
+            declared width differs from ``width_reference``, or (for a
+            non-centroid row) its declared identity differs from
+            ``identity_reference``.
 
     """
     row_identity = await _assert_embedding_row_structurally_valid(record)
+    width_reference = _track_embedding_width(
+        row_identity,
+        width_reference,
+        width_reference_label,
+        subject_label="a row in the snapshot",
+    )
     if row_identity[0] == CENTROID_MODEL_NAME:
-        return identity_reference
-    return _track_embedding_identity(
+        return identity_reference, width_reference
+    identity_reference = _track_embedding_identity(
         row_identity,
         identity_reference,
         identity_reference_label,
         subject_label="a row in the snapshot",
     )
+    return identity_reference, width_reference
 
 
 async def _assert_embedding_row_structurally_valid(record: TableRecord) -> tuple[str, int]:
@@ -2736,9 +2889,10 @@ async def _stream_insert(
     the target's own data, never against ``embedding_provider`` or the
     snapshot's metadata header: a plain restore never resolves a provider,
     and the header is not proof of anything the rows do not already say for
-    themselves. A target that starts with neither a lock nor any embeddings
-    adopts the snapshot's declared identity as its new lock once every row
-    has been checked to agree on it.
+    themselves. A target that starts with neither a lock nor any
+    non-centroid embeddings -- whether it holds none at all or only centroid
+    rows -- adopts the snapshot's declared identity as its new lock once
+    every row has been checked to agree on it.
 
     Args:
         conn: Open aiosqlite connection (inside the caller's transaction).
@@ -2773,6 +2927,8 @@ async def _stream_insert(
     (
         identity_reference,
         identity_reference_label,
+        width_reference,
+        width_reference_label,
         may_adopt_identity,
     ) = await _initial_embedding_state(conn)
 
@@ -2785,8 +2941,12 @@ async def _stream_insert(
         if record.spec.table is CoreTable.EMBEDDING:
             if not check_incoming:
                 continue
-            identity_reference = await _check_embedding_row_before_insert(
-                record, identity_reference, identity_reference_label
+            identity_reference, width_reference = await _check_embedding_row_before_insert(
+                record,
+                identity_reference,
+                identity_reference_label,
+                width_reference,
+                width_reference_label,
             )
 
         await _insert_record_tracking_replacement(
