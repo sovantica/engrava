@@ -874,3 +874,72 @@ async def test_nested_in_suspend_auto_commit_does_not_discard_the_callers_pendin
     assert [t.thought_id for t in store.prepare_calls] == ["t-pending", "t-second"]
     ids = {row["thought_id"] for row in await db.execute_fetchall("SELECT thought_id FROM thought")}
     assert ids == {pending.thought_id, record.thought_id} == {"t-pending", "t-second"}
+
+
+async def test_upsert_by_hash_decisive_hit_leaves_the_callers_pending_writes_alone(
+    db: aiosqlite.Connection,
+) -> None:
+    """A decisive no-change hit must not roll back writes it did not open.
+
+    Inside the caller's own ``suspend_auto_commit()`` window nothing is open
+    when the exploratory probe samples the connection, so that probe's
+    ``opened_transaction`` is ``True``. The seam then leaves a transaction
+    open with pending writes (a ``marker`` row of the caller's own, plus a
+    ``same`` row whose content equals the candidate's, so the decisive probe
+    hits with no field to update). The decisive probe finds that transaction
+    already open, so *it* opened nothing and must end nothing: the first
+    probe's flag describes the connection as it was then, not now. Both rows
+    must survive the window's commit.
+    """
+    state = {"armed": False}
+
+    async def leave_pending_writes(store: _SeamHookCore, thought: ThoughtRecord) -> ThoughtRecord:
+        if state["armed"]:
+            state["armed"] = False
+            await SqliteEngravaCore.create_thought(
+                store, _thought("marker", content="the caller's own pending write")
+            )
+            await SqliteEngravaCore.create_thought(store, _thought("same", content=thought.content))
+        return thought
+
+    store = await _make_store(db, on_prepare=leave_pending_writes)
+
+    async with store.suspend_auto_commit():
+        state["armed"] = True
+        result = await store.upsert_by_hash(
+            _thought("cand", content="candidate content the seam collides with"),
+        )
+
+    assert result.thought_id == "same"
+    ids = {row["thought_id"] for row in await db.execute_fetchall("SELECT thought_id FROM thought")}
+    assert ids == {"marker", "same"}
+
+
+async def test_upsert_by_hash_decisive_hit_ends_the_transaction_its_own_probe_opened(
+    db: aiosqlite.Connection,
+) -> None:
+    """The case the ownership flag exists for: the decisive probe opened the transaction.
+
+    With no enclosing window, another writer lands the same content between
+    the two probes and commits (no transaction is left open). The decisive
+    probe then opens its own ``BEGIN IMMEDIATE``, matches, finds no mutable
+    field to change and writes nothing, so it must end that transaction
+    itself -- leaving it open would hold the cross-connection write
+    reservation after the call returned.
+    """
+    content = "Raced content with nothing to update."
+
+    async def inject_competing_write(store: _SeamHookCore, thought: ThoughtRecord) -> ThoughtRecord:
+        if len(store.prepare_calls) == 1:
+            await store._insert_new_thought_row(
+                _thought("t-competitor", content=content),
+                expires_after_seconds=None,
+            )
+        return thought
+
+    store = await _make_store(db, on_prepare=inject_competing_write)
+    result = await store.upsert_by_hash(_thought("t-mine", content=content))
+
+    assert result.thought_id == "t-competitor"
+    assert len(store.prepare_calls) == 1
+    assert store._db.in_transaction is False

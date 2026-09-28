@@ -7523,32 +7523,33 @@ class SqliteEngravaCore:
 
         # Phase 2 -- decisive probe: reacquired from scratch, keyed on the
         # prepared record's content. Insert only if this still misses.
-        async with (
-            self._write_lock,
-            self._dedup_lock,
-            self._serialize_dedup_probe(operation="upsert_by_hash"),
-        ):
-            existing = await self._get_thought_by_content_hash(
-                _compute_content_hash(thought.content),
-            )
-            if existing is None:
-                # Insert-only, inside the window; auto-embed / on_store /
-                # derivation run afterwards -- at the top level, once the
-                # write lock is released; nested in the caller's own
-                # suspend_auto_commit() window, while that outer hold stays
-                # in place instead (see _insert_new_thought_row /
-                # _finish_create_thought's docstring for both cases).
-                persisted = await self._insert_new_thought_row(
-                    thought,
-                    expires_after_seconds=expires_after_seconds,
+        async with self._write_lock, self._dedup_lock:
+            # Sampled again, not carried over from phase 1: the seam (or
+            # anything else on this connection) may have left a transaction
+            # open in between, and this window opened nothing then.
+            opened_transaction = not self._db.in_transaction
+            async with self._serialize_dedup_probe(operation="upsert_by_hash"):
+                existing = await self._get_thought_by_content_hash(
+                    _compute_content_hash(thought.content),
                 )
-            else:
-                # Another writer won the race between the two probes -- the
-                # seam already ran once for this call; take the hit branch
-                # instead of inserting.
-                return await self._upsert_matched_row(
-                    thought, existing, opened_transaction=opened_transaction
-                )
+                if existing is None:
+                    # Insert-only, inside the window; auto-embed / on_store /
+                    # derivation run afterwards -- at the top level, once the
+                    # write lock is released; nested in the caller's own
+                    # suspend_auto_commit() window, while that outer hold stays
+                    # in place instead (see _insert_new_thought_row /
+                    # _finish_create_thought's docstring for both cases).
+                    persisted = await self._insert_new_thought_row(
+                        thought,
+                        expires_after_seconds=expires_after_seconds,
+                    )
+                else:
+                    # Another writer won the race between the two probes -- the
+                    # seam already ran once for this call; take the hit branch
+                    # instead of inserting.
+                    return await self._upsert_matched_row(
+                        thought, existing, opened_transaction=opened_transaction
+                    )
         origin_token = _DERIVATION_ORIGIN.set("upsert_by_hash")
         try:
             return await self._finish_create_thought(persisted)
