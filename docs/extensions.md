@@ -55,7 +55,7 @@ class MyHooks(EngravaHooksProtocol):
 > `get_or_create` / `upsert_by_hash` do not call it. `score_function` and
 > `mindql_extension_registry()` are reserved and not called by core — and
 > MindQL verbs are **not** wired through a manifest passed to the store either;
-> the store only reads `ExtensionManifest.schema_migrations`. The one consumer
+> the store uses a manifest only to apply its schema migrations. The one consumer
 > of `mindql_extensions` is the `engrava` CLI, which discovers verbs through
 > the `engrava.extensions` entry-point group. See
 > [Available extension hooks](extension-hooks.md). Subclass

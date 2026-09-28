@@ -5,7 +5,7 @@ cannot catch an example that calls an API which does not exist or behaves
 differently from what the prose claims (e.g. reading ``result.is_valid`` when
 the real attribute is ``result.valid``). This module closes that gap for the
 highest-value examples by actually *running* them against the installed
-``engrava`` and asserting a clean exit. It offers three execution shapes:
+``engrava`` and asserting a clean exit. It offers four execution shapes:
 
 **Self-contained blocks.** Some documentation code blocks are complete, runnable
 scripts (they import what they use and drive themselves via ``asyncio.run``).
@@ -59,12 +59,13 @@ tests in ``test_docs_examples_behavior.py``.
 
 Opting a page in
 -----------------
-All three execution shapes are **allowlist-driven**: a block runs only when it
-has an explicit entry in ``EXECUTABLE_BLOCKS``, ``CONCATENATED_PAGES``, or
-``FIXTURE_EXECUTED_BLOCKS`` below. The opt-in lives entirely in this test
-module — there is no special fence syntax or marker in the Markdown — so the
-public docs (and the engrava.ai mirror) need no magic annotations to be
-executed: published Markdown stays clean of any test-only markers.
+All four execution shapes are **allowlist-driven**: a block runs only when it
+has an explicit entry in ``EXECUTABLE_BLOCKS``, ``SYNC_EXECUTABLE_BLOCKS``,
+``CONCATENATED_PAGES``, or ``FIXTURE_EXECUTED_BLOCKS`` below. The opt-in
+lives entirely in this test module — there is no special fence syntax or
+marker in the Markdown — so the public docs (and the engrava.ai mirror) need
+no magic annotations to be executed: published Markdown stays clean of any
+test-only markers.
 
 * To execute a **single** self-contained block, add a
   ``(markdown_path, anchor_substring)`` entry to ``EXECUTABLE_BLOCKS``. The
@@ -137,10 +138,10 @@ if TYPE_CHECKING:
 # Bound for every documentation subprocess so a hung example cannot wedge CI.
 _RUN_TIMEOUT_S = 120
 
-# Bound for a fixture-executed fragment (in-process, not a subprocess) so a hung
-# example fails loudly instead of wedging the suite -- same guarantee as
-# _RUN_TIMEOUT_S, scaled down because these are fast in-memory operations, not a
-# fresh interpreter start.
+# Timeout for a fixture-executed fragment (in-process, not a subprocess), applied
+# with asyncio.wait_for, which can cancel only at an await -- see
+# _run_fixture_block. Shorter than _RUN_TIMEOUT_S because these are fast
+# in-memory operations, not a fresh interpreter start.
 _FIXTURE_RUN_TIMEOUT_S = 15
 
 
@@ -841,9 +842,10 @@ async def _run_fixture_block(body: str, invoke: _FixtureInvoke | None) -> None:
 
     Per-block isolation: a brand-new in-memory connection and store are built for
     every call, so one block's rows are never what the next block's query finds.
-    Bounded: the block's own top-level code and the registered ``invoke`` call (if
-    any) are each wrapped in ``asyncio.wait_for`` so a hung example fails the test
-    instead of wedging the suite.
+    Only a block that contains a top-level ``await``, and the registered
+    ``invoke`` call, run under ``asyncio.wait_for``. A block without one runs
+    inside ``eval()`` with no timeout, and ``wait_for`` can cancel only at an
+    ``await``, so code that never yields is not bounded.
     """
     conn = await aiosqlite.connect(":memory:")
     try:

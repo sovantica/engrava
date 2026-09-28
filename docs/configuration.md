@@ -382,7 +382,7 @@ operations.
 | `enabled` | `bool` | `false` | Enable dreaming consolidation |
 | `schedule_every_n_cycles` | `int` | `100` | Positive cadence consumed by `DreamingExtension.is_due()` / `run_if_due()`; Engrava does not start a background scheduler. |
 | `promote_threshold` | `float` | `0.7` | Promotion requires a redistributed weighted score strictly greater than this value. |
-| `signals` | `map[str, float]` | see below | Relative promotion-signal weights. A partial YAML map merges onto the defaults. A default signal is removed and the active weights renormalised per run when none of the candidates carries a value for its data at all — not merely when the candidates' values are identical — except `frequency`, which is also removed whenever `access_tracking_enabled` is `false`, and a custom signal under a new name, which is always treated as active; a custom signal that reuses a default name instead follows that default's own rule (see [Signals](dreaming.md#signals)). |
+| `signals` | `map[str, float]` | see below | Relative promotion-signal weights. A partial YAML map merges onto the defaults. Which signals are active in a run, and how their weights are combined, is described in [Signals](dreaming.md#signals). |
 | `candidates_limit` | `int` | `200` | Limit for the ACTIVE promotion pool and each agglomerative type query. The LPA path reads the existing dream-edge graph rather than applying this as a graph-edge cap. |
 | `clustering_backend` | `"numpy" \| "python"` | `"numpy"` | Similarity backend for agglomerative clustering. `numpy` uses vectorised/chunked float32 matrix operations; `python` is the much slower O(n²) debugging fallback. |
 | `top_keyphrases_count` | `int` | `3` | Number of TF-IDF keyphrases written to each v2 REFLECTION payload. |

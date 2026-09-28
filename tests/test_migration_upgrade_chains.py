@@ -1124,9 +1124,9 @@ async def test_v20_to_v21_atomic_step_failure_leaves_no_columns_behind(
     that already executed against the connection is rolled back along with
     everything else: this demonstrates -- rather than merely asserts -- that
     ``user_version`` stays at 20 and that none of the three columns, not even
-    ``thought.revision``, survive on disk. A plain re-run then applies the
-    step from scratch and reaches head without losing anything that came
-    before it.
+    ``thought.revision``, are present in the schema afterward. A plain re-run
+    then applies the step from scratch and reaches head without losing
+    anything that came before it.
     """
     await _bootstrap_core_at_version(fresh_db, 20)
     await _seed_legacy_rows(fresh_db)
@@ -1151,7 +1151,7 @@ async def test_v20_to_v21_atomic_step_failure_leaves_no_columns_behind(
     # The step raised inside its transaction, before COMMIT: the rollback
     # that follows undoes the ADD COLUMN that already ran against the
     # connection along with the rest of the step. The version is still 20,
-    # and thought.revision does not exist on disk either.
+    # and thought.revision is not present in the schema either.
     assert await _user_version(fresh_db) == 20
     assert calls == ["thought"]
 

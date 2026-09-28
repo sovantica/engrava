@@ -219,9 +219,9 @@ The remaining caps operate at different stages:
 
 Signals compute a score in `[0.0, 1.0]` for each candidate thought.
 The candidate's promotion score is a weighted sum over the signals
-**active for this run** — an inactive signal's weight is dropped and
-redistributed over the rest (see below) rather than counted at its
-configured weight — and that score is compared against `promote_threshold`.
+**active for this run** — an inactive signal's weight is set to zero (see
+below) — and that score is compared against
+`promote_threshold`.
 
 | Signal | Weight | Description |
 |--------|--------|-------------|
@@ -232,27 +232,25 @@ configured weight — and that score is compared against `promote_threshold`.
 | `frequency` | 0.20 | Ratio of `access_count` to max (10). |
 | `action_outcome` | 0.15 | Thought's `action_outcome_score` — the mean outcome value over its terminal linked actions (`None` ⇒ contributes `0.0`). |
 
-A signal is dropped, and its weight redistributed over the active signals,
-when **none of the candidates in the pool carries a value at all** for its
-underlying data — not when the values happen to be identical across the pool.
-Two candidates that both have an explicit `confidence=0.5`, for example, keep
-the `confidence` signal active, because each carries a non-null value; only a
-pool where every candidate's `confidence` is unset (`None`) would drop it.
-`action_outcome` is therefore **inactive** — and its weight falls out of the
-denominator — in any store where no candidate has a recorded action outcome,
-so it never perturbs consolidation until actions are used. `frequency` carries
-a second condition beyond data presence: it is also dropped whenever
-`access_tracking_enabled` is `false`, regardless of whether candidates already
-carry a non-zero `access_count` (see
-[Access tracking](#access-tracking-the-frequency-substrate) below). A custom
-signal registered via `custom_signals` under a new name (not one of the six
-above) is not subject to this rule at all — it has no introspectable data
-source, so it is always treated as active. A custom signal that reuses one
-of the six default names instead follows that name's own activeness rule
-above, because the check is keyed on the name, not on which callable
-computes the value. The default weights sum to more than 1.0 for this
-reason: they are relative priorities renormalised over the active set, not
-a probability distribution.
+Which signals are active is decided once per run, over the whole candidate
+pool:
+
+- `recency` and `staleness` are always active: a consolidation run always has
+  a cycle.
+- `confirmation` is active when some candidate has `confirmation_count > 0`.
+- `confidence` is active when some candidate has a `confidence` value.
+- `action_outcome` is active when some candidate has an `action_outcome_score`.
+- `frequency` is active when `access_tracking_enabled` is `true` and some
+  candidate has `access_count > 0` (see
+  [Access tracking](#access-tracking-the-frequency-substrate) below).
+- A custom signal registered via `custom_signals` under a new name is always
+  active. One that reuses a default name follows that name's rule.
+
+An inactive signal's weight is set to `0.0`, and each active signal's weight
+is divided by the sum of the active weights. If no signal is active, or that
+sum is zero, every weight is `0.0` and nothing is promoted. The default
+weights sum to more than 1.0: they are relative priorities, not a probability
+distribution.
 
 Custom signals can be provided via `DreamingSignalProtocol`. `custom_signals` only
 supplies the *callable* for a name — the name itself must also carry a weight in
@@ -675,14 +673,14 @@ The cross-cluster boilerplate filter is controlled separately by
 | `candidates_evaluated` | Number of ACTIVE candidates in the bounded promotion pool |
 | `promoted_count` / `promoted_ids` | Promotions written and their thought IDs |
 | `skipped_gate_count` | Candidates rejected by age/confirmation gates |
-| `scores` | Computed score for each candidate scored before scoring stopped — the loop `break`s as soon as `max_promoted_per_run` promotions are reached, so once the cap is hit, remaining candidates are not scored and are absent from this map |
+| `scores` | Computed score for each candidate the loop scores. Every candidate is scored before its gate, metadata and threshold checks run, so scoring continues past the `max_promoted_per_run` cap; once the cap is reached, the loop stops at the next candidate that passes the gates, the metadata filter and the threshold, after scoring it, and candidates after that one are absent from the map |
 | `edges_created` | New dream-created ASSOCIATED edges |
 | `reflections_created` | New REFLECTION thoughts |
 | `promotion_capped` | Whether the corpus-wide P1 fraction prevented a promotion |
 | `p1_fraction_after` | P1 share after the run |
 | `orphans_retired` | ACTIVE REFLECTIONs archived because all sources left the active set |
 | `active_signal_weights` | Effective weights after flat-signal redistribution |
-| `flat_signals` | Configured signal names that carried no ranking information this run |
+| `flat_signals` | Configured signals dropped as inactive for this run (see [Signals](#signals)) |
 
 ### Querying reflections
 

@@ -94,16 +94,16 @@ scoring signals, normalised by the total active weight — the same library
 | `confidence` | 0.15 | the thought carries a high confidence value |
 | `staleness` | 0.10 | the thought has been active over a long span |
 
-A signal is dropped, and its weight renormalised over the remaining active
-signals, when **none of the candidates in the pool carries a value at all**
-for its underlying data (for example `confirmation` with no deduplication)
-— not when the candidates' values merely happen to agree. Activation is
-presence-based: candidates that share the same non-null value still keep
-the signal active. `frequency` adds a second condition on top of data
-presence: it is also dropped whenever access tracking is disabled, even if
-candidates already carry a non-zero access count from before tracking was
-turned off. This keeps the keep-score meaningful on sparse stores instead
-of dragging every score toward a constant.
+Which signals are active is decided once per run, over the whole candidate
+pool, by the rules [dreaming](dreaming.md#signals) uses for its default
+signals: `recency` and `staleness` are always active, and each other signal is
+active only when some candidate has its data (`frequency` also needs access
+tracking on). An inactive signal's weight is set to `0.0`, and each active
+signal's weight is divided by the sum of the active weights. If no signal is
+active, or that sum is zero, the keep-score selects nothing for archiving
+that run. This keeps the
+keep-score meaningful on sparse stores instead of dragging every score
+toward a constant.
 
 The keep-score is then multiplied by the
 [`decay_function` hook](extension-hooks.md) to produce the **eviction-score**:
