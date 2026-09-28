@@ -487,7 +487,17 @@ class ExtensionMigrationRunner:
             # A savepoint keeps the migration SQL, the history append and the
             # summary upsert atomic.  SQLite DDL is transactional, so a ROLLBACK
             # undoes CREATE TABLE / ALTER TABLE statements too.
-            await db.execute(f"SAVEPOINT {savepoint}")
+            try:
+                await db.execute(f"SAVEPOINT {savepoint}")
+            except asyncio.CancelledError:
+                # aiosqlite runs each statement on a worker thread through a
+                # FIFO queue; a cancellation delivered while this await is in
+                # flight does not stop that thread, so the SAVEPOINT may
+                # already have been opened even though this call never
+                # returns normally.  Unwind it the same way a failed step
+                # would, then let the cancellation propagate unwrapped.
+                await self._unwind_savepoint(db, savepoint)
+                raise
             try:
                 for stmt in step.statements:
                     await db.execute(stmt)
@@ -516,9 +526,7 @@ class ExtensionMigrationRunner:
                 # explicitly here rather than relying on a bare ``except:`` --
                 # that would also swallow ``SystemExit``/``KeyboardInterrupt``,
                 # which must keep propagating unimpeded.
-                with contextlib.suppress(Exception):
-                    await db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-                    await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+                await self._unwind_savepoint(db, savepoint)
                 if isinstance(exc, asyncio.CancelledError):
                     # Not a migration failure -- the savepoint is unwound the
                     # same way, but the cancellation itself propagates
@@ -554,6 +562,29 @@ class ExtensionMigrationRunner:
             c if c == "_" or (c.isascii() and c.isalnum()) else "_" for c in extension_name
         )
         return f"ext_mig_{safe}_{suffix}"
+
+    @staticmethod
+    async def _unwind_savepoint(db: aiosqlite.Connection, savepoint: str) -> None:
+        """Roll back and release *savepoint*, suppressing any secondary error.
+
+        Shared by every point that must undo a savepoint's effect: a failed
+        migration step or legacy-history backfill, and a cancellation landing
+        anywhere in that work, including while the ``SAVEPOINT`` statement's
+        own execution is still in flight.  aiosqlite runs each statement on a
+        worker thread through a FIFO queue, so this ``ROLLBACK TO`` /
+        ``RELEASE`` is enqueued behind the interrupted statement and only
+        runs once it has completed.  Any secondary error the unwind itself
+        raises is suppressed so the original failure or cancellation is what
+        surfaces to the caller.
+
+        Args:
+            db: Connection the savepoint was opened on.
+            savepoint: Identifier previously returned by ``_savepoint_name``.
+
+        """
+        with contextlib.suppress(Exception):
+            await db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            await db.execute(f"RELEASE SAVEPOINT {savepoint}")
 
     @staticmethod
     def _reject_duplicate_filenames(
@@ -781,7 +812,15 @@ class ExtensionMigrationRunner:
         ]
 
         savepoint = self._savepoint_name(manifest.name, "adopt")
-        await db.execute(f"SAVEPOINT {savepoint}")
+        try:
+            await db.execute(f"SAVEPOINT {savepoint}")
+        except asyncio.CancelledError:
+            # See ``apply_pending``: aiosqlite may already have applied the
+            # SAVEPOINT on its worker thread even though this await never
+            # returns normally.  Unwind it the same way a failed backfill
+            # would, then let the cancellation propagate unwrapped.
+            await self._unwind_savepoint(db, savepoint)
+            raise
         try:
             for entry in baseline:
                 await db.execute(
@@ -805,9 +844,7 @@ class ExtensionMigrationRunner:
             # rather than relying on a bare ``except:`` -- that would also
             # swallow ``SystemExit``/``KeyboardInterrupt``, which must keep
             # propagating unimpeded.
-            with contextlib.suppress(Exception):
-                await db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-                await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            await self._unwind_savepoint(db, savepoint)
             if isinstance(exc, asyncio.CancelledError):
                 # Not a backfill failure -- the savepoint is unwound the same
                 # way, but the cancellation itself propagates unwrapped so the
