@@ -14,13 +14,51 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
+import yaml
+
+from tests._shell_command import INTERPRETERS, script_argv
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "check_release_target_was_published.py"
+WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release.yml"
+SCRIPT_RELATIVE = "scripts/check_release_target_was_published.py"
+RELEASE_TRIGGER = {"push": {"branches": ["dev"]}}
+WORKFLOW_KEYS = {"name", "on", "permissions", "concurrency", "jobs"}
+RELEASE_JOB_KEYS = {"name", "runs-on", "outputs", "steps"}
+BOOL_TAG = "tag:yaml.org,2002:bool"
+MERGE_TAG = "tag:yaml.org,2002:merge"
+
+
+class _WorkflowLoader(yaml.SafeLoader):
+    """Reads a plain ``on`` as a string, and refuses a repeated key and a merge key."""
+
+    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Any, Any]:
+        seen: set[Any] = set()
+        for key_node, _ in node.value:
+            if key_node.tag == MERGE_TAG:
+                msg = "found a merge key"
+                raise yaml.constructor.ConstructorError(None, None, msg, key_node.start_mark)
+            key = self.construct_object(key_node, deep=True)
+            if key in seen:
+                msg = f"found a duplicate key {key!r}"
+                raise yaml.constructor.ConstructorError(None, None, msg, key_node.start_mark)
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+
+_WorkflowLoader.yaml_implicit_resolvers = {
+    first: [(tag, pattern) for tag, pattern in resolvers if tag != BOOL_TAG]
+    for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+_WorkflowLoader.add_implicit_resolver(
+    BOOL_TAG, re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"), list("tTfF")
+)
 
 
 @pytest.fixture
@@ -906,3 +944,146 @@ class TestMainAgainstADisposableRepository:
         assert "does not name a commit" not in captured.out
         assert "no tag named v0.7.0 exists" not in captured.out
         assert "PyPI" not in captured.out
+
+
+def _load_workflow_text(text: str) -> dict[Any, Any]:
+    loader = _WorkflowLoader(text)
+    try:
+        loaded = loader.get_single_data()
+    finally:
+        loader.dispose()
+    assert isinstance(loaded, dict)
+    return loaded
+
+
+class TestWorkflowLoader:
+    """The loader reads a plain ``on`` as a string, and refuses a repeated key and a merge key."""
+
+    def test_a_plain_on_key_is_read_as_the_string_on(self) -> None:
+        assert list(_load_workflow_text("on:\n  push: {}\n")) == ["on"]
+
+    @pytest.mark.parametrize("key", ["true", "True", "yes", "Yes", "On", "ON"])
+    def test_true_yes_and_capitalised_on_are_not_read_as_the_trigger_key(self, key: str) -> None:
+        loaded = _load_workflow_text(f"{key}:\n  push: {{}}\n")
+
+        assert "on" not in loaded
+
+    def test_true_and_false_are_still_booleans(self) -> None:
+        loaded = _load_workflow_text("a: true\nb: false\nc: True\nd: FALSE\n")
+
+        assert loaded == {"a": True, "b": False, "c": True, "d": False}
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "on:\n  pull_request: {}\non:\n  push: {}\n",
+            "jobs:\n  a:\n    steps:\n      - run: x\n        run: y\n",
+        ],
+    )
+    def test_a_key_repeated_in_a_mapping_is_refused(self, text: str) -> None:
+        with pytest.raises(yaml.constructor.ConstructorError, match="duplicate key"):
+            _load_workflow_text(text)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "base: &b {x: 1}\nuse:\n  <<: *b\n",
+            "jobs:\n  a:\n    steps:\n      - run: x\n        <<: {}\n",
+        ],
+    )
+    def test_a_merge_key_is_refused(self, text: str) -> None:
+        with pytest.raises(yaml.constructor.ConstructorError, match="merge key"):
+            _load_workflow_text(text)
+
+
+class TestReleaseWorkflowWiring:
+    """The tests above call the script; these pin the step that runs it in ``release.yml``.
+
+    The gate exists for the run in which nothing was released, so the step
+    must run whether or not the release was published, and its failure must
+    fail the workflow. The step is pinned to one plain command with no
+    argument and no key but its name. The workflow trigger, the workflow's
+    keys and the keys of the job that holds the step are pinned to what they
+    are today, so a new trigger or a new key fails here until the pin is
+    updated. The step must also sit in the same job as the ``detect`` step.
+    """
+
+    @staticmethod
+    def _workflow() -> dict[str, Any]:
+        return _load_workflow_text(WORKFLOW_PATH.read_text(encoding="utf-8"))
+
+    @classmethod
+    def _jobs(cls) -> dict[str, dict[str, Any]]:
+        jobs = cls._workflow()["jobs"]
+        assert isinstance(jobs, dict)
+        return jobs
+
+    @classmethod
+    def _gate_step(cls) -> tuple[str, dict[str, Any]]:
+        matching = [
+            (job_name, step)
+            for job_name, job in cls._jobs().items()
+            for step in job.get("steps", [])
+            if script_argv(step.get("run"), SCRIPT_RELATIVE) is not None
+        ]
+        assert len(matching) == 1, (
+            f"expected exactly one step whose run command executes {SCRIPT_RELATIVE} under "
+            f"an interpreter, found {len(matching)}"
+        )
+        return matching[0]
+
+    def test_the_step_executes_the_script_rather_than_naming_it(self) -> None:
+        _, step = self._gate_step()
+
+        argv = script_argv(step["run"], SCRIPT_RELATIVE)
+
+        assert argv is not None
+        assert argv[0] in INTERPRETERS
+        assert argv[1] == SCRIPT_RELATIVE
+
+    def test_the_script_is_run_with_no_arguments(self) -> None:
+        _, step = self._gate_step()
+
+        argv = script_argv(step["run"], SCRIPT_RELATIVE)
+
+        assert argv is not None
+        assert argv[2:] == []
+
+    def test_the_step_sets_nothing_but_its_name_and_its_command(self) -> None:
+        _, step = self._gate_step()
+
+        assert set(step) <= {"name", "run"}, (
+            "a key on this step (if, continue-on-error, shell, ...) can skip it, excuse its "
+            f"failure or change what runs; found {sorted(set(step) - {'name', 'run'})}"
+        )
+
+    def test_the_workflow_runs_on_a_push_to_the_release_branch_and_on_nothing_else(self) -> None:
+        assert self._workflow()["on"] == RELEASE_TRIGGER
+
+    def test_the_job_and_the_workflow_carry_no_key_they_do_not_carry_today(self) -> None:
+        job_name, _ = self._gate_step()
+        workflow = self._workflow()
+        job = self._jobs()[job_name]
+
+        assert set(workflow) <= WORKFLOW_KEYS, (
+            "a key on the workflow (env, defaults, ...) can change whether or how the gate step "
+            f"runs; check {sorted(set(workflow) - WORKFLOW_KEYS)} against it, then add it here"
+        )
+        assert set(job) <= RELEASE_JOB_KEYS, (
+            "a key on the job (if, needs, continue-on-error, defaults, env, ...) can skip the "
+            "gate step, excuse its failure or change what runs; check "
+            f"{sorted(set(job) - RELEASE_JOB_KEYS)} against it, then add it here"
+        )
+
+    def test_the_step_belongs_to_the_job_that_detects_whether_a_release_was_published(
+        self,
+    ) -> None:
+        job_name, _ = self._gate_step()
+
+        detecting_jobs = [
+            name
+            for name, job in self._jobs().items()
+            if any(step.get("id") == "detect" for step in job.get("steps", []))
+        ]
+
+        assert detecting_jobs == [job_name]

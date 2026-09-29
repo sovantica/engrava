@@ -19,8 +19,14 @@ from pathlib import Path
 
 import pytest
 
+from tests._shell_command import INTERPRETERS, script_argv
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "check_computed_version_matches_target.py"
+RELEASERC_PATH = REPO_ROOT / ".releaserc.json"
+SCRIPT_RELATIVE = "scripts/check_computed_version_matches_target.py"
+COMPUTED_VERSION_TEMPLATE = "${nextRelease.version}"
+RELEASERC_KEYS = {"branches", "plugins"}
 
 
 @pytest.fixture
@@ -416,3 +422,112 @@ class TestMain:
         monkeypatch.setattr(gate_module, "RELEASE_TARGET_PATH", target_path)  # type: ignore[attr-defined]
         exit_code = gate_module.main(["0.7.0\n"])  # type: ignore[attr-defined]
         assert exit_code == 1
+
+
+def _plugin_name(entry: object) -> str:
+    """Return the plugin name of one ``plugins`` entry (a bare string or ``[name, config]``)."""
+    if isinstance(entry, str):
+        return entry
+    assert isinstance(entry, list)
+    assert isinstance(entry[0], str)
+    return entry[0]
+
+
+def _plugin_config(entry: object) -> dict[str, object]:
+    """Return the configuration object of one ``plugins`` entry, empty for a bare string."""
+    if isinstance(entry, list) and len(entry) > 1:
+        assert isinstance(entry[1], dict)
+        return entry[1]
+    return {}
+
+
+class TestSemanticReleaseWiring:
+    """The tests above hand the gate a version directly; these pin how the release passes it one.
+
+    ``.releaserc.json`` says how the version semantic-release computed
+    reaches ``check_computed_version_matches_target.py``. A literal in place
+    of the template leaves the cases above green while the gate compares the
+    target against a fixed string. The configuration is pinned to the
+    top-level keys it carries today and the gate's entry to its command, so
+    a new key at either level fails here until the pin is updated.
+    """
+
+    @staticmethod
+    def _config() -> dict[str, object]:
+        config = json.loads(RELEASERC_PATH.read_text(encoding="utf-8"))
+        assert isinstance(config, dict)
+        return config
+
+    @classmethod
+    def _plugins(cls) -> list[object]:
+        plugins = cls._config()["plugins"]
+        assert isinstance(plugins, list)
+        return plugins
+
+    @staticmethod
+    def _index_of(plugins: list[object], name: str) -> int:
+        matching = [i for i, entry in enumerate(plugins) if _plugin_name(entry) == name]
+        assert len(matching) == 1, f"expected exactly one {name} entry, found {len(matching)}"
+        return matching[0]
+
+    @classmethod
+    def _gate_entry(cls, plugins: list[object]) -> int:
+        matching = [
+            i
+            for i, entry in enumerate(plugins)
+            if _plugin_name(entry) == "@semantic-release/exec"
+            and script_argv(_plugin_config(entry).get("prepareCmd"), SCRIPT_RELATIVE) is not None
+        ]
+        assert len(matching) == 1, (
+            "expected exactly one @semantic-release/exec prepareCmd to run "
+            f"{SCRIPT_RELATIVE} under an interpreter, found {len(matching)}"
+        )
+        return matching[0]
+
+    @classmethod
+    def _gate_command(cls, plugins: list[object]) -> list[str]:
+        command = _plugin_config(plugins[cls._gate_entry(plugins)]).get("prepareCmd")
+        argv = script_argv(command, SCRIPT_RELATIVE)
+        assert argv is not None
+        return argv
+
+    def test_the_gate_is_the_script_an_interpreter_runs_from_an_exec_prepare_command(
+        self,
+    ) -> None:
+        argv = self._gate_command(self._plugins())
+
+        assert argv[0] in INTERPRETERS
+        assert argv[1] == SCRIPT_RELATIVE
+
+    def test_the_gate_command_ends_with_the_computed_version_template(self) -> None:
+        argv = self._gate_command(self._plugins())
+
+        assert argv[2:] == [COMPUTED_VERSION_TEMPLATE]
+
+    def test_the_release_configuration_carries_no_key_it_does_not_carry_today(self) -> None:
+        config = self._config()
+
+        assert set(config) <= RELEASERC_KEYS, (
+            "a top-level key in .releaserc.json can change whether the gate runs; check "
+            f"{sorted(set(config) - RELEASERC_KEYS)} against it, then add it here"
+        )
+
+    def test_the_gate_entry_configures_nothing_but_its_command(self) -> None:
+        plugins = self._plugins()
+
+        config = _plugin_config(plugins[self._gate_entry(plugins)])
+
+        assert set(config) == {"prepareCmd"}, (
+            "a key beside prepareCmd on the gate's entry can change whether, or where, the "
+            f"command runs; found {sorted(set(config) - {'prepareCmd'})}"
+        )
+
+    def test_the_gate_runs_after_the_analyzer_and_notes_plugins_and_before_the_git_plugin(
+        self,
+    ) -> None:
+        plugins = self._plugins()
+        gate = self._gate_entry(plugins)
+
+        assert self._index_of(plugins, "@semantic-release/commit-analyzer") < gate
+        assert self._index_of(plugins, "@semantic-release/release-notes-generator") < gate
+        assert gate < self._index_of(plugins, "@semantic-release/git")

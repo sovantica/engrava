@@ -12,13 +12,16 @@
 # Wiring is not enough, and neither is "some hook is wired". A hook that is
 # wired, executable, and cannot resolve commitlint used to warn and let the
 # commit through -- a gate reporting its health by existing, exactly what
-# this workstream exists to remove. And a value that merely points at SOME
+# this gate exists to catch. And a value that merely points at SOME
 # absolute directory containing an executable named commit-msg would pass
 # even if that hook belongs to something else entirely and never checks a
-# thing. So this verifies three separate claims: the value is this
+# thing. So this verifies four separate claims: the value is this
 # repository's OWN .githooks at the primary checkout, the hook there is
-# executable, and commitlint actually resolves its configuration from this
-# checkout's working directory, the same way the real hook does.
+# executable, commitlint actually resolves its configuration from this
+# checkout's working directory, the same way the real hook does, and the
+# hook itself, when run, accepts a well-formed message and rejects a
+# malformed one. A hook file replaced by `exit 0` is wired and executable,
+# and checks nothing; the last claim is the one it fails.
 set -euo pipefail
 
 HOOKS_PATH="$(git config --get core.hooksPath || true)"
@@ -93,5 +96,53 @@ if ! CONFIG_OUTPUT="$(NODE_PATH="$PRIMARY_ROOT/node_modules" "$COMMITLINT_BIN" -
   exit 1
 fi
 
+# Run the hook itself from the work tree root with the path of a message file
+# as its only argument. Two message files in a private scratch directory, one
+# the repository's own grammar accepts and one it rejects. The hook chains to
+# an executable at <git-common-dir>/hooks/commit-msg, if there is one, and a
+# nonzero exit from that guard makes the hook reject the message.
+#
+# The hook's own grammar check is skipped on some inputs, and the inputs below
+# are chosen to reach it: neither subject is one that .commitlintrc.js ignores,
+# and no true merge may be in progress (the hook skips its own grammar check
+# when MERGE_HEAD exists). The scope "docs" is in
+# commit-scopes.json, so the good message also produces no scope warning;
+# "wibble" is outside the type-enum.
+MERGE_HEAD="$(git rev-parse --git-path MERGE_HEAD)"
+if [ -f "$MERGE_HEAD" ]; then
+  echo "✗ a merge is in progress ($MERGE_HEAD exists)." >&2
+  echo "  The commit-msg hook skips its own grammar check for a true merge commit," >&2
+  echo "  so it cannot be exercised now. Conclude or abort the merge and re-run." >&2
+  exit 1
+fi
+
+WORK_TREE="$(git rev-parse --show-toplevel)"
+HOOK="$HOOKS_PATH/commit-msg"
+GOOD_MESSAGE="docs(docs): describe the thing"
+BAD_MESSAGE="wibble(docs): describe the thing"
+
+if ! SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/hooks-active.XXXXXX")"; then
+  echo "✗ could not create a scratch directory to run the commit-msg hook in." >&2
+  exit 1
+fi
+trap 'rm -rf "$SCRATCH"' EXIT
+printf '%s\n' "$GOOD_MESSAGE" > "$SCRATCH/good.txt"
+printf '%s\n' "$BAD_MESSAGE" > "$SCRATCH/bad.txt"
+
+if ! GOOD_OUTPUT="$(cd "$WORK_TREE" && "$HOOK" "$SCRATCH/good.txt" 2>&1)"; then
+  echo "✗ the commit-msg hook at $HOOK rejected a well-formed message:" >&2
+  echo "  $GOOD_MESSAGE" >&2
+  if [ -n "$GOOD_OUTPUT" ]; then echo "$GOOD_OUTPUT" | sed 's/^/  /' >&2; fi
+  exit 1
+fi
+
+if BAD_OUTPUT="$(cd "$WORK_TREE" && "$HOOK" "$SCRATCH/bad.txt" 2>&1)"; then
+  echo "✗ the commit-msg hook at $HOOK accepted a message whose type is not allowed:" >&2
+  echo "  $BAD_MESSAGE" >&2
+  if [ -n "$BAD_OUTPUT" ]; then echo "$BAD_OUTPUT" | sed 's/^/  /' >&2; fi
+  exit 1
+fi
+
 echo "✓ Git hooks active: core.hooksPath = $HOOKS_PATH (this repository's own)"
 echo "✓ commitlint resolves from this checkout via $COMMITLINT_BIN"
+echo "✓ the commit-msg hook accepts a well-formed message and rejects a malformed one"
