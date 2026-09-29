@@ -77,10 +77,10 @@ class TestParseVersion:
             gate_module.parse_version("0.7.0 ")  # type: ignore[attr-defined]
 
     def test_rejects_a_trailing_newline(self, gate_module: object) -> None:
-        # Regression for the finding that "0.7.0\n" satisfied the previous
-        # '^...$'-anchored VERSION_RE under match(): '$' matches just
-        # before a trailing newline, so a computed version corrupted with
-        # one was silently treated as equal to the clean version.
+        # A trailing newline must be rejected. '$' matches just before a
+        # trailing newline, so a '^...$'-anchored pattern under match() would
+        # accept "0.7.0\n" and treat a computed version corrupted with one as
+        # equal to the clean version. VERSION_RE ends in '\Z' instead.
         with pytest.raises(gate_module.GateInputError):  # type: ignore[attr-defined]
             gate_module.parse_version("0.7.0\n")  # type: ignore[attr-defined]
 
@@ -128,15 +128,9 @@ class TestReadDeclaredTarget:
     def test_a_memory_error_while_reading_raises_gate_input_error(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Regression for the finding that this script caught MemoryError at
-        # neither the read nor the decode stage -- unlike
-        # check_release_target_was_published.py, which already caught it at
-        # the read stage. Confirmed by execution: a real ~15 MB
-        # release-target.json (a flat array of five million elements) read
-        # under a 40 MB 'ulimit -v' raised an uncaught MemoryError out of
-        # 'read_text()' before this except clause covered it. MemoryError is
-        # simulated directly here rather than reproducing that memory
-        # pressure in a unit test.
+        # A MemoryError raised while reading the file must surface as
+        # GateInputError. It is simulated directly here rather than by
+        # reproducing real memory pressure in a unit test.
         path = tmp_path / "release-target.json"
         path.write_text(json.dumps({"version": "0.7.0"}))
 
@@ -152,11 +146,8 @@ class TestReadDeclaredTarget:
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Sibling of the read-stage test above: 'json.loads()' builds a
-        # tree of Python objects that costs far more memory than the raw
-        # text it parses, so it can exhaust memory even after a successful
-        # read. Confirmed by execution against the real file described
-        # above under a 60 MB 'ulimit -v': the read succeeded and
-        # 'json.loads()' then raised an uncaught MemoryError.
+        # tree of Python objects, so it can exhaust memory even after a
+        # successful read. The MemoryError is simulated directly.
         path = tmp_path / "release-target.json"
         path.write_text(json.dumps({"version": "0.7.0"}))
 
@@ -169,15 +160,9 @@ class TestReadDeclaredTarget:
             gate_module.read_declared_target(path)  # type: ignore[attr-defined]
 
     def test_a_symlinked_declaration_file_raises(self, gate_module: object, tmp_path: Path) -> None:
-        # Regression for the finding that this script's post-publication
-        # sibling (check_release_target_was_published.py) refused a
-        # symlinked release-target.json, but this pre-publication gate
-        # still followed one through a bare 'read_text()' -- letting it
-        # pass, before anything is tagged, against ambient JSON elsewhere on
-        # the filesystem. Confirmed by execution: pointing
-        # release-target.json at an unrelated file declaring a version
-        # equal to the CLI-supplied computed version made this gate exit 0
-        # before this guard existed.
+        # A symlinked release-target.json must be refused. Followed through
+        # 'read_text()', it could declare a version equal to the
+        # CLI-supplied computed version from a file outside the checkout.
         ambient_dir = tmp_path / "ambient-outside-the-checkout"
         ambient_dir.mkdir()
         ambient_file = ambient_dir / "elsewhere.json"
@@ -195,13 +180,10 @@ class TestReadDeclaredTarget:
         self, gate_module: object, tmp_path: Path
     ) -> None:
         # A directory named release-target.json is not a symlink, but it is
-        # also not a regular file -- the same "require a regular file"
-        # guard must reject it too, not just the symlink shape. Both before
-        # and after the guard, a directory raises GateInputError (read_text()
-        # already turns 'IsADirectoryError' into one via the generic OSError
-        # clause) -- so this asserts the *message* changes to the guard's
-        # own wording, which is what actually distinguishes "the guard ran"
-        # from "read_text() merely failed for an unrelated reason".
+        # also not a regular file, so the "require a regular file" guard
+        # must reject it too. read_text() alone would also end in a
+        # GateInputError ("could not read ... IsADirectoryError"), so this
+        # asserts the guard's own wording, which shows the guard ran.
         path = tmp_path / "release-target.json"
         path.mkdir()
         with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
@@ -211,34 +193,22 @@ class TestReadDeclaredTarget:
     def test_a_missing_file_still_reports_could_not_read(
         self, gate_module: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        # The regular-file guard must not change this script's existing
-        # behaviour for the ordinary "file absent" case: it still falls
-        # through to read_text()'s own OSError, not a new "does not exist"
-        # message the guard could have introduced.
+        # For the ordinary "file absent" case the regular-file guard stays
+        # silent and read_text()'s own failure is reported as "could not
+        # read", not as a separate "does not exist" message.
         with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
             gate_module.read_declared_target(tmp_path / "does-not-exist.json")  # type: ignore[attr-defined]
         assert "could not read" in str(excinfo.value)
 
 
 class TestReadDeclaredTargetBoundary:
-    """Regressions for the single-boundary fix: no enumerated exception list, one catch-all.
-
-    ``read_declared_target()`` used to catch a short, hand-picked list of
-    anticipated exception types (``OSError``/``MemoryError`` around
-    ``read_text()``, ``json.JSONDecodeError``/``MemoryError`` around
-    ``json.loads()``). Each case here is a failure mode that list did not
-    name -- confirmed by execution against the pre-fix script, which let
-    every one of them escape as a bare traceback -- and now goes through the
-    single ``except Exception`` boundary in ``read_declared_target()``
-    instead.
-    """
+    """``read_declared_target()`` has one catch-all boundary, not an enumerated exception list."""
 
     def test_invalid_utf8_raises_a_clean_gate_input_error(
         self, gate_module: object, tmp_path: Path
     ) -> None:
-        # Regression for the finding that a file containing invalid UTF-8
-        # raised an uncaught UnicodeDecodeError out of read_text() -- not
-        # OSError, not MemoryError, so the old catch list missed it entirely.
+        # A file whose bytes are not valid UTF-8. A UnicodeDecodeError out of
+        # read_text() is neither OSError nor MemoryError.
         path = tmp_path / "release-target.json"
         path.write_bytes(b'{"version": "0.7.0\xff\xfe"}')
         with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
@@ -249,9 +219,8 @@ class TestReadDeclaredTargetBoundary:
     def test_a_deeply_nested_json_document_raises_a_clean_gate_input_error(
         self, gate_module: object, tmp_path: Path
     ) -> None:
-        # Regression for the finding that a 10,000-level nested JSON document
-        # raised an uncaught RecursionError out of json.loads() -- not
-        # json.JSONDecodeError, so the old catch list missed it too.
+        # A 10,000-level nested JSON document. A RecursionError out of
+        # json.loads() is not a json.JSONDecodeError.
         path = tmp_path / "release-target.json"
         nested = "[" * 10_000 + "]" * 10_000
         path.write_text('{"version": ' + nested + "}")
@@ -263,15 +232,12 @@ class TestReadDeclaredTargetBoundary:
     def test_an_unrelated_oversized_integer_field_raises_a_clean_gate_input_error(
         self, gate_module: object, tmp_path: Path
     ) -> None:
-        # The fourth, unanticipated failure mode: a field this script never
-        # reads at all -- not "version" -- with a 5,000-digit integer
-        # literal. json.loads() itself calls int() on every JSON integer
-        # literal in the document, so this raises ValueError from *inside*
-        # json.loads(), before this script's own code ever runs -- a
-        # different trigger site than the version-component overflow below,
-        # and one nobody enumerated when writing the old catch list.
-        # Confirmed by execution against the pre-fix script: an uncaught
-        # ValueError escaped as a bare traceback out of json.loads().
+        # A field this script never reads (not "version") holding a
+        # 5,000-digit integer literal. json.loads() itself calls int() on
+        # every JSON integer literal in the document, and int() refuses more
+        # than 4300 digits by default, so ValueError is raised from *inside*
+        # json.loads(), before this script's own code runs. That is a
+        # different trigger site than the version-component overflow below.
         path = tmp_path / "release-target.json"
         huge_literal = "9" * 5000
         path.write_text('{"version": "0.7.0", "unrelated_field": ' + huge_literal + "}")
@@ -283,12 +249,9 @@ class TestReadDeclaredTargetBoundary:
     def test_a_5000_digit_version_component_is_rejected_by_the_regex_bound(
         self, gate_module: object, tmp_path: Path
     ) -> None:
-        # Regression for the finding that a version component of 5,000
-        # digits satisfied the previous, unbounded VERSION_RE and then raised
-        # an uncaught ValueError out of int() inside parse_version(). The
-        # regex now bounds each component to 18 digits, so this is rejected
-        # before int() ever runs, via parse_version()'s own deliberate
-        # diagnostic -- not the generic boundary message.
+        # A version component of 5,000 digits must be rejected by the
+        # VERSION_RE bound (18 digits per component) before int() runs, via
+        # parse_version()'s own diagnostic, not the generic boundary message.
         path = tmp_path / "release-target.json"
         huge_component = "9" * 5000
         path.write_text(json.dumps({"version": f"0.7.{huge_component}"}))
@@ -305,9 +268,9 @@ class TestReadDeclaredTargetBoundary:
         # the boundary in read_declared_target() must independently survive
         # a ValueError out of int() inside parse_version() too -- not rely on
         # the bound being the only thing standing between a malformed
-        # component and a bare traceback. VERSION_RE is widened back to its
-        # pre-fix, unbounded shape here to simulate a future change
-        # reopening the gap the bound closes, so this exercises the real
+        # component and a bare traceback. VERSION_RE is widened to an
+        # unbounded shape here to simulate a future change
+        # removing the bound, so this exercises the real
         # int() call inside parse_version() with a 5,000-digit component,
         # proving the boundary alone -- not the bound -- is what makes this
         # fail closed rather than traceback. (sys.set_int_max_str_digits()
@@ -413,10 +376,8 @@ class TestMain:
     def test_a_computed_version_with_a_trailing_newline_exits_one(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Regression for the finding that a computed version corrupted with
-        # a trailing newline ("0.7.0\n") was reported equal to a clean
-        # declared target of "0.7.0" and exited 0 -- confirmed by execution
-        # against the unfixed script in a disposable clone.
+        # A computed version with a trailing newline ("0.7.0\n") must not be
+        # reported equal to a clean declared target of "0.7.0"; main() exits 1.
         target_path = tmp_path / "release-target.json"
         target_path.write_text(json.dumps({"version": "0.7.0"}))
         monkeypatch.setattr(gate_module, "RELEASE_TARGET_PATH", target_path)  # type: ignore[attr-defined]

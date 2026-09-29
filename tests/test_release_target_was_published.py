@@ -144,10 +144,9 @@ class TestReadDeclaredTarget:
     def test_a_trailing_newline_in_the_version_raises(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Regression for the finding that "0.7.0\n" satisfied the previous
-        # '^...$'-anchored VERSION_RE under match(): '$' matches just
-        # before a trailing newline, so this value passed validation and
-        # only failed later, misleadingly, as "unpublished".
+        # A trailing newline must be rejected. '$' matches just before a
+        # trailing newline, so a '^...$'-anchored pattern under match()
+        # would accept "0.7.0\n"; VERSION_RE ends in '\Z' instead.
         _write_target(tmp_path, "0.7.0\n")
         monkeypatch.setattr(gate_module, "REPO_ROOT", tmp_path)  # type: ignore[attr-defined]
         with pytest.raises(gate_module.GateInputError):  # type: ignore[attr-defined]
@@ -156,13 +155,11 @@ class TestReadDeclaredTarget:
     def test_a_memory_error_while_reading_raises_gate_input_error(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Regression for the finding that a declaration file too large to
-        # read raised an uncaught MemoryError instead of the clean,
-        # fail-closed diagnostic every other unreadable input gets here.
-        # MemoryError is simulated directly rather than by actually
-        # allocating an oversized file -- see this task's real-command
-        # reproduction (a 500 MB file under a lowered RLIMIT_AS) for the
-        # end-to-end proof; this unit test only pins the except clause.
+        # A declaration file too large to read must produce the clean,
+        # fail-closed diagnostic every other unreadable input gets here,
+        # not an uncaught MemoryError. MemoryError is simulated directly
+        # rather than by actually allocating an oversized file; this unit
+        # test only pins that the read stage's failure is converted.
         _write_target(tmp_path, "0.7.0")
         monkeypatch.setattr(gate_module, "REPO_ROOT", tmp_path)  # type: ignore[attr-defined]
 
@@ -177,15 +174,10 @@ class TestReadDeclaredTarget:
     def test_a_memory_error_while_decoding_raises_gate_input_error(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Regression for the finding that reading the file was already
-        # guarded against MemoryError (see the read-stage test above) but
-        # decoding it was not: 'json.loads()' builds a tree of Python
-        # objects that costs far more memory than the raw text it parses,
-        # so it can exhaust memory even after a successful read. Confirmed
-        # by execution: a real ~15 MB release-target.json (a flat array of
-        # five million elements) read cleanly under a 60 MB 'ulimit -v' but
-        # raised an uncaught MemoryError out of 'json.loads()' before this
-        # except clause covered it. MemoryError is simulated directly here
+        # A MemoryError while decoding must be converted too, not only one
+        # while reading (see the read-stage test above): 'json.loads()'
+        # builds a tree of Python objects, so it can exhaust memory even
+        # after a successful read. MemoryError is simulated directly here
         # rather than reproducing that memory pressure in a unit test.
         _write_target(tmp_path, "0.7.0")
         monkeypatch.setattr(gate_module, "REPO_ROOT", tmp_path)  # type: ignore[attr-defined]
@@ -201,11 +193,11 @@ class TestReadDeclaredTarget:
     def test_a_symlinked_declaration_file_raises(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Regression for the finding that release-target.json being a
-        # symlink to unrelated, well-formed JSON elsewhere on the
-        # filesystem -- with a matching old tag already in the repository
-        # -- made this gate exit 0. A symlink is refused outright, whether
-        # or not its target is itself well-formed.
+        # A release-target.json that is a symlink to unrelated, well-formed
+        # JSON elsewhere on the filesystem must not be followed: the
+        # declared version would come from outside the checkout and could
+        # match an old tag already in the repository. A symlink is refused
+        # outright, whether or not its target is itself well-formed.
         ambient_dir = tmp_path / "ambient-outside-the-checkout"
         ambient_dir.mkdir()
         ambient_file = ambient_dir / "elsewhere.json"
@@ -234,24 +226,20 @@ class TestReadDeclaredTarget:
 
 
 class TestReadDeclaredTargetBoundary:
-    """Regressions for the single-boundary fix: no enumerated exception list, one catch-all.
+    """``read_declared_target()`` has one catch-all boundary, not an enumerated exception list.
 
-    ``read_declared_target()`` used to catch a short, hand-picked list of
-    anticipated exception types (``OSError``/``MemoryError`` around
-    ``read_text()``, ``json.JSONDecodeError``/``MemoryError`` around
-    ``json.loads()``). Each case here is a failure mode that list did not
-    name -- confirmed by execution against the pre-fix script, which let
-    every one of them escape as a bare traceback -- and now goes through the
-    single ``except Exception`` boundary in ``read_declared_target()``
-    instead.
+    A short, hand-picked list of anticipated exception types
+    (``OSError``/``MemoryError`` around ``read_text()``,
+    ``json.JSONDecodeError``/``MemoryError`` around ``json.loads()``) would
+    not name every way reading and parsing can fail.
     """
 
     def test_invalid_utf8_raises_a_clean_gate_input_error(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Regression for the finding that a file containing invalid UTF-8
-        # raised an uncaught UnicodeDecodeError out of read_text() -- not
-        # OSError, not MemoryError, so the old catch list missed it entirely.
+        # A file whose bytes are not valid UTF-8. A UnicodeDecodeError out of
+        # read_text() is not OSError and not MemoryError, so a list limited
+        # to those would miss it.
         repo = tmp_path / "repo"
         repo.mkdir()
         (repo / "release-target.json").write_bytes(b'{"version": "0.7.0\xff\xfe"}')
@@ -263,9 +251,9 @@ class TestReadDeclaredTargetBoundary:
     def test_a_deeply_nested_json_document_raises_a_clean_gate_input_error(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Regression for the finding that a 10,000-level nested JSON document
-        # raised an uncaught RecursionError out of json.loads() -- not
-        # json.JSONDecodeError, so the old catch list missed it too.
+        # A 10,000-level nested JSON document. A RecursionError out of
+        # json.loads() is not a json.JSONDecodeError, so such a list would
+        # miss it too.
         repo = tmp_path / "repo"
         repo.mkdir()
         nested = "[" * 10_000 + "]" * 10_000
@@ -278,14 +266,13 @@ class TestReadDeclaredTargetBoundary:
     def test_an_unrelated_oversized_integer_field_raises_a_clean_gate_input_error(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # The fourth, unanticipated failure mode: a field this script never
-        # reads at all -- not "version" -- with a 5,000-digit integer
+        # A further failure mode outside such a list: a field this script
+        # never reads at all -- not "version" -- with a 5,000-digit integer
         # literal. json.loads() itself calls int() on every JSON integer
-        # literal in the document, so this raises ValueError from *inside*
-        # json.loads(), before this script's own code ever runs -- nobody
-        # enumerated this when writing the old catch list. Confirmed by
-        # execution against the pre-fix script: an uncaught ValueError
-        # escaped as a bare traceback out of json.loads().
+        # literal in the document, and int() refuses a literal past the
+        # interpreter's integer-string conversion limit (4300 digits by
+        # default), so this raises ValueError from *inside* json.loads(),
+        # before this script's own code runs.
         repo = tmp_path / "repo"
         repo.mkdir()
         huge_literal = "9" * 5000
@@ -345,8 +332,7 @@ class TestResolveTagCommitAgainstADisposableRepository:
     def test_a_tag_on_a_blob_resolves_to_none(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Regression for the finding that a tag naming *any* object -- not
-        # specifically a commit -- was previously accepted as "published".
+        # A tag naming a blob, not a commit, must not count as published.
         repo = tmp_path / "repo"
         repo.mkdir()
         _init_disposable_repo(repo)
@@ -375,10 +361,9 @@ class TestResolveTagCommitAgainstADisposableRepository:
     def test_a_symbolic_ref_resolves_to_none(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Regression for the finding that a symbolic refs/tags/v0.7.0
-        # pointing at the current branch made this resolve straight to
-        # HEAD's own commit, with no real tag object anywhere in the
-        # repository -- confirmed by execution against the unfixed script.
+        # A symbolic refs/tags/v0.7.0 pointing at the current branch peels
+        # straight to HEAD's own commit, with no real tag object anywhere
+        # in the repository, so it must not resolve as a tag.
         repo = tmp_path / "repo"
         repo.mkdir()
         _init_disposable_repo(repo)
@@ -462,15 +447,13 @@ class TestClassifyTargetAgainstADisposableRepository:
     def test_asks_symbolic_ref_exactly_once_on_a_passing_classification(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Regression for the finding that a passing classify_target() call
-        # asked git the identical 'git symbolic-ref --quiet
-        # refs/tags/v<version>' question twice: once here, to decide
-        # whether to call resolve_tag_commit() at all, and once more inside
-        # resolve_tag_commit() itself, re-deriving an answer the caller
-        # already had. Confirmed by execution: instrumenting _run_git and
-        # calling classify_target() on a tag reachable from HEAD recorded
-        # two 'symbolic-ref' invocations before resolve_tag_commit() took
-        # the already-known answer as a parameter, one afterwards.
+        # classify_target() asks git 'git symbolic-ref --quiet
+        # refs/tags/v<version>' once, to decide whether to call
+        # resolve_tag_commit() at all, and passes that answer to
+        # resolve_tag_commit() as a parameter rather than having it ask
+        # the identical question again. Instrumenting _run_git and calling
+        # classify_target() on a tag reachable from HEAD must record
+        # exactly one 'symbolic-ref' invocation.
         repo = tmp_path / "repo"
         repo.mkdir()
         _init_disposable_repo(repo)
@@ -506,9 +489,8 @@ class TestClassifyTargetAgainstADisposableRepository:
     def test_a_tag_on_an_unreachable_commit_is_not_accepted(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Regression for the finding that a tag existing anywhere in the
-        # object database -- even on a commit this branch never merged --
-        # was previously accepted as "published".
+        # A tag that exists in the object database on a commit this branch
+        # never merged must not count as published.
         repo = tmp_path / "repo"
         repo.mkdir()
         _init_disposable_repo(repo)
@@ -606,8 +588,7 @@ class TestMainAgainstADisposableRepository:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        # Regression for the finding that deleting release-target.json made
-        # the gate pass: a repository with no legitimate case for the file
+        # A repository with no legitimate case for release-target.json
         # being absent must fail closed, not report a clean no-op.
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -763,10 +744,9 @@ class TestMainAgainstADisposableRepository:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        # Regression for the finding that a symbolic refs/tags/v0.7.0
-        # pointing at the current branch made the whole gate exit 0 with no
-        # real tag present -- confirmed by execution against the unfixed
-        # script in a disposable clone.
+        # A symbolic refs/tags/v0.7.0 pointing at the current branch must
+        # not let the gate exit 0: no real tag is present, only a ref that
+        # peels to HEAD's own commit.
         repo = tmp_path / "repo"
         repo.mkdir()
         _init_disposable_repo(repo)

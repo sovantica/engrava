@@ -11,8 +11,7 @@ import time, so this is the seam, and it keeps production code unchanged.
 
 ``TestFailabilityOnRealHistory`` is separate again: it runs the check
 against *this* repository's own history, because a check like this is only
-worth anything once it has actually been seen red as well as green (see the
-module docstring in ``check_main_carries_the_released_tag.py``). Those
+worth anything once it has actually been seen red as well as green. Those
 cases are skipped when the required history is absent (e.g. a shallow CI
 checkout), which is why the other two kinds of git-backed tests above exist
 as unconditional coverage of the same code paths.
@@ -94,9 +93,8 @@ REQUIRES_ORIGIN_MAIN = pytest.mark.skipif(
 )
 # The exact first parent of the merge commit that brought v0.6.0 into main
 # (github.com/sovantica/engrava commit 8c044e2, "Merge pull request #49 from
-# sovantica/chore/forward-merge-the-0-6-0-release"). This is the real state
-# main was in right after v0.6.0 published to PyPI and before the forward
-# merge landed -- not a synthetic scenario.
+# sovantica/chore/forward-merge-the-0-6-0-release"). This is the state main
+# was in before the forward merge landed -- not a synthetic scenario.
 PRE_FORWARD_MERGE_COMMIT = "4185a5d8a33dbd591125aa4ccd476c2455652b3d"
 REQUIRES_PRE_FORWARD_MERGE_COMMIT = pytest.mark.skipif(
     not _ref_exists(PRE_FORWARD_MERGE_COMMIT),
@@ -136,10 +134,10 @@ class TestNewestVersionTag:
     def test_a_malformed_leading_zero_tag_does_not_shadow_the_real_one(
         self, gate_module: object
     ) -> None:
-        # v01.0.0 and v1.0.0 both parsed to (1, 0, 0) before TAG_RE rejected
-        # leading zeros, and max() kept whichever it saw first -- v01.0.0 in
-        # this exact ordering. Pin that the malformed spelling is never a
-        # candidate at all, regardless of list order.
+        # The malformed spelling v01.0.0 must never be a candidate at all,
+        # regardless of list order: if it parsed to (1, 0, 0) it would tie
+        # with v1.0.0, and max() keeps whichever of two equal keys it saw
+        # first.
         assert gate_module.newest_version_tag(["v01.0.0", "v1.0.0"]) == "v1.0.0"  # type: ignore[attr-defined]
         assert gate_module.newest_version_tag(["v1.0.0", "v01.0.0"]) == "v1.0.0"  # type: ignore[attr-defined]
 
@@ -169,15 +167,13 @@ class TestRunGateWithStubbedReads:
     *first*, and it shells out to ``git rev-parse --verify`` against the
     real ``REPO_ROOT`` (this repository's own checkout, since these tests
     never monkeypatch ``REPO_ROOT`` the way the disposable-repository tests
-    elsewhere in this file do). Before this stub, "refs/heads/main" here
-    resolved against whatever branches this checkout happens to have --
-    passing only because a local ``refs/heads/main`` happened to exist.
-    Confirmed by execution: cloning this repository shallow and
-    single-branch -- the shape ``actions/checkout@v7`` produces with no
-    ``ref``/``fetch-depth`` override -- leaves no local ``refs/heads/main``
-    at all, and the two tests that reach a
-    real assertion below raised ``GateInputError: 'refs/heads/main' does
-    not exist in this repository`` there instead of exercising the stubbed
+    elsewhere in this file do). Without the stub, "refs/heads/main" here
+    would resolve against whatever branches this checkout happens to have,
+    so the tests would pass only where a local ``refs/heads/main`` exists.
+    A checkout with no local ``refs/heads/main`` (a shallow single-branch
+    clone of another branch, for example) would make the tests that reach
+    a real assertion below raise ``GateInputError: 'refs/heads/main' does
+    not exist in this repository`` instead of exercising the stubbed
     ``list_git_tags``/``is_ancestor`` behaviour this class exists to check.
 
     The fourth read, ``_resolves_to_a_local_branch()``, is not stubbed: the
@@ -350,27 +346,25 @@ class TestRunGateFailureRemediation:
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """Regression: a symbolic ``refs/heads/main`` whose target is non-UTF-8 must not crash.
+        """A symbolic ``refs/heads/main`` whose target is non-UTF-8 exits cleanly.
 
         ``_resolves_to_a_local_branch`` is only reached once ``contains_tag``
         is ``False`` (see :func:`run_gate`), so this needs ``main`` itself to
         be symbolic, its target to contain raw bytes that are not valid
         UTF-8, and the newest tag to *not* be reachable from it -- all three
         at once, built with ordinary git commands, no manual ``.git`` editing
-        (an ordinary fresh checkout, e.g. ``git clone --no-local --branch
-        main`` or a fetch followed by ``git checkout -B main
-        refs/remotes/origin/main``, converts a symbolic ``main`` into a
-        direct one, which is why this state has to be constructed directly
-        rather than reproduced through checkout mechanics).
+        (``git clone --no-local --branch main`` yields a direct ``main``, not
+        a symbolic one, which is why this state has to be constructed
+        directly rather than reproduced through a clone).
 
-        Before the fix, ``git symbolic-ref --quiet refs/heads/main`` succeeds
-        (exit 0) and echoes the raw-byte target on stdout; ``text=True``
-        decodes that eagerly as strict UTF-8 and raises
-        ``UnicodeDecodeError`` -- outside :class:`GateInputError`, so it
-        escapes ``main()`` as a bare traceback instead of the clean exit-1
-        diagnostic this module promises. This is exercised through
-        ``main()`` with the default ``--branch refs/heads/main``, the exact
-        invocation the release workflow uses.
+        ``git symbolic-ref --quiet refs/heads/main`` succeeds (exit 0) and
+        echoes the raw-byte target on stdout; decoding that eagerly as strict
+        UTF-8 would raise ``UnicodeDecodeError`` -- outside
+        :class:`GateInputError`, so it would escape ``main()`` as a bare
+        traceback instead of the clean exit-1 diagnostic this module
+        promises. This is exercised through ``main()`` with the default
+        ``--branch refs/heads/main``, the invocation the release workflow
+        uses.
         """
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -411,8 +405,8 @@ class TestRunGateFailureRemediation:
 
         exit_code = gate_module.main([])  # type: ignore[attr-defined]
 
-        # Before the fix, this line was never reached: resolving the FAIL
-        # remediation raised UnicodeDecodeError instead of returning.
+        # main() returns the failure exit code instead of raising while it
+        # resolves the FAIL remediation.
         assert exit_code == 1
         captured = capsys.readouterr()
         assert "FAIL" in captured.out
@@ -467,24 +461,24 @@ class TestIsAncestorAgainstADisposableRepository:
 
 
 class TestUnicodeTagSpoofingAgainstADisposableRepository:
-    """Regression coverage for two Unicode assumptions the parser used to make.
+    """Two Unicode assumptions the tag parser must not make.
 
     Both build a throwaway repository under ``tmp_path`` -- unconditional,
     like ``TestIsAncestorAgainstADisposableRepository`` above -- rather than
     depending on any tag actually present in this repository's own history.
 
-    1. ``TAG_RE``'s numeric component was ``(?:0|[1-9]\\d*)``. ``\\d`` in a
-       Python regex is Unicode-aware, so it also matches non-ASCII decimal
-       digits (e.g. U+0662 ARABIC-INDIC DIGIT TWO), and ``int()`` converts
-       what it matches. A tag such as ``v1٩.0.0`` therefore parsed as if its
-       major component were 19, not as a non-match.
-    2. ``parse_tag_version`` called ``tag.strip()`` before matching.
+    1. The numeric component of ``TAG_RE`` must match ASCII digits only.
+       ``\\d`` in a Python regex is Unicode-aware, so it also matches
+       non-ASCII decimal digits (e.g. U+0662 ARABIC-INDIC DIGIT TWO), and
+       ``int()`` converts what it matches. A tag such as ``v1٩.0.0`` would
+       parse as if its major component were 19, not as a non-match.
+    2. ``parse_tag_version`` must not strip whitespace before matching.
        ``str.strip()`` removes Unicode whitespace, not just ASCII space, so
        a tag differing from a canonical one only by trailing U+00A0
-       NO-BREAK SPACE parsed identically to the canonical spelling -- even
-       though ``git tag`` accepts that trailing character (confirmed by
-       creating one; ``git check-ref-format`` rejects ASCII space and
-       control characters in a ref name, but not this).
+       NO-BREAK SPACE would parse identically to the canonical spelling --
+       and ``git tag`` accepts that trailing character
+       (``git check-ref-format`` rejects ASCII space and control characters
+       in a ref name, but not this).
     """
 
     def test_a_non_ascii_digit_tag_that_looks_newer_hides_an_unmerged_real_release(
@@ -534,10 +528,9 @@ class TestUnicodeTagSpoofingAgainstADisposableRepository:
         monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
 
         passed, messages = gate_module.run_gate(branch="refs/heads/main")  # type: ignore[attr-defined]
-        # Before the fix, this returned (True, ...): the Unicode-digit tag
-        # parsed as (19, 0, 0), outranked the real v12.0.0, and was itself
-        # reachable, so the gate reported PASS while the real v12.0.0
-        # release sat unreachable from main.
+        # If the Unicode-digit tag parsed as (19, 0, 0) it would outrank the
+        # real v12.0.0 and, being reachable, make the gate report PASS while
+        # the real v12.0.0 release sat unreachable from main.
         assert passed is False, messages
         fail_lines = [line for line in messages if line.startswith("FAIL")]
         assert fail_lines, messages
@@ -590,9 +583,9 @@ class TestUnicodeTagSpoofingAgainstADisposableRepository:
         monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
 
         passed, messages = gate_module.run_gate(branch="refs/heads/main")  # type: ignore[attr-defined]
-        # Before the fix, 'v13.0.0\xa0'.strip() == 'v13.0.0' matched TAG_RE,
-        # so this tag parsed as (13, 0, 0), uniquely outranked the real
-        # v12.0.0, and was itself reachable -- the gate reported PASS while
+        # 'v13.0.0\xa0'.strip() == 'v13.0.0', so if the parser stripped
+        # whitespace this tag would parse as (13, 0, 0), uniquely outrank the
+        # real v12.0.0 and, being reachable, make the gate report PASS while
         # the real v12.0.0 release sat unreachable from main. It must not
         # stand in for a canonical tag that was never actually created.
         assert passed is False, messages
@@ -602,28 +595,27 @@ class TestUnicodeTagSpoofingAgainstADisposableRepository:
 
 
 class TestTagAncestryUsesTheQualifiedTagRef:
-    """Regression: the tag side of the ancestry check must be qualified, like the branch side.
+    """The tag side of the ancestry check must be qualified, like the branch side.
 
-    ``run_gate`` compared ``is_ancestor(tag, branch)`` with a *bare* tag name
-    -- ``tag`` comes straight from ``git tag -l`` (e.g. ``"v12.0.0"``), never
-    ``"refs/tags/v12.0.0"``. Git resolves a bare name through its usual
+    ``run_gate`` passes the tag to ``is_ancestor`` as ``refs/tags/<tag>``,
+    not as the bare name ``list_git_tags`` returns (e.g. ``"v12.0.0"``).
+    Git resolves a bare name through its usual
     search order (``$GIT_DIR/<name>``, then ``refs/<name>``, then
     ``refs/tags/<name>``, then ``refs/heads/<name>``, ...), so a same-named
     ref that sits earlier in that order can shadow the real tag entirely.
-    ``assert_ref_is_qualified_and_exists`` hardens ``branch`` against exactly
-    this ambiguity, but it was never applied to the tag side -- this is the
-    same class of defect already fixed on ``--branch``, just on the other
-    argument of the same call.
+    ``assert_ref_is_qualified_and_exists`` protects ``branch`` against
+    exactly this ambiguity, and ``run_gate`` qualifies the tag as
+    ``refs/tags/<tag>`` to protect the other argument of the same call.
 
-    This builds the shape that reproduces the ambiguity: a genuine
+    This builds the shape that exposes the ambiguity: a genuine
     ``v12.0.0`` tag that is unreachable from ``main``, and a generic
     ``refs/v12.0.0`` ref (not a tag, not a branch -- a top-level ref under
     ``refs/``) that *is* reachable from ``main``. ``refs/<name>`` is tried before
     ``refs/tags/<name>`` in git's search order, so resolving the tag by its
-    bare name picks the generic ref instead of the real tag. Before
-    qualifying the tag as ``refs/tags/<tag>``, this made the gate report
-    PASS while the real release sat unreachable; after qualifying it, the
-    generic ref is never consulted and the gate must report FAIL.
+    bare name would pick the generic ref instead of the real tag and the
+    gate would report PASS while the real release sat unreachable. With the
+    tag qualified as ``refs/tags/<tag>``, the generic ref is never consulted
+    and the gate must report FAIL.
     """
 
     def test_a_generic_ref_sharing_the_tags_bare_name_must_not_shadow_the_real_tag(
@@ -668,11 +660,11 @@ class TestTagAncestryUsesTheQualifiedTagRef:
         monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
 
         passed, messages = gate_module.run_gate(branch="refs/heads/main")  # type: ignore[attr-defined]
-        # Before the fix, is_ancestor() received the bare "v12.0.0", git
-        # resolved it to 'refs/v12.0.0' (reachable from main) instead of the
-        # real 'refs/tags/v12.0.0' (not reachable), and this returned
+        # If is_ancestor() received the bare "v12.0.0", git would resolve it
+        # to 'refs/v12.0.0' (reachable from main) instead of the real
+        # 'refs/tags/v12.0.0' (not reachable), and this would return
         # (True, ...) -- reporting the newest version tag as on main when it
-        # was not.
+        # is not.
         assert passed is False, messages
         fail_lines = [line for line in messages if line.startswith("FAIL")]
         assert fail_lines, messages
@@ -680,23 +672,21 @@ class TestTagAncestryUsesTheQualifiedTagRef:
 
 
 class TestListGitTagsSplitsOnlyOnALiteralNewline:
-    """Regression for ``list_git_tags`` splitting ``git tag -l`` output.
+    """``list_git_tags`` splits git's output on a literal newline only.
 
     ``str.splitlines()`` breaks on more than ``"\\n"`` -- it also treats
     U+0085 NEL (among other separators) as a line boundary, and git accepts
-    U+0085 inside a tag name (see the module docstring's comment on
-    ``list_git_tags``). A tempting argument is that a fragment produced by
-    this fracture is harmless on its own: it would either fail ``TAG_RE``
-    or name a ref that does not exist and raise. That argument does not hold
-    on its own repository state -- a fragment can still shadow a real,
+    U+0085 inside a tag name (see the comment inside ``list_git_tags``). It
+    might seem that a fragment produced by such a split is harmless on its
+    own: it would either fail ``TAG_RE`` or name a ref that does not exist
+    and raise. That does not hold -- a fragment can still shadow a real,
     lower-numbered release by outranking it in ``newest_version_tag`` and
     then failing to resolve, which masks the correct tag behind a
-    ``GateInputError`` instead of letting the gate run against it. This is a
-    real defect in its own right, independent of whether the tag side of
-    ``is_ancestor`` is qualified (that is a separate defect, fixed
-    separately) -- the fragment here never resolves to *anything* real, so
-    qualifying it would only change the shape of the failure, not this
-    test's ability to detect the fracture.
+    ``GateInputError`` instead of letting the gate run against it. This is
+    independent of whether the tag side of ``is_ancestor`` is qualified:
+    the fragment here never resolves to *anything* real, so qualifying it
+    would only change the shape of the failure, not this test's ability to
+    detect the split.
     """
 
     def test_a_tag_fractured_by_splitlines_does_not_shadow_the_real_tag(
@@ -715,8 +705,8 @@ class TestListGitTagsSplitsOnlyOnALiteralNewline:
         subprocess.run(["git", "tag", "v11.0.0"], cwd=repo, check=True)  # noqa: S607
         _commit(repo, "cosmetic commit on main")
         # A tag name containing U+0085 NEL. str.splitlines() treats this as
-        # a line boundary and would fracture 'git tag -l's single output
-        # line for this tag into two bogus entries, "v13.0.0" and "junk" --
+        # a line boundary and would fracture git's single output line for
+        # this tag into two bogus entries, "v13.0.0" and "junk" --
         # neither of which is a real ref in this repository. "v13.0.0" is
         # shaped like a valid version tag and would outrank the real
         # v11.0.0 in newest_version_tag() if it were ever treated as a
@@ -725,38 +715,36 @@ class TestListGitTagsSplitsOnlyOnALiteralNewline:
 
         monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
 
-        # With the fix (splitting on a literal "\n" only), 'git tag -l's
-        # output for the fractured tag comes back as one line containing the
-        # NEL character, which does not match TAG_RE -- so it is correctly
-        # excluded, and the gate runs against the one real tag, v11.0.0,
-        # which is reachable from main.
+        # Splitting on a literal "\n" only, git's output for this tag comes
+        # back as one line containing the NEL character, which does not
+        # match TAG_RE -- so it is correctly excluded, and the gate runs
+        # against the one real tag, v11.0.0, which is reachable from main.
         passed, messages = gate_module.run_gate(branch="refs/heads/main")  # type: ignore[attr-defined]
         assert passed is True, messages
         assert any("v11.0.0" in line for line in messages)
 
 
 class TestListGitTagsIsNotSubjectToPorcelainDisplayConfiguration:
-    """Regression: ``list_git_tags`` must not read a porcelain command's formatted output.
+    """``list_git_tags`` must not read a porcelain command's formatted output.
 
     ``git tag -l`` is porcelain -- it formats its output for a human reader
     and honours display configuration that has nothing to do with which
     tags exist. With ``column.tag=always`` set and a narrow terminal width
     (``COLUMNS=20``), ``git tag -l 'v*'`` against a repository with
-    reachable tags up to
-    ``v3.0.0`` and unreachable ``v4.0.0`` and ``v5.0.0`` printed::
+    reachable tags up to ``v3.0.0`` and unreachable ``v4.0.0`` and
+    ``v5.0.0`` prints::
 
         v1.0.0  v4.0.0
         v2.0.0  v5.0.0
         v3.0.0
 
     Each of the first two lines holds two tag names, so neither matches
-    ``TAG_RE`` and both are discarded by :func:`newest_version_tag`. The
-    parser was left with only ``v3.0.0``, which is reachable, so the gate
-    reported PASS while the real newest release, ``v5.0.0``, sat unreachable
-    from ``main``. ``list_git_tags`` now reads ``git for-each-ref``, a
-    plumbing command that is not subject to ``column.*`` configuration
-    (confirmed by execution against git 2.51.0 -- see the function's
-    docstring), so this must report FAIL.
+    ``TAG_RE`` and both would be discarded by :func:`newest_version_tag`.
+    That would leave only ``v3.0.0``, which is reachable, so the gate would
+    report PASS while the real newest release, ``v5.0.0``, sits unreachable
+    from ``main``. ``list_git_tags`` reads ``git for-each-ref``, a plumbing
+    command that is not subject to ``column.*`` configuration (see the
+    function's docstring), so this must report FAIL.
     """
 
     def test_column_tag_always_with_a_narrow_terminal_does_not_hide_the_newest_tag(
@@ -778,7 +766,7 @@ class TestListGitTagsIsNotSubjectToPorcelainDisplayConfiguration:
         # v4.0.0 and v5.0.0 are published on a branch that is never
         # forward-merged into main -- exactly the gap this gate exists to
         # catch. They must outrank v1.0.0-v3.0.0 so that hiding them behind
-        # the porcelain column fracture is what makes the gate wrongly pass.
+        # the porcelain column fracture would make the gate wrongly pass.
         subprocess.run(  # noqa: S603
             ["git", "checkout", "--quiet", "-b", "side", base],  # noqa: S607
             cwd=repo,
@@ -791,8 +779,7 @@ class TestListGitTagsIsNotSubjectToPorcelainDisplayConfiguration:
         subprocess.run(["git", "checkout", "--quiet", "main"], cwd=repo, check=True)  # noqa: S607
 
         # column.tag=always forces column formatting even though this
-        # subprocess is never attached to a terminal -- "always" means
-        # always, confirmed by execution above.
+        # subprocess is never attached to a terminal.
         subprocess.run(
             ["git", "config", "column.tag", "always"],  # noqa: S607
             cwd=repo,
@@ -806,10 +793,10 @@ class TestListGitTagsIsNotSubjectToPorcelainDisplayConfiguration:
         monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
 
         passed, messages = gate_module.run_gate(branch="refs/heads/main")  # type: ignore[attr-defined]
-        # Before the fix, list_git_tags() read 'git tag -l's columnised
-        # output, only 'v3.0.0' survived TAG_RE, and it is reachable from
-        # main -- so this returned (True, ...) while the real newest
-        # release, v5.0.0, was not on main at all.
+        # Were list_git_tags() to read 'git tag -l's columnised output, only
+        # 'v3.0.0' would survive TAG_RE, and it is reachable from main --
+        # so this would return (True, ...) while the real newest release,
+        # v5.0.0, is not on main at all.
         assert passed is False, messages
         assert any("v5.0.0" in line for line in messages)
         fail_lines = [line for line in messages if line.startswith("FAIL")]
@@ -818,19 +805,16 @@ class TestListGitTagsIsNotSubjectToPorcelainDisplayConfiguration:
 
 
 class TestListGitTagsToleratesANonUtf8TagName:
-    """Regression: a non-UTF-8 tag name must be ignored, not crash the process.
+    """A non-UTF-8 tag name must be ignored, not crash the process.
 
     Git accepts tag names containing raw bytes ``0x80``-``0xff`` that are
-    not valid UTF-8 (confirmed by creating one below). ``list_git_tags``
-    used to decode ``git``'s output with the strict default UTF-8 codec
-    (via ``subprocess.run(..., text=True)``), which raised an uncaught
-    ``UnicodeDecodeError`` the moment such a tag existed -- a traceback,
-    not the clean exit-1 diagnostic the module docstring promises for a bad
-    input. Decoding with ``errors="surrogateescape"`` instead preserves
-    every byte losslessly (as an unpaired surrogate) so the name reaches
-    ``TAG_RE``, fails to match it like any other non-canonical name, and is
-    silently excluded -- exactly like a prerelease suffix or any other tag
-    that is not a canonical ``vMAJOR.MINOR.PATCH`` name.
+    not valid UTF-8 (the test creates one below). Decoding ``git``'s output
+    as strict UTF-8 would raise an uncaught ``UnicodeDecodeError`` the moment
+    such a tag existed -- a traceback, not a clean exit-1 diagnostic.
+    ``list_git_tags`` decodes with ``errors="surrogateescape"`` instead, so
+    the name reaches ``TAG_RE``, fails to match it like any other non-canonical
+    name, and is silently excluded -- exactly like a prerelease suffix or
+    any other tag that is not a canonical ``vMAJOR.MINOR.PATCH`` name.
     """
 
     def test_a_non_utf8_tag_is_ignored_rather_than_crashing(
@@ -861,16 +845,16 @@ class TestListGitTagsToleratesANonUtf8TagName:
 
         monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
 
-        # Before the fix, this call raised UnicodeDecodeError instead of
-        # returning. It must instead run to completion, ignore the
-        # non-UTF-8 tag as non-canonical, and report the one real tag.
+        # The call must run to completion, ignore the non-UTF-8 tag as
+        # non-canonical, and report the one real tag; a strict UTF-8 decode
+        # would raise UnicodeDecodeError here instead.
         passed, messages = gate_module.run_gate(branch="refs/heads/main")  # type: ignore[attr-defined]
         assert passed is True, messages
         assert any("v1.0.0" in line for line in messages)
 
 
 class TestIsWellFormedRefPathToleratesNonUtf8Bytes:
-    """Regression: a ``--branch`` value with raw invalid-UTF-8 bytes must not crash.
+    """A ``--branch`` value with raw invalid-UTF-8 bytes must not crash.
 
     When the OS hands Python an ``argv`` entry it cannot decode as UTF-8,
     CPython decodes it anyway with ``errors="surrogateescape"`` (PEP 383):
@@ -881,18 +865,14 @@ class TestIsWellFormedRefPathToleratesNonUtf8Bytes:
     round-trips back to the identical raw bytes on the way out (the same
     codec is how ``os.fsencode``/``exec`` handle ``argv`` on POSIX), so git
     receives exactly what the OS would have handed a C program directly --
-    confirmed by execution that git accepts this as a syntactically
-    well-formed (if nonexistent) ref path.
+    and git accepts this as a syntactically well-formed (if nonexistent)
+    ref path.
 
-    Before the fix, ``_is_well_formed_ref_path`` ran that subprocess call
-    with ``text=True``, which decodes *both* streams as strict UTF-8
-    regardless of whether their content is ever used -- and it is not used
-    here, only the exit code is. ``--normalize`` echoes the (still
-    byte-laden) ref back to stdout on success, so this raised
-    ``UnicodeDecodeError`` inside ``subprocess.communicate()``, before
-    ``_is_well_formed_ref_path`` or any of its callers ever ran, let alone
-    reached the clean exit-1 diagnostic this module promises for a bad
-    input.
+    ``_is_well_formed_ref_path`` runs that subprocess call without
+    ``text=True``, which would decode *both* streams regardless of whether
+    their content is ever used -- and it is not used here, only the exit
+    code is. ``--normalize`` echoes the (still byte-laden) ref back to
+    stdout on success; capturing raw bytes means nothing decodes it.
     """
 
     def test_a_branch_with_non_utf8_bytes_exits_cleanly_instead_of_crashing(
@@ -914,43 +894,35 @@ class TestIsWellFormedRefPathToleratesNonUtf8Bytes:
 
         exit_code = gate_module.main(["--branch", branch])  # type: ignore[attr-defined]
 
-        # Before the fix this line was never reached: the call above raised
-        # UnicodeDecodeError instead of returning.
+        # main() returns a clean exit code; a strict UTF-8 decode in
+        # _is_well_formed_ref_path would raise UnicodeDecodeError from the
+        # call above instead.
         assert exit_code == 1
         captured = capsys.readouterr()
         assert "does not exist" in captured.err
 
 
 class TestIsAncestorToleratesNonUtf8Bytes:
-    """Regression: is_ancestor's failure-to-resolve message must not crash, on decode or on write.
+    """is_ancestor's failure-to-resolve message must not crash, on decode or on write.
 
-    Reaching this from an unmodified ``main()`` is not possible today:
-    ``run_gate()`` always calls ``assert_ref_is_qualified_and_exists(branch)``
-    before ``is_ancestor()``, and that guard already rejects a branch value
-    that does not resolve to an existing object -- which a raw-byte value
-    like the one used here never does (see
+    ``run_gate()`` calls ``assert_ref_is_qualified_and_exists(branch)``
+    before ``is_ancestor()``, and that guard rejects a raw-byte branch
+    value that does not resolve to an existing object (see
     ``TestIsWellFormedRefPathToleratesNonUtf8Bytes``, where the same shape
     of value fails with a "does not exist" diagnostic before ``is_ancestor``
-    ever runs). This is precisely the "latent" exposure the module
-    docstring's history describes: ``is_ancestor`` has the same
-    strict-decode defect ``assert_ref_is_qualified_and_exists`` exists to
-    close, and a caller that reorders the two -- or a future call site that
-    invokes ``is_ancestor`` directly -- would trip it.
-    ``assert_ref_is_qualified_and_exists`` is monkeypatched to a no-op here
-    specifically to exercise that reordering through ``main()``, rather
-    than calling ``is_ancestor`` as a bare unit: the requirement is that
-    ``main()`` never lets an exception escape on this path, not merely that
-    the helper returns a value.
+    runs). ``is_ancestor`` is still reachable from an unmodified ``main()``
+    with a raw-byte name, through an existing ref that resolves to a blob
+    rather than a commit: ``git merge-base --is-ancestor`` then exits 128
+    and echoes that raw name on stderr. ``assert_ref_is_qualified_and_exists``
+    is monkeypatched to a no-op here so the test reaches ``is_ancestor``
+    through ``main()`` with a name git cannot resolve, rather than calling
+    ``is_ancestor`` as a bare unit: the requirement is that ``main()``
+    never lets an exception escape on this path, not merely that the helper
+    returns a value.
 
     ``capsys`` is requested deliberately: it replaces ``sys.stderr`` with a
-    stream using the strict ``"utf-8"`` codec (confirmed by execution),
-    unlike the ``"backslashreplace"`` handler CPython's own interactive
-    ``sys.stderr`` defaults to, and unlike pytest's own default
-    file-descriptor-level capture, neither of which reproduces this crash
-    (also confirmed by execution). Without ``capsys``, this test would pass
-    even without the write-site fix -- for the wrong reason, exercising
-    only the earlier decode-site fix and never actually reaching the
-    encode-on-write defect at all.
+    stream using the strict ``"utf-8"`` codec, so an unsanitised write of a
+    surrogate-laden message would raise ``UnicodeEncodeError`` here.
     """
 
     def test_a_branch_with_non_utf8_bytes_exits_cleanly_instead_of_crashing(
@@ -980,29 +952,25 @@ class TestIsAncestorToleratesNonUtf8Bytes:
 
         exit_code = gate_module.main(["--branch", branch])  # type: ignore[attr-defined]
 
-        # Before the fix this line was never reached: either the strict
-        # decode inside is_ancestor's subprocess call, or (once that alone
-        # was fixed) the write of its surrogate-laden message to a strict
-        # sys.stderr, raised instead of returning.
+        # main() must return: a strict decode inside is_ancestor's
+        # subprocess call, or the write of its surrogate-laden message to a
+        # strict sys.stderr, would each raise instead.
         assert exit_code == 1
         captured = capsys.readouterr()
         assert "could not resolve one of the refs" in captured.err
 
 
 class TestListGitTagsErrorMessageToleratesNonUtf8Bytes:
-    """Regression: list_git_tags' own failure message must not crash on write either.
+    """list_git_tags' own failure message must not crash on write either.
 
-    git does not fail an ordinary ``for-each-ref`` call in practice, so
-    there is no real invocation to reproduce a non-UTF-8 ``fatal:`` message
-    from -- this fakes that one subprocess call instead, routing every
-    other git invocation ``run_gate()`` makes (``check-ref-format``,
-    ``rev-parse``, ``merge-base``) through the real ``subprocess.run``
-    unchanged. ``list_git_tags`` already decodes this stderr with
-    ``errors="surrogateescape"``, which preserves any raw byte losslessly
-    instead of crashing on decode -- the defect this fixes is the later
-    write of that preserved byte to ``sys.stderr``, the same one
-    ``is_ancestor``'s message has (see
-    ``TestIsAncestorToleratesNonUtf8Bytes``).
+    This test fakes the one ``for-each-ref`` subprocess call to fail with a
+    non-UTF-8 ``fatal:`` message, routing every other git invocation
+    ``run_gate()`` makes (``check-ref-format``, ``rev-parse``,
+    ``merge-base``) through the real ``subprocess.run`` unchanged.
+    ``list_git_tags`` decodes this stderr with ``errors="surrogateescape"``
+    instead of crashing on decode; the remaining concern is the later write
+    of the decoded message to ``sys.stderr``, the same one ``is_ancestor``'s
+    message has (see ``TestIsAncestorToleratesNonUtf8Bytes``).
     """
 
     def test_a_non_utf8_for_each_ref_failure_exits_cleanly_instead_of_crashing(
@@ -1036,37 +1004,33 @@ class TestListGitTagsErrorMessageToleratesNonUtf8Bytes:
 
         exit_code = gate_module.main(["--branch", "refs/heads/main"])  # type: ignore[attr-defined]
 
-        # Before the fix, main()'s unsanitised write of this message raised
-        # UnicodeEncodeError instead of returning.
+        # main() sanitises this message before writing it; an unsanitised
+        # write to capsys' strict stderr would raise UnicodeEncodeError
+        # instead of returning.
         assert exit_code == 1
         captured = capsys.readouterr()
         assert "for-each-ref" in captured.err
 
 
 class TestSuccessReportToleratesNonUtf8BranchBytes:
-    """Regression: the success-path report line must not crash on write either.
+    """The success-path report line must not crash on write either.
 
-    The previous fix (see ``TestIsAncestorToleratesNonUtf8Bytes`` and
-    ``TestListGitTagsErrorMessageToleratesNonUtf8Bytes`` above) only
-    sanitised the single write inside ``main()``'s ``except GateInputError``
-    branch. The success path -- reached once validation *and* ancestry both
-    succeed -- interpolates the checked ``branch`` straight into a
-    "branch checked: ..." report line and writes it to ``sys.stdout``
-    completely unsanitised. An *existing* branch whose name contains raw
-    bytes that are not valid UTF-8 (accepted by git; confirmed by creating
-    one below) reaches that write with the undecodable bytes still embedded
-    as unpaired surrogates (PEP 383), and a strict stream raises
-    ``UnicodeEncodeError`` there -- not during validation, not during the
-    ancestry check, only while printing the result that both already
-    succeeded.
+    Besides the write inside ``main()``'s ``except GateInputError`` branch
+    (see ``TestIsAncestorToleratesNonUtf8Bytes`` and
+    ``TestListGitTagsErrorMessageToleratesNonUtf8Bytes`` above), the
+    success path -- reached once validation *and* ancestry both succeed --
+    interpolates the checked ``branch`` into a "branch checked: ..." report
+    line and writes it to ``sys.stdout``. An *existing* branch whose name
+    contains raw bytes that are not valid UTF-8 (accepted by git; the test
+    creates one below) can reach that write as text carrying unpaired
+    surrogates, and a strict stream raises
+    ``UnicodeEncodeError`` on such text unless it is sanitised first --
+    not during validation, not during the ancestry check, only while
+    printing the result that both already succeeded.
 
-    ``capsys`` reproduces the strict stream this needs: it installs a
-    strict-UTF-8 ``sys.stdout`` (confirmed by execution the same way
-    ``TestIsAncestorToleratesNonUtf8Bytes`` relies on it for ``sys.stderr``),
-    unlike CPython's own interactive ``sys.stdout``, which defaults to
-    ``"backslashreplace"`` and would swallow the defect silently. Without
-    ``capsys`` this test would pass even with the defect present -- for the
-    wrong reason, never exercising the write at all.
+    ``capsys`` provides the strict stream this needs: it installs a
+    strict-UTF-8 ``sys.stdout``, as ``TestIsAncestorToleratesNonUtf8Bytes``
+    relies on for ``sys.stderr``.
     """
 
     def test_an_existing_branch_with_non_utf8_bytes_prints_cleanly(
@@ -1102,31 +1066,27 @@ class TestSuccessReportToleratesNonUtf8BranchBytes:
 
         exit_code = gate_module.main(["--branch", branch])  # type: ignore[attr-defined]
 
-        # Before the fix, this line was never reached: the success-path
-        # write of "branch checked: <branch>" raised UnicodeEncodeError
-        # instead of returning.
+        # main() returns 0; an unsanitised success-path write of
+        # "branch checked: <branch>" would raise UnicodeEncodeError instead.
         assert exit_code == 0
         captured = capsys.readouterr()
         assert "branch checked" in captured.out
 
 
 class TestReportWriteToleratesTheActualStreamEncoding:
-    """Regression: the write helper's guarantee must hold for the stream's real encoding.
+    """A report write of a non-ASCII ref must not raise on a strict ASCII ``sys.stdout``.
 
     ``_safe_for_stream`` (the sanitiser every write in ``main()`` goes
-    through) used to re-encode with a hardcoded ``"utf-8"``, so its guarantee was
-    only ever "the result is UTF-8 encodable" -- not "safe to write to the
-    stream actually installed as ``sys.stdout``/``sys.stderr``". A perfectly
-    legitimate, valid-UTF-8 ref such as ``refs/heads/é`` is unaffected by
-    that sanitiser (nothing about it is unencodable as UTF-8), yet writing
-    it to a stream configured with a stricter encoding than UTF-8 -- ASCII,
-    say -- still raises ``UnicodeEncodeError``, because the sanitiser never
-    looks at what encoding the destination stream actually uses.
+    through) re-encodes against ``stream.encoding`` rather than a hardcoded
+    ``"utf-8"``. A sanitiser that only guaranteed "the result is UTF-8
+    encodable" would not guarantee "safe to write to the stream actually
+    installed as ``sys.stdout``/``sys.stderr``": a perfectly legitimate,
+    valid-UTF-8 ref such as ``refs/heads/é`` passes such a sanitiser
+    unchanged (nothing about it is unencodable as UTF-8), yet writing it to
+    a strict ASCII stream raises ``UnicodeEncodeError``.
 
-    ``capsys`` cannot reproduce this: it always installs a UTF-8 stream.
     This substitutes ``sys.stdout`` directly with a ``TextIOWrapper`` around
-    an in-memory buffer, configured with ``encoding="ascii", errors="strict"``
-    -- a stream that is strict, but in a way ``capsys`` never is.
+    an in-memory buffer, configured with ``encoding="ascii", errors="strict"``.
     """
 
     def test_a_legitimate_unicode_branch_prints_cleanly_on_a_strict_ascii_stream(
@@ -1145,11 +1105,10 @@ class TestReportWriteToleratesTheActualStreamEncoding:
         strict_ascii_stdout = io.TextIOWrapper(buffer, encoding="ascii", errors="strict")
         monkeypatch.setattr("sys.stdout", strict_ascii_stdout)
 
-        # Before the fix, this line was never reached: the success-path
-        # write of "branch checked: refs/heads/é" raised UnicodeEncodeError
-        # instead of returning, even though "é" is valid UTF-8 -- the
-        # sanitiser only ever guaranteed UTF-8 encodability, not safety
-        # against whatever encoding sys.stdout actually has.
+        # The success-path write of "branch checked: refs/heads/é" must not
+        # raise UnicodeEncodeError even though "é" is valid UTF-8: the
+        # sanitiser has to handle the ASCII sys.stdout installed above, not
+        # just UTF-8 encodability.
         exit_code = gate_module.main(["--branch", "refs/heads/é"])  # type: ignore[attr-defined]
 
         strict_ascii_stdout.flush()
@@ -1158,22 +1117,17 @@ class TestReportWriteToleratesTheActualStreamEncoding:
 
 
 class TestSafeForStreamDoesNotCoverAnUnregisteredCodecName:
-    """Pins the narrowed scope of ``_safe_for_stream``'s encoding-safety guarantee.
+    """Pins that ``_safe_for_stream`` raises ``LookupError`` for an unregistered codec name.
 
     A stream whose ``.encoding`` names a codec the codec registry does not
     recognise (``"x-no-such-codec"``) makes ``_safe_for_stream`` raise
-    ``LookupError`` rather than returning a sanitised string -- confirmed by
-    execution. This is deliberately *not* treated as a defect: no real
-    ``io.TextIOWrapper`` can ever report such a name, because its own
-    constructor performs the identical codec lookup and raises
-    ``LookupError`` immediately if the name is unregistered (see
-    :func:`_safe_for_stream`'s docstring). Only a duck-typed, non-real
-    stream can reach this path at all.
+    ``LookupError`` rather than returning a sanitised string. This is
+    deliberately *not* treated as a defect: an ``io.TextIOWrapper``
+    constructed with such a name raises ``LookupError`` in its own
+    constructor.
 
     This test exists so a future change that adds a silent fallback for
-    this case -- re-introducing the kind of overstated guarantee this
-    function's docstring already had to correct twice -- fails loudly here
-    instead of shipping unnoticed.
+    this case fails loudly here instead of shipping unnoticed.
     """
 
     def test_an_unregistered_codec_name_raises_lookuperror_rather_than_falling_back(
@@ -1189,23 +1143,21 @@ class TestSafeForStreamDoesNotCoverAnUnregisteredCodecName:
 
 
 class TestArgparseWritesGoThroughTheSanitisingChokePoint:
-    """Regression: argparse's own help/usage/error writes must not bypass ``_write``.
+    """argparse's own help/usage/error writes must not bypass ``_write``.
 
-    ``ArgumentParser.parse_args()`` can write directly to ``sys.stdout``
-    (``--help``) or ``sys.stderr`` (an unrecognised argument) without ever
-    calling :func:`_write` -- confirmed by execution before the fix:
-    instrumenting ``_write`` and calling ``main(["--help"])`` or
-    ``main(["--bogus"])`` recorded zero calls to it either way, even though
-    ``_write``'s own docstring promises every write ``main()`` makes goes
-    through it. The first test below pins that the choke point is actually
-    used. The second reproduces the concrete failure that gap caused: with
-    a strict-UTF-8 ``sys.stderr`` installed (the same technique
+    The base ``ArgumentParser`` writes directly to ``sys.stdout``
+    (``--help``) or ``sys.stderr`` (an unrecognised argument) without
+    calling :func:`_write`, while ``_write``'s own docstring promises every
+    write ``main()`` makes goes through it. ``main()`` therefore uses a
+    parser subclass that routes those writes through ``_write``. The first
+    test below pins that the choke point is actually used. The second pins
+    the concrete failure a bypass would cause: with a strict-UTF-8
+    ``sys.stderr`` installed (the same technique
     ``TestReportWriteToleratesTheActualStreamEncoding`` uses for
-    ``sys.stdout``), ``main(["bad-\\udcff"])`` used to raise
-    ``UnicodeEncodeError`` from argparse's own unsanitised
-    ``file.write(message)`` -- after printing only the usage line, never
-    reaching the "unrecognized arguments" message that would have named
-    the bad value.
+    ``sys.stdout``), the base parser raises ``UnicodeEncodeError`` from its
+    own unsanitised ``file.write(message)`` for ``main(["bad-\\udcff"])`` --
+    after printing only the usage line, never reaching the "unrecognized
+    arguments" message that names the bad value.
     """
 
     def test_help_output_is_routed_through_write(
@@ -1224,8 +1176,9 @@ class TestArgparseWritesGoThroughTheSanitisingChokePoint:
             gate_module.main(["--help"])  # type: ignore[attr-defined]
 
         assert exc_info.value.code == 0
-        # Before the fix, this list was empty -- argparse's print_help()
-        # wrote straight to sys.stdout without ever calling _write().
+        # The base ArgumentParser's print_help() writes straight to
+        # sys.stdout without calling _write(), which would leave this list
+        # empty.
         assert calls, "expected --help output to go through _write()"
         assert any("usage:" in call for call in calls)
 
@@ -1238,8 +1191,9 @@ class TestArgparseWritesGoThroughTheSanitisingChokePoint:
 
         # A positional argument (this parser defines none) containing an
         # unpaired surrogate -- the shape CPython hands back for an argv
-        # entry the OS could not decode as UTF-8 (PEP 383). Before the fix,
-        # this raised UnicodeEncodeError instead of exiting cleanly.
+        # entry the OS could not decode as UTF-8 (PEP 383). The base
+        # ArgumentParser would raise UnicodeEncodeError here instead of
+        # exiting cleanly.
         with pytest.raises(SystemExit) as exc_info:
             gate_module.main(["bad-\udcff"])  # type: ignore[attr-defined]
 
@@ -1253,15 +1207,12 @@ class TestArgparseWritesGoThroughTheSanitisingChokePoint:
 class TestAssertRefIsQualifiedAndExists:
     """Only a fully qualified ref path or a full object ID is accepted -- nothing else.
 
-    The previous guard (``assert_ref_is_unambiguous``) tried to enumerate
-    git's own name-resolution search order and reject a bare name only when
-    more than one candidate in that order existed. That enumeration produced
-    real, executed false greens -- a root pseudo-ref colliding with a
-    branch, and an abbreviated object ID colliding with a branch -- because
-    the candidate list was necessarily incomplete. This class pins the
-    replacement: bare names, 'HEAD',
-    abbreviated SHAs, and revision expressions are refused unconditionally,
-    regardless of what else they happen to collide with.
+    Git resolves a bare name through a search order across several ref
+    namespaces, and also as an abbreviated object ID, so a guard that
+    enumerated those candidates and refused a bare name only on a collision
+    would have to track that search order. This class pins the alternative:
+    bare names, 'HEAD', abbreviated SHAs, and revision expressions are
+    refused unconditionally.
     """
 
     def test_bare_name_is_refused(self, gate_module: object) -> None:
@@ -1292,14 +1243,11 @@ class TestAssertRefIsQualifiedAndExists:
     def test_revision_expression_on_a_qualified_ref_is_refused(
         self, monkeypatch: pytest.MonkeyPatch, gate_module: object, tmp_path: Path
     ) -> None:
-        """Reproduces the 'refs/heads/main^0' false green from the previous guard.
+        """A revision expression on a qualified ref path is refused.
 
         ``refs/heads/main^0`` starts with 'refs/', but names a ref plus a
-        suffix operation, not the ref itself -- the previous
-        ``_resolves_to_a_local_branch`` returned ``True`` for this and told
-        the caller to forward-merge into a revision expression, which is
-        not an action anyone can take. Refusing it here removes that dead
-        end entirely.
+        suffix operation, not the ref itself, so it must not be accepted as
+        a qualified ref path.
         """
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -1388,14 +1336,13 @@ class TestAssertRefIsQualifiedAndExists:
     def test_root_pseudo_ref_colliding_with_a_branch_is_refused(
         self, monkeypatch: pytest.MonkeyPatch, gate_module: object, tmp_path: Path
     ) -> None:
-        """Reproduces the 'FOO' false green: a root pseudo-ref shadowing a branch.
+        """A root pseudo-ref that collides with a branch is refused.
 
-        The previous guard's pseudo-ref allowlist was necessarily incomplete
-        -- git tries ``$GIT_DIR/<name>`` for any name, not just the handful
-        that guard hardcoded. Here 'FOO' is a root pseudo-ref pointing at
-        the tagged commit while 'refs/heads/FOO' points at an earlier one;
-        git itself warns this is ambiguous. Under the new design there is no
-        list to be incomplete: 'FOO' is a bare name and is refused outright,
+        Git tries ``$GIT_DIR/<name>`` for any name, not just a handful of
+        well-known ones. Here 'FOO' is a root pseudo-ref pointing at the
+        tagged commit while 'refs/heads/FOO' points at an earlier one; git
+        itself warns this is ambiguous. There is no list of candidates to
+        be incomplete: 'FOO' is a bare name and is refused outright,
         independent of what it collides with.
         """
         repo = tmp_path / "repo"
@@ -1427,13 +1374,11 @@ class TestAssertRefIsQualifiedAndExists:
     def test_abbreviated_object_id_colliding_with_a_branch_is_refused(
         self, monkeypatch: pytest.MonkeyPatch, gate_module: object, tmp_path: Path
     ) -> None:
-        """Reproduces the abbreviated-SHA false green: an abbreviation that also names a branch.
+        """An abbreviated commit ID that also names a branch is refused.
 
-        The previous guard never considered object-ID candidates at all, so
-        an abbreviated commit ID that also happened to name a branch slipped
-        through unresolved and unrejected. Under the new design an
-        abbreviation is neither a full object ID nor a qualified ref path,
-        so it is refused outright, independent of what it collides with.
+        An abbreviation is neither a full object ID nor a qualified ref
+        path, so it is refused outright, independent of what it collides
+        with.
         """
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -1513,12 +1458,12 @@ class TestAssertRefIsQualifiedAndExists:
     ) -> None:
         """``refs/remotes/origin/main`` is accepted unconditionally and resolves to itself.
 
-        This shape is pinned elsewhere only inside ``TestFailabilityOnRealHistory``,
-        which skips on a shallow checkout -- exactly the condition the
-        mutation criterion simulates. Built on a disposable repository so it
-        runs unconditionally instead. A local branch named ``main`` exists
-        at a different commit to prove this resolves the remote-tracking
-        ref itself, not the local branch of the same bare name.
+        This shape is also exercised inside ``TestFailabilityOnRealHistory``,
+        which is skipped when the required history is absent from the
+        checkout. This test is built on a disposable repository so it runs
+        unconditionally. A local branch named ``main`` exists at a different
+        commit to prove this resolves the remote-tracking ref itself, not
+        the local branch of the same bare name.
         """
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -1558,16 +1503,16 @@ class TestAssertRefIsQualifiedAndExists:
 @REQUIRES_ORIGIN_MAIN
 @REQUIRES_PRE_FORWARD_MERGE_COMMIT
 class TestFailabilityOnRealHistory:
-    """The acceptance bar this check exists to meet: seen both green and red.
+    """The check run against this repository's real history.
 
-    Green: v0.6.0 is the newest published tag, and origin/main -- the real,
-    current state of the stable mirror -- contains it today.
+    Green: ``origin/main`` contains the newest version tag, so the gate
+    passes.
 
     Red: the merge commit that forward-merged v0.6.0 into main is
     8c044e2 ("Merge pull request #49 from
     sovantica/chore/forward-merge-the-0-6-0-release"); its first parent,
-    pinned above as PRE_FORWARD_MERGE_COMMIT, is main's real state right
-    after v0.6.0 published to PyPI and before that forward merge landed.
+    pinned above as PRE_FORWARD_MERGE_COMMIT, is the state of main just
+    before that forward merge landed, and does not contain v0.6.0.
     Checking the tool against that exact commit is not a synthetic
     scenario -- it is the window this check exists to close, captured as
     real history.

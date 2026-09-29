@@ -14,18 +14,9 @@ the release history intact: non-conventional subjects, scopes absent from
 none of it visible from the merge commit's own message, which looks like
 routine housekeeping (``Merge branch 'fix/x' into release/v0.7.0``).
 
-This is exactly what happened on this repository's own ``release/v0.7.0``
-branch: one such merge went unnoticed long enough that four more landed the
-same way, then a second wave of eleven, then a `Merge branch 'X' into
-release/v0.7.0` merge from a bunch of feature branches (13 more) that were
-themselves each merged the same way into a staging branch first, then that
-staging branch fast-forwarded a release branch. A rebuild that squashed the
-history back down was undone within days by the same mistake repeating at a
-larger scale, because nothing had made the mistake visible at the moment it
-happened. This script is that visibility: run before merging anything into
-a release branch, and again before merging that branch into ``dev``, it
-turns "did I remember to squash" from a fact nobody checks into a fact this
-records.
+This script makes that visible: run before merging anything into a release
+branch, and again before merging that branch into ``dev``, it reports
+whether ``base..branch`` contains a merge commit.
 
 What a PASS from this script establishes, and only this: no merge commit
 (a commit with two or more parents) exists in ``base..branch``. It does not
@@ -63,14 +54,10 @@ if TYPE_CHECKING:
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# A control character, never a legal byte inside a commit subject (git
-# itself refuses a NUL there), used to split the hash from the subject on
-# one line without a subject that happens to contain a literal space
-# breaking the split -- confirmed by execution against a subject reading
-# "into release/v0.7.0: fast-forward -> nothing", which a plain
-# str.split(" ", 1) still handles correctly, but which made the choice of
-# separator worth pinning down rather than assuming a single space is safe
-# for every subject this repository's contributors have ever written.
+# A control character used to split the hash from the subject on one line.
+# The hash is hexadecimal, so the first separator on a line always follows
+# it, and str.partition() keeps a subject that contains spaces (or this
+# character itself) whole.
 _FIELD_SEP = "\x1f"
 
 EXIT_OK = 0

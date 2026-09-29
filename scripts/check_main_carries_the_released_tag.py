@@ -92,39 +92,36 @@ def list_git_tags() -> list[str]:
     Tags whose names do not start with ``v`` are not returned.
 
     This shells out to ``git for-each-ref``, a plumbing command, rather than
-    ``git tag -l``, a porcelain one -- confirmed by execution, not by
-    reading the manual. ``git tag -l`` formats its output for a human
-    reader and honours display configuration that has nothing to do with
-    what tags exist: with ``column.tag=always`` set and a narrow terminal
-    width, ``git tag -l 'v*'`` packs multiple tag names onto one line
-    (e.g. ``"v1.0.0  v4.0.0"``), which does not match ``TAG_RE`` and is
-    silently dropped by :func:`newest_version_tag` -- so a newer, unreachable
-    tag can vanish from the candidate list entirely while an older,
-    reachable one is reported as the newest, and the gate passes when it
-    should not. ``--no-column`` closes that one report; it was rejected in
-    favour of ``for-each-ref`` because column formatting is a property of
-    porcelain commands in general, not a single flag on this one, and
-    enumerating porcelain behaviour instead of avoiding it keeps being
-    incomplete (see :func:`assert_ref_is_qualified_and_exists`). Executed
-    checks against git 2.51.0: ``for-each-ref`` output is identical with and
-    without ``column.tag=always``/``column.ui=always`` at ``COLUMNS=20``;
+    ``git tag -l``, a porcelain one. ``git tag -l`` formats its output for a
+    human reader and honours display configuration that has nothing to do
+    with what tags exist: with ``column.tag=always`` set and a narrow
+    terminal width, ``git tag -l 'v*'`` packs multiple tag names onto one
+    line (e.g. ``"v1.0.0  v4.0.0"``), which does not match ``TAG_RE`` and
+    would be silently dropped by :func:`newest_version_tag` -- so a newer,
+    unreachable tag could vanish from the candidate list entirely while an
+    older, reachable one is reported as the newest, and the gate would pass
+    when it should not. ``--no-column`` would close only that case: column
+    formatting is a property of porcelain commands in general, not a single
+    flag on this one, and avoiding the porcelain command is more reliable
+    than enumerating its behaviour (see
+    :func:`assert_ref_is_qualified_and_exists`). With git 2.51.0,
+    ``for-each-ref`` output is identical with and without
+    ``column.tag=always``/``column.ui=always`` at ``COLUMNS=20``;
     ``tag.sort`` only changes ordering, which this function does not rely
-    on (:func:`newest_version_tag` computes the maximum itself); forcing
-    ``pager.for-each-ref=true`` with ``core.pager=cat`` does not alter the
-    bytes received by this subprocess either way, for ``for-each-ref`` or
-    for ``tag -l``, because ``capture_output`` never attaches a pty for the
-    pager to detect. The resulting tag set is *not* always identical to
-    ``git tag -l 'v*'``'s, though -- confirmed by execution, in a repository
-    with the tags ``v1.0.0``, ``v2.0.0``, ``v3/nested``, and
+    on (:func:`newest_version_tag` computes the maximum itself); and a
+    configured pager does not alter the bytes this subprocess receives,
+    because ``capture_output`` gives git no terminal to page to.
+
+    The resulting tag set is *not* always identical to ``git tag -l 'v*'``'s:
+    in a repository with the tags ``v1.0.0``, ``v2.0.0``, ``v3/nested``, and
     ``vprefix/refs/tags/v999.0.0``, ``git tag -l 'v*'`` lists all four, but
     this call lists only ``v1.0.0`` and ``v2.0.0``. The two hierarchical
     names are excluded here because for-each-ref's pattern matches whole
     path components: its ``*`` does not cross a ``/`` boundary, so
     ``refs/tags/v*`` cannot match ``refs/tags/v3/nested`` or
-    ``refs/tags/vprefix/refs/tags/v999.0.0`` -- querying
-    ``refs/tags/v*/*`` instead does match ``v3/nested`` (also confirmed by
-    execution), showing that the missing ``/``-crossing, not
-    ``%(refname:lstrip=2)``'s formatting, is what excludes them.
+    ``refs/tags/vprefix/refs/tags/v999.0.0``, whereas ``refs/tags/v*/*``
+    does match ``v3/nested``. It is the missing ``/``-crossing, not
+    ``%(refname:lstrip=2)``'s formatting, that excludes them.
     ``git tag -l``'s glob has no such restriction and matches ``v*`` against
     the bare tag name directly, letting ``*`` cross ``/`` freely.
 
@@ -147,19 +144,18 @@ def list_git_tags() -> list[str]:
         msg = f"'git for-each-ref' failed: {stderr.strip()}"
         raise GateInputError(msg)
     # Decoded with 'surrogateescape' rather than the strict default: git
-    # accepts tag names containing raw bytes that are not valid UTF-8
-    # (confirmed by creating one), and a strict decode would raise
+    # accepts tag names containing raw bytes that are not valid UTF-8,
+    # and a strict decode would raise
     # UnicodeDecodeError before such a name ever reaches parse_tag_version,
     # crashing this script instead of the clean exit-1 diagnostic the
-    # module promises for a bad input. 'surrogateescape' preserves every
-    # byte losslessly as an unpaired surrogate, so a non-UTF-8 tag name
-    # simply fails to match TAG_RE below like any other non-canonical name
-    # -- it is never selected, and it never crashes the process.
+    # module promises for a bad input. With 'surrogateescape' a non-UTF-8
+    # tag name reaches TAG_RE below, fails to match it like any other
+    # non-canonical name, and is excluded.
     #
     # str.splitlines() is deliberately not used here either: it breaks on
     # more than "\n" -- it also treats U+0085 NEL and U+2028 LINE SEPARATOR
     # (among others) as line boundaries, and git accepts both inside a tag
-    # name (confirmed by creating one): a tag such as "v1<NEL>2.0.0" would
+    # name: a tag such as "v1<NEL>2.0.0" would
     # come back from splitlines() as the two bogus entries "v1" and "2.0.0"
     # instead of the one real tag name git reported. Splitting on a literal
     # "\n" -- the only separator this subprocess's output actually uses --
@@ -186,15 +182,11 @@ def parse_tag_version(tag: str) -> tuple[int, int, int] | None:
     name that differs from a canonical tag only by leading or trailing
     whitespace is a different tag and must not be silently treated as the
     one it merely resembles. This matters because ``git check-ref-format``
-    only rejects *ASCII* space and control characters in a ref name (verified
-    by shelling out to it directly) -- it accepts other Unicode whitespace,
-    such as U+00A0 NO-BREAK SPACE, so ``git tag v13.0.0<NBSP>`` succeeds and
-    creates a tag distinct from ``v13.0.0``. ``str.strip()`` removes that
-    same Unicode whitespace, which previously made the two indistinguishable
-    here. A tag our own release tooling creates is always exactly
-    ``vMAJOR.MINOR.PATCH`` with no surrounding characters of any kind, so
-    nothing legitimate depends on stripping -- only a look-alike tag someone
-    else could create would have benefited from it.
+    rejects *ASCII* space and control characters in a ref name but accepts
+    other Unicode whitespace, such as U+00A0 NO-BREAK SPACE, so
+    ``git tag v13.0.0<NBSP>`` succeeds and creates a tag distinct from
+    ``v13.0.0``. ``str.strip()`` removes that same Unicode whitespace, so
+    stripping here would make the two indistinguishable.
     """
     match = TAG_RE.match(tag)
     if match is None:
@@ -274,16 +266,11 @@ def _is_well_formed_ref_path(ref: str) -> bool:
     if not ref.startswith("refs/"):
         return False
     # No 'text=True': only the exit code is consulted below, but 'text=True'
-    # would still make subprocess decode both streams as strict UTF-8 before
-    # this function ever saw them. git accepts ref paths containing raw bytes
-    # that are not valid UTF-8 (confirmed by creating one in the test suite),
-    # '--normalize' echoes the (possibly byte-laden) path back to stdout on
-    # success, and neither stream is suppressed the way '--quiet' suppresses
-    # it on the other call sites in this module -- so a caller-supplied
-    # 'ref' with such bytes previously crashed here with UnicodeDecodeError
-    # before reaching the clean exit-1 diagnostic this module promises.
-    # Capturing raw bytes and never decoding them removes the crash without
-    # needing a decode this function has no use for.
+    # would still make subprocess decode both streams before this function
+    # ever saw them. git accepts ref paths containing raw bytes that are not
+    # valid UTF-8, and '--normalize' echoes the (possibly byte-laden) path
+    # back to stdout on success. Capturing raw bytes and never decoding them
+    # avoids a decode this function has no use for.
     completed = subprocess.run(  # noqa: S603 -- trusted internal git invocation
         ["git", "check-ref-format", "--normalize", ref],  # noqa: S607
         cwd=REPO_ROOT,
@@ -303,10 +290,8 @@ def assert_ref_is_qualified_and_exists(ref: str) -> None:
     SHA, or a revision expression (``main^0``) -- is refused outright. Git
     resolves those other shapes by trying a search order over whatever else
     happens to exist in the repository, and that search can silently pick
-    something other than what the caller meant; enumerating that search
-    order here was tried twice before and both attempts missed real cases,
-    which is why this guard no longer tries to reproduce it at all (see the
-    module docstring for that history).
+    something other than what the caller meant, which is why this guard
+    refuses those shapes instead of trying to reproduce that search order.
 
     A well-formed ref that does not exist is also rejected here, with a
     message naming it, rather than surfacing as a failure further down the
@@ -337,11 +322,10 @@ def is_ancestor(ancestor_ref: str, descendant_ref: str) -> bool:
     (as opposed to resolving but simply not being an ancestor).
     """
     # No 'text=True': git accepts ref names containing raw bytes that are
-    # not valid UTF-8 (confirmed by creating one in the test suite), and a
-    # descendant_ref built from such a name previously crashed this call
-    # with UnicodeDecodeError -- inside subprocess.communicate(), before
-    # either branch below ever ran -- instead of the clean exit-1
-    # diagnostic this module promises for a bad input.
+    # not valid UTF-8, and git's error text can echo such a name back (for a
+    # ref that resolves to a blob, for example). Capturing raw bytes and
+    # decoding the error text explicitly below keeps that text out of
+    # subprocess's own decode.
     completed = subprocess.run(  # noqa: S603 -- trusted internal git invocation
         ["git", "merge-base", "--is-ancestor", ancestor_ref, descendant_ref],  # noqa: S607
         cwd=REPO_ROOT,
@@ -351,8 +335,8 @@ def is_ancestor(ancestor_ref: str, descendant_ref: str) -> bool:
     if completed.returncode in (0, 1):
         return completed.returncode == 0
     # Decoded with 'surrogateescape', the same convention list_git_tags()
-    # uses and for the same reason: it preserves every byte losslessly
-    # instead of raising here. The result can still contain an unpaired
+    # uses and for the same reason: an undecodable byte does not raise
+    # here. The result can still contain an unpaired
     # surrogate that cannot be encoded back to UTF-8 -- that is handled once,
     # centrally, at the point this message is actually written (see
     # main()), not here.
@@ -386,15 +370,12 @@ def _resolves_to_a_local_branch(ref: str) -> bool:
     one, and judges the prefix on the resolved target instead.
 
     No ``text=True``: git accepts a symbolic ref whose *target* contains raw
-    bytes that are not valid UTF-8 (confirmed by creating one in the test
-    suite) -- a branch name is not required to be UTF-8, only well-formed by
+    bytes that are not valid UTF-8 -- a branch name is not required to be
+    UTF-8, only well-formed by
     ``git check-ref-format``'s rules, and a target built from such a name
     reaches here unchanged. ``git symbolic-ref --quiet`` succeeds and echoes
-    that target on stdout; ``text=True`` decodes it eagerly as strict UTF-8
-    before this function ever inspects it, raising ``UnicodeDecodeError``
-    inside ``subprocess.communicate()`` -- outside :class:`GateInputError`,
-    so it would escape ``main()`` as a bare traceback instead of the clean
-    exit-1 diagnostic this module promises. Comparing the raw prefix bytes
+    that target on stdout; ``text=True`` decodes it eagerly before this
+    function ever inspects it. Comparing the raw prefix bytes
     directly avoids the decode entirely: this function only ever needs to
     know whether the target starts with ``refs/heads/``, a question raw
     bytes answer exactly as well as text does.
@@ -422,16 +403,16 @@ def run_gate(*, branch: str) -> tuple[bool, list[str]]:
     assert_ref_is_qualified_and_exists(branch)
     tags = list_git_tags()
     tag = newest_version_tag(tags)
-    # ``tag`` is a bare name from 'git tag -l' (e.g. "v12.0.0"), not a
-    # qualified ref path. Passing it to is_ancestor() as-is would let git
-    # resolve it through its usual bare-name search order -- exactly the
-    # ambiguity assert_ref_is_qualified_and_exists() above exists to close
-    # for 'branch', but that guard was never applied to the tag side. A
-    # same-named ref elsewhere in the search order (e.g. a top-level
-    # 'refs/<tag>' or a branch) would then be resolved instead of the real
-    # tag, silently. Qualifying it as 'refs/tags/<tag>' removes that
-    # ambiguity the same way 'branch' is already required to be qualified.
-    # The bare 'tag' is still what gets printed to the reader below.
+    # ``tag`` is a bare name as returned by list_git_tags() (e.g.
+    # "v12.0.0"), not a qualified ref path. Passing it to is_ancestor()
+    # as-is would let git resolve it through its usual bare-name search
+    # order -- exactly the ambiguity assert_ref_is_qualified_and_exists()
+    # above closes for 'branch'. A same-named ref that comes earlier in
+    # that search order (e.g. a top-level 'refs/<tag>') would then be
+    # resolved instead of the real tag, silently. Qualifying it as
+    # 'refs/tags/<tag>' removes that ambiguity the same way 'branch' is
+    # required to be qualified. The bare 'tag' is still what gets printed
+    # to the reader below.
     contains_tag = is_ancestor(f"refs/tags/{tag}", branch)
 
     messages = [
@@ -451,7 +432,7 @@ def run_gate(*, branch: str) -> tuple[bool, list[str]]:
 
 
 def _safe_for_stream(text: str, stream: TextIO) -> str:
-    r"""Return ``text`` re-encoded so writing it to ``stream`` cannot raise ``UnicodeEncodeError``.
+    r"""Round-trip ``text`` through ``stream.encoding`` using ``errors="backslashreplace"``.
 
     ``text`` can carry an unpaired surrogate -- either from git's own error
     text, decoded with ``errors="surrogateescape"`` in :func:`list_git_tags`
@@ -467,50 +448,15 @@ def _safe_for_stream(text: str, stream: TextIO) -> str:
     whatever ``stream`` is actually configured with, if that is stricter
     than UTF-8 (ASCII, for instance).
 
-    An earlier version of this function hardcoded ``"utf-8"`` rather than
-    consulting ``stream``, so its only real guarantee was "UTF-8 encodable"
-    -- which a strict ASCII ``sys.stdout`` (or any stream whose encoding is
-    not UTF-8) can still reject even after that sanitising, as confirmed by
-    execution: ``refs/heads/é`` reached a strict-ASCII stream unchanged and
-    raised ``UnicodeEncodeError`` there, despite this function's docstring
-    at the time claiming it made "a write to sys.stderr" safe outright.
-    Reading ``stream.encoding`` and re-encoding *against that* instead makes
-    the guarantee real rather than merely narrowing what it claims: whatever
-    ``stream`` turns out to be configured with, the text handed to
-    ``stream.write`` is already representable in that same encoding, so the
-    write itself cannot raise on encoding grounds. A stream that reports no
-    ``encoding`` attribute (not a real ``TextIOWrapper``) falls back to
-    ``"utf-8"``, the previous behaviour, rather than failing outright.
+    The text is therefore encoded against ``stream.encoding`` rather than a
+    fixed ``"utf-8"``. A stream that reports no ``encoding`` attribute falls
+    back to ``"utf-8"``. An ``encoding`` that names a codec the codec
+    registry does not recognise makes ``text.encode`` below raise
+    ``LookupError``.
 
-    That guarantee assumes ``stream.encoding``, when set, names a codec
-    Python's codec registry actually has -- true of every real
-    ``io.TextIOWrapper`` (including ``sys.stdout``/``sys.stderr`` as CPython
-    constructs them), because ``TextIOWrapper.__init__`` performs the same
-    codec lookup itself and raises ``LookupError`` immediately, before the
-    stream can exist at all, if the name is not registered (confirmed by
-    execution: ``io.TextIOWrapper(io.BytesIO(), encoding="x-no-such-codec")``
-    raises ``LookupError`` at construction, never at write time). This
-    function does *not* cover the case this rules out for every real stream:
-    a duck-typed object whose ``.encoding`` attribute names something the
-    codec registry does not recognise reaches ``text.encode(encoding, ...)``
-    below and raises ``LookupError`` there instead of returning safely --
-    confirmed by execution against exactly such a fake. That is a narrower
-    promise than "safe for any object with an ``.encoding`` attribute", and
-    deliberately so: guarding against a codec name no real ``TextIOWrapper``
-    can ever report would mean choosing a silent fallback for a fabricated
-    input, which is how the previous, hardcoded-``"utf-8"`` version of this
-    function came to overstate its own guarantee in the first place.
-
-    ``"backslashreplace"`` is used for both the encode and the decode: on
-    encode, it turns each character ``stream``'s encoding cannot represent
-    (an unpaired surrogate, or a code point outside a narrower charset like
-    ASCII) into a literal ``\\xHH``/``\\uHHHH``-style escape made of plain
-    ASCII bytes -- always representable in any of these encodings, so the
-    decode back to ``str`` cannot fail either. The cost is fidelity, not
-    safety: the exact original character is no longer reproduced, only its
-    escaped spelling -- acceptable here because this string exists to be
-    read by a human deciding whether a ``--branch`` value was well-formed,
-    not to be parsed back into the original text.
+    Both the encode and the decode pass ``errors="backslashreplace"``. The
+    result is meant to be read by a human deciding whether a ``--branch``
+    value was well-formed, not to be parsed back into the original text.
     """
     encoding = getattr(stream, "encoding", None) or "utf-8"
     raw = text.encode(encoding, errors="backslashreplace")
@@ -522,15 +468,13 @@ def _write(stream: TextIO, text: str) -> None:
 
     Every write ``main()`` makes -- on both the success path and the error
     path -- goes through this single function rather than calling
-    ``stream.write`` directly, so each one is made safe for the stream's
-    encoding (see :func:`_safe_for_stream`). That includes the success-path
+    ``stream.write`` directly, so each one is passed through
+    :func:`_safe_for_stream`. That includes the success-path
     report, which interpolates the checked ``branch`` verbatim into a
     "branch checked: ..." line: an existing branch whose name is not valid
     UTF-8 passes validation and the ancestry check, and its name reaches
     that line. Sanitising at the one point every write goes through, rather
-    than at each interpolation site, covers a write added later without its
-    author having to know which values can carry an unpaired surrogate or
-    what encoding the stream has.
+    than at each interpolation site, keeps that handling in one place.
     """
     stream.write(_safe_for_stream(text, stream) + "\n")
 
@@ -538,20 +482,16 @@ def _write(stream: TextIO, text: str) -> None:
 class _SanitizingArgumentParser(argparse.ArgumentParser):
     r"""``ArgumentParser`` whose help/usage/error writes go through this module's one choke point.
 
-    ``ArgumentParser.parse_args()`` can write directly to ``sys.stdout``
+    The base ``argparse.ArgumentParser`` writes directly to ``sys.stdout``
     (``--help``) or ``sys.stderr`` (an unrecognised option, a missing
-    argument value) without ever calling :func:`_write` -- confirmed by
-    execution: instrumenting ``_write`` and calling ``main(["--help"])`` or
-    ``main(["--bogus"])`` against the base ``argparse.ArgumentParser``
-    recorded zero calls to it. ``_write``'s own docstring promises that
-    *every* write ``main()`` makes goes through this one sanitising choke
-    point; before this subclass, argparse's own writes were the gap that
-    made that promise false. The practical cost is real, not merely
-    inconsistent: with a strict-UTF-8 ``sys.stderr`` installed,
-    ``main(["bad-\\udcff"])`` used to raise ``UnicodeEncodeError`` -- from
-    argparse's own unsanitised ``file.write(message)`` -- after printing
-    only the usage line, instead of the clean exit-2 diagnostic naming the
-    bad argument.
+    argument value) without calling :func:`_write`. ``_write``'s own
+    docstring promises that *every* write ``main()`` makes goes through this
+    one sanitising choke point, so this subclass routes argparse's writes
+    through it as well. Without that, with a strict-UTF-8 ``sys.stderr``
+    installed, ``main(["bad-\\udcff"])`` would raise ``UnicodeEncodeError``
+    -- from argparse's own unsanitised ``file.write(message)`` -- after
+    printing only the usage line, instead of the clean exit-2 diagnostic
+    naming the bad argument.
 
     Both writing paths already funnel through one base-class method,
     ``_print_message(message, file)`` -- a bare ``file.write(message)`` with
@@ -573,7 +513,7 @@ class _SanitizingArgumentParser(argparse.ArgumentParser):
         stream = cast("TextIO", file) if file is not None else sys.stdout
         # argparse's own messages already end with their own trailing
         # newline; _write() appends one more, so strip exactly one here to
-        # avoid a doubled blank line relative to the pre-fix output.
+        # avoid a doubled blank line.
         _write(stream, message.removesuffix("\n"))
 
 

@@ -83,37 +83,26 @@ RELEASE_TARGET_PATH = REPO_ROOT / "release-target.json"
 # stops a malformed spelling ("01") from parsing to the same value as its
 # canonical form ("1") and silently standing in for it in the comparison
 # below. See scripts/check_main_carries_the_released_tag.py's TAG_RE, which
-# this mirrors -- that module's docstring has the fuller history of both
-# pitfalls being found by execution, not by inspection.
+# this mirrors.
 #
 # The pattern ends in '\Z', not '$': without 're.MULTILINE', '$' matches at
-# the end of the string *or* just before a trailing newline, so
-# "0.7.0\n" satisfied "^...$" up to the position before the newline and
-# was reported as equal to the clean "0.7.0" -- confirmed by execution:
-# 'run_gate(computed_version="0.7.0\n", declared_target="0.7.0")' passed
-# before this pattern used '\Z'. '\Z' matches only the true end of the
-# string, closing that case regardless of which method the call site uses.
+# the end of the string *or* just before a trailing newline, so a
+# '$'-anchored pattern used with match() accepts "0.7.0\n" as though it were
+# the clean "0.7.0". '\Z' matches only the true end of the string, closing
+# that case regardless of which method the call site uses.
 #
 # Each numeric component is additionally bounded to 18 digits ('[0-9]{0,17}'
 # after the leading digit), not left as '[0-9]*'. The bound sits comfortably
 # above anything this pipeline can produce: the computed version comes from
 # semantic-release, whose semver implementation caps a component at
 # JavaScript's MAX_SAFE_INTEGER -- 16 digits -- so nothing it can emit is
-# rejected here. (An earlier version of this comment justified the bound by
-# saying 18 digits exceeds a 64-bit integer's range. It does not: the largest
-# 18-digit number is about 1.0e18 and a signed 64-bit integer reaches roughly
-# 9.2e18. The bound is fine; that reason for it was wrong.) It exists to stop a
-# component with thousands of digits from ever reaching parse_version()'s
-# int() call below, which raises a bare ValueError once a component exceeds
-# Python's own int-string conversion ceiling (4300 digits by default,
-# CPython's 'sys.get_int_max_str_digits()') -- confirmed by execution: a
-# 5,000-digit component matched the previous, unbounded pattern and then
-# raised an uncaught ValueError out of int(), rather than the clean
-# GateInputError every other malformed version gets here. The bound reduces
-# how often that path is taken; it does not replace the boundary in
-# read_declared_target() below, which still converts a ValueError from
-# int() -- reachable if this limit is ever raised or lowered independently
-# of this pattern -- into the same clean diagnostic as everything else.
+# rejected here. It exists to stop a component with thousands of digits from
+# ever reaching parse_version()'s int() call below, which raises a bare
+# ValueError once a component exceeds Python's own int-string conversion
+# ceiling (4300 digits by default, CPython's 'sys.get_int_max_str_digits()'):
+# with an unbounded '[0-9]*', a 5,000-digit component would match, and int()
+# would raise ValueError at the default ceiling, rather than the
+# GateInputError every other malformed version gets here.
 _NUMERIC_COMPONENT = r"(?:0|[1-9][0-9]{0,17})"
 VERSION_RE = re.compile(
     rf"^({_NUMERIC_COMPONENT})\.({_NUMERIC_COMPONENT})\.({_NUMERIC_COMPONENT})\Z"
@@ -149,21 +138,21 @@ def _assert_is_a_regular_declaration_file(path: Path) -> None:
     below, and that call already turns a missing file into a clean
     ``"could not read {path}: ..."`` :class:`GateInputError` on its own --
     this script's docstring makes no claim, unlike the sibling gate's, that
-    there is no legitimate history where the file is briefly absent, so
-    there is nothing to add for that case. ``lstat()``, not ``stat()``: the
-    latter follows a symlink and reports on whatever it points at, which is
-    exactly the fact this check needs to see through, not past -- confirmed
-    by execution: pointing ``release-target.json`` at an unrelated,
-    well-formed ``release-target.json`` elsewhere on the filesystem made
-    this gate exit 0, reporting PASS against ambient JSON this checkout
-    never declared, before this check existed.
+    a checkout without the file is not a legitimate state, so there is
+    nothing to add for that case. ``lstat()``, not ``stat()``: the
+    latter follows a symlink and reports on whatever it points at, so it
+    could not tell that ``path`` is a link. Without this check,
+    ``read_text()`` would follow the link and the gate could report PASS
+    against a well-formed ``release-target.json`` elsewhere on the
+    filesystem that this checkout never declared.
     """
     try:
         file_stat = path.lstat()
     except OSError:
         # Missing (or otherwise unstattable, e.g. an unreadable parent
         # directory) -- read_text() below raises its own OSError for this,
-        # with the message this script has always given for it.
+        # and read_declared_target() reports it as a "could not read"
+        # GateInputError.
         return
 
     if stat.S_ISLNK(file_stat.st_mode):
@@ -189,14 +178,10 @@ def parse_version(version: str) -> tuple[int, int, int]:
     canonical version only by leading or trailing whitespace is not that
     version and must not be silently treated as though it were.
 
-    ``fullmatch()``, not ``match()``: changing ``VERSION_RE`` to end in
-    ``'\\Z'`` already closes the specific trailing-newline case this method
-    used to let through (see the pattern's own comment), but ``match()``
-    never required the pattern to consume the whole string to begin with,
-    only to match starting at position 0 -- a future change widening this
-    pattern could reopen the same class of bug under ``match()`` without
-    touching the anchor at all. ``fullmatch()`` fails closed regardless of
-    how the pattern itself is written.
+    ``fullmatch()``, not ``match()``: ``fullmatch()`` requires the pattern to
+    consume the whole string, while ``match()`` only requires a match
+    starting at position 0. ``VERSION_RE`` also ends in ``'\Z'``, which
+    rejects a trailing newline (see the pattern's own comment).
     """
     match = VERSION_RE.fullmatch(version)
     if match is None:
@@ -229,19 +214,13 @@ def read_declared_target(path: Path | None = None) -> str:
     converted to the same clean, fail-closed diagnostic, naming this file and
     the exception that hit it.
 
-    This replaces what used to be a short, hand-picked list of anticipated
-    exception types on this path (``OSError`` and ``MemoryError`` around
-    ``read_text()``, ``json.JSONDecodeError`` and a second ``MemoryError``
-    around ``json.loads()``): each entry closed one specific, previously
-    found gap and left every other kind of unreadable or malformed file to
-    escape as a bare traceback -- confirmed by execution against a file
-    containing invalid UTF-8 (``UnicodeDecodeError`` out of ``read_text()``),
-    a 10,000-level nested JSON document (``RecursionError`` out of
-    ``json.loads()``), and a version component of 5,000 digits (``ValueError``
-    out of ``int()`` inside :func:`parse_version`) -- none of which is any of
-    the four types the old list named. A single boundary around the whole
-    path has no fifth type to miss, because it does not enumerate types at
-    all.
+    The trailing ``except Exception`` is deliberately a single boundary
+    rather than a list of anticipated exception types, so that an exception
+    nobody anticipated cannot escape as a bare traceback. Reading and parsing
+    can raise well beyond ``OSError`` and ``json.JSONDecodeError``:
+    ``UnicodeDecodeError`` out of ``read_text()`` for a file whose bytes are
+    not valid in the locale's text encoding, and ``RecursionError`` out of
+    ``json.loads()`` for a deeply nested JSON document.
     """
     if path is None:
         path = RELEASE_TARGET_PATH

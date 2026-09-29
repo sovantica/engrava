@@ -67,11 +67,7 @@ LONGMEMEVAL_RECALL_AT_5_FLOOR: float | None = 0.30
 # Questions that the upstream LongMemEval oracle variant ships with text
 # that the engrava-core FTS5 query normaliser cannot serialise into a
 # valid ``MATCH`` expression. The harness crashes mid-sweep when it
-# reaches one of them, so the probe filters them out by id. Each entry
-# corresponds to a tracked follow-up against the FTS normaliser; the set
-# shrinks to empty once the normaliser handles single-quoted phrases
-# plus a bare ``Not`` token in the same query without producing invalid
-# FTS5 syntax.
+# reaches one of them, so the probe filters them out by id.
 LONGMEMEVAL_EXCLUDED_QUESTION_IDS: frozenset[str] = frozenset(
     {
         "352ab8bd",

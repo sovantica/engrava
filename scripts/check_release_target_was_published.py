@@ -38,19 +38,12 @@ advances ``release-target.json`` to the next target would otherwise fail this
 gate for a version that was never meant to ship again.
 
 If ``release-target.json`` itself does not exist, this script fails rather
-than passing. A prior revision treated an absent file as a clean pass,
-reasoning that a repository -- or an older commit in this one's own
-history -- that declares no target at all has made no promise this gate
-can check. That reasoning does not hold for this repository: the file and
-this script were introduced one commit apart on the same branch (the
-commit that added ``release-target.json`` never shipped without this
-script, and this script has never shipped without the file already
-present), so there is no point in this repository's history where a
-checkout legitimately has the script but not the file. The only way to
-reach that state on a real run is for something -- an accidental deletion,
-a broken checkout step, a misconfigured sparse checkout -- to remove a
-file that is supposed to be there, which is exactly the kind of silent
-gap this gate exists to catch, not a state it should wave through.
+than passing. A checkout that has this script but not the file is not a
+legitimate state: this repository tracks both, so the only way to reach it
+on a real run is for something -- an accidental deletion, a broken
+checkout step, a misconfigured sparse checkout -- to remove a file that is
+supposed to be there, which is exactly the kind of silent gap this gate
+exists to catch, not a state it should wave through.
 
 What a PASS from this script establishes, and only this: a tag named
 ``v<version>``, where ``<version>`` is release-target.json's declared
@@ -95,18 +88,14 @@ RELEASE_TARGET_FILENAME = "release-target.json"
 # numeric component is spelled out rather than using '\d+'.
 #
 # The pattern ends in '\Z', not '$': without 're.MULTILINE', '$' matches at
-# the end of the string *or* just before a trailing newline, so a value
-# like "0.7.0\n" satisfies "^...$" at the position before the newline and
-# is reported as a match, even though it is not the version it appears to
-# be. '\Z' matches only the true end of the string, with no such exception,
-# so the same value fails to match regardless of whether the call site uses
-# 'match()' or 'fullmatch()' -- confirmed by execution against both. The
-# call site below still uses 'fullmatch()' rather than 'match()' as a
-# second, independent line of defence: 'match()' does not require the
-# pattern to consume the whole string at all, so a future edit that widens
-# this pattern (e.g. to allow a suffix) could reopen the same class of bug
-# even with '\Z' in place, whereas 'fullmatch()' fails closed regardless of
-# how the pattern itself is written.
+# the end of the string *or* just before a trailing newline, so under
+# 'match()' a value like "0.7.0\n" satisfies "^...$" at the position before
+# the newline and is reported as a match, even though it is not the version
+# it appears to be. '\Z' matches only the true end of the string, with no
+# such exception, so the same value fails to match regardless of whether
+# the call site uses 'match()' or 'fullmatch()'. The call site below uses
+# 'fullmatch()', which requires the pattern to consume the whole string;
+# 'match()' only requires a match starting at position 0.
 _NUMERIC_COMPONENT = r"(?:0|[1-9][0-9]*)"
 VERSION_RE = re.compile(
     rf"^({_NUMERIC_COMPONENT})\.({_NUMERIC_COMPONENT})\.({_NUMERIC_COMPONENT})\Z"
@@ -133,11 +122,9 @@ def _assert_is_a_regular_declaration_file(path: Path) -> None:
     instead, as a distinct problem from "the file is missing".
 
     'lstat()', not 'stat()': the latter follows a symlink and reports on
-    whatever it points at, which is exactly the fact this check needs to
-    see through, not past. Confirmed by execution: pointing
-    release-target.json at an unrelated, well-formed release-target.json
-    elsewhere on the filesystem -- with a matching old tag already in this
-    repository -- made this gate exit 0 before this check existed.
+    whatever it points at, so it could not tell that ``path`` is a link.
+    Without this check, 'read_text()' would follow the link and the gate
+    could pass on declared contents that live outside this checkout.
     'release-target.json' is a git-tracked file; a real checkout never
     produces it as a symlink, so requiring a regular file rejects nothing
     legitimate.
@@ -189,17 +176,13 @@ def read_declared_target() -> str:
     ``except Exception``, and converted to the same clean, fail-closed
     diagnostic, naming this file and the exception that hit it.
 
-    This replaces what used to be a short, hand-picked list of anticipated
-    exception types on this path (``OSError`` and ``MemoryError`` around
-    ``read_text()``, ``json.JSONDecodeError`` and a second ``MemoryError``
-    around ``json.loads()``): each entry closed one specific, previously
-    found gap and left every other kind of unreadable or malformed file to
-    escape as a bare traceback -- confirmed by execution against a file
-    containing invalid UTF-8 (``UnicodeDecodeError`` out of ``read_text()``)
-    and a 10,000-level nested JSON document (``RecursionError`` out of
-    ``json.loads()``), neither of which is any of the four types the old
-    list named. A single boundary around the whole path has no fifth type to
-    miss, because it does not enumerate types at all.
+    The trailing ``except Exception`` is deliberately a single boundary
+    rather than a list of anticipated exception types, so that an exception
+    nobody anticipated cannot escape as a bare traceback. Reading and parsing
+    can raise well beyond ``OSError`` and ``json.JSONDecodeError``:
+    ``UnicodeDecodeError`` out of ``read_text()`` for a file whose bytes are
+    not valid in the locale's text encoding, and ``RecursionError`` out of
+    ``json.loads()`` for a deeply nested JSON document.
     """
     path = REPO_ROOT / RELEASE_TARGET_FILENAME
     try:
@@ -239,16 +222,10 @@ def _read_declared_target(path: Path) -> str:
         msg = f"{path}'s 'version' value must be a string, got {type(version).__name__}"
         raise GateInputError(msg)
 
-    # 'fullmatch()', not 'match()': with the previous pattern (ending in
-    # '$'), 'match()' let "0.7.0\n" through, because '$' matches just before
-    # a trailing newline -- see VERSION_RE's own comment. Changing the
-    # pattern to end in '\Z' already closes that specific case even under
-    # 'match()', but 'match()' never required the pattern to consume the
-    # whole string in the first place, only to match starting at position 0
-    # -- a future change to this pattern (e.g. widening it to allow a
-    # suffix) could reopen the same class of bug under 'match()' without
-    # touching '\Z' at all. 'fullmatch()' fails closed regardless of how the
-    # pattern is written, so the two fixes are independent, not redundant.
+    # 'fullmatch()', not 'match()': 'fullmatch()' requires the pattern to
+    # consume the whole string, while 'match()' only requires a match
+    # starting at position 0. VERSION_RE also ends in '\Z', which rejects
+    # "0.7.0\n" under either -- see VERSION_RE's own comment.
     match = VERSION_RE.fullmatch(version)
     if match is None:
         msg = f"{path}'s 'version' value {version!r} is not a bare MAJOR.MINOR.PATCH version"
@@ -262,9 +239,9 @@ def _run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
 
     ``subprocess.run`` raises ``OSError`` (typically ``FileNotFoundError``)
     when the executable itself cannot be found or started -- that is a
-    problem with this environment, not an answer about the repository, and
-    previously escaped this module as a bare traceback instead of the
-    clean, fail-closed diagnostic every other input problem here gets.
+    problem with this environment, not an answer about the repository, so
+    it is reported as a clean, fail-closed diagnostic like every other input
+    problem here rather than escaping as a bare traceback.
     """
     try:
         return subprocess.run(  # noqa: S603 -- trusted internal git invocation
@@ -285,19 +262,18 @@ def _is_symbolic_ref(ref: str) -> bool:
     ``git symbolic-ref --quiet <ref>`` exits ``0`` and prints the ref's
     target when ``ref`` is symbolic, and exits ``1`` both when ``ref`` does
     not exist at all and when it exists but is an ordinary (annotated or
-    lightweight) tag -- confirmed by execution against all three cases.
-    Both non-zero cases collapse to ``False`` here: this function only
-    answers "is this specifically a symbolic ref", and the caller separately
-    handles "does not exist" and "names a non-commit object".
+    lightweight) tag. Both non-zero cases collapse to ``False`` here: this
+    function only answers "is this specifically a symbolic ref", and the
+    caller separately handles "does not exist" and "names a non-commit
+    object".
 
     This exists because ``git symbolic-ref refs/tags/v0.7.0
     refs/heads/some-branch`` is accepted by git and creates something that
     answers to the name ``refs/tags/v0.7.0`` without ever creating a tag
-    object -- confirmed by execution: with such a symbolic ref in place and
-    ``refs/heads/some-branch`` pointing at ``HEAD``, ``git rev-parse
-    --verify --quiet 'refs/tags/v0.7.0^{commit}'`` resolved and printed
-    ``HEAD``'s own commit, exiting ``0``, so :func:`resolve_tag_commit`
-    would previously have accepted the target with no real tag
+    object: with ``refs/heads/some-branch`` pointing at ``HEAD``, ``git
+    rev-parse --verify --quiet 'refs/tags/v0.7.0^{commit}'`` resolves and
+    prints ``HEAD``'s own commit, exiting ``0``. Without this check,
+    :func:`resolve_tag_commit` would accept the target with no real tag
     anywhere in the repository. Any other exit code means git could not
     answer at all and is raised as :class:`GateInputError` rather than
     silently treated as "not symbolic".
@@ -337,23 +313,19 @@ def resolve_tag_commit(version: str, *, is_symbolic_tag_ref: bool | None = None)
     A symbolic ref of that name is rejected before it is ever peeled: it is
     not a tag this gate created or this repository's release tooling would
     ever produce, only something able to imitate one for this one check --
-    see :func:`_is_symbolic_ref` for the executed proof. It is treated the
-    same as a missing tag, not resolved through to whatever it happens to
-    point at.
+    see :func:`_is_symbolic_ref` for how it can pass for a tag. It is
+    treated the same as a missing tag, not resolved through to whatever it
+    happens to point at.
 
     ``is_symbolic_tag_ref``, when given, is the caller's own already-known
     answer to "is ``refs/tags/v<version>`` a symbolic ref", and this
     function trusts it instead of asking git again. :func:`classify_target`
     passes its own answer here, because it has to compute it anyway before
-    deciding whether to call this function at all -- without this
-    parameter, a passing run asked git the identical
-    ``git symbolic-ref --quiet refs/tags/v<version>`` question twice,
-    confirmed by execution (instrumenting ``_run_git`` on a passing
-    ``classify_target()`` call showed two identical invocations before this
-    parameter existed, one after). Every other caller -- including this
-    module's own direct tests of this function -- omits it, and the
-    ``None`` default makes this function compute the answer itself exactly
-    as it always has.
+    deciding whether to call this function at all, so a classification asks
+    git the ``git symbolic-ref --quiet refs/tags/v<version>`` question once.
+    Every other caller -- including this module's own direct tests of this
+    function -- omits it, and the ``None`` default makes this function
+    compute the answer itself.
 
     Past that, the ``^{commit}`` peel is deliberate, not ``^{object}``: it
     requires the ref to resolve to a commit specifically, so a tag that
@@ -362,12 +334,12 @@ def resolve_tag_commit(version: str, *, is_symbolic_tag_ref: bool | None = None)
     *something* exists under that ref name, which is all ``^{object}``
     would have confirmed. ``git rev-parse --verify --quiet`` exits ``1``
     both when the ref does not exist at all and when it exists but is the
-    wrong type (confirmed by execution against a tag pointing at a blob);
-    either way, "not a commit" is the correct answer here, so
-    both are folded into the same ``None`` result. Any other exit code
-    means git could not answer the question at all (a broken repository, an
-    unreadable object database) and is raised as :class:`GateInputError`
-    instead of being silently treated as "no such tag".
+    wrong type (for example a tag pointing at a blob); either way, "not a
+    commit" is the correct answer here, so both are folded into the same
+    ``None`` result. Any other exit code means git could not answer the
+    question at all (a broken repository, an unreadable object database)
+    and is raised as :class:`GateInputError` instead of being silently
+    treated as "no such tag".
     """
     tag_ref = f"refs/tags/v{version}"
     if is_symbolic_tag_ref is None:
@@ -427,14 +399,11 @@ def classify_target(version: str) -> tuple[TagState, str | None]:
     coincidence; keeping one means there is nothing left to disagree.
 
     That single-source-of-truth intent is about the pass/fail decision, not
-    about how many times git itself gets asked: this function's own
-    ``git symbolic-ref --quiet`` probe and :func:`resolve_tag_commit`'s used
-    to ask the identical question independently, on every passing
-    classification -- not a second opinion able to disagree with the first,
-    just the same subprocess call made twice for no reason. This function
-    computes the answer once and passes it into :func:`resolve_tag_commit`
-    via ``is_symbolic_tag_ref`` instead of letting that function re-derive
-    it.
+    about how many times git itself gets asked. This function computes
+    whether the tag is a symbolic ref once and passes the answer into
+    :func:`resolve_tag_commit` via ``is_symbolic_tag_ref`` instead of
+    letting that function re-derive it, so a classification runs
+    ``git symbolic-ref --quiet`` once.
 
     Both a tag naming a non-commit object and a tag naming a commit outside
     ``HEAD``'s history fail to establish a PASS, distinctly from each other
