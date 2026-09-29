@@ -21,7 +21,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import yaml
+
+from tests._shell_command import script_argv
+from tests._workflow_yaml import load_workflow_text
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release-merge-discipline.yml"
@@ -31,20 +33,29 @@ RELEASE_BRANCH = "release/v9.9.9"
 
 
 def _load_workflow() -> dict[Any, Any]:
-    return yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
+    return load_workflow_text(WORKFLOW_PATH.read_text(encoding="utf-8"))
 
 
 def _triggers(workflow: dict[Any, Any]) -> dict[str, Any]:
-    # PyYAML follows YAML 1.1, where the bare key ``on`` is the boolean True.
-    return workflow["on"] if "on" in workflow else workflow[True]
+    assert "on" in workflow, "the trigger key must be the string 'on'"
+    return workflow["on"]
 
 
 def _steps(workflow: dict[Any, Any]) -> list[dict[str, Any]]:
     return workflow["jobs"]["merge-discipline"]["steps"]
 
 
+def _one_line(command: object) -> object:
+    # ``script_argv`` reads one line, so a line that ends in a backslash is joined to the next.
+    return command.replace("\\\n", " ") if isinstance(command, str) else command
+
+
 def _gate_step(workflow: dict[Any, Any]) -> dict[str, Any]:
-    matching = [s for s in _steps(workflow) if SCRIPT_RELATIVE in s.get("run", "")]
+    matching = [
+        s
+        for s in _steps(workflow)
+        if script_argv(_one_line(s.get("run")), SCRIPT_RELATIVE) is not None
+    ]
     assert len(matching) == 1, "exactly one step must run the merge-discipline script"
     return matching[0]
 

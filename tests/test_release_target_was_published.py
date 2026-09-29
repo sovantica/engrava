@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -23,6 +22,7 @@ import pytest
 import yaml
 
 from tests._shell_command import INTERPRETERS, script_argv
+from tests._workflow_yaml import load_workflow_text
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "check_release_target_was_published.py"
@@ -31,34 +31,6 @@ SCRIPT_RELATIVE = "scripts/check_release_target_was_published.py"
 RELEASE_TRIGGER = {"push": {"branches": ["dev"]}}
 WORKFLOW_KEYS = {"name", "on", "permissions", "concurrency", "jobs"}
 RELEASE_JOB_KEYS = {"name", "runs-on", "outputs", "steps"}
-BOOL_TAG = "tag:yaml.org,2002:bool"
-MERGE_TAG = "tag:yaml.org,2002:merge"
-
-
-class _WorkflowLoader(yaml.SafeLoader):
-    """Reads a plain ``on`` as a string, and refuses a repeated key and a merge key."""
-
-    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Any, Any]:
-        seen: set[Any] = set()
-        for key_node, _ in node.value:
-            if key_node.tag == MERGE_TAG:
-                msg = "found a merge key"
-                raise yaml.constructor.ConstructorError(None, None, msg, key_node.start_mark)
-            key = self.construct_object(key_node, deep=True)
-            if key in seen:
-                msg = f"found a duplicate key {key!r}"
-                raise yaml.constructor.ConstructorError(None, None, msg, key_node.start_mark)
-            seen.add(key)
-        return super().construct_mapping(node, deep=deep)
-
-
-_WorkflowLoader.yaml_implicit_resolvers = {
-    first: [(tag, pattern) for tag, pattern in resolvers if tag != BOOL_TAG]
-    for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
-}
-_WorkflowLoader.add_implicit_resolver(
-    BOOL_TAG, re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"), list("tTfF")
-)
 
 
 @pytest.fixture
@@ -946,30 +918,20 @@ class TestMainAgainstADisposableRepository:
         assert "PyPI" not in captured.out
 
 
-def _load_workflow_text(text: str) -> dict[Any, Any]:
-    loader = _WorkflowLoader(text)
-    try:
-        loaded = loader.get_single_data()
-    finally:
-        loader.dispose()
-    assert isinstance(loaded, dict)
-    return loaded
-
-
 class TestWorkflowLoader:
     """The loader reads a plain ``on`` as a string, and refuses a repeated key and a merge key."""
 
     def test_a_plain_on_key_is_read_as_the_string_on(self) -> None:
-        assert list(_load_workflow_text("on:\n  push: {}\n")) == ["on"]
+        assert list(load_workflow_text("on:\n  push: {}\n")) == ["on"]
 
     @pytest.mark.parametrize("key", ["true", "True", "yes", "Yes", "On", "ON"])
     def test_true_yes_and_capitalised_on_are_not_read_as_the_trigger_key(self, key: str) -> None:
-        loaded = _load_workflow_text(f"{key}:\n  push: {{}}\n")
+        loaded = load_workflow_text(f"{key}:\n  push: {{}}\n")
 
         assert "on" not in loaded
 
     def test_true_and_false_are_still_booleans(self) -> None:
-        loaded = _load_workflow_text("a: true\nb: false\nc: True\nd: FALSE\n")
+        loaded = load_workflow_text("a: true\nb: false\nc: True\nd: FALSE\n")
 
         assert loaded == {"a": True, "b": False, "c": True, "d": False}
 
@@ -982,7 +944,7 @@ class TestWorkflowLoader:
     )
     def test_a_key_repeated_in_a_mapping_is_refused(self, text: str) -> None:
         with pytest.raises(yaml.constructor.ConstructorError, match="duplicate key"):
-            _load_workflow_text(text)
+            load_workflow_text(text)
 
     @pytest.mark.parametrize(
         "text",
@@ -993,7 +955,7 @@ class TestWorkflowLoader:
     )
     def test_a_merge_key_is_refused(self, text: str) -> None:
         with pytest.raises(yaml.constructor.ConstructorError, match="merge key"):
-            _load_workflow_text(text)
+            load_workflow_text(text)
 
 
 class TestReleaseWorkflowWiring:
@@ -1010,7 +972,7 @@ class TestReleaseWorkflowWiring:
 
     @staticmethod
     def _workflow() -> dict[str, Any]:
-        return _load_workflow_text(WORKFLOW_PATH.read_text(encoding="utf-8"))
+        return load_workflow_text(WORKFLOW_PATH.read_text(encoding="utf-8"))
 
     @classmethod
     def _jobs(cls) -> dict[str, dict[str, Any]]:
