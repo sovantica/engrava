@@ -534,8 +534,8 @@ every other guarded write does, so a different task's write can no longer even
 start until the window has closed. It is not closed **across connections**: a
 second store's write still can, which is exactly [Multiple stores, one
 database file](#multiple-stores-one-database-file)'s subject.
-**`bulk_store(deduplicate=True)` does not share this property, by design, and
-this fix does not change that.** Its insert loop, and — when auto-embed is on
+**`bulk_store(deduplicate=True)` does not share this property, by design.**
+Its insert loop, and — when auto-embed is on
 — the one batch embedding call it makes afterwards, run inside a single
 `suspend_auto_commit` transaction (see
 [Many async tasks, one store](#many-async-tasks-one-store)), so the write lock

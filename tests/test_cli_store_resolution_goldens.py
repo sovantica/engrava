@@ -7,10 +7,9 @@ not change what ``info``, ``verify``, ``query``, or ``gc`` do — those four
 commands' own code was not touched by this change, but "I didn't touch the
 code" is a claim about the diff, not about behaviour. This test makes it an
 empirical one: the exact invocation matrix below was run against the
-pre-refactor worktree (commit ``b97b209``, the base this branch was cut from)
-via the identical ``CliRunner`` harness, its stdout and exit codes captured
-into ``tests/data/bare_command_goldens.json`` after normalizing the two
-sources of incidental noise (the per-run temp directory path, and the
+pre-refactor code via the identical ``CliRunner`` harness, its stdout and
+exit codes captured into ``tests/data/bare_command_goldens.json`` after
+normalizing the two sources of incidental noise (the per-run temp directory path, and the
 wall-clock timestamps ``info``'s metrics snapshot embeds). Running the same
 matrix here, against the current code, and normalizing the same way, must
 reproduce that file byte-for-byte.

@@ -135,8 +135,8 @@ though a rising `fts_match_failure_count` is how you see it happening. See
 `recall` returns a thought whose essence and content plainly do not contain
 the word you searched for.
 
-**Cause.** `restore` inserts every record with `INSERT OR REPLACE`. Before
-this was fixed, a record that collided with an existing row on a primary key
+**Cause.** On `0.6.0`, `restore` inserted records with `INSERT OR REPLACE`, so
+a record that collided with an existing row on a primary key
 or `UNIQUE` constraint made SQLite delete the old row and re-insert it
 internally to resolve the conflict — and because nothing in engrava sets
 `PRAGMA recursive_triggers` (SQLite's default is off), the FTS delete trigger
@@ -147,8 +147,8 @@ replacement. The old, stale index entry survived, pointing at a rowid the
 original word resolved to that unrelated thought instead.
 
 **Fix.** `restore` now rebuilds the full-text index unconditionally, inside
-its own transaction, after every merge or `--clear`, so a build carrying this
-fix cannot leave a stale entry behind this way.
+its own transaction, after every merge or `--clear`, so `0.7.0` cannot leave a
+stale entry behind this way.
 
 **Repair a database an older build already restored into.** Rebuild its
 index directly with the SQLite CLI:

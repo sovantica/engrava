@@ -925,15 +925,14 @@ class TestCloseQuietlyCancellation:
     """``_close_quietly`` must close the connection even under cancellation.
 
     ``await conn.close()`` is a suspension point, so the original
-    ``try: await conn.close() / except Exception`` body had the identical
-    gap the surrounding commit (d706f88) exists to close: a cancellation
-    landing while the close itself is suspended is a ``BaseException``, not
-    an ``Exception``, escapes uncaught -- correctly, cancellation must
-    propagate -- but leaves the close abandoned mid-flight, stranding
-    aiosqlite's non-daemon connection worker thread exactly like the
-    original corrupt-file hang. These exercise the helper directly, without
-    a real database, since the failure is about the shape of the exception
-    handler rather than anything sqlite-specific.
+    ``try: await conn.close() / except Exception`` body had a gap of its
+    own: a cancellation landing while the close itself is suspended is a
+    ``BaseException``, not an ``Exception``, escapes uncaught -- correctly,
+    cancellation must propagate -- but leaves the close abandoned
+    mid-flight, stranding aiosqlite's non-daemon connection worker thread
+    exactly like the original corrupt-file hang. These exercise the helper
+    directly, without a real database, since the failure is about the shape
+    of the exception handler rather than anything sqlite-specific.
     """
 
     async def test_the_close_still_completes_when_cancelled_mid_close(self) -> None:

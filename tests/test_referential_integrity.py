@@ -657,21 +657,21 @@ class TestDeleteThoughtChildrenAtomicity:
 class TestParentDeleteSeesChildrenBeforeTheyAreGone:
     """The parent delete must run before the children are gone, not after.
 
-    ``6e4ed41`` deleted the edge / embedding / action rows first and released
-    their savepoint before the ``thought`` row itself was ever touched. Two
-    distinct defects followed from that ordering, both fixed by
-    ``_delete_thought_atomic`` running the parent delete first, inside the
-    savepoint that then covers the explicit child deletes:
+    Deleting the edge / embedding / action rows first, and releasing their
+    savepoint before the ``thought`` row is touched, would cause two distinct
+    defects, both avoided by ``_delete_thought_atomic`` running the parent
+    delete first, inside the savepoint that then covers the explicit child
+    deletes:
 
-    * **Lost atomicity.** Anything that then prevented, diverted or skipped
-      the parent delete -- a ``BEFORE DELETE ON thought`` trigger that always
-      vetoes, the concrete case exercised here -- left the already-deleted
+    * **Lost atomicity.** Anything that then prevents, diverts or skips the
+      parent delete -- a ``BEFORE DELETE ON thought`` trigger that always
+      vetoes, the concrete case exercised here -- leaves the already-deleted
       children sitting in the open transaction with the parent still
-      present. Nothing in the raised exception said so; the children were
+      present. Nothing in the raised exception says so; the children are
       simply gone the moment any later, unrelated write on the same
-      connection committed.
+      connection commits.
     * **A defeated guard.** A trigger that vetoes only *conditionally* --
-      ``WHEN EXISTS (... the thought still has children ...)`` -- never saw
+      ``WHEN EXISTS (... the thought still has children ...)`` -- never sees
       them: the predicate it tests is already false by the time the parent
       delete runs, so the trigger never fires and the delete the user's own
       policy meant to block **succeeds**.

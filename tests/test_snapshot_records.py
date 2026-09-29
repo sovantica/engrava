@@ -1875,7 +1875,7 @@ class TestRestoreExemptsCentroidRowsFromTheIdentityInvariant:
     """Regression: a centroid row must never gate provider identity.
 
     ``_ensure_embedding_model_lock`` already exempts
-    ``CENTROID_MODEL_NAME`` at write time (``a3abb7a``); restore had no
+    ``CENTROID_MODEL_NAME`` at write time; restore had no
     counterpart, so a perfectly healthy store containing both provider
     vectors and reflection centroids was refused on restore into a fresh
     target, and a merge into an already-healthy centroid-bearing target

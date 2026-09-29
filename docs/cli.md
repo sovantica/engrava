@@ -428,18 +428,12 @@ Click's ordinary behaviour, not a bug, for these six. Use `--option=value`
 (`=` syntax) when a value might otherwise be ambiguous with a following flag,
 rather than relying on Click to catch the omission.
 
-`--db` and `--config` are **not** on that list. A previous revision of this
-document also called `engrava --db --json remember "x"` an instance of the
-same ordinary behaviour — silently creating a database literally named
-`--json` and never seeing the real `--json` flag at all — and left it alone.
-That claim was false: the equivalent `argparse` program rejects the same
-input outright ("expected one argument"), so calling it unavoidable parser
-convention was wrong on the facts, not just generous. It is now a rejected
-usage error instead (exit `2`, Click's own plain usage text, `--json` or
-not — see **What is never JSON** above): any `--db` or `--config` value
-starting with `-` is refused before it can be silently taken as a database
-or config path. A caller who genuinely needs such a path can disambiguate it
-the usual shell way, by prefixing it (`--db ./--json`).
+`--db` and `--config` are **not** on that list. A `--db` or `--config` value
+starting with `-` is a rejected usage error (exit `2`, Click's own plain usage
+text, `--json` or not — see **What is never JSON** above), so
+`engrava --db --json remember "x"` fails rather than taking `--json` as a
+database path. A caller who genuinely needs such a path can disambiguate it the
+usual shell way, by prefixing it (`--db ./--json`).
 
 ### `remember`
 

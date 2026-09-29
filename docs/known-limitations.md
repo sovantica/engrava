@@ -308,8 +308,7 @@ resurrect one:
 - **Reconciliation only backfills a vector whose thought still exists.**
   `sync_embeddings` (the pass that runs on every sqlite-vec-enabled open)
   joins to `thought` before treating an `embedding` row as a valid backfill
-  source, so a dangling row left behind by something older than this fix can
-  no longer put a vector back.
+  source.
 - **The purge is the same join.** The sweep that removes orphaned
   `embedding_vec` rows (on reconcile, and in `engrava gc`) now considers a
   vector orphaned when its owning *thought* is gone, not only when its
@@ -325,14 +324,11 @@ and its `content` with it. Resolving the identifier — `get_thought()`, or
 any read that hydrates an id into a record — returns `None`. The content
 does not come back, and neither, now, does the identifier.
 
-**Historical residue is not retroactively repaired.** If a database
-accumulated dangling `embedding` rows *before* upgrading to this fix — every
-delete made on a pre-core-12 schema by an older engrava build did, since
-nothing removed them — those rows are still sitting there. They can no
-longer be resurrected into a search result, but they are not cleaned up
-until you migrate: `engrava migrate` runs the core-12 step, which recreates
-the three child tables with `ON DELETE CASCADE` and purges the orphan rows
-that had already accumulated.
+**Historical residue.** On a pre-core-12 schema an older engrava build left
+a deleted thought's `embedding` row behind, since nothing removed it.
+`engrava migrate` runs the core-12 step, which recreates the three child
+tables with `ON DELETE CASCADE` and purges the orphan rows that had already
+accumulated.
 
 ```bash
 engrava --db engrava.db migrate

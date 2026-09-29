@@ -1937,16 +1937,12 @@ class TestCleanupLogNoLongerReformatsThePropagatingException:
     calling ``__str__`` on the close exception, on the original exception a
     *second* time (:func:`~engrava.cli.memory_commands._describe_exception`
     already reads it once, downstream, to build the final message), and on
-    any exception-group children attached to either. Measured live against
-    this module's own predecessor (commit ``bdf78a9``) with a secondary close
-    failure whose original exception carried a one-child exception group:
-    ``{"close": 1, "original": 2, "exception_group": 1, "group_child": 1}``,
-    identical with and without ``--verbose`` (the warning was never gated
-    behind ``--verbose`` in the first place). The fix, ``_frame_only_stack``
-    shared with :func:`~engrava.cli.memory_commands._error_boundary`, reads
-    only frame metadata, so the group and its child stay at zero calls and
-    the original exception's own formatter is read only the one time the
-    boundary always reads it downstream.
+    any exception-group children attached to either.
+    ``_frame_only_stack``, shared with
+    :func:`~engrava.cli.memory_commands._error_boundary`, reads only frame
+    metadata, so the group and its child are at zero calls and the original
+    exception's own formatter is read only the one time the boundary always
+    reads it downstream.
 
     **Dropping the close exception's own count to zero would be a
     regression** -- frame metadata says *where* closing failed, never
@@ -2027,13 +2023,9 @@ class TestCleanupLogNoLongerReformatsThePropagatingException:
     def test_system_exit_from_close_formatter_now_reaches_the_caller(self, tmp_path: Path) -> None:
         """A formatter raising ``SystemExit`` during the close description must escape too.
 
-        Confirmed live against ``bdf78a9``: the standard library's traceback
-        formatter absorbed the ``SystemExit(37)`` and substituted a fixed
-        placeholder, so the command exited ``1`` rather than ``37``. Against
-        the fixed code, ``_describe_exception`` reads the close exception's
-        ``__str__`` once (the marker appears), and this time that raised
-        ``SystemExit(37)`` propagates all the way out instead of being
-        substituted for anything.
+        ``_describe_exception`` reads the close exception's ``__str__`` once
+        (the marker appears), and a ``SystemExit(37)`` raised there propagates
+        all the way out instead of being substituted for anything.
         """
         db = tmp_path / "m.db"
         config_path = tmp_path / "engrava.yaml"

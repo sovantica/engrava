@@ -252,9 +252,8 @@ the original text — evaluate each against your own threat model.
 > `embedding` row, enforced in reconciliation, in the vector-index purge, and
 > in search itself — so this no longer happens on any schema version, whether
 > or not `engrava migrate` has been run. What migration still does is clean up
-> the dangling `embedding` rows a pre-fix delete on such a database already
-> left behind — those rows are inert (they can no longer be resurrected) but
-> are not removed until the core-12 step purges them. Full mechanism:
+> the dangling `embedding` rows that earlier deletes on such a database left
+> behind: the core-12 step purges them. Full mechanism:
 > [Known Limitations → Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated).
 
 > **Memory-hygiene GC is a hard delete, not erasure.** The opt-in

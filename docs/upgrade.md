@@ -291,28 +291,27 @@ side of the gate — executed, two directions.** Neither direction was
 designed; both are accidents of the arithmetic, on the old formula and
 the new one alike, and this release does not attempt to make either side
 "correct" — that is a separate, filed decision. It only documents what
-actually happens, because the previous revision of this note denied that
-anything did.
+actually happens.
 
 - A member vector containing `nan` or `inf`, paired with a member vector
   whose own norm is exactly (or underflows to) zero, now scores `0.0`
   instead of `nan`. Executed: `[nan]` paired with `[0.0]` scored `nan`
-  under the pre-fix raw-dot-product formula (`nan * 0.0` is `nan`) and
+  under the old raw-dot-product formula (`nan * 0.0` is `nan`) and
   scores `0.0` here — the zero-norm check on the *other*, genuinely-zero
   vector fires before the `nan` in the first vector is ever examined.
   `[inf]` paired with `[0.0]` does the same, for the same reason (`inf *
   0.0` is also `nan`). Because `nan < cohesion_threshold` is `False` but
   `0.0 < cohesion_threshold` is `True` for the default `0.40`, a cluster
-  containing this pair moves from **admitted** (pre-fix) to **rejected**
+  containing this pair moves from **admitted** (old formula) to **rejected**
   (this release).
 - An anti-parallel pair whose magnitudes overflow `float64` now scores
   `nan` instead of a signed infinity. Executed: `[1e200]` paired with
-  `[-1e200]` scored `-inf` under the pre-fix raw-dot-product formula
+  `[-1e200]` scored `-inf` under the old raw-dot-product formula
   (`1e200 * -1e200` overflows to `-inf` directly) — correctly rejected,
   since `-inf` is below any threshold — and scores `nan` here, because
   both norms overflow to `inf` and `-inf / inf` is `nan`. Because `nan <
   cohesion_threshold` is `False`, this cluster moves from **rejected**
-  (pre-fix) to **admitted** (this release) — the opposite direction from
+  (old formula) to **admitted** (this release) — the opposite direction from
   the case above.
 - Not every overflowing pair changes: an orthogonal pair whose components
   also overflow (`[1e200, 0.0]` against `[0.0, 1e200]`) scores `0.0`
@@ -400,15 +399,12 @@ signal is active at all — see the executed, zero-other-signal case below.
 
 **Who is not affected: `recency_now` callers, on both counts, executed.**
 If you use `recency_now` (transaction-time recency) instead of
-`current_cycle`, this fix changed nothing that reaches you — order or score.
-The diff that produced this fix touches only the `current_cycle` branch;
-the `transaction_now` branch is byte-for-byte the same function on both
-sides. Executed directly against both branches with identical inputs: the
-`transaction_now` path returns the same scores in the same order on 0.6.x
-and 0.7. A resolved weight of `0.0` with no cognitive-cycle reference
+`current_cycle`, this change does not reach you — order or score. Executed
+directly with identical inputs: the `transaction_now` path returns the same
+scores in the same order on 0.6.x and 0.7. A resolved weight of `0.0` with no cognitive-cycle reference
 present at all (no explicit `current_cycle`, no configured `cycle_provider`)
-was likewise already a no-op on both revisions — the changed branch is never
-reached because there is no reference for it to gate.
+was likewise already a no-op on both versions — there is no reference for
+the cycle-decayed score to gate.
 
 **What changed.** On 0.6.x, a resolved `recency_weight` of `0.0` correctly
 kept `'recency'` out of `HybridSearchResult.backends_used`, but the fallback
@@ -619,12 +615,13 @@ are not interchangeable:
 connection at a time never exercises `WriteContentionError`'s path — that
 one requires genuine cross-connection contention. `WriteLockTimeoutError` is
 not fully excluded by single-task use: `write_lock_acquire_timeout_seconds`
-takes no validation, and a non-positive configured value (`0`, or negative)
-makes the write lock raise it immediately even with nothing else contending
-— see the `flush_access_buffer()` reproduction later in this section for
-measured numbers. A default or any positive timeout genuinely excludes a
-single-task, single-connection caller; the gap is specifically a
-non-positive configured timeout.
+takes no validation, and with a non-positive configured value (`0`, or
+negative) a task that does not already hold the write lock raises it
+immediately, even with nothing else contending. A task that already holds the
+lock re-enters it without waiting, so its call proceeds. See the
+`flush_access_buffer()` reproduction later in this section for measured
+numbers. A default or positive timeout does not raise it for a single task
+on a single connection.
 
 **The population that matters most here has two shapes, and the fix differs
 by shape.** Before this release, sustained dedup contention surfaced as a
@@ -682,14 +679,7 @@ window on the same store instance — see
 [Concurrency](concurrency.md#a-deadlock-this-store-cannot-resolve-raises-it-does-not-hang).
 
 **Overriding `create_thought()` no longer runs on three insert paths — override
-`prepare_thought_for_insert()` for that instead.** No schema change. This
-consolidates two commits from the same release, `47bd68e` (routed
-`get_or_create()` / `upsert_by_hash()`'s miss branch off the public method)
-and the later commits that added `prepare_thought_for_insert` — not
-`f2d2348`, which added `WriteLockTimeoutError` and is unrelated to either.
-Both landed before `0.7.0` shipped, so a `0.6.x` user upgrading straight to
-the released `0.7.0` sees only the final result below, never an intermediate
-state where the bypass existed with nothing to replace it.
+`prepare_thought_for_insert()` for that instead.** No schema change.
 
 **What a 0.6 user gets.** On `0.6.x`, `get_or_create()`'s and
 `upsert_by_hash()`'s miss branch, and each item in `bulk_store()`'s insert
@@ -701,12 +691,9 @@ never called it. On the released
 branch and `bulk_store()`'s per-item insert all reach internal primitives
 directly, never the public `create_thought()` method, so a `create_thought()`
 override now runs **only** on a direct `create_thought()` call (or through
-`remember()`, which makes one). This is permanent, not a transient defect
-visible only mid-development: `get_or_create()` / `upsert_by_hash()` have
-never called the public method on any `0.7` commit, and `bulk_store()` stopped
-doing so as part of adding the seam described next. A hit on `get_or_create()`
+`remember()`, which makes one). A hit on `get_or_create()`
 was already routed through `_increment_confirmation()`, not `create_thought()`,
-on every revision, so it was never in scope here either way;
+on `0.6.x`, so it is not affected;
 `upsert_by_hash()`'s hit branch calls the separately-overridable
 `update_thought()` instead when a mutable field differs, under locks that
 override can't safely nest into
@@ -731,7 +718,7 @@ on a direct `create_thought()` call.
 
 **A direct `create_thought(deduplicate=True)` call is not simply unaffected
 either — a miss there used to run the override twice, and now runs it
-once.** Before `47bd68e`, `create_thought(deduplicate=True)`'s own miss
+once.** On `0.6.x`, `create_thought(deduplicate=True)`'s own miss
 branch re-entered `self.create_thought(thought, deduplicate=False)` — the
 same virtual call an override sits on top of — so a call arriving with
 `deduplicate=True` reached the override once for the original call and once
@@ -754,39 +741,20 @@ path; migrating straight to `prepare_thought_for_insert()` (rather than first
 adopting, then abandoning, a `create_thought()` override) has nothing to
 migrate away from either.
 
-**A `upsert_by_hash()` no-op-commit defect from `47bd68e` was caught and
-fixed before this release shipped.** No schema change. `47bd68e` added an
-unconditional `self._maybe_commit()` to `upsert_by_hash()`'s no-change
-branch — the one that returns the existing row without writing to it at
-all — to close the `BEGIN IMMEDIATE` window the probe ahead of it could
-open. On a shared connection that commit also flushed whatever *unrelated*
-pending work the caller already had open: a rejected journal insert left
-uncommitted, followed by an unrelated no-op `upsert_by_hash()` call on the
-same connection, became durable anyway, and a caller's later `rollback()`
-meant to undo the rejected insert had nothing left to undo. Anyone
-upgrading straight from `0.6.0` to the released `0.7.0` never observes it: the
-no-change branch no longer calls `_maybe_commit()` at all, matching `0.6.0`'s
-own behaviour on this specific point (and the existing no-op rule already
-documented on `update_action`).
-
-**What remains different from `0.6.0` on this path: a no-op match now takes
-the cross-connection write reservation when the connection has no transaction
-open, and releases it as promptly as a write does; `0.6.0` took none.**
-That is the general `BEGIN IMMEDIATE` change documented above (see the
-`WriteContentionError` section), true of every dedup entry point, so a no-op
-`upsert_by_hash()` match can now raise `WriteContentionError` under
-cross-connection contention where `0.6.0` never contended. The no-op branch
-writes nothing, so it rolls back only a transaction its own probe opened and
-leaves any other open transaction alone.
+**A no-op `upsert_by_hash()` match now takes the cross-connection write
+reservation when the connection has no transaction open; `0.6.0` took none.**
+No schema change. That is the general `BEGIN IMMEDIATE` change documented
+above (see the `WriteContentionError` section), so a no-op `upsert_by_hash()`
+match can now raise `WriteContentionError` under cross-connection contention
+where `0.6.0` did not. The no-op branch writes nothing, so it rolls back only
+a transaction its own probe opened and leaves any other open transaction
+alone.
 
 **What to do.** Nothing beyond the `WriteContentionError` handler described
 above; it applies to a no-op match as to any other `upsert_by_hash()` call.
 
 **A dedup hit's journal entry can no longer be lost while its confirmation
-bump survives — no concurrency required.** No schema change. This is
-`47bd68e`, the same commit that added `WriteContentionError` above — not
-`f2d2348`, which added `WriteLockTimeoutError` and is unrelated to this
-change.
+bump survives — no concurrency required.** No schema change.
 
 **Who is affected.** Anyone journaling writes (`journal_enabled=True`) who
 relies on the journal for a complete audit trail, and who deduplicates via
@@ -800,7 +768,7 @@ write happened to flush that pending journal insert, the confirmation bump
 was durable and its `UPDATE_THOUGHT` journal entry was not. Executed
 directly: a dedup hit followed immediately by closing the connection left
 `confirmation_count` bumped but only the original `INSERT_THOUGHT` entry in
-`journal_entry` on 0.6.x-shaped code; the current code left both the bump
+`journal_entry` on 0.6.x-shaped code; 0.7.0 left both the bump
 and its `UPDATE_THOUGHT` entry.
 
 **Who is not affected.** Anyone not journaling (`journal_enabled=False`,
@@ -821,11 +789,11 @@ case — and the caller's own code catches that failure before the window's
 body returns, the bump is never rolled back: `_increment_confirmation()`'s own
 `_maybe_commit()` is a no-op inside the window, but the window's own clean
 exit commits the transaction anyway, bump included, with no journal entry for
-it. Executed directly, on both 0.6.x-shaped code and the current tree: a
+it. Executed directly, on both 0.6.x-shaped code and 0.7.0: a
 dedup hit inside `suspend_auto_commit()`, with a trigger rejecting the
 journal insert and the surrounding code catching that error before the block
 exits, left `confirmation_count` bumped and committed with no `UPDATE_THOUGHT`
-entry for it, on both revisions. This fix closes the single-connection,
+entry for it, on both versions. That change closes the single-connection,
 no-`suspend_auto_commit` gap described above; it does not make the pair
 atomic against a failure the caller catches inside its own deferred-commit
 window.
@@ -867,7 +835,7 @@ identical reason (`except Exception` on 0.6.x, `except BaseException` on
 0.7). Executed directly: a single, non-nested block that ran one write and
 then raised `SystemExit` left the write neither committed nor rolled back on
 0.6.x-shaped code (`in_transaction` stuck `True`, the row visible only
-within that still-open transaction); the identical block on the current tree
+within that still-open transaction); the identical block on 0.7.0
 rolled the write back cleanly.
 
 **What changed.** On 0.6.x, `suspend_auto_commit()` caught only `Exception`.
@@ -897,7 +865,7 @@ commit that follows it.** The outermost call's own `commit()` runs in the
 `except BaseException` that protects the body — on both 0.6.x and 0.7 alike.
 Executed directly: cancelling right as that `commit()` call is completing
 leaves one committed row with `in_transaction` already `False`, on both
-revisions; this method has never rolled back a cancellation that lands in
+versions; this method has never rolled back a cancellation that lands in
 that specific window.
 
 **What to do.** Do not carry over an assumption from 0.6.x about what a
@@ -924,10 +892,7 @@ assumes a caught inner failure implies a rollback, against this rule rather
 than against 0.6.x's behavior.
 
 **A `bulk_store()` call nested inside a caller's own `suspend_auto_commit()`
-window silently drops automatic derivation.** No schema change. This is
-`f2d2348`, the same commit as the depth-counter fix documented immediately
-above — not the dedup journal-entry fix before that, which is `47bd68e` —
-and a third, independent consequence of it.
+window silently drops automatic derivation.** No schema change.
 
 **Who is affected.** Anyone with the derived-records seam enabled
 (`DeriveGates(enabled=True)`) who calls `bulk_store()` from inside their own,
@@ -946,12 +911,12 @@ there is no second pass when the outer window eventually closes. Executed
 directly with a real structural-split producer: a single-thought
 `bulk_store()` call nested inside an outer `suspend_auto_commit()` window
 produced the source thought plus 2 derived children and 2 `DERIVED_FROM`
-edges on 0.6.x-shaped code; on the current tree, only the source thought
+edges on 0.6.x-shaped code; on 0.7.0, only the source thought
 persisted — no children, no edges, and no error of any kind.
 
 **Who is not affected.** A `bulk_store()` call made directly, with no
 `suspend_auto_commit()` window open anywhere in the same task's call stack,
-dispatches derivation normally on both revisions — this is `bulk_store()`'s
+dispatches derivation normally on both versions — this is `bulk_store()`'s
 ordinary, documented case. **"Not wrapped in an explicit
 `suspend_auto_commit()` call" is not the same condition, and undercounts the
 affected population**: `bulk_store()` always opens its own window
@@ -1011,7 +976,7 @@ you independently of the thought itself — the old dry run would not have
 told you they were going.
 
 **A deleted thought's vector can no longer resurface through search.** No
-schema change from this fix itself, but it interacts with whether your
+schema change of its own, but it interacts with whether your
 database has run the core-12 migration.
 
 **Who is affected.** Anyone running a database that has not run `engrava
@@ -1082,18 +1047,15 @@ database below head that you plan to run `gc` or `restore` against. If the
 refusal instead says the database is *newer* than this build's head
 version, `engrava migrate` will not resolve it — that database was written
 by a newer engrava, and the fix is to upgrade engrava, not to migrate. If a
-database accumulated dangling `embedding` rows from deletions made *before*
-this fix, under an older engrava build, on a schema still below core-12:
-those rows can no longer be resurrected into a result, but they are not
-removed until you migrate — `engrava migrate` purges them as part of the
-core-12 step. See [Known Limitations → Deletion on a database that has not
+database accumulated dangling `embedding` rows from deletions made
+under an older engrava build, on a schema still below core-12:
+`engrava migrate` purges them as part of the core-12 step. See
+[Known Limitations → Deletion on a database that has not
 been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated)
 for the full mechanism.
 
 **`ConnectionQuarantinedError` is now reachable from a plain `delete_thought()`
-call, with the derived-records seam disabled.** No schema change. This is
-`6e4ed41`, the same commit as the vector-ownership fix above, and a second,
-independent consequence of it.
+call, with the derived-records seam disabled.** No schema change.
 
 **Who is affected.** Anyone whose `delete_thought()` (or the TTL `delete`
 strategy, or hygiene GC) hits **any failure the store cannot cleanly unwind**
@@ -1122,7 +1084,7 @@ same outcome:
 
 Both cases produce `ConnectionQuarantinedError` on the *next* guarded call,
 not on the `delete_thought()` call itself (which raises whatever the
-original failure was). Previously, `ConnectionQuarantinedError` was
+original failure was). On `0.6.0`, `ConnectionQuarantinedError` was
 reachable only through a failed derived-record compensation rollback — a
 caller who never enabled that seam had a real reason to treat this error as
 something that could not happen to them.
@@ -1134,13 +1096,12 @@ or not.
 
 **What changed.** `delete_thought` (and the TTL delete strategy, and hygiene
 GC) gained the explicit child-row deletion described above, wrapped in a
-`SAVEPOINT` whose release sits inside the guarded region specifically so a
-cancellation landing during that release can still be recognized as
-"already released." When the store's own unwind attempt then fails for
-**any** reason — a race with a cancellation, or an ordinary error that
-happens to also defeat the `ROLLBACK TO` — it quarantines the connection
-rather than guessing at a consistent state, exactly as the pre-existing
-derived-record compensation path already did. The two paths (derivation
+`SAVEPOINT` whose release sits inside the guarded region, so a failure or
+cancellation delivered while awaiting it reaches the store's unwind. When
+that unwind attempt fails — through a race with a cancellation, or an
+ordinary error that also defeats the `ROLLBACK TO` — it quarantines the
+connection rather than guessing at a consistent state, as the
+derived-record compensation path does. The two paths (derivation
 compensation, and this one) now share one outcome (`ConnectionQuarantinedError`
 on the next guarded call) from independent triggers.
 
@@ -1156,23 +1117,15 @@ the initial delete, but `ROLLBACK TO` still succeeds unless something else
 `ConnectionQuarantinedError`, replace the store instance — it is terminal
 by design, the same as before this change.
 
-**Child deletion is atomic with the parent delete again.** No schema change.
-Immediately after the vector-ownership fix above first split the single,
-cascade-driven delete into an explicit children-delete followed by a
-separate, unguarded parent delete, anything that could fail, skip, or
-silently not run the parent `DELETE FROM thought` — a trigger, an
-authorizer, or a silently-suppressing `RAISE(IGNORE)` — could leave the
-children gone with the parent still there, or bypass a `WHEN EXISTS (...)`
-guard that no longer saw them once they were already gone. **That window
-lived only inside `0.7.0`'s own development history and never reached a
-release: anyone upgrading from the published `0.6.0` to the published
-`0.7.0` will not see it and has nothing to handle.**
+**Child deletion stays atomic with the parent delete.** No schema change.
+On `0.6.0`, `delete_thought()` was one `DELETE FROM thought`. On `0.7.0`
+the store deletes the children explicitly (see the vector-ownership entry
+above): the parent delete and the child deletes run inside one savepoint,
+which is rolled back when the parent delete did not remove a row that
+existed.
 
-**Who is affected.** No one, by the window itself. Anyone whose delete-time
-policy is a `thought`-table trigger should still read **What changed** below
-— it describes the guarantees the released `0.7.0` actually provides, which
-differ from `0.6.0` in a few specific, permanent ways even though the net
-protection the two versions give a trigger is the same.
+**Who is affected.** Anyone whose delete-time policy is a `thought`-table
+trigger. **What changed** below lists the differences from `0.6.0`.
 
 **Who is not affected.** A database with nothing installed on the `thought`
 table that can fail, skip, or stop matching the parent delete never
@@ -1188,15 +1141,14 @@ exercises any of this, on `0.6.0` or `0.7.0` alike.
 - **The enforcement-off sweep.** `delete_thought` (and the TTL `delete`
   strategy, and hygiene GC) delete `edge`, `embedding`, and `action` rows
   explicitly, every time, rather than depending on the core-12
-  `ON DELETE CASCADE` — this is the permanent, intended half of the
-  vector-ownership fix documented above, not new here: on `0.6.0`, a
-  connection without `PRAGMA foreign_keys=ON`, or a database below core-12,
-  left these rows orphaned behind a deleted thought.
-- **What `RAISE(IGNORE)` now does.** A
+  `ON DELETE CASCADE`, as the vector-ownership entry above describes: on
+  `0.6.0`, a connection without `PRAGMA foreign_keys=ON`, or a database
+  below core-12, left these rows orphaned behind a deleted thought.
+- **What `RAISE(IGNORE)` does.** A
   `BEFORE DELETE ON thought BEGIN SELECT RAISE(IGNORE); END` trigger
   silently suppresses the parent delete — no exception,
   `delete_thought() == False` — exactly as it would against `0.6.0`'s single
-  cascade-driven statement, and the released `0.7.0` reaches the same
+  statement, and `0.7.0` reaches the same
   outcome for the children: the store checks, inside the same savepoint and
   immediately before the parent `DELETE`, whether the row existed at all. If
   it did, a delete that still matched zero rows is not treated as "already
@@ -1208,26 +1160,25 @@ exercises any of this, on `0.6.0` or `0.7.0` alike.
   and a `WHEN EXISTS` guard, with `PRAGMA foreign_keys` both on and off,
   through `delete_thought()`, `cleanup_expired()`'s `delete` strategy, and
   hygiene GC.
-- **TTL cleanup and hygiene GC stop acting on a delete that did not
-  happen.** Both now check the parent delete's own outcome before purging
-  the thought's vector or appending a `DELETE_THOUGHT` journal entry, so a
-  suppressed parent delete no longer purges a live vector or records journal
-  history for a thought that is still there. One inaccuracy is unchanged, on
-  every revision: `cleanup_expired()`'s `expired_count` is the number of
-  candidates its own `SELECT` found, not the number of rows actually
-  removed — it does not, and never did, discriminate a suppressed delete
-  from a successful one. Check `delete_thought()`'s own return value, not
-  the TTL count, when that distinction matters.
+- **TTL cleanup stops acting on a delete that did not happen.** The
+  `delete` strategy of `cleanup_expired()` now checks the parent delete's
+  own outcome before purging the thought's vector or appending a
+  `DELETE_THOUGHT` journal entry, so a suppressed parent delete no longer
+  purges a live vector or records journal history for a thought that is
+  still there; `0.6.0` did not check that outcome before either step.
+  One inaccuracy is unchanged from `0.6.0`: `expired_count` is not the
+  number of rows actually removed, so it does not discriminate a
+  suppressed delete from a successful one. Check `delete_thought()`'s own
+  return value, not the TTL count, when that distinction matters.
 - **An unconditional `RAISE(ROLLBACK, ...)` trigger** still ends the whole
-  surrounding transaction rather than just this delete, on every revision —
-  not something this fix changes. It protects the children when it fires,
+  surrounding transaction rather than just this delete, as on `0.6.0`.
+  It protects the children when it fires,
   at the same cost as always: an unrelated write earlier in the same
   transaction does not survive either. Do not wrap the call in your own
   `SAVEPOINT` expecting to rescue that unrelated work — the trigger's own
   rollback removes your savepoint before your `except` block can use it.
 
-**What to do.** Nothing, to recover from the in-development window above —
-there is nothing to recover from. If delete-time policy is installed as a
+**What to do.** If delete-time policy is installed as a
 `thought`-table trigger: `RAISE(ABORT)`, `RAISE(FAIL)`, `RAISE(IGNORE)`, and
 a `WHEN EXISTS` guard are all handled correctly by the store and need no
 caller-side workaround. An unconditional `RAISE(ROLLBACK, ...)` still trades
@@ -1238,7 +1189,7 @@ forms, or move the check earlier — before calling `delete_thought()` at all
 **Connection cleanup on failure and cancellation is fixed — not only in the
 CLI.** No schema change. This reaches every caller of the library, not just
 the CLI: `SqliteEngravaCore.from_config()`, `EngravaManager.get_store()`,
-`close()`, and `close_all()` all changed, and the fix is not limited to
+`close()`, and `close_all()` all changed, and the change is not limited to
 corrupt-file opens.
 
 **Who is affected.** The real axis is not "shutdown", and not cancellation
@@ -1276,21 +1227,21 @@ that residual:
   during construction — on a perfectly healthy database, with nothing to do
   with shutdown.** A timeout wrapped around either call (`asyncio.wait_for`,
   a cancelled parent task) can land after the connection opens but before
-  construction finishes. Executed directly against both revisions: a
+  construction finishes. Executed directly against both versions: a
   cancellation raised mid-construction leaves the connection open — `close()`
   never reached — on 0.6.x-shaped code (`except Exception`, which does not
-  match `asyncio.CancelledError`); the current code (`except BaseException`)
+  match `asyncio.CancelledError`); 0.7.0 (`except BaseException`)
   reaches `close()` before re-raising the cancellation.
 - **Anyone whose `from_config()` construction fails with an ordinary error
   whose own cleanup *also* fails — no cancellation anywhere in it.** On
   0.6.x, construction's `except Exception: await db.close(); raise` let a
   failure in `db.close()` itself replace the original error, because the
-  bare `raise` is never reached when the statement before it raises. Current
-  code routes that close through `_close_quietly`, which swallows (and logs)
+  bare `raise` is never reached when the statement before it raises. 0.7.0
+  routes that close through `_close_quietly`, which swallows (and logs)
   its own failure so the original error's `raise` is always reached.
   Executed directly: construction raising `ValueError` with cleanup raising
   `OSError` surfaced the `OSError` on 0.6.x-shaped code and the original
-  `ValueError` on the current tree. A caller whose error handling branches on
+  `ValueError` on 0.7.0. A caller whose error handling branches on
   which exception type it catches, for this exact combination, sees a
   different type now — on a perfectly healthy database, with no cancellation
   involved at all.
@@ -1313,8 +1264,8 @@ finishes closing every remaining store when one of them is cancelled,
 re-raising the cancellation only afterward. Cleanup is also routed through a
 shared `_close_quietly` helper that catches `Exception` and logs it rather
 than raising, so an ordinary close failure during cleanup never replaces
-the original error that triggered the cleanup — on any revision-vs-0.6.x
-construction failure, cancelled or not. **A single cancellation landing
+the original error that triggered the cleanup — on any construction
+failure, cancelled or not. **A single cancellation landing
 during `_close_quietly`'s own `await conn.close()` — the same suspension
 point this whole change is protecting — no longer aborts the close.**
 The close now runs as its own task, shielded from that first
@@ -1373,15 +1324,14 @@ The troubleshooting entry documenting the old import failure is gone along
 with it.
 
 **A hook that calls back into dedup no longer deadlocks — a resolved defect,
-in the reader's favour.** No schema change. This is `47bd68e`, the same
-commit as the cross-connection dedup fixes above.
+in the reader's favour.** No schema change.
 
 **Who is affected.** Anyone whose `on_store` hook (or anything else reached
 during the insert pipeline of `create_thought(deduplicate=True)`,
 `get_or_create()`, or `upsert_by_hash()`) itself awaits one of those same
 three methods on the same store instance, from the same task — a hook that
 records its own enrichment as a separately deduplicated thought is the
-concrete shape. Before this commit, `_dedup_lock` — a plain, non-reentrant
+concrete shape. On `0.6.x`, `_dedup_lock` — a plain, non-reentrant
 `asyncio.Lock` — was held for the whole outer call, insert pipeline and
 `on_store` included, because the miss branch of all three methods recursed
 back into the public `create_thought()` from inside that lock's own `async
@@ -1393,67 +1343,54 @@ unconditional hang, not a race.
 rather than actually blocking forever:** a hook that, on a miss, awaits
 `get_or_create()` against different, already-existing content (so the
 inner call is a hit and does not recurse into the hook again) stalled past
-the bound on every one of the three entry points — `create_thought
-(deduplicate=True)`, `get_or_create()`, and `upsert_by_hash()` — on `v0.6.0`
-and on the commit immediately before this one. The identical setup
-completed normally, on all three entry points, on this commit and the
-current tree.
+the bound on each of the three entry points — `create_thought
+(deduplicate=True)`, `get_or_create()`, and `upsert_by_hash()` — on `v0.6.0`.
+The identical setup completed normally, on all three entry points, on
+`0.7.0`.
 
-**A spawned-and-awaited callback on a different task is also fixed by this
-commit — measured, not assumed.** `_TaskReentrantLock` does not exist yet at
-`v0.6.0` or at the commit immediately before this one — this whole
-probe-and-insert mechanism, and its own residual-gap comment noting "Closing
-it for real needs a task-reentrant lock", are themselves new in this commit
-(`47bd68e`); `f2d2348` is what later replaces that comment with the class
-itself. So at those two revisions there was no write lock standing between a
-spawned task's `get_or_create()` call and the hang above — a hook that
-spawns a task, and awaits it, hit `_dedup_lock` for the same reason the
-same-task case did. Executed directly, guarded by the same bounded wait as
-above: a hook that spawns a task to await `get_or_create()` against
-different, already-existing content and then awaits that task stalled past
-the bound on all three entry points — `create_thought(deduplicate=True)`,
-`get_or_create()`, and `upsert_by_hash()` — on `v0.6.0` and on the commit
-immediately before this one, and completed normally on all three, on this
-commit and the current tree.
+**A spawned-and-awaited callback on a different task is also fixed.** On
+`0.6.x`, a callback into one of the three entry points from a task the hook
+spawns and awaits hit `_dedup_lock` for the same reason the same-task case
+did. Executed directly, guarded by the same
+bounded wait as above: a hook that spawns a task to await `get_or_create()`
+against different, already-existing content and then awaits that task stalled
+past the bound on all three entry points — `create_thought(deduplicate=True)`,
+`get_or_create()`, and `upsert_by_hash()` — on `v0.6.0`, and completed
+normally on all three on `0.7.0`.
 
-**Who is not affected.** A hook that never calls back into any of the three
-dedup entry points on the same store instance never reached `_dedup_lock` a
-second time, so it never hung *on that lock* on any revision, whether the
-callback runs on the same task or one it spawns and awaits. **That is not
-the same as "never hung" outright.** `_write_lock` is a separate,
-later-introduced lock guarding every guarded write, not only the three dedup
-methods, and a spawned task gets none of the same-task reentrancy that
-closes the gap above: a hook that spawns a task to call plain
-`create_thought()` — never touching `create_thought(deduplicate=True)`,
+**Who is not affected.** A hook that reaches none of the three dedup entry
+points again on the same store instance — directly, or through a wrapper such
+as `bulk_store(deduplicate=True)` — did not reach `_dedup_lock` a second time,
+so it did not hang *on that lock* on `0.6.x`, whether the callback runs on the
+same task or one it spawns and awaits. **Such a hook can
+still fail on `0.7.0`, on a different lock.** `_write_lock` guards writes
+beyond the three dedup methods, and a spawned task gets none of the same-task
+reentrancy that closes the gap above: a hook that spawns a task to call plain
+`create_thought()` — not touching `create_thought(deduplicate=True)`,
 `get_or_create()`, or `upsert_by_hash()` — from inside an enclosing
-`suspend_auto_commit()` window still raises `WriteLockTimeoutError` on the
-current tree, the same residual mechanism the next paragraph describes.
-Executed directly: that exact hook, armed inside an open
-`suspend_auto_commit()` window with a 2-second
+`suspend_auto_commit()` window raises `WriteLockTimeoutError` on `0.7.0`, the
+same residual mechanism the next paragraph describes. Executed directly: that
+hook, armed inside an open `suspend_auto_commit()` window with a short
 `write_lock_acquire_timeout_seconds`, raised `WriteLockTimeoutError` rather
 than completing or hanging past the bound.
 
-**A residual write-lock risk remains, but only under an enclosing
-lock-holding window — a non-positive `write_lock_acquire_timeout_seconds`
-is a separate, unvalidated risk, not this one.** Outside an enclosing
-window, both `_dedup_lock` and `_write_lock` are released before `on_store`
-runs (see "What changed" below), which is why the spawned-task shape above
-now completes — provided the configured timeout is a default or a positive
-value. `write_lock_acquire_timeout_seconds` takes no validation, and a
-non-positive configured value (`0`, or negative) still makes the write lock
-raise `WriteLockTimeoutError` immediately against a completely free lock,
-with no enclosing window required — the same gap documented above and in
-the `flush_access_buffer()` reproduction later in this section. The risk
-below is conditional on the *calling* task already holding `_write_lock` open
-across the whole call — the concrete case is an outer
-`suspend_auto_commit()` window — because a task spawned and awaited from
-inside that window cannot reuse its parent's task-reentrant grant, and
-blocks on the lock its own parent task is still holding. Executed directly
-on the current tree: the same spawn-and-await hook, driven from inside an
-open `suspend_auto_commit()` window, raised `WriteLockTimeoutError` instead
-of completing — the task-reentrant write-lock hazard documented elsewhere
-in this file, not a new one, and reachable only with that enclosing window
-in place.
+**A residual write-lock risk remains under an enclosing lock-holding
+window.** Outside such a window, both `_dedup_lock` and `_write_lock` are
+released before `on_store` runs (see "What changed" below), which is why the
+spawned-task shape above completes on `0.7.0`. The residual risk is that the
+*calling* task already holds `_write_lock` across the whole call — the
+concrete case is an outer `suspend_auto_commit()` window — because a task
+spawned and awaited from inside that window cannot reuse its parent's
+task-reentrant grant, and blocks on the lock its parent task is holding.
+Executed directly on `0.7.0`: the same spawn-and-await hook, driven from
+inside an open `suspend_auto_commit()` window, raised `WriteLockTimeoutError`
+instead of completing — the task-reentrant write-lock hazard documented
+elsewhere in this file. A non-positive `write_lock_acquire_timeout_seconds`
+(`0`, or negative; the setting takes no validation) is a separate risk: a task
+that does not already hold the write lock raises `WriteLockTimeoutError`
+immediately, even against a free lock, with no enclosing window required — the
+same gap documented above and in the `flush_access_buffer()` reproduction
+later in this section.
 
 **What changed.** Serialising the dedup probe-and-insert window narrowed
 `_dedup_lock`'s scope to end where the probe-and-insert span ends, before
@@ -1488,7 +1425,7 @@ re-enters it without waiting and does not raise.
 **What changed.** The flush drains the buffer only after it holds the lock, so
 a call that raises `WriteLockTimeoutError` has taken nothing out of the buffer.
 
-Executed directly on the current tree: one access event buffered, a different
+Executed directly on 0.7.0: one access event buffered, a different
 task holding the write lock open (via its own `suspend_auto_commit()` window)
 for longer than a `write_lock_acquire_timeout_seconds` of `0.2`, then
 `flush_access_buffer()` called — it raised `WriteLockTimeoutError` and the
@@ -1548,13 +1485,7 @@ importing the bad row at all. If you must recover the original vector
 first, edit the offending line in the snapshot file directly — it is plain
 JSONL — before restoring.
 
-**This section covers effects of four large commits, not everything they
-touched.** `f2d2348`, `6e4ed41`, `47bd68e`, and
-`d706f88` — the read-modify-write critical section, vector ownership,
-cross-connection dedup serialisation, and connection cleanup on failure and
-cancellation — each changed between roughly 1,000 and 2,500 lines apiece
-(997 to 2,471 insertions, by commit). The entries above are not a closed
-inventory of these four commits' effects.
+**The entries above are not a complete inventory of what changed.**
 A reader whose store is subclassed, hooked, wrapped in `suspend_auto_commit()`,
 or driven from more than one task in a combination not covered above should
 test that exact combination directly — treating its absence from this list
@@ -1562,7 +1493,7 @@ as a clean bill is not a conclusion this section supports.
 
 **A merge restore into a journalled target can now refuse instead of
 silently replacing data — the journalled-merge collision gate.** No schema
-change; this is `0b73414`.
+change.
 
 **Who is affected.** Anyone who has journaling on (`journal.enabled: true` in
 config, or a store constructed with `journal_enabled=True`) and restores a
