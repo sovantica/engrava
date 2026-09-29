@@ -240,8 +240,7 @@ NUMERIC_CASES: list[NumericFieldCase] = [
         is_int=False,
         out_of_range=2.0,
     ),
-    # ``reflection_topk_cap`` is a [0.0, 1.0] fraction; 1.5 must be rejected
-    # (it was wrongly accepted while validated as a plain non-negative float).
+    # ``reflection_topk_cap`` is a [0.0, 1.0] fraction; 1.5 must be rejected.
     NumericFieldCase(
         "search.reflection_topk_cap",
         SearchConfig,
@@ -316,7 +315,7 @@ class NonMappingCase(NamedTuple):
 
 
 # Every YAML section must fail loudly when it is not a mapping — including
-# ``extensions.vector`` and ``hooks``, which previously retained defaults silently.
+# ``extensions.vector`` and ``hooks``.
 NON_MAPPING_CASES: list[NonMappingCase] = [
     NonMappingCase("database", ("database",), r"database.*mapping"),
     NonMappingCase("extensions", ("extensions",), r"extensions.*mapping"),
@@ -395,8 +394,7 @@ class CollectionCase(NamedTuple):
 
 
 # Fields that take a list/tuple/set of strings. A bare ``str`` iterates into
-# characters and must be rejected on both paths (the direct path previously
-# accepted it silently).
+# characters and must be rejected on both paths.
 STR_COLLECTION_CASES: list[CollectionCase] = [
     CollectionCase(
         "gates.cluster_allowed_types",
@@ -512,7 +510,7 @@ class TestFiniteFloatParity:
 
 
 class TestNonConfigErrorEscapes:
-    """Paths that once escaped as ``TypeError`` / ``AttributeError`` now raise ``ConfigError``."""
+    """Each of these inputs raises ``ConfigError``."""
 
     def test_derive_gates_int_enabled(self) -> None:
         with pytest.raises(ConfigError, match="enabled"):
@@ -535,7 +533,7 @@ class TestNonConfigErrorEscapes:
 
 
 class TestNewlyValidatedDataclasses:
-    """Dataclasses that gained direct-construction validation reject bad values.
+    """Dataclasses with direct-construction validation reject bad values.
 
     The nested-type and ``Path`` checks have no YAML analogue — the loader
     structurally produces the right types — so these assert the direct path alone.
@@ -661,7 +659,7 @@ class TestDreamingNestedTypeParity:
 
 
 class TestYamlTypeErrorNormalized:
-    """Malformed YAML that once leaked ``TypeError`` now raises ``ConfigError``."""
+    """Malformed YAML raises ``ConfigError``."""
 
     def test_embeddings_provider_list(self, tmp_path: Path) -> None:
         with pytest.raises(ConfigError, match="provider"):
@@ -1077,13 +1075,11 @@ _CONFIG_CLASS_NAMES: frozenset[str] = frozenset(
 
 
 def _discovered_dataclasses() -> dict[str, type]:
-    """Every dataclass in the installed package, found by walking it.
+    """Dataclasses defined at module level in the installed package, found by walking it.
 
-    Enumerating one module is how the previous version of this test missed two
-    configuration classes that live elsewhere. This walks the whole package, so
-    a configuration class added in any module is discovered the moment it
-    exists — and then has to be classified, because the partition below is
-    asserted to be exact.
+    This walks the whole package rather than enumerating one module. A
+    configuration class it finds has to be classified, because the partition
+    below is asserted to be exact.
 
     ``walk_packages`` enumerates a package's *sub*modules and never the package
     module itself, so ``engrava`` is inspected explicitly: a dataclass defined
@@ -1091,7 +1087,7 @@ def _discovered_dataclasses() -> dict[str, type]:
     otherwise be invisible to the whole partition.
 
     Returns:
-        Fully-qualified name to class, for every dataclass under ``engrava``.
+        Fully-qualified name to class.
 
     """
     found: dict[str, type] = {}
@@ -1407,14 +1403,11 @@ class _EntryThatRefusesToBeHashed:
 class TestHostileContainersAreRefusedNotObeyed:
     """A container that fights being read is refused with the typed error.
 
-    This does **not** assert that no caller code runs — that property was
-    claimed twice on this branch and was false both times, and claiming it is
-    the exact defect this work exists to remove. What is asserted is narrower
-    and true: the dispatches the sweep *can* avoid it does avoid (containers are
-    read through the unbound built-in iterators over their real storage, and one
-    is rebuilt only when its entries have decoded to exact built-ins whose
-    ``__hash__`` is the built-in one), and anything that still escapes leaves as
-    the refusal validation would have produced.
+    This does **not** assert that no caller code runs — that is not a property
+    the sweep can hold. What is asserted is narrower and true: the dispatches
+    the sweep *can* avoid it does avoid (containers are read through the unbound
+    built-in iterators over their real storage), and anything that still
+    escapes leaves as the refusal validation would have produced.
     """
 
     def test_a_container_that_refuses_to_be_iterated_is_still_rejected_cleanly(self) -> None:
@@ -1467,7 +1460,7 @@ class TestHostileContainersAreRefusedNotObeyed:
 class TestConfigClassesRefuseSubclassing:
     """A configuration class cannot be subclassed, and says so at the definition.
 
-    This is the fix for the attack no reading discipline can survive. A **data
+    This is the guard against an attack no reading discipline can survive. A **data
     descriptor** installed over a field answers benign values while the object
     is decoded and validated, then different ones for ever after; nothing
     raises, so no fail-closed guard fires, and the sweep's write-back is fed to
@@ -1640,14 +1633,7 @@ class TestTheSweepFailsClosed:
     Reading an arbitrary object's state in Python cannot be done with zero
     dispatch — a metaclass, a data descriptor and ``isinstance`` itself all
     consult something the caller can define — so "no caller code runs" is not a
-    property this could hold, and it is not claimed anywhere any more.
-
-    Fail-closed is the guard behind the real fix, not the fix. On a
-    configuration class the attack cannot start, because such a class refuses to
-    be subclassed and a descriptor needs a subclass to be installed on. What is
-    pinned here is the behaviour of the sweep itself for anything else that
-    calls it: whatever runs, the outcome is a typed refusal and never an object
-    that should not have been built.
+    property this could hold.
     """
 
     def test_a_raising_data_descriptor_produces_a_configuration_error(self) -> None:

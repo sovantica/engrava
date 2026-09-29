@@ -164,9 +164,7 @@ class DreamingGates:
         cluster_allowed_types: Thought types eligible to enter the
             agglomerative clustering candidate pool. Defaults to
             ``("OBSERVATION",)`` so REFLECTIONs created in earlier
-            cycles are NOT re-clustered into meta-reflections
-            (fixes meta-cascade pathology and cuts the O(n²) cost
-            of cluster buildup across cycles by ~30-45%). Operators
+            cycles are NOT re-clustered into meta-reflections. Operators
             who explicitly want meta-consolidation can pass
             e.g. ``("OBSERVATION", "REFLECTION")``.
         clustering_min_new_candidates: Minimum number of new eligible
@@ -897,9 +895,7 @@ class HygienePolicyConfig:
             thought — required **in addition to** ``gc_min_archive_age_cycles``.
             A thought is GC-eligible only once it has been hygiene-archived for at
             least this many seconds of real time
-            (``archived_at <= now - gc_restore_window_seconds``), so a bulk /
-            fast-cycling store cannot permanently delete a just-archived thought
-            before any real-time chance to ``restore_thought`` it. Measured off
+            (``archived_at <= now - gc_restore_window_seconds``). Measured off
             the explicit ``archived_at`` column; a hygiene-archived row that
             predates that column (``archived_at`` is ``None``) is never GC-eligible
             while this window is active (fail closed). Default ``2592000``
@@ -1857,9 +1853,8 @@ def load_config(path: str | Path) -> EngravaConfig:
 
     if not isinstance(raw, dict):
         # Names the offending value itself, not just its type -- a bare
-        # scalar document (e.g. a config file containing only `hello`) used
-        # to be reported as "got str", which named the type but dropped the
-        # value that actually appeared in the file.
+        # scalar document (e.g. a config file containing only `hello`) is
+        # reported as "got str: 'hello'".
         msg = f"Config must be a YAML mapping (dict), got {type(raw).__name__}: {raw!r}"
         raise ConfigError(msg)
 

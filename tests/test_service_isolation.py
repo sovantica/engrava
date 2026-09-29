@@ -566,18 +566,16 @@ class TestEngravaManager:
     ) -> None:
         """Cancelling ``get_store`` mid-init must not leak the aiosqlite worker.
 
-        ``_create_store``'s cleanup used to be ``except Exception``, which
-        does not catch ``asyncio.CancelledError`` (it derives from
-        ``BaseException``, not ``Exception``). A cancellation while an
-        ``await`` inside that block is suspended -- ``ensure_schema()``
-        here, driven by an ``asyncio.Event`` so the cancellation lands
-        deterministically while the connection is still open -- used to skip
-        ``await db.close()`` entirely and strand aiosqlite's connection
-        worker thread. That thread is not a daemon, so a stranded one blocks
-        interpreter shutdown exactly like the corrupt-file hang this whole
-        fix addresses, and it matters most at service shutdown -- exactly
-        when things get cancelled. This asserts the actual invariant -- no
-        surviving worker thread -- rather than a proxy for it.
+        ``_create_store``'s cleanup handler catches ``BaseException``, so it
+        also runs for ``asyncio.CancelledError`` (which derives from
+        ``BaseException``, not ``Exception``) arriving while an ``await``
+        inside the guarded block is suspended -- ``ensure_schema()`` here,
+        driven by an ``asyncio.Event`` so the cancellation lands
+        deterministically while the connection is still open. The handler
+        must close the connection: aiosqlite's connection worker thread is
+        not a daemon, so a stranded one blocks interpreter shutdown. This
+        asserts the actual invariant -- no surviving worker thread -- rather
+        than a proxy for it.
         """
         data_dir = tmp_path / "services"
 
@@ -628,10 +626,8 @@ class TestEngravaManager:
         finally:
             # However the assertion above turns out, never leave a leaked
             # worker thread running past this test. It is not a daemon, so
-            # if it survived, it would otherwise block interpreter shutdown
-            # for the entire suite -- turning "this one test fails" into
-            # "the process hangs forever" for every test after it, exactly
-            # the failure mode this whole fix exists to avoid.
+            # if it survived, it would otherwise block interpreter shutdown,
+            # turning "this one test fails" into "the process hangs at exit".
             if conn._thread.is_alive():
                 stopped = conn.stop()
                 if stopped is not None:
@@ -692,16 +688,12 @@ class TestEngravaManager:
     ) -> None:
         """A close failure during cleanup must not replace the original error.
 
-        ``_create_store``'s cleanup handler used to do
-        ``await db.close(); raise`` unconditionally: the bare ``raise``
-        only re-raises the original failure when the close itself
-        succeeds. If ``db.close()`` also raised, its exception became the
-        one that propagated, and the original -- here, a deliberate
-        ``ensure_schema()`` failure, but in production a ``ConfigError``
-        or a cancellation -- was lost. Now routed through
+        ``_create_store``'s cleanup handler closes the connection through
         ``_close_quietly``, which logs a close failure instead of letting
-        it take over. This makes both fail at once and asserts the caller
-        still sees the original.
+        it propagate in place of the original error -- here, a deliberate
+        ``ensure_schema()`` failure, but in production a ``ConfigError``
+        or a cancellation. This makes both fail at once and asserts the
+        caller still sees the original.
 
         The original error escaping is necessary but not sufficient: a
         regression that stops attempting the cleanup close entirely would
@@ -778,12 +770,10 @@ class TestEngravaManager:
     ) -> None:
         """A close failure while peeking must not replace the read failure that caused it.
 
-        ``peek_schema_version`` used to do
-        ``try: ... finally: await conn.close()`` unconditionally: if the
-        ``PRAGMA`` read failed and the close also failed, the close's
-        exception replaced the read's -- exactly the defect
-        ``_close_quietly`` exists to prevent. Now routed through
-        ``_close_quietly`` on the failure path, mirroring
+        On the failure path ``peek_schema_version`` closes its connection
+        through ``_close_quietly``, so if the ``PRAGMA`` read failed and the
+        close also fails, the close failure is logged and the read's
+        exception is the one that propagates. Mirrors
         ``test_create_store_failure_survives_a_failing_cleanup_close`` above.
         """
         data_dir = tmp_path / "services"
@@ -916,15 +906,14 @@ class _SynchronouslyFailingConnection:
 class TestCloseQuietlyCancellation:
     """``_close_quietly`` must close the connection even under cancellation.
 
-    ``await conn.close()`` is a suspension point, so the original
-    ``try: await conn.close() / except Exception`` body had a gap of its
-    own: a cancellation landing while the close itself is suspended is a
-    ``BaseException``, not an ``Exception``, escapes uncaught -- correctly,
-    cancellation must propagate -- but leaves the close abandoned
-    mid-flight, stranding aiosqlite's non-daemon connection worker thread
-    exactly like the original corrupt-file hang. These exercise the helper
-    directly, without a real database, since the failure is about the shape
-    of the exception handler rather than anything sqlite-specific.
+    ``await conn.close()`` is a suspension point. A cancellation landing
+    while the close itself is suspended is a ``BaseException``, not an
+    ``Exception``, so a bare ``try: await conn.close() / except Exception``
+    would let it escape -- correctly, cancellation must propagate -- but
+    leave the close abandoned mid-flight, stranding aiosqlite's non-daemon
+    connection worker thread. These exercise the helper directly, without a
+    real database, since what matters is the shape of the exception handler
+    rather than anything sqlite-specific.
     """
 
     async def test_the_close_still_completes_when_cancelled_mid_close(self) -> None:
@@ -933,8 +922,8 @@ class TestCloseQuietlyCancellation:
         The cancellation is delivered only after ``conn.close()`` is
         observed to have actually started (``started.wait()``), and the
         close is held open (``may_finish`` stays unset) while the
-        cancellation lands, so this exercises the exact window the
-        escaped-BaseException gap lived in, without depending on timing.
+        cancellation lands, so this exercises a cancellation landing while
+        the close is suspended, without depending on timing.
 
         While the close is held, the cleanup task must **not** be done: it
         has to keep waiting for the shielded close rather than hand the
@@ -975,13 +964,11 @@ class TestCloseQuietlyCancellation:
     async def test_an_ordinary_exception_from_close_is_still_swallowed_and_logged(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """The documented, uncancelled behaviour must be unchanged.
+        """An ordinary exception from ``close()`` is logged and swallowed.
 
-        This is the control for the cancellation fix above: a close() that
+        This is the control for the cancellation tests above: a close() that
         raises a plain ``Exception`` -- no cancellation involved at all --
-        must still be logged and swallowed exactly as before, never
-        propagated. If this regresses, the fix for the cancellation gap
-        went too far.
+        is logged and swallowed, never propagated.
         """
         conn = _FailingConnection()
         with caplog.at_level(logging.WARNING):
@@ -1055,15 +1042,14 @@ class TestRunCleanupStepQuietlyCancellation:
 class TestAexitPreservesBodyException:
     """``SqliteEngravaCore.__aexit__`` must not let a close failure replace the body's.
 
-    ``__aexit__`` used to do a bare ``await self.close()``. If the
-    ``async with`` body already raised and ``close()`` then raised its own
-    ordinary exception, Python's own ``with``-statement semantics make the
-    ``__aexit__`` exception the one the caller sees -- the body's becomes
-    only its ``__context__`` -- exactly the defect ``_close_quietly``
-    exists to prevent for a raw ``conn.close()``, here one layer up at
+    If the ``async with`` body already raised and ``close()`` then raised
+    its own ordinary exception, Python's own ``with``-statement semantics
+    would make the ``__aexit__`` exception the one the caller sees -- the
+    body's becomes only its ``__context__`` -- the outcome ``_close_quietly``
+    prevents for a raw ``conn.close()``, here one layer up at
     :meth:`SqliteEngravaCore.close` itself, which ``__aexit__`` cannot
     route through that helper directly since it has no raw connection of
-    its own.
+    its own. ``__aexit__`` logs the close failure instead.
     """
 
     async def test_body_exception_survives_a_failing_close(self, tmp_path: Path) -> None:
@@ -1480,7 +1466,8 @@ class TestEngravaConfigServices:
 
 
 # ------------------------------------------------------------------
-# Regression tests for quality-gap fixes
+# Re-embed provider requirement, snapshot service guard, get_store concurrency, manager
+# lifecycle lock ordering, default service, and service_exists
 # ------------------------------------------------------------------
 
 
@@ -1864,13 +1851,10 @@ class TestGetStoreConcurrency:
 class TestManagerLifecycleLockOrdering:
     """``get_store``, ``delete_service`` and ``close_all`` share one lock.
 
-    Before this fix, ``get_store`` was the only one of the three that ever
-    took ``self._lock`` -- ``delete_service`` and ``close_all`` touched
-    ``self._stores`` (and, for delete, the filesystem) with no coordination
-    at all. Each test below barrier-controls one of the three pairwise
-    overlaps this exposed, using the same started/may-finish ``asyncio.Event``
-    technique the existing cancellation tests above use, so the interleaving
-    is deterministic rather than timing-dependent.
+    Each test below barrier-controls one overlap between them, using the
+    same started/may-finish ``asyncio.Event`` technique the cancellation
+    tests above use, so the interleaving is deterministic rather than
+    timing-dependent.
     """
 
     async def test_create_vs_close_all_closes_the_in_flight_store(
@@ -1878,15 +1862,10 @@ class TestManagerLifecycleLockOrdering:
     ) -> None:
         """``close_all`` must not finish while a same-named creation is in flight.
 
-        Before this fix, ``close_all`` never looked at an in-flight
-        creation at all: if ``get_store`` was suspended between opening the
-        connection and inserting it into the cache, ``close_all`` would run
-        to completion first, and the connection created afterward was never
-        closed -- it outlived shutdown. Now ``close_all`` snapshots
-        ``_creating`` under the lock and waits for anything captured there
-        to land before it can return, so the store this test stalls
-        mid-creation is guaranteed to be closed by the time both calls
-        finish, regardless of which one is "first".
+        ``close_all`` snapshots ``_creating`` under the lock and waits for
+        anything captured there to land before it can return, so the store
+        this test stalls mid-creation is guaranteed to be closed by the time
+        both calls finish, regardless of which one is "first".
         """
         data_dir = tmp_path / "lock-create-close"
         mgr = EngravaManager(data_dir=data_dir)
@@ -1938,15 +1917,10 @@ class TestManagerLifecycleLockOrdering:
     ) -> None:
         """``delete_service`` must not race a same-named creation's file write.
 
-        Before this fix, ``delete_service`` checked
-        ``if name in self._stores`` with no lock at all: while a same-named
-        ``_create_store`` was mid-flight (already holding the file open and
-        writing its schema, but not yet in the cache), ``delete_service``
-        would see "not cached", conclude the database already exists as a
-        finished file, and unlink it out from under the write in progress.
-        Now ``delete_service`` sees the in-flight creation in ``_creating``
-        and waits for it to land before it re-checks, so the file it
-        unlinks is always the one the finished creation actually wrote.
+        While a same-named ``_create_store`` is mid-flight (already holding
+        the file open and writing its schema, but not yet in the cache),
+        ``delete_service`` sees the in-flight creation in ``_creating`` and
+        waits for it to finish before it re-checks.
         """
         data_dir = tmp_path / "lock-create-delete"
         mgr = EngravaManager(data_dir=data_dir)
@@ -1999,16 +1973,16 @@ class TestManagerLifecycleLockOrdering:
     ) -> None:
         """Closing one cached store must not corrupt or block another's creation.
 
-        Before this fix, ``close_all`` iterated ``self._stores.items()``
-        directly with no snapshot: an insertion into ``self._stores`` from
-        a concurrent ``get_store()`` call for a different name, landing
-        during an ``await store.close()`` in that loop, raised
-        ``RuntimeError: dictionary changed size during iteration`` on the
-        next iteration step. This stalls the *close* of an already-cached
-        store and, while that close is still in flight, creates a second,
-        unrelated service -- asserting both that no ``RuntimeError`` occurs
-        and that the second service ends up fully alive and cached
-        afterward, untouched by the close of the first.
+        ``close_all`` iterates a snapshot of ``self._stores`` rather than the
+        live cache, so an insertion into ``self._stores`` from a concurrent
+        ``get_store()`` call for a different name, landing during an
+        ``await store.close()`` in that loop, cannot raise
+        ``RuntimeError: dictionary changed size during iteration``. This
+        stalls the *close* of an already-cached store and, while that close
+        is still in flight, creates a second, unrelated service -- asserting
+        both that no ``RuntimeError`` occurs and that the second service ends
+        up fully alive and cached afterward, untouched by the close of the
+        first.
         """
         data_dir = tmp_path / "lock-close-create"
         mgr = EngravaManager(data_dir=data_dir)
@@ -2445,8 +2419,7 @@ class TestConfigObjectsMustBeExactlyTheirClass:
 class TestStoreConstructorParametersAreOwned:
     """The store takes raw numbers straight from its caller, not only via config.
 
-    The configuration sweep never sees these, which is why the whole class of
-    defect reappeared here one layer out. The cadence in particular decides
+    The configuration sweep never sees these. The cadence in particular decides
     whether an automatic cleanup runs at all, and under the ``delete`` strategy
     that cleanup destroys rows.
     """

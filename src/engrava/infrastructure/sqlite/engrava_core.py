@@ -281,12 +281,12 @@ class _DeleteAtomicResult:
 
     Attributes:
         deleted: Whether the parent thought row was actually removed.
-        wrote_anything: Whether this call's own return leaves any row's
-            change intact — the parent, a swept orphan child, or both. A
-            change a trigger made and this call then rolled back inside its
-            own savepoint (a vetoed parent delete, see
-            :meth:`SqliteEngravaCore._delete_thought_atomic`) does not count,
-            even though a row was written for part of the call's execution.
+        wrote_anything: Whether the connection's ``total_changes`` rose across
+            the parent delete and the child sweep. A vetoed parent delete,
+            whose savepoint this call rolls back (see
+            :meth:`SqliteEngravaCore._delete_thought_atomic`), reports
+            ``False``, even though a trigger may have written a row for part
+            of the call's execution.
 
     """
 
@@ -558,8 +558,7 @@ class _QuarantinedConnection:
     fails hard on **any** core-initiated DB operation — ``commit``, ``execute``,
     ``cursor``, a read, or one of the direct-commit sites that bypass the
     :meth:`SqliteEngravaCore._maybe_commit` flag guard — **independent of whether
-    the physical connection actually closed**. This is what makes quarantine
-    terminal by construction rather than by a best-effort ``close()`` succeeding.
+    the physical connection actually closed**.
 
     ``close`` is a no-op so store shutdown stays graceful after quarantine.
     Private to this module; never part of the public API.
@@ -856,7 +855,7 @@ def _provider_dimension(provider: EmbeddingProviderProtocol) -> int:
     message that says the attribute is a required protocol member and what to
     add.
 
-    A conformant provider is read **exactly once**, as before — the member is
+    A conformant provider is read **exactly once** — the member is
     accessed in the ``try`` and everything else lives in the ``except``.
     ``hasattr(provider, ...)`` would be the shorter spelling and is deliberately
     not used: it evaluates the property to answer, so the read would happen twice
@@ -1024,11 +1023,7 @@ _SUPPRESS_SEARCH_METRICS: contextvars.ContextVar[bool] = contextvars.ContextVar(
 #: unit early with its own commit. Deliberately **not** the instance-wide
 #: ``_skip_auto_commit_depth``: that counter is shared by every task on the
 #: store, so raising it for the length of a hygiene pass would make an
-#: unrelated task's guarded write see a foreign window as its own — the same
-#: shape of bug ``_dispatch_derivation`` used to have before it gained its own
-#: task-local marker (see ``_current_auto_commit_window``). A ``ContextVar``
-#: keeps the suppression visible only to the task running the pass, exactly
-#: like ``_IN_DERIVATION`` / ``_SUPPRESS_SEARCH_METRICS`` above.
+#: unrelated task's guarded write see a foreign window as its own.
 _SUPPRESS_NESTED_AUTO_COMMIT: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "engrava_suppress_nested_auto_commit",
     default=False,
@@ -1235,13 +1230,11 @@ async def _run_cleanup_step_quietly(
     propagating" treatment for each step, and this is that treatment,
     written once -- shared across the infrastructure and CLI layers rather
     than copied, unlike :func:`_close_quietly` and its CLI counterpart
-    (:mod:`engrava.cli.main`'s own ``_close_quietly``), which predate this
-    helper and already drifted from each other once (the CLI copy gained a
-    hostile-``__str__``-safe render and a cancellation/SIGINT-delivery fix
-    the infrastructure copy still lacks). ``step`` is a zero-argument
-    callable rather than an already-created coroutine so that a synchronous
-    failure -- raised by calling it, before anything is scheduled -- is also
-    caught here rather than escaping before the shield is even in place.
+    (:mod:`engrava.cli.main`'s own ``_close_quietly``), which are separate
+    copies. ``step`` is a zero-argument callable rather than an
+    already-created coroutine so that a synchronous failure -- raised by
+    calling it, before anything is scheduled -- is also caught here rather
+    than escaping before the shield is even in place.
 
     An ordinary failure (not a cancellation) is logged and swallowed: the
     caller already knows an exception is propagating through it, and this
@@ -1423,7 +1416,7 @@ class _TaskReentrantLock:
     :meth:`SqliteEngravaCore.suspend_auto_commit` window — blocks on itself and
     hangs forever. This wrapper tracks the *owning task* and a nesting depth so
     the owning task's own nested acquisitions are free, while every other task
-    still blocks on the underlying lock exactly as before. Getting this wrong
+    blocks on the underlying lock. Getting this wrong
     turns a silent data loss into a hang, which is not an improvement — so the
     identity check is on the task object itself (``asyncio.current_task()``),
     never on anything the caller could pass or forge.
@@ -1765,18 +1758,17 @@ class SqliteEngravaCore:
         # (e.g. ``_write_readback_savepoint``, including a derived child's row
         # or edge insert) could not unwind its savepoint after it failed
         # (raised or was cancelled), so the long-lived connection may still
-        # hold an open transaction. Quarantine is terminal by construction:
+        # hold an open transaction. Quarantine has three parts:
         #   * the flag makes guarded entry points + ``_maybe_commit`` fail fast;
         #   * ``_db`` is swapped for a ``_QuarantinedConnection`` proxy so every
         #     core-initiated op raises regardless of physical close; and
-        #   * the shared revocation token (below) makes every *other* holder of
-        #     the real connection (the JournalWriter) fail hard too.
+        #   * the shared revocation token (below) is revoked, so the
+        #     JournalWriter's methods that check it raise.
         # Never cleared — recovery requires a fresh connection + store.
         self._connection_quarantined: bool = False
         self._quarantine_reason: str | None = None
-        # Shared with the JournalWriter (and any future direct-connection holder)
-        # so quarantine revokes them all synchronously, independent of the
-        # best-effort physical close.
+        # Shared with the JournalWriter so quarantine can revoke the token
+        # synchronously, independent of the best-effort physical close.
         self._revocation = ConnectionRevocationToken()
         # The task performing the real connection's *physical* close, however
         # it started -- quarantine's own detached best-effort close, or an
@@ -2682,8 +2674,7 @@ class SqliteEngravaCore:
         3. **The task finished within the bound, with no cancellation of this
            call's own drain**: a genuine outcome is surfaced only when this
            call is the one that created the task (``is_new_task``) -- a
-           piggybacked task's outcome is never actionable to this caller,
-           exactly as before this bound existed.
+           piggybacked task's outcome is never actionable to this caller.
 
         Args:
             task: The physical-close task that was just drained.
@@ -2745,7 +2736,7 @@ class SqliteEngravaCore:
                 # for the rule this follows.
                 self._log_close_failure_over_pending_cancellation(task)
         # else: piggybacking on a task that finished within this call's own
-        # bound -- outcome discarded, exactly as before this bound existed.
+        # bound -- outcome discarded.
         return pending_cancellation
 
     async def __aenter__(self) -> Self:
@@ -3216,8 +3207,7 @@ class SqliteEngravaCore:
         A genuinely fresh file — no core table exists at all — skips the
         comparison entirely rather than opening a disposable reference
         connection it would never need: that keeps the common case (every
-        brand-new database) exactly as cheap, and as free of incidental
-        connection churn, as before this check existed.
+        brand-new database) free of that extra connection.
 
         When at least one core table does already exist, this bootstraps a
         disposable, provably-fresh reference database from ``schema_sql``
@@ -3480,7 +3470,7 @@ class SqliteEngravaCore:
         edge-touching migrations guard theirs — a thought-only database has no
         edge index to build, and the fresh DDL already carries it. Any *other*
         DDL failure propagates rather than being swallowed, so an isolated
-        index-creation error can no longer be recorded as a completed migration.
+        index-creation error cannot be recorded as a completed migration.
         A postcondition assertion confirms the index is present (when the
         ``edge`` table exists) before the loop bumps the version.
         """
@@ -3738,9 +3728,8 @@ class SqliteEngravaCore:
         path. But losing the pragma restore because the rollback ahead of it
         raised would silently leave FK enforcement off for the rest of the
         connection's life, so the pragma restore is wrapped in a plain
-        ``finally`` under the rollback -- the same guarantee the deleted
-        nested-``finally`` shape this whole cleanup replaced used to give --
-        rather than relying only on ``_run_cleanup_step_quietly``'s own
+        ``finally`` under the rollback, rather than relying only on
+        ``_run_cleanup_step_quietly``'s own
         return-a-``CancelledError``-instead-of-raising convention: that
         helper's own shield-then-redraw re-awaits an already-finished task
         through an ``except Exception``, so a rollback that raises a
@@ -3924,8 +3913,7 @@ class SqliteEngravaCore:
             await self._require_index(12, "idx_edge_type_from")
 
         # Retry model: the per-step registry resumes a failed upgrade at the
-        # failed step (an improvement over the old bump-once-at-the-end ladder,
-        # which re-ran the whole tail). The table swaps are atomic within the
+        # failed step. The table swaps are atomic within the
         # SAVEPOINT above and rolled back to it on failure, so a mid-recreate
         # drop never persists; a legacy state that already carries the exact FK
         # is skipped and the required edge index is recreated independently, so
@@ -4269,11 +4257,10 @@ class SqliteEngravaCore:
         UTC-normalised ISO-8601 instant at which the Memory Hygiene loop archived
         a thought, or ``NULL`` when it was not archived by hygiene (a restore
         clears it back to ``NULL``, exactly like ``archived_at_cycle``). It backs
-        the wall-clock restore window: the irreversible GC stage may reap a
-        hygiene-archived thought only once **both** the cycle window
-        (``archived_at_cycle``) and this real-time window have elapsed, so a
-        fast-cycling store can no longer permanently delete a just-archived
-        thought before any real-time chance to restore it.
+        the wall-clock restore window: while ``gc_restore_window_seconds`` is
+        greater than zero, the irreversible GC stage also requires
+        ``archived_at`` to be at least that many seconds old, in addition to
+        the cycle window (``archived_at_cycle``).
 
         The add is guarded against the duplicate-column error exactly as
         ``_migrate_core_v17_to_v18`` guards its own ``ADD COLUMN``, so a database
@@ -4934,11 +4921,9 @@ class SqliteEngravaCore:
         # Held for this whole method, not just by callers that happen to
         # already have it: ``store_embedding`` holds it for its entire body
         # (a free re-entrant no-op here), but ``verify_embedding_model`` — a
-        # public entry point — used to call this with no lock at all, so two
-        # concurrent first-callers could both see no stored model and both
-        # write the lock row. Acquiring it here, in the shared helper, covers
-        # every caller by construction rather than relying on each one to
-        # remember to wrap it.
+        # public entry point — does not, and without the lock two concurrent
+        # first-callers could both see no stored model and both write the lock
+        # row.
         async with self._write_lock:
             # Ensure _metadata table exists (idempotent).
             await self._migrate_core_v4_to_v5()
@@ -5088,13 +5073,11 @@ class SqliteEngravaCore:
         """
         if self._embedding_provider is None:
             return
-        # Read in the order this method has always read: ``model_name`` first,
-        # then the dimension. Only ``dimension`` is translated into a typed
-        # error, so a provider missing ``model_name`` as well still fails on that
-        # member — as it did before — rather than being told about a different
+        # Read ``model_name`` first, then the dimension. Only ``dimension`` is
+        # translated into a typed error, so a provider missing ``model_name``
+        # as well fails on that member rather than being told about a different
         # one. Reversing the order to catch that case would change what a
-        # conformant provider with stateful properties observes, which this
-        # change is required not to do.
+        # conformant provider with stateful properties observes.
         model_name = self._embedding_provider.model_name
         await self._ensure_embedding_model_lock(
             model_name,
@@ -5138,8 +5121,7 @@ class SqliteEngravaCore:
         Batches every write in the block into one transaction: the block
         commits once on clean exit and rolls back entirely on any exception.
 
-        **One writer for the duration of the window — now enforced, not just
-        documented.** This method takes
+        **One writer for the duration of the window.** This method takes
         :attr:`_write_lock` for its entire duration, so a *different* task
         calling any guarded write path on this instance blocks until the
         window closes instead of joining its transaction. The *same* task may
@@ -5159,12 +5141,7 @@ class SqliteEngravaCore:
         :attr:`_skip_auto_commit_depth` counts the nesting, and only the
         **outermost** call's clean exit commits or its exception rolls back;
         an inner call's own exit does neither, and its ``finally`` only
-        decrements the depth rather than clearing it outright. Two failures a
-        plain ``bool`` produced here, now closed: a clean inner block used to
-        commit the outer transaction early (its ``else`` branch committed
-        unconditionally, whatever the nesting), and its ``finally`` used to
-        reset the flag outright, so per-call autocommit resumed for the rest
-        of the outer block even though the outer window was still open.
+        decrements the depth rather than clearing it outright.
 
         Note on the derived-records seam: a create issued inside this block does
         **not** auto-derive (the source is not yet durable and this block owns
@@ -5723,8 +5700,7 @@ class SqliteEngravaCore:
         Args:
             task: The already-scheduled task to drain.
             timeout_seconds: Maximum time to wait for ``task``. ``None`` (the
-                default) waits without a bound, exactly as before this parameter
-                existed.
+                default) waits without a bound.
 
         Returns:
             The last ``CancelledError`` raised into our await, or ``None``. Check
@@ -5823,8 +5799,7 @@ class SqliteEngravaCore:
         Retrieves any exception so the task is never reported as an
         unretrieved-exception; a *cancelled* close task carries no exception to
         retrieve and is left alone (``exception()`` would raise on it). The
-        outcome is irrelevant to correctness — the proxy + token already
-        guarantee terminality — so it is never re-raised.
+        outcome is not re-raised.
 
         Args:
             task: The completed detached close task.
@@ -5836,22 +5811,22 @@ class SqliteEngravaCore:
             task.exception()
 
     async def _quarantine_connection(self, reason: str) -> None:
-        """Make the store terminally unusable, by construction and independent of close.
+        """Quarantine the store's connection without waiting for its physical close.
 
         Kept ``async`` for call-site symmetry with the compensating-rollback flow
         and so the "returns promptly even if close hangs" liveness contract is
         awaitable in tests; it intentionally **awaits nothing** — every step is
         synchronous and the physical close is *detached*.
 
-        Terminal-by-construction, in three synchronous steps (nothing here can be
+        Three synchronous steps (nothing here can be
         cancelled or blocked, so a caller-frame cancellation is never swallowed —
         it is simply delivered at the caller's next await and propagates):
 
         1. Set the flag — guarded entry points and :meth:`_maybe_commit` fail fast
            with a typed :class:`ConnectionQuarantinedError`.
-        2. Revoke the shared :class:`ConnectionRevocationToken` — every *other*
-           holder of the real connection (the :class:`JournalWriter`) fails hard
-           on its next connection-touching method, so it cannot bypass the proxy.
+        2. Revoke the shared :class:`ConnectionRevocationToken` — the
+           :class:`JournalWriter`'s ``append``, ``verify_integrity`` and
+           ``get_entries`` check it and raise :class:`ConnectionQuarantinedError`.
         3. Detach the real connection, swap in a :class:`_QuarantinedConnection`
            proxy (so every core-initiated op raises), and schedule a **bounded,
            detached** best-effort close for resource cleanup — unless
@@ -5860,7 +5835,7 @@ class SqliteEngravaCore:
            entering ``real_conn.close()`` a second time (see :meth:`close`
            for the race two concurrent closes on the same connection can
            hit). Quarantine returns promptly even if that close hangs
-           forever — safety never depends on it. A done-callback consumes
+           forever. A done-callback consumes
            the close outcome so a failure/cancellation is never an
            unretrieved-task warning, and the task is retained so it is not
            GC'd while pending.
@@ -5868,11 +5843,11 @@ class SqliteEngravaCore:
         Idempotent: a second call is a no-op (already quarantined).
 
         Guarantee / limitation: quarantine synchronously revokes *admission* —
-        every NEW operation on the store or its journal fails fast with
-        :class:`ConnectionQuarantinedError`, and direct core connection access is
-        terminal via the proxy — so no write/commit can flush an orphaned
-        transaction, regardless of whether the physical close succeeds. It does
-        NOT retract an operation already admitted before revocation: a reader
+        the core's connection access raises :class:`ConnectionQuarantinedError`
+        through the proxy, and so do the :class:`JournalWriter`'s ``append``,
+        ``verify_integrity`` and ``get_entries`` — so a write or commit does not
+        flush an orphaned transaction whether or not the physical close
+        succeeds. It does NOT retract an operation already admitted before revocation: a reader
         admitted just before revocation may complete its in-flight read on the
         pre-revocation connection — a possibly-stale read, never a commit.
 
@@ -5888,8 +5863,8 @@ class SqliteEngravaCore:
         real_conn = self._db
         self._db = _QuarantinedConnection(reason)  # type: ignore[assignment]  # terminal proxy: every later use must fail
         # Detached best-effort close: schedule and return; do NOT await it, so a
-        # hung close can never block quarantine (safety is already guaranteed by
-        # the proxy + token). Retain the task and consume its result via callback.
+        # hung close does not block quarantine. Retain the task and consume its
+        # result via callback.
         # But only schedule it if nothing has already initiated the physical
         # close of this same real connection -- self._quarantine_close_task
         # doubles as that shared "already in progress" marker, checked and set
@@ -6197,8 +6172,7 @@ class SqliteEngravaCore:
     #: one; the public docstrings say both rather than implying a general
     #: staleness check. ``updated_cycle`` is not this guard's column: it is a
     #: cognitive-recency signal nothing in this store advances on its own, and
-    #: is not safe to overload as a write counter (see the module history for
-    #: why the two were once, incorrectly, the same column).
+    #: is not safe to overload as a write counter.
     _CORE_UPDATE_GUARD = "thought_id = ? AND revision = ?"
 
     def _thought_to_core_columns(self, thought: ThoughtRecord) -> dict[str, object]:
@@ -6214,13 +6188,10 @@ class SqliteEngravaCore:
 
         Two columns are absent, for different reasons. ``thought_id``
         identifies the row being updated, so it is correctly not assignable
-        here. ``content_hash`` is a **known defect being preserved, not a
-        design choice**: no update has ever written it, so editing ``content``
-        leaves the stored hash pointing at the superseded text and content-hash
-        deduplication then matches the row on content it no longer holds.
-        Repairing it changes deduplication behaviour and belongs to a change of
-        its own; it is carried unchanged here so this rewrite stays
-        behaviour-preserving.
+        here. ``content_hash`` is not written by any update, so editing
+        ``content`` leaves the stored hash pointing at the superseded text and
+        content-hash deduplication then matches the row on content it no
+        longer holds.
 
         Args:
             thought: The thought record to encode.
@@ -6326,9 +6297,8 @@ class SqliteEngravaCore:
 
         Returns:
             The matching ``ThoughtRecord`` or ``None`` if no row
-            matches.  When more than one row shares the hash (only
-            possible for older data ingested before this fix
-            was deployed) the first match in B-tree order is returned.
+            matches.  When more than one row shares the hash the first
+            match in B-tree order is returned.
 
         """
         cursor = await self._db.execute(
@@ -6491,17 +6461,7 @@ class SqliteEngravaCore:
         batch sees ``in_transaction`` already ``True`` and correctly takes no
         further lock of its own — it is already covered by the one still open.
 
-        **This method commits nothing, on any path.** Inferring, at this
-        guard's own exit, whether a transaction it saw open was still the
-        one it started produced a new defect each time it was tried: a
-        frozen flag went stale the moment a nested write committed early; a
-        live ``in_transaction`` read could not tell this call's own leftover
-        work apart from a different, genuinely concurrent task's; a per-call
-        token protecting that read then made the guard skip a commit some
-        *other* code still depended on it for.
-        The common cause was not any one of those mechanisms — it was asking
-        the guard to know something a shared connection does not expose:
-        which open transaction is "ours". The fix is to stop asking. Whoever
+        **This method commits nothing, on any path.** Whoever
         actually does the write — :meth:`_insert_new_thought_row`,
         :meth:`_increment_confirmation`, :meth:`update_thought` (via
         ``upsert_by_hash``'s matched-row path) — commits its own work, in the
@@ -6528,35 +6488,21 @@ class SqliteEngravaCore:
         connection until something else eventually commits, rolls back, or
         closes it.
 
-        **This rollback used to be able to discard a different, genuinely
-        concurrent task's uncommitted write — closed in-process by an
-        in-process task-reentrant write lock.** A connection has exactly one
-        transaction, so while this call's is open, any other task's write on
-        the same store instance used to join it rather than opening its own,
-        and a rollback at that point took both down together, whether or not
-        this call's own row
-        ever committed first. No amount of bookkeeping inside this guard
-        could change that, because the information needed to tell the two
-        apart — whose write is whose — does not exist below the level of "is
-        a transaction currently open on this connection". The fix is not
-        bookkeeping inside this guard; it is that every caller of this method
-        (:meth:`_create_thought_with_dedup`, :meth:`get_or_create`,
-        :meth:`upsert_by_hash`) now holds :attr:`_write_lock` — the same
+        **This rollback does not discard another task's guarded write.** A
+        connection has exactly one transaction, so a rollback here would take
+        down any other task's write that had joined it. Every caller of this
+        method (:meth:`_create_thought_with_dedup`, :meth:`get_or_create`,
+        :meth:`upsert_by_hash`) holds :attr:`_write_lock` — the same
         task-reentrant lock every other guarded write path on this instance
-        holds — for the whole probe-and-row window, so a different task's
-        write can no longer even start until this window has closed. See
+        holds — for the whole probe-and-row window, so a different task cannot
+        take that lock until this window has closed. See
         ``docs/concurrency.md`` ("What is guaranteed" under "Many async
-        tasks, one store") for the caller-facing statement of the fix, and
-        its "Busy timeout" section for the "riding along" exposure this
-        closed. **This closes it in-process only** — across *connections*
-        the same exposure is unchanged (see
-        ``docs/concurrency.md#multiple-stores-one-database-file``): that
-        needs a transaction-level mechanism this store does not have yet.
+        tasks, one store") for the caller-facing statement.
 
-        **Known residual gap, separate from the one above.** If a caller
-        already holds an open transaction on this connection through means
-        this store does not control — a raw ``BEGIN`` issued directly against
-        it, with nothing written yet — ``self._db.in_transaction`` is already
+        **Known residual gap.** If a caller already holds an open transaction
+        on this connection through means this store does not control — a raw
+        ``BEGIN`` issued directly against it, with nothing written yet —
+        ``self._db.in_transaction`` is already
         ``True`` when this method is entered, so no ``BEGIN IMMEDIATE`` is
         taken: SQLite refuses a ``BEGIN`` inside an already-open transaction,
         so there is no way to acquire the *cross-connection* write lock up
@@ -6624,20 +6570,14 @@ class SqliteEngravaCore:
         own window began — so when it is ``True``, no transaction of any
         kind, the caller's or anyone else's, was open at that point, and the
         ``BEGIN IMMEDIATE`` that may now be open can only be the one this
-        probe itself opened. There is nothing ambiguous left to protect: an
-        additional test on ``self._skip_auto_commit`` (whether this call
-        happens to be nested inside a caller's own
-        :meth:`suspend_auto_commit` window) used to gate the rollback here
-        too, on the theory that "nested" implies "someone else's
-        transaction". It does not — a caller's window can be open with
-        *nothing yet written to it* (e.g. before its first guarded write), in
-        which case ``opened_transaction`` is still ``True`` and the
-        transaction is still this probe's own. Requiring
-        ``not self._skip_auto_commit`` on top of that left this probe's
-        read-only ``BEGIN IMMEDIATE`` — a cross-connection write reservation —
-        open across the seam call in exactly that case: a second connection's
-        own write blocks, and a same-call callback that writes can deadlock
-        or time out on it. When ``opened_transaction`` is ``False`` instead
+        probe itself opened. There is nothing ambiguous left to protect, so
+        no test on ``self._skip_auto_commit`` (whether this call happens to
+        be nested inside a caller's own :meth:`suspend_auto_commit` window)
+        is made: "nested" does not imply "someone else's transaction" — a
+        caller's window can be open with *nothing yet written to it* (e.g.
+        before its first guarded write), in which case ``opened_transaction``
+        is still ``True`` and the transaction is still this probe's own.
+        When ``opened_transaction`` is ``False`` instead
         (a transaction was already open before this probe began — e.g. this
         call is itself nested inside the *same* task's own
         :meth:`suspend_auto_commit` window, where an earlier guarded write
@@ -6678,12 +6618,11 @@ class SqliteEngravaCore:
         *after* the row is written, so a rejection there does not stop the
         write unless the exception leaves an enclosing ``suspend_auto_commit()``
         window and rolls it back, and an enrichment there reaches the caller's
-        returned record but never the stored one (see ``docs/upgrade.md``,
-        "0.6 -> 0.7", for the measured failure modes). Overriding ``create_thought`` itself
-        silently stopped covering ``get_or_create`` / ``upsert_by_hash`` once
-        their miss branch was rewritten to call the internal insertion step
-        directly instead of the public, overridable method. This seam is the
-        restored, and now uniform, replacement for that override point.
+        returned record but never the stored one. Overriding
+        ``create_thought`` itself does not cover ``get_or_create`` /
+        ``upsert_by_hash``, whose miss branch calls the internal insertion
+        step directly instead of the public, overridable method. This seam is
+        the uniform override point for all of them.
 
         **Invocation count — pinned per entry point, not "once per row":**
 
@@ -6692,9 +6631,8 @@ class SqliteEngravaCore:
           whether the call goes on to insert, to bump
           an existing row's ``confirmation_count`` (``deduplicate=True`` hit),
           or (``deduplicate=False``) always inserts. A direct call has no way
-          to know in advance which of those it will be, so — matching what a
-          subclass override of the whole method could always do before this
-          seam existed — it runs once either way.
+          to know in advance which of those it will be, so it runs once
+          either way.
         * :meth:`get_or_create` / :meth:`upsert_by_hash` — **zero** times on a
           stable, pre-existing hit (their exploratory probe resolves the call
           before this method is ever reached — an idempotent "ensure it
@@ -6722,14 +6660,14 @@ class SqliteEngravaCore:
         :meth:`upsert_by_hash` release ``_write_lock``, ``_dedup_lock``, and
         (via :meth:`_end_exploratory_probe`) their own ``BEGIN IMMEDIATE``
         *before* calling this, and only reacquire everything afterward, from
-        scratch, for the decisive probe. This is deliberate: restoring a call
-        to the public ``create_thought()`` from *inside* an already-locked
-        dedup window (a naive, rejected shape for this fix) runs auto-embed,
-        cleanup, ``on_store`` and derivation while still holding
-        ``_dedup_lock`` — a plain lock with no legitimate reentrant use — so a
-        hook that calls back into a dedup entry point on the *same task*
-        raises :class:`~engrava.domain.exceptions.DedupLockReentryError`
-        rather than blocking on it. This call's own machinery does not hold
+        scratch, for the decisive probe. This is deliberate: a call to the
+        public ``create_thought()`` from *inside* an already-locked dedup
+        window would run auto-embed, cleanup, ``on_store`` and derivation
+        while still holding ``_dedup_lock`` — a plain lock with no
+        legitimate reentrant use — so a hook that calls back into a dedup
+        entry point on the *same task* would raise
+        :class:`~engrava.domain.exceptions.DedupLockReentryError` rather
+        than blocking on it. This call's own machinery does not hold
         ``_dedup_lock`` while it awaits this seam, so a recursive call *from
         inside this method* does not contend for a ``_dedup_lock`` this call
         took. The same lock's reentry guard exists for a different call site:
@@ -6832,13 +6770,13 @@ class SqliteEngravaCore:
         instance** with identical ``content`` never race past the existence
         probe, and additionally serialises that same window across
         *connections* with :meth:`_serialize_dedup_probe` (``BEGIN
-        IMMEDIATE``), so a second store on the same database file can no
-        longer insert between this call's probe and its insert — see that
-        method's docstring for its one remaining residual gap (a caller
+        IMMEDIATE``), so a second store on the same database file cannot
+        insert between this call's probe and its insert — see that
+        method's docstring for its one residual gap (a caller
         holding a raw, unmediated transaction on the connection). The other
-        gap that docstring documents — a genuinely concurrent, unrelated
-        task's write riding along with this call's own commit — is closed
-        here by :attr:`_write_lock` (below). On a miss, the row is inserted
+        exposure that docstring describes — a different task's write joining
+        this call's transaction — is closed here by :attr:`_write_lock`
+        (below). On a miss, the row is inserted
         directly via
         :meth:`_insert_new_thought_row` (not by recursing into
         ``create_thought``) so only the probe and the insert run inside the
@@ -6872,16 +6810,14 @@ class SqliteEngravaCore:
         level:** the probe-then-insert/bump window is held under
         :attr:`_write_lock` in
         addition to ``_dedup_lock`` — the latter blocks a *second* call to one
-        of the three dedup methods, the former now blocks *every* other
-        guarded write on this instance, closing the gap
-        :meth:`_serialize_dedup_probe` documents ("a genuinely concurrent,
-        unrelated task's write riding along with this call's own commit"): that
-        other task's write cannot even start until this window's lock is
-        released, so it can no longer join this window's transaction. Released
-        at the same point as before — before :meth:`_finish_create_thought` —
-        except when this call is nested in the caller's own
-        :meth:`suspend_auto_commit` window, where ``_write_lock`` is
-        task-reentrant and the outer hold never actually drops, so it stays
+        of the three dedup methods, the former blocks *every* other guarded
+        write on this instance, closing the exposure
+        :meth:`_serialize_dedup_probe` describes (a different task's write
+        joining this call's transaction): that other task's write cannot even
+        start until this window's lock is released. Released before
+        :meth:`_finish_create_thought`, except when this call is nested in the
+        caller's own :meth:`suspend_auto_commit` window, where ``_write_lock``
+        is task-reentrant and the outer hold never actually drops, so it stays
         held through :meth:`_finish_create_thought` too.
         """
         async with (
@@ -6980,8 +6916,7 @@ class SqliteEngravaCore:
         # call itself acquires, for the whole batch, before taking
         # _write_lock for its one insert transaction
         # (see _prepare_for_create / _create_thought_from_prepared). A direct
-        # call here just runs both halves back to back, in the same order as
-        # before that split.
+        # call here just runs both halves back to back.
         thought = await self._prepare_for_create(thought)
         return await self._create_thought_from_prepared(
             thought,
@@ -7004,8 +6939,7 @@ class SqliteEngravaCore:
         separately, per item, in its own insert phase — see its docstring for
         why bundling this helper's validate-seam-revalidate sequence across
         the whole batch would let a later item's validation failure pre-empt
-        an earlier item's own outcome. A direct :meth:`create_thought` call
-        runs this helper exactly as before that split existed. See
+        an earlier item's own outcome. See
         :meth:`prepare_thought_for_insert`'s docstring for the full
         per-entry-point invocation-count contract.
 
@@ -7112,7 +7046,7 @@ class SqliteEngravaCore:
 
         Returns:
             The persisted thought record, with timestamps and expiry resolved
-            — the same value ``create_thought`` used to pass into what is now
+            — the value the create paths pass on to
             :meth:`_finish_create_thought`.
 
         Raises:
@@ -7599,7 +7533,7 @@ class SqliteEngravaCore:
             # before the probe ran -- its own `BEGIN IMMEDIATE` when this
             # call opened one, or an already-open outer transaction when it
             # reused one instead (it cannot know in advance that the match
-            # needs no change) -- and the guard itself no longer commits on a
+            # needs no change) -- and the guard itself does not commit on a
             # clean exit. Closing
             # what nothing else here will, *without committing*: a
             # `_maybe_commit()` here would commit whatever the caller already
@@ -7668,7 +7602,7 @@ class SqliteEngravaCore:
         Like :meth:`suspend_auto_commit`, this call briefly toggles
         store-instance state (the deferred-commit flag, and a flag that defers
         per-thought embedding to the batch). The store owns a single
-        connection, but a *second* writer no longer needs to be kept off it
+        connection, but a *second* writer does not need to be kept off it
         by convention: :attr:`_write_lock` covers this whole call the same
         way it covers :meth:`suspend_auto_commit`, so a concurrent task's
         guarded write on this instance simply waits for the batch to finish
@@ -7711,17 +7645,6 @@ class SqliteEngravaCore:
             DerivedRecordProducerProtocol,
         )
 
-        # The existing-ids snapshot used to be taken here, before any lock was
-        # acquired: a concurrent task's insert landing between this read and
-        # the batch's own lock acquisition would be invisible to it, so this
-        # call's own row could be misclassified as newly-created when it was
-        # actually a pre-existing row a dedup hit resolved to — re-embedding
-        # and, worse, re-deriving from it, against the guarantee that a
-        # dedup hit never derives. It is now taken inside
-        # ``_bulk_store_inner``'s own ``suspend_auto_commit`` window, which
-        # holds ``_write_lock`` for the window's whole duration, so no
-        # concurrent task's write can land between the snapshot and this
-        # batch's own insert loop.
         origin_token = _DERIVATION_ORIGIN.set("bulk_store")
         try:
             return await self._bulk_store_inner(
@@ -7758,42 +7681,37 @@ class SqliteEngravaCore:
         :meth:`_create_thought_from_prepared`, which does not call the seam
         again.
 
-        **Why the split is this narrow.** An earlier version of this method
-        ran :meth:`_prepare_for_create` — validate, seam, revalidate — for
-        the whole batch in phase 1, matching how :meth:`create_thought` does
-        it for one item. That satisfied constraint 1 (the seam holding no
-        lock this call itself acquires) but over-corrected the caller-visible failure
-        ordering: because *every* item's validation, not only its seam call,
-        ran before *any* item's insert, a later item's ordinary
-        (non-seam) validation error — invalid ``metadata`` or ``provenance``,
-        either on the original candidate or on what the seam returned —
-        could raise *before* an earlier item's own duplicate-id failure or
-        ``on_store`` call was ever reached, silently replacing that earlier
-        outcome and suppressing that earlier ``on_store``. A bare loop of
-        :meth:`create_thought` calls never did this: item *n* is fully
+        **Why the split is this narrow.** Running :meth:`_prepare_for_create`
+        — validate, seam, revalidate — for the whole batch in phase 1, the way
+        :meth:`create_thought` does it for one item, would keep the seam from
+        holding any lock this call itself acquires, but it would change the
+        caller-visible failure ordering: because *every* item's validation,
+        not only its seam call, would run before *any* item's insert, a later
+        item's ordinary (non-seam) validation error — invalid ``metadata`` or
+        ``provenance``, either on the original candidate or on what the seam
+        returned — could raise *before* an earlier item's own duplicate-id
+        failure or ``on_store`` call was ever reached, silently replacing that
+        earlier outcome and suppressing that earlier ``on_store``. A bare loop
+        of :meth:`create_thought` calls does not do this: item *n* is fully
         finished — validated, seamed, inserted, ``on_store`` dispatched —
         before item *n + 1* is even looked at. Moving *only* the seam call to
         phase 1 and revalidating in phase 2, per item, immediately before
-        that item's own insert, restores that exact ordering: item *n*'s
+        that item's own insert, gives that same ordering: item *n*'s
         ordinary validation, insert, and ``on_store`` all happen within the
         same iteration of phase 2's loop, before item *n + 1*'s iteration
-        begins, and a later item's validation failure can no longer pre-empt
-        an earlier one's insert-time or ``on_store`` outcome.
+        begins, and a later item's validation failure cannot pre-empt an
+        earlier one's insert-time or ``on_store`` outcome.
 
-        **The one thing this does not restore: the seam itself, in phase 1,
-        no longer receives pre-validated input for the bulk path.** Every
-        other entry point (:meth:`create_thought`, :meth:`get_or_create`,
-        :meth:`upsert_by_hash`) validates the candidate's ``metadata`` /
-        ``provenance`` immediately before calling the seam, so an override
+        **One difference from the other entry points: the seam itself, in
+        phase 1, does not receive pre-validated input for the bulk path.** The
+        other entry points (:meth:`create_thought`, :meth:`get_or_create`,
+        :meth:`upsert_by_hash`) validate the candidate's ``metadata`` /
+        ``provenance`` before calling the seam, so an override
         can rely on that precondition — see :meth:`prepare_thought_for_insert`'s
         ``Args`` — but here the seam call in phase 1 runs before phase 2's
         revalidation, on whatever ``thoughts`` was given, unvalidated. A
         seam call for item *m* raising anywhere in phase 1 (a validated
-        precondition or not) still stops the whole batch there, with no lock
-        taken and no transaction opened, so nothing is persisted — the same
-        all-or-nothing outcome the batch has always produced when an item
-        fails (see :meth:`bulk_store`'s docstring), reached without ever
-        opening a transaction that was never going to complete. Only
+        precondition or not) stops the whole batch there. Only
         genuinely-inserted records — those whose id was absent before the
         batch and not inserted earlier in it, i.e. dedup / hash hits excluded
         — are collected as ``newly_created``. **After** the batch
@@ -7819,13 +7737,13 @@ class SqliteEngravaCore:
         # holding no lock this call itself acquires. Deliberately not
         # _prepare_for_create: that helper
         # also validates (before and after the seam), and running validation
-        # here, batched across the whole input ahead of phase 2, is exactly
-        # what let a later item's ordinary validation error pre-empt an
-        # earlier item's duplicate-id or on_store outcome (see this method's
-        # docstring). Only the seam -- the one piece of overridable code
-        # constraint 1 requires out from under the lock -- runs here; ordinary
-        # validation now runs in phase 2, per item, at the point the base
-        # loop of create_thought() calls would have run it.
+        # here, batched across the whole input ahead of phase 2, would let a
+        # later item's ordinary validation error pre-empt an earlier item's
+        # duplicate-id or on_store outcome (see this method's docstring). Only
+        # the seam -- the one piece of overridable code that must run without
+        # holding a lock this call itself acquires -- runs here; ordinary
+        # validation runs in phase 2, per item, at the point the base loop of
+        # create_thought() calls would have run it.
         prepared_thoughts = [await self.prepare_thought_for_insert(thought) for thought in thoughts]
 
         newly_created: list[ThoughtRecord] = []
@@ -8919,14 +8837,13 @@ class SqliteEngravaCore:
             # commit even though that one candidate reports ``deleted=False``.
             wrote_anything = False
 
-            # The candidate read is now inside the same critical section as the
-            # writes below (it used to run before the lock was even acquired):
-            # a concurrent task extending a thought's `expires_at`, or a
-            # suspended transaction exposing a value it then rolls back,
-            # could otherwise land between this read and the write that acts
-            # on it, and this call would archive or delete a row that is no
-            # longer actually expired -- caller data loss, not merely a stale
-            # read.
+            # The candidate read is inside the same critical section as the
+            # writes below: a concurrent task extending a thought's
+            # `expires_at`, or a suspended transaction exposing a value it then
+            # rolls back, could otherwise land between this read and the write
+            # that acts on it, and this call would archive or delete a row that
+            # is no longer actually expired -- caller data loss, not merely a
+            # stale read.
             cursor = await self._db.execute(
                 "SELECT thought_id FROM thought WHERE expires_at IS NOT NULL AND expires_at <= ?",
                 (now,),
@@ -9107,11 +9024,11 @@ class SqliteEngravaCore:
         from the initial read to the commit runs
         under :attr:`_write_lock`, a task-reentrant lock, so a second task
         calling any guarded write path on this store blocks until this call's
-        own write has committed — it can no longer land *between* this call's
+        own write has committed — it cannot land *between* this call's
         read and its write. Concretely: a competing edit to the **same** field
-        can no longer be silently discarded by an interleaved write racing this
-        one (each such call now runs to completion before the next one's own
-        read), a competing cycle stamp can no longer spuriously reject an
+        cannot be silently discarded by an interleaved write racing this
+        one (each such call runs to completion before the next one's own
+        read), a competing cycle stamp cannot spuriously reject an
         unrelated edit that merely happened to straddle it, and a
         ``lifecycle_status`` transition is validated against a row that no
         concurrent call on this instance can move out from under it mid-check.
@@ -9654,10 +9571,8 @@ class SqliteEngravaCore:
                 raise
 
             if result.wrote_anything:
-                # A real write happened — the thought itself, an orphan sweep
-                # on a never-existed id, or both — commit it, exactly as
-                # before. ``deleted`` alone would miss the orphan-sweep-only
-                # case (see _DeleteAtomicResult).
+                # A real write happened, so commit it. ``deleted`` alone would
+                # miss the orphan-sweep-only case (see _DeleteAtomicResult).
                 await self._maybe_commit()
             elif opened_transaction and self._db.in_transaction:
                 # Nothing was written at all — the id never matched a row and
@@ -9812,7 +9727,7 @@ class SqliteEngravaCore:
         task-reentrant :attr:`_write_lock` critical section: the
         read, the merge, and the write are atomic with respect to every other
         guarded write on this instance, so a competing edit to a field this
-        call also writes can no longer land between this call's own read and
+        call also writes cannot land between this call's own read and
         write.
 
         **The write (when there is one), its confirming read-back, and its
@@ -10904,11 +10819,10 @@ class SqliteEngravaCore:
             nothing (a ``RAISE(IGNORE)`` trigger, for one) — in both cases the
             caller must treat this exactly like "nothing was deleted": no
             vector purge, no journal append. Its ``wrote_anything`` is
-            ``True`` whenever this call's own return leaves a row change
-            intact — the parent, an orphan swept on a never-existed id, or
-            both — which callers need to decide whether they have anything
-            of their own left to commit; ``deleted`` alone is not that
-            signal (see the class docstring). A parent delete that matches
+            ``True`` if ``total_changes`` rose across the parent delete and
+            the child sweep. Callers use it to decide whether they have
+            anything of their own left to commit; ``deleted`` alone is not
+            that signal (see the class docstring). A parent delete that matches
             no row although the row existed rolls its own savepoint all the
             way back, so a write a trigger made along the way does not make
             this ``True``.
@@ -11221,9 +11135,9 @@ class SqliteEngravaCore:
             # nearest ``top_k`` neighbours turn out to be non-live. Fetch a
             # bounded multiple instead, filter, sort, then trim to ``top_k`` so
             # the trim keeps the highest-similarity *live* rows. The deeper live
-            # pool also now feeds the hybrid-fusion vector arm more completely
-            # (previously under-fed); for stores containing expired/retired rows
-            # this can shift the fused order — a more-correct pool, disclosed.
+            # pool feeds the hybrid-fusion vector arm more completely; for
+            # stores containing expired/retired rows this can shift the fused
+            # order.
             overfetch_factor = (
                 self._search_config.vec0_overfetch_factor if self._search_config is not None else 4
             )
@@ -11291,8 +11205,7 @@ class SqliteEngravaCore:
         ids = [r[0] for r in results]
         placeholders = ",".join("?" * len(ids))
         # Positive form: keep-form archived gate (``!= 'ARCHIVED'``), matching
-        # the arm WHERE clauses — the opposite polarity of the old
-        # exclusion-form query this replaces.
+        # the arm WHERE clauses.
         archived_clause = (
             ""
             if include_archived
@@ -11389,13 +11302,12 @@ class SqliteEngravaCore:
         # per-row ``struct.unpack`` + ``list()``. The dtype is **native-endian**
         # ``np.float32`` — the exact byte layout ``store_embedding`` writes with
         # native ``struct.pack(f"{dim}f", …)`` — so the decode is bit-identical
-        # to the old ``struct.unpack(f"{dim}f", …)`` on every platform (both use
-        # the host byte order). Every embedding in a store shares one
-        # ``dimension`` (enforced by the model lock), so the blobs are joined and
-        # viewed as one ``(n, dimension)`` matrix in a single decode. If any blob
-        # is missing/short (a corrupt or truncated row), the fast path is
-        # abandoned for the original per-row decode so the exact prior
-        # skip/error behaviour is preserved.
+        # to the per-row ``struct.unpack(f"{dim}f", …)`` decode below on every
+        # platform (both use the host byte order). When the rows agree on
+        # ``dimension``, the blobs are joined and viewed as one
+        # ``(n, dimension)`` matrix in a single decode. If a blob is
+        # missing/short (a corrupt or truncated row), the fast path is
+        # abandoned for that per-row decode.
         first_dimension = int(rows[0]["dimension"])
         if len(query_vector) != first_dimension:
             # Typed rejection instead of an opaque numpy ``matmul`` ValueError.
@@ -11420,7 +11332,7 @@ class SqliteEngravaCore:
         if uniform:
             # Decode as native float32 (bit-identical to the stored bytes), then
             # widen to float64 so the norm/dot arithmetic below runs at exactly
-            # the same precision as the original per-row path (which built a
+            # the same precision as the per-row path below (which builds a
             # float64 matrix). ``frombuffer`` returns a read-only view;
             # ``astype`` produces the writable float64 copy the reduction expects.
             matrix = (
@@ -13688,9 +13600,7 @@ class SqliteEngravaCore:
           store, where cycle-recency degenerates into ingest order, from
           archiving its earliest-ingested rows.
         * **Decay clamp.** The ``decay_function`` return is clamped to
-          ``[0.0, 1.0]`` and a non-finite value is treated as ``1.0`` (no decay)
-          — decay can only lower a score toward archive, never resurrect one, and
-          a misbehaving custom hook can never cause a spurious eviction.
+          ``[0.0, 1.0]`` and a non-finite value is treated as ``1.0`` (no decay).
         * **Deterministic capped selection.** Same store + config + cycle ⇒ the
           identical eviction set; archive orders by ``eviction_score ASC,
           updated_cycle ASC, thought_id ASC`` and GC by ``archived_at_cycle ASC,
@@ -13699,17 +13609,16 @@ class SqliteEngravaCore:
           non-NULL ``archived_at_cycle`` (i.e. archived *by hygiene*) are ever
           auto-GC'd — a TTL/manually-archived thought (``archived_at_cycle`` is
           ``None``) is left alone.
-        * **Two restore windows, both required.** GC reaps a hygiene-archived
-          thought only once it is old enough *cognitively* (the cycle window,
-          ``gc_min_archive_age_cycles``) **and** in *real time* (the wall-clock
-          window, ``gc_restore_window_seconds``, measured against ``now``), so a
-          fast-cycling store cannot permanently delete a just-archived thought
-          before a real-time chance to restore it. A hygiene-archived row that
-          predates the ``archived_at`` column (``archived_at`` is ``None``) has
-          no real-time stamp and is never auto-GC'd while the wall-clock window
-          is active — the irreversible stage fails closed. Setting
-          ``gc_restore_window_seconds = 0`` disables the wall-clock window
-          (cycle-only, backward-compatible).
+        * **Two restore windows.** GC requires a hygiene-archived thought to
+          be old enough *cognitively* (the cycle window,
+          ``gc_min_archive_age_cycles``) **and**, while
+          ``gc_restore_window_seconds`` is greater than zero, in *real time*
+          (the wall-clock window, measured against ``now``). A hygiene-archived
+          row that predates the ``archived_at`` column (``archived_at`` is
+          ``None``) has no real-time stamp and is never auto-GC'd while the
+          wall-clock window is active — the irreversible stage fails closed.
+          Setting ``gc_restore_window_seconds = 0`` disables the wall-clock
+          window (cycle-only, backward-compatible).
         * **Dry run.** When ``dry_run`` is set nothing is mutated and nothing is
           journaled; the would-evict set is returned for preview.
 
@@ -13910,9 +13819,9 @@ class SqliteEngravaCore:
         """Collect the eviction candidate pool: every ACTIVE and CREATED thought.
 
         Already-ARCHIVED and DONE thoughts are outside the candidate set (they
-        are not re-processed). The **whole** eligible pool must be scored — the
-        per-run cap bounds the *archived* set, not the *considered* set, so that
-        the coldest thoughts (not an arbitrary page) are the ones selected.
+        are not re-processed). The per-run cap bounds the *archived* set, not
+        the *considered* set, so that the coldest thoughts (not an arbitrary
+        page) are the ones selected.
         Both eligible lifecycles are walked one page at a time (mirroring the
         orphan-reflection sweep) so no candidate is missed regardless of store
         size. The frequency signal is not fed by these internal scans (access
@@ -13947,14 +13856,10 @@ class SqliteEngravaCore:
     ) -> dict[str, float]:
         """Resolve the clamped decay multiplier for each candidate.
 
-        Unlike ``on_store``/``on_retrieve``, which have always had call-sites
-        elsewhere, ``decay_function`` was dead code until this call-site was
-        added: the hygiene eviction score is its **only** call-site (it is
-        never wired into search / ranking / promotion). Its return is clamped
-        to ``[0.0, 1.0]`` and a
-        non-finite value (``NaN`` / ``±inf``) is treated as ``1.0`` — the
-        fail-safe direction, since decay can then only lower a score toward
-        archive, never resurrect one above threshold or over-evict.
+        The hygiene eviction score is ``decay_function``'s **only** call-site
+        (it is never wired into search / ranking / promotion). Its return is
+        clamped to ``[0.0, 1.0]`` and a non-finite value (``NaN`` / ``±inf``)
+        is treated as ``1.0`` (no decay).
 
         Args:
             candidates: The candidate pool.
@@ -13984,9 +13889,9 @@ class SqliteEngravaCore:
     ) -> list[EvictionReason]:
         """Score candidates and pick the deterministic, capped archive set.
 
-        For each unprotected candidate, computes ``keep_score`` (weighted average
-        over the active signals) and ``eviction_score = keep_score * decay``, and
-        keeps those strictly below ``eviction_threshold``. The survivors are
+        For each candidate not excluded below, computes ``keep_score`` (weighted
+        sum over the active signals) and ``eviction_score = keep_score * decay``,
+        and keeps those strictly below ``eviction_threshold``. The survivors are
         ordered ``eviction_score ASC, updated_cycle ASC, thought_id ASC``
         (lowest-value, oldest, id tiebreak) and truncated to
         ``max_evictions_per_run`` — a stable set for a given store + config +
@@ -14512,7 +14417,7 @@ class SqliteEngravaCore:
 
         Calling this again **replaces** whatever was attached before,
         including one installed by :meth:`from_config` — the same behaviour
-        as re-assigning the private attribute has always had. There is no
+        as re-assigning the private attribute. There is no
         separate "already attached" error: a second call is a deliberate
         re-wiring, not a mistake this method can distinguish from one.
 
@@ -14702,7 +14607,7 @@ class SqliteEngravaCore:
         read, the transition check, and the write share the same
         task-reentrant :attr:`_write_lock` critical section every other guarded
         write on this instance uses, so a competing move issued by
-        a *different task on this instance* can no longer land in that window —
+        a *different task on this instance* cannot land in that window —
         it is delayed until this call's write has committed, and then it
         validates against the state this call actually left. ``verification_status``
         is not gated
@@ -15483,12 +15388,10 @@ def _decode_consolidated(raw: str | None) -> list[str] | None:
 
 
 def _clamp_decay(raw: float) -> float:
-    """Clamp a ``decay_function`` return into the fail-safe ``[0.0, 1.0]`` range.
+    """Clamp a ``decay_function`` return into the ``[0.0, 1.0]`` range.
 
-    A non-finite value (``NaN`` / ``±inf``) maps to ``1.0`` (no decay) — the
-    fail-safe direction, since decay can then only lower an eviction-score toward
-    archive, never resurrect one above threshold or cause a spurious eviction. A
-    finite value is clamped into ``[0.0, 1.0]``.
+    A non-finite value (``NaN`` / ``±inf``) maps to ``1.0`` (no decay). A finite
+    value is clamped into ``[0.0, 1.0]``.
 
     Args:
         raw: The raw ``decay_function`` hook result.

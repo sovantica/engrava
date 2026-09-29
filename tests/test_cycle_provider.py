@@ -517,7 +517,7 @@ class TestFallbackPathCycleRecencyGating:
     """
 
     async def test_zero_weight_cycle_inert_on_fallback_path(self, store: SqliteEngravaCore) -> None:
-        # DEFECT regression: weight-0 cycle recency must be byte-identical to a
+        # Weight-0 cycle recency must be byte-identical to a
         # fallback with no recency reference at all, never scored by cognitive
         # cycle. ``old``/``new`` differ enough in ``updated_cycle`` that cycle
         # decay (half-life 50) would separate their scores if it leaked through.
@@ -746,16 +746,16 @@ class TestMaxCycleProvider:
 
 
 # ---------------------------------------------------------------------------
-# Golden regressions: NO provider + explicit cycle == the pre-seam path
+# Golden outputs: NO provider + explicit cycle
 # ---------------------------------------------------------------------------
 
 
 class TestGoldenDefaultUnchanged:
-    """Exact/golden regressions on the default (no-provider) path.
+    """Exact/golden outputs on the default (no-provider) path.
 
     With no ``cycle_provider`` configured and an explicit ``current_cycle``, the
-    resolution is a pure no-op, so each cycle-consuming path must produce output
-    byte-for-byte identical to the pre-seam implementation. These freeze the
+    resolution is a pure no-op, so the default path must produce exactly
+    the golden outputs below. These freeze the
     exact fused order + scores (and the exact eligibility outcome) so a future
     change to the resolution/fusion that perturbs the default path fails loudly.
     """

@@ -201,20 +201,28 @@ class TestReadDeclaredTarget:
         assert "could not read" in str(excinfo.value)
 
 
+def _read_text_rejecting_the_bytes(self: Path, *args: object, **kwargs: object) -> str:
+    return b"\xff".decode("utf-8")
+
+
 class TestReadDeclaredTargetBoundary:
     """``read_declared_target()`` has one catch-all boundary, not an enumerated exception list."""
 
-    def test_invalid_utf8_raises_a_clean_gate_input_error(
-        self, gate_module: object, tmp_path: Path
+    def test_a_unicode_decode_error_raises_a_clean_gate_input_error(
+        self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # A file whose bytes are not valid UTF-8. A UnicodeDecodeError out of
-        # read_text() is neither OSError nor MemoryError.
+        # A UnicodeDecodeError out of read_text() is neither OSError nor
+        # MemoryError. Whether a real file with invalid bytes raises one
+        # depends on the locale's default codec, so read_text() is made to
+        # raise it.
         path = tmp_path / "release-target.json"
-        path.write_bytes(b'{"version": "0.7.0\xff\xfe"}')
-        with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
-            gate_module.read_declared_target(path)  # type: ignore[attr-defined]
-        assert str(path) in str(excinfo.value)
-        assert "UnicodeDecodeError" in str(excinfo.value)
+        path.write_bytes(b'{"version": "0.7.0"}')
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "read_text", _read_text_rejecting_the_bytes)
+            with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
+                gate_module.read_declared_target(path)  # type: ignore[attr-defined]
+        assert isinstance(excinfo.value.__cause__, UnicodeDecodeError)
+        assert f"could not read {path}: UnicodeDecodeError: " in str(excinfo.value)
 
     def test_a_deeply_nested_json_document_raises_a_clean_gate_input_error(
         self, gate_module: object, tmp_path: Path

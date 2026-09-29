@@ -64,12 +64,7 @@ selected via ``services.default_service`` has no invocation that could ever
 reach it here — the CLI group only ever loads ``services_cfg`` for the
 ``snapshot`` and ``restore`` subcommands themselves (see
 ``_SERVICES_CONFIG_COMMANDS`` in ``main.py``), which these three verbs are
-not. An earlier version of this module carried a third tier for it anyway,
-"for the documented precedence" — reachable through no combination of flags,
-exercised by no test, a second unreachable branch shipped days after this
-milestone opened by removing exactly that shape of defect elsewhere in this
-CLI. Removed rather than kept "for completeness"; when ``--service`` is added
-to these verbs, a service tier gets written against code that exists.
+not.
 """
 
 from __future__ import annotations

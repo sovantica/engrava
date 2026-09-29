@@ -30,7 +30,7 @@ reading the page, not for this gate. The structural rules it does apply are
 about fences and about indentation, described next. A few things below look like
 structural parsing
 but are not: they are single, narrow predicates over one line (or one cell)
-each, kept only because their absence is a real hole this gate has had:
+each, kept only because their absence would leave a hole in this gate:
 
 * **The header is identified by its first cell being exactly ``"Exception"``**
   (whitespace around it ignored), not by the whole line matching some fixed
@@ -116,13 +116,14 @@ indented four or more spaces is code, so it neither starts nor ends the
 section (see ``test_gate_rejects_an_exceptions_heading_indented_as_code`` and
 ``test_gate_reads_a_terminator_indented_as_code_as_part_of_the_section``).
 
-This narrow a scope is deliberate and cost something to arrive at. A
-*structural* model of "the table" kept being fooled in a new way
-— a decoy under a subheading, a commented-out table, indentation edge cases,
+This narrow a scope is deliberate. A *structural* model of "the table" is open
+to edge cases such as
+a decoy under a subheading, a commented-out table, indentation edge cases,
 escaped pipes, a plausible second table with plain-text rows, a stale row
 hiding in the separator's position, a linked name, an extra column, a
-deprecation annotation, a same-shaped header elsewhere, an asymmetric section
-boundary — because "correctly parse Markdown" has no natural stopping point.
+deprecation annotation, a same-shaped header elsewhere, or an asymmetric
+section boundary, because "correctly parse Markdown" has no natural stopping
+point.
 The blank-line rule has one real, accepted cost in exchange: a blank line
 accidentally inserted in the middle of the real table truncates the body
 there, and every exception documented below it reads as undocumented (see
@@ -132,19 +133,16 @@ fixes the blank line, the gate does not grow a merge-adjacent-fragments
 heuristic to paper over it.
 
 **The document must contain no HTML comment marker at all — a total ban,
-not a scan for where a comment sits.** Three consecutive attempts at
-scanning for comment placement (in the section only; before the heading too;
-ordering-aware across a whole line) each closed one hiding case and left
-another — a comment can hide a section from a rendered page regardless of
-where it sits or how it is nested, and enumerating "where" is exactly the
-kind of structural question this gate has already refused to answer for
-tables. An HTML comment is invisible in the rendered document, and this gate
-exists to ensure the exceptions documentation is *visible*, so this file
-does not carry HTML comments — full stop. This trades away something real:
-a balanced, purely editorial comment above the heading, which used to be
-allowed, now fails too. That is deliberate, not an oversight; if a comment
-is ever genuinely needed, the resulting red build is the conversation to
-have about it, not a defect in this check.
+not a scan for where a comment sits.** A comment can hide a section from a
+rendered page, and
+enumerating "where" is exactly the kind of structural question this gate
+refuses to answer for tables. An HTML comment is invisible in the rendered
+document, and this gate exists to ensure the exceptions documentation is
+*visible*, so this file does not carry HTML comments — full stop. This
+trades away something real: a balanced, purely editorial comment above the
+heading fails too. That is deliberate, not an oversight; if a comment is
+ever genuinely needed, the resulting red build is the conversation to have
+about it, not a defect in this check.
 
 There is deliberately no exemption or allow-list mechanism here. If a class
 should not appear in the table, that is a decision for a human to make in
@@ -304,11 +302,9 @@ def _assert_document_has_no_html_comment_marker(lines: list[str]) -> None:
     A total ban, not a scan for where a comment sits: an HTML comment is
     invisible in the rendered document, and this gate exists to ensure the
     exceptions documentation is *visible*, so this file carries no HTML
-    comments at all. Three attempts at scanning for comment *placement*
-    (in the section only; before the heading too; ordering-aware within a
-    line) each closed one hiding case and left another open — a plain
-    substring check over the whole document has no such gap, because it
-    asks nothing about where or how a comment is written. The real
+    comments at all. A plain substring check over the whole document leaves
+    no placement gap, because it asks nothing about where or how a comment
+    is written. The real
     ``docs/api-reference.md`` has zero ``<!--`` today, so this costs it
     nothing; if a comment is ever genuinely wanted, the resulting failure is
     the conversation to have, not a defect in this check.
@@ -568,8 +564,8 @@ def test_exceptions_table_rows_are_unique() -> None:
 def test_exceptions_table_rows_are_backtick_quoted() -> None:
     """Every body line's first cell is a clean, single backtick-quoted name.
 
-    This check's remaining value is narrower than it looks, now that the
-    forward check above exists: a body row for a *currently exported*
+    This check's value is narrower than it looks, given the forward check
+    above: a body row for a *currently exported*
     exception whose cell stops being a clean name (backticks lost entirely,
     or extra prose/strikethrough/a second token added around a real name) is
     already caught there too — the name is no longer extracted, so that
@@ -579,8 +575,7 @@ def test_exceptions_table_rows_are_backtick_quoted() -> None:
     row that is *both* no longer exported *and* has an unclean cell, which
     the reverse check above cannot see at all (it extracts names via the
     same rule, so an unclean cell is invisible to it too). That is a narrow,
-    rare intersection, but the check is harmless and correctly scoped to the
-    body now, so it stays.
+    rare intersection, but the check is harmless and scoped to the body.
     """
     malformed = [line for line in _table_body() if _row_name(line) is None]
     assert not malformed, (
@@ -999,10 +994,9 @@ def test_gate_rejects_a_deprecation_annotation_row(
     """A row whose first cell mixes a strikethrough old name, prose, and a
     link to the replacement (e.g. ``~~RemovedError~~ (use [`NewError`](x))``)
     must not be read as documenting the replacement: the replacement then has
-    no row of its own and must be reported missing. This is the exact defect
-    a prior, looser rule ("the first backtick anywhere in the cell") allowed
-    (verified separately, outside this suite, to actually pass under that
-    prior rule — see the commit message for that discrimination check).
+    no row of its own and must be reported missing. A looser rule ("the first
+    backtick anywhere in the cell") would read the row as documenting the
+    replacement.
     """
     decoy = _write_decoy(
         tmp_path,
@@ -1753,9 +1747,9 @@ def test_gate_rejects_a_comment_that_closes_and_reopens_on_one_line(
 ) -> None:
     """A single line that closes one comment and opens a second
     (``<!-- old note --> <!-- temporarily hide section``), immediately above
-    the heading, used to defeat an ordering-aware scanner that tracked only
-    one open/close flag per line: it saw one opener and one closer and
-    called the line clear, even though a new, still-open comment starts on
+    the heading, would defeat an ordering-aware scanner that tracked only
+    one open/close flag per line: it would see one opener and one closer and
+    call the line clear, even though a new, still-open comment starts on
     it and is not closed until much later. The whole-document ban needs
     none of that reasoning -- the line contains ``<!--``, which is already
     disallowed, independent of how many comments are on it or in what order

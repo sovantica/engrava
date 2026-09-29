@@ -8,8 +8,9 @@ Covers the two coupled write-surface features:
 2. The denormalised ``thought.action_outcome_score`` aggregate: the per-action
    outcome mapping, the mean-over-terminal-actions aggregate, the idempotent
    recompute and its firing points, and — critically — the flat-safe guarantee
-   that the 6th ``action_outcome`` dreaming signal leaves an action-free store's
-   dreaming promotion byte-identical to before the signal existed.
+   that the 6th ``action_outcome`` dreaming signal leaves dreaming scores and
+   promoted set identical to those of the five signals without it when no
+   candidate has an action outcome.
 
 The schema block asserts the core-16 migration (column + ``action`` seek index,
 idempotency, fresh-DB version, cascade from an older version) and that the
@@ -607,7 +608,7 @@ class TestJournaling:
 
 
 # ---------------------------------------------------------------------------
-# 6th dreaming signal — flat-safe regression guard
+# 6th dreaming signal — flat-safe when no action data exists
 # ---------------------------------------------------------------------------
 
 
@@ -683,16 +684,16 @@ class TestSignalActiveness:
 
 
 class TestFlatSafeRegression:
-    """THE regression guard — an action-free store's dreaming is byte-identical."""
+    """With no action outcome recorded, ``action_outcome`` changes no score or promotion."""
 
     def test_action_free_scores_byte_identical(self) -> None:
-        # Candidates with NO action outcome (the pre-feature world).
+        # Candidates with NO action outcome.
         candidates = [_obs(f"t{i}", updated_cycle=i * 5) for i in range(6)]
 
         cfg6 = _dreaming_cfg()  # ships the 6th signal
         ext6 = DreamingExtension(cfg6)
         five = {k: v for k, v in cfg6.signals.items() if k != "action_outcome"}
-        ext5 = DreamingExtension(_dreaming_cfg(signals=five))  # pre-feature 5 signals
+        ext5 = DreamingExtension(_dreaming_cfg(signals=five))  # the five other signals
 
         w6, flat6 = ext6._compute_active_weights(candidates, current_cycle=_CYCLE)
         w5, _ = ext5._compute_active_weights(candidates, current_cycle=_CYCLE)
@@ -711,7 +712,7 @@ class TestFlatSafeRegression:
 
     async def test_action_free_promotion_set_identical_end_to_end(self, tmp_path: Path) -> None:
         # Two identical stores; one runs dreaming with the 6th signal, the other
-        # with only the five pre-feature signals. No actions anywhere.
+        # with only the five other signals. No actions anywhere.
         async def _run(signals: dict[str, float] | None) -> list[str]:
             conn = await aiosqlite.connect(":memory:")
             conn.row_factory = aiosqlite.Row

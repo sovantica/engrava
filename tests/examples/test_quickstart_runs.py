@@ -5,9 +5,8 @@ The test runs ``examples/quickstart.py`` as the user would, via
 the markers documented in the script docstring. It requires the
 ``embeddings-local`` extra: when ``sentence_transformers`` is missing
 the test skips cleanly rather than failing the suite. Two defensive
-guards pin the dreaming demonstration policy: the fresh-store
-walkthrough script that promised a REFLECTION is no longer shipped,
-and ``quickstart.py`` must not promise one either.
+guards pin the dreaming demonstration policy: ``examples/dreaming_benefit.py``
+is not shipped, and ``quickstart.py`` must not promise a REFLECTION either.
 """
 
 from __future__ import annotations
@@ -135,10 +134,9 @@ def test_simple_agent_runs_to_completion() -> None:
 def test_dreaming_benefit_script_not_shipped() -> None:
     """The fresh-store dreaming walkthrough script is not part of the public surface.
 
-    A previous iteration shipped a script that promised a REFLECTION
-    on a fresh in-memory store, which the default consolidation
-    configuration cannot deliver. The script was dropped; this guard
-    keeps it gone so the dropped artifact cannot silently reappear.
+    This guard keeps ``examples/dreaming_benefit.py`` absent from the
+    shipped examples, in line with the honesty contract pinned by
+    ``test_quickstart_does_not_promise_a_reflection``.
     """
     assert not (EXAMPLES_DIR / "dreaming_benefit.py").exists(), (
         "examples/dreaming_benefit.py must not be shipped — "

@@ -408,7 +408,7 @@ class TestRoundTrip:
 
 
 # ---------------------------------------------------------------------------
-# Byte-identical when provenance is None (regression)
+# provenance=None: stored as NULL and read back as None
 # ---------------------------------------------------------------------------
 
 

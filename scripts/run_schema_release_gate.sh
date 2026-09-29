@@ -15,9 +15,7 @@
 # HEAD at this point in the lifecycle is still the ordinary branch tip
 # semantic-release started from -- no release commit, no tag, exists yet.
 # The last released tag is therefore whatever `git describe` finds reachable
-# directly from HEAD, not from HEAD^ (HEAD^ only made sense when this gate
-# used to run as a separate workflow step after semantic-release had already
-# tagged HEAD).
+# directly from HEAD, not from HEAD^.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

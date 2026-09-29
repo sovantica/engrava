@@ -570,11 +570,11 @@ class TestFailurePaths:
     async def test_zero_weight_transaction_inert_on_fallback_path(
         self, store: SqliteEngravaCore
     ) -> None:
-        # DEFECT regression: weight-0 transaction recency must be inert on the
-        # query-less FALLBACK path too (no FTS, no vector) — byte-identical to a
-        # fallback with no recency reference, never ordered/scored by transaction
-        # time. ``old`` has the higher updated_cycle, so the neutral fallback
-        # orders it first; transaction time would order ``new`` first.
+        # Weight-0 transaction recency must be inert on the query-less
+        # FALLBACK path too (no FTS, no vector) — byte-identical to a fallback
+        # with no recency reference, never ordered/scored by transaction time.
+        # ``old`` has the higher updated_cycle, so the neutral fallback orders
+        # it first; transaction time would order ``new`` first.
         await store.create_thought(
             _thought("old", updated_cycle=2, updated_at="2026-01-01T00:00:00+00:00")
         )

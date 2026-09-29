@@ -225,6 +225,10 @@ class TestReadDeclaredTarget:
             gate_module.read_declared_target()  # type: ignore[attr-defined]
 
 
+def _read_text_rejecting_the_bytes(self: Path, *args: object, **kwargs: object) -> str:
+    return b"\xff".decode("utf-8")
+
+
 class TestReadDeclaredTargetBoundary:
     """``read_declared_target()`` has one catch-all boundary, not an enumerated exception list.
 
@@ -234,19 +238,24 @@ class TestReadDeclaredTargetBoundary:
     not name every way reading and parsing can fail.
     """
 
-    def test_invalid_utf8_raises_a_clean_gate_input_error(
+    def test_a_unicode_decode_error_raises_a_clean_gate_input_error(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # A file whose bytes are not valid UTF-8. A UnicodeDecodeError out of
-        # read_text() is not OSError and not MemoryError, so a list limited
-        # to those would miss it.
+        # A UnicodeDecodeError out of read_text() is not OSError and not
+        # MemoryError, so a list limited to those would miss it. Whether a
+        # real file with invalid bytes raises one depends on the locale's
+        # default codec, so read_text() is made to raise it.
         repo = tmp_path / "repo"
         repo.mkdir()
-        (repo / "release-target.json").write_bytes(b'{"version": "0.7.0\xff\xfe"}')
+        (repo / "release-target.json").write_bytes(b'{"version": "0.7.0"}')
         monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
-        with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
-            gate_module.read_declared_target()  # type: ignore[attr-defined]
-        assert "UnicodeDecodeError" in str(excinfo.value)
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "read_text", _read_text_rejecting_the_bytes)
+            with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
+                gate_module.read_declared_target()  # type: ignore[attr-defined]
+        assert isinstance(excinfo.value.__cause__, UnicodeDecodeError)
+        expected = f"could not read {repo / 'release-target.json'}: UnicodeDecodeError: "
+        assert expected in str(excinfo.value)
 
     def test_a_deeply_nested_json_document_raises_a_clean_gate_input_error(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

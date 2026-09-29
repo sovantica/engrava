@@ -1,21 +1,19 @@
 """Golden-parity contract for retrieval *semantics* (not merely liveness).
 
-A retrieval rewrite can stay non-empty yet return the WRONG answer. The
-motivating regression normalized ``essence:"a b"`` to an unscoped
-``essence a b`` — still valid FTS5, still returning documents — so every
-findability / never-raises / arm-liveness test stayed green while the answer was
-semantically wrong. Only a byte-identical normalizer golden or a frozen
-ranked-result golden tells "different answer" apart from "an answer". This module
-pins both:
+A retrieval rewrite can stay non-empty yet return the WRONG answer. Normalizing
+``essence:"a b"`` to an unscoped ``essence a b`` is still valid FTS5 and still
+returns documents, so a check that only asks for a non-empty result cannot tell
+the wrong answer from the right one. This module pins a byte-identical
+normalizer golden and a frozen ranked-result golden:
 
 * :class:`TestExpertNormalizationGolden` — every genuine expert query (the full
   column-filter x phrase x boolean cross-product) normalizes byte-identically to
   a checked-in golden.
 * :class:`TestHybridRankedGolden` — the hybrid search over the deterministic
   corpus produces a frozen ``query -> [thought_id, rounded_score]`` list.
-* :class:`TestGoldenDiscriminatingPower` — reverting the column-filter drop
-  in-process makes BOTH goldens fail, proving they discriminate a wrong answer
-  from an answer rather than passing vacuously.
+* :class:`TestGoldenDiscriminatingPower` — patching the normalizer in-process to
+  drop the column-filter scope makes BOTH goldens fail, proving they discriminate
+  a wrong answer from an answer rather than passing vacuously.
 
 The goldens are checked-in fixtures under ``goldens/``. The tests only *read*
 them; regeneration is an explicit, reviewed command
@@ -125,20 +123,19 @@ async def hybrid_store_from_config() -> AsyncIterator[SqliteEngravaCore]:
 _HYBRID_DISCRIMINATOR_QUERY = 'content:"three cheeses"'
 
 # ``essence:"office plant"`` etc.: a column filter directly wrapping a phrase —
-# the exact shape whose scope the rejected rewrite dropped.
+# the shape whose scope the column-filter-dropping normalizer below strips.
 _COLUMN_FILTER_PHRASE_RE = re.compile(r'(?:essence|content):"', re.IGNORECASE)
 
 
 def _make_column_filter_dropping_normalizer(
     original: Callable[[str], str],
 ) -> Callable[[str], str]:
-    """Build a normalizer that reproduces the rejected column-filter drop.
+    """Build a normalizer that drops the scope of column-filter phrase queries.
 
-    The regression normalized ``essence:"a b"`` to an unscoped ``essence a b`` —
-    valid FTS5 that still returns documents, so it slipped past liveness tests.
-    This reproduces the drop surgically: only a genuine column-filter *phrase*
-    query loses its ``:`` scope and quotes (then re-normalizes as a bare query);
-    every other query is delegated to the real normalizer unchanged.
+    It turns ``essence:"a b"`` into an unscoped ``essence a b`` — valid FTS5 that
+    still returns documents. A query that contains a column-filter *phrase* has
+    every ``:`` and ``"`` replaced with a space before it is passed to the real
+    normalizer; every other query is passed to it unchanged.
 
     Args:
         original: The real ``_normalize_fts_query`` captured before patching.
@@ -174,9 +171,9 @@ class TestExpertNormalizationGolden:
         assert compute_expert_normalizations() == _EXPERT_CASES
 
     def test_golden_is_superset_of_prior_inline_cases(self) -> None:
-        """Nothing lost: every previously-inline parity case is still covered."""
+        """Every case in ``LEGACY_EXPERT_PARITY_QUERIES`` is still covered."""
         assert LEGACY_EXPERT_PARITY_QUERIES.issubset(_EXPERT_CASES)
-        # A strict superset of the five cases that used to live inline.
+        # A strict superset: the golden holds more cases than the legacy set.
         assert len(_EXPERT_CASES) > len(LEGACY_EXPERT_PARITY_QUERIES)
 
     def test_golden_spans_the_cross_product(self) -> None:
@@ -314,12 +311,12 @@ class TestHybridRankedFromConfigGolden:
 
 
 class TestGoldenDiscriminatingPower:
-    """Reverting the column-filter drop must break BOTH goldens.
+    """Dropping the column-filter scope must break BOTH goldens.
 
-    A single in-process revert — the rewrite that drops the column-filter scope —
-    is applied below. It must make the expert-normalizer golden AND the frozen hybrid
-    golden fail, proving each golden discriminates a wrong answer from an answer
-    rather than passing vacuously.
+    A single in-process patch of the normalizer, which drops the column-filter
+    scope, is applied below. It must make the expert-normalizer golden AND the
+    frozen hybrid golden fail, proving each golden discriminates a wrong answer
+    from an answer rather than passing vacuously.
     """
 
     def test_revert_breaks_the_expert_normalization_golden(

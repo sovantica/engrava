@@ -19,7 +19,7 @@ to be core infrastructure, not an extension, and gets re-homed with a
 that coming — the file it discovers there is the thin alias, not the logic
 that moved — so such a module is named explicitly in
 ``TestNoLLMInMigratedCoreModules`` below rather than silently losing the
-coverage the walk used to give it for free.
+coverage the walk gives a module that lives under ``extensions/``.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ _EXTENSIONS_DIR = Path(__file__).parent.parent / "src" / "engrava" / "extensions
 #: genuine, intentional alias as "this name resolved to some other copy of
 #: the package", which is exactly the failure that check exists to catch —
 #: so the mapping is spelled out here, by name, rather than guessed at. The
-#: aliased module's own content is no longer scanned by walking this
+#: aliased module's own content is not scanned by walking this
 #: directory; its coverage lives in ``TestNoLLMInMigratedCoreModules`` below,
 #: pointed at the real file directly.
 _KNOWN_MODULE_ALIASES: dict[str, Path] = {
@@ -413,9 +413,9 @@ class TestGuardDetectors:
     def test_the_text_scan_covers_the_whole_forbidden_set(self) -> None:
         """Every forbidden runtime is scanned for as text, not a chosen subset.
 
-        The text scan used to look for three of the ten names, which is the same
-        defect as a hand-listed file set: adding a runtime to the import guard
-        left the dynamic-import path uncovered for it.
+        The text scan looks for every name in ``_FORBIDDEN_IMPORT_PREFIXES``, so
+        adding a runtime to the import guard covers the dynamic-import path for it
+        too.
         """
         for runtime in sorted(_FORBIDDEN_IMPORT_PREFIXES):
             assert runtime in _named_runtimes(f'__import__("{runtime}")\n')
@@ -554,13 +554,13 @@ class TestNoLLMInMigratedCoreModules:
     """
 
     #: Every entry needs its own reason it still belongs on the Free side of
-    #: the cognitive boundary despite no longer living under ``extensions/``.
+    #: the cognitive boundary despite not living under ``extensions/``.
     #:
     #: ``vector_sqlite_vec.py`` — a SQLite adapter for KNN vector search, not
     #: an extension. Re-homed to ``infrastructure/sqlite/``; the alias left at
     #: ``engrava.extensions.vector_sqlite_vec`` keeps the old import path (and
     #: a monkeypatch through it) working, but this is where its content is
-    #: actually checked now.
+    #: actually checked.
     _MIGRATED_MODULES: ClassVar[dict[str, Path]] = {
         "engrava.infrastructure.sqlite.vector_sqlite_vec": (
             Path(__file__).parent.parent

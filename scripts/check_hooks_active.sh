@@ -9,14 +9,11 @@
 # contributor sees it before that can happen unnoticed, rather than
 # discovering it the day a bad commit message goes through.
 #
-# Wiring is not enough, and neither is "some hook is wired". A hook that is
-# wired, executable, and cannot resolve commitlint used to warn and let the
-# commit through -- a gate reporting its health by existing, exactly what
-# this gate exists to catch. And a value that merely points at SOME
-# absolute directory containing an executable named commit-msg would pass
-# even if that hook belongs to something else entirely and never checks a
-# thing. So this verifies four separate claims: the value is this
-# repository's OWN .githooks at the primary checkout, the hook there is
+# Wiring is not enough, and neither is "some hook is wired". A value that
+# merely points at SOME absolute directory containing an executable named
+# commit-msg would pass even if that hook belongs to something else entirely
+# and never checks a thing. So this verifies four separate claims: the value
+# is this repository's OWN .githooks at the primary checkout, the hook there is
 # executable, commitlint actually resolves its configuration from this
 # checkout's working directory, the same way the real hook does, and the
 # hook itself, when run, accepts a well-formed message and rejects a

@@ -146,7 +146,7 @@ class _BindingResult:
     value: float
     threshold: float
     passed: bool
-    rule_text: str  # e.g. ">= 0.80" or "<= 0.02"
+    rule_text: str  # e.g. ">= 0.80" or "<= 0.05"
 
 
 @dataclass(frozen=True)

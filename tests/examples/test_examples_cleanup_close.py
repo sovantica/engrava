@@ -1,7 +1,8 @@
-"""In-process regression tests for the examples' cleanup-close ordering.
+"""In-process tests for the examples' cleanup-close ordering.
 
-Each of ``agent_loop.py``, ``notes_memory.py`` and ``quickstart.py`` used a
-bare ``async with aiosqlite.connect(":memory:") as conn:`` --
+Each of ``agent_loop.py``, ``notes_memory.py`` and ``quickstart.py`` opens its
+connection with ``await aiosqlite.connect(":memory:")`` and closes it itself
+rather than through ``async with``:
 ``aiosqlite.Connection.__aexit__`` is an unconditional ``await close()`` and
 cannot distinguish a cleanup close (something in the body already raised)
 from a success-path one, so a failure in that close would replace whatever

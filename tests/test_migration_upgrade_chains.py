@@ -5,7 +5,7 @@ through an ordered migration registry plus a loop over a chain of per-version
 ``_migrate_core_v*`` helpers. Existing suites cover single rungs (the
 v13->v14 hot-path indexes and the v18->v19 edge metadata column); this module
 generalises that to the **entire** ladder so an off-by-one step (a wrong start
-version or a skipped step) can no longer strand one specific source version
+version or a skipped step) cannot strand one specific source version
 undetected.
 
 Four properties are asserted:
@@ -1201,7 +1201,7 @@ async def test_atomic_step_failure_mid_step_leaves_database_unchanged(
     backfills two of them. Patching ``_add_column_if_absent`` to raise on the
     fourth column (after the first three real ``ALTER TABLE`` statements have
     already executed against the connection) simulates a crash partway through
-    the step. Because the whole step now runs inside one explicit transaction,
+    the step. Because the whole step runs inside one explicit transaction,
     the three columns that *did* execute must not survive the rollback: the
     table's column definitions and every row's decoded values must read back
     exactly matching the pre-migration snapshot (see
@@ -1355,12 +1355,11 @@ async def test_atomic_step_busy_commit_rolls_back_and_stays_retryable(
                 await durable.close()
 
             # Release the contending transaction and retry on the SAME
-            # connection that just failed. The bug this guards against:
-            # reading back the stuck, uncommitted user_version made a retry
-            # believe the database was already current and return without
-            # ever running the step -- so require that it actually ran this
-            # time. Closed here (not only in the outer `finally`) because the
-            # retry below needs the lock gone.
+            # connection that just failed. A user_version read back stuck at
+            # the uncommitted value would make the retry believe the database
+            # was already current and return without running the step, so
+            # require that it actually ran. Closed here (not only in the
+            # outer `finally`) because the retry below needs the lock gone.
             await reader.close()
             reader_closed = True
 
@@ -1436,7 +1435,7 @@ async def test_fk_recreate_step_cannot_be_one_atomic_unit_but_still_converges() 
     ``embedding`` and ``action`` (the savepoint-guarded swap succeeds and
     commits), and only *then* — outside that swap, back in the outer method —
     tries to repair the missing edge index and fails. The result is exactly
-    the shape the upgrade guide now describes for this step: some of the
+    the shape the upgrade guide describes for this step: some of the
     step's work (embedding and action's foreign keys) is durably applied,
     ``user_version`` never advances past 11, and the failure is retryable —
     removing the conflict and re-running converges to head with the

@@ -852,7 +852,7 @@ class TestMaxPerUnitNoneParity:
 
 
 class TestDeepBackfillCliffRegression:
-    """A3 — the per-defect regression: deeper distinct unit + deeper answer chunk.
+    """A3 — a deeper distinct unit and a deeper answer chunk.
 
     Fully controlled ranks via the exhaustive vector arm (a ``no-fts-match``
     query text isolates the vector arm, so BM25 length normalization never
@@ -877,7 +877,7 @@ class TestDeepBackfillCliffRegression:
             await s.store_embedding(tid, vec)
 
     async def test_today_none_path_misses_deeper_distinct_unit(self, tmp_path: Path) -> None:
-        """BEFORE (default path): the distinct deeper unit is unreachable.
+        """Default path (no ``collapse_key``): the distinct deeper unit is unreachable.
 
         ``collapse_key=None`` never widens the pool, so with ``vector_top_k=2``
         the candidate set is only the two strongest ``u1`` fragments and the
@@ -902,11 +902,11 @@ class TestDeepBackfillCliffRegression:
             await conn.close()
 
     async def test_today_single_keeper_drops_deeper_answer_chunk(self, tmp_path: Path) -> None:
-        """BEFORE (single-keeper collapse): the long turn's deeper answer chunk is dropped.
+        """Single-keeper collapse (no ``collapse_max_per_unit``) drops the deeper answer chunk.
 
         ``collapse_key`` widens the pool (so ``u2-best`` is reachable) but keeps
         exactly one row per unit, so the deeper ``u1-ans`` answer chunk is
-        evicted in favour of ``u1-top`` — the ss-assistant regression pattern.
+        evicted in favour of ``u1-top``.
         """
         conn = await aiosqlite.connect(str(tmp_path / "cliff_keeper.db"))
         conn.row_factory = aiosqlite.Row
@@ -930,11 +930,11 @@ class TestDeepBackfillCliffRegression:
             await conn.close()
 
     async def test_h_a_surfaces_distinct_unit_and_keeps_answer_chunk(self, tmp_path: Path) -> None:
-        """AFTER (H-A on, N>=2): distinct deeper unit present AND answer chunk kept.
+        """H-A on, N>=2: distinct deeper unit present AND answer chunk kept.
 
         The widened pool still reaches ``u2-best`` (distinct-unit backfill), and
         raising the retention depth to 2 keeps the deeper ``u1-ans`` answer chunk
-        alongside ``u1-top`` — repairing both halves of the defect at once.
+        alongside ``u1-top``.
         """
         conn = await aiosqlite.connect(str(tmp_path / "cliff_ha.db"))
         conn.row_factory = aiosqlite.Row

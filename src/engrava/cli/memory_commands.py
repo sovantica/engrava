@@ -95,7 +95,7 @@ _UNEXPECTED_ERROR_EXIT_CODE = 1
 # (an exact `ConfigError` / `ReferentialIntegrityError` whose fields fail
 # validation, and every subclass of either). One named constant per message,
 # used by both the "malformed field" and the "subclass" branch, so the two
-# call sites cannot drift apart the way a hand-copied literal has before.
+# call sites cannot drift apart.
 # Says the detail is *omitted*, not that a read was attempted and failed --
 # the subclass branch makes no read attempt at all, so "omitted" is the
 # claim that stays true in both cases.
@@ -135,17 +135,17 @@ def _emit_and_exit(*, as_json: bool, kind: str, message: str, code: int) -> NoRe
     r"""Write the one, terminal line of output for a command's failure, and exit.
 
     This writes the failure output of a memory verb that reaches
-    :func:`_error_boundary` -- :func:`_fail` no longer does, precisely so that
-    nothing else in the command can write after it (see
-    :func:`_error_boundary`, the only caller). A schema refusal is written
-    earlier, by the schema gate, and never reaches here. ``message`` is always
+    :func:`_error_boundary`; :func:`_fail` does not write, so that nothing
+    else in the command can write after it (see :func:`_error_boundary`, the
+    only caller). A schema refusal is written earlier, by the schema gate,
+    and never reaches here. ``message`` is always
     an *exact* ``str`` instance by the time it reaches here: ``_fail``'s
     callers pass literal text or the shared fixed-fallback constants, the
     boundary's own generic branch builds its fallback through
     :func:`_describe_exception` (which normalizes both halves with
     :func:`~engrava.config_validation.own_str` before returning), and the two
     known-error adapters in
-    :func:`_resolve_for_command` / ``link`` now check ``type(...) is str``
+    :func:`_resolve_for_command` / ``link`` check ``type(...) is str``
     on a field before ever using it, falling back to a fixed literal
     otherwise -- so nothing here can be a ``str`` *subclass* whose own
     ``__format__`` might misbehave downstream, even though ``json.dumps``
@@ -258,36 +258,22 @@ def _error_boundary(*, as_json: bool, command: str) -> Iterator[_ResolvedDatabas
     path, a directory or corrupt file given as ``--db``, an unreadable or
     non-UTF-8 ``--config``, an uninitialised database — because "everything
     a library this CLI touches might raise" is not a set these functions can
-    enumerate correctly, and ``mypy`` gives
-    no help either: nothing in ``resolve_hooks()`` or ``aiosqlite.connect()``'s
-    signature says what they raise. Catching ``Exception`` once, here, closes
-    the *class* of defect instead of chasing its latest instance.
+    enumerate correctly, and ``mypy`` gives no help either: nothing in
+    ``resolve_hooks()`` or ``aiosqlite.connect()``'s signature says what they
+    raise.
 
     **This is also the only place that writes the output of a failure that
     reaches it, and it does so only after everything it wraps has finished
-    unwinding.** The
-    previous shape -- ``_fail`` itself calling ``click.echo`` and
-    ``sys.exit()`` at the point of detection -- let cleanup still running
-    *underneath* that call corrupt the output
-    that had already been written: a database's ``close()`` failing during
-    the ``async with`` unwind either printed a stray line after the
-    documented final JSON object, or (worse, on a ``--config`` store, whose
-    ``finally: await store.close()`` unconditionally ran on the way out)
-    replaced an already-decided ``SystemExit(4)`` outright, so the boundary
-    caught the close failure instead and reported a second, contradicting
-    error object at exit ``1``. Enumerating more cleanup paths to special-case
-    is the same mistake this boundary already replaced once for exception
-    *types*; the actual fix is structural: :func:`_fail` (and a directly
-    raised :class:`ReferentialIntegrityError` conversion, and this boundary's
-    own generic-exception branch) no longer write or exit themselves, they
-    only raise :class:`_CliError` -- an ordinary ``Exception`` -- and let it
-    propagate through every enclosing ``async with``/``finally`` exactly like
-    any other exception would, so those blocks' own cleanup (and cleanup's
-    own failure, logged rather than raised -- see ``_opened_full_store``)
-    always completes *before* this ``except`` clause below ever runs. The
-    write-and-exit in :func:`_emit_and_exit` is therefore always the last
-    thing a failing invocation that reaches it does, by construction, not by
-    checking that it happened to be. A schema refusal does not reach it: the
+    unwinding.** :func:`_fail` (and a directly raised
+    :class:`ReferentialIntegrityError` conversion) does not write or exit
+    itself: it only raises :class:`_CliError` -- an ordinary ``Exception``
+    -- which propagates through every enclosing ``async with``/``finally``
+    exactly like any other exception would, so those blocks' own cleanup (and
+    cleanup's own failure, logged rather than raised -- see
+    ``_opened_full_store``) always completes *before* either ``except``
+    clause below runs. The write-and-exit in :func:`_emit_and_exit` therefore
+    runs after that cleanup, by construction rather than by checking the
+    order. A schema refusal does not reach it: the
     schema gate prints that refusal and exits before the store is opened, so
     nothing is left to unwind.
 
@@ -322,10 +308,9 @@ def _error_boundary(*, as_json: bool, command: str) -> Iterator[_ResolvedDatabas
     way. Only an exception that neither of those two classes (exact or
     subclass), nor any other narrower catch, recognised ever reaches the
     generic branch below, and only that one gets the generic kind.
-    ``SystemExit`` itself still passes through this boundary
-    untouched, same as before ``_CliError`` existed: it does not subclass
-    ``Exception``, so a ``sys.exit()`` a click internal or a genuinely
-    intentional early exit raises is never caught here.
+    ``SystemExit`` itself passes through this boundary untouched: it does
+    not subclass ``Exception``, so a ``sys.exit()`` a click internal or a
+    genuinely intentional early exit raises is never caught here.
 
     **Why a generic kind and exit code, not one of the specific ones.**
     Reusing ``database_not_found`` (exit ``3``) or ``invalid_config`` (exit
@@ -377,22 +362,12 @@ def _error_boundary(*, as_json: bool, command: str) -> Iterator[_ResolvedDatabas
     for safety: it is not a full exception-chain rendering. It never calls
     the exception's own formatter a second time, and it never visits a
     ``__cause__``, ``__context__``, attached notes, or exception-group
-    children -- an earlier shape passed ``exc_info=True`` to ``logger.debug``
-    instead, which made CPython's own traceback formatter render the
-    exception a second time to build that text; that formatter wraps its own
-    rendering in a bare ``except``, so a real OS ``SIGINT`` arriving during
-    that second render was swallowed before it could reach this module's
-    guards, and the command still exited ``1`` with an ordinary error object
-    instead of aborting (verified by sending a real signal). Reading frame
-    metadata instead touches no exception-controlled code at all: nothing
-    here calls ``__str__``, ``__format__``, or any other overridable method,
-    and no local variable or source line is inspected. This debug call is
-    unconditionally cheap when ``--verbose`` was not given: it is wrapped in
-    its own ``logger.isEnabledFor(logging.DEBUG)`` check, so neither the
-    stack nor the formatted message is ever built in that case -- which also
-    means it cannot itself raise ``MemoryError`` under the exhaustion this
-    boundary is trying to survive unless ``--verbose`` asked it to do the one
-    thing that does allocate.
+    children. Reading frame metadata touches no exception-controlled code at
+    all: nothing here calls ``__str__``, ``__format__``, or any other
+    overridable method, and no local variable or source line is inspected.
+    This debug call is wrapped in its own
+    ``logger.isEnabledFor(logging.DEBUG)`` check; the stack and the
+    formatted message are built inside that check.
 
     **This does not make a programming error in this CLI's own code harder
     to find.** Catching ``Exception`` this broadly risks turning a genuine
@@ -403,9 +378,7 @@ def _error_boundary(*, as_json: bool, command: str) -> Iterator[_ResolvedDatabas
     is one flag away rather than requiring a code change to surface — a
     developer is never worse off than "reproduce with the same input, add
     ``--verbose``". What this boundary deliberately does *not* do is
-    re-raise or print a traceback by default: a CLI that sometimes
-    tracebacks and sometimes doesn't, depending on which exception type
-    happened to already be enumerated, is the exact defect this replaces.
+    re-raise or print a traceback by default.
 
     **What is not, and cannot be, guaranteed.** A ``MemoryError`` raised
     while memory is genuinely exhausted is still caught and still routed
@@ -449,15 +422,12 @@ def _error_boundary(*, as_json: bool, command: str) -> Iterator[_ResolvedDatabas
         # logging arguments themselves.
         description = _describe_exception(exc)
         if logger.isEnabledFor(logging.DEBUG):
-            # Deliberately not `logger.debug(..., exc_info=True)`: that made
+            # Deliberately not `logger.debug(..., exc_info=True)`: that makes
             # Python's own traceback formatter render `exc` a second time to
             # build the traceback text, outside `_describe_exception`'s
             # guards entirely -- and that formatter wraps its own rendering
-            # in a bare `except`, so a real OS `SIGINT` arriving during that
-            # second render was swallowed before it could reach this
-            # module's guards, leaving this command to still emit an
-            # `unexpected_error` object at exit `1` instead of aborting
-            # (verified with a real signal). `_frame_only_stack` instead
+            # in a bare `except`, which swallows a `KeyboardInterrupt` raised
+            # during that second render. `_frame_only_stack` instead
             # reads only frame metadata -- filename, line number, function
             # name -- for each frame, through the built-in traceback
             # descriptor rather than a plain, interceptable attribute read
@@ -469,11 +439,9 @@ def _error_boundary(*, as_json: bool, command: str) -> Iterator[_ResolvedDatabas
             # this stack carries less detail than a full exception-chain
             # traceback would -- no chained-exception text, no source lines,
             # no locals -- in exchange for never executing exception
-            # formatting a second time. The `isEnabledFor` check keeps this
-            # whole block, not just the log call, cheap when `--verbose` was
-            # not given -- the same property `_error_boundary`'s own
-            # docstring documents. `_opened_full_store`'s own cleanup-failure
-            # warning shares this same helper rather than a second copy.
+            # formatting a second time. `_opened_full_store`'s own
+            # cleanup-failure warning shares this helper rather than a
+            # second copy.
             logger.debug(
                 "Unexpected %s in %r; caught exception's stack (file:line in "
                 "function, not a full exception-chain rendering):\n%s",
@@ -700,32 +668,19 @@ async def _opened_full_store(
             # `_describe_exception` already reads it once, downstream, to
             # build the final message), and any `__cause__`/`__context__`
             # or exception-group children attached to *either* -- all
-            # through their own overridable formatters. Measured with a
-            # secondary close failure whose original exception carried an
-            # exception group with one child: one call the fixed code
-            # below makes of the close exception's own formatter, not zero:
-            # dropping it entirely (as an earlier shape of this fix did,
-            # alongside the original exception a second time, the group, and
-            # the child, all of which stay at zero) would be a diagnostic
-            # regression -- a frame-only stack says *where* closing failed,
-            # never *why*, so
-            # an ordinary `PermissionError`, a full disk, or a locked file
-            # were all indistinguishable. `_describe_exception` is called
-            # here exactly once, on the close exception, which is the same
-            # single, non-absorbing attempt it always made for the original
-            # exception downstream -- not the forbidden second render: a
+            # through their own overridable formatters. The warning below
+            # logs a frame-only stack instead, which lists file names, line
+            # numbers and function names but not the exception's message
+            # text, so it also calls `_describe_exception` once, on the close
+            # exception: a single, non-absorbing attempt, like the one it
+            # makes for the original exception downstream, where a
             # `KeyboardInterrupt`/`SystemExit` raised while describing the
-            # close exception still escapes instead of being caught by a
-            # bare `except` the way the standard library's own formatter
-            # used to. The same formatter also wraps its own rendering in a
-            # bare `except`, so a real OS `SIGINT` (or a formatter raising
-            # `SystemExit`) arriving during that render was swallowed there
-            # instead of reaching this module's guards, leaving the command
-            # to still exit `1` as an ordinary `unexpected_error` object
-            # instead of aborting (both verified live). `_frame_only_stack`
-            # gives the same "where" detail `_error_boundary`'s own debug
-            # log uses, through the same helper, without touching the
-            # original exception, the group, or the child.
+            # close exception escapes instead of being caught by a bare
+            # `except` the way the standard library's own formatter catches
+            # it. `_frame_only_stack` gives the "where" detail
+            # `_error_boundary`'s own debug log uses, through that helper,
+            # without touching the original exception, the group, or the
+            # child.
             try:
                 await store.close()
             except Exception as close_exc:  # noqa: BLE001 -- deliberately logged, not raised
@@ -805,24 +760,17 @@ def _resolve_for_command(
     specific diagnosis this branch exists to give and the exit code
     ``docs/cli.md`` promises categorically for it); reading from one whose
     accessor raises ``SystemExit`` would escape with no error object at
-    all. An earlier fix checked ``type(exc) is ConfigError`` before
-    reading anything off it and re-raised a subclass otherwise, sending it
-    through :func:`_error_boundary`'s generic branch instead -- which kept
-    the failure path from corrupting, but also silently downgraded the
-    subclass to ``unexpected_error``, exit ``1``, breaking the documented
-    promise that a ``--config`` file this function actually reads (no
-    explicit ``--db``), if invalid, is exit ``2``. The class
-    hierarchy is trustworthy even when a subclass's own attributes are
-    not: a ``ConfigError`` subclass genuinely *is* a configuration failure,
-    so it keeps ``invalid_config`` / exit ``2`` either way. Only *how the
-    message is built* differs -- a subclass gets a fixed literal message
-    instead, with nothing read off it at all. Even the hardened, generic
-    :func:`_describe_exception` is not enough here: it still includes
-    ``str(exc)``, which the subclass fully
-    controls, and a subclass built to return a believable-looking
-    fabricated diagnosis would have that fabrication reported as if this
-    CLI had produced it. Trading the subclass's detail for a fixed, honest
-    message closes that the way normalizing the read never could.
+    all. The class hierarchy is trustworthy even when a subclass's own
+    attributes are not: a ``ConfigError`` subclass genuinely *is* a
+    configuration failure, so it keeps ``invalid_config`` / exit ``2``
+    either way. Only *how the message is built* differs -- a subclass gets a
+    fixed literal message instead, with nothing read off it at all. Even the
+    hardened, generic :func:`_describe_exception` is not enough here: it still
+    includes ``str(exc)``, which the subclass fully controls, and a subclass
+    built to return a believable-looking fabricated diagnosis would have that
+    fabrication reported as if this CLI had produced it. Trading the
+    subclass's detail for a fixed, honest message closes that the way
+    normalizing the read never could.
 
     **An exact instance is not automatically safe either -- its own fields
     can still be hostile.** ``type(exc) is ConfigError`` rules out an

@@ -420,8 +420,7 @@ class TestUpdateActionJournalAppendFailure:
 
 
 # ---------------------------------------------------------------------------
-# 5. The legitimate chain still verifies after a normal write following a
-#    failed one -- the fix must not, itself, corrupt the surviving chain.
+# 5. The chain still verifies after a normal write following a failed one.
 # ---------------------------------------------------------------------------
 
 

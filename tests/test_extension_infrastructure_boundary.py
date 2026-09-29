@@ -213,13 +213,10 @@ _SANCTIONED_DREAMING_PATH = (
 #: "known-bad prefix" filter -- extending this tuple is an architecture
 #: decision, not a test fix.
 #:
-#: The sqlite-vec vector backend used to be a second entry here
-#: (``engrava.infrastructure.sqlite.engrava_core`` ->
-#: ``engrava.extensions.vector_sqlite_vec``): it was a SQLite adapter, not an
-#: extension, and moving it to ``engrava.infrastructure.sqlite`` removed the
-#: crossing rather than widening the allow-list. The old import path still
-#: resolves, as a ``sys.modules`` alias to the relocated module -- see
-#: ``engrava.extensions.vector_sqlite_vec`` and
+#: The sqlite-vec vector backend is not an entry here: it is a SQLite adapter,
+#: not an extension, and lives in ``engrava.infrastructure.sqlite``. Importing
+#: it as ``engrava.extensions.vector_sqlite_vec`` resolves through a
+#: ``sys.modules`` alias to that module -- see that module and
 #: ``test_vector_sqlite_vec_alias_is_the_same_module_object`` below.
 _PRE_EXISTING_EXTENSION_CROSSINGS = (("engrava.config", "engrava.extensions.discovery"),)
 

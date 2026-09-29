@@ -1,4 +1,4 @@
-"""Regression tests for graph_weight=0.0 default.
+"""Tests for the graph_weight=0.0 default.
 
 Covers:
 - SearchConfig.default_graph_weight default is 0.0 (graph signal disabled)
@@ -68,11 +68,7 @@ class TestGraphWeightDefault:
     """SearchConfig.default_graph_weight must default to 0.0."""
 
     def test_default_graph_weight_is_zero(self) -> None:
-        """default_graph_weight default is 0.0 — graph signal disabled.
-
-        Empirical evidence: graph_weight=0.3 hotfix from 2026-04-22 caused
-        -8 pp AMB PersonaMem regression (Chi² p=0.045). Reverted empirically.
-        """
+        """default_graph_weight default is 0.0 — graph signal disabled."""
         assert SearchConfig().default_graph_weight == pytest.approx(0.0)
 
     def test_parse_search_none_graph_weight_is_zero(self) -> None:

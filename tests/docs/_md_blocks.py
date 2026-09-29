@@ -835,15 +835,12 @@ class CompileOnlyReason(Enum):
     never be executed" is not, and members should not be extended on the assumption
     that it is.
 
-    Mirrors :class:`ExemptionReason` for the ``python`` fence's own, larger, previously
-    unclassified tier: the 122 blocks in ``COMPILE_ONLY`` (see
-    ``test_docs_examples_coverage.py``) used to carry 113 distinct free-text reasons --
-    122 against 113 is nine duplicate uses, not a one-sentence-per-nine-blocks ratio --
-    so nobody could count how many blocks were exempt for which cause, or notice one
-    cause quietly growing. Every ``COMPILE_ONLY``
-    entry now cites exactly one of these members in addition to its free-text note; the
-    note may still say something the member cannot (which exact API, which specific
-    test mirrors it) -- the member is what gets counted, the note is what gets read.
+    Mirrors :class:`ExemptionReason` for the ``python`` fence's own compile-only tier,
+    ``COMPILE_ONLY`` in ``test_docs_examples_coverage.py``. Every ``COMPILE_ONLY``
+    entry cites exactly one of these members in addition to its free-text note, so the
+    blocks exempt for each cause can be counted and one cause quietly growing is
+    noticed; the note may still say something the member cannot (which exact API, which
+    specific test mirrors it) -- the member is what gets counted, the note is what gets read.
 
     Extend this enum deliberately when a genuinely new reason a block is not executed
     or behaviour-asserted appears -- never by grepping the old free-text sentence for

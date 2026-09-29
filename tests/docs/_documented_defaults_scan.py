@@ -25,8 +25,7 @@ The documentation states a default in two shapes this scanner recognises:
    either a separate token (``` `field` ... (default `value`) ```) or a
    single ``field = value`` token.
 
-A third form the design brief for this scanner calls out — inline
-``field = value`` — is handled as a sub-case of (2): a backtick token that
+A third form — inline ``field = value`` — is handled as a sub-case of (2): a backtick token that
 itself contains ``=`` is parsed as its own self-contained claim.
 
 Recognition is loud, not clever

@@ -40,11 +40,11 @@ class JournalWriter:
         db: An open aiosqlite connection with the ``journal_entry``
             table already created.
         revocation: Optional shared revocation token. When the owning store
-            quarantines the connection it revokes this token, and every
-            connection-touching method here then fails hard with
-            :class:`~engrava.domain.exceptions.ConnectionQuarantinedError` —
-            so this holder of the real connection cannot bypass the store's
-            terminal quarantine. ``None`` (standalone use) disables the check.
+            quarantines the connection it revokes this token, and
+            :meth:`append`, :meth:`verify_integrity` and :meth:`get_entries`
+            then raise
+            :class:`~engrava.domain.exceptions.ConnectionQuarantinedError`.
+            ``None`` (standalone use) disables the check.
 
     Examples:
         >>> writer = JournalWriter(db)  # doctest: +SKIP

@@ -155,35 +155,24 @@ async def _close_quietly(conn: Any) -> None:  # noqa: ANN401
     keeping the event loop alive) open until the real close has actually
     completed, before letting the cancellation propagate.
 
-    **The warning below no longer passes ``exc_info=True``.** This function
-    is reached by the memory verbs' own bare/default store tier
+    **The warning below does not pass ``exc_info=True``.** This function is
+    reached by the memory verbs' own bare/default store tier
     (``remember`` / ``recall`` / ``link`` with no ``--config``, via
-    ``_opened_db`` above) -- not just the other built-ins this module
-    already owned -- and ``exc_info=True`` had the same defect here as the
-    already-fixed ``--config``-tier cleanup site in
-    :mod:`engrava.cli.memory_commands`: it asks the standard library's
-    traceback formatter to render the close exception through its own
-    overridable ``__str__``, and that formatter wraps its own rendering in
-    a bare ``except``, so a real OS ``SIGINT`` -- and separately, a
-    formatter raising ``SystemExit`` -- arriving during that render was
-    absorbed there instead of propagating, verified live against this
-    exact function. Because the close here runs as a separately scheduled,
-    shielded task (see above) rather than inline inside the caller's
-    ``except`` block, ``exc_info=True``'s chain-walk had nothing to walk
-    beyond the close exception itself -- no implicit ``__context__`` links
-    it to whatever this coroutine was cleaning up after, unlike the
-    ``--config`` tier's inline ``await store.close()`` -- so the defect
-    here was one unwanted render, not the multi-exception cascade found
-    there. ``_frame_only_stack`` and ``_describe_exception``, shared with
-    that module through :mod:`engrava.cli.exception_reporting` (the two
-    modules import each other and neither can define these at module level
-    without a cycle -- see that module's own docstring), replace it:
-    the frame-only stack gives "where" without touching the close
-    exception's own formatting at all, and the description gives "why" --
-    an ordinary ``PermissionError``, a full disk, a locked file -- through
-    the same single, guarded, non-absorbing read
-    :func:`~engrava.cli.exception_reporting._describe_exception` always
-    performs, once, never a second render of anything.
+    ``_opened_db`` above), not just the other built-ins this module owns.
+    ``exc_info=True`` would ask the standard library's traceback formatter
+    to render the close exception through its own overridable ``__str__``,
+    and that formatter wraps its own rendering in a bare ``except``, which
+    absorbs a ``KeyboardInterrupt`` or ``SystemExit`` raised during that
+    render instead of propagating it. ``_frame_only_stack`` and
+    ``_describe_exception``, shared with :mod:`engrava.cli.memory_commands`
+    through :mod:`engrava.cli.exception_reporting` (see that module's own
+    docstring for why they live there), are used instead: the
+    frame-only stack gives "where" without touching the close exception's
+    own formatting at all, and the description gives "why" -- an ordinary
+    ``PermissionError``, a full disk, a locked file -- through the same
+    single, guarded, non-absorbing read
+    :func:`~engrava.cli.exception_reporting._describe_exception` performs,
+    once, never a second render of anything.
 
     Args:
         conn: The aiosqlite connection to close.
@@ -248,14 +237,12 @@ async def _rollback_quietly(conn: Any) -> None:  # noqa: ANN401
     Delegates the actual shield-then-redraw mechanics to the infrastructure
     layer's :func:`~engrava.infrastructure.sqlite.engrava_core._run_cleanup_step_quietly`
     rather than re-deriving them here: unlike :func:`_close_quietly` -- which
-    is copied, not shared, between this module and the infrastructure layer,
-    and already drifted once as a result (the CLI copy gained a
-    hostile-``__str__``-safe render and a cancellation/SIGINT-delivery fix
-    the infrastructure copy still lacks) -- there is no import cycle blocking
-    a shared helper here, so this uses it directly instead of adding a third
-    copy of the same technique. Only the logging shape is CLI-specific
-    (``_describe_exception``/``_frame_only_stack`` instead of a bare
-    ``exc_info=True``), so that is the one thing passed in.
+    is copied, not shared, between this module and the infrastructure layer --
+    there is no import cycle blocking a shared helper here, so this uses it
+    directly instead of adding a third copy of the same technique. Only the
+    logging shape is CLI-specific (``_describe_exception``/
+    ``_frame_only_stack`` instead of a bare ``exc_info=True``), so that is the
+    one thing passed in.
 
     Args:
         conn: The aiosqlite connection whose transaction to roll back.
@@ -431,10 +418,9 @@ def _ahead_schema_refusal(version: int, *, command: str) -> str:
 def _apply_read_schema_gate_for_version(version: int, *, command: str) -> None:
     """Apply the schema-version gate for a read-classified built-in command.
 
-    Warns and proceeds on a behind schema (refusing would trade this defect
-    for a worse one — a pending migration blocking an ordinary read); refuses
-    unconditionally on a schema newer than this build's head, which it cannot
-    understand at all.
+    Warns and proceeds on a behind schema (refusing would make a pending
+    migration block an ordinary read); refuses unconditionally on a schema
+    newer than this build's head, which it cannot understand at all.
 
     Args:
         version: The database's stamped ``user_version``.
@@ -453,8 +439,7 @@ def _apply_destructive_schema_gate_for_version(version: int, *, command: str) ->
 
     Refuses on any schema that is not exactly head — below head because a
     destructive operation must not delete rows through an engine that does
-    not understand the schema it is deleting from (the "gc never migrates"
-    defect reached a user through exactly this gap), and above head because
+    not understand the schema it is deleting from, and above head because
     this build cannot understand it either.
 
     Args:
@@ -517,12 +502,14 @@ def _run_command(coro: Any, *, command: str, db_path: Path | None) -> Any:  # no
     specifically -- a corrupt or truncated ``--db`` file surfacing as
     ``sqlite3.DatabaseError`` from :func:`_open_db`'s first ``PRAGMA``, a
     directory given as ``--db`` surfacing as ``OSError``, a close failure on
-    the success path -- used to propagate straight out of ``asyncio.run()``
-    as a raw Python traceback: not just noisy, but silent about *which*
-    database it happened to, since neither the traceback's own frames (they
-    name this module's source file, never the caller's database) nor several
-    of these exceptions' own text (``sqlite3``'s "file is not a database" and
-    "no such table" carry no path at all) say so.
+    the success path -- is converted here to a message on stderr and
+    exit ``1``, naming ``command`` and, when there is one, the database. Left
+    to propagate out of ``asyncio.run()``, it would be a raw Python
+    traceback, silent about *which* database it happened to, since neither
+    the traceback's own frames (they name this module's source file, never
+    the caller's database) nor several of these exceptions' own text
+    (``sqlite3``'s "file is not a database" and "no such table" carry no path
+    at all) say so.
 
     ``click.ClickException`` and ``click.Abort`` propagate unconverted:
     both are Click's own clean-failure vocabulary -- raised throughout the
@@ -907,16 +894,10 @@ def cli(
     # off ``ctx.obj`` (``snapshot`` and ``restore`` — see their own bodies
     # below): every other command, including the memory verbs (they resolve
     # their own database through engrava.cli.store_resolution and never touch
-    # either value), used to pay for this load — and its failure — anyway,
-    # since a group callback runs before Click even knows which subcommand's
-    # options to parse. That made an explicit --db unable to save any command
-    # from a broken --config: this callback raised before a subcommand's own
-    # precedence logic ever ran, so --db's documented "explicit always wins"
-    # was true for the *chosen database* but false for whether the command
-    # ran at all. Scoping the load to the two commands that need it restores
-    # that precedence for everything else, while a broken --config given to
-    # snapshot/restore themselves is still reported here, once, as a clean
-    # CLI error instead of a traceback.
+    # either value), skips this load — and its failure. A group callback runs
+    # before Click even knows which subcommand's options to parse, so an
+    # unconditional load would raise on a broken --config before a
+    # subcommand's own precedence logic ever ran, whatever --db said.
     services_cfg = None
     default_embeddings = None
     if ctx.invoked_subcommand in _SERVICES_CONFIG_COMMANDS and cfg.config_path is not None:
@@ -1115,15 +1096,14 @@ def query(ctx: click.Context, mql: str) -> None:
 # Atomic output writing (shared by snapshot and export)
 # ------------------------------------------------------------------
 #
-# Both writers used to open their `-o` path directly (`open("w")` /
-# `Path.write_text`), which truncates whatever was already there before a
-# single byte of the new output exists. A write that fails part-way -- a
-# full disk, a cancelled task, a `KeyboardInterrupt` -- left the previous
-# good file destroyed and replaced by a truncated one, and `restore`
-# accepted the wreckage as a valid (if short) snapshot. The shared fix
-# below writes to a temporary file in *the target's own directory* first,
-# flushes and fsyncs it, and only publishes it onto the real path with
+# Both writers write to a temporary file in *the target's own directory*
+# first, flush and fsync it, and only publish it onto the real path with
 # `os.replace` once every read it depends on has completed successfully.
+# Opening the `-o` path directly (`open("w")` / `Path.write_text`) would
+# truncate whatever was already there before a single byte of the new output
+# exists, so a write that fails part-way -- a full disk, a cancelled task, a
+# `KeyboardInterrupt` -- would leave the previous good file destroyed and
+# replaced by a truncated one.
 # `os.replace` is only guaranteed atomic across a *rename*, not a copy, and
 # only when both paths share a filesystem -- a system-wide temp directory
 # cannot promise that, which is why the temporary file is created next to
@@ -1141,8 +1121,7 @@ def _resolve_real_output_path(out: Path) -> Path:
     a symlinked ``-o`` would silently sever it and leave the old target file
     it pointed to untouched and orphaned. Resolving first, and then writing
     and replacing the real file underneath the link, is what keeps a
-    symlinked ``-o`` path pointing at the (now-updated) real file, matching
-    what the old in-place writers did.
+    symlinked ``-o`` path pointing at the (now-updated) real file.
 
     A plain sync helper — not inlined in the async writers that call it — so
     ``os.path.realpath``'s blocking filesystem lookup happens in one place
@@ -1224,14 +1203,12 @@ def _open_same_directory_tempfile(out: Path) -> tuple[Path, TextIO]:
     0o666)`` under a randomly-suffixed name, rather than ``tempfile.mkstemp``:
     the kernel applies the process umask to that ``0o666`` exactly as a plain
     ``open(path, "w")`` would, so a fresh output file comes out with the
-    permissions the old in-place writers gave it, not ``mkstemp``'s always-
-    ``0o600``. Reading the umask to replicate that ourselves would mean
-    flipping it to ``0`` and back -- process-wide state, so any other thread
-    creating a file in that window would get an unintended, unrestricted
-    mode. When *out* already exists, it keeps its permission bits (read,
-    write and execute for user, group and other), copied onto the new file
-    with ``os.fchmod`` instead: a replace must not silently widen or narrow
-    permissions on an existing file.
+    same permissions, not ``mkstemp``'s always-``0o600``. Reading the umask to
+    replicate that ourselves would mean flipping it to ``0`` and back, which
+    is process-wide state. When *out* already exists, it keeps its permission
+    bits (read, write and execute for user, group and other), copied onto the
+    new file with ``os.fchmod`` instead: a replace must not silently widen or
+    narrow permissions on an existing file.
 
     Args:
         out: The path this temporary file is standing in for.
@@ -3050,17 +3027,16 @@ async def _import_records_to_db(
     gate described below, every record is inserted with ``INSERT OR
     REPLACE``, and an incoming thought, edge, or action whose id matches one
     the journal already describes replaces it outright. But an id match is
-    not the only way a journalled row is orphaned this way, and framing it as
-    the only way is exactly the false conservatism the shipped documentation
-    used to carry: an incoming edge with a brand-new ``edge_id`` still
-    replaces a journalled edge if it repeats that table's composite
+    not the only way a journalled row is orphaned this way: an incoming edge
+    with a brand-new ``edge_id`` still replaces a journalled edge if it
+    repeats that table's composite
     ``UNIQUE(from_thought_id, to_thought_id, edge_type)`` (schema_core.sql),
     with no id ever colliding, and replacing a journalled thought cascades an
     ``ON DELETE CASCADE`` foreign-key delete onto *that thought's own* edges,
     embeddings, and actions -- rows whose ids never appeared in the incoming
     snapshot at all. Either way, the journal entries describing what was just
-    removed are left behind unchanged, and ``verify_journal()`` keeps reporting that
-    mismatched chain as valid, because the chain itself stays internally
+    removed are left behind unchanged, and ``verify_journal()`` keeps
+    reporting that mismatched chain as valid, because the chain itself stays internally
     self-consistent; it simply no longer matches what is stored.
 
     The **journalled-merge collision gate** closes this for every case above,

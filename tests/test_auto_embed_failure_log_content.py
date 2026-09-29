@@ -1,16 +1,14 @@
 """Content-safety guard for the auto-embed-failure ``WARNING``.
 
-An auto-embed provider failure used to be logged with the provider's raw
-exception as a ``%s`` argument. A provider whose error message quotes its
-input (a payload-too-large or validation error, for instance) then wrote the
-thought's own content straight into the log. The log now carries only the
-thought id and the exception's *type name* -- never its message, a digest of
-it, or the exception object itself. What is raised to the caller is
-unchanged: this is a logging fix only.
+An auto-embed provider failure is logged with the thought id and the
+exception's *type name*, not the exception object. A provider whose error
+message quotes its input (a payload-too-large or validation error, for
+instance) would otherwise write the thought's own content straight into the
+log.
 
 Two independent call sites route through the same handler,
-``_on_auto_embed_failure``, and both must be driven here so a fix that
-patches one but not the other still fails this suite:
+``_on_auto_embed_failure``, and both are driven here so that patching one but
+not the other still fails this suite:
 
 * the single-thought path, reached from ``create_thought`` (and
   ``update_thought``, which shares the same helper);
@@ -25,8 +23,8 @@ This suite checks three independent things about every record an engrava
 logger emits while a failing call runs:
 
 * **Shape (exact pin, not a shape match).** Every record from an engrava
-  logger must carry ``record.msg`` identical to the literal format string the
-  fix passes to ``logger.warning`` (copied from the source below, not
+  logger must carry ``record.msg`` identical to the literal format string
+  passed to ``logger.warning`` (copied from the source below, not
   reconstructed), its level must be ``WARNING``, and its rendering must
   satisfy ``record.getMessage() == record.msg % record.args`` -- confirming
   the record's own message is exactly the pinned format with these args. The
@@ -35,12 +33,11 @@ logger emits while a failing call runs:
   matched by shape: the thought id must equal the one this call actually
   used, and the exception type name must equal ``type(...).__name__`` of the
   exact exception instance the provider raised for this call -- not a
-  hard-coded literal, so a wrong fix that glues extra content onto an
-  otherwise-plausible type name (e.g. ``f"{type(exc).__name__}: {digest}"``)
-  is rejected too. This is checked with ``caplog`` capturing *every* level
-  (``NOTSET`` on both the root logger and the ``engrava`` package logger, not
-  just ``WARNING``), so an extra ``logger.debug(...)``/``logger.info(...)``
-  leak would be seen too.
+  hard-coded literal, so a type name with extra content glued on (e.g.
+  ``f"{type(exc).__name__}: {digest}"``) is rejected too. This is checked
+  with ``caplog`` capturing *every* level (``NOTSET`` on both the root logger
+  and the ``engrava`` package logger, not just ``WARNING``), so an extra
+  ``logger.debug(...)``/``logger.info(...)`` leak would be seen too.
 * **Exactly one record.** Each failing call must emit exactly one engrava
   record -- the warning itself, at any level. Removing the warning drops
   this to zero; a second record derived from the exception (a digest at
@@ -56,9 +53,8 @@ Separately, the raised exception itself is asserted unchanged: the exact
 provider exception instance propagates by identity under the default mode,
 and under ``require_embedding=True`` the resulting
 :class:`~engrava.domain.exceptions.EmbeddingGenerationError` carries that
-same instance as its ``__cause__`` and the same message text -- this change
-narrows what is logged, not what a caller who wants the detail still
-receives.
+same instance as its ``__cause__``, so a caller who wants the detail still
+receives it.
 """
 
 from __future__ import annotations
@@ -91,8 +87,7 @@ _MARKER = "embed7q2vwk9fjd41cnotamemoryword"
 # The exact format string ``_on_auto_embed_failure`` passes to
 # ``logger.warning``, copied verbatim from
 # ``src/engrava/infrastructure/sqlite/engrava_core.py`` -- not reconstructed
-# or matched by shape, so a wrong fix cannot satisfy this by producing
-# something merely similar.
+# or matched by shape, so something merely similar cannot satisfy it.
 _ALLOWED_MESSAGE_FORMAT = (
     "Auto-embed failed for thought %s: %s. The embedding was not "
     "produced. Whether the thought row survives, and in what "

@@ -100,13 +100,12 @@ CREATE TABLE IF NOT EXISTS thought (
     -- the hygiene loop archived a thought, or NULL when it was not archived by
     -- hygiene (a restore clears it back to NULL, exactly like archived_at_cycle).
     -- Appended last for the same column-order parity as the columns above. It
-    -- backs the wall-clock restore window: the irreversible GC stage may reap a
-    -- hygiene-archived thought only once BOTH the cycle window and this real-time
-    -- window have elapsed, so a fast-cycling store cannot delete a just-archived
-    -- thought before a real-time chance to restore it. A hygiene-archived row
-    -- with archived_at NULL (archived before this column existed) has no
-    -- real-time stamp and is therefore never GC-eligible while the wall-clock
-    -- window is active — the irreversible stage fails closed.
+    -- backs the wall-clock restore window: while gc_restore_window_seconds is
+    -- greater than zero, the irreversible GC stage also requires archived_at to
+    -- be at least that many seconds old, in addition to the cycle window. A
+    -- hygiene-archived row with archived_at NULL (archived before this column
+    -- existed) has no real-time stamp and is therefore never GC-eligible while
+    -- the wall-clock window is active — the irreversible stage fails closed.
     archived_at       TEXT,
     -- Row-version guard (core-21). Incremented atomically by every guarded
     -- UPDATE (update_thought / restore_thought) as part of the same statement

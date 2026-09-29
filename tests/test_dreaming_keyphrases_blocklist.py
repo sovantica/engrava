@@ -1,6 +1,6 @@
 """Tests for the sentence-starter blocklist + role-marker stripping helpers.
 
-Covers the two pure helpers introduced as the v2 quality amendment:
+Covers the two pure helpers:
 
 * ``_strip_role_markers`` — substitutes ``[USER] User: ...``,
   ``[ASSISTANT] Assistant: ...`` and ``[SYSTEM] ...`` prefixes with a
@@ -205,7 +205,7 @@ class TestTopKeyphrasesTfidfRoleMarkerStrip:
         corpus = ["unrelated content one", "another unrelated topic two"]
         result = top_keyphrases_tfidf(cluster, corpus=corpus, top_n=10)
         phrases = {entry["phrase"] for entry in result}
-        # Critical regression guard: no ``user user`` appears as a keyphrase.
+        # No ``user user`` appears as a keyphrase.
         assert "user user" not in phrases
         assert "assistant assistant" not in phrases
 
@@ -229,20 +229,15 @@ class TestTopKeyphrasesTfidfRoleMarkerStrip:
 
 
 # ---------------------------------------------------------------------------
-# short07 NE top-15 audit regression tests
+# Sentence-starter words that must be blocklisted
 # ---------------------------------------------------------------------------
 
 
 class TestBlocklistExtensionShort07Audit:
-    """Regression tests for the blocklist extension.
-
-    11 words from the short07 NE top-15 audit (2026-05-04) were found
-    among the most frequent named_entities in 47 REFLECTION thoughts;
-    all must be present in ``SENTENCE_STARTER_BLOCKLIST``.
-    """
+    """The listed sentence-starting words are in ``SENTENCE_STARTER_BLOCKLIST``."""
 
     def test_blocklist_includes_short07_audit_findings(self) -> None:
-        """Verify 11 NE top-15 sentence-starters from short07 are blocked."""
+        """The eleven listed sentence-starters are blocked."""
         short07_findings = {
             "How",
             "For",

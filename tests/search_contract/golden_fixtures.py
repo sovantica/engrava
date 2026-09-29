@@ -1,11 +1,11 @@
 """Shared query sets and generation logic for the checked-in search goldens.
 
-Two goldens defend retrieval *semantics* (not merely liveness) against the
-column-filter-drop regression class: a rewrite once normalized ``essence:"a b"``
-to an unscoped ``essence a b`` — still valid FTS5, still returning documents — so
-every findability / never-raises / arm-liveness test stayed green while the
-answer was semantically wrong. Only a byte-identical normalizer golden or a
-frozen ranked-result golden tells "different answer" apart from "an answer".
+Two goldens defend retrieval *semantics* (not merely liveness) against a
+normalizer that drops a column filter's scope: normalizing ``essence:"a b"`` to an
+unscoped ``essence a b`` is still valid FTS5 and still returns documents, so a
+check that only asks for a non-empty result cannot tell the wrong answer from the
+right one. The two goldens are a byte-identical normalizer golden and a frozen
+ranked-result golden.
 
 This module is the single source of truth for BOTH the golden tests
 (``test_search_goldens.py``) and the reviewed regeneration entry point
@@ -65,10 +65,9 @@ RankedEntry = list[str | float]
 # The full column-filter x phrase x boolean cross-product. Every entry is a
 # *genuine* expert query (``_query_is_expert_syntax`` is True) whose normalized
 # MATCH must stay byte-identical release-to-release. The set is a strict superset
-# of the five cases that previously lived inline (see
-# :data:`LEGACY_EXPERT_PARITY_QUERIES`), and deliberately spans the exact
-# column-filter phrase shape (``essence:"a b"``) whose scope a prior rewrite
-# dropped, plus non-identity rewrites (hyphenated identifiers) so the golden pins
+# of the five cases in :data:`LEGACY_EXPERT_PARITY_QUERIES`, and deliberately spans
+# the column-filter phrase shape (``essence:"a b"``), whose scope a normalizer
+# could drop, plus non-identity rewrites (hyphenated identifiers) so the golden pins
 # real normalization behaviour rather than a pure pass-through.
 
 EXPERT_NORMALIZATION_QUERIES: tuple[str, ...] = (
@@ -118,8 +117,7 @@ EXPERT_NORMALIZATION_QUERIES: tuple[str, ...] = (
     '"machine learning" AND req-func',
 )
 
-#: The five cases that previously lived inline; the externalized golden must
-#: remain a superset of them so nothing is lost in the move.
+#: The five legacy parity cases; the golden must remain a superset of them.
 LEGACY_EXPERT_PARITY_QUERIES: frozenset[str] = frozenset(
     {
         'essence:"a b"',
@@ -135,7 +133,7 @@ LEGACY_EXPERT_PARITY_QUERIES: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 # Driven against the deterministic ``hybrid_store`` corpus (bag-of-words vector
 # arm, no network, no model). Includes column-filter phrase queries whose ranked
-# list changes end-to-end if the column filter is dropped — the regression a
+# list changes end-to-end if the column filter is dropped — a change a
 # liveness-only test cannot see.
 
 HYBRID_RANKING_QUERIES: tuple[str, ...] = (

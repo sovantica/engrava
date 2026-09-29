@@ -46,8 +46,8 @@ async def db_path(tmp_path: Path) -> str:
     Non-WAL is required: only in rollback-journal mode can a concurrent
     reader's own lock make the *writer's* ``COMMIT`` itself fail with
     ``SQLITE_BUSY`` once ``busy_timeout`` elapses. In WAL mode a reader never
-    blocks a writer's commit this way, so the defect this module pins would
-    not be reachable through it.
+    blocks a writer's commit this way, so a failed commit could not be
+    reproduced through it.
     """
     path = str(tmp_path / "failed-commit.db")
     conn = await aiosqlite.connect(path)
@@ -105,7 +105,7 @@ async def _stored_thought_ids(db_path: str) -> set[str]:
 
 
 class TestABusyCommitDoesNotSurviveViaALaterWrite:
-    """The defect this closes: a failed commit's write riding a later one."""
+    """A failed commit's write is not published by a later, unrelated commit."""
 
     async def test_standalone_write_busy_commit_is_not_published_later(self, db_path: str) -> None:
         """The plain ``_maybe_commit`` path (a single ``create_thought``)."""

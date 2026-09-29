@@ -1,25 +1,16 @@
 """Release gate: refuse a release whose computed version disagrees with the declared target.
 
-Nothing in this pipeline used to name the version it intends to publish.
 ``.releaserc.json``'s commit-analyzer *derives* a version from whatever the
 commit range on ``dev`` happens to type as (``feat`` -> minor, ``fix``/``perf``
 -> patch, everything else -> no release, this being a ``0.x`` repository).
-The release branch name (``release/v0.7.0``), the release record
-(``docs/upgrade.md``'s in-progress compatibility notes), and the GitHub
-milestone all name a version too, but none of them was ever compared to what
-semantic-release actually computes.
 
-``release-target.json`` at the repository root is the fix: a single
-git-tracked file naming the version this release train intends to publish,
-independent of the branch name that carried the work to ``dev``. The branch
-name itself cannot serve this role -- the release job runs on a push to
-``dev``, and by the time it runs, the source ``release/vX.Y.Z`` branch has
-already been merged and (per ``BRANCHING.md``) deleted; there is no branch
-name left to read.
+``release-target.json`` at the repository root is a single git-tracked file
+naming the version this release train intends to publish, independent of the
+branch name that carried the work to ``dev``.
 
-This script is the F1 half of closing that gap: the wrong-version failure
-mode, where semantic-release computes a release that disagrees with what
-this release train intends. Invoked as a ``@semantic-release/exec``
+This script guards the wrong-version failure mode, where semantic-release
+computes a release that disagrees with what this release train intends.
+Invoked as a ``@semantic-release/exec``
 ``prepareCmd`` in ``.releaserc.json``, positioned as the *first* plugin with
 a ``prepare`` hook -- ahead of ``@semantic-release/changelog``,
 ``bump_pyproject_version.py``, ``verify_release_artifacts.sh``, and

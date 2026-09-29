@@ -5,9 +5,7 @@ Covers:
 * Batched legacy → v2 enrichment writes correct content back.
 * Idempotence — running again on a fully-migrated DB is a no-op.
 * ``--dry-run`` mode terminates after a single full scan even when
-  the legacy row count is exactly *batch_size* (the previous loop
-  re-fetched the same rows because the legacy filter still matched
-  every row after the in-memory rollback).
+  the legacy row count is exactly *batch_size*.
 """
 
 from __future__ import annotations
@@ -154,7 +152,7 @@ class TestReenrichV2Behaviour:
 
 
 # ---------------------------------------------------------------------------
-# Malformed-JSON tolerance — regression guard
+# Malformed-JSON tolerance
 # ---------------------------------------------------------------------------
 
 
@@ -162,12 +160,8 @@ class TestMalformedJsonTolerance:
     """A single corrupt-JSON REFLECTION row must not block the whole run.
 
     The legacy filter combines ``json_valid(content)`` with
-    ``json_extract(content, '$.version') IS NULL``.  Without the
-    ``json_valid`` guard SQLite raises ``OperationalError: malformed
-    JSON`` mid-SELECT the moment ``json_extract`` hits a corrupt row,
-    and the entire re-enrichment pass crashes.  These tests pin the
-    fix: malformed rows are silently excluded by the fetch filter and
-    every other legacy row is enriched normally.
+    ``json_extract(content, '$.version') IS NULL``.  These tests pin
+    that malformed rows are silently excluded by the fetch filter.
     """
 
     async def _inject_malformed_reflection(self, db_path: Path, thought_id: str) -> None:
@@ -254,29 +248,27 @@ class TestMalformedJsonTolerance:
 
 
 # ---------------------------------------------------------------------------
-# dry-run loop termination — regression guard
+# dry-run loop termination
 # ---------------------------------------------------------------------------
 
 
 class TestDryRunTermination:
     """Dry-run mode terminates after a single scan even at row-count boundaries.
 
-    The previous loop's termination condition was ``len(batch) < batch_size``.
-    In dry-run mode the helper rolled back the in-memory UPDATEs each batch,
-    which kept every row matching the ``json_extract($.version) IS NULL``
-    filter forever — so a database with exactly *batch_size* legacy rows
-    would loop infinitely (the next fetch returned the same *batch_size*
-    rows).  This test pins the fix: pagination by ``thought_id`` advances
-    the cursor regardless of whether an UPDATE was issued.
+    A dry run issues no UPDATE, so every legacy row keeps matching the
+    ``json_extract($.version) IS NULL`` filter.  Pagination by
+    ``thought_id`` advances the cursor regardless of whether an UPDATE was
+    issued, so a database with exactly *batch_size* legacy rows is not
+    fetched again.
     """
 
     async def test_dry_run_with_full_batch_does_not_loop(self, populated_db: Path) -> None:
         """``batch_size`` matching the row count terminates after one scan."""
         from scripts.reenrich_reflections_to_v2 import reenrich
 
-        # Three legacy reflections in the fixture; ``batch_size=3`` puts
-        # the loop into the worst-case branch where ``len(batch) ==
-        # batch_size`` would trigger a re-fetch under the old logic.
+        # Three legacy reflections in the fixture; ``batch_size=3`` makes
+        # the first batch full, so the loop fetches again and must get an
+        # empty page.
         result = await reenrich(populated_db, batch_size=3, dry_run=True)
         assert result == 3
 

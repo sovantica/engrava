@@ -1,7 +1,7 @@
 """Tests for opt-in content-hash deduplication on ``create_thought``.
 
 Covers the ``deduplicate=True`` branch of
-``SqliteEngravaCore.create_thought`` introduced for the deduplication fix.
+``SqliteEngravaCore.create_thought``.
 The test file is large on purpose: every behavioural axis (default
 preservation, hash determinism, unicode safety, concurrency, Pydantic
 ``frozen=True`` semantics, identity preservation, cross-thought-type
@@ -368,7 +368,7 @@ def test_protocol_create_thought_accepts_deduplicate_kwarg() -> None:
     Without this, ingest-layer code typed against the public protocol
     cannot forward ``IngestConfig.deduplication_enabled`` to the store
     even though the concrete ``SqliteEngravaCore`` implementation
-    accepts it.  Pinned as a regression test for that gap.
+    accepts it.
     """
     import inspect
 
@@ -387,9 +387,8 @@ def test_protocol_create_thought_accepts_deduplicate_kwarg() -> None:
 async def test_readonly_create_thought_signature_parity_and_violation() -> None:
     """``ReadOnlyEngrava.create_thought`` accepts ``deduplicate`` and raises cleanly.
 
-    Pinned as a regression test: previously calling
-    ``ro.create_thought(t, deduplicate=True)`` would surface a raw
-    ``TypeError`` instead of the documented ``ReadOnlyViolationError``.
+    Calling ``ro.create_thought(t, deduplicate=True)`` raises the documented
+    ``ReadOnlyViolationError``, not a raw ``TypeError``.
     """
     from engrava.domain.exceptions import ReadOnlyViolationError
     from engrava.infrastructure.read_only_store import ReadOnlyEngrava

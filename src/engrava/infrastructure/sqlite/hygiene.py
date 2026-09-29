@@ -172,9 +172,8 @@ def compute_active_hygiene_weights(
     Returns:
         A ``(weights, flat_signals)`` pair. ``weights`` maps every configured
         signal name to its effective (renormalised) weight — ``0.0`` for
-        inactive signals; the active entries sum to ``1.0`` unless the active
-        set is empty (all-zero). ``flat_signals`` is the sorted list of
-        configured signals found inactive this run.
+        inactive signals. ``flat_signals`` is the sorted list of configured
+        signals found inactive this run.
 
     """
     active_names: list[str] = []
@@ -265,12 +264,11 @@ def compute_keep_score(
     ctx: DreamingContext,
     active_weights: Mapping[str, float],
 ) -> tuple[float, dict[str, float]]:
-    """Compute a thought's keep-score as a weighted average of active signals.
+    """Compute a thought's keep-score as a weighted sum of active signals.
 
     The score is ``Σ active-signal weight · signal(thought)`` over the signals
     with a non-zero effective weight (inactive signals have already been
-    redistributed to ``0.0`` by :func:`compute_active_hygiene_weights`, so the
-    effective weights sum to ``1.0`` and the score lands in ``[0.0, 1.0]``).
+    redistributed to ``0.0`` by :func:`compute_active_hygiene_weights`).
 
     Args:
         thought: The thought to score.

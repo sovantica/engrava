@@ -168,9 +168,8 @@ class ThoughtRecord(BaseModel):
             paired with ``archived_at_cycle``; a restore (un-archive) clears both
             back to ``None``.  It backs the garbage-collection **wall-clock**
             restore window (``archived_at <= now - gc_restore_window_seconds``),
-            required in addition to the cycle window before the irreversible GC
-            stage may reap the thought, so a fast-cycling store cannot delete a
-            just-archived thought before a real-time chance to restore it.  A
+            which the irreversible GC stage applies in addition to the cycle
+            window while ``gc_restore_window_seconds`` is greater than zero.  A
             thought archived by any other path (TTL / manual) keeps ``None``.
             Defaults to ``None``.
 

@@ -1117,7 +1117,7 @@ async def test_foreign_window_does_not_skip_derivation(db: aiosqlite.Connection)
     Persisting the derived child then legitimately blocks on the write lock
     B's window holds for its whole duration (a genuinely different task's
     guarded write), so this test observes the producer call BEFORE releasing
-    B, then releases B, then awaits both tasks — the order the corrected
+    B, then releases B, then awaits both tasks — the order the
     behaviour requires: awaiting A first (or releasing B before observing the
     call) would either race the assertion or deadlock A's derivation against
     B's own window.
@@ -1739,8 +1739,7 @@ async def test_failed_unwind_aborts_derivation_raise_propagates(
     with pytest.raises(RuntimeError, match="journal down"):
         await store.create_thought(_source(content=_THREE_PARAS))
 
-    # The store is quarantined and any subsequent op fails fast — reverting the
-    # quarantine-on-failed-unwind fix leaves the store usable and this fails.
+    # The store is quarantined; ``get_thought`` raises ``ConnectionQuarantinedError``.
     assert store._connection_quarantined is True
     with pytest.raises(ConnectionQuarantinedError):
         await store.get_thought("src-1")
@@ -1767,8 +1766,6 @@ async def test_failed_unwind_aborts_derivation_log_propagates_after_logging(
     either policy, so this is the one case where the fail-open ``"log"`` policy
     does not swallow the failure: it logs at ``ERROR`` first — naming the
     source, so an operator can find which one was orphaned — then still raises.
-    This replaces the old ``_DerivationRollbackError`` rule, which quarantined
-    the same way but stopped silently under ``"log"`` instead of propagating.
     """
     db_path = tmp_path / "seam.db"
     store, conn = await _file_journaled_seam_store(db_path, "log")
@@ -1784,7 +1781,7 @@ async def test_failed_unwind_aborts_derivation_log_propagates_after_logging(
     assert any(record.levelno == logging.ERROR for record in caplog.records)
     assert any("src-1" in record.getMessage() for record in caplog.records)
 
-    # The store is quarantined and a subsequent op fails fast.
+    # The store is quarantined; ``get_thought`` raises ``ConnectionQuarantinedError``.
     assert store._connection_quarantined is True
     with pytest.raises(ConnectionQuarantinedError):
         await store.get_thought("src-1")
@@ -2087,10 +2084,10 @@ async def test_close_cancellation_does_not_corpse_the_physical_close(
     """A cancellation of close()'s own caller must not corpse the physical close.
 
     The branch that *creates* the close task (no prior quarantine -- this is
-    an ordinary close with nothing else in the picture) used to await it with
-    a bare ``await``, which forwards this call's own cancellation into the
-    task. A single cancellation could then cancel the physical close before
-    ``_db.close()`` had meaningfully run at all, yet leave a ``done()``
+    an ordinary close with nothing else in the picture) does not await it with
+    a bare ``await``, which would forward this call's own cancellation into
+    the task. A single cancellation could then cancel the physical close
+    before ``_db.close()`` had meaningfully run at all, yet leave a ``done()``
     (cancelled) task sitting in the shared slot -- every later ``close()`` or
     quarantine drain would see a completed task and report success without
     the real connection ever having closed.
@@ -2153,11 +2150,11 @@ async def test_close_cancellation_during_flush_still_closes_the_connection(
     machinery exercised above -- only protects the physical close itself.
     The access-buffer flush that runs *before* any of that was guarded only
     by ``except Exception``, which does not catch ``asyncio.CancelledError``.
-    A cancellation landing there used to escape immediately, skipping the
-    close entirely and leaking the connection's non-daemon worker thread --
-    recreating the exact interpreter-shutdown hang this whole fix exists to
-    prevent, despite the docstring's promise that "a flush failure never
-    blocks the close."
+    A cancellation landing there must not escape immediately: that would skip
+    the close entirely and leak the connection's non-daemon worker thread,
+    contradicting the docstring's promise that "a flush failure never blocks
+    the close." ``close()`` defers the cancellation and re-raises it once the
+    close has run.
     """
     conn = await aiosqlite.connect(":memory:")
     conn.row_factory = aiosqlite.Row
@@ -2213,10 +2210,10 @@ async def test_close_cancellation_during_flush_outranks_a_failing_close(
     """A deferred cancellation must win over the physical close's own failure.
 
     The sibling test above shows a cancelled flush still lets the physical
-    close run. But ``self._quarantine_close_task.result()`` used to raise
-    the close's own exception *before* the line that re-raises the
-    deferred cancellation -- so a cancelled flush followed by a close that
-    itself fails surfaced the close's ``RuntimeError``, not the caller's
+    close run. But if ``self._quarantine_close_task.result()`` raised the
+    close's own exception *before* the line that re-raises the deferred
+    cancellation, a cancelled flush followed by a close that itself fails
+    would surface the close's ``RuntimeError``, not the caller's
     ``CancelledError``, contradicting this method's own documented promise
     that a cancellation of the caller's await always propagates ahead of
     whatever the close task resolved to. The rule
@@ -2337,15 +2334,14 @@ async def test_quarantine_during_an_in_flight_close_does_not_double_close(
 ) -> None:
     """A quarantine racing an in-flight close() must not enter the real close twice.
 
-    Reproduces the exact shape confirmed on a real database: ``close()`` has
-    already entered the real connection's close (published as the shared
-    ``_quarantine_close_task`` before awaiting it), and quarantine runs while
-    that is still in flight. On the pinned aiosqlite version two concurrent
-    physical closes on the same connection each enqueue their own stop
-    sentinel to the worker thread, which exits on the first and can leave
-    the other caller's future unresolved forever -- a hang. The final await
-    is timeout-guarded so a regression here fails this test instead of
-    stalling the suite.
+    The shape: ``close()`` has already entered the real connection's close
+    (published as the shared ``_quarantine_close_task`` before awaiting it),
+    and quarantine runs while that is still in flight. Two concurrent physical
+    closes on the same connection can each enqueue their own stop sentinel to
+    the worker thread, which exits on the first and can leave the other
+    caller's future unresolved forever -- a hang. The final await is
+    timeout-guarded so a regression here fails this test instead of stalling
+    the suite.
 
     Builds its own connection rather than using the shared ``db`` fixture —
     see the previous test's docstring for why.
@@ -2437,9 +2433,9 @@ async def _wedge_the_worker_thread(
 async def test_close_bound_expires_on_a_genuinely_unresponsive_worker() -> None:
     """The first close() on a genuinely wedged worker returns bounded, not never.
 
-    Before this bound existed, ``close()`` awaited the physical close with no
+    Without a bound, ``close()`` would await the physical close with no
     limit at all: queued behind a worker that will never answer, it would
-    never return -- the exact failure this test constructs for real via
+    never return -- the exact case this test constructs for real via
     :func:`_wedge_the_worker_thread`, rather than a finite, merely-slow mock.
     A bound that only proved itself against a mock that always eventually
     returns would not actually prove anything about the unbounded case.
@@ -2604,14 +2600,14 @@ async def test_close_bound_covers_the_access_buffer_flush_too() -> None:
 
     ``close()`` flushes the access buffer *before* it ever reaches the
     bounded physical-close drain -- and that flush awaits the same worker
-    directly (``_write_lock`` + a raw ``executemany``), with no bound of its
-    own until this test's own fix. Access tracking defaults to ``False`` on
-    the manual constructor, but ``from_config`` turns it on whenever dreaming
-    is enabled, and ``DreamingConfig.access_tracking_enabled`` itself
-    defaults to ``True`` -- so a store built the way most deployments build
-    one (dreaming on, nothing said about access tracking) would have hung
-    here even with the physical-close bound in place, exactly the case
-    docs/deployment.md promises is covered. Executed with a genuinely wedged
+    directly (``_write_lock`` + a raw ``executemany``), so it has a bound of
+    its own. Access tracking defaults to ``False`` on the manual
+    constructor, but ``from_config`` turns it on when dreaming is enabled and
+    ``DreamingConfig.access_tracking_enabled`` is set, and that flag defaults
+    to ``True`` -- so a store built with dreaming on and nothing said about
+    access tracking would hang here without the flush bound even with the
+    physical-close bound in place, exactly the case docs/deployment.md
+    promises is covered. Executed with a genuinely wedged
     worker, not reasoned about: a buffer entry is seeded directly so the
     flush actually reaches ``executemany`` instead of returning early on an
     empty buffer.
@@ -2630,7 +2626,7 @@ async def test_close_bound_covers_the_access_buffer_flush_too() -> None:
         with pytest.raises(ConnectionQuarantinedError):
             # The outer wait_for is only a suite-safety net (per the sibling
             # tests above) -- without the flush bound, this would need it to
-            # actually fire, which is exactly the regression this guards.
+            # actually fire.
             await asyncio.wait_for(store.close(), timeout=5.0)
         elapsed = time.monotonic() - started
 
@@ -2738,7 +2734,6 @@ async def test_foreign_id_reuse_does_not_attach_false_provenance_log(
     ``Y``; attaching a ``DERIVED_FROM`` edge would falsely assert "Y was derived
     from source". Under ``on_error="log"`` the collision is logged and skipped:
     no edge is attached (and the foreign row's own content is untouched).
-    Reverting the fix attaches the edge and this fails.
     """
     child_content = "Derived body X."
     foreign_id = await _seed_foreign_row(
@@ -2888,9 +2883,9 @@ def test_is_unique_violation_false_for_check_named_unique() -> None:
     """A CHECK failure whose name contains ``"unique"`` is NOT a unique violation.
 
     This is the fragile case: its message ("CHECK constraint failed:
-    chk_unique_flag") contains "UNIQUE", so the old text-based classifier
-    misclassifies it as a unique violation. The structural (extended error code)
-    check correctly returns ``False``. Reverting the fix fails this test.
+    chk_unique_flag") contains "UNIQUE", so a text-based classifier would
+    misclassify it as a unique violation. The structural (extended error code)
+    check returns ``False``.
     """
     check_exc = _integrity_error("INSERT INTO parent (id, v) VALUES (2, 99)")
     assert check_exc.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_CHECK
@@ -3323,12 +3318,11 @@ async def test_backfill_raise_in_suspend_window_rolls_back_caller_writes_source_
     runs derivation *inside* such a window (the on-store trigger defers instead).
     The source thought, committed **before** the window, is unaffected.
 
-    Regression-sensitive by construction: the first produced child is persisted
-    (uncommitted) into the window before the second child collides and aborts, so
-    if the window did NOT roll back on the raise the unrelated write and that
-    first child's row + ``DERIVED_FROM`` edge would survive — assertions (a)/(c)
-    would fail. If the already-committed source were swept into the rollback,
-    assertion (b) would fail.
+    The first produced child is persisted (uncommitted) into the window before
+    the second child collides and aborts, so if the window did NOT roll back on
+    the raise the unrelated write and that first child's row + ``DERIVED_FROM``
+    edge would survive — assertions (a)/(c) would fail. If the already-committed
+    source were swept into the rollback, assertion (b) would fail.
     """
     collide = "poison content"
     # Make the source id equal a produced child's content-addressed derived id, so

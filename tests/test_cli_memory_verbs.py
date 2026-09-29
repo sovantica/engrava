@@ -1,6 +1,6 @@
 """Tests for the one-shot memory verbs: ``remember``, ``recall``, ``link``.
 
-Covers the acceptance surface for the new commands: the headline
+Covers the commands' surface: the headline
 store-then-search round trip, ``--type``/``--priority`` on ``remember``,
 ``--filter`` narrowing on ``recall`` (including a dotted key reaching a
 nested metadata field rather than a literal dotted key), edge creation
@@ -15,9 +15,9 @@ creation, ``--top-k``/``--weight`` range validation ahead of any database
 side effect, and the ``--db``-vs-``--config`` precedence and error-reporting
 rules (an explicit ``--db`` never reads ``--config`` at all; a ``--config``
 named without ``--db`` is validated unconditionally). The config-driven
-embedding-provider criterion for ``backends_used`` lives in
+embedding-provider tests for ``backends_used`` live in
 :mod:`test_cli_memory_verbs_embedding`, and the configured-search-weights /
-configured-journaling criteria live in :mod:`test_cli_memory_verbs_config`,
+configured-journaling tests live in :mod:`test_cli_memory_verbs_config`,
 since both need more elaborate ``--config`` fixtures than the rest of this
 file.
 """

@@ -1072,11 +1072,10 @@ class TestGcArchivedBlastRadius:
     ) -> None:
         """``gc`` refuses a pre-cascade schema outright rather than collecting on it.
 
-        A destructive operation now refuses on a schema below head, applied
+        A destructive operation refuses on a schema below head, applied
         to every built-in command that deletes user data, ``gc`` included.
-        Before this decision ``gc`` would run its collection anyway — the
-        three explicit child-delete statements in ``_gc_archived`` made that
-        collection *correct* even without a foreign-key cascade (see
+        The three explicit child-delete statements in ``_gc_archived`` make
+        a collection *correct* even without a foreign-key cascade (see
         ``test_gc_archived_helper_still_deletes_children_explicitly_on_pre_cascade``
         below for that coverage, exercised directly against the helper), but
         "correct collection" is not the same question as "should this ever run against
@@ -1142,14 +1141,12 @@ class TestGcArchivedBlastRadius:
         """``_gc_archived`` itself still needs no cascade — exercised directly.
 
         The CLI-level refusal above means ``gc`` never reaches
-        ``_gc_archived`` on a pre-cascade schema in practice, but the helper's
-        own explicit child deletes (``cli/main.py``'s ``_gc_archived``) are
-        exactly the pattern every physical thought-delete path now follows —
-        deleting the children explicitly rather than relying on a cascade the
-        database may not have — and calling it directly (bypassing the CLI's
-        schema-version gate, the same way a future caller reached only
-        through the library could) is what keeps that coverage rather than
-        losing it entirely alongside the CLI-level test above.
+        ``_gc_archived`` on a pre-cascade schema in practice, but the helper
+        (``cli/main.py``'s ``_gc_archived``) deletes the children explicitly
+        rather than relying on a cascade the database may not have, and
+        calling it directly (bypassing the CLI's schema-version gate) is what
+        keeps that coverage rather than losing it entirely alongside the
+        CLI-level test above.
         """
         import aiosqlite as _aiosqlite
 
@@ -1402,13 +1399,11 @@ class TestGcArchivedBlastRadius:
             assert _sync_id_set(conn, _ALL_EMBEDDING_OWNERS) == thoughts_before
             assert _sync_id_set(conn, _ALL_ACTION_IDS) == actions_before
             assert _sync_vec_rowids(conn) == vectors_before
-        # The purge failure no longer escapes as a raw, uncaught
-        # OperationalError: `_run_command` (engrava.cli.main) now converts
-        # every unclassified database failure into a clean exit-1 message
-        # naming the resolved database, the same as a corrupt file or a
-        # directory given as --db. The rollback this test exists to prove
-        # is unaffected either way -- what changed is only how the already-
-        # rolled-back failure is reported.
+        # The purge failure does not escape as a raw, uncaught
+        # OperationalError: `_run_command` (engrava.cli.main) converts it
+        # into a clean exit-1 message naming the resolved database. The
+        # rollback this test exists to prove does not depend on how the
+        # failure is reported.
         assert isinstance(result.exception, SystemExit), result.exception
         assert result.exception.code == 1
         assert str(vec_indexed_mixed_lifecycle_db) in result.output
@@ -2227,7 +2222,7 @@ class TestGcExpiredBlastRadius:
             assert _sync_id_set(conn, _ALL_ACTION_IDS) == all_actions
             assert _sync_vec_rowids(conn) == vectors_before
         # See the matching comment in TestGcArchivedBlastRadius's own
-        # purge-failure test: `_run_command` now converts this into a clean
+        # purge-failure test: `_run_command` converts this into a clean
         # exit-1 message naming the resolved database instead of an
         # uncaught OperationalError -- the rollback is unaffected.
         assert isinstance(result.exception, SystemExit), result.exception

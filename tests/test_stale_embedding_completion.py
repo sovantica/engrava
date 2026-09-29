@@ -1,4 +1,4 @@
-"""Regression: a slower, stale auto-embed completion must not overwrite a newer vector.
+"""A slower, stale auto-embed completion must not overwrite a newer vector.
 
 Auto-embed is deliberately *not* run under the write lock that protects an
 update: the provider call is a slow, arbitrary network round trip, and

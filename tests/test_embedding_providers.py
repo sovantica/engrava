@@ -463,14 +463,12 @@ class TestModelImmutability:
 
 
 class TestModelReCheckOnEveryCall:
-    """A single long-lived store instance re-verifies identity every call.
+    """A single long-lived store instance re-verifies model identity on later calls.
 
-    Regression coverage for the lazy lock's early return that used to make
-    ``_ensure_embedding_model_lock`` a no-op after its first successful call:
-    once ``self._embedding_model_verified`` was set, a *later* call on that
-    same instance skipped the comparison entirely, so a differently sized
-    (or differently named, or differently prefixed) vector was accepted
-    silently instead of raising ``EmbeddingModelMismatchError``. Uses a real
+    A *later* call on the same instance is compared against the model
+    identity already stored. These tests pin a differently sized (or
+    differently named, or differently prefixed) vector raising
+    ``EmbeddingModelMismatchError`` instead of being accepted silently. Uses a real
     temporary file database (not ``:memory:``) so these tests exercise the
     same on-disk ``_metadata`` round trip production code does.
     """
@@ -2264,11 +2262,10 @@ class TestProviderMissingRequiredMember:
         """A provider missing ``model_name`` too still fails on that member.
 
         The guard translates one member. ``verify_embedding_model`` reads
-        ``model_name`` first, as it always has — reversing that to reach the
-        typed check would change the order a conformant provider's properties are
-        evaluated in, which this change is required not to do. So a provider
-        exposing neither member is told about ``model_name``, exactly as before,
-        and nothing is written on the way out.
+        ``model_name`` first — reversing that to reach the typed check would
+        change the order a conformant provider's properties are evaluated in. So
+        a provider exposing neither member is told about ``model_name``, and
+        nothing is written on the way out.
         """
         store = SqliteEngravaCore(db, embedding_provider=_NoPublicMembersProvider())  # type: ignore[arg-type]
 
@@ -2299,18 +2296,13 @@ class TestProviderMissingRequiredMember:
         self,
         db: aiosqlite.Connection,
     ) -> None:
-        """A conformant provider's ranked output is unchanged, order and scores.
+        """A conformant provider's ranked output is frozen, order and scores.
 
         The discriminating half of the pair above: a multi-candidate corpus with
         a provider whose vectors actually differ, frozen as an ordered
         ``(thought_id, score)`` expectation. A guard that changed the resolved
         dimension, the candidate set, or the cosine inputs would move one of
-        these values.
-
-        The frozen values were produced by this same scenario with the guard
-        removed — i.e. reading ``provider.dimension`` directly, as the code did
-        before this change — and are unchanged with it in place, to the six
-        decimal places asserted here.
+        these values, which are asserted to six decimal places.
         """
         provider = CallbackProvider(
             callback=lambda text: [float(len(text) % 7) / 7.0, 0.5, 0.25, 0.125],
@@ -2337,9 +2329,8 @@ class TestProviderMissingRequiredMember:
         """The guard adds no extra read of a conformant provider's ``dimension``.
 
         ``dimension`` is a property, so a presence check that evaluates it (say
-        ``hasattr``) would double the reads on every vector search. A provider
-        whose property is stateful or expensive would then behave differently
-        than it does today, which the change is required not to do.
+        ``hasattr``) would double the reads of ``dimension`` in the single
+        ``search_similar`` call below.
         """
         provider = _CountingDimensionProvider()
         store = SqliteEngravaCore(db, embedding_provider=provider)  # type: ignore[arg-type]

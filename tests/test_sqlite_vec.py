@@ -1144,10 +1144,10 @@ class TestVec0OverfetchFillsTopK(TestSqliteVecRealConnection):
         """search_hybrid's vector arm yields the expected fused top-k live pool.
 
         Weighted purely on the vector arm (``fts_weight=0``) so the fused
-        result depends on the vec pool alone: the deeper live pool now feeds
+        result depends on the vec pool alone: the deeper live pool feeds
         hybrid fusion, and the fused top-k fills with live rows while non-live
         rows never appear. (Positive integration check of the fused path;
-        the strict under-fill regressions live in the ``search_similar`` tests
+        the strict under-fill checks live in the ``search_similar`` tests
         above, where ``top_k`` is the binding fetch bound.)
         """
         store = await self._build_store(tmp_path, backend="sqlite-vec", dimension=2)
@@ -1165,7 +1165,7 @@ class TestVec0OverfetchFillsTopK(TestSqliteVecRealConnection):
             )
             ids = [tid for tid, _ in result.results]
             assert "vector" in result.backends_used
-            # Fused top-k fills entirely from the (now-complete) live vec pool.
+            # Fused top-k fills entirely from the live vec pool.
             assert len(result.results) == 3
             assert all(tid.startswith("t-live-") for tid in ids)
         finally:
@@ -1478,7 +1478,7 @@ def _embedding_snapshot_line(
 
 @sqlite_vec_required
 class TestMergeRestoreDoesNotLeaveAStaleVectorUnderAReusedRowid:
-    """Regression: a restored row's vector must be its own.
+    """A restored row's vector must be its own.
 
     Ordinary merge restore (no ``--clear``/``--re-embed``) never resets the
     vec0 index -- only those two flags route through
@@ -1524,7 +1524,7 @@ class TestMergeRestoreDoesNotLeaveAStaleVectorUnderAReusedRowid:
         this whole scenario is that the *embedding_id changes* across the
         replace while the underlying rowid is what may (or may not) get
         reused, so asserting on rowid-by-owner is what actually exercises
-        the defect.
+        the rowid reuse.
         """
         conn = await aiosqlite.connect(str(db_path))
         try:
@@ -1574,7 +1574,7 @@ class TestMergeRestoreDoesNotLeaveAStaleVectorUnderAReusedRowid:
         # Confirm the mechanism actually fired: the replacement embedding
         # landed on the exact rowid the old one held. If this assertion ever
         # fails, SQLite's rowid-reuse behaviour changed and the rest of this
-        # test no longer exercises the defect.
+        # test no longer exercises rowid reuse.
         new_rowid = await self._embedding_rowid_for_owner(target, owner_id="t-x")
         assert new_rowid == old_rowid
 
@@ -1602,8 +1602,7 @@ class TestMergeRestoreDoesNotLeaveAStaleVectorUnderAReusedRowid:
     async def test_unrelated_merge_leaves_an_untouched_vector_alone(self, tmp_path: Path) -> None:
         """A merge that replaces nothing must not purge any existing vector.
 
-        Guards against an overly broad fix: only rowids this restore actually
-        replaced should ever be touched.
+        Only rowids this restore actually replaced should ever be touched.
         """
         model_name = _PARITY_MODEL
         vector = [1.0, 0.0, 0.0]

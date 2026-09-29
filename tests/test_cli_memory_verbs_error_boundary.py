@@ -1,24 +1,18 @@
 """``remember`` / ``recall`` / ``link`` never traceback -- one boundary, not an enumeration.
 
-A hand-enumerated ``except`` list in these three commands (see
-``engrava.cli.memory_commands``) kept missing exception types: a directory
-or corrupt file given as ``--db``, an unreadable / non-UTF-8 / directory
-``--config``, an uninitialised database.
-``_error_boundary`` replaces the enumeration with a single ``except
-Exception`` around each command's entire body, so *every* exception that
-reaches it -- not just the ones this test module happens to name -- becomes
-the documented ``engrava.cli.error.v1`` object under ``kind:
-"unexpected_error"``, exit ``1``, never a bare traceback.
+``_error_boundary`` (see ``engrava.cli.memory_commands``) is a single
+``except Exception`` around each command's entire body, not a list of
+exception types.
 
 The classes below are organised in two groups:
 
 * :class:`TestPreviouslyTracebackingCasesNowProduceTheDocumentedObject`
-  reproduces every concrete case that used to traceback, now against the
-  fixed code, proving each one individually.
-* :class:`TestGenericPathCoversAnyException` proves the boundary is generic
-  rather than merely a longer enumeration, by injecting an exception type
-  this module has never seen and could not have named in an ``except``
-  clause -- the entire point of replacing enumeration with a boundary.
+  checks each concrete case individually: a directory or corrupt file given
+  as ``--db``, an uninitialised database, and a directory, unreadable or
+  non-UTF-8 ``--config``.
+* :class:`TestGenericPathCoversAnyException` injects an exception type that
+  only this module defines, and checks that it is reported as
+  ``unexpected_error``.
 """
 
 from __future__ import annotations
@@ -73,10 +67,10 @@ class TestPreviouslyTracebackingCasesNowProduceTheDocumentedObject:
         assert result.exit_code == 1
         payload = json.loads(_last_line(result.output))
         assert payload["error"] == "unexpected_error"
-        # Stronger than "mentions the word database": that survives a
-        # regression to a message that no longer names *which* database --
-        # exactly the gap an operator running against several stores, or
-        # with the path coming from --config/ENGRAVA_DB, hits.
+        # Stronger than "mentions the word database": that would pass for a
+        # message that does not name *which* database, which an operator
+        # running against several stores, or with the path coming from
+        # --config/ENGRAVA_DB, needs.
         assert str(db) in payload["message"]
 
     def test_uninitialised_empty_database_is_the_documented_object(self, tmp_path: Path) -> None:
@@ -151,10 +145,7 @@ class _NobodyAnticipatedError(Exception):
 
     Deliberately arbitrary: it exists only to prove the boundary converts
     *any* exception reaching it, not merely the finite set this test module
-    also happens to exercise through a real failing code path. That is the
-    entire premise of replacing an enumerated ``except`` list with one
-    ``except Exception`` boundary -- an enumeration is only ever as good as
-    the last time it was extended.
+    also happens to exercise through a real failing code path.
     """
 
 
@@ -290,6 +281,17 @@ def _run_subprocess(argv: list[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
+#: Child-side launcher: restores ``SIGINT`` to its default disposition, then
+#: replaces itself with the real interpreter so the target script starts with
+#: that default in place (a process that starts with ``SIGINT`` ignored
+#: installs no ``KeyboardInterrupt`` handler).
+_RESTORE_SIGINT_THEN_EXEC = (
+    "import os, signal, sys\n"
+    "signal.signal(signal.SIGINT, signal.SIG_DFL)\n"
+    "os.execv(sys.executable, [sys.executable, *sys.argv[1:]])\n"
+)
+
+
 def _run_subprocess_with_external_sigint(
     argv: list[str], marker: str, *, sigint_delay: float = 0.05
 ) -> subprocess.CompletedProcess[str]:
@@ -314,10 +316,14 @@ def _run_subprocess_with_external_sigint(
     *marker* to prove it has reached the exact synchronous window this test
     targets, with no suspension point ahead of it.
 
+    The child starts with ``SIGINT`` at its default disposition whatever this
+    process has: an ignored ``SIGINT`` is inherited across ``exec``, and a
+    child that inherits it would ignore the signal this helper sends.
+
     Args:
         argv: Full argv after the interpreter, as for :func:`_run_subprocess`.
-        marker: Line the child prints (then blocks briefly) once it has
-            reached the vulnerable synchronous window.
+        marker: Line the child prints (then waits) once it has reached the
+            vulnerable synchronous window.
         sigint_delay: Extra real time to wait, after the marker appears,
             before sending the signal -- gives the child's own stdout flush
             and this process's readline a moment to settle.
@@ -330,7 +336,7 @@ def _run_subprocess_with_external_sigint(
     repo_src = str(_Path(__file__).resolve().parent.parent / "src")
     env = {**os.environ, "PYTHONPATH": repo_src}
     proc = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell, our own source
-        [sys.executable, *argv],
+        [sys.executable, "-c", _RESTORE_SIGINT_THEN_EXEC, *argv],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -375,20 +381,45 @@ def _run_subprocess_with_external_sigint(
     )
 
 
+def test_external_sigint_helper_aborts_the_child_when_this_process_ignores_sigint() -> None:
+    """The child still receives a real ``SIGINT`` while this process ignores it.
+
+    ``SIG_IGN`` survives ``fork`` and ``exec``, so a child started from a
+    process that ignores ``SIGINT`` (a background job started from a
+    non-interactive shell is one) would otherwise ignore the signal too.
+    The child here sleeps for a minute, far longer than the helper waits
+    for it to exit after the signal, so a child that ignored the signal
+    would be killed by the helper, which would then fail; with the default
+    disposition restored, ``KeyboardInterrupt`` ends it by ``SIGINT``.
+    """
+    child = "import time\nprint('ready', flush=True)\ntime.sleep(60)\nprint('finished')\n"
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        result = _run_subprocess_with_external_sigint(["-c", child], "ready")
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+    assert result.returncode == -signal.SIGINT, result.stderr
+    assert "finished" not in result.stdout
+    assert "KeyboardInterrupt" in result.stderr
+
+
 class TestFinalOutputIsGenuinelyLast:
     """A cleanup failure must not follow, or replace, an already-decided outcome.
 
     This makes a store's own ``close()`` fail after ``link --json`` has
-    already decided a ``missing_thought`` failure (exit ``4``). Before
-    ``_error_boundary`` became the single place that writes
-    and exits (see its docstring), ``_fail`` wrote the JSON object and
-    exited from *inside* the still-open ``async with``: on the bare tier, a
-    close failure logged during unwind printed after that JSON, breaking
-    the documented "last line is JSON" contract; on the ``--config`` tier,
-    an unconditional ``finally: await store.close()`` let a close failure
-    there *replace* the already-decided ``SystemExit(4)`` outright, so the
-    boundary caught the close failure instead and printed a second,
-    contradicting ``unexpected_error`` object at exit ``1``.
+    already decided a ``missing_thought`` failure (exit ``4``).
+    ``_error_boundary`` is the single place that writes the failure output
+    and exits (see its docstring), after every ``async with`` block still
+    open at the point of failure has finished unwinding. Were ``_fail`` to
+    write the JSON object and exit from *inside* the still-open ``async
+    with``, a close failure logged during unwind would print after that
+    JSON on the bare tier, breaking the documented "last line is JSON"
+    contract; on the ``--config`` tier, an unconditional ``finally: await
+    store.close()`` would let a close failure there *replace* the
+    already-decided ``SystemExit(4)`` outright, so the boundary would catch
+    the close failure instead and print a second, contradicting
+    ``unexpected_error`` object at exit ``1``.
     """
 
     def test_bare_store_close_failure_does_not_follow_the_final_json(self, tmp_path: Path) -> None:
@@ -461,13 +492,13 @@ def _raise_broken_str(*_args: object, **_kwargs: object) -> None:
 class TestBoundaryFormattingSurvivesABrokenException:
     """The boundary's own message-building must not itself be the thing that fails.
 
-    An ordinary exception whose ``__str__`` raises would escape as a bare,
-    undocumented ``RuntimeError`` with no error object at all: the
-    boundary's fallback message built
-    ``f"...{exc}..."``, which calls that broken ``__str__`` directly.
-    :func:`~engrava.cli.memory_commands._safe_str` closes this by falling
-    back to a fixed placeholder instead of letting the formatting itself
-    raise a second, unrelated exception.
+    The tests give an exception a ``__str__`` that raises ``RuntimeError`` and
+    check that the boundary still produces the documented ``unexpected_error``
+    object, not a bare, undocumented ``RuntimeError``. The boundary describes
+    the exception through
+    :func:`~engrava.cli.exception_reporting._describe_exception`, which
+    substitutes a fixed placeholder for a ``__str__`` that raises
+    ``RuntimeError``.
     """
 
     def test_remember_survives_an_exception_whose_str_raises(
@@ -507,15 +538,13 @@ def _raise_unnameable(*_args: object, **_kwargs: object) -> None:
 class TestBoundarySurvivesAnExceptionWhoseTypeNameRaises:
     """``type(exc).__name__`` is exactly as arbitrary as ``str(exc)``.
 
-    Before :func:`~engrava.cli.memory_commands._describe_exception` existed,
-    the type-name half of the boundary's fallback description was read
-    unprotected at both of its call sites (the debug log line and the
-    message text itself) even though the text half was already guarded by
-    the earlier ``_safe_str``. An exception whose
-    *metaclass* raises on a plain ``__name__`` read escaped as a bare,
-    undocumented ``RuntimeError`` with no error object at all --
-    :func:`~engrava.cli.memory_commands._describe_exception` closes this the
-    same way its predecessor closed the ``__str__`` half.
+    The tests give an exception a *metaclass* that raises ``RuntimeError`` on
+    a plain ``__name__`` read and check that the boundary still produces the
+    documented ``unexpected_error`` object, not a bare, undocumented
+    ``RuntimeError``.
+    :func:`~engrava.cli.exception_reporting._describe_exception` guards the
+    type-name half the same way it guards the ``__str__`` half, substituting
+    a fixed placeholder.
     """
 
     def test_remember_survives_an_exception_whose_type_name_raises(
@@ -581,7 +610,7 @@ class TestDescribeExceptionNormalizesEveryValueToAnExactStr:
     enough: a value that comes back without raising can still be unsafe to
     interpolate, if interpolating it -- not just obtaining it -- is what
     runs arbitrary code.
-    :func:`~engrava.cli.memory_commands._describe_exception` now normalizes
+    :func:`~engrava.cli.memory_commands._describe_exception` normalizes
     each half with :func:`~engrava.config_validation.own_str` inside the
     same guard that obtains it, so nothing but an exact ``str``, with a
     plain, non-overridden ``__format__``, ever reaches the final f-string.
@@ -619,9 +648,9 @@ class _ExpandingIteratorStr(str):
     Distinct from ``_HostileFormatStr``, which attacks *interpolation*
     (``__format__``): this class attacks *normalization* itself, and only if
     normalization is implemented as something that walks the value through
-    its own ``__iter__`` -- as ``"".join(...)`` did before it was replaced
-    with :func:`~engrava.config_validation.own_str` -- as opposed to reading
-    the underlying buffer directly.
+    its own ``__iter__`` -- as ``"".join(...)`` does -- as opposed to
+    reading the underlying buffer directly, as
+    :func:`~engrava.config_validation.own_str` does.
     """
 
     __slots__ = ()
@@ -642,16 +671,12 @@ class TestDescribeExceptionDoesNotWalkAHostileIterator:
     """Normalizing a ``str`` half must read its buffer, never iterate it.
 
     ``"".join(...)`` invokes a ``str`` subclass's overridden ``__iter__``,
-    and a one-byte value whose ``__iter__`` yields 200,000 attacker-selected
-    characters made the old normalization produce all 200,000 of them. A
-    real OS ``SIGINT`` sent to this process while that unbounded iterator
-    ran was silently swallowed, converted into a normal-looking error object
-    at exit ``1`` instead of the immediate ``KeyboardInterrupt`` a
-    deliberate Ctrl-C is supposed to be.
-    :func:`~engrava.config_validation.own_str` closes both problems at
-    once: it never calls the subclass's ``__iter__`` (or any other
-    overridden method) at all, so the description's length tracks the
-    underlying one-byte buffer, not the hostile expansion.
+    so a one-byte value whose ``__iter__`` yields 200,000 attacker-selected
+    characters would make a join-based normalization produce all 200,000 of
+    them. :func:`~engrava.config_validation.own_str` never calls the
+    subclass's ``__iter__`` (or any other overridden method) at all, so the
+    description's length tracks the underlying one-byte buffer, not the
+    hostile expansion.
     """
 
     def test_describe_exception_length_tracks_the_underlying_buffer(self) -> None:
@@ -714,16 +739,12 @@ class TestConfigErrorPreservesKindAndCodeAcrossSubclasses:
 
     ``ConfigError`` is a public library class (``engrava.config_validation``),
     so a third-party subclass is realistic, not theoretical, and reading
-    ``str(exc)`` unprotected for one is not safe. An earlier fix re-raised a
-    subclass into the generic boundary instead, which stopped it from
-    corrupting the failure path but also silently downgraded it to
-    ``unexpected_error`` / exit ``1`` -- breaking the categorical exit-``2``
-    promise ``docs/cli.md`` makes for an invalid ``--config``. The class
-    hierarchy is trustworthy even when a subclass's own attributes are not:
-    :func:`~engrava.cli.memory_commands._resolve_for_command` now keeps
-    ``invalid_config`` / exit ``2`` for *any* ``ConfigError``, exact or
-    subclass, and only changes *how the message is built* -- an exact
-    instance has its ``.message`` field read once and used only if
+    ``str(exc)`` unprotected for one is not safe. ``docs/cli.md`` promises
+    exit ``2`` for an invalid ``--config``. The tests below raise exact and
+    subclass instances from ``resolve_store_target``, and
+    :func:`~engrava.cli.memory_commands._resolve_for_command` answers each
+    with ``invalid_config`` / exit ``2``; the message is built differently --
+    an exact instance has its ``.message`` field read once and used only if
     ``type(message) is str``; a subclass, or an exact instance whose
     ``.message`` fails that check, gets a fixed literal message instead,
     with nothing read off it at all -- not even through the hardened
@@ -759,12 +780,12 @@ class TestConfigErrorPreservesKindAndCodeAcrossSubclasses:
         # it still includes str(exc), which the subclass fully controls,
         # and a subclass built to return a believable-looking fabricated
         # diagnosis would have that fabrication reported as if this CLI had
-        # produced it. The message
-        # is now a fixed literal -- nothing derived from the exception at
-        # all, not even its type name -- so the hostile __str__'s own text
-        # can never appear here, whether or not it happens to run. It says
-        # the detail is *omitted*, not that a read of it failed: this path
-        # never reads .message off a subclass instance at all.
+        # produced it. The message is a fixed literal -- nothing derived
+        # from the exception at all, not even its type name -- so the
+        # hostile __str__'s own text can never appear here, whether or not
+        # it happens to run. It says the detail is *omitted*, not that a
+        # read of it failed: this path never reads .message off a subclass
+        # instance at all.
         assert payload["message"] == memory_commands._CONFIG_ERROR_DETAILS_OMITTED_MESSAGE
         assert "_HostileConfigError" not in payload["message"]
         assert "hostile ConfigError __str__" not in payload["message"]
@@ -890,21 +911,16 @@ class TestReferentialIntegrityErrorPreservesKindAndCodeAcrossSubclasses:
     ``ReferentialIntegrityError`` is a public library class
     (``engrava.domain.exceptions``), so a third-party subclass is
     realistic, not theoretical, and reading ``.column`` / ``.referenced_id``
-    unprotected for one is not safe. An earlier fix re-raised a subclass
-    into the generic boundary instead, which stopped it from corrupting the
-    failure path but also silently downgraded it to ``unexpected_error`` /
-    exit ``1`` -- breaking the categorical exit-``4`` promise ``docs/cli.md``
-    makes for a missing ``FROM`` / ``TO``. The class hierarchy is
-    trustworthy even when a subclass's own attributes are not: ``link`` now
-    keeps ``missing_thought`` / exit ``4`` for *any*
-    ``ReferentialIntegrityError``, exact or subclass, and only changes *how
-    the message is built* -- an exact instance has ``.column`` /
-    ``.referenced_id`` read once and validated (exact ``str`` types, a real
-    column name, and an id matching this invocation's own ``FROM``/``TO``)
-    before the *invocation's own* endpoint value is used to name which one
-    is missing; a subclass, or an exact instance that fails that
-    validation, gets a fixed literal message instead, with nothing read off
-    it at all -- not even through the hardened
+    unprotected for one is not safe. ``docs/cli.md`` promises exit ``4``
+    for a missing ``FROM`` / ``TO``. The tests below raise exact and
+    subclass instances from ``create_edge``, and ``link`` answers each with
+    ``missing_thought`` / exit ``4``; the message is built differently --
+    an exact instance has ``.column`` / ``.referenced_id`` read once and
+    validated (exact ``str`` types, a real column name, and an id matching
+    this invocation's own ``FROM``/``TO``) before the *invocation's own*
+    endpoint value is used to name which one is missing; a subclass, or an
+    exact instance that fails that validation, gets a fixed literal message
+    instead, with nothing read off it at all -- not even through the hardened
     :func:`~engrava.cli.memory_commands._describe_exception`, since that
     still calls ``str(exc)``, which a subclass fully controls -- and its
     message is phrased so it stays true without claiming to know which
@@ -1058,11 +1074,11 @@ class TestErrorJsonEscapesUnicodeLineSeparators:
 
     ``json.dumps(..., ensure_ascii=False)`` leaves U+0085/U+2028/U+2029
     literal in its output -- they are not JSON control characters, so
-    nothing about the JSON grammar itself escapes them. A ``--db`` path
-    containing one produced a ``database_not_found`` object whose last
-    fragment, after a consumer's ``str.splitlines()`` (which treats those
-    three code points as line breaks, unlike a strict ``"\\n"`` split), was
-    not valid JSON. ``ensure_ascii=True`` (see
+    nothing about the JSON grammar itself escapes them. Left literal, a
+    ``--db`` path containing one would produce a ``database_not_found``
+    object whose last fragment, after a consumer's ``str.splitlines()``
+    (which treats those three code points as line breaks, unlike a strict
+    ``"\\n"`` split), is not valid JSON. ``ensure_ascii=True`` (see
     ``engrava.cli.memory_commands._emit_and_exit``) removes the hazard by
     escaping them to ``\\uXXXX`` instead of leaving them literal.
     """
@@ -1086,13 +1102,12 @@ class TestErrorJsonEscapesUnicodeLineSeparators:
 
 
 class TestAdvertisedProtectionsAreNoLongerMutationSurvivors:
-    """Three "advertised protections" were mutation survivors -- untested in practice.
+    """Advertised protections asserted directly.
 
-    These are real, pre-existing coverage gaps, not an artefact of a failed
-    patch apply: nothing in this test module checked the command-name prefix
-    on an ``unexpected_error`` message, the stack a ``--verbose`` debug log
-    record carries, or the ``--verbose`` resolution line memory verbs share
-    with every other CLI command. Each is closed here directly.
+    This class checks the command-name prefix on an ``unexpected_error``
+    message and the stack a ``--verbose`` debug log record carries.
+    :class:`TestVerboseReportsTheResolvedDatabase` below covers the
+    ``--verbose`` resolution line.
     """
 
     def test_unexpected_error_message_is_prefixed_with_the_command_name(
@@ -1105,8 +1120,7 @@ class TestAdvertisedProtectionsAreNoLongerMutationSurvivors:
         result = runner.invoke(cli, ["--db", str(db), "remember", "hi", "--json"])
         payload = json.loads(_last_line(result.output))
         # The resolved database sits between the command name and
-        # "unexpected" -- naming *which* database is what this whole
-        # boundary now exists to add over a bare "remember: unexpected ...".
+        # "unexpected", naming *which* database failed.
         assert payload["message"].startswith(f"remember: {db}: unexpected ")
 
     def test_unexpected_error_is_logged_with_a_frame_stack_under_verbose(
@@ -1117,15 +1131,14 @@ class TestAdvertisedProtectionsAreNoLongerMutationSurvivors:
     ) -> None:
         """``--verbose`` logs the caught exception's description and frame stack.
 
-        Not ``exc_info=True`` any more (see ``memory_commands._error_boundary``):
-        that made CPython render the exception a second time, and a real
-        Ctrl-C during that second render was swallowed by the standard
-        library's own traceback formatter. The record's own message now
-        carries filename:line-in-function frames built from
-        ``exc.__traceback__`` via ``traceback.walk_tb`` -- this test asserts
-        the frame where the exception was actually raised is present, and
-        that the record does not carry stdlib ``exc_info`` (which would
-        indicate the old, second-formatting shape).
+        The log call does not pass ``exc_info=True`` (see
+        ``memory_commands._error_boundary``): that makes CPython's traceback
+        formatter render the exception a second time, outside the guarded
+        description. The record's own message carries
+        filename:line-in-function frames built from ``exc.__traceback__``
+        via ``traceback.walk_tb``. This test asserts the frame where the
+        exception was actually raised is present, and that the record does
+        not carry stdlib ``exc_info``.
         """
         monkeypatch.setattr(memory_commands.uuid, "uuid4", _raise_unanticipated)
         db = tmp_path / "m.db"
@@ -1163,13 +1176,11 @@ class TestAdvertisedProtectionsAreNoLongerMutationSurvivors:
 
 
 class TestVerboseReportsTheResolvedDatabase:
-    """``--verbose`` echoes the resolution decision -- no test checked this at all.
+    """``--verbose`` echoes the resolution decision.
 
-    :func:`engrava.cli.memory_commands._report_resolution` is only ever
-    called under ``cfg.verbose``; nothing in this module (or
-    ``test_cli_memory_verbs.py``) previously asserted its output existed,
-    which is exactly why disabling that call site leaves every relevant
-    test green.
+    :func:`engrava.cli.memory_commands._report_resolution` echoes the
+    resolved database to stderr only when ``cfg.verbose`` is set; this class
+    asserts that output.
     """
 
     def test_remember_verbose_reports_the_resolved_database(self, tmp_path: Path) -> None:
@@ -1221,19 +1232,17 @@ def _raise_keyboard_interrupt_on_str(*_args: object, **_kwargs: object) -> None:
 
 
 class TestDescribeExceptionReraisesControlFlowSignals:
-    """A hostile ``__str__`` raising ``KeyboardInterrupt`` used to be swallowed.
+    """A ``KeyboardInterrupt`` or ``SystemExit`` raised while describing an exception propagates.
 
-    A real OS ``SIGINT`` delivered to the process during an endless hostile
-    ``__str__`` was converted into an ordinary-looking error object at exit
-    ``1`` instead of the immediate ``KeyboardInterrupt`` a deliberate Ctrl-C
-    is supposed to be --
+    Converting a real interrupt raised while obtaining ``str(exc)`` or the
+    type name into an ordinary-looking error object at exit ``1`` would
+    replace the immediate ``KeyboardInterrupt`` a deliberate Ctrl-C is
+    supposed to be.
     :func:`~engrava.cli.memory_commands._describe_exception`'s two guards
-    were both ``except BaseException``, which converts a real interrupt
-    exactly like any ordinary exception. Both guards now re-raise
-    ``KeyboardInterrupt`` and ``SystemExit`` immediately instead of
-    converting them; every ordinary ``Exception`` -- including one raised
-    from ``__str__`` or a hostile metaclass's ``__name__`` -- still converts
-    to the documented placeholder exactly as before.
+    therefore re-raise ``KeyboardInterrupt`` and ``SystemExit`` immediately
+    instead of converting them; every ordinary ``Exception`` -- including
+    one raised from ``__str__`` or a hostile metaclass's ``__name__`` --
+    still converts to the documented placeholder.
     """
 
     def test_describe_exception_reraises_a_keyboard_interrupt_from_str(self) -> None:
@@ -1340,28 +1349,25 @@ main()
 
 
 class TestVerboseNoLongerCallsTheExceptionASecondTime:
-    """The specific window a real OS ``SIGINT`` used to be swallowed in is now gone.
+    """``--verbose`` does not call ``str(exc)`` a second time.
 
-    Before this fix, the debug log call passed ``exc_info=True``, which made
-    CPython's own traceback formatter call ``str(exc)`` a *second* time (via
+    Passing ``exc_info=True`` to the debug log call would make CPython's own
+    traceback formatter call ``str(exc)`` a *second* time (via
     ``traceback._safe_string``'s bare ``except:`` in the standard library)
     to build the traceback's exception-message line, entirely outside
     :func:`~engrava.cli.memory_commands._describe_exception`'s guards. A
-    real interrupt landing during that second call was swallowed by that
-    bare ``except``, and the command finished as an ordinary
+    real interrupt landing during that second call would be swallowed by
+    that bare ``except``, and the command would finish as an ordinary
     ``unexpected_error`` JSON object at exit ``1`` instead of aborting.
 
     This test's hostile exception succeeds normally on its *first* call --
     the one read ``_describe_exception`` performs either way, needed for
     the message regardless of ``--verbose`` -- and only self-signals on a
-    *second* call. Against the fixed code that second call never happens at
-    all: the ``--verbose`` stack is built from ``exc.__traceback__`` frame
-    metadata, not by calling ``str(exc)`` again, so there is no longer a
-    second read for a real interrupt to land inside. The marker the second
-    call would print never appears, and the command completes as an
-    ordinary, correctly classified error -- not because an interrupt was
-    survived, but because the vulnerable second read no longer exists to
-    receive one.
+    *second* call. That second call never happens: the ``--verbose`` stack
+    is built from ``exc.__traceback__`` frame metadata, not by calling
+    ``str(exc)`` again, so there is no second read for a real interrupt to
+    land inside. The marker the second call would print never appears, and
+    the command completes as an ordinary, correctly classified error.
     """
 
     def test_second_str_call_marker_never_appears_under_verbose(self, tmp_path: Path) -> None:
@@ -1380,10 +1386,9 @@ class TestVerboseNoLongerCallsTheExceptionASecondTime:
             ]
         )
 
-        # If a future change reintroduced a second, unguarded read (e.g. an
-        # `exc_info=True` regression), the marker below would print, this
-        # exception would self-signal, and this assertion would catch the
-        # regression immediately regardless of how the signal then behaved.
+        # The marker prints if `str(exc)` is read a second time (for example
+        # through `exc_info=True`): the exception then self-signals, and this
+        # assertion fails whatever the signal does.
         assert "REACHED_SECOND_STR_CALL" not in result.stdout
         assert result.returncode == 1, result.stderr
         assert "Aborted!" not in result.stderr
@@ -1459,8 +1464,8 @@ class TestVerboseCallsNoFormatterMoreThanOnceTotal:
     ) -> None:
         """Same exception, ``--verbose`` omitted: the call count must not differ.
 
-        Confirms the one remaining call is the message-building read that
-        always happens, not something ``--verbose`` newly triggers.
+        Confirms the one call is the message-building read that always
+        happens, not something ``--verbose`` triggers.
         """
         _FORMATTER_CALL_LOG.clear()
         monkeypatch.setattr(memory_commands.uuid, "uuid4", _raise_chained_recording_error)
@@ -1925,31 +1930,28 @@ _CONFIG_REAL_SIGINT_DURING_CLOSE_DESCRIPTION_SCRIPT = (
 class TestCleanupLogNoLongerReformatsThePropagatingException:
     """A secondary close failure must not re-render the exception it is cleaning up after.
 
-    ``_opened_full_store``'s cleanup-failure log
-    (``logger.warning("Error closing store during cleanup", exc_info=True)``)
-    was not the harmless, unrelated second exception it looked like: the body
-    exception it is cleaning up after is still the *active* exception at that
-    point (this runs inside ``except BaseException:``), so Python attaches it
-    as the close exception's own ``__context__``, and ``exc_info=True`` asked
-    the standard library's traceback formatter to render that whole chain --
-    calling ``__str__`` on the close exception, on the original exception a
-    *second* time (:func:`~engrava.cli.memory_commands._describe_exception`
-    already reads it once, downstream, to build the final message), and on
-    any exception-group children attached to either.
-    ``_frame_only_stack``, shared with
-    :func:`~engrava.cli.memory_commands._error_boundary`, reads only frame
-    metadata, so the group and its child are at zero calls and the original
-    exception's own formatter is read only the one time the boundary always
-    reads it downstream.
+    ``_opened_full_store``'s cleanup-failure log does not pass
+    ``exc_info=True``. The body exception it is cleaning up after is still
+    the *active* exception at that point (this runs inside ``except
+    BaseException:``), so Python attaches it as the close exception's own
+    ``__context__``, and ``exc_info=True`` would ask the standard library's
+    traceback formatter to render that whole chain -- calling ``__str__`` on
+    the close exception, on the original exception a *second* time
+    (:func:`~engrava.cli.memory_commands._describe_exception` already reads
+    it once, downstream, to build the final message), and on any
+    exception-group children attached to either. ``_frame_only_stack``,
+    shared with :func:`~engrava.cli.memory_commands._error_boundary`, reads
+    only frame metadata, so the group and its child are at zero calls and
+    the original exception's own formatter is read only the one time the
+    boundary always reads it downstream.
 
-    **Dropping the close exception's own count to zero would be a
-    regression** -- frame metadata says *where* closing failed, never
-    *why*. The fix now calls
-    :func:`~engrava.cli.exception_reporting._describe_exception` once on the
-    close exception too, the same single, guarded, non-absorbing attempt
-    already made for the original exception, so ``"close"`` is ``1`` again
-    here -- not a second render of anything, the *first* and only read of
-    the close exception's own formatting.
+    The close exception's own count is ``1``, not zero: frame metadata says
+    *where* closing failed, never *why*, so
+    :func:`~engrava.cli.exception_reporting._describe_exception` is called
+    once on the close exception too, the same single, guarded,
+    non-absorbing attempt made for the original exception. That is not a
+    second render of anything, but the *first* and only read of the close
+    exception's own formatting.
     """
 
     def test_close_original_group_and_child_formatter_call_counts(self, tmp_path: Path) -> None:
@@ -2036,15 +2038,15 @@ class TestCleanupLogNoLongerReformatsThePropagatingException:
         assert "unexpected RuntimeError" not in result.stderr
 
     def test_an_ordinary_close_failure_now_shows_why_not_just_where(self, tmp_path: Path) -> None:
-        """The ``--config`` tier had only ``__str__``-hostile proofs of this, never a plain one.
+        """An ordinary close failure shows *why* as well as *where*.
 
         Mirrors the bare tier's own
         ``TestBareTierCleanupLogNowSharesTheSameFix``
         ``.test_an_ordinary_close_failure_now_shows_why_not_just_where``:
         an ordinary ``PermissionError`` closing the store must still show
         *why* (its own type and text), not just *where* (the frame-only
-        stack), and the pending-cancellation checkpoint added for the real
-        ``SIGINT`` fix must not cost that diagnostic.
+        stack), and the pending-cancellation checkpoint after the warning
+        must not cost that diagnostic.
         """
         db = tmp_path / "m.db"
         config_path = tmp_path / "engrava.yaml"
@@ -2106,32 +2108,25 @@ class TestCleanupLogNoLongerReformatsThePropagatingException:
 
 
 class TestBareTierCleanupLogNowSharesTheSameFix:
-    """``main._close_quietly`` (the bare/default store tier) needed the identical fix.
+    """``main._close_quietly`` (the bare/default store tier) follows the same rules.
 
-    This function was still passing ``exc_info=True`` after the
-    ``--config`` tier's own cleanup site
+    Its cleanup log does not pass ``exc_info=True``, like the ``--config``
+    tier's own cleanup site
     (:func:`~engrava.cli.memory_commands._opened_full_store`, covered by
-    :class:`TestCleanupLogNoLongerReformatsThePropagatingException` above)
-    had already been fixed: ``remember`` / ``recall`` / ``link`` with no
-    ``--config`` reach ``_close_quietly`` through
-    ``_opened_full_store``'s bare branch and
+    :class:`TestCleanupLogNoLongerReformatsThePropagatingException` above).
+    ``remember`` / ``recall`` / ``link`` with no ``--config`` reach
+    ``_close_quietly`` through ``_opened_full_store``'s bare branch and
     :func:`~engrava.cli.main._opened_db`, not through the ``--config``
-    tier's own inline ``await store.close()`` -- a call site the earlier
-    fix never touched. These mirror the ``--config``-tier tests above,
-    against the bare tier instead: a plain ``--db`` (or no ``--db`` at all)
-    invocation, patching ``aiosqlite.Connection.close`` rather than
-    ``SqliteEngravaCore.close``.
+    tier's own inline ``await store.close()``. These mirror the
+    ``--config``-tier tests above, against the bare tier instead: a plain
+    ``--db`` (or no ``--db`` at all) invocation, patching
+    ``aiosqlite.Connection.close`` rather than ``SqliteEngravaCore.close``.
 
-    Because ``_close_quietly`` runs the close as a separately scheduled,
-    shielded task (see its own docstring), the close exception's
-    ``__context__`` is never linked back to whatever this coroutine was
-    cleaning up after -- unlike the ``--config`` tier's inline close. That
-    means the original exception's own formatter is never invoked by this
-    tier's cleanup log at all (measured ``{"close": 1, "original": 1}``
-    both before and after this fix, since the boundary's own downstream
-    read of the original exception is unaffected by this tier's cleanup
-    log either way): the defect here was the absorbed control-flow signal
-    and the missing "why", not an inflated call count.
+    The cleanup log in ``_close_quietly`` passes the close exception, not
+    the original one, to ``_describe_exception`` and ``_frame_only_stack``.
+    The counts asserted below are ``{"close": 1, "original": 1}``: the one
+    ``original`` call is the boundary's own downstream read of the original
+    exception.
     """
 
     def test_close_and_original_formatter_call_counts(self, tmp_path: Path) -> None:
@@ -2300,7 +2295,7 @@ class TestFrameOnlyStackReadsTheTracebackThroughTheDescriptor:
 
     This test instruments an exception with an overridden
     ``__getattribute__`` and requires the traceback read to record zero
-    calls through it, at both call sites that now share
+    calls through it, at both call sites that share
     :func:`~engrava.cli.memory_commands._frame_only_stack`:
     :func:`~engrava.cli.memory_commands._error_boundary`'s ``--verbose``
     stack log, and :func:`~engrava.cli.memory_commands._opened_full_store`'s

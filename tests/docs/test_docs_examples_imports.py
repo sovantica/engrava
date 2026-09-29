@@ -112,7 +112,7 @@ def _synthetic_block(body: str) -> CodeBlock:
 
 
 def test_rule_flags_a_from_import_naming_a_nonexistent_symbol() -> None:
-    """The motivating defect: ``from engrava import DoesNotExistAtAll`` is unambiguous."""
+    """``from engrava import DoesNotExistAtAll`` is unambiguously a dead import."""
     block = _synthetic_block("from engrava import DoesNotExistAtAll\n")
     resolution = resolve_imports(block)
     assert resolution.has_dead_imports
@@ -352,11 +352,10 @@ def test_rule_resolving_an_unimported_submodule_does_not_depend_on_import_order(
     once before anything has touched ``engrava.cli`` (this is the shape a
     real pytest session hits on some import orders and not others), and
     once again immediately after explicitly importing ``engrava.cli``
-    directly (reproducing the side effect that used to change the answer).
-    Both must report the same, correct verdict for both a real submodule
-    and a genuinely nonexistent one -- proving the fix consults the actual
-    submodule, not whatever a prior import happened to leave bound on the
-    parent package.
+    directly (reproducing the side effect on the parent package). Both must
+    report the same, correct verdict for both a real submodule and a
+    genuinely nonexistent one, whatever a prior import happened to leave
+    bound on the parent package.
     """
     script = """
 import sys
@@ -521,7 +520,7 @@ def _leaf_ast_node_types() -> list[type[ast.AST]]:
 
 
 def test_leaf_ast_node_types_includes_constant() -> None:
-    """Regression guard: ``ast.Constant`` must survive the leaf computation.
+    """``ast.Constant`` must survive the leaf computation.
 
     ``ast.Constant`` is the node type ``ast.parse`` produces for scalar
     literals (numbers, strings, bytes, ``None``/``True``/``False``,
@@ -546,8 +545,7 @@ def test_leaf_ast_node_types_includes_constant() -> None:
 # produces). This list exists so a future Python grammar addition that
 # introduces a genuinely new statement-body construct is forced onto
 # `_STATEMENT_BODY_CONTAINERS` by a failing test, rather than silently
-# falling into "presumably harmless" the way an unlisted construct hid a real
-# hole in the (out of scope) attribute resolver's history.
+# falling into "presumably harmless".
 #
 # The deprecated `ast.Constant` aliases (`Bytes`, `Ellipsis`, `NameConstant`,
 # `Num`, `Str`) are not on this list: `_leaf_ast_node_types()` excludes them

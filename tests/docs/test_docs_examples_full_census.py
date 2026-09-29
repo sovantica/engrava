@@ -2,16 +2,12 @@
 
 Every other layer in this suite asks the Markdown extractor for one specific
 language: ``python`` (layers 1-5), ``bash`` (layer 6), ``yaml`` (layer 7).
-Nothing until now has asked what is left over, so a block whose info string is
-none of those — including a **bare** fence with no info string at all — was
-invisible to the whole census, not just unchecked.
 
-This module closes that final gap. It groups every fenced block across
-``README.md`` and ``docs/`` by its *exact* info string (see
-``extract_all_fenced_blocks`` for why exact, not prefix, matching is required
-here: prefix matching would make the empty string collect all 284 blocks
-instead of the 29 true bare fences) and asserts the whole set partitions
-into exactly:
+This module groups every fenced block across ``README.md`` and ``docs/`` by its
+*exact* info string (see ``extract_all_fenced_blocks`` for why exact, not
+prefix, matching is required here: prefix matching would make the empty string
+collect every fenced block instead of only the bare fences) and asserts the
+whole set partitions into exactly:
 
 * the ``python`` blocks, already exhaustively partitioned into executed /
   behaviour-asserted / compile-only by ``test_docs_examples_coverage.py``
@@ -29,12 +25,12 @@ into exactly:
   MindQL query, or raw SQL run directly against the database file. Each reason
   is the block's *true* category, not the nearest available one — a formula
   is not filed as a diagram, and a grammar template is not filed as "not an
-  invocation" merely because the enum once lacked a member for it.
+  invocation".
 
-A block that is added to the docs in a fifth language, or a bare block that is
-not registered, fails ``test_every_fenced_block_is_classified_exactly_once``
-below — the same no-silent-gap guarantee the ``python`` census already gives,
-now extended to the whole file.
+A block whose location none of these partitions covers, or a bare block that
+is not registered, fails ``test_every_fenced_block_is_classified_exactly_once``
+below — the same no-silent-gap guarantee the ``python`` census gives, extended
+to the whole file.
 """
 
 from __future__ import annotations
@@ -379,7 +375,7 @@ def test_retagging_a_block_to_python3_is_caught(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression test for the exactness trap: a `python` block retagged to `python3`.
+    """A `python` block retagged to `python3` is caught by the exactness check.
 
     `extract_python_blocks` (prefix match) still finds a `python3` block when
     asked for `python`, so naive prefix-based coverage stays green on its own
@@ -400,18 +396,17 @@ def test_retagging_a_block_to_python3_is_caught(
     exact_all = extract_all_fenced_blocks(md)
 
     assert len(prefix_matches) == 1  # The trap: prefix matching absorbs it.
-    assert len(exact_python_matches) == 0  # The fix: exact matching does not.
+    assert len(exact_python_matches) == 0  # Exact matching does not.
     assert exact_all[0][0] == "python3"
     assert "python3" not in _KNOWN_FENCE_LANGUAGES
 
 
 def test_tilde_fence_is_recognised(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Regression: a ``~~~``-fenced block is not invisible to the extractors.
+    """A ``~~~``-fenced block is found by the extractors.
 
-    Markdown lets a fence use three tildes instead of backticks. Before this
-    fix, a tilde-fenced block was found by neither ``extract_fenced_blocks``
-    nor ``extract_all_fenced_blocks``, so it never reached any partition or
-    exactness check at all -- the census denominator itself was wrong.
+    Markdown lets a fence use three tildes instead of backticks.
+    ``extract_all_fenced_blocks`` and ``extract_exact_fenced_blocks`` both
+    return a tilde-fenced block, so it is counted like a backtick-fenced one.
     """
     monkeypatch.setattr(_md_blocks, "REPO_ROOT", tmp_path)
     md = tmp_path / "tilde.md"
@@ -425,10 +420,10 @@ def test_tilde_fence_is_recognised(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
 
 def test_unterminated_fence_fails_loudly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Regression: a fence opened but never closed raises, instead of vanishing.
+    """A fence opened but never closed raises, instead of vanishing.
 
-    Markdown lets a fence run to the end of the document. Before this fix,
-    the extractor silently dropped such a block (and everything after it) --
+    Markdown lets a fence run to the end of the document, but the extractor
+    raises ``ValueError`` for one rather than silently dropping the block --
     a census whose denominator can shrink like this is worse than none,
     because it still reports a total.
     """
@@ -444,11 +439,10 @@ def test_fence_inside_a_blockquote_is_recognised(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression: a fence whose every line carries a `>` blockquote prefix is found.
+    """A fence whose every line carries a `>` blockquote prefix is found.
 
-    Before this fix, `stripped.startswith(fence)` never matched a line
-    starting with `>`, so a fence inside a blockquote -- and its body, and
-    its closer -- were entirely invisible to every extractor.
+    The blockquote prefix is stripped from the fence's opener, body and
+    closer, so the block is found and its body carries no leftover `>`.
     """
     monkeypatch.setattr(_md_blocks, "REPO_ROOT", tmp_path)
     md = tmp_path / "blockquote.md"
@@ -465,13 +459,11 @@ def test_ordinary_fence_keeps_a_literal_leading_angle_bracket(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression: a `>` inside an ordinary (non-blockquoted) fence is literal content.
+    """A `>` inside an ordinary (non-blockquoted) fence is literal content.
 
-    Before this fix, blockquote stripping was unconditional: it removed a
-    leading `>` from every line inside every fence, so this invalid,
-    literal-`>`-prefixed YAML was silently repaired into valid configuration
-    before any validator ever saw it. The fence's own opener carries no `>`,
-    so nothing inside it should be stripped.
+    The fence's own opener carries no `>`, so nothing inside it is stripped:
+    this invalid, literal-`>`-prefixed YAML keeps its prefix instead of being
+    repaired into valid configuration before any validator sees it.
     """
     monkeypatch.setattr(_md_blocks, "REPO_ROOT", tmp_path)
     md = tmp_path / "ordinary.md"
@@ -488,7 +480,7 @@ def test_fence_inside_a_list_inside_a_blockquote_is_recognised(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression: a fence nested in a list item inside a blockquote is still found.
+    """A fence nested in a list item inside a blockquote is found.
 
     The list item's own indentation is just extra whitespace once the
     blockquote marker is stripped; deciding "blockquoted or not" once, from
@@ -513,7 +505,7 @@ def test_four_character_fence_is_recognised(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression: an opener longer than three characters is a valid fence too."""
+    """An opener longer than three characters is a valid fence too."""
     monkeypatch.setattr(_md_blocks, "REPO_ROOT", tmp_path)
     md = tmp_path / "longfence.md"
     md.write_text("````bash\nengrava info\n````\n", encoding="utf-8")
@@ -527,7 +519,7 @@ def test_closer_longer_than_opener_is_accepted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression: CommonMark only requires the closer be at least as long as the opener."""
+    """CommonMark only requires the closer be at least as long as the opener."""
     monkeypatch.setattr(_md_blocks, "REPO_ROOT", tmp_path)
     md = tmp_path / "longcloser.md"
     md.write_text("```bash\nengrava info\n`````\n", encoding="utf-8")
@@ -541,7 +533,7 @@ def test_closer_with_trailing_whitespace_is_accepted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression: CommonMark allows trailing whitespace after the closer."""
+    """CommonMark allows trailing whitespace after the closer."""
     monkeypatch.setattr(_md_blocks, "REPO_ROOT", tmp_path)
     md = tmp_path / "trailingspace.md"
     md.write_text("```bash\nengrava info\n```   \n", encoding="utf-8")
@@ -565,8 +557,9 @@ def test_every_fenced_block_is_classified_exactly_once() -> None:
 
     Combines the four independent partitions -- python (layers 1-5), bash
     (layer 6), yaml (layer 7), and bare/text/sql/json (this module) -- and
-    asserts they cover every fenced block in the docs exactly once. A block in
-    a fifth language, or an unregistered bare fence, shows up in ``uncovered``.
+    asserts they cover every fenced block in the docs exactly once. A block whose
+    location none of them covers, or an unregistered bare fence, fails this
+    test.
     """
     by_language = all_blocks_by_exact_language()
     all_locations: set[str] = {b.location for blocks in by_language.values() for b in blocks}

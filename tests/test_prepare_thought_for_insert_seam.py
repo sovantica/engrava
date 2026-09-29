@@ -30,8 +30,8 @@ This module pins:
   blocked (``bulk_store``'s own seam phase) -- and with same-task /
   spawned-task recursive
   callbacks bounded by ``asyncio.wait_for`` -- including the
-  otherwise-empty ``suspend_auto_commit()`` case, where an earlier ownership
-  test on the exploratory probe's transaction left it open across the seam
+  otherwise-empty ``suspend_auto_commit()`` case, where the exploratory
+  probe's own transaction is still closed before the seam runs
   (a lock an *enclosing* caller's own task took is a different matter, not
   one this call itself acquired -- see ``docs/concurrency.md``'s nesting
   note); and
@@ -47,10 +47,6 @@ This module pins:
   hanging forever on ``_dedup_lock``, on both the exploratory-probe-hit
   route and the decisive-probe-hit route the seam can newly reach by
   transforming a miss into a hit.
-
-Every test here is expected to fail against the source before this seam
-existed, where ``prepare_thought_for_insert`` is never called from any
-entry point.
 """
 
 from __future__ import annotations
@@ -224,9 +220,8 @@ async def test_create_thought_dedup_true_calls_seam_once_on_miss_and_once_on_hit
     """Unlike ``get_or_create`` / ``upsert_by_hash``, a dedup *hit* still costs one call.
 
     A direct ``create_thought()`` call cannot know in advance whether it will
-    hit or miss -- restoring the pre-regression override-everywhere behaviour
-    means the seam runs once per call regardless of which branch it resolves
-    to.
+    hit or miss, so the seam runs once per call regardless of which branch it
+    resolves to.
     """
     store = await _make_store(db)
     content = "Same content, seen twice."
@@ -622,18 +617,17 @@ async def test_exploratory_probe_lock_is_released_before_seam_runs(db_path: str)
 async def test_otherwise_empty_suspend_auto_commit_window_releases_probe_lock_before_seam_runs(
     db_path: str,
 ) -> None:
-    """Bug: ``_end_exploratory_probe`` used to also test ``not self._skip_auto_commit``.
+    """An empty ``suspend_auto_commit()`` window leaves no probe transaction open at the seam.
 
     Nesting ``get_or_create()`` inside a caller's *own*, otherwise-empty
     ``suspend_auto_commit()`` window (nothing written yet) still opens the
     exploratory probe's own ``BEGIN IMMEDIATE`` -- ``opened_transaction`` is
-    ``True`` because nothing was open before this probe began. The old
-    ownership test also required ``not self._skip_auto_commit``, which is
-    ``False`` here (we *are* nested), so it skipped the rollback and left
-    that ``BEGIN IMMEDIATE`` -- a cross-connection write reservation -- open
-    across the seam call. A second, independent connection's own
+    ``True`` because nothing was open before this probe began. That
+    ``BEGIN IMMEDIATE`` -- a cross-connection write reservation -- is rolled
+    back before the seam call even though ``_skip_auto_commit`` is ``False``
+    here (we *are* nested). A second, independent connection's own
     ``BEGIN IMMEDIATE`` (``busy_timeout=0``, so it fails immediately rather
-    than queueing and masking the bug) must succeed while the seam is
+    than queueing and masking a held lock) must succeed while the seam is
     paused, exactly as it does at the top level in the test above.
     """
     seam_entered = asyncio.Event()
@@ -690,12 +684,9 @@ async def test_same_task_callback_into_dedup_entry_point_does_not_deadlock(
 ) -> None:
     """A hook that calls back into another dedup entry point, on the same task.
 
-    Before this fix, restoring a call to the public ``create_thought()`` from
-    inside an already-locked dedup window ran the equivalent recursive call
-    while still holding the plain, non-reentrant ``_dedup_lock`` -- a same-task
-    callback would then wait forever on a lock it already holds. The seam
-    runs holding no ``_dedup_lock`` this call acquires, so this must complete
-    quickly.
+    The seam runs holding no ``_dedup_lock`` this call acquires, so a same-task
+    callback into another dedup entry point does not wait on a lock it already
+    holds, and this must complete quickly.
     """
 
     async def callback(store: _SeamHookCore, thought: ThoughtRecord) -> ThoughtRecord:
@@ -754,8 +745,7 @@ async def test_update_thought_same_task_callback_on_exploratory_hit_raises(
     """``update_thought`` runs under ``_write_lock`` and ``_dedup_lock`` on
     ``upsert_by_hash``'s hit branch, when a mutable field differs (see
     ``docs/extension-hooks.md`` §1B.3; the existing row and the candidate
-    differ in ``priority``, so the hit calls it) -- this predates the seam,
-    and is not something the seam introduces or could close. An ``update_thought``
+    differ in ``priority``, so the hit calls it). An ``update_thought``
     override that calls back into another dedup entry point on the *same*
     task tries to acquire ``_dedup_lock`` a second time; a plain
     ``asyncio.Lock`` would block that acquisition on itself forever, since
@@ -794,15 +784,14 @@ async def test_update_thought_same_task_callback_on_exploratory_hit_raises(
 async def test_update_thought_same_task_callback_on_decisive_hit_raises(
     db: aiosqlite.Connection,
 ) -> None:
-    """The decisive-hit route to ``update_thought`` is newly *reachable*, not new in shape.
+    """A same-task ``update_thought`` callback on a decisive hit raises DedupLockReentryError.
 
     The seam can turn an exploratory *miss* into a decisive *hit* by
     transforming the candidate's ``content`` to match an existing row --
-    deterministically, with no race required, unlike before this seam
-    existed. That route reaches the same ``_upsert_matched_row`` ->
-    ``update_thought`` call, under the same two locks
-    (``_write_lock``, ``_dedup_lock``) as the exploratory-hit case above -- pinned separately
-    because the path to it is different.
+    deterministically, with no race required. That route reaches the same
+    ``_upsert_matched_row`` -> ``update_thought`` call, under the same two locks
+    (``_write_lock``, ``_dedup_lock``) as the exploratory-hit case above -- pinned
+    separately because the path to it is different.
     """
     entered = asyncio.Event()
 

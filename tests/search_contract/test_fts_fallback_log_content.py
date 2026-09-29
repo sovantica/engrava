@@ -1,25 +1,22 @@
 """Content-safety guard for the FTS5 ``MATCH``-failure log calls.
 
-``SqliteEngravaCore.search_fts`` used to log the user's normalized query text
-directly (via ``%r``) whenever the primary FTS5 ``MATCH`` failed and the
-sanitizing bare-mode fallback ran, and it attached ``exc_info=True`` on top --
-SQLite's own FTS5 syntax-error message can itself quote a fragment of the
-offending expression. Under a wrapping MCP server, stderr lands in the host's
-log files verbatim, so a failed search wrote whatever the caller searched for
-straight into an operator's logs.
-
-An intermediate fix replaced the query text with its length plus a truncated
-SHA-256 digest for correlating repeats -- but a search query is often one or
-two words, and an unsalted hash of low-entropy plaintext is a dictionary
-lookup away from the original. The digest is gone; the log now carries only
-the query length, the exception's type, and SQLite's own error name.
+When the primary FTS5 ``MATCH`` fails and the sanitizing bare-mode fallback runs,
+``SqliteEngravaCore.search_fts`` logs no query text and attaches no
+``exc_info`` -- SQLite's own FTS5 syntax-error message can itself quote a
+fragment of the offending expression. Under a wrapping MCP server, stderr lands
+in the host's log files verbatim, so anything logged from the query would reach
+an operator's logs. In 0.6.0 the same log call carried the normalized query text
+(via ``%r``) with ``exc_info=True``. The log now carries only the query length,
+the exception's type, and SQLite's own error name; it carries no digest of the
+query either, because a search query is often one or two words, and an unsalted
+hash of low-entropy plaintext is a dictionary lookup away from the original.
 
 This suite checks two independent things about every record an engrava logger
 emits while the fallback runs:
 
 * **Shape (exact pin, not a shape match).** Every record from an engrava
   logger must carry ``record.msg`` identical to one of the two literal
-  format strings the fix passes to ``logger.warning`` (copied from the
+  format strings the source passes to ``logger.warning`` (copied from the
   source below, not reconstructed), and its rendering must satisfy
   ``record.getMessage() == record.msg % record.args`` -- confirming nothing
   else shapes the text a handler ultimately sees. The three substituted args
@@ -81,7 +78,7 @@ _MARKER = "xqzk4f7pv9d3e1cnotamemoryword"
 _MARKER_QUERY = f'"{_MARKER}"?'
 
 # ---------------------------------------------------------------------------
-# Exact pin: the two literal format strings the fix passes to
+# Exact pin: the two literal format strings the source passes to
 # ``logger.warning``, copied verbatim from
 # ``src/engrava/infrastructure/sqlite/engrava_core.py`` -- not reconstructed
 # or matched by shape, so a wrong fix cannot satisfy this by producing
@@ -334,7 +331,7 @@ def _assert_marker_absent_from_every_record(
     """Assert *marker* is absent from every record's message, args, traceback, and attributes.
 
     Checks four independent surfaces per record -- any one of which could
-    carry content if it escaped the fix: the formatted message
+    carry query content: the formatted message
     (``record.getMessage()``), the raw ``args`` stringified (in case content
     reached an ``args`` entry rather than the format string), the fully
     formatted exception -- ``record.exc_info`` rendered through
@@ -403,8 +400,8 @@ class TestPrimaryFallbackNeverLogsQueryContent:
         # tracing (its driver logs the full SQL and bound parameters, which
         # legitimately include the query) also lands in caplog.records.
         # Suppressing a third-party driver's own debug tracing is a host's
-        # logging-configuration choice, not something engrava controls or
-        # this fix is about -- only engrava's own log calls are in scope.
+        # logging-configuration choice, not something engrava controls -- only
+        # engrava's own log calls are in scope.
         engrava_records = _engrava_records(caplog.records)
         assert engrava_records, "expected the primary MATCH failure to log at least one record"
         _assert_records_match_allowed_content_free_shape(engrava_records)

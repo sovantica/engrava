@@ -380,7 +380,7 @@ class DreamingExtension:
     ) -> tuple[dict[str, float], list[str]]:
         """Compute the redistributed per-signal weights for this run.
 
-        The promotion score is a **weighted average over the signals active
+        The promotion score is a **weighted sum over the signals active
         for the run**. A signal is active when its data source yields a
         non-default value for at least one candidate in the pool (see
         :func:`~engrava.domain.dreaming.default_signal_active`);
@@ -400,9 +400,11 @@ class DreamingExtension:
         rule (see :func:`~engrava.domain.dreaming.default_signal_active`)
         even though a different function actually computes its value.
 
-        **Degenerate guard.** When no signal is active the returned weights are
-        all zero, so every score is ``0.0`` and nothing promotes — the exact
-        analogue of the precedent's ``active_weight == 0 -> zeros`` branch.
+        **Degenerate guard.** When the configured weights of the active signals
+        sum to ``0.0`` (which includes no signal being active) the returned
+        weights are all zero, so every score is ``0.0`` and nothing promotes —
+        the exact analogue of the precedent's ``active_weight == 0 -> zeros``
+        branch.
 
         **Pool-relative, once per run.** Activeness is decided over the whole
         candidate pool a single time; it is never recomputed per thought (a
@@ -417,9 +419,8 @@ class DreamingExtension:
         Returns:
             A ``(weights, flat_signals)`` pair. ``weights`` maps every
             configured signal name to its effective (renormalised) weight —
-            ``0.0`` for inactive signals; the active entries sum to ``1.0``
-            unless no signal is active (all-zero). ``flat_signals`` is the
-            sorted list of configured signals found inactive this run.
+            ``0.0`` for inactive signals. ``flat_signals`` is the sorted list
+            of configured signals found inactive this run.
 
         """
         active_names: list[str] = []
@@ -539,7 +540,7 @@ class DreamingExtension:
         ctx: DreamingContext,
         active_weights: dict[str, float] | None = None,
     ) -> float:
-        """Compute the promotion score as a weighted average over the signals.
+        """Compute the promotion score as a weighted sum of the signal values.
 
         When ``active_weights`` is provided (the consolidation path always
         passes it), each signal's value is multiplied by the weight

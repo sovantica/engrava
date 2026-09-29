@@ -703,14 +703,10 @@ async def _unlocked_target_with_vector(
 ) -> None:
     """Build a target with an ``embedding`` row but no ``_metadata`` lock.
 
-    This is the state a plain restore into a fresh target could leave behind
-    on ``release/v0.7.0``: restore inserts ``embedding`` rows via fixed SQL
-    directly, never through ``store_embedding()``, so nothing ever wrote the
-    lock. Built directly here (rather than via two restores) because the
-    fixed restore adopts a lock for a target that starts with neither one nor
-    any vectors, closing that path going forward -- this state is still
-    reachable by other means (an old client, direct data manipulation) and
-    must still be handled correctly when it is.
+    Restore inserts ``embedding`` rows via fixed SQL directly, never through
+    ``store_embedding()``. This state is built directly here (rather than via
+    two restores); it is reachable by direct data manipulation and must be
+    handled correctly when it is.
 
     Args:
         db_path: Path to create the database at.
@@ -1072,9 +1068,7 @@ class TestBatchedReembed:
 # of every embedding row -- enforced from the
 # snapshot's `embedding` rows and the target's own data, never from a
 # resolved provider or the snapshot's metadata header. Every test here goes
-# through the CLI: the two tests that used to call the guard directly
-# (TestBatchedReembed, above) both pass re_embed=True, so neither of them
-# ever reached it -- exactly the coverage gap that let the gate ship dead.
+# through the CLI.
 # ---------------------------------------------------------------------------
 
 
@@ -1084,10 +1078,10 @@ class TestEmbeddingIdentityInvariant:
     def test_restore_fails_when_incoming_row_declarations_disagree_with_the_targets_lock(
         self, runner: CliRunner, tmp_path: Path
     ) -> None:
-        """Reproduces the defect directly: a plain restore into a target
-        locked to one model must refuse a snapshot whose embedding rows
-        declare another, naming both identities -- not silently import them
-        and leave the lock lying about what is actually stored.
+        """A plain restore into a target locked to one model must refuse a
+        snapshot whose embedding rows declare another, naming both identities
+        -- not silently import them and leave the lock lying about what is
+        actually stored.
         """
         target = tmp_path / "target.db"
         asyncio.run(_locked_target(target, model_name="model-A", dimension=384))
@@ -1775,15 +1769,14 @@ class TestEmbeddingIdentityInvariant:
         snap = tmp_path / "snap.jsonl"
         snap.write_text(_thought_line(_minimal_thought_data("t-new")) + "\n", encoding="utf-8")
 
-        # Plain --clear alone does not resolve it -- confirm the failure mode
-        # the error message warns about before trusting the fix below.
+        # Plain --clear alone does not resolve it.
         plain_clear = runner.invoke(
             cli, ["--db", str(target), "restore", "-i", str(snap), "--clear"]
         )
         assert plain_clear.exit_code != 0
         assert "not-a-number" in plain_clear.output
 
-        # The exact recovery command the error message now recommends.
+        # The recovery command the error message recommends.
         result = runner.invoke(
             cli,
             ["--db", str(target), "restore", "-i", str(snap), "--clear", "--clear-identity"],

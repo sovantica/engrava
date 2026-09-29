@@ -1,7 +1,7 @@
 """Tests for ``scripts.backfill_content_hashes``.
 
-Covers the cleanup-close ordering fixed alongside the rest of this sweep:
-``backfill`` used a bare ``async with aiosqlite.connect(...) as db:`` --
+Covers the cleanup-close ordering in ``backfill``, which does not use a bare
+``async with aiosqlite.connect(...) as db:`` --
 ``aiosqlite.Connection.__aexit__`` is an unconditional ``await close()`` and
 cannot distinguish a cleanup close (something in the body already raised)
 from a success-path one, so a failure in that close would replace whatever

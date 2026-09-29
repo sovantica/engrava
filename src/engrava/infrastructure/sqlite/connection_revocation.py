@@ -1,13 +1,11 @@
 """Shared connection-revocation token for terminal store quarantine.
 
 A single :class:`ConnectionRevocationToken` is created per store and shared with
-every object that retains a *direct* reference to the real ``aiosqlite``
-connection — the core and its :class:`~engrava.infrastructure.sqlite.journal_writer.JournalWriter`.
+the core and its :class:`~engrava.infrastructure.sqlite.journal_writer.JournalWriter`,
+which retain a *direct* reference to the real ``aiosqlite`` connection.
 When the store quarantines the connection it revokes the token **synchronously**,
-so a holder that bypasses the core's ``_db`` proxy still fails hard on its next
-connection-touching method. This makes quarantine terminal by construction:
-it no longer relies on the argued "core is the only caller" invariant, nor on a
-physical ``close()`` succeeding.
+so a holder that bypasses the core's ``_db`` proxy fails hard when it checks the
+token before using its connection.
 """
 
 from __future__ import annotations
@@ -18,7 +16,7 @@ from engrava.domain.exceptions import ConnectionQuarantinedError
 class ConnectionRevocationToken:
     """A shared, one-way revocation flag guarding a real connection.
 
-    Created once per store; shared by every holder of the real connection. Once
+    Created once per store; shared by the core and its journal writer. Once
     :meth:`revoke` is called the token stays revoked for its lifetime (quarantine
     is terminal — recovery requires a fresh connection + store).
     """

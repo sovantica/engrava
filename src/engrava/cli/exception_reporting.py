@@ -18,11 +18,10 @@ itself be adversarial:
 
 ``memory_commands`` imports from ``main`` (for ``_opened_db``, ``_run`` and
 ``cli`` itself) and ``main`` imports ``memory_commands`` at the bottom of the
-module, to register the memory verbs as commands -- so neither module can
-define these helpers and have the other import them at module level without
-a cycle. Both import them from here instead: one implementation, not a copy
-per module. A duplicated copy is exactly how this kind of fix drifts: a fix
-applied to one module's copy leaves the other module's copy behind.
+module, to register the memory verbs as commands. Both import these helpers
+from here: one implementation, not a copy per module. A duplicated copy
+could drift: a change applied to one module's copy would leave the other
+module's copy behind.
 
 Both functions below read attributes off an exception they did not raise and
 cannot trust, so both are written to survive one that fights back: a
@@ -65,10 +64,9 @@ def _describe_exception(exc: BaseException) -> str:
     ``SystemExit``, would walk straight through -- which is why neither
     guard below is narrowed that way.
 
-    The fix is structural, not two more named cases: **no value leaves
-    either guarded block except an exact, already-safe ``str``.** Each
-    block still catches ``BaseException`` broadly, but re-raises
-    ``KeyboardInterrupt`` and ``SystemExit`` immediately instead of
+    **No value leaves either guarded block except an exact, already-safe
+    ``str``.** Each block catches ``BaseException`` broadly, but
+    re-raises ``KeyboardInterrupt`` and ``SystemExit`` immediately instead of
     converting them (see the guards below) -- converting a real Ctrl-C or
     ``sys.exit()`` into an ordinary-looking error object is worse than an
     endless hostile ``__str__`` staying endless. Everything else --
@@ -101,57 +99,45 @@ def _describe_exception(exc: BaseException) -> str:
     ``str.__str__`` itself raises ``TypeError``, and the *same*
     ``except BaseException`` clause substitutes the fixed placeholder. By
     the time either half reaches the final f-string, it is a plain ``str``
-    with a plain ``str.__format__``, so that interpolation can no longer be
-    the thing that raises.
+    with a plain ``str.__format__``.
 
     This function is the place in the failure path that deliberately reads
     either attribute off an arbitrary exception under a guard. The
     boundary's fallback message and its ``DEBUG``-level stack log both use
-    this function's result for the same description. An earlier shape's
-    debug log line also passed ``exc_info=True``, which made Python's own
-    traceback machinery render the original exception a second time, calling
-    its ``__str__`` again outside anything defined here; a ``KeyboardInterrupt``
-    or ``SystemExit`` raised during that second rendering was caught by the
-    standard library's own formatting code rather than propagating, so a
-    real Ctrl-C arriving during it could still end in that command emitting
-    an ``unexpected_error`` object at exit ``1`` instead of aborting.
-    :func:`~engrava.cli.memory_commands._error_boundary` no longer does
-    this: its ``DEBUG`` log, :func:`~engrava.cli.memory_commands._opened_full_store`'s
+    this function's result for the same description. The ``DEBUG`` log of
+    :func:`~engrava.cli.memory_commands._error_boundary`,
+    :func:`~engrava.cli.memory_commands._opened_full_store`'s
     cleanup-failure warning (``--config`` tier), and
     :func:`~engrava.cli.main._close_quietly`'s cleanup-failure warning
     (bare/default tier) all build their stack text through
-    :func:`_frame_only_stack` instead, which reads only frame metadata --
+    :func:`_frame_only_stack`, which reads only frame metadata --
     through the built-in traceback descriptor, not a plain attribute read --
-    so the second read this paragraph used to describe no longer happens at
-    any of the three sites.
+    so none of the three sites passes ``exc_info=True``, which would make
+    Python's own traceback machinery render the exception a second time,
+    calling its ``__str__`` again outside anything defined here.
 
-    **Dropping the description entirely at the two close-failure sites would
-    be a regression.** Frame metadata alone says *where* closing failed,
-    never *why* -- an ordinary ``PermissionError``, a full disk, or a locked
-    file all look identical in a stack of file names and line numbers, which
-    is a real loss for an ordinary, non-hostile user. Both close-failure
-    warnings also call this function once, for the close exception itself,
-    and log its result
-    alongside the frame-only stack. That is not a second render of
-    anything: it is the *same* single, guarded, non-absorbing attempt this
-    function always made, applied to the close exception the way it was
-    already applied to the body's original exception -- so a real
-    ``PermissionError`` comes back into the log as
+    **The two close-failure sites keep the description.** The frame-only
+    stack lists file names, line numbers and function names; it does not
+    carry the exception's message text. Both close-failure warnings
+    therefore also call this function once, for the close exception itself,
+    and log its result alongside the frame-only stack. That is a single,
+    guarded, non-absorbing attempt, like the one this function makes for
+    the body's original exception, applied here to the close exception --
+    so a real ``PermissionError`` comes back into the log as
     ``"PermissionError: [Errno 13] ..."`` while a hostile close exception's
     ``KeyboardInterrupt``/``SystemExit`` still escapes instead of being
-    absorbed, and the forbidden second render (``exc_info=True`` walking the
-    close exception, the original exception a second time, and any
-    exception-group children, all through their own overridable formatters)
-    stays gone.
+    absorbed. No ``exc_info=True`` walks the close exception, the original
+    exception a second time, or any exception-group children through their
+    own overridable formatters.
 
     **Deliberate limit.** This function converts every ordinary
     ``Exception`` raised while obtaining or normalizing either half, but
     re-raises ``KeyboardInterrupt`` and ``SystemExit`` rather than
     converting them -- see above for why a safe *read* is not the same as
     a bounded one. :func:`~engrava.cli.memory_commands._error_boundary`
-    itself still catches only ``Exception``: a ``SystemExit`` or
+    itself catches only ``Exception``: a ``SystemExit`` or
     ``KeyboardInterrupt`` raised directly by a command's own body also
-    passes through the boundary untouched. Both paths now agree for the
+    passes through the boundary untouched. Both paths agree for the
     same reason -- those are control-flow signals a caller or the
     interpreter itself raises on purpose, not failures this CLI should
     repackage as JSON -- whether the signal originates in the command body

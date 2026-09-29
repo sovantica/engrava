@@ -577,9 +577,9 @@ def test_tutorial_page_claims_exclusion_for_exactly_the_notes_it_drops() -> None
     ``never reaches `top_k=3``` — and requires it to name every dropped note and
     no ranked one.
 
-    Both directions matter and each catches a different regression. Dropping the
-    claim, or going back to "the coffee notes rank for the coffee query" while
-    one of them does not, fails the first. Moving the claim onto a note that in
+    Both directions matter and each catches a different fault. Dropping the
+    claim, or stating that the coffee notes rank for the coffee query while one
+    of them does not, fails the first. Moving the claim onto a note that in
     fact ranks fails the second. Between them, the page cannot go quiet about a
     note it drops, and cannot attribute the exclusion to the wrong note.
 

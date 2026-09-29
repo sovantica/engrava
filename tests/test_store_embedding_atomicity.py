@@ -1,5 +1,4 @@
-"""Regression tests: a ``store_embedding()`` write and its vector-index
-update are one failure-atomic unit.
+"""A ``store_embedding()`` write and its vector-index update are one failure-atomic unit.
 
 ``store_embedding`` writes the base ``embedding`` row and then, when a vector
 backend is configured, calls its ``upsert_embedding``. A failure in that
@@ -332,17 +331,15 @@ class TestFirstEmbeddingIdentityAtomicity:
             await reopened.close()
 
     async def test_centroid_first_call_that_fails_locks_nothing(self, tmp_path: Path) -> None:
-        """The centroid sentinel's lock exemption must survive this fix.
+        """The centroid sentinel's lock exemption holds when its first write fails.
 
         A REFLECTION centroid write that happens to be the very first
         ``store_embedding()`` call ever made is exempt from the identity lock
         in both directions: it must never be compared against a locked
-        identity, and it must never lock one itself. That must hold even
+        identity, and it must never lock one itself. That holds even
         when that first call's own base-row write fails — the sentinel
-        short-circuits before the identity-lock machinery runs at all, so
-        moving that machinery inside the write's own savepoint (this fix)
-        must not change that a rejected centroid write locks nothing,
-        before or after.
+        short-circuits before the identity-lock machinery runs at all, so a
+        rejected centroid write locks nothing.
         """
         from engrava.domain.dreaming import CENTROID_MODEL_NAME
 

@@ -1,12 +1,10 @@
 """Update paths write only the fields they own, and report what actually landed.
 
-Every update in the store used to be derived from a whole-record snapshot read
-at the top of the call: the record was read, evolved in memory, and written back
-column by column — including columns the caller never mentioned. A telemetry
-write (``record_access``) or a confirmation bump landing between that read and
-that write was silently overwritten.
+An update writes only the columns the operation owns, so a telemetry write
+(``record_access``) or a confirmation bump landing between the operation's read
+and its write is not overwritten.
 
-These tests pin the two halves of the fix:
+These tests pin two properties:
 
 * **Blast radius** — an update writes the columns the operation owns and leaves
   every other column exactly as it stands in storage, verified by reading the
@@ -824,7 +822,7 @@ class TestUpdateEdge:
 
         That journal entry is itself a real row insert on this connection, so
         unlike the un-journaled no-op above, this call *does* have something
-        of its own to make durable — the fix must still commit here.
+        of its own to make durable — the call must still commit here.
         """
         await self._seed(journaling_store)
 
@@ -884,13 +882,11 @@ class TestUpdateEdge:
 class TestUpdateEdgeWroteAnythingDiscrimination:
     """``wrote_anything`` must reflect ``total_changes``, not "``append`` was called".
 
-    ``update_edge`` used to set ``wrote_anything = True`` merely because the
-    journal's ``append`` was invoked -- ``append`` never checks whether its own
-    ``INSERT`` actually landed, so a trigger on ``journal_entry`` can veto it
-    with ``RAISE(IGNORE)`` while the flag still claims a write happened. Both
-    tests below share one file-backed database (a second connection is needed
-    to check durability) and the same trigger; they differ only in whether
-    that trigger writes something of its own before vetoing.
+    ``update_edge`` derives ``wrote_anything`` from ``total_changes``, not from
+    whether the journal's ``append`` was invoked -- ``append`` does not check
+    whether its own ``INSERT`` actually landed, so a trigger on
+    ``journal_entry`` can veto it with ``RAISE(IGNORE)`` while a flag set on
+    invocation would still claim a write happened.
     """
 
     async def _open(self, tmp_path: Path, name: str) -> tuple[aiosqlite.Connection, Path]:
@@ -948,11 +944,9 @@ class TestUpdateEdgeWroteAnythingDiscrimination:
     async def test_a_journal_veto_that_writes_nothing_commits_nothing(self, tmp_path: Path) -> None:
         """A pure veto (no trigger side effect at all) must not commit a caller's own edit.
 
-        This is the regression this fix closes: the old code set
-        ``wrote_anything = True`` unconditionally whenever journaling was
-        enabled, regardless of whether ``append``'s own ``INSERT`` actually
-        took effect -- so a no-op edit with journaling on always committed,
-        even when this call itself had genuinely written nothing.
+        Enabling journaling does not by itself make a call a write: when the
+        journal insert is vetoed and the edit changes no column, this call has
+        written nothing, so it commits nothing.
         """
         db, _ = await self._open(tmp_path, "update-edge-journal-veto-write-free.sqlite")
         try:
@@ -1157,12 +1151,10 @@ class TestColumnMapsMatchTheSchema:
         """Every thought column is either updatable or explicitly excluded."""
         mapped = set(store._thought_to_core_columns(_thought()))
         # ``thought_id`` identifies the row being updated. ``content_hash`` is
-        # excluded because no update has ever written it — a known defect (an
-        # edit to ``content`` leaves the stored hash pointing at the old text),
-        # preserved here deliberately rather than sanctioned: changing it moves
-        # deduplication behaviour and belongs to its own change. ``revision``
-        # is excluded because it is engine-bumped (``revision = revision + 1``
-        # in the guarded ``UPDATE`` itself), never a caller-supplied value.
+        # excluded because no update writes it, so an edit to ``content``
+        # leaves the stored hash unchanged. ``revision`` is excluded because
+        # it is engine-bumped (``revision = revision + 1`` in the guarded
+        # ``UPDATE`` itself), never a caller-supplied value.
         excluded = {"thought_id", "content_hash", "revision"}
         assert mapped | excluded == await self._table_columns(db, "thought")
         assert not mapped & excluded

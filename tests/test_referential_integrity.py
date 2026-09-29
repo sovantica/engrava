@@ -63,7 +63,10 @@ from engrava.domain.exceptions import (
 from engrava.domain.models.action import ActionRecord
 from engrava.domain.models.edge import EdgeRecord
 from engrava.domain.models.thought import ThoughtRecord
-from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
+from engrava.infrastructure.sqlite.engrava_core import (
+    SqliteEngravaCore,
+    _close_quietly,
+)
 from engrava.infrastructure.sqlite.vector_sqlite_vec import SqliteVecSearchBackend
 from tests.test_migration_upgrade_chains import _bootstrap_core_at_version
 
@@ -534,60 +537,59 @@ class TestDeleteThoughtChildrenAtomicity:
         db = await aiosqlite.connect(":memory:")
         db.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(db, embedding_provider=None, auto_embed=False)
-        await store.ensure_schema()
+        try:
+            await store.ensure_schema()
 
-        await store.create_thought(_make_thought("t1"))
-        await store.create_thought(_make_thought("t2"))
-        await store.create_edge(_make_edge("e1", "t1", "t2"))
+            await store.create_thought(_make_thought("t1"))
+            await store.create_thought(_make_thought("t2"))
+            await store.create_edge(_make_edge("e1", "t1", "t2"))
 
-        real_execute = db.execute
-        released = {"count": 0}
+            real_execute = db.execute
+            released = {"count": 0}
 
-        async def _execute_and_cancel_after_release(
-            sql: str, *args: object, **kwargs: object
-        ) -> object:
-            cursor = await real_execute(sql, *args, **kwargs)
-            if sql == "RELEASE delete_thought_children" and released["count"] == 0:
-                released["count"] += 1
-                raise asyncio.CancelledError
-            return cursor
+            async def _execute_and_cancel_after_release(
+                sql: str, *args: object, **kwargs: object
+            ) -> object:
+                cursor = await real_execute(sql, *args, **kwargs)
+                if sql == "RELEASE delete_thought_children" and released["count"] == 0:
+                    released["count"] += 1
+                    raise asyncio.CancelledError
+                return cursor
 
-        async def _delete_inside_the_callers_transaction() -> None:
-            async with store.suspend_auto_commit():
-                # A transaction the caller already holds, open before
-                # delete_thought is ever called -- opened_transaction is
-                # False inside the helper for this call.
-                await store.create_thought(_make_thought("t3"))
-                assert db.in_transaction
+            async def _delete_inside_the_callers_transaction() -> None:
+                async with store.suspend_auto_commit():
+                    # A transaction the caller already holds, open before
+                    # delete_thought is ever called -- opened_transaction is
+                    # False inside the helper for this call.
+                    await store.create_thought(_make_thought("t3"))
+                    assert db.in_transaction
 
-                db.execute = _execute_and_cancel_after_release
-                with pytest.raises(asyncio.CancelledError):
-                    await store.delete_thought("t1")
-                # Falling through to let this ``async with`` block exit:
-                # suspend_auto_commit's own exit touches the connection
-                # (checking whether to commit), and the connection is
-                # already quarantined by this point -- that exit is
-                # expected to raise too, which is exactly the point: every
-                # subsequent touch of this connection fails, not only a
-                # fresh, unrelated write.
+                    db.execute = _execute_and_cancel_after_release
+                    with pytest.raises(asyncio.CancelledError):
+                        await store.delete_thought("t1")
+                    # Falling through to let this ``async with`` block exit:
+                    # suspend_auto_commit's own exit touches the connection
+                    # (checking whether to commit), and the connection is
+                    # already quarantined by this point -- that exit is
+                    # expected to raise too, which is exactly the point: a later touch
+                    # of this connection through the store fails, not only a
+                    # fresh, unrelated write.
 
-        with pytest.raises(ConnectionQuarantinedError):
-            await _delete_inside_the_callers_transaction()
+            with pytest.raises(ConnectionQuarantinedError):
+                await _delete_inside_the_callers_transaction()
 
-        assert store._connection_quarantined is True
-        with pytest.raises(ConnectionQuarantinedError):
-            await store.create_thought(_make_thought("unrelated-after-quarantine"))
-
-        # Quarantine's own physical close is deliberately detached (see the
-        # docstring above) so *safety* never depends on it, but that leaves
-        # its task still in flight when this test function returns -- and
-        # pytest-asyncio closes this test's event loop immediately after.
-        # Awaiting it here (never done in production, where the loop keeps
-        # running) lets the close finish on the loop it was scheduled on,
-        # instead of leaking aiosqlite's non-daemon worker thread to call
-        # back into a now-closed loop from some unrelated, later test.
-        if store._quarantine_close_task is not None:
-            await store._quarantine_close_task
+            assert store._connection_quarantined is True
+            with pytest.raises(ConnectionQuarantinedError):
+                await store.create_thought(_make_thought("unrelated-after-quarantine"))
+        finally:
+            # Quarantine detaches the connection and closes it in its own
+            # task: wait up to 10 s for that task when the store quarantined
+            # the connection, otherwise close the connection here.
+            close_task = store._quarantine_close_task
+            if close_task is not None:
+                await asyncio.wait({close_task}, timeout=10)
+            else:
+                await _close_quietly(db)
 
     async def test_cancellation_during_unwind_wins_over_the_original_error(
         self,
@@ -619,39 +621,45 @@ class TestDeleteThoughtChildrenAtomicity:
         db = await aiosqlite.connect(":memory:")
         db.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(db, embedding_provider=None, auto_embed=False)
-        await store.ensure_schema()
-        await db.execute("PRAGMA foreign_keys = OFF")
+        try:
+            await store.ensure_schema()
+            await db.execute("PRAGMA foreign_keys = OFF")
 
-        await store.create_thought(_make_thought("t1"))
-        await store.create_action(_make_action("a1", "t1"))
-        await db.execute(
-            "CREATE TRIGGER reject_action_delete_for_cancel BEFORE DELETE ON action "
-            "BEGIN SELECT RAISE(ABORT, 'policy: action rows are retained'); END"
-        )
+            await store.create_thought(_make_thought("t1"))
+            await store.create_action(_make_action("a1", "t1"))
+            await db.execute(
+                "CREATE TRIGGER reject_action_delete_for_cancel BEFORE DELETE ON action "
+                "BEGIN SELECT RAISE(ABORT, 'policy: action rows are retained'); END"
+            )
 
-        real_execute = db.execute
-        rollback_to_attempts = {"count": 0}
+            real_execute = db.execute
+            rollback_to_attempts = {"count": 0}
 
-        async def _cancel_the_rollback_to(sql: str, *args: object, **kwargs: object) -> object:
-            if sql == "ROLLBACK TO delete_thought_children" and rollback_to_attempts["count"] == 0:
-                rollback_to_attempts["count"] += 1
-                raise asyncio.CancelledError
-            return await real_execute(sql, *args, **kwargs)
+            async def _cancel_the_rollback_to(sql: str, *args: object, **kwargs: object) -> object:
+                if (
+                    sql == "ROLLBACK TO delete_thought_children"
+                    and rollback_to_attempts["count"] == 0
+                ):
+                    rollback_to_attempts["count"] += 1
+                    raise asyncio.CancelledError
+                return await real_execute(sql, *args, **kwargs)
 
-        db.execute = _cancel_the_rollback_to
-        with pytest.raises(asyncio.CancelledError):
-            await store.delete_thought("t1")
+            db.execute = _cancel_the_rollback_to
+            with pytest.raises(asyncio.CancelledError):
+                await store.delete_thought("t1")
 
-        assert store._connection_quarantined is True
-        with pytest.raises(ConnectionQuarantinedError):
-            await store.create_thought(_make_thought("unrelated-after-quarantine"))
-
-        # See the previous test's closing comment: awaiting quarantine's
-        # detached close task here keeps it from outliving this test's event
-        # loop, which production code never has to do because its own loop
-        # keeps running past this point.
-        if store._quarantine_close_task is not None:
-            await store._quarantine_close_task
+            assert store._connection_quarantined is True
+            with pytest.raises(ConnectionQuarantinedError):
+                await store.create_thought(_make_thought("unrelated-after-quarantine"))
+        finally:
+            # Quarantine detaches the connection and closes it in its own
+            # task: wait up to 10 s for that task when the store quarantined
+            # the connection, otherwise close the connection here.
+            close_task = store._quarantine_close_task
+            if close_task is not None:
+                await asyncio.wait({close_task}, timeout=10)
+            else:
+                await _close_quietly(db)
 
 
 class TestParentDeleteSeesChildrenBeforeTheyAreGone:
@@ -998,15 +1006,14 @@ class TestParentDeleteSuppressedByRaiseIgnore:
     async def test_nonexistent_id_control_still_sweeps_orphans_and_reports_false(
         self,
     ) -> None:
-        """The discrimination must not regress the pre-existing nonexistent-id path.
+        """A never-existed id is still swept for orphans and reported as not deleted.
 
         With foreign keys off (no cascade to rely on), a schema can be left
         carrying orphaned child rows for a ``thought_id`` that was never
-        (re)inserted into ``thought`` -- exactly the scenario the
-        unconditional sweep in ``_delete_thought_atomic`` exists to clean up.
-        This must keep working: ``existed_before`` is False, so the sweep
-        runs and ``delete_thought`` reports ``False``, with no
-        ``RAISE(IGNORE)`` trigger involved at all.
+        (re)inserted into ``thought`` -- exactly the scenario the orphan
+        sweep in ``_delete_thought_atomic`` exists to clean up.
+        ``existed_before`` is False, so the sweep runs and ``delete_thought``
+        reports ``False``, with no ``RAISE(IGNORE)`` trigger involved at all.
         """
         async with aiosqlite.connect(":memory:") as db:
             db.row_factory = aiosqlite.Row
@@ -1038,19 +1045,13 @@ class TestParentDeleteSuppressedByRaiseIgnore:
 class TestChildTriggerWriteSurvivesAVetoedSweep:
     """``wrote_anything`` must reflect ``total_changes``, not a per-delete rowcount.
 
-    ``_delete_thought_children_explicit`` used to OR together the ``rowcount``
-    of its three deletes. A ``BEFORE DELETE`` trigger on any of the three
-    child tables can write a real row of its own (an audit entry, say) and
-    then veto its own statement with ``RAISE(IGNORE)`` -- which reverts only
-    that statement, not the trigger's earlier writes, but leaves every
-    rowcount involved at zero. The old computation therefore reported
+    A ``BEFORE DELETE`` trigger on any of the three child tables can write a
+    real row of its own (an audit entry, say) and then veto its own statement
+    with ``RAISE(IGNORE)`` -- which reverts only that statement, not the
+    trigger's earlier writes, but leaves every rowcount involved at zero. A
+    computation from the three rowcounts would therefore report
     ``wrote_anything=False`` for a call that really did write something, and
-    ``delete_thought`` rolled that write back instead of committing it.
-
-    The two tests below share one scaffold (the same audit table and
-    trigger) and differ only in whether the trigger ever actually fires --
-    proving the fix discriminates the two states rather than merely
-    happening to pass on one of them.
+    ``delete_thought`` would roll that write back instead of committing it.
     """
 
     async def test_trigger_write_before_the_veto_is_durable(self, tmp_path: Path) -> None:
@@ -1412,10 +1413,10 @@ class TestTransactionStateAfterAVetoedDelete:
         ``delete_thought`` so this test is the narrowest possible pin on the
         internal ownership mechanism, independent of whatever the public
         method's own call site does with it.
-        ``delete_thought`` itself no longer needs a ``suspend_auto_commit``
-        window to leave a raw, unmediated caller ``BEGIN`` alone on this
-        path: it now gates its own ``_maybe_commit()`` on whether it actually
-        deleted anything, exactly like this method gates its own transaction
+        ``delete_thought`` itself leaves a raw, unmediated caller ``BEGIN``
+        alone on this path, with no ``suspend_auto_commit`` window: it gates
+        its own ``_maybe_commit()`` on whether it actually wrote anything,
+        exactly like this method gates its own transaction
         handling — see ``TestPubliclyVetoedWritesDoNotCommitACallersTransaction``
         for that behaviour exercised through the public method, with a real
         pending edit under the caller's ``BEGIN`` and a ``rollback()`` that
@@ -1513,21 +1514,16 @@ class TestPubliclyVetoedWritesDoNotCommitACallersTransaction:
     """A write-free outcome must not commit a caller's own pending edit.
 
     ``_delete_thought_atomic`` (exercised above) never touches a transaction
-    it did not open. But before this fix, its two public callers,
-    ``delete_thought`` and ``cleanup_expired``, undid that protection from the
-    outside: both called ``_maybe_commit()`` unconditionally on return,
-    regardless of whether anything was actually deleted. When a caller had
-    opened its own transaction first (a raw ``BEGIN``, or a real write buried
-    a few frames up the same task) and had a pending edit of its own sitting
-    in it, a vetoed delete's unconditional commit durably applied that edit
-    too — the caller's own later ``rollback()`` had nothing left to undo.
+    it did not open. Its two public callers, ``delete_thought`` and
+    ``cleanup_expired``, must not undo that protection from the outside: an
+    unconditional ``_maybe_commit()`` on return would commit a pending edit
+    that the caller made after its own raw ``BEGIN``, and the caller's own
+    later ``rollback()`` would have nothing left to undo.
 
-    Each test below reproduces exactly that: a caller-owned transaction, a
-    real pending edit inside it, a write-free call, and a ``rollback()`` that
-    must actually undo the edit. The controls alongside confirm the ordinary,
-    writing path is unchanged: it keeps committing, caller-owned transaction
-    or not, because "whoever writes, commits" was never in question — only
-    the write-free branch was.
+    The two veto tests each set up a caller-owned transaction, a real pending
+    edit inside it, a write-free call, and a ``rollback()`` that must undo the
+    edit. The two control tests do a real delete or expiry with no caller
+    transaction and check that it commits.
     """
 
     async def test_delete_thought_veto_does_not_commit_the_callers_pending_edit(
@@ -1572,7 +1568,7 @@ class TestPubliclyVetoedWritesDoNotCommitACallersTransaction:
             await db.close()
 
     async def test_ordinary_delete_thought_still_commits(self, tmp_path: Path) -> None:
-        """Control: a real delete, with no caller transaction, commits as before."""
+        """Control: a real delete, with no caller transaction, commits."""
         db_path = tmp_path / "delete-thought-ordinary-commit.sqlite"
         db = await aiosqlite.connect(str(db_path))
         try:
@@ -2602,12 +2598,13 @@ class TestRecreateFkCleanupDoesNotReplaceTheOriginalError:
     """A failing rollback or pragma-restore during migration cleanup must not
     replace the migration failure that triggered it.
 
-    ``_recreate_child_tables_with_fk_atomically``'s outer cleanup used to be
-    an unconditional ``finally: try: await self._db.rollback() finally: await
-    self._db.execute("PRAGMA foreign_keys=ON")``. A failure in either
-    statement there raised in front of whatever the recreate body was
-    already failing with, so a user whose ``engrava migrate`` hit a mid-swap
-    error and then hit a rollback or pragma failure on top of it saw only
+    ``_recreate_child_tables_with_fk_atomically``'s cleanup on the failure
+    path runs the rollback and the ``PRAGMA foreign_keys=ON`` restore through
+    ``_run_cleanup_step_quietly``, which logs an ordinary failure of either
+    step instead of raising it. A failure in either statement would
+    otherwise raise in front of whatever the recreate body was already
+    failing with, so a user whose ``engrava migrate`` hit a mid-swap error
+    and then hit a rollback or pragma failure on top of it would see only
     the second, purely-mechanical error -- never the actual reason their
     migration failed, which is the only thing they can act on.
     """
@@ -2618,11 +2615,10 @@ class TestRecreateFkCleanupDoesNotReplaceTheOriginalError:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Before this fix: a user would see ``OperationalError("injected
-        rollback failure")`` -- the cleanup's own error -- when a mid-recreate
-        failure's cleanup rollback also failed. After this fix: they see the
-        real migration failure (``RuntimeError("injected mid-recreate
-        failure")``), with the rollback failure only in the log.
+        """When a mid-recreate failure's cleanup rollback also fails, the caller
+        sees the real migration failure (``RuntimeError("injected mid-recreate
+        failure")``), not the cleanup's own ``OperationalError("injected
+        rollback failure")``; the rollback failure is only in the log.
         """
         db_path = tmp_path / "rollback-cleanup-failure.sqlite"
         async with aiosqlite.connect(db_path) as db:
@@ -2759,13 +2755,12 @@ class TestRecreateFkCleanupDoesNotReplaceTheOriginalError:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The symmetric case: the cleanup rollback itself fails on the clean
-        success path (no original migration error). Before this fix, the
-        pragma restore below the rollback was never reached, silently
-        leaving FK enforcement off for the rest of the connection's life.
-        After this fix, the pragma restore still runs -- verified by reading
-        it back from the connection, not from a mock's call list -- and the
-        rollback's own failure still reaches the caller rather than being
-        silently lost.
+        success path (no original migration error). The pragma restore below
+        the rollback still runs -- verified by reading it back from the
+        connection, not from a mock's call list, since skipping it would
+        leave FK enforcement off for the rest of the connection's life --
+        and the rollback's own failure still reaches the caller rather than
+        being silently lost.
         """
         db_path = tmp_path / "rollback-clean-path-failure.sqlite"
         async with aiosqlite.connect(db_path) as db:
@@ -2805,11 +2800,11 @@ class TestRecreateFkCleanupDoesNotReplaceTheOriginalError:
 
         ``_run_cleanup_step_quietly``'s shield-then-redraw re-awaits an
         already-finished task through an ``except Exception``, which does
-        not catch a second ``CancelledError`` -- so before this fix, this
-        exact case let the ``CancelledError`` escape the cleanup helper
-        before the pragma restore below it ever ran. This must still reach
-        the caller (never swallowed), and the pragma restore must still have
-        run first.
+        not catch a second ``CancelledError`` -- so this exact case escapes
+        that helper. The pragma restore below it still runs, because
+        ``_restore_after_successful_recreate`` runs it in a ``finally``. The
+        ``CancelledError`` must still reach the caller (never swallowed), and
+        the pragma restore must still have run first.
         """
         db_path = tmp_path / "rollback-clean-path-cancellederror.sqlite"
         async with aiosqlite.connect(db_path) as db:

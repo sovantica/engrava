@@ -1,51 +1,26 @@
 """Layer 7 of the documentation-example tests — ``yaml`` config vs the real loader.
 
-Every existing documentation-test layer asks the Markdown extractor for a
-``python`` fenced block (one, ``test_docs_examples_behavior.py``'s tutorial
-and upgrade checks, also compares ``text`` transcripts against real output).
-Nothing has ever looked at ``yaml``, so a documented ``engrava.yaml`` key that
-no configuration class backs left the whole suite green — and it is the
-sharpest form of this bug, because ``load_config`` already raises
-``ConfigError: Unknown configuration key(s)`` for exactly this case: a reader
-who pastes the documented snippet gets an immediate failure.
+This layer extracts the documented ``yaml`` fenced blocks and checks them,
+using ``load_config`` for the key names and values, except the blocks
+registered as exempt.
 
 Delegating to the real loader, not reimplementing it
 ------------------------------------------------------
-Two earlier versions of this module were both wrong.
-The first mirrored each section's key set by hand and split a block into
-"stanzas"; the mirror missed real value-level checks and the splitter broke
-comments, ``null``, and anchors/aliases. The second delegated to
-``load_config`` but *preprocessed the text* before parsing it: substituting
-``${VAR}`` placeholders before ``yaml.safe_load`` let substitution repair
-genuinely invalid YAML (a flow mapping broken by an unescaped placeholder),
-and unconditionally injecting a placeholder ``database:`` section let a
-documented **complete** ``engrava.yaml`` example lose a real defect (a
-missing ``database.path``) to the very placeholder meant only for fragments.
-
-This version fixes both by keeping the raw document intact until it is a
-real Python value, and by only ever inventing content for a block the
-registry below says needs it:
+Key names and values are validated by ``load_config`` itself; this module
+keeps no mirrored key or value model. The raw document stays intact until it
+is a real Python value:
 
 0. **Check for a duplicate written key on the composed node graph, before
-   anything is constructed.** Three earlier versions of this one check got
-   the ordering wrong in three different directions: a plain
-   ``yaml.safe_load`` silently keeps only the last of a duplicate key; a
-   ``SafeLoader.construct_mapping`` override that checked *before*
-   flattening a merge key crashed on the merge key's own node (which has no
-   registered constructor outside ``flatten_mapping``'s own handling of it);
-   checking *after* flattening mistook an explicit key overriding a merged
-   one — or two merge sources that legitimately overlap — for a real
-   duplicate, and a shared node reached through more than one alias made
-   construction order matter in a way it never should have. "Is this key
-   written twice in this mapping" is a property of the document's *text*,
-   not of a constructed value, so ``yaml.compose()`` gets the node graph
-   (composed, not constructed — no construction and no merge flattening;
-   ``yaml.compose()`` does still resolve an alias to the *same* mapping
-   node object its anchor produced, which is exactly what lets a duplicate
-   inside a shared, aliased mapping still be caught) and
-   ``_find_duplicate_key`` walks it directly: for each ``MappingNode``, its
-   own written keys, skipping the merge key itself. See that function's
-   docstring for the full history.
+   anything is constructed.** A plain ``yaml.safe_load`` silently keeps only
+   the last of a duplicate key. "Is this key written twice in this mapping"
+   is a property of the document's *text*, not of a constructed value, so
+   ``yaml.compose()`` gets the node graph (composed, not constructed — no
+   construction and no merge flattening; ``yaml.compose()`` does still
+   resolve an alias to the *same* mapping node object its anchor produced,
+   which is exactly what lets a duplicate inside a shared, aliased mapping
+   still be caught) and ``_find_duplicate_key`` walks it directly: for each
+   ``MappingNode``, its own written keys, skipping the merge key itself. See
+   that function's docstring for the merge-key and alias cases.
 1. **Parse first.** ``yaml.safe_load`` runs on the block exactly as written.
    Invalid YAML fails as invalid YAML — nothing before this step touches the
    text.
@@ -80,23 +55,13 @@ registry below says needs it:
 5. Write the (possibly substituted, possibly database-augmented) document to
    a temporary file and call ``load_config`` on it, catching ``ConfigError``.
 
-Any ``ConfigError`` the real loader raises is reported, and only that: there
-is no mirrored key or value model left in this module to drift from the
-shipped classes.
-
 Fragment vs. complete, honestly
 --------------------------------
-Only **3 of the 25** documented ``yaml`` blocks already include a
-``database:`` section and are registered as complete
-(``docs/configuration.md``'s "Create a ``engrava.yaml`` file:" example,
-and two others that happen to show it alongside one more section). The
-other 20 checkable blocks are fragments. This is not a defect to fix by
-reclassifying more blocks as complete — a snippet titled "Configure it via
-``SearchConfig``:" or "A minimal enable:" is genuinely illustrating one
-section, not publishing a runnable file — but it does mean the
-"key exists and the value is valid" guarantee is real for every block, while
-the *stronger* "this whole example runs as-is" guarantee this module could
-offer only applies to those 3.
+The documented ``yaml`` blocks listed in ``COMPLETE_YAML_BLOCKS`` are
+registered as complete. The other checkable blocks are treated as fragments.
+This is not a defect to fix by reclassifying more blocks as complete — a
+snippet titled "Configure it via ``SearchConfig``:" or "A minimal enable:" is
+genuinely illustrating one section, not publishing a runnable file.
 
 Two documented blocks each show the same top-level key (``manifests:``)
 twice, side by side, to illustrate alternate forms. That is a real duplicate
@@ -212,13 +177,7 @@ def _find_duplicate_key(node: yaml.Node, visited: set[int]) -> str | None:
     "Is this key written twice in this mapping" is a property of the
     document's text, not of the value construction gets to -- so this
     inspects ``yaml.compose()``'s node graph directly, before anything is
-    constructed. That sidesteps every ordering bug a constructor override
-    had: ``flatten_mapping`` folding a merge key's referenced keys in before
-    an override sees them (raising on the merge key's own, unconstructable
-    node), or after (mistaking an explicit key overriding a merged one, or
-    two merge sources that legitimately overlap, for a real duplicate), and
-    an alias being resolved into a *shared* node object that construction
-    order could see mutated by an earlier reference to it.
+    constructed.
 
     The YAML merge key (``<<:``) is not a key at all -- it is a directive,
     identified by its own node's special ``tag:yaml.org,2002:merge`` tag,
@@ -576,16 +535,12 @@ def test_checker_accepts_a_valid_deeply_nested_key_on_a_non_obvious_class() -> N
 
 
 def test_checker_accepts_a_null_hooks_section() -> None:
-    """Regression: `hooks: null` is accepted by the real loader (means "unset").
-
-    A mirrored validator that requires `hooks` to be a mapping whenever the
-    key is present would reject this; the real loader does not.
-    """
+    """`hooks: null` is accepted by the real loader (means "unset")."""
     assert block_config_error("hooks: null\n", complete=False) is None
 
 
 def test_checker_does_not_let_a_column_zero_comment_split_a_mapping() -> None:
-    """Regression: a comment between two keys of one mapping is not a new document."""
+    """A comment between two keys of one mapping is not a new document."""
     fragment = (
         "search:\n"
         "  default_fts_weight: 0.30\n"
@@ -597,13 +552,13 @@ def test_checker_does_not_let_a_column_zero_comment_split_a_mapping() -> None:
 
 
 def test_checker_accepts_an_anchor_and_alias_spanning_two_sections() -> None:
-    """Regression: a YAML anchor defined in one section and used in another works."""
+    """A YAML anchor defined in one section and used in another works."""
     fragment = "database:\n  path: &db_path demo.db\n\nservices:\n  data_dir: *db_path\n"
     assert block_config_error(fragment, complete=True) is None
 
 
 def test_checker_rejects_a_non_boolean_wal_mode() -> None:
-    """Regression: the real loader rejects a non-boolean `wal_mode`; a mirror missed this."""
+    """The real loader rejects a non-boolean `wal_mode`."""
     error = block_config_error(
         'database:\n  path: demo.db\n  wal_mode: "yes"\n',
         complete=True,
@@ -613,7 +568,7 @@ def test_checker_rejects_a_non_boolean_wal_mode() -> None:
 
 
 def test_checker_rejects_a_negative_vector_dimension() -> None:
-    """Regression: the real loader rejects a negative dimension; a mirror missed this."""
+    """The real loader rejects a negative dimension."""
     error = block_config_error("extensions:\n  vector:\n    dimension: -1\n", complete=False)
     assert error is not None
 
@@ -631,7 +586,7 @@ def test_checker_substitutes_an_env_placeholder_deterministically() -> None:
 
 
 def test_checker_rejects_a_placeholder_outside_embeddings_api_key() -> None:
-    """Regression: substitution must not repair a field the real loader never interpolates.
+    """Substitution must not repair a field the real loader never interpolates.
 
     `services.default_service` is validated as a literal service name; the
     real loader raises `Invalid service name '${DOC_SERVICE}'` even with
@@ -691,7 +646,7 @@ def test_checker_accepts_a_per_service_embeddings_api_key_placeholder() -> None:
 
 
 def test_checker_does_not_repair_invalid_yaml_via_substitution() -> None:
-    """Regression: substituting in the text let a genuinely broken flow mapping parse.
+    """Substituting a placeholder must not repair a genuinely broken flow mapping.
 
     `${DOCS_DB}` contains `{`/`}`, which are flow-collection indicators in a
     YAML flow mapping. `yaml.safe_load` rejects this document as written,
@@ -704,7 +659,7 @@ def test_checker_does_not_repair_invalid_yaml_via_substitution() -> None:
 
 
 def test_checker_does_not_let_a_placeholder_complete_a_deleted_database_section() -> None:
-    """Regression: a complete block with its `database:` section removed is not repaired.
+    """A complete block with its `database:` section removed is not repaired.
 
     Deleting `docs/configuration.md`'s "Create a `engrava.yaml` file:"
     example's `database:` section is a real documentation defect (the file it
@@ -722,7 +677,7 @@ def test_checker_does_not_let_a_placeholder_complete_a_deleted_database_section(
 
 
 def test_checker_distinguishes_an_empty_document_from_an_explicit_null() -> None:
-    """Regression: an empty block and a `null` block must not share a verdict.
+    """An empty block and a `null` block must not share a verdict.
 
     A truly empty block has nothing to check. A block whose content is the
     literal `null` is a real value a reader's own parser also produces
@@ -737,10 +692,10 @@ def test_checker_distinguishes_an_empty_document_from_an_explicit_null() -> None
 
 
 def test_checker_rejects_a_duplicate_key_that_discards_an_invalid_value() -> None:
-    """Regression: a duplicate key must not let plain YAML silently keep only the last.
+    """A duplicate key must not let plain YAML silently keep only the last.
 
     `wal_mode: "not-a-boolean"` immediately before the real `wal_mode: true`
-    used to pass, because `yaml.safe_load` keeps only the second occurrence
+    would pass under `yaml.safe_load`, which keeps only the second occurrence
     -- discarding a shown value unread instead of judging it.
     """
     fragment = 'database:\n  path: demo.db\n  wal_mode: "not-a-boolean"\n  wal_mode: true\n'
@@ -750,17 +705,16 @@ def test_checker_rejects_a_duplicate_key_that_discards_an_invalid_value() -> Non
 
 
 def test_checker_judges_a_database_fragment_missing_only_path() -> None:
-    """Regression: `database: {wal_mode: true}` as a fragment is judged on what it shows.
+    """A fragment with a `database` section but no `path` gets the placeholder path.
 
-    Injection used to handle a missing `database` section but not a present
-    one missing `path`, so this fragment failed with `'database.path' is
-    required` -- a defect not shown by the fragment at all.
+    `database: {wal_mode: true}` is judged on what it shows, so it is not
+    reported for a missing `'database.path'` it never shows.
     """
     assert block_config_error("database:\n  wal_mode: true\n", complete=False) is None
 
 
 def test_checker_accepts_a_yaml_merge_key() -> None:
-    """Regression: `<<:` is a merge directive, not a duplicate (or invalid) key.
+    """`<<:` is a merge directive, not a duplicate (or invalid) key.
 
     A naive check must not construct the merge key's own node as if it were
     a plain key (it carries a special tag with no registered constructor
@@ -773,7 +727,7 @@ def test_checker_accepts_a_yaml_merge_key() -> None:
 
 
 def test_checker_accepts_an_explicit_key_that_overrides_a_merged_one() -> None:
-    """Regression: an explicit key beats a merge-introduced one; that is not a duplicate.
+    """An explicit key beats a merge-introduced one; that is not a duplicate.
 
     Checking the *flattened* result (after the merge key's keys are folded
     in) cannot tell "written twice" from "one written, one introduced by
@@ -789,8 +743,8 @@ def test_checker_still_rejects_a_duplicate_key_inside_a_merged_mapping() -> None
     """Control: a genuine duplicate inside the mapping a merge key references is still caught.
 
     That mapping is its own node, constructed (and checked) independently of
-    the mapping doing the merging -- fixing the false positive above must
-    not also blind the check to a real duplicate one level down.
+    the mapping doing the merging -- the merge handling above must not also
+    blind the check to a real duplicate one level down.
     """
     fragment = "x: &defaults\n  path: a.db\n  path: b.db\ndatabase:\n  <<: *defaults\n"
     error = block_config_error(fragment, complete=True)

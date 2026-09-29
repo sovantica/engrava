@@ -1382,11 +1382,11 @@ async def _rank_with_optional_edge(
 async def test_migration_guide_edges_do_not_feed_ranking_at_defaults() -> None:
     """migrating-from-other-memory.md: letting edges feed ranking is opt-in.
 
-    The concept table used to say edges "also feed ranking"; it now says the
-    graph signal is opt-in at ``default_graph_weight = 0.0``. That is a claim
-    about ranked output, so pin it as a frozen order: the same corpus and query,
-    with and without an ``ASSOCIATED`` edge, rank identically at defaults — and
-    the search reports no graph signal at all.
+    The concept table says the graph signal is opt-in at
+    ``default_graph_weight = 0.0``. That is a claim about ranked output, so pin
+    it as a frozen order: the same corpus and query, with and without an
+    ``ASSOCIATED`` edge, rank identically at defaults — and the search reports
+    no graph signal at all.
 
     Both stores are exercised, because the two resolve the default from
     different places: one from ``SearchConfig.default_graph_weight``, which the

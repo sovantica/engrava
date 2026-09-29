@@ -289,10 +289,10 @@ def _pairwise_cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float
     whatever magnitude the remote model or user callback returns. Normalising
     at the provider boundary instead would change what *every* consumer of
     those vectors sees (vector-index storage, dedup similarity, any future
-    caller doing its own dot product) for a fix whose scope is this one gate.
+    caller doing its own dot product).
     Normalising here keeps the blast radius to the cohesion computation:
     every other consumer of a raw provider vector is unaffected, and the
-    gate now approximates the quantity its name and the documentation
+    gate approximates the quantity its name and the documentation
     promise for every provider — see the Returns section below for where
     floating-point arithmetic still keeps that from being exact.
 

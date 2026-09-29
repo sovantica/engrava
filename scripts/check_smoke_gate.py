@@ -38,9 +38,9 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
 
-# Public floors. Mirror the frozen acceptance criteria committed to
-# ``engrava/benchmarks/synthetic/runner.py`` — a deliberate redundancy so
-# the gate fails if either side drifts. The four labels exactly match
+# Public floors. They duplicate the thresholds in
+# ``engrava/benchmarks/synthetic/runner.py`` (``_AC9A_FLOOR``,
+# ``_AC9B_CEILING``, ``_AC8_CEILING``). The four labels exactly match
 # the benchmark's ``_BindingResult.label`` strings.
 SYNTHETIC_FLOORS: Mapping[str, dict[str, float | str]] = {
     "AC-9a synthesis coverage": {"comparator": ">=", "floor": 0.80},

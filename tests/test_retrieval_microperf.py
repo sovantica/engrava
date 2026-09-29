@@ -1,4 +1,4 @@
-"""Read-path micro-performance regression tests.
+"""Read-path micro-performance tests.
 
 These lock in a bundle of behaviour-preserving read-path optimisations:
 
@@ -9,10 +9,7 @@ These lock in a bundle of behaviour-preserving read-path optimisations:
 * An ``edge(edge_type, to_thought_id)`` composite index backs the
   edge-type-scoped inbound lookup so it seeks on both columns.
 
-The load-bearing property throughout is that **results do not move**: the same
-ranked ids and the same scores come out before and after. Each optimisation is
-paired with an identity assertion (batch decode == per-row decode, ranking is
-stable, the index changes only the query plan).
+The load-bearing property throughout is that **results do not move**.
 """
 
 from __future__ import annotations
@@ -117,18 +114,18 @@ async def _seed_mixed_store(store: SqliteEngravaCore) -> tuple[list[str], list[s
 
 
 class TestNumpyBatchDecode:
-    """The ``np.frombuffer`` batch decode must equal the old per-row decode."""
+    """The ``np.frombuffer`` batch decode must equal a per-row ``struct.unpack`` decode."""
 
     def test_frombuffer_equals_struct_unpack_bit_for_bit(self) -> None:
         """Decoded matrices are exactly equal for the same stored blobs."""
         vectors = [_unit_vector(seed, dim=_DIM) for seed in range(20)]
         blobs = [struct.pack(f"{_DIM}f", *v) for v in vectors]
 
-        # Old path: per-row struct.unpack into a float64 matrix.
+        # Reference: per-row struct.unpack into a float64 matrix.
         reference = np.asarray(
             [list(struct.unpack(f"{_DIM}f", b)) for b in blobs], dtype=np.float64
         )
-        # New path: one frombuffer (native float32, matching the native
+        # Batched: one frombuffer (native float32, matching the native
         # ``struct.pack`` storage) over the joined buffer, widened to float64.
         batched = (
             np.frombuffer(b"".join(blobs), dtype=np.float32)

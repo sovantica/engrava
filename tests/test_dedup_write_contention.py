@@ -266,9 +266,7 @@ async def test_write_lock_is_released_before_auto_embed_runs(db_path: str) -> No
     Binding design constraint: the dedup
     probe-and-insert window's ``BEGIN IMMEDIATE`` must close *before* any
     ``await`` that does external I/O -- embedding chief among them -- or a
-    slow or hanging provider call would stall every other writer on the file,
-    trading the original data-loss bug for a store-wide outage instead of
-    fixing it.
+    slow or hanging provider call would stall every other writer on the file.
 
     This asserts the *observable* property directly rather than the internal
     call order: while a real ``get_or_create`` call's embedding is

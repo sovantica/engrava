@@ -573,15 +573,13 @@ async def test_upsert_by_hash_noop_does_not_commit_callers_pending_work(
     The unchanged-record branch writes nothing of its own -- no
     ``UPDATE``, no journal entry -- so it must not call ``_maybe_commit()``
     either. A commit there would commit whatever *unrelated* work the caller
-    already had open on the same connection (a rejected journal insert is the
-    motivating case), leaving a later ``rollback()`` with nothing left to
-    undo.
+    already had open on the same connection, leaving a later ``rollback()``
+    with nothing left to undo.
 
     Here a raw pending ``INSERT`` left uncommitted on the shared connection
-    stands in for "the caller's pending work", exactly the way the residual
-    gap documented on
-    :meth:`SqliteEngravaCore._serialize_dedup_probe` describes a transaction
-    already open when this store's own guard is entered.
+    stands in for "the caller's pending work": a transaction already open
+    when this store's own guard is entered (see
+    :meth:`SqliteEngravaCore._serialize_dedup_probe`).
     """
     content = "Content re-upserted with byte-identical mutable fields."
     seeded = await store.upsert_by_hash(_thought("t-rb-noop-1", content=content))
@@ -646,9 +644,11 @@ async def test_upsert_by_hash_noop_inside_suspend_auto_commit_unaffected(
     store: SqliteEngravaCore,
     db: aiosqlite.Connection,
 ) -> None:
-    """A no-op ``upsert_by_hash()`` inside ``suspend_auto_commit()`` does not commit.
+    """Inside ``suspend_auto_commit()``, a no-op ``upsert_by_hash()`` commits nothing.
 
-    An outer rollback still discards the writes made inside the window.
+    The first upsert inserts a row and the second is a no-op hit on the same
+    content. When the window then raises, the outer rollback discards the
+    insert, so no row remains.
     """
     content = "Content re-upserted with byte-identical mutable fields, nested."
 
@@ -1093,10 +1093,9 @@ async def test_bulk_store_dedup_hit_reusing_existing_id_not_reembedded(
 ) -> None:
     """A dedup hit that reuses an existing row's id is classified by row existence.
 
-    Regression guard: dedup-hit detection must key off whether the row already
-    existed, not instance identity — otherwise a submitted thought whose id
-    coincides with the matched row's id would be misread as a fresh insert and
-    redundantly re-embedded.
+    Dedup-hit detection keys off whether the row already existed, not off
+    instance identity. A submitted thought whose id coincides with the matched
+    row's id is a hit, so it is not embedded again.
     """
     provider = _SpyProvider()
     store = await _embedding_store(db, provider)
@@ -1169,8 +1168,8 @@ def test_require_embedding_docstring_does_not_overclaim_top_level_durability() -
     # behaviour is instead asserted directly by
     # ``test_require_embedding_flag_flips_durability_through_a_typed_except``
     # and ``test_nested_update_rollback_can_leave_a_stale_embedding`` below.
-    # This assertion only guards a specific absolute this file has already
-    # gotten wrong once, so a regression back to it is caught immediately.
+    # This assertion only checks that one absolute phrase is absent from the
+    # section.
     assert "it never decides whether the thought row survives" not in section
 
 
@@ -1409,7 +1408,7 @@ async def test_update_reembed_failure_raises_typed_under_strict(
 
 
 # ---------------------------------------------------------------------------
-# Additive / no-regression: existing behaviour unchanged
+# Additive: existing behaviour unchanged
 # ---------------------------------------------------------------------------
 
 

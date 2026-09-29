@@ -13,7 +13,7 @@ Covers:
 - search_reflections_only returns only REFLECTION thoughts
 
 Cognitive-boundary guard tests for the keyword extractor live in
-``tests/test_dreaming_keyphrases.py`` since the helper now lives in
+``tests/test_dreaming_keyphrases.py`` since the helper lives in
 the ``dreaming_keyphrases`` sibling module.
 """
 
@@ -65,9 +65,8 @@ def _make(
 ) -> ThoughtRecord:
     """Minimal thought for clustering tests.
 
-    ``valid_from`` / ``valid_until`` default to ``None`` (open bounds) so
-    existing callers keep their old behaviour; the REFLECTION
-    valid-time-inheritance tests pass explicit ISO-8601 bounds.
+    ``valid_from`` / ``valid_until`` default to ``None`` (open bounds); the
+    REFLECTION valid-time-inheritance tests pass explicit ISO-8601 bounds.
     """
     return ThoughtRecord(
         thought_id=thought_id,
@@ -346,9 +345,9 @@ class TestColdStartFallback:
     async def test_lpa_empty_graph_falls_back_when_enabled(self, store: SqliteEngravaCore) -> None:
         """flag ON + no edges + similar OBSERVATIONs → cold-start clusters.
 
-        This is the core regression: on the pre-change code the LPA path
-        bails to ``[]`` because adjacency is empty, so no cluster forms even
-        though eligible OBSERVATIONs exist. With the fallback it clusters.
+        With the flag off, the LPA path returns ``[]`` when adjacency is
+        empty, so no cluster forms even though eligible OBSERVATIONs exist.
+        With the fallback enabled they cluster.
         """
         await _seed_similar_observations(store, count=3, prefix="t-cold")
 
@@ -549,7 +548,7 @@ class TestCreateReflections:
 class TestReflectionEmbeddingFailureRecovery:
     """A transient embedding failure must not permanently strand a REFLECTION.
 
-    Regression coverage: a REFLECTION's own auto-embed can fail (provider
+    A REFLECTION's own auto-embed can fail (provider
     timeout, rate limit, ...) after ``create_thought`` has already inserted
     its row inside the consolidation pass's ``suspend_auto_commit()``
     window. The failed attempt must leave nothing durable behind, so the
@@ -597,9 +596,9 @@ class TestReflectionEmbeddingFailureRecovery:
             cluster = frozenset([t1.thought_id, t2.thought_id])
             ext = DreamingExtension(config=_reflection_cfg())
 
-            # RED behaviour this guards against: the reflection's own embed
-            # fails, yet an ACTIVE, centroid-less, edge-less REFLECTION used
-            # to survive the pass and permanently block a retry.
+            # The reflection's own embed fails: the assertion below checks
+            # that no REFLECTION is left behind, since a stranded one would
+            # permanently block a retry.
             health.healthy = False
             count_failed = await ext._create_reflections(
                 store,

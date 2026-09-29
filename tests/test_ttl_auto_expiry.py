@@ -461,13 +461,12 @@ class TestCleanupArchive:
 class TestCleanupArchiveWroteAnythingDiscrimination:
     """The ARCHIVE branch's ``wrote_anything`` must reflect what the UPDATE actually did.
 
-    Before this fix, the ARCHIVE branch set ``wrote_anything = True``
-    unconditionally right after issuing the archive ``UPDATE``, never
-    checking whether that statement changed anything at all. A ``BEFORE
-    UPDATE`` trigger that vetoes the archive with ``RAISE(IGNORE)`` exposes
-    the difference: a plain veto that writes nothing of its own must not
-    commit a caller's own pending transaction, while a trigger that writes
-    something of its own before vetoing must still have that write survive.
+    The ARCHIVE branch derives ``wrote_anything`` from ``total_changes``, not
+    from the archive ``UPDATE`` having been issued. A ``BEFORE UPDATE``
+    trigger that vetoes the archive with ``RAISE(IGNORE)`` exposes the
+    difference: a plain veto that writes nothing of its own must not commit a
+    caller's own pending transaction, while a trigger that writes something
+    of its own before vetoing must still have that write survive.
 
     Self-contained (a file-backed database, not this module's ``:memory:``
     fixtures) because the durability test needs a second connection.
@@ -561,15 +560,12 @@ class TestCleanupArchiveWroteAnythingDiscrimination:
     async def test_journal_entry_for_a_vetoed_archive_is_durable(self, tmp_path: Path) -> None:
         """A vetoed archive's own journal insert must not be discarded either.
 
-        ``wrote_anything`` used to be sampled right after the archive
-        ``UPDATE`` -- before the journal append below it ran. A ``BEFORE
-        UPDATE`` veto leaves that per-UPDATE delta at zero, but
-        ``JournalWriter.append`` still inserts a real ``UPDATE_THOUGHT`` row
-        regardless of whether the archive itself took effect, and the
-        batch's own closing rollback (gated on that too-early ``False``)
-        then discarded it. The comparison must be taken after everything
-        this iteration could write, the journal insert included, not just
-        after the UPDATE.
+        ``wrote_anything`` is sampled after the journal append, not right
+        after the archive ``UPDATE``. A ``BEFORE UPDATE`` veto leaves the
+        per-UPDATE delta at zero, but ``JournalWriter.append`` still inserts a
+        real ``UPDATE_THOUGHT`` row regardless of whether the archive itself
+        took effect, and that row must be committed rather than discarded by
+        the batch's closing rollback.
         """
         db, db_path = await self._open(tmp_path, "archive-veto-journal-durable.sqlite")
         try:

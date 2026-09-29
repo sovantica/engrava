@@ -340,9 +340,7 @@ class TestOffOnPair:
 # producer byte-identical, and the producer stays inert unless the seam is enabled.
 # Later extended with VectorDimensionMismatchError, the typed error the vector-arm
 # no-silent-degradation guard raises when a search_similar query vector's length
-# differs from the store's embedding dimension (previously an opaque numpy error or
-# a silent empty result) — an additive public-API addition raised only on a
-# malformed query vector, never on any well-formed vector-search path.
+# differs from the store's embedding dimension — an additive public-API addition.
 # Later extended with EngravaReadProtocol, the runtime-checkable read (non-mutating)
 # half of EngravaCoreProtocol — extracted so the write-blocking ReadOnlyEngrava view
 # declares and is type-checked against exactly the capabilities it forwards. An
@@ -350,9 +348,8 @@ class TestOffOnPair:
 # and every full store satisfies it by construction, so no existing consumer changes.
 # Later extended with EmbeddingProviderContractError, raised when a configured
 # embedding provider omits a required EmbeddingProviderProtocol member (today:
-# a public ``dimension``). The protocol has always required it; the error only
-# replaces the bare AttributeError the core previously raised from internals, so
-# it is additive and unreachable for any conformant provider.
+# a public ``dimension``). The protocol has always required it, so the error is
+# additive and unreachable for any conformant provider.
 # Later extended with WriteContentionError, raised when the content-hash dedup
 # probe-and-insert window (create_thought(deduplicate=True), get_or_create,
 # upsert_by_hash) cannot acquire its cross-connection BEGIN IMMEDIATE write lock

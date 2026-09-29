@@ -4,8 +4,7 @@ The stored timestamp columns hold one canonical UTC form. A timestamp that
 arrives through a public parameter, or inside a snapshot being restored, is
 compared with those columns as TEXT or written into them, so it has to be put in
 the same form first -- otherwise a space separator, basic format, a week date or
-an offset makes the comparison or the stored value wrong in exactly the way the
-stored columns used to be.
+an offset makes the comparison or the stored value wrong.
 
 Covered here, one per entry point:
 

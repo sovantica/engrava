@@ -2,9 +2,7 @@
 
 ``docs/upgrade.md`` tells operators that a patch upgrade never changes the
 core schema, so they can decide whether an upgrade is safe to roll purely
-from its version number. Nothing enforced that until this script: a release
-that moved the schema and was tagged as a patch would previously pass every
-other gate in this pipeline.
+from its version number.
 
 Two independent stamps carry the schema version, and this gate reads both
 rather than trusting either alone:
@@ -19,7 +17,7 @@ rather than trusting either alone:
 fresh bootstrap on whatever commit is checked out; it does not compare
 across a release boundary. A gate that read only the constant (or only the
 SQL stamp) here would be one refactor away from measuring nothing if the two
-ever drifted apart again — so either stamp moving between the last released
+ever drifted apart — so either stamp moving between the last released
 tag and the candidate release counts as the schema having moved, and the two
 stamps disagreeing at the candidate release is itself a hard failure.
 

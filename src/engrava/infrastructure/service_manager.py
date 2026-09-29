@@ -449,15 +449,11 @@ class EngravaManager:
         ``RuntimeError: dictionary changed size during iteration``.
 
         A cancellation while closing one store must not abandon the rest:
-        ``store.close()`` completes the real, physical close before it
-        re-raises a ``CancelledError`` from an in-flight cancellation (see
-        its own docstring), so catching that here and continuing to the
-        next store never skips a close that hasn't actually happened yet
-        -- it only avoids abandoning every store *after* the one that was
-        in flight when the cancellation landed. The cancellation itself is
-        never swallowed: it is re-raised once every store has had its
-        close attempt, not discarded and not left to interrupt the loop
-        early.
+        ``store.close()`` waits for its physical close, up to its own bound,
+        before it re-raises a ``CancelledError`` from an in-flight
+        cancellation (see its own docstring). The loop catches a
+        ``CancelledError`` from ``store.close()``, keeps the last one it
+        caught, and raises it after the loop.
 
         A cancellation while this method waits on a creation from its
         snapshot is handled the same way. It keeps waiting until that
@@ -806,9 +802,9 @@ class EngravaManager:
         This runs while the exception that stopped the publication is
         already propagating, and that exception is the one to report. An
         ordinary failure of this close is therefore logged, not raised in its
-        place. A further cancellation does not cut the attempt short:
-        ``store.close()`` completes the physical close before it re-raises
-        one (see its docstring).
+        place. A further cancellation does not cancel the physical close:
+        ``store.close()`` waits for it, up to its own bound, before it
+        re-raises the cancellation (see its docstring).
 
         Args:
             name: The service the store was built for.

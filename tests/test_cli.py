@@ -396,9 +396,9 @@ def journalled_db_with_edge(tmp_path: Path) -> Path:
     """Two journalled thoughts (``t-old-0``, ``t-old-1``) joined by a journalled edge.
 
     Distinct from ``journalled_db``, which has no edges. Backs the
-    cascade-collision known-defect test: ``edge`` carries an ``ON DELETE
-    CASCADE`` foreign key to ``thought`` on both endpoints, so replacing
-    ``t-old-0`` also removes this edge.
+    cascade-collision test: ``edge`` carries an ``ON DELETE CASCADE`` foreign
+    key to ``thought`` on both endpoints, so replacing ``t-old-0`` would also
+    remove this edge.
     """
     db_path = tmp_path / "journalled_with_edge.db"
     _write_journalled_thought_pair_with_edge(db_path)
@@ -409,9 +409,10 @@ def journalled_db_with_edge(tmp_path: Path) -> Path:
 def plain_thoughts_db(tmp_path: Path) -> Path:
     """Two plain thoughts (``p-0``, ``p-1``), no journal, no edges, no embeddings.
 
-    Backs the "already damaged by an older build" acceptance case: unlike
-    ``populated_db``, nothing here cascades when ``_corrupt_fts_with_raw_replace``
-    forces a raw primary-key collision on one of these thoughts.
+    Backs the cases where the store already carries a stale ``thought_fts``
+    entry before the restore runs: unlike ``populated_db``, nothing here
+    cascades when ``_corrupt_fts_with_raw_replace`` forces a raw primary-key
+    collision on one of these thoughts.
     """
     db_path = tmp_path / "plain.db"
     _write_plain_thoughts(db_path, ["p-0", "p-1"])
@@ -726,9 +727,9 @@ def identical_snapshot_of_journalled_db(
 
     Restoring this into ``journalled_db`` collides every thought on its own
     unchanged primary key and content. Used to show that even an identical
-    merge is refused: with the old ``INSERT OR REPLACE`` behavior this
-    silently changed every row's ``rowid`` (SQLite resolves the primary-key
-    conflict by deleting then re-inserting, even when column values match).
+    merge is refused: an ``INSERT OR REPLACE`` would silently change every
+    row's ``rowid`` (SQLite resolves the primary-key conflict by deleting
+    then re-inserting, even when column values match).
     """
     snap = tmp_path / "identical-snapshot.jsonl"
     result = runner.invoke(cli, ["--db", str(journalled_db), "snapshot", "-o", str(snap)])
@@ -742,8 +743,7 @@ def _thought_rowids(db_path: Path) -> dict[str, int]:
     An ``INSERT OR REPLACE`` that resolves a primary-key collision by
     deleting and re-inserting changes a row's ``rowid`` even when every
     column value is unchanged -- a plain ``SELECT thought_id, essence, ...``
-    comparison would never see that, which is exactly the first fatal finding
-    against the abandoned detection-based branch this gate replaces.
+    comparison would never see that.
     """
     conn = sqlite3.connect(db_path)
     try:
@@ -762,8 +762,7 @@ def _thought_fts_match_count(db_path: Path, term: str) -> int:
     bare, unfiltered ``COUNT(*)`` over an external-content table is satisfied
     by reading through to the row count of the backing ``thought`` table
     itself. It reports the number of thoughts, by construction, no matter how
-    desynchronised the FTS shadow tables actually are -- it cannot observe
-    this defect at all.
+    desynchronised the FTS shadow tables actually are.
 
     A ``MATCH`` query, by contrast, scans the real inverted index and returns
     one hit per indexed entry, including a stale entry whose rowid no longer
@@ -963,7 +962,7 @@ def _full_thought_table_snapshot(db_path: Path) -> list[tuple[object, ...]]:
 
 
 def _assert_recall_never_returns_a_mismatch(runner: CliRunner, db_path: Path, term: str) -> None:
-    """Assert ``recall(term)`` never returns a thought whose live content lacks ``term``.
+    """Assert every thought this ``recall(term)`` call returns contains ``term``.
 
     Checked against each returned thought's *live* essence and content read directly from
     the database -- not just ``recall --json``'s own payload, which surfaces
@@ -1191,8 +1190,8 @@ class TestInfo:
         A fresh ``populated_db`` is stamped at ``CORE_SCHEMA_HEAD_VERSION`` by
         ``ensure_schema()``, while the metrics snapshot's own shape version
         (``EngravaMetrics.schema_version``) is a separate, much smaller
-        number — asserting they differ here is not incidental, it is the
-        defect this label used to hide.
+        number — asserting they differ here is not incidental: equal values
+        would not show which label names which.
         """
         result = runner.invoke(cli, ["--db", str(populated_db), "info"])
         assert result.exit_code == 0
@@ -1707,11 +1706,11 @@ async def _export_with_commit_interleaved_before_edge_scan(populated_db: Path, o
         )
     finally:
         await export_conn.close()
-    # `_export_db_to_jsonl` no longer publishes on its own -- it hands back
+    # `_export_db_to_jsonl` does not publish on its own -- it hands back
     # the fully-written temporary file for the caller to publish once its
-    # own connection handling is done, which is exactly what just happened
-    # above (`export_conn.close()`). This test reads `out` afterward, so it
-    # has to publish here the same way `snapshot` itself now does.
+    # own connection handling is done (`export_conn.close()` above). This
+    # test reads `out` afterward, so it publishes here the same way
+    # `snapshot` itself does.
     cli_main._publish_atomic_replacement(tmp_path, real_out)
 
 
@@ -1790,8 +1789,9 @@ class TestSnapshotObservesOneConsistentState:
 class TestSnapshotAtomicReplace:
     """``snapshot`` must never destroy a good file at `-o` on a failed write.
 
-    `_export_db_to_jsonl` used to open `-o` with `open("w")`,
-    truncating it before a single byte of the new snapshot existed. These
+    `snapshot` writes the new snapshot to a same-directory temporary file and
+    publishes it onto `-o` only after the connection handling has finished,
+    so `-o` is never truncated before the new snapshot exists. These
     tests show an existing target survives byte-identical whenever the
     write, the read-transaction close, or the publish itself fails; that a
     successful run still publishes the full snapshot; and that `-o` cannot
@@ -1997,7 +1997,7 @@ class TestSnapshotAtomicReplace:
         `CancelledError` immediately, so this function's `except` block
         reads `conn.in_transaction` while it is still `False`: the
         transaction the pending `BEGIN` will eventually open does not exist
-        yet. The fix does not depend on that read reflecting the future --
+        yet. The function does not depend on that read reflecting the future --
         it decides from the state captured *before* `BEGIN` was ever
         attempted, and issues the rollback unconditionally in that case.
         That rollback is itself a queued call on the same
@@ -2415,7 +2415,7 @@ class TestRestore:
 
         ``populated_db`` never enables journaling, so ``journal_entry`` starts
         (and stays) empty. The count printed must say so honestly rather than
-        the CLI staying silent about a table it now also clears.
+        the CLI staying silent about a table ``--clear`` also clears.
         """
         assert _journal_entry_count(populated_db) == 0
         snap = tmp_path / "snap.jsonl"
@@ -2478,13 +2478,9 @@ class TestRestore:
         disjoint from every ID already in ``journalled_db``, so this only
         establishes that ``journal_entry`` survives untouched in that disjoint
         case -- it keeps describing exactly the three pre-existing thoughts and
-        nothing about the merged-in ``t-src``. It does **not** establish that a
-        merge is safe for a *colliding* ID: restore inserts every record with
-        ``INSERT OR REPLACE``, so an incoming ID that matches an existing
-        journalled thought, edge, or action instead replaces (or, through a
-        cascading foreign-key delete, removes) that row while its journal
-        entry is left describing content that is no longer there. See the
-        known-defect tests immediately below for that case.
+        nothing about the merged-in ``t-src``. It says nothing about a
+        *colliding* ID: ``TestRestoreRefusesCollisionAgainstAJournalledStore``
+        below covers that case.
         """
         assert _journal_entry_count(journalled_db) == 3
 
@@ -2850,20 +2846,15 @@ class TestRestore:
 class TestRestoreRefusesCollisionAgainstAJournalledStore:
     """A merge restore (no ``--clear``) refuses a collision once the target is journalled.
 
-    Formerly ``TestRestoreWithoutClearKnownJournalCollisionDefects``: these
-    same two scenarios used to pin the KNOWN DEFECT that ``INSERT OR REPLACE``
-    silently replaced (or cascade-deleted) a journalled row, leaving its
-    journal entry describing content that was no longer there while ``verify``
-    kept reporting the chain valid. The journalled-merge collision gate in
-    ``_import_records_to_db`` (``cli/main.py``) closes that gap: once the
-    target's ``journal_entry`` table is non-empty, every incoming record is
-    written with a plain ``INSERT`` instead, so SQLite itself refuses the
-    collision. Nothing here still passes with the old ``INSERT OR REPLACE``
-    behavior -- these tests must now show the refusal and an entirely
-    untouched database, which is also the atomicity guarantee: the existing
-    ``finally: await conn.rollback()`` in ``_import_records_to_db`` discards
-    the whole transaction, including any record inserted before the one that
-    collided.
+    When the target's ``journal_entry`` table is non-empty and
+    ``--orphan-journal-entries`` is not given, the journalled-merge collision
+    gate in ``_import_records_to_db`` (``cli/main.py``) inserts incoming
+    records with a plain ``INSERT`` instead of ``INSERT OR REPLACE``, so
+    SQLite itself refuses the collision rather than replacing (or
+    cascade-deleting) a journalled row. These tests show the refusal and an
+    entirely untouched database, which is also the atomicity guarantee: the
+    rollback in ``_import_records_to_db`` discards the whole transaction,
+    including any record inserted before the one that collided.
     """
 
     def test_colliding_thought_id_is_refused_content_and_journal_untouched(
@@ -2925,13 +2916,13 @@ class TestRestoreRefusesCollisionAgainstAJournalledStore:
         """A colliding thought ID is refused before its cascading edge delete can fire.
 
         ``edge`` carries an ``ON DELETE CASCADE`` foreign key to ``thought`` on
-        both endpoints (schema_core.sql). Under the old ``INSERT OR REPLACE``
-        behavior, resolving the primary-key collision on ``t-old-0`` deleted
-        the pre-existing row first, and with ``PRAGMA foreign_keys = ON``
-        (always on for restore, see ``_open_db``) that cascaded onto
-        ``edge-001``. A plain ``INSERT`` has no delete half, so that cascade
-        path is now unreachable rather than merely mitigated: it never gets
-        the chance to fire.
+        both endpoints (schema_core.sql). An ``INSERT OR REPLACE`` resolving
+        the primary-key collision on ``t-old-0`` would delete the pre-existing
+        row first, and with ``PRAGMA foreign_keys = ON`` (always on for
+        restore, see ``_open_db``) that would cascade onto ``edge-001``. A
+        plain ``INSERT`` has no delete half, so that cascade path is
+        unreachable rather than merely mitigated: it never gets the chance to
+        fire.
         """
         assert _journal_entry_count(journalled_db_with_edge) == 3  # 2 thoughts + 1 edge
 
@@ -3056,13 +3047,12 @@ class TestJournalledMergeCollisionGate:
         """Restoring a store's own snapshot back into itself is refused.
 
         Every value in the incoming record matches what is already stored --
-        only the primary key collides. Under the old ``INSERT OR REPLACE``
-        behavior SQLite still resolves that collision by deleting and
-        re-inserting the row, which silently changes its ``rowid`` (and, with
-        it, desynchronises anything keyed on ``rowid``, such as the
-        ``thought_fts`` external-content index or a persisted sqlite-vec
-        table) even though no column value differs. A plain ``INSERT`` never
-        reaches that delete-and-recreate at all.
+        only the primary key collides. An ``INSERT OR REPLACE`` would still
+        resolve that collision by deleting and re-inserting the row, which
+        silently changes its ``rowid`` (and, with it, desynchronises anything
+        keyed on ``rowid``, such as the ``thought_fts`` external-content index
+        or a persisted sqlite-vec table) even though no column value differs.
+        A plain ``INSERT`` never reaches that delete-and-recreate at all.
         """
         before_rowids = _thought_rowids(journalled_db)
         # "content" matches every journalled thought's own content column
@@ -3097,11 +3087,9 @@ class TestJournalledMergeCollisionGate:
 
         The gate only asks whether ``journal_entry`` has rows; it never reads
         ``mutation_type``. A detector that instead tried to interpret the
-        journal's content could be bypassed by a value it did not recognise --
-        the second fatal finding against the abandoned branch this gate
-        replaces -- and this is unreachable here for the same reason the first
-        finding is: nothing about this record's insert depends on what
-        ``mutation_type`` says.
+        journal's content could be bypassed by a value it did not recognise;
+        that cannot happen here, because nothing about this record's insert
+        depends on what ``mutation_type`` says.
         """
         assert _journal_entry_count(custom_mutation_db) == 1
         conn = sqlite3.connect(custom_mutation_db)
@@ -3226,10 +3214,10 @@ class TestJournalledMergeCollisionGate:
         journalled_db: Path,
         colliding_snapshot: Path,
     ) -> None:
-        """``--orphan-journal-entries`` restores the original merge behavior on request.
+        """``--orphan-journal-entries`` restores the unconditional ``INSERT OR REPLACE`` merge.
 
         The same collision ``TestRestoreRefusesCollisionAgainstAJournalledStore``
-        shows refused now succeeds and replaces once the override is passed,
+        shows refused succeeds and replaces once the override is passed,
         which is the flag's entire purpose: a caller who has weighed the gap
         and wants the merge anyway.
         """
@@ -3279,14 +3267,12 @@ class TestJournalledMergeCollisionGate:
         regardless of whether the journalled-merge collision gate is active
         for this restore.
 
-        It no longer escapes the CLI *uncaught*, though: ``_run_command``
-        (see ``engrava.cli.main``) now converts it, the same as any other
-        unclassified database failure, into exit ``1`` with a message naming
-        the resolved database and the exception's own type and text -- not a
-        raw traceback that never says which store hit the violation. That
-        conversion is exactly why ``sqlite3.IntegrityError`` /
-        ``sqlite_errorcode`` are no longer observable through
-        ``result.exception`` or ``result.output``: the printed text is
+        It does not escape the CLI *uncaught*, though: ``_run_command``
+        (see ``engrava.cli.main``) converts it into exit ``1`` with a
+        message naming the resolved database and the exception's own type
+        and text -- not a raw traceback. That conversion is exactly why
+        ``sqlite3.IntegrityError`` / ``sqlite_errorcode`` are not observable
+        through ``result.exception`` or ``result.output``: the printed text is
         ``"restore: <path>: unexpected IntegrityError: FOREIGN KEY
         constraint failed"``, and nowhere in it -- not in the command name,
         not in the path, not in the exception's own text -- does SQLite's
@@ -3350,12 +3336,11 @@ class TestJournalledMergeCollisionGate:
     ) -> None:
         """A refused collision leaves ``in_transaction`` false on the caller's own open connection.
 
-        Every other test in this module drives restore through the CLI,
-        which always closes its connection afterward -- closing an
-        ``aiosqlite`` connection implicitly rolls back any open transaction,
-        so those tests cannot tell an explicit ``await conn.rollback()`` in
-        ``_import_records_to_db``'s ``finally`` block apart from one that was
-        silently removed. This calls ``_import_records_to_db`` directly on a
+        A restore run through the CLI closes its connection afterward, and
+        closing an ``aiosqlite`` connection implicitly rolls back an open
+        transaction, so such a run does not show whether an explicit
+        rollback in ``_import_records_to_db``'s error path was silently
+        removed. This calls ``_import_records_to_db`` directly on a
         connection it keeps open across the call, so only the explicit
         rollback -- not connection teardown -- can account for the result.
         """
@@ -3556,8 +3541,8 @@ class TestRestoreRebuildsFtsIndex:
         journalled-merge collision gate (see
         ``test_identical_restore_is_refused_and_rowids_never_move``), which is
         exactly why the gate closes this class of damage for the common case
-        -- this test covers the caller who explicitly opts back into the old
-        merge behaviour and still must not get a stale index out of it.
+        -- this test covers the caller who explicitly passes
+        ``--orphan-journal-entries`` and still must not get a stale index out of it.
         """
         assert _journal_entry_count(journalled_db) == 3
         assert _thought_fts_match_count(journalled_db, "content") == 3
@@ -4190,9 +4175,9 @@ async def _read_with_commit_interleaved_before_edge_scan(
 class TestExportObservesOneConsistentState:
     """``export`` must not read the thought and edge tables as two independent scans.
 
-    ``export_cmd`` used to run ``SELECT * FROM thought`` and
-    ``SELECT * FROM edge`` with nothing enclosing them, so each was its own
-    implicit read. A writer that commits a new thought and its edge, and
+    ``export_cmd`` runs ``SELECT * FROM thought`` and ``SELECT * FROM edge``
+    inside one explicit read transaction. Without one, each scan would be its
+    own implicit read: a writer that commits a new thought and its edge, and
     deletes an existing edge, between the two scans could leave the export
     holding an edge referencing a thought it never scanned, while also
     missing an edge that existed at the moment export started. This does not
@@ -4412,12 +4397,12 @@ class TestExport:
 class TestExportAtomicReplace:
     """``export`` must never destroy a good file at `-o` on a failed write.
 
-    `export_cmd` used to write `-o` with `Path.write_text`,
-    truncating it before a single byte of the new export existed. Same
-    shape of tests as `TestSnapshotAtomicReplace`, but `export`'s "closes or
-    completes its reads" boundary is its database connection's own close
-    (via `_opened_db`), not a `commit()` -- `export` has no read
-    transaction of its own to close.
+    `export_cmd` writes the new export to a same-directory temporary file and
+    publishes it onto `-o` only at the end, so `-o` is never truncated before
+    the new export exists. Same shape of tests as `TestSnapshotAtomicReplace`,
+    but `export`'s "closes or completes its reads" boundary is its database
+    connection's own close (via `_opened_db`), not a `commit()` -- its read
+    transaction is already committed before the file is written.
     """
 
     def test_write_failure_leaves_existing_target_untouched(
@@ -4688,7 +4673,7 @@ class TestExportAtomicReplace:
 # ------------------------------------------------------------------
 #
 # ``sqlite3.DatabaseError: file is not a database`` raised from the first
-# ``PRAGMA`` against a corrupt/truncated file used to leave the aiosqlite
+# ``PRAGMA`` against a corrupt/truncated file must not leave the aiosqlite
 # connection open. aiosqlite's connection worker thread is not a daemon and
 # stops only when ``Connection.close()`` sends it the shutdown sentinel, so a
 # leaked connection blocks ``threading._shutdown`` and the process never
@@ -4701,7 +4686,7 @@ class TestExportAtomicReplace:
 # tests promptly instead of wedging the whole suite.
 
 # Long enough that a fixed, promptly-erroring command never gets close on a
-# loaded CI host; far short of "wedge the test worker" if the fix regresses.
+# loaded CI host; far short of "wedge the test worker" if a command hangs.
 _CLI_SUBPROCESS_TIMEOUT_S = 20.0
 
 # A command that returns fast enough for a live process to still be a
@@ -4816,9 +4801,8 @@ def _assert_succeeds(args: list[str]) -> None:
 def corrupt_db(tmp_path: Path) -> Path:
     """A file named like a database that is not one — text, truncated, whatever.
 
-    Reproduces the reported shape: a plain text file where a SQLite database
-    is expected, which opens fine (the file exists) but fails the first real
-    read against it.
+    A plain text file where a SQLite database is expected, which opens fine
+    (the file exists) but fails the first real read against it.
     """
     path = tmp_path / "corrupt.sqlite"
     path.write_text("this is not a sqlite database, just some text\n", encoding="utf-8")
@@ -4837,18 +4821,15 @@ def valid_snapshot(runner: CliRunner, populated_db: Path, tmp_path: Path) -> Pat
 class TestCorruptDatabaseExitsInsteadOfHanging:
     """Every built-in command that opens the database file must fail fast.
 
-    One test per affected command, each with the known-good control the
-    acceptance criteria require: the same command against ``populated_db``
-    (or an equivalent valid target) still works. Covers all eight built-in
-    commands found to route through a connection-opening call in
-    ``cli/main.py`` — the originally reported four (``info``, ``gc``,
-    ``migrate``, ``snapshot``) plus ``verify``, ``query``, ``export``, and
-    the single-database branch of ``restore``, which shared the exact same
-    unclosed-connection mechanism. The two commands that only ever go
-    through :class:`~engrava.infrastructure.service_manager.EngravaManager`
-    (the ``--service`` branch of ``snapshot``/``restore``) are not covered
-    here — that path already closes on its own error, independently of this
-    fix.
+    One test per affected command, each with a known-good control: the same
+    command against ``populated_db`` (or an equivalent valid target) still
+    works. Covers eight built-in commands that route through a
+    connection-opening call in ``cli/main.py``: ``info``, ``gc``,
+    ``migrate``, ``snapshot``, ``verify``, ``query``, ``export``, and the
+    single-database branch of ``restore``. The ``--service`` branch of
+    ``snapshot``/``restore``, which only ever goes through
+    :class:`~engrava.infrastructure.service_manager.EngravaManager`, is not
+    covered here — that path closes on its own error.
     """
 
     def test_info(self, corrupt_db: Path, populated_db: Path) -> None:
@@ -4937,13 +4918,13 @@ class TestRestoreBootstrapWindowClosesOnFailure:
 
     ``restore`` against a target that does not pre-exist calls
     ``store = SqliteEngravaCore(conn)`` and then ``await
-    store.ensure_schema()`` to bootstrap it. Before ``_opened_db`` wrapped
-    the whole body in one step, both of those ran ahead of the ``try`` that
-    was supposed to guarantee the close, so a failure there leaked the
+    store.ensure_schema()`` to bootstrap it. ``_opened_db`` wraps the whole
+    body in one step, so neither of those can run ahead of the ``try`` that
+    guarantees the close: a failure there would otherwise leak the
     connection exactly like the corrupt-file case -- just through a
     different call, with a target file that is itself perfectly valid. The
     ``corrupt_db`` tests above are blind to this: they all fail inside
-    ``_open_db``, which was already closing correctly before this fix.
+    ``_open_db``, which closes the connection on its own error.
     """
 
     def test_restore_bootstrap_failure_is_not_a_hang(self, tmp_path: Path) -> None:
@@ -4997,14 +4978,13 @@ cli()
 class TestSuccessPathCloseFailureIsNotSwallowed:
     """A close() failure on an otherwise-successful command must surface.
 
-    ``_opened_db``'s cleanup used to be an unconditional
-    ``finally: await _close_quietly(conn)`` -- including on the success
-    path, where a close failure is not secondary to anything, it is the
-    only error there is. ``_close_quietly`` logs and swallows by design
-    (correct for the exception-in-flight case), so the unconditional call
-    turned a genuine close failure into a command that printed its normal
-    success output and exited 0 -- a worse outcome than the original hang,
-    which was at least visible.
+    ``_opened_db`` routes the close through ``_close_quietly`` only when the
+    command body raised. On the success path a close failure is not
+    secondary to anything, it is the only error there is, so it propagates.
+    ``_close_quietly`` logs and swallows by design (correct for the
+    exception-in-flight case), so an unconditional
+    ``finally: await _close_quietly(conn)`` would turn a genuine close
+    failure into a command that prints its normal success output and exits 0.
     """
 
     def test_close_failure_after_a_successful_command_is_not_silent(
@@ -5078,12 +5058,12 @@ class _SynchronouslyFailingConnection:
 
 
 class TestCliCloseQuietlyCancellation:
-    """The CLI's own ``_close_quietly`` copy needs the same cancellation fix.
+    """The CLI's own ``_close_quietly`` copy needs the same cancellation handling.
 
     This module defines its own ``_close_quietly`` rather than importing the
     infrastructure layer's (see that function's docstring), so the
-    escaped-``BaseException`` gap in ``await conn.close()`` had to be fixed
-    here independently too. These mirror
+    escaped-``BaseException`` gap in ``await conn.close()`` is closed here
+    independently too. These mirror
     ``TestCloseQuietlyCancellation`` in ``tests/test_service_isolation.py``,
     which covers the infrastructure copy.
     """
@@ -5189,21 +5169,17 @@ class _SystemExitOnCloseStrConnection:
 
 
 class TestCliCloseQuietlyDisclosesWhyNotJustWhere:
-    """The bare/default store tier's ``_close_quietly`` was still passing
-    ``exc_info=True`` after the ``--config`` tier's own cleanup log
-    (``memory_commands._opened_full_store``) had already been fixed to stop doing
-    that. ``exc_info=True`` asks the standard library's traceback formatter to
-    render the close exception a second, unguarded way -- and, separately, an
-    earlier fix at the ``--config`` tier had *also* removed the only place a
-    close failure's own diagnosis reached the log at all, trading the
-    ``exc_info=True`` defect for a real regression: frame metadata says
-    *where* closing failed, never *why*, so an ordinary ``PermissionError``,
-    a full disk, or a locked file all looked identical. ``_close_quietly``
-    now calls :func:`~engrava.cli.exception_reporting._describe_exception`
-    once on the close exception -- the same single, guarded, non-absorbing
-    attempt the boundary already made for the original exception -- and logs
-    its result alongside the existing frame-only stack, never
-    ``exc_info=True``.
+    """The bare/default store tier's ``_close_quietly`` never passes ``exc_info=True``.
+
+    ``exc_info=True`` asks the standard library's traceback formatter to
+    render the close exception a second, unguarded way -- and frame metadata
+    alone says *where* closing failed, never *why*, so an ordinary
+    ``PermissionError``, a full disk, or a locked file would all look
+    identical. ``_close_quietly`` calls
+    :func:`~engrava.cli.exception_reporting._describe_exception` once on the
+    close exception -- the same single, guarded, non-absorbing attempt the
+    boundary makes for the original exception -- and logs its result
+    alongside the frame-only stack.
     """
 
     async def test_an_ordinary_close_failure_now_logs_why_not_just_where(
@@ -5228,10 +5204,10 @@ class TestCliCloseQuietlyDisclosesWhyNotJustWhere:
     async def test_a_keyboard_interrupt_from_the_close_exceptions_str_is_not_absorbed(
         self,
     ) -> None:
-        """The close exception's own formatting is now read once -- a real
+        """The close exception's own formatting is read once -- a real
         interrupt raised during that read must still escape, not be
         swallowed the way the standard library's own traceback formatter
-        used to swallow it under ``exc_info=True``.
+        swallows it under ``exc_info=True``.
         """
         conn = _KeyboardInterruptOnCloseStrConnection()
 

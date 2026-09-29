@@ -977,17 +977,15 @@ class TestQuotedValueStaysString:
 class TestConditionFullMatch:
     """A WHERE fragment must match an operand grammar in full.
 
-    A prefix match used to silently discard any trailing content after the
-    first ``field op value`` token. On the flat (pure-``AND``) path each
-    fragment is still matched in full. ``OR`` is now a first-class operator, so
-    ``priority = 'P1' OR 1=1`` parses as a boolean tree — but the injected
-    ``1=1`` operand names the non-column ``1``, which the per-table allowlist
-    rejects when the query runs, so the surplus can never quietly change the
-    result set.
+    On the flat (pure-``AND``) path each fragment is matched in full. ``OR`` is a
+    first-class operator, so ``priority = 'P1' OR 1=1`` parses as a boolean tree
+    — but the injected ``1=1`` operand names the non-column ``1``, which the
+    per-table allowlist rejects when the query runs, so the surplus can never
+    quietly change the result set.
     """
 
     def test_trailing_injection_operand_rejected_at_execution(self) -> None:
-        # ``OR 1=1`` is valid grammar now, but ``1`` is not an allowlisted
+        # ``OR 1=1`` is valid grammar, but ``1`` is not an allowlisted
         # column, so execution rejects it rather than widening the result set.
         q = parse("FIND thoughts WHERE priority = 'P1' OR 1=1")
         assert isinstance(q.where, BoolExpr)
@@ -1930,8 +1928,7 @@ class TestParserQuotedValueWhitespacePreserved:
         assert irregular.offset == spaced.offset
 
     def test_extension_args_still_split_on_whitespace(self) -> None:
-        # The extension-command path stays tokenised: this fix only changes
-        # how the FIND/COUNT clause tail is carried, never extension args.
+        # Extension-command args are split on whitespace.
         q = parse("CUSTOM  foo\tbar", known_extensions={"CUSTOM"})
         assert q.extension_args == ["foo", "bar"]
 
@@ -1985,10 +1982,10 @@ class TestExecutorQuotedValueWhitespaceMatchesExactly:
 
         A bare ``count == 1`` cannot tell "matched the target" from "matched
         the decoy" when the fixture holds exactly one of each — both give the
-        same number, so a fix that normalises the literal's whitespace before
-        binding would match the single decoy and still report 1. Seeding two
+        same number, so a match that normalises the literal's whitespace before
+        binding would hit the single decoy and still report 1. Seeding two
         exact-value rows against one decoy makes the two outcomes numerically
-        distinct: the real fix counts both targets (2); a normalising fix
+        distinct: an exact match counts both targets (2); a normalising match
         counts only the decoy (1) and fails the assertion below.
         """
         store = SqliteEngravaCore(db)

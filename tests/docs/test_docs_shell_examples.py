@@ -1,17 +1,10 @@
 """Layer 6 of the documentation-example tests — ``bash`` invocations vs the real CLI.
 
-Most documentation-test layers ask the Markdown extractor for a ``python``
-fenced block; ``test_docs_examples_behavior.py`` additionally reads two
-``text`` blocks (the tutorial's published output, and ``upgrade.md``'s
-published error message) and compares each against real output. None of
-those layers — nor the sibling ``yaml`` layer in
-``test_docs_config_examples.py`` — has ever looked at ``bash``, so a
-fabricated CLI invocation appended to a ``bash`` block — a command that does
-not exist, or a long option that does not exist on the command it is
-attached to — left the whole suite green. This module closes that gap for
-shell examples: every ``engrava ...`` invocation on a ``bash`` block's lines
-is checked, **without executing anything**, against the real ``click``
-command tree the CLI ships.
+The ``engrava ...`` invocations on a ``bash`` block's lines are checked,
+**without executing anything**, against the real ``click`` command tree the
+CLI ships, except in the blocks registered in ``EXEMPT_BASH_BLOCKS``, so a
+command that does not exist, or a long option that does not exist on the
+command it is attached to, fails the suite.
 
 Checked, not executed
 ----------------------
@@ -26,24 +19,12 @@ a single or doubled ``&``), and whether a ``#`` starts a comment (only at
 the start of a word, unquoted). Each token is tagged as an operator or not
 *while quote state is known* -- a quoted value equal to a separator's text
 (a filename literally
-named ``|``) can never be reinterpreted as one later, which a library lexer
-asked to also split on control characters provably cannot guarantee (it
-returns the identical token for a quoted operator and a real one, since
-quoting is consumed and gone by the time a caller sees the token text).
+named ``|``) can never be reinterpreted as one later.
 Escaping, command substitution, subshells, heredocs, and redirection are out
 of scope; see ``_tokenize_shell_line``'s docstring for the exact boundary. An
 unquoted redirection character (``>``, ``<``, and their relatives, including
 the ``&`` inside ``2>&1``) is reported, naming the line, rather than modelled
 or silently ignored.
-
-There is no separate pre-filter deciding which lines are worth tokenising: every
-line is tokenised, and only the real, quote-aware scanner ever decides an
-``engrava`` word starts an invocation. (An earlier version used a regex
-pre-filter to skip that decision cheaply for obviously-irrelevant lines; the
-regex blanked quoted regions to guess at word boundaries, which split a
-single env-assignment token in two and silently hid a real invocation on the
-next line. Deleting it, not patching it, is the fix: the real scanner already
-makes every such decision correctly.)
 
 The resulting token stream is walked left to right for ``engrava`` invocations: a
 fresh segment begins at the start of the line and immediately after any
@@ -66,9 +47,7 @@ operator is left for the walk to find as a boundary instead.
 
 A line whose tokenising fails (an unterminated quote) is unconditionally a
 violation, named by the line it occurs on -- there is no second, cruder
-model deciding which failures are "worth" reporting; that shape is exactly
-what the deleted pre-filter was, from a different seat, and it erased a
-malformed invocation the same way. A bash block in this documentation that
+model deciding which failures are "worth" reporting. A bash block in this documentation that
 cannot be tokenised is either wrong or belongs in ``EXEMPT_BASH_BLOCKS`` with
 a reason. Each logical line is tokenised independently, so a quote a real
 shell would let span multiple physical lines on a bare newline (as opposed
@@ -127,8 +106,7 @@ from tests.docs._md_blocks import (
 _PROMPT_RE = re.compile(r"^\$\s*")
 
 # A whole token that is an env-var assignment, e.g. "ENGRAVA_DB=x.db" --
-# checked against a real token once a line tokenises, and against a plain
-# whitespace-split word in the fallback described below.
+# checked against a real token once a line tokenises.
 _ENV_ASSIGNMENT_TOKEN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
@@ -378,14 +356,10 @@ def _tokenize_shell_line(text: str) -> list[_Token]:  # noqa: C901, PLR0915
     that state for exactly two decisions: whether a character is a real
     (unquoted) operator (``;``, a single or doubled ``|``, a single or
     doubled ``&``), and whether a ``#`` starts a comment (only at the start
-    of a word, i.e. preceded by whitespace or the start of the line, and
-    unquoted). A library-provided lexer cannot make the first decision
-    correctly: asked
-    to also split on control characters, it returns the identical token for
-    a quoted operator character and a real one, since quoting is consumed
-    and gone by the time a caller sees the token text. Tagging each token
-    with whether it *is* an operator, decided while quote state is still
-    known, is what a later ``token.text in {...}`` comparison cannot recover.
+    of a word, i.e. preceded by whitespace, an operator, or the start of the
+    line, and unquoted). Tagging each token with whether it *is* an operator,
+    decided while quote state is still known, is what a later
+    ``token.text in {...}`` comparison cannot recover.
 
     Escaping, command substitution, subshells, and heredocs are out of
     scope; a line needing any of those is not documentation-example shell
@@ -935,10 +909,10 @@ def block_invocation_errors(block: CodeBlock) -> list[InvocationError]:
 
     Every command line (see ``_command_line_candidates``) is tokenised; there
     is no pre-filter deciding which lines are "worth" tokenising, and no
-    fallback deciding which tokenising failures are "worth" reporting --
-    both are exactly the second, cruder model this checker exists to not
-    have. A command whose trailing backslash could not be reconstructed, or
-    that fails to tokenise once reconstructed (e.g. an unterminated quote
+    fallback deciding which tokenising failures are "worth" reporting -- a
+    second, cruder model is exactly what this checker does not have. A
+    command whose trailing backslash could not be reconstructed, or that
+    fails to tokenise once reconstructed (e.g. an unterminated quote
     unrelated to continuation), is unconditionally a violation, named by the
     line it occurs on: a bash block in this documentation that cannot be
     read this way is either wrong or needs registering with a reason in
@@ -1127,7 +1101,7 @@ def _synthetic_block(body: str) -> CodeBlock:
 
 
 def test_checker_accepts_the_option_terminator() -> None:
-    """Regression: click's `--` option terminator is not an unknown option.
+    """Click's `--` option terminator is not an unknown option.
 
     `--` before the command name means "stop parsing global options"; the
     next token is still the command, not something `--` itself must be found
@@ -1138,22 +1112,20 @@ def test_checker_accepts_the_option_terminator() -> None:
 
 
 def test_checker_does_not_attribute_a_piped_commands_flags_to_engrava() -> None:
-    """Regression: a `|` starts a new segment; the piped command's own flags are not engrava's.
+    """A `|` starts a new segment; the piped command's own flags are not engrava's.
 
-    Without segment splitting, `--lines=5` (a flag on `head`, not `info`) was
-    wrongly reported as an unknown option on `info`.
+    `--lines=5` is a flag on `head`, not on `info`, so it is not reported as
+    an unknown option on `info`.
     """
     block = _synthetic_block("engrava --db demo.db info | head --lines=5")
     assert block_invocation_errors(block) == []
 
 
 def test_checker_catches_a_second_invocation_after_a_compound_operator() -> None:
-    """Regression: `a && b` checks `b` too, not just `a`.
+    """`a && b` checks `b` too, not just `a`.
 
-    Without segment splitting, the whole line was checked as one invocation,
-    so `&&`, `engrava`, and `reindex` were silently consumed as unrecognised
-    positional tokens of the first command -- `reindex` never got checked at
-    all. That falsified "every invocation" the module claims to check.
+    `&&` starts a new segment, so the second invocation's `reindex` is
+    checked and reported.
     """
     block = _synthetic_block("engrava --db demo.db info && engrava reindex")
     errors = block_invocation_errors(block)
@@ -1165,8 +1137,7 @@ def test_checker_catches_a_second_invocation_after_a_compound_operator() -> None
 def test_checker_fails_loudly_on_an_engrava_line_that_will_not_tokenise() -> None:
     """A line that plausibly invokes `engrava` but is not valid shell input is a violation.
 
-    Silently skipping it (as an earlier version of this checker did on any
-    `shlex` failure) would let a malformed example evade every check here.
+    Silently skipping it would let a malformed example evade every check here.
     """
     block = _synthetic_block("engrava --db demo.db query 'unterminated")
     errors = block_invocation_errors(block)
@@ -1175,11 +1146,10 @@ def test_checker_fails_loudly_on_an_engrava_line_that_will_not_tokenise() -> Non
 
 
 def test_checker_does_not_treat_a_quoted_separator_as_a_boundary() -> None:
-    """Regression: a quoted value equal to a separator's text hides no command.
+    """A quoted value equal to a separator's text hides no command.
 
-    A blind text/token split on `|` would treat this quoted filename as a
-    boundary, leaving `reindex` -- not a real command -- unchecked as if it
-    were a separate, ignorable segment.
+    The quoted filename `'|'` is `--db`'s value, not a boundary, so `reindex`
+    -- not a real command -- is read as the command name and reported.
     """
     block = _synthetic_block("engrava --db '|' reindex")
     errors = block_invocation_errors(block)
@@ -1189,7 +1159,7 @@ def test_checker_does_not_treat_a_quoted_separator_as_a_boundary() -> None:
 
 
 def test_checker_splits_a_semicolon_with_no_surrounding_whitespace() -> None:
-    """Regression: `;` is a boundary even glued directly to the previous word.
+    """`;` is a boundary even glued directly to the previous word.
 
     A library lexer glues `info;` into one word by default; the quote-state
     scan recognises `;` as its own token regardless of adjacent whitespace.
@@ -1201,13 +1171,13 @@ def test_checker_splits_a_semicolon_with_no_surrounding_whitespace() -> None:
 
 
 def test_checker_does_not_glue_a_command_name_to_a_following_semicolon() -> None:
-    """Regression: `info;` must not become the (invalid) command name `info;`."""
+    """`info;` must not become the (invalid) command name `info;`."""
     block = _synthetic_block("engrava info; engrava info")
     assert block_invocation_errors(block) == []
 
 
 def test_checker_strips_an_env_assignment_after_a_compound_operator() -> None:
-    """Regression: a second segment's own leading env assignment is not part of the command word."""
+    """A second segment's own leading env assignment is not part of the command word."""
     block = _synthetic_block(
         "engrava info && ENGRAVA_DISABLE_EXTENSIONS=1 engrava reindex",
     )
@@ -1217,10 +1187,10 @@ def test_checker_strips_an_env_assignment_after_a_compound_operator() -> None:
 
 
 def test_checker_finds_an_invocation_that_is_not_the_lines_first_word() -> None:
-    """Regression: `engrava` need not be the first word of the line to be checked.
+    """`engrava` need not be the first word of the line to be checked.
 
-    Without per-segment command-word detection, appending this line to a
-    block that already has a valid `engrava` line left the whole block green.
+    The command word is detected per segment, so `reindex` is reported
+    although `engrava` is not the first word of the line.
     """
     block = _synthetic_block("true && engrava reindex")
     errors = block_invocation_errors(block)
@@ -1229,7 +1199,7 @@ def test_checker_finds_an_invocation_that_is_not_the_lines_first_word() -> None:
 
 
 def test_checker_rejects_an_unknown_option_after_help() -> None:
-    """Regression: `--help` does not bypass validation of later options.
+    """`--help` does not bypass validation of later options.
 
     Real click parses the whole line before acting on an eager option like
     `--help`: `engrava --help --nonexistent` exits 2 with `No such option`.
@@ -1241,7 +1211,7 @@ def test_checker_rejects_an_unknown_option_after_help() -> None:
 
 
 def test_checker_rejects_an_unknown_command_option_after_help() -> None:
-    """Regression: same as above, at the command level."""
+    """Same as above, at the command level."""
     tokens = _tokenize_shell_line("engrava info --help --nonexistent")
     error = _check_invocation(tokens)
     assert error is not None
@@ -1249,13 +1219,12 @@ def test_checker_rejects_an_unknown_command_option_after_help() -> None:
 
 
 def test_checker_does_not_let_a_quoted_positional_hide_a_later_option() -> None:
-    """Regression: a quoted positional equal to an operator's text is not a boundary.
+    """A quoted positional equal to an operator's text is not a boundary.
 
-    `query`'s MQL positional argument has no option consuming it by count,
-    so the old design fell through to a plain `tok in _SEGMENT_SEPARATORS`
-    check and stopped there -- `--nonexistent` was never reached. Tagging
-    each token as an operator (or not) at tokenising time, while quote state
-    is known, fixes this regardless of where in the invocation it occurs.
+    `query`'s MQL positional argument has no option consuming it by count.
+    Each token is tagged as an operator (or not) at tokenising time, while
+    quote state is known, so the quoted `'|'` is never taken for a boundary
+    and the `--nonexistent` after it is still reached.
     """
     tokens = _tokenize_shell_line("engrava query '|' --nonexistent")
     error = _check_invocation(tokens)
@@ -1264,7 +1233,7 @@ def test_checker_does_not_let_a_quoted_positional_hide_a_later_option() -> None:
 
 
 def test_checker_recognises_a_bare_ampersand_as_a_separator() -> None:
-    """Regression: `&` (not just `&&`) is a real shell control operator too."""
+    """`&` (not just `&&`) is a real shell control operator too."""
     block = _synthetic_block("engrava info & engrava reindex")
     errors = block_invocation_errors(block)
     assert len(errors) == 1
@@ -1272,11 +1241,10 @@ def test_checker_recognises_a_bare_ampersand_as_a_separator() -> None:
 
 
 def test_checker_never_consumes_a_real_operator_as_an_options_value() -> None:
-    """Regression: `--output ;` must not swallow `;` as `--output`'s value.
+    """`--output ;` must not swallow `;` as `--output`'s value.
 
-    Counting-based value consumption used to advance past the next token
-    unconditionally; a genuine (unquoted) operator token immediately after
-    an option needing a value is never eligible to be that value.
+    A genuine (unquoted) operator token immediately after an option needing
+    a value is never eligible to be that value.
     """
     block = _synthetic_block("engrava export --output ; engrava reindex")
     errors = block_invocation_errors(block)
@@ -1285,7 +1253,7 @@ def test_checker_never_consumes_a_real_operator_as_an_options_value() -> None:
 
 
 def test_checker_does_not_treat_a_mid_word_hash_as_a_comment() -> None:
-    """Regression: `#` only starts a comment at the start of a word."""
+    """`#` only starts a comment at the start of a word."""
     tokens = _tokenize_shell_line("engrava --db demo#tag.db info")
     assert [t.text for t in tokens] == ["engrava", "--db", "demo#tag.db", "info"]
 
@@ -1297,15 +1265,10 @@ def test_checker_still_treats_a_real_comment_as_a_comment() -> None:
 
 
 def test_checker_does_not_lose_an_invocation_to_a_quoted_env_value() -> None:
-    """Regression: a quoted character inside an env-assignment value must not hide the line.
+    """A quoted character inside an env-assignment value must not hide the line.
 
-    A regex pre-filter used to blank quoted regions before deciding whether
-    a line was worth tokenising at all. Blanking `'b'` inside
-    `ENGRAVA_DB=a'b'c` split one token into two ("a" and "c"), so the line no
-    longer looked like an invocation and was skipped -- `reindex` was never
-    checked, on a block whose first line is perfectly checkable. Deleting the
-    pre-filter fixes this: every line now reaches the real, quote-aware
-    scanner.
+    The `ENGRAVA_DB=a'b'c engrava reindex` line reaches the real,
+    quote-aware scanner, so its `reindex` invocation is checked.
     """
     block = _synthetic_block("engrava info\nENGRAVA_DB=a'b'c engrava reindex\n")
     errors = block_invocation_errors(block)
@@ -1333,12 +1296,10 @@ def test_checker_still_fails_a_mid_word_hash_prefixed_argument() -> None:
 
 
 def test_checker_reports_a_malformed_line_even_when_first_word_is_not_engrava() -> None:
-    """Regression: a fallback keyed on the first word erased this line entirely.
+    """A malformed line is reported even when its first word is not `engrava`.
 
-    `_naive_first_word` returned `true` (not `engrava`), so the whole line
-    was silently discarded instead of failing -- the same shape of defect
-    already removed from the pre-filter, doing the same damage from a
-    different place.
+    `true && engrava reindex 'unterminated` starts with `true`, yet the line
+    is reported, not discarded.
     """
     block = _synthetic_block("engrava info\ntrue && engrava reindex 'unterminated\n")
     errors = block_invocation_errors(block)
@@ -1347,12 +1308,10 @@ def test_checker_reports_a_malformed_line_even_when_first_word_is_not_engrava() 
 
 
 def test_checker_reports_a_malformed_line_behind_an_env_assignment() -> None:
-    """Regression: a fallback keyed on the first (assignment-skipped) word still erased this.
+    """A malformed line behind an env assignment with a quoted space is reported.
 
-    `_naive_first_word` skips a leading `VAR=value` word, but the quoted
-    space inside this one (`'demo db'`) meant the *next* naive word was
-    `engrava` -- and the line was still untokenisable, so it should still
-    fail, not silently pass by accident of which word the fallback landed on.
+    `ENGRAVA_DB='demo db' engrava reindex 'unterminated` is untokenisable, so
+    it fails instead of passing.
     """
     block = _synthetic_block("engrava info\nENGRAVA_DB='demo db' engrava reindex 'unterminated\n")
     errors = block_invocation_errors(block)
@@ -1361,7 +1320,7 @@ def test_checker_reports_a_malformed_line_behind_an_env_assignment() -> None:
 
 
 def test_checker_treats_a_dollar_prefixed_line_as_a_command_in_a_transcript() -> None:
-    """Regression: a session transcript's `$ `-prefixed command is checked as an invocation."""
+    """A session transcript's `$ `-prefixed command is checked as an invocation."""
     block = _synthetic_block("$ engrava --db old.db reindex\n")
     errors = block_invocation_errors(block)
     assert len(errors) == 1
@@ -1369,7 +1328,7 @@ def test_checker_treats_a_dollar_prefixed_line_as_a_command_in_a_transcript() ->
 
 
 def test_checker_never_tokenises_a_transcripts_output_line() -> None:
-    """Regression: output in a session transcript is not shell input, ever.
+    """Output in a session transcript is not shell input, ever.
 
     The apostrophe in this line would make it fail to tokenise if treated as
     a command; because the block also has a `$ `-prefixed line, this one is
@@ -1400,12 +1359,11 @@ def test_checker_ignores_non_engrava_commands_in_a_transcript() -> None:
 
 
 def test_checker_does_not_let_transcript_output_swallow_the_next_command() -> None:
-    """Regression: an output line's trailing backslash must never join to the next command.
+    """An output line's trailing backslash must never join to the next command.
 
-    Continuation joining used to run before commands and output were told
-    apart, so a backslash at the end of an output line absorbed the next
-    physical line -- including a fresh `$ `-prefixed command -- making it
-    disappear instead of being checked.
+    Lines are classified as commands or output before continuations are
+    joined, so a backslash at the end of an output line does not absorb the
+    next physical line -- a fresh `$ `-prefixed command is still checked.
     """
     block = _synthetic_block("$ engrava info\noutput \\\n$ engrava reindex\n")
     errors = block_invocation_errors(block)
@@ -1414,7 +1372,7 @@ def test_checker_does_not_let_transcript_output_swallow_the_next_command() -> No
 
 
 def test_checker_does_not_let_a_comment_swallow_the_next_line() -> None:
-    """Regression: a comment line's trailing backslash must never join to the next line.
+    """A comment line's trailing backslash must never join to the next line.
 
     Real bash comments run to end of line regardless of a trailing
     backslash; classifying lines before joining continuations keeps a
@@ -1441,11 +1399,10 @@ def test_checker_still_joins_a_genuine_multi_line_command() -> None:
 
 
 def test_checker_reports_a_redirection_instead_of_mis_splitting_on_it() -> None:
-    """Regression: `2>&1`'s `&` is not a real `&&`-style separator.
+    """`2>&1`'s `&` is not a real `&&`-style separator.
 
-    Treating it as one silently dropped `--nonexistent` from being checked
-    against `info` at all; redirection is out of scope, so it is reported
-    instead.
+    Redirection is out of scope, so the line is reported as a redirection
+    instead of being split at the `&`.
     """
     block = _synthetic_block("engrava info 2>&1 --nonexistent\n")
     errors = block_invocation_errors(block)
@@ -1460,12 +1417,10 @@ def test_checker_does_not_mistake_a_comment_arrow_for_redirection() -> None:
 
 
 def test_checker_does_not_continue_a_line_from_inside_a_comment() -> None:
-    """Regression: a trailing backslash inside a comment does not continue the line.
+    """A trailing backslash inside a comment does not continue the line.
 
     Real bash comments run to end of line regardless of a trailing
-    backslash; the classifier only excluded lines *starting* with `#`, so
-    this joined into one comment-swallowed line and `reindex` was discarded
-    along with it instead of being checked as its own command.
+    backslash, so `reindex` on the next line is checked as its own command.
     """
     block = _synthetic_block("engrava info # comment \\\nengrava reindex\n")
     errors = block_invocation_errors(block)
@@ -1474,12 +1429,11 @@ def test_checker_does_not_continue_a_line_from_inside_a_comment() -> None:
 
 
 def test_checker_does_not_insert_whitespace_when_joining_a_continuation() -> None:
-    """Regression: backslash-newline removal inserts no character, not even a space.
+    """Backslash-newline removal inserts no character, not even a space.
 
-    Joining used to insert a literal space, so `engra` + `va reindex`
-    produced `engra va reindex` -- no `engrava` word at all, and the line
-    passed by accident. A real shell removes the backslash-newline pair with
-    nothing in its place, producing `engrava reindex`.
+    A real shell removes the backslash-newline pair with nothing in its
+    place, so `engra` + `va reindex` produces `engrava reindex`, whose
+    `reindex` is reported.
     """
     block = _synthetic_block("engrava info\nengra\\\nva reindex\n")
     errors = block_invocation_errors(block)
@@ -1488,7 +1442,7 @@ def test_checker_does_not_insert_whitespace_when_joining_a_continuation() -> Non
 
 
 def test_checker_passes_the_no_space_join_mirror() -> None:
-    """Control (mirrors the no-space join fix above): joining inserts no space.
+    """Control (the mirror of the no-space join above): joining inserts no space.
 
     `engrava in\\` followed by `fo` must become `engrava info`, a valid
     invocation -- not `engrava in fo`, which a space-inserting join would
@@ -1499,7 +1453,7 @@ def test_checker_passes_the_no_space_join_mirror() -> None:
 
 
 def test_checker_strips_a_repeated_prompt_on_a_continuation_line() -> None:
-    """Below the bar: a `$ ` on a continuation line is stripped, not literal or an error.
+    """A `$ ` on a continuation line is stripped, not literal or an error.
 
     Inside a transcript, a continued command's next physical line is a
     continuation of that command, never a fresh prompt -- a `$ ` there is
@@ -1511,11 +1465,11 @@ def test_checker_strips_a_repeated_prompt_on_a_continuation_line() -> None:
 
 
 def test_checker_resets_comment_detection_after_an_operator() -> None:
-    """Regression: a comment right after ``;``/``|``/``&`` is still a comment.
+    """A comment right after ``;``/``|``/``&`` is still a comment.
 
-    The comment tracker only reset word-start after whitespace, so
-    ``engrava info;# comment`` did not recognise the ``#`` as starting a
-    comment right after the ``;`` the way real bash does.
+    The comment tracker resets word-start after an operator as well as after
+    whitespace, so ``engrava info;# comment`` recognises the ``#`` as
+    starting a comment right after the ``;`` the way real bash does.
     """
     block = _synthetic_block("engrava info;# comment \\\nengrava reindex\n")
     errors = block_invocation_errors(block)
@@ -1524,7 +1478,7 @@ def test_checker_resets_comment_detection_after_an_operator() -> None:
 
 
 def test_checker_refuses_an_escaped_trailing_backslash() -> None:
-    """Regression: an even run of backslashes is an escaped, literal one.
+    """An even run of backslashes is an escaped, literal one.
 
     Bash reads a trailing ``\\\\`` as one escaped backslash ending the
     command, not a continuation marker -- this checker does not model
@@ -1538,7 +1492,7 @@ def test_checker_refuses_an_escaped_trailing_backslash() -> None:
 
 
 def test_checker_refuses_a_backslash_inside_an_open_quote() -> None:
-    """Regression: a quote spanning the join point is not reconstructed.
+    """A quote spanning the join point is not reconstructed.
 
     Bash keeps both the backslash and the newline as literal content inside
     a single-quoted string; this checker does not model a quote spanning a
@@ -1551,7 +1505,7 @@ def test_checker_refuses_a_backslash_inside_an_open_quote() -> None:
 
 
 def test_checker_treats_an_escaped_trailing_space_as_a_real_boundary() -> None:
-    """Regression: a backslash followed by trailing whitespace does not continue.
+    """A backslash followed by trailing whitespace does not continue.
 
     Checked on the raw, un-stripped line: the backslash is not the literal
     last character, so this is not a continuation at all -- the physical
@@ -1564,7 +1518,7 @@ def test_checker_treats_an_escaped_trailing_space_as_a_real_boundary() -> None:
 
 
 def test_checker_strips_a_dangling_continuation_on_the_last_line() -> None:
-    """Regression: a block's final line ending in a real marker is not `info\\`.
+    """A block's final line ending in a real marker is not `info\\`.
 
     There is no next physical line to join with; a real shell reads the
     same backslash-newline-EOF and simply ends the command there.
@@ -1582,12 +1536,11 @@ def test_checker_still_joins_and_fails_the_no_space_mirror() -> None:
 
 
 def test_checker_strips_pipeline_negation_before_the_command() -> None:
-    """Regression: a leading, unquoted ``!`` hid the invocation it negates.
+    """A leading, unquoted ``!`` does not hide the invocation it negates.
 
     An unquoted ``!`` is bash's pipeline-negation operator when it is the
-    first word of a segment -- unambiguous there, no context needed. Without
-    stripping it, the segment's first word was ``!``, not ``engrava``, and
-    the invocation that followed was never found at all.
+    first word of a segment -- unambiguous there, no context needed -- so it
+    is stripped and the invocation that follows is found.
     """
     block = _synthetic_block("! engrava reindex\n")
     errors = block_invocation_errors(block)
@@ -1601,7 +1554,7 @@ def test_checker_accepts_a_negated_valid_command() -> None:
 
 
 def test_checker_strips_negation_after_a_compound_operator() -> None:
-    """Regression: negation composes with an existing segment boundary (``;``)."""
+    """Negation composes with an existing segment boundary (``;``)."""
     block = _synthetic_block("true; ! engrava reindex\n")
     errors = block_invocation_errors(block)
     assert len(errors) == 1
@@ -1609,7 +1562,7 @@ def test_checker_strips_negation_after_a_compound_operator() -> None:
 
 
 def test_checker_strips_negation_before_an_env_assignment() -> None:
-    """Regression: negation composes with a following env assignment, in that order."""
+    """Negation composes with a following env assignment, in that order."""
     block = _synthetic_block("! ENGRAVA_DISABLE_EXTENSIONS=1 engrava reindex\n")
     errors = block_invocation_errors(block)
     assert len(errors) == 1
@@ -1617,13 +1570,12 @@ def test_checker_strips_negation_before_an_env_assignment() -> None:
 
 
 def test_checker_strips_a_run_of_pipeline_negations() -> None:
-    """Regression: bash allows repeated ``!``, not just one.
+    """Bash allows repeated ``!``, not just one.
 
     ``bash -c '! ! echo hi'`` prints ``hi`` and exits 0 -- a double negation
     still runs the command, so ``! ! engrava reindex`` genuinely invokes
-    ``engrava reindex``. Skipping only a single leading ``!`` left the
-    second one as the segment's first word, and the invocation was never
-    found at all.
+    ``engrava reindex``. The whole leading run of ``!`` is skipped, so the
+    invocation is found.
     """
     block = _synthetic_block("! ! engrava reindex\n")
     errors = block_invocation_errors(block)
@@ -1632,7 +1584,7 @@ def test_checker_strips_a_run_of_pipeline_negations() -> None:
 
 
 def test_checker_strips_a_negation_run_after_a_compound_operator() -> None:
-    """Regression: a negation run composes with an existing segment boundary."""
+    """A negation run composes with an existing segment boundary."""
     block = _synthetic_block("true && ! ! engrava reindex\n")
     errors = block_invocation_errors(block)
     assert len(errors) == 1
@@ -1640,7 +1592,7 @@ def test_checker_strips_a_negation_run_after_a_compound_operator() -> None:
 
 
 def test_checker_strips_a_negation_run_before_an_env_assignment() -> None:
-    """Regression: a negation run composes with a following env assignment, in that order."""
+    """A negation run composes with a following env assignment, in that order."""
     block = _synthetic_block("! ! ENGRAVA_X=1 engrava reindex\n")
     errors = block_invocation_errors(block)
     assert len(errors) == 1

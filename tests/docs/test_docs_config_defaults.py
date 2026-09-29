@@ -7,14 +7,13 @@ the shipped configuration object. A doc line like ``reflection_boost
 silently misleads a user who copies the value into their config when the
 code actually ships ``1.0``.
 
-This module used to close that gap for five hand-picked fields out of the
-fifty-four across ``SearchConfig``, ``DreamingGates``, ``HygienePolicyConfig``
-and ``TTLConfig`` — the five involved in the incidents that prompted the
-check. It now derives the set of checked fields from the documentation
-itself, via ``tests.docs._documented_defaults_scan``, which finds where
-``README.md`` or a file under ``docs/`` states a default for one of these
-fields. See that module's docstring for which statements it compares against
-the shipped dataclass and which it records separately.
+This module derives the set of checked fields from the documentation itself,
+across the fifty-four fields of ``SearchConfig``, ``DreamingGates``,
+``HygienePolicyConfig`` and ``TTLConfig``, via
+``tests.docs._documented_defaults_scan``, which finds where ``README.md`` or a
+file under ``docs/`` states a default for one of these fields. See that
+module's docstring for which statements it compares against the shipped
+dataclass and which it records separately.
 
 The expected value is always read from the *code* (``ClassName().field``),
 never hard-coded in this file, so the code stays the single source of truth
@@ -62,9 +61,8 @@ _ALL_CONFIG_DATACLASSES = [
 AMBIGUOUS_NAMES = derive_ambiguous_names(TARGET_CLASSES, _ALL_CONFIG_DATACLASSES)
 SECTION_ALIASES = derive_section_aliases(_config_module.EngravaConfig, TARGET_CLASSES)
 
-# The five fields the old hand-kept registry covered. The derived scan must
-# keep covering them — a derived list that loses coverage the hand-kept list
-# had is a regression however much reach it gains elsewhere.
+# Five fields the derived scan must keep covering — a scan that loses one of
+# them has lost coverage however much reach it gains elsewhere.
 _ORIGINAL_FIVE: frozenset[tuple[str, str]] = frozenset(
     {
         ("SearchConfig", "reflection_boost"),
@@ -370,7 +368,7 @@ def test_no_documented_default_names_a_nonexistent_field() -> None:
 
 
 def test_original_five_fields_remain_covered() -> None:
-    """The derived scan must not lose the five fields the old hand-kept list covered."""
+    """The derived scan must resolve a default for each of the five ``_ORIGINAL_FIVE`` fields."""
     reached = {(r.claim.cls.__name__, r.claim.field) for r in _RESULT.resolved}
     missing = _ORIGINAL_FIVE - reached
     assert not missing, f"the derived scan no longer resolves a default for: {sorted(missing)}"
@@ -474,11 +472,10 @@ def test_min_and_max_cluster_size_defaults_match_docs() -> None:
 
 
 def test_scan_reach_is_wider_than_the_old_five_field_registry() -> None:
-    """Sanity floor: the derived scan checks far more than the old five entries.
+    """Sanity floor: the derived scan checks far more than the five ``_ORIGINAL_FIVE`` entries.
 
-    Not an exact count — the docs will keep changing wording — just a floor
-    well below the ~70 claims resolved at the time this test was written, so
-    a change that silently collapses recognition back toward zero is caught.
+    Not an exact count — the docs will keep changing wording — just a floor,
+    so a change that silently collapses recognition toward zero is caught.
     """
     assert len(_RESULT.resolved) >= 40, (
         f"only {len(_RESULT.resolved)} documented defaults resolved; expected the derived "

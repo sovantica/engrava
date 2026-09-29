@@ -326,9 +326,9 @@ class TestCancellationStaysWithTheCancelledCaller:
     ) -> None:
         """A waiter nobody cancelled must not inherit its creator's cancellation.
 
-        The creator used to resolve the shared future with its own
-        ``CancelledError``, so the waiter raised it too. The waiter now starts
-        the creation over and gets a working store from its own retry.
+        The creator resolves the shared future with ``_CreationAbandonedError``,
+        not with its own ``CancelledError``, so the waiter starts the creation
+        over and gets a working store from its own retry.
         """
         gate = _gate_schema_setup(monkeypatch)
         mgr = EngravaManager(data_dir=tmp_path / "services")
@@ -481,10 +481,9 @@ class TestCancellationStaysWithTheCancelledCaller:
     ) -> None:
         """A cancelled ``close_all`` finishes with the in-flight creation before re-raising.
 
-        It used to let its cancellation cancel the shared future. The
-        creator's ``get_store`` then raised ``InvalidStateError`` on a store
-        it had built, and ``close_all`` returned before that store existed,
-        so nothing ever closed it.
+        Its cancellation does not cancel the shared creation: the creator's
+        ``get_store`` returns the store it built, and ``close_all`` closes that
+        store before it re-raises.
         """
         gate = _gate_schema_setup(monkeypatch)
         mgr = EngravaManager(data_dir=tmp_path / "services")
@@ -594,9 +593,8 @@ class TestCancellationStaysWithTheCancelledCaller:
         """A creator cancelled between building its store and publishing it cleans up.
 
         The creator waits for the manager's lock to publish. A cancellation
-        during that wait used to escape with the creation still registered
-        and unresolved. Every waiter then hung, and the store it had built was
-        never closed.
+        during that wait closes the store it had built and resolves the
+        creation as abandoned, so the waiter starts the creation over.
         """
         gate = _gate_schema_setup(monkeypatch)
         mgr = EngravaManager(data_dir=tmp_path / "services")

@@ -750,13 +750,12 @@ def _duplicate_locations(locations: list[str]) -> list[str]:
     return sorted(duplicates)
 
 
-# The exact per-reason tally over COMPILE_ONLY, as of this revision -- every
-# CompileOnlyReason member appears, including the two currently at 0, so this is a
-# complete accounting over the closed vocabulary rather than a sparse "only the
-# reasons currently in use" snapshot. Update this constant deliberately whenever an
-# entry is added, removed, or recategorised -- that is the point: a category quietly
-# growing (or shrinking, or newly used) must fail the test below, not merely change a
-# number in a captured ``-s`` report nobody reads.
+# The exact per-reason tally over COMPILE_ONLY. Every CompileOnlyReason member appears,
+# including those at 0, so this is a complete accounting over the closed vocabulary
+# rather than a sparse snapshot of the reasons in use. Update this constant deliberately
+# whenever an entry is added, removed, or recategorised: a category quietly growing (or
+# shrinking, or newly used) must fail the test below, not merely change a number in a
+# captured ``-s`` report nobody reads.
 _EXPECTED_COMPILE_ONLY_REASON_TALLY: dict[str, int] = {
     CompileOnlyReason.ASSUMES_STORE_OR_CONNECTION.value: 0,
     CompileOnlyReason.DEFINITION_ONLY.value: 10,
@@ -837,15 +836,9 @@ def test_behaviour_registry_has_no_duplicate_locations() -> None:
 def test_compile_only_registry_has_no_duplicate_locations() -> None:
     """A block registered twice in COMPILE_ONLY must fail, not collapse into a set.
 
-    Before this test, duplicating the first ``COMPILE_ONLY`` row verbatim left
-    every existing exactly-once test green: ``_compile_only_locations()``
-    returns a ``set``, so the two rows collapse into one location, and
-    ``test_compile_only_reasons_are_tallied`` at the time only checked
-    ``sum(tally.values()) == len(COMPILE_ONLY)`` -- true by construction of the
-    tally (it sums to the row count no matter what the rows are), so it grew
-    right along with the duplicate instead of catching it. That tautological
-    check has since been removed in favour of comparing against a value fixed
-    independently of the row count.
+    ``_compile_only_locations()`` returns a ``set``, so two identical rows collapse
+    into one location. This test checks the un-deduplicated list instead, so a
+    duplicated row fails and is named.
     """
     duplicates = _duplicate_locations(_compile_only_locations_list())
     assert not duplicates, f"COMPILE_ONLY registers these blocks more than once: {duplicates}"
@@ -888,22 +881,14 @@ def test_every_documentation_block_is_covered() -> None:
 def test_compile_only_reasons_are_tallied() -> None:
     """Every ``COMPILE_ONLY`` entry cites one closed-vocabulary reason and one real note.
 
-    Before ``CompileOnlyReason`` existed, 122 compile-only blocks carried 113 distinct
-    free-text sentences -- 122 against 113 is nine duplicate uses, not a one-sentence-
-    per-nine-blocks ratio -- so nobody could count how many blocks were exempt for
-    which cause. This asserts each entry's third element really is a
-    ``CompileOnlyReason`` member (not a stray string or ``None`` left by an incomplete
-    edit), that its fourth element is an actual explicit free-text note (not ``""`` or
-    ``None``, which passed unnoticed before this assertion existed), and that the
-    per-cause tally exactly matches ``_EXPECTED_COMPILE_ONLY_REASON_TALLY``. That last
-    check is deliberately an assertion against an independently pinned value, not a
-    print and not a self-check: ``sum(tally.values()) == len(COMPILE_ONLY)`` would be
-    true by construction (the tally is built by incrementing one bucket per row, so
-    the sum can never be anything else while the loop completes) and was removed as a
-    tautology that could not fail. A print in a ``-s`` report is read by nobody, so
-    neither is the guarantee ``test_every_fenced_block_is_classified_exactly_once``
-    gives the non-python fences unless a changed count actually fails a test against a
-    value fixed independently of the count itself -- which this now does.
+    Asserts that each entry's third element is a ``CompileOnlyReason`` member (not a
+    stray string or ``None``), that its fourth element is a non-blank free-text note
+    (not ``""`` or ``None``), and that the per-cause tally exactly matches
+    ``_EXPECTED_COMPILE_ONLY_REASON_TALLY``. The tally is compared against a value
+    pinned independently of the row count: ``sum(tally.values()) == len(COMPILE_ONLY)``
+    would hold by construction (one bucket is incremented per row), so it could not
+    fail. The printed tally in a ``-s`` report does not fail either; the assertion is
+    what makes a changed count fail.
     """
     for rel, anchor, reason, note in COMPILE_ONLY:
         assert isinstance(reason, CompileOnlyReason), (

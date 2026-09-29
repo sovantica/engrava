@@ -1,8 +1,7 @@
-"""Regression guard for FTS query-normalization robustness.
+"""Robustness of FTS query normalization for bare natural-language input.
 
 This suite locks two invariants of the bare (natural-language) FTS5
-normalization path so a future edit cannot silently reintroduce an invalid
-``MATCH`` for ordinary user input:
+normalization path:
 
 * **Bare trailing-punctuation is stripped, not passed through.** A bare
   natural-language question that merely *contains* a literal ``?`` (or ``.``,

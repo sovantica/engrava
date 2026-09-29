@@ -261,7 +261,7 @@ class TestClusterCohesion:
         # provider such as HuggingFaceProvider / OllamaProvider /
         # OpenAICompatibleProvider / CallbackProvider would return): the
         # raw dot product (6.0) is not even in the [-1, 1] range a cosine
-        # can take, which is exactly the defect this gate is fixed for.
+        # can take.
         vec_a = [3.0, 0.0]
         vec_b = [2.0, 0.1]
         score = cluster_cohesion_score([vec_a, vec_b])
@@ -304,9 +304,8 @@ class TestClusterCohesion:
         assert cluster_cohesion_score([unit_a, unit_b]) == pytest.approx(0.96)
 
     def test_already_normalised_pair_pinned_exact_not_approx(self) -> None:
-        # Regression pin for claim 5 of the 0.6 -> 0.7 fix ("byte-identical
-        # behaviour" / "this release changes nothing for you" on an
-        # already-normalising provider): [0.7071067811865475]*2 is, to
+        # Exact-equality pin for an already-normalising provider:
+        # [0.7071067811865475]*2 is, to
         # float64 precision, a unit vector, but its norm computes to
         # 0.9999999999999999, not exactly 1.0. Dividing by that norm shifts
         # the score by one representable bit relative to the raw dot

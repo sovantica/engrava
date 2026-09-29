@@ -1,6 +1,6 @@
 """Backward-compat tests — v1 reader handles v2 content gracefully.
 
-The dreaming extension now emits structural REFLECTION content schema
+The dreaming extension emits structural REFLECTION content schema
 v2, but legacy code paths and external consumers built against v1
 must keep working.  These tests pin three properties:
 

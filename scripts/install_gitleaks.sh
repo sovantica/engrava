@@ -2,15 +2,14 @@
 # scripts/install_gitleaks.sh — the one place that names which gitleaks
 # binary this repository trusts and how that trust is checked.
 #
-# Two call sites need the exact same gitleaks: .github/workflows/secret-scan.yml
-# (scans push/PR history) and scripts/verify_release_content_scan.sh (scans
-# the release commit range and the generated changelog before a release is
-# tagged). Before this script existed, the version and its sha256 were
-# declared once, inline in secret-scan.yml; a second inline copy for the
-# release gate would be a second place that could drift from the first —
-# quietly trusting a different binary in the one job that gates publication.
-# So the pin lives here, once, and both call sites install through this
-# script rather than repeating it.
+# Two jobs need the exact same gitleaks: .github/workflows/secret-scan.yml
+# (scans push/PR history) and .github/workflows/release.yml, whose
+# scripts/verify_release_content_scan.sh scans the release commit range and
+# the generated changelog before a release is tagged. Both workflows install
+# it by running this script rather than repeating the pin: a second inline
+# copy of the version and its sha256 would be a second place that could
+# drift from the first — quietly trusting a different binary in the one job
+# that gates publication.
 #
 # Neither gitleaks-action nor any other third-party Action is used to
 # install it: this repository's Actions policy allows only GitHub-owned

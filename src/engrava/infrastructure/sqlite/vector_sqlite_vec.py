@@ -242,8 +242,8 @@ class SqliteVecSearchBackend:
 
         The ``embedding_vec`` virtual table is not reachable by the
         ``embedding`` table's ``ON DELETE CASCADE`` foreign key, so deleting
-        a thought (which cascades to its ``embedding`` row) does not remove
-        the corresponding vector. Callers on a thought-delete path must
+        a thought does not remove the corresponding vector. Callers on a
+        thought-delete path must
         invoke this explicitly to avoid leaving a ghost vector that would
         otherwise keep occupying a KNN result slot forever.
 
@@ -275,15 +275,10 @@ async def purge_orphan_vectors(db: aiosqlite.Connection) -> int:
     remove the vector of an embedding whose thought is still live, whatever
     the caller believes it deleted.
 
-    **Ownership here is the thought, not the ``embedding`` row** — a
-    correction to this function's own earlier reasoning. A row is
+    **Ownership here is the thought, not the ``embedding`` row.** A row is
     kept only when its ``embedding`` row exists *and* joins to a ``thought``
     row that still exists; either one missing makes the vector an orphan.
-    On a schema whose foreign keys cascade — every schema at or above the
-    version that introduced them — deleting a thought takes its ``embedding``
-    row with it, so the two failure modes coincide and this predicate
-    behaves exactly as the embedding-row-only form used to. On an older
-    schema they do not: a delete can leave the ``embedding`` row behind, and
+    A thought delete can leave the ``embedding`` row behind, and
     without the join to ``thought`` this function would leave that vector in
     place — the same dangling row :meth:`SqliteVecSearchBackend.sync_embeddings`
     would then read as proof the thought was still live and use to put the
