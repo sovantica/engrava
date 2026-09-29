@@ -1,19 +1,19 @@
 """Regression tests: a ``store_embedding()`` write and its vector-index
 update are one failure-atomic unit.
 
-Before the fix, ``store_embedding`` wrote the base ``embedding`` row and
-then, when a vector backend was configured, called its ``upsert_embedding``
-in a second, separate statement. A failure in that second step (a
-wrong-dimension vector rejected by ``vec0``, or any other vec0-layer error)
-left the base row's write pending in the connection's open transaction —
-``self._db.in_transaction`` stayed ``True`` — so a *later, unrelated* write
-on the same connection (e.g. ``create_thought``) would commit it as a side
-effect, corrupting the ``embedding`` table with a row that has no matching
+``store_embedding`` writes the base ``embedding`` row and then, when a vector
+backend is configured, calls its ``upsert_embedding``. A failure in that
+second step (a wrong-dimension vector rejected by ``vec0``, or any other
+vec0-layer error) must not leave the base row's write pending in the
+connection's open transaction. When the caller had no transaction open,
+``self._db.in_transaction`` is ``False`` afterwards, so a *later, unrelated*
+write on the same connection (e.g. ``create_thought``) cannot commit it as a
+side effect and leave the ``embedding`` table with a row that has no matching
 vector.
 
 These tests use a real, file-backed temporary database (never ``:memory:``)
-because the defect is specifically about state surviving to a later
-connection-level commit.
+because the property is about state surviving to a later connection-level
+commit.
 """
 
 from __future__ import annotations
@@ -99,14 +99,13 @@ class TestStoreEmbeddingSqliteVecAtomicity:
     ) -> None:
         """Force a vec0-layer failure independent of the model/dimension lock.
 
-        The model-identity re-check (the second fix in this change) now
-        catches an ordinary "second call with a different vector length"
-        before it ever reaches the vec0 upsert, so it alone would no longer
-        exercise this savepoint. To test the transaction boundary in
-        isolation, the vec0 index table is dropped out from under a
-        same-model, same-dimension call, so the model check passes and the
-        failure originates purely in the vec0 upsert step — exactly the
-        class of failure the savepoint protects against.
+        The model-identity re-check catches an ordinary "second call with a
+        different vector length" before it ever reaches the vec0 upsert, so
+        it alone would not exercise this savepoint. To test the transaction
+        boundary in isolation, the vec0 index table is dropped out from under
+        a same-model, same-dimension call, so the model check passes and the
+        failure originates purely in the vec0 upsert step — exactly the class
+        of failure the savepoint protects against.
         """
         store = await _build_store(tmp_path, backend="sqlite-vec", dimension=3)
         db = store._db
@@ -145,13 +144,13 @@ class TestStoreEmbeddingSqliteVecAtomicity:
             await store.close()
 
     async def test_wrong_dimension_second_call_now_caught_before_vec0(self, tmp_path: Path) -> None:
-        """The original bug reproduction stays closed end-to-end.
+        """A wrong-dimension second call is refused before it can leave an orphan.
 
-        A genuinely wrong-dimension vector on a second call is now refused
-        by the model-identity re-check before it ever reaches the base row
+        A genuinely wrong-dimension vector on a second call is refused by
+        the model-identity re-check before it ever reaches the base row
         write or the vec0 upsert — belt and suspenders with the savepoint
-        above, and pinned here so a future change to either fix cannot
-        silently reopen the original ``[3] -> [3, 4]`` orphan.
+        above, and pinned here so a future change to either guard cannot
+        silently allow a ``[3] -> [3, 4]`` orphan.
         """
         from engrava import EmbeddingModelMismatchError
 
@@ -220,16 +219,14 @@ class TestStoreEmbeddingNumpyBackendFailure:
 class TestFirstEmbeddingIdentityAtomicity:
     """A rejected *first* ``store_embedding()`` must not durably lock identity.
 
-    Before this fix, ``store_embedding`` called ``_ensure_embedding_model_lock``
-    *before* opening its own ``_write_readback_savepoint``. On an empty corpus
-    that helper writes and commits the ``_metadata`` identity rows
-    unconditionally, so a first call whose base/vec0 write then failed still
-    left that identity durably locked — with no way for a corrected retry to
-    succeed short of manual ``_metadata`` surgery. This is distinct from
-    ``TestStoreEmbeddingSqliteVecAtomicity`` / ``TestStoreEmbeddingNumpyBackendFailure``
-    above, which cover a *second*-call bypass already fixed separately: these
-    tests are about the identity lock itself outliving the very first write it
-    was meant to gate.
+    ``store_embedding`` calls ``_ensure_embedding_model_lock`` from inside its
+    own ``_write_readback_savepoint``. On an empty corpus that helper writes
+    the ``_metadata`` identity rows, so a first call whose base/vec0 write then
+    fails unwinds that identity write with it, and a corrected retry can
+    succeed. This is distinct from ``TestStoreEmbeddingSqliteVecAtomicity`` /
+    ``TestStoreEmbeddingNumpyBackendFailure`` above, which cover a
+    *second* call: these tests are about the identity lock outliving the very
+    first write it is meant to gate.
     """
 
     @sqlite_vec_required
@@ -239,10 +236,10 @@ class TestFirstEmbeddingIdentityAtomicity:
         """vec0's width is fixed at store-configuration time, not derived from the first vector.
 
         A first vector whose length disagrees with that configured width
-        fails the vec0 upsert. Before the fix, the identity lock had already
-        committed (with the *wrong*, rejected dimension) before that upsert
-        ever ran, so even a corrected retry using the store's actual
-        configured dimension was refused.
+        fails the vec0 upsert. The identity lock is written inside the same
+        savepoint, so the rejected dimension is not left committed and a
+        corrected retry using the store's actual configured dimension
+        succeeds.
         """
         store = await _build_store(tmp_path, backend="sqlite-vec", dimension=3)
         db = store._db
@@ -255,8 +252,8 @@ class TestFirstEmbeddingIdentityAtomicity:
                     thought_id="t-first", vector=[1.0, 0.0, 0.0, 0.0], model_name="m"
                 )
 
-            # The failed call left no base row, no open transaction, and —
-            # this is the fix — no identity lock either.
+            # The failed call left no base row, no open transaction, and no
+            # identity lock either.
             assert await _embedding_row_count(db) == 0
             assert db.in_transaction is False
             assert await _metadata_value(db, "embedding_model_name") is None
@@ -292,12 +289,11 @@ class TestFirstEmbeddingIdentityAtomicity:
 
         The numpy backend has no vec0 width to violate, so the only way this
         first call fails is the ``embedding.owner_id`` foreign key. The
-        failed attempt uses a 4-dimensional placeholder vector (stand-in
-        data from before the real embedding pipeline was wired up); the
-        corrected retry uses the real 3-dimensional one. Before the fix, the
-        placeholder's dimension had already locked the corpus identity, so
-        even a retry with the right ``thought_id`` *and* the right dimension
-        for the real provider was refused.
+        failed attempt uses a 4-dimensional placeholder vector; the corrected
+        retry uses the real 3-dimensional one. The placeholder's dimension
+        must not lock the corpus identity, so a retry with the right
+        ``thought_id`` *and* the right dimension for the real provider
+        succeeds.
         """
         store = await _build_store(tmp_path, backend="numpy", dimension=3, db_name="numpy-fk")
         db = store._db

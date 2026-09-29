@@ -1,14 +1,12 @@
 """Safety-invariant suite for FTS5 expert-syntax classification and fallback.
 
-This suite pins the contract introduced to close a silent hybrid-search
-degradation: a natural-language query that merely *contains* double quotes
-(scare-quotes around a UI label) used to be misclassified as expert phrase
-syntax, so hazardous punctuation adjacent to a quote (``"forum"?``) survived
-into the FTS5 ``MATCH`` and raised an ``OperationalError``. The guard then
-silently returned no FTS results and hybrid search degraded to vector-only with
-no signal to the caller.
+This suite pins how ``search_fts`` handles a natural-language query that
+contains double quotes (scare-quotes around a UI label): when the primary
+FTS5 ``MATCH`` raises, the query is re-normalized through the bare path and
+retried once instead of returning no FTS results, and every primary failure
+is counted.
 
-The fix has three parts, each pinned here:
+The contract has three parts, each pinned here:
 
 * **Classification tightening** (:func:`_query_is_expert_syntax`) — a query is
   expert only for a *deliberate* construct (a balanced quoted phrase wrapping a
@@ -133,9 +131,8 @@ _REPORTED_QUERY = 'field name between "body" and "forum"? Mark your final answer
 # ---------------------------------------------------------------------------
 # The genuine-expert parity golden — for each real expert query the
 # classification MUST be expert and the normalized output MUST be byte-identical
-# to the frozen MATCH — is now an externalized, checked-in golden covering the
-# full column-filter x phrase x boolean cross-product (a superset of the five
-# cases that used to live inline here). It lives in
+# to the frozen MATCH — is an externalized, checked-in golden covering the
+# full column-filter x phrase x boolean cross-product. It lives in
 # ``tests/search_contract/goldens/fts_expert_normalization.json`` and is asserted
 # by ``TestExpertNormalizationGolden`` in ``test_search_goldens.py``, whose
 # discriminating-power tests also prove the rejected column-filter drop breaks
@@ -197,7 +194,7 @@ _SENTENCE_PUNCT = (".", "?", "!", ",", ":", ";")
 def _build_group_a() -> list[FuzzCase]:
     """Build the valid-primary partition of the fuzz corpus (delta 0).
 
-    Every case here classifies to a valid FTS5 ``MATCH`` under the fix — either
+    Every case here classifies to a valid FTS5 ``MATCH`` — either
     a bare, fully-sanitized query (odd/zero quote count, hazardous punctuation,
     wildcards, hyphens, unicode, parentheses) or a well-formed genuine-expert
     query (balanced clean phrase, boolean, field filter). None should ever
@@ -318,8 +315,8 @@ _FUZZ_CORPUS: tuple[FuzzCase, ...] = tuple(_build_group_a() + _build_group_b())
 
 
 # ---------------------------------------------------------------------------
-# Genuine-expert parity now lives in ``test_search_goldens.py`` (externalized
-# golden — see the note above where the inline table used to be).
+# Genuine-expert parity lives in ``test_search_goldens.py`` (externalized
+# golden — see the note above).
 # ---------------------------------------------------------------------------
 
 
@@ -349,12 +346,12 @@ class TestCuratedAdversarialTable:
 
 
 # ---------------------------------------------------------------------------
-# The concrete reported input now returns hits
+# The concrete reported input returns hits
 # ---------------------------------------------------------------------------
 
 
 class TestReportedInputRegression:
-    """The concrete reported input returns non-empty FTS/BM25 hits after the fix."""
+    """The concrete reported input returns non-empty FTS/BM25 hits."""
 
     async def test_reported_input_returns_fts_hits(
         self,
@@ -545,13 +542,13 @@ class TestDiscriminatingPower:
         reported_store: SqliteEngravaCore,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """With the old (over-triggering) classifier a scare-quote case fails.
+        """With a classifier that over-triggers on any quote a scare-quote case fails.
 
         The odd/scare-quote anchor ``he said "run away`` is a Group-A case
-        (expected delta 0). Under the pre-fix rule ``'"' in query -> expert`` it
-        normalizes to an unbalanced phrase, the primary MATCH is invalid, and
-        the fallback fires — so its failure delta becomes 1, breaking the
-        invariant's Group-A prediction.
+        (expected delta 0). Under the rule ``'"' in query -> expert`` (the
+        ``_old_is_expert`` below) it normalizes to an unbalanced phrase, the
+        primary MATCH is invalid, and the fallback fires — so its failure
+        delta becomes 1, breaking the invariant's Group-A prediction.
         """
         anchor = 'he said "run away'
         # Baseline: valid primary, no failure.
@@ -559,7 +556,7 @@ class TestDiscriminatingPower:
         await reported_store.search_fts(anchor)
         assert reported_store.fts_match_failure_count == before
 
-        # Restore the old, over-triggering classifier.
+        # Substitute a classifier that treats any double quote as expert syntax.
         import engrava.infrastructure.sqlite.engrava_core as core_mod
 
         def _old_is_expert(query: str) -> bool:
@@ -613,13 +610,12 @@ class TestDiscriminatingPower:
         The anchor ``forum** body`` is a bare Group-A shape: under the
         wildcard-collapsing sanitizer it normalizes to the valid
         ``forum* OR body`` (delta 0) and returns real hits. With the collapse
-        reverted to an identity — the pre-fix behaviour — the ``forum**`` token
-        survives as an invalid ``**`` term, so the *primary* MATCH raises AND
-        the bare fallback (which re-uses the same sanitizer) raises too: the
-        query silently degrades to no hits with a failure delta of 1. That is
-        exactly the wildcard-degradation bug the safety invariant must catch, proving the
-        wildcard cases carry real discriminating power rather than passing
-        vacuously.
+        reverted to an identity, the ``forum**`` token survives as an invalid
+        ``**`` term, so the *primary* MATCH raises AND the bare fallback (which
+        re-uses the same sanitizer) raises too: the query silently degrades to
+        no hits with a failure delta of 1. The safety invariant must catch that,
+        so the wildcard cases carry real discriminating power rather than
+        passing vacuously.
         """
         import engrava.infrastructure.sqlite.engrava_core as core_mod
 
@@ -633,7 +629,7 @@ class TestDiscriminatingPower:
         )
         assert baseline, "the collapsed primary MATCH must return real hits"
 
-        # Revert the wildcard fix: an identity collapse restores the raw ``**``.
+        # An identity collapse restores the raw ``**``.
         monkeypatch.setattr(core_mod, "_collapse_fts_wildcards", lambda fragment: fragment)
 
         before = reported_store.fts_match_failure_count
@@ -644,7 +640,7 @@ class TestDiscriminatingPower:
         )
         assert reverted == [], (
             "with the collapse reverted the bare fallback is also invalid, so "
-            "the query silently degrades to no hits — the wildcard-degradation defect"
+            "the query silently degrades to no hits"
         )
 
 

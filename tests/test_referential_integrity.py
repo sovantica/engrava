@@ -867,7 +867,7 @@ class TestParentDeleteSeesChildrenBeforeTheyAreGone:
 
 
 class TestParentDeleteSuppressedByRaiseIgnore:
-    """``RAISE(IGNORE)`` reproduces the same data loss with a different trigger.
+    """A ``RAISE(IGNORE)`` veto on the parent delete is silent, unlike ``RAISE(ABORT)``.
 
     ``RAISE(ABORT)`` (and a ``WHEN EXISTS`` guard, which uses it too) raises,
     so ``_delete_thought_atomic``'s own ``except`` branch unwinds the whole
@@ -876,14 +876,10 @@ class TestParentDeleteSuppressedByRaiseIgnore:
     instead *silently* reverts just the parent ``DELETE``: no exception, the
     thought stays, and the delete's own rowcount is zero -- indistinguishable
     from ``thought_id`` never having existed if rowcount is all that is
-    consulted. Before the fix pinned here, ``_delete_thought_atomic`` ran the
-    explicit child sweep unconditionally on that zero-row outcome, so a
-    still-live parent lost its edges and its actions anyway, and
-    ``delete_thought`` (or TTL cleanup, or hygiene GC) reported ``False``
-    while having actually done the damage. TTL cleanup additionally never
-    checked the return value at all, so it went on to purge the vector and
-    append a ``DELETE_THOUGHT`` journal entry for a parent that was never
-    deleted -- false history on top of the data loss.
+    consulted. ``_delete_thought_atomic`` therefore reads whether the row
+    existed before the delete, and runs the explicit child sweep only when the
+    parent row was removed or never existed: sweeping after a vetoed delete
+    would strip a still-live parent of its edges and its actions.
 
     Exercised on both ``PRAGMA foreign_keys`` settings: the veto prevents the
     parent row from ever actually being removed, so no cascade fires either
@@ -891,7 +887,7 @@ class TestParentDeleteSuppressedByRaiseIgnore:
     pinning both turns that equivalence into a tested fact instead of an
     assumption. The last test in this class is the control: a genuinely
     nonexistent ``thought_id`` must keep sweeping any orphaned children it
-    finds, exactly as before this fix.
+    finds.
     """
 
     @staticmethod
@@ -1008,9 +1004,9 @@ class TestParentDeleteSuppressedByRaiseIgnore:
         carrying orphaned child rows for a ``thought_id`` that was never
         (re)inserted into ``thought`` -- exactly the scenario the
         unconditional sweep in ``_delete_thought_atomic`` exists to clean up.
-        This must keep working after the fix: ``existed_before`` is False, so
-        the sweep still runs and ``delete_thought`` still reports ``False``,
-        with no ``RAISE(IGNORE)`` trigger involved at all.
+        This must keep working: ``existed_before`` is False, so the sweep
+        runs and ``delete_thought`` reports ``False``, with no
+        ``RAISE(IGNORE)`` trigger involved at all.
         """
         async with aiosqlite.connect(":memory:") as db:
             db.row_factory = aiosqlite.Row
@@ -3200,18 +3196,11 @@ async def _delete_then_reconcile(
     reason="sqlite-vec package not installed",
 )
 class TestDeletionOnAPreCascadeSchema:
-    """Deleting on a database below core-12 no longer leaves the identifier reachable.
+    """Deleting a thought on a database below core-12, which has no cascade.
 
-    This fixes what this class used to pin as a **documented
-    non-guarantee** (see ``docs/known-limitations.md`` — "Deletion on a
-    database that has not been migrated" — and ``docs/data-lifecycle.md``,
-    both updated alongside this test): a vector is now owned by a *live*
-    thought rather than by the presence of an ``embedding`` row, enforced in
-    ``delete_thought``'s own explicit child delete (no cascade required),
-    ``sync_embeddings``'s reconciliation join, and the ``vec0`` search
-    resolution. The first test below used to demonstrate the resurrection;
-    it now demonstrates that it no longer happens — red on the pre-fix tree,
-    green here.
+    ``delete_thought`` deletes the thought's child rows explicitly, so it
+    does not rely on a cascade. The first test below shows that the deleted
+    identifier does not come back into search.
     """
 
     async def test_pre_cascade_delete_does_not_resurrect_the_identifier(
@@ -3225,8 +3214,7 @@ class TestDeletionOnAPreCascadeSchema:
         not exist at this schema version, so ``sync_embeddings`` has no
         dangling row to treat as a valid backfill source, and
         ``search_similar`` never sees the deleted identifier again. The
-        content was already gone before this fix and still is: hydrating the
-        id yields ``None``.
+        content is gone too: hydrating the id yields ``None``.
         """
         observed = await _delete_then_reconcile(
             tmp_path / "pre-cascade.db",
@@ -3238,7 +3226,7 @@ class TestDeletionOnAPreCascadeSchema:
         # the embedding row without needing a cascade this schema lacks.
         assert observed.embedding_owner_ids == [_SURVIVOR_ID]
         assert observed.backfilled == 0
-        # The fix: the deleted identifier does not return.
+        # The deleted identifier does not return.
         assert _DELETED_ID not in observed.search_similar_ids
         # Second control — the un-deleted sibling is still returned, so this
         # cannot pass against a search path that returns nothing at all.
@@ -3250,16 +3238,15 @@ class TestDeletionOnAPreCascadeSchema:
         self,
         tmp_path: Path,
     ) -> None:
-        """A dangling row from *before* this fix still cannot come back.
+        """``sync_embeddings`` does not treat a dangling ``embedding`` row as live.
 
         ``delete_thought``'s explicit child delete (proven above) stops *new*
-        dangling rows, but a database that already accumulated one under the
-        pre-fix engine needs the other half of the invariant:
-        ``sync_embeddings`` itself must not treat a dangling ``embedding`` row
-        as proof its thought is live, however that row came to exist. Bypasses
-        ``delete_thought`` entirely — a raw ``DELETE FROM thought`` simulates
-        exactly the historical damage — so this exercises the reconciliation
-        join on its own, independent of the delete-path fix.
+        dangling rows, but a database that already holds one needs the other
+        half of the invariant: ``sync_embeddings`` itself must not treat a
+        dangling ``embedding`` row as proof its thought is live, however that
+        row came to exist. Bypasses ``delete_thought`` entirely — a raw
+        ``DELETE FROM thought`` builds exactly that state — so this exercises
+        the reconciliation join on its own, independent of the delete path.
         """
         db_path = tmp_path / "pre-existing-dangling.db"
         db = await aiosqlite.connect(str(db_path))
@@ -3297,11 +3284,9 @@ class TestDeletionOnAPreCascadeSchema:
                 thought_id=_DELETED_ID, vector=list(_QUERY_VECTOR), model_name=_PRE_CASCADE_MODEL
             )
 
-            # Simulate pre-fix damage directly: a bare parent delete, with no
-            # cascade at this schema version and no explicit child delete
-            # (this is deliberately *not* a call to delete_thought), leaving
-            # the embedding row dangling exactly as an old engrava build
-            # would have.
+            # Leave the embedding row dangling directly: a bare parent delete,
+            # with no cascade at this schema version and no explicit child
+            # delete (this is deliberately *not* a call to delete_thought).
             await db.execute("DELETE FROM thought WHERE thought_id = ?", (_DELETED_ID,))
             await db.commit()
             dangling = [

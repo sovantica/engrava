@@ -883,7 +883,7 @@ def _snapshot_line_types(snapshot_path: Path) -> set[str]:
 
 
 def _corrupt_fts_with_raw_replace(db_path: Path, thought_id: str) -> None:
-    """Reproduce, at the raw-SQL level, exactly what an unfixed restore left behind.
+    """Leave a stale ``thought_fts`` entry behind for one thought, at the raw-SQL level.
 
     An ``INSERT OR REPLACE`` colliding on ``thought_id``'s primary key deletes
     the existing row and re-inserts it, internally, as part of resolving the
@@ -895,10 +895,8 @@ def _corrupt_fts_with_raw_replace(db_path: Path, thought_id: str) -> None:
     ``REPLACE``. The old entry survives, stale, pointing at a rowid ``thought``
     no longer uses.
 
-    This calls no engrava code at all: it exists to build a database "already
-    carrying stale FTS rows produced by the 0.6.0 behaviour" (the WS's own
-    acceptance wording) without going through ``restore``, which -- once this
-    fix lands -- can no longer produce that state itself.
+    This calls no engrava code at all: it builds a database that already
+    carries stale FTS rows without going through ``restore``.
 
     Args:
         db_path: Path to a database already holding a thought with this id.
@@ -2446,11 +2444,11 @@ class TestRestore:
         """``--clear`` from an unrelated snapshot must not leave a journal that
         describes thoughts the clear just removed.
 
-        Before the fix, ``journal_entry`` was not in the table list ``--clear``
-        iterates and no foreign key reaches it, so it survived untouched:
-        ``thought`` held only the restored ``t-src`` row while ``journal_entry``
-        kept all three ``t-old-*`` entries, and ``verify_journal()`` reported
-        that mismatched chain as ``valid``.
+        ``journal_entry`` is not in the table list ``--clear`` iterates and no
+        foreign key reaches it, so ``--clear`` discards it with a statement of
+        its own. Afterwards ``thought`` holds only the restored ``t-src`` row,
+        all three ``t-old-*`` journal entries are gone, and ``verify_journal()``
+        reports the empty journal as ``valid``.
         """
         assert _journal_entry_count(journalled_db) == 3
 
@@ -3416,14 +3414,11 @@ class TestJournalledMergeCollisionGate:
         """A rollback failure while a collision error is propagating must not
         replace it.
 
-        Before this fix, ``_import_records_to_db``'s cleanup was a bare
-        ``finally: if not committed: await conn.rollback()`` -- a rollback
-        failure there raises in front of the collision ``click.ClickException``
-        that triggered it, so a user restoring into a journalled store sees a
-        message about the rollback itself (e.g. a disk error) instead of the
-        collision that is actually actionable. After the fix, the collision
-        error still reaches the caller unchanged and the rollback failure is
-        only in the log.
+        The collision ``click.ClickException`` is the message a user restoring
+        into a journalled store can act on; a rollback failure in
+        ``_import_records_to_db``'s cleanup (a disk error, say) must not be
+        raised in front of it. The collision error reaches the caller
+        unchanged and the rollback failure is only in the log.
         """
         import aiosqlite
 
@@ -3533,10 +3528,8 @@ class TestRestoreRebuildsFtsIndex:
     ) -> None:
         """Case 1: an ordinary merge restore (no journal) of a DB's own snapshot into itself.
 
-        Reproduces the WS's own measurement directly
-        (``scratch/audit-070/cli/fts_stale_repro.sh``): both thoughts collide
-        on their own unchanged primary key, and the pre-fix behaviour left 4
-        real index entries for "alpha" over 2 live thought rows.
+        Both thoughts collide on their own unchanged primary key; the index
+        must end with exactly one entry per live "alpha" thought (two in all).
         """
         db = tmp_path / "alpha.db"
         r1 = runner.invoke(cli, ["--db", str(db), "remember", "alpha apples orchard"])
@@ -3608,12 +3601,10 @@ class TestRestoreRebuildsFtsIndex:
     ) -> None:
         """Case 3: case 1's merge, followed by a ``--clear`` restore of unrelated data.
 
-        This is the WS's own headline defect: pre-fix, the merge above leaves
-        a stale "alpha" entry at a freed rowid, ``--clear`` empties the table,
-        and the very next insert (the first "zulu" thought) is handed that
-        same freed rowid by SQLite's ordinary rowid allocation -- so
-        ``recall "alpha"`` resolves the stale entry straight to a "zulu"
-        thought that does not contain the word at all.
+        A stale "alpha" entry left by the merge would point at a rowid that
+        the first "zulu" insert reuses after ``--clear`` empties the table, so
+        ``recall "alpha"`` would resolve it to a "zulu" thought that does not
+        contain the word at all.
         """
         db = tmp_path / "alpha.db"
         r1 = runner.invoke(cli, ["--db", str(db), "remember", "alpha apples orchard"])
@@ -3656,13 +3647,11 @@ class TestRestoreRebuildsFtsIndex:
         """Case 4a: a merge restore into an already-damaged database comes out consistent.
 
         The damage is built directly at the SQL level
-        (:func:`_corrupt_fts_with_raw_replace`), reproducing exactly what an
-        unfixed restore left behind without going through ``restore`` at all
-        -- which, with this fix, can no longer produce that state itself. A
-        per-row-delete-before-REPLACE alternative would not heal this: the
-        damage already happened in the past, on a row this restore's own
-        snapshot never even mentions, so it has nothing to key a delete on.
-        Only an unconditional, full rebuild reaches it.
+        (:func:`_corrupt_fts_with_raw_replace`), without going through
+        ``restore``. A per-row-delete-before-REPLACE alternative would not
+        heal this: the damage sits on a row this restore's own snapshot never
+        even mentions, so it has nothing to key a delete on. An
+        unconditional, full rebuild reaches it.
         """
         _corrupt_fts_with_raw_replace(plain_thoughts_db, "p-0")
         # Sanity: the corruption landed -- a stale entry plus a fresh one.
@@ -4808,10 +4797,7 @@ def _assert_fails_fast_and_names_the_problem(args: list[str], *, db_path: Path) 
     path coming from ``ENGRAVA_DB``/``--config`` rather than a literal
     ``--db`` on the command they typed -- unable to tell which store failed.
     Checking for *this invocation's* ``db_path`` fails on exactly that
-    regression, and also failed against the pre-fix behaviour (a raw Python
-    traceback whose frames name this CLI's own source files, never the
-    caller's database) -- see this test module's own history for the
-    red-then-green run that proved it.
+    regression.
     """
     completed, elapsed = _run_engrava_subprocess(args)
     _assert_completed_fails_fast(completed, elapsed)

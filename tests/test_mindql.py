@@ -964,8 +964,8 @@ class TestQuotedValueStaysString:
             )
         )
         result = await store.execute_mindql(parse("FIND thoughts WHERE source = '007'"))
-        # Pre-fix: '007' was coerced to int 7 and never matched the stored
-        # string '007', so this returned no rows.
+        # The quoted '007' stays the string '007' rather than becoming int 7,
+        # so it matches the stored string.
         assert {row["thought_id"] for row in result.rows} == {"t-zero-pad"}
 
 
@@ -1046,7 +1046,7 @@ class TestDefaultFindLimit:
                 )
             )
         result = await store.execute_mindql(parse("FIND thoughts"))
-        # Pre-fix: the query was unbounded and returned every stored row.
+        # ``default + 10`` rows are stored; only ``default`` of them come back.
         assert len(result.rows) == default
 
     async def test_explicit_limit_still_wins(
@@ -1886,10 +1886,9 @@ _WHITESPACE_TARGETS: list[tuple[str, str]] = [
 class TestParserQuotedValueWhitespacePreserved:
     """A quoted value's internal whitespace survives parsing byte-for-byte.
 
-    Before the fix, ``parse()`` tokenised the whole query on whitespace and
-    re-joined the WHERE/ORDER BY/LIMIT/OFFSET tail with single spaces before
-    any quote-aware parsing ran, so every run of whitespace inside a quoted
-    literal — a double space, a tab, a newline — collapsed to one space.
+    Every run of whitespace inside a quoted literal — a double space, a tab,
+    a newline — reaches the parsed condition unchanged, rather than being
+    collapsed to one space.
     """
 
     @pytest.mark.parametrize(("case_id", "value"), _WHITESPACE_TARGETS)

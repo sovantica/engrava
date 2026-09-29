@@ -326,15 +326,15 @@ class TestClusterCohesion:
 
 class TestIsLowCohesion:
     def test_magnitude_disagreement_case_admits_before_rejects_after(self) -> None:
-        # This is the case that shows the defect matters: a large-magnitude
-        # member paired with a mostly-orthogonal, small-magnitude member.
-        # The pre-fix raw dot product (1.5) clears the 0.40 threshold and
-        # admits the pair; the true cosine (~0.29) is below it and rejects
-        # the pair.
+        # This is the case that shows the normalisation matters: a
+        # large-magnitude member paired with a mostly-orthogonal,
+        # small-magnitude member. A raw dot product (1.5) would clear the
+        # 0.40 threshold and admit the pair; the true cosine (~0.29) is below
+        # it and rejects the pair.
         vec_c = [5.0, 0.0]
         vec_d = [0.3, 1.0]
         raw_dot_product = sum(x * y for x, y in zip(vec_c, vec_d, strict=False))
-        assert raw_dot_product == pytest.approx(1.5)  # pre-fix score: NOT low cohesion
+        assert raw_dot_product == pytest.approx(1.5)  # as a score: NOT low cohesion
         is_loose, score = is_low_cohesion([vec_c, vec_d], cohesion_threshold=0.40)
         assert score == pytest.approx(0.2873478855663454)
         assert is_loose is True
@@ -378,35 +378,30 @@ class TestIsLowCohesion:
         assert score == pytest.approx(1.0)
 
     def test_nan_paired_with_zero_vector_now_rejects_not_admits(self) -> None:
-        # Regression pin for a 0.6 -> 0.7 side-effect that the upgrade
-        # note now documents: a member vector containing nan, paired with
-        # a member vector whose own norm is exactly zero, scored nan
-        # under the pre-fix raw-dot-product formula (nan * 0.0 is nan;
-        # nan < threshold is False, so the cluster was admitted) and
-        # scores 0.0 here, because _pairwise_cosine_similarity's
-        # zero-norm check on the genuinely-zero vector fires before the
-        # nan in the other vector is ever examined (0.0 < threshold is
-        # True for any positive threshold, so the cluster is rejected).
+        # A member vector containing nan, paired with a member vector whose
+        # own norm is exactly zero, scores 0.0 (0.0 < threshold is True for
+        # any positive threshold, so the cluster is rejected). A raw dot
+        # product would score nan (nan * 0.0 is nan; nan < threshold is
+        # False, so the cluster would be admitted).
         is_loose, score = is_low_cohesion([[float("nan")], [0.0]], cohesion_threshold=0.40)
         assert score == 0.0
         assert is_loose is True
 
     def test_inf_paired_with_zero_vector_now_rejects_not_admits(self) -> None:
-        # Same mechanism as the nan case above: inf * 0.0 is nan under the
-        # pre-fix raw dot product (admitted); the zero-norm branch fires
-        # here instead and scores 0.0 (rejected).
+        # Like the nan case above: inf * 0.0 is nan in a raw dot product
+        # (which would admit the cluster); this pair scores 0.0 instead
+        # (rejected).
         is_loose, score = is_low_cohesion([[float("inf")], [0.0]], cohesion_threshold=0.40)
         assert score == 0.0
         assert is_loose is True
 
     def test_overflowing_antiparallel_pair_now_admits_not_rejects(self) -> None:
-        # The opposite-direction side-effect: an anti-parallel pair whose
-        # magnitudes overflow float64 scored -inf under the pre-fix raw
-        # dot product (1e200 * -1e200 overflows straight to -inf) —
-        # correctly rejected, since -inf is below any threshold. Here
-        # both norms also overflow to inf, and -inf / inf is nan, which
-        # is neither below nor above any threshold, so the cluster is
-        # admitted instead.
+        # The opposite-direction case: an anti-parallel pair whose
+        # magnitudes overflow float64 would score -inf as a raw dot product
+        # (1e200 * -1e200 overflows straight to -inf), which is rejected,
+        # since -inf is below any threshold. Here both norms also overflow
+        # to inf, and -inf / inf is nan, which is neither below nor above any
+        # threshold, so the cluster is admitted instead.
         import math
 
         is_loose, score = is_low_cohesion([[1e200], [-1e200]], cohesion_threshold=0.40)

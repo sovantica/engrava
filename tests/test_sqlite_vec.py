@@ -426,8 +426,9 @@ class TestSqliteVecRealConnection:
     async def test_sqlite_vec_backend_constructs_and_searches(self, tmp_path: Path) -> None:
         """A real sqlite-vec backend loads, indexes, and returns ranked results.
 
-        This is the regression guard for the worker-thread load: on the
-        pre-fix code construction raised ``sqlite3.ProgrammingError`` here.
+        This guards the worker-thread load: the extension is loaded on
+        aiosqlite's worker thread, the thread the queries run on, so
+        construction yields a live backend.
         """
         store = await self._build_store(tmp_path, backend="sqlite-vec", dimension=3)
         try:
@@ -712,9 +713,10 @@ class TestVec0DeleteRemovesVector(TestSqliteVecRealConnection):
     async def test_delete_thought_removes_vec_row(self, tmp_path: Path) -> None:
         """delete_thought purges the vec0 vector; a later search never sees it.
 
-        On the pre-fix code the ``embedding`` row is FK-cascaded away but the
-        vec0 vector lingers, so the rowid stays in ``embedding_vec`` and can
-        still occupy a KNN slot.
+        The ``embedding`` row is removed with the thought, but that removal
+        does not reach the vec0 table; the vector has to be purged as
+        well, or its rowid would stay in ``embedding_vec`` and could still
+        occupy a KNN slot.
         """
         store = await self._build_store(tmp_path, backend="sqlite-vec", dimension=3)
         try:
@@ -1082,9 +1084,9 @@ class TestVec0OverfetchFillsTopK(TestSqliteVecRealConnection):
     async def test_search_similar_fills_topk_despite_expired(self, tmp_path: Path) -> None:
         """search_similar returns top_k live rows even when nearer rows are dead.
 
-        On the pre-fix code only ``top_k`` neighbours are fetched; the closest
-        ``top_k`` are the non-live rows, which the post-filter removes, leaving
-        fewer than ``top_k`` (often zero) results.
+        The nearest neighbours are non-live rows that the live-row post-filter
+        drops; the arm over-fetches past them, so the result is still filled
+        to ``top_k`` live rows.
         """
         store = await self._build_store(tmp_path, backend="sqlite-vec", dimension=2)
         try:
@@ -1483,10 +1485,10 @@ class TestMergeRestoreDoesNotLeaveAStaleVectorUnderAReusedRowid:
     ``_reset_sqlite_vec_index_for_restore``. In an unjournalled target,
     replacing an embedded thought cascade-deletes its old ``embedding`` row,
     freeing its rowid; the incoming replacement embedding can land on that
-    same freed rowid. Before the fix, the old vec0 entry at that rowid was
-    never invalidated, so it kept winning search under the new row's
-    identity. This builds that exact scenario against a real sqlite-vec
-    backend and shows which vector wins after a reopen.
+    same freed rowid. The old vec0 entry at that rowid has to be invalidated,
+    or it would keep winning search under the new row's identity. This builds
+    that exact scenario against a real sqlite-vec backend and shows which
+    vector wins after a reopen.
     """
 
     async def _build_target_with_one_embedded_thought(
@@ -1539,10 +1541,9 @@ class TestMergeRestoreDoesNotLeaveAStaleVectorUnderAReusedRowid:
     async def test_restored_rows_own_vector_wins_after_reopen(self, tmp_path: Path) -> None:
         """The exact scenario: forced rowid reuse via a merge restore.
 
-        Pre-fix this fails: the old vector (``old_vector``) keeps winning a
-        search for itself even though the target thought's embedding was
-        replaced, and a search for the new vector (``new_vector``) does not
-        find a perfect match at all. Post-fix, the reverse holds.
+        After the replace, a search for ``new_vector`` finds the thought as a
+        perfect match, and the best score for a search for ``old_vector`` is
+        0.0.
         """
         model_name = _PARITY_MODEL
         old_vector = [1.0, 0.0, 0.0]

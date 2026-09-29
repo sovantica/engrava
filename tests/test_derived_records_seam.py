@@ -2287,22 +2287,16 @@ async def test_close_after_quarantine_shares_the_close_task_and_returns_promptly
     test does not want in the picture.
 
     Quarantine schedules its own detached close of the real connection
-    first. Before the fix, ``close()`` would then hit the quarantine proxy's
-    own no-op ``close()`` — harmless here, but only because this ordering
-    happens to route around the real connection entirely, not because the
-    two were coordinated. The fix makes ``close()`` explicitly await
-    quarantine's own close task instead, so ``close()`` must not return
-    before the physical close is actually finished.
+    first. ``close()`` explicitly awaits quarantine's own close task, so it
+    must not return before the physical close is actually finished.
 
     Asserted by **gating the physical close and checking that ``close()``
     is still pending**, not by counting how many times it ran: a counter
     can be satisfied by quarantine's own detached task completing on its
-    own schedule, regardless of whether ``close()`` ever joined it — which
-    is exactly the scheduling-dependent false pass this test used to be
-    exposed to (green on a schedule where quarantine's task happened to run
-    before the assertion, independent of whether ``close()`` itself waited
-    for anything). Checking that ``close()`` remains pending until the gate
-    is explicitly released tests the property directly.
+    own schedule, regardless of whether ``close()`` ever joined it, which
+    would be a scheduling-dependent false pass. Checking that ``close()``
+    remains pending until the gate is explicitly released tests the
+    property directly.
     """
     conn = await aiosqlite.connect(":memory:")
     conn.row_factory = aiosqlite.Row

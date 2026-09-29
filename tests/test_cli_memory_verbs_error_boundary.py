@@ -1264,20 +1264,18 @@ class TestDescribeExceptionReraisesControlFlowSignals:
     def test_remember_lets_a_keyboard_interrupt_reach_clicks_own_abort_handling(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A raised ``KeyboardInterrupt`` now reaches Click's own interrupt handling, not ours.
+        """A raised ``KeyboardInterrupt`` reaches Click's own interrupt handling, not ours.
 
-        ``_error_boundary`` catches only ``Exception``, and (after this fix)
+        ``_error_boundary`` catches only ``Exception``, and
         ``_describe_exception`` re-raises rather than converts a
         ``KeyboardInterrupt`` too, so it propagates all the way up through
         ``asyncio.run()`` and the command callback to Click's own
         ``BaseCommand.main()`` -- the same top-level ``except (EOFError,
         KeyboardInterrupt)`` handling that turns a real terminal Ctrl-C into
         ``Abort`` -- rather than being disguised as this CLI's own
-        ``unexpected_error`` JSON object first. Confirmed against the
-        pre-fix guard (plain ``except BaseException``) that the same
-        scenario instead produces exactly that JSON object, with the
-        exception's type name and ``<str() raised>`` placeholder baked into
-        ``message`` as if it had been safely diagnosed.
+        ``unexpected_error`` JSON object first, with the exception's type
+        name and ``<str() raised>`` placeholder baked into ``message`` as if
+        it had been safely diagnosed.
         """
         monkeypatch.setattr(memory_commands.uuid, "uuid4", _raise_keyboard_interrupt_on_str)
         db = tmp_path / "m.db"
@@ -1286,10 +1284,10 @@ class TestDescribeExceptionReraisesControlFlowSignals:
         result = runner.invoke(cli, ["--db", str(db), "remember", "hi", "--json"])
 
         # Click's own Abort handling still exits non-zero via a fresh
-        # SystemExit(1) -- the exit code alone does not distinguish the fix
-        # from the bug it replaces. What distinguishes them is the output:
-        # no JSON error object at all, and Click's own "Aborted!" message
-        # instead of a fabricated diagnosis of the exception.
+        # SystemExit(1) -- the exit code alone does not tell an interrupt
+        # that reached Click from one turned into an error object. The output
+        # does: no JSON error object at all, and Click's own "Aborted!"
+        # message instead of a fabricated diagnosis of the exception.
         assert isinstance(result.exception, SystemExit)
         assert "Aborted!" in result.output
         assert "schema" not in result.output
@@ -1984,20 +1982,11 @@ class TestCleanupLogNoLongerReformatsThePropagatingException:
     ) -> None:
         """A ``KeyboardInterrupt`` raised while describing the close exception must escape.
 
-        A real OS ``SIGINT`` delivered during this exact window was also
-        verified live against this fix, but ``asyncio.run()``'s own
-        signal-delivery timing is not
-        reliable enough on this platform to assert on in an automated test
-        -- a ``time.sleep`` polling loop woken by a self-delivered
-        ``os.kill(..., SIGINT)`` inside this exact call stack was observed
-        to defer the interrupt past process exit in both the pre-fix and
-        post-fix code, which is a CPython/asyncio scheduling property, not
-        something either version of this code controls. This exercises the
-        same guarded read deterministically instead: ``__str__`` raising
-        ``KeyboardInterrupt`` directly, exactly like
-        :class:`TestDescribeExceptionReraisesControlFlowSignals`'s existing
-        coverage of the *original* exception's own describe call, applied
-        here to the *close* exception's.
+        This exercises the guarded read deterministically: ``__str__``
+        raising ``KeyboardInterrupt`` directly, exactly like
+        :class:`TestDescribeExceptionReraisesControlFlowSignals`'s coverage
+        of the *original* exception's own describe call, applied here to the
+        *close* exception's.
         """
         db = tmp_path / "m.db"
         config_path = tmp_path / "engrava.yaml"
@@ -2080,21 +2069,18 @@ class TestCleanupLogNoLongerReformatsThePropagatingException:
     def test_real_external_sigint_during_close_description_now_aborts(
         self, tmp_path: Path, extra_args: list[str]
     ) -> None:
-        """A real, externally delivered ``SIGINT`` during this exact window must now abort.
+        """A real, externally delivered ``SIGINT`` during this exact window must abort.
 
-        Before the fix, this was absorbed, confirmed live for both
-        ``--verbose`` on and off: with no suspension point between building
-        the close-exception warning and re-raising the original exception,
-        ``asyncio.run()``'s pending task-cancellation request (see
-        :func:`_run_subprocess_with_external_sigint`'s own docstring) was
-        simply dropped, and the process finished the warning, emitted the
-        original ``unexpected_error`` JSON, and exited ``1``. The fix adds a
-        genuine ``await
-        asyncio.sleep(0)`` checkpoint in
-        :func:`~engrava.cli.memory_commands._opened_full_store`, after the
-        warning is logged and before the original exception is re-raised, so
-        a cancellation requested during that synchronous stretch is now
-        delivered there instead of being lost.
+        With no suspension point between building the close-exception
+        warning and re-raising the original exception, ``asyncio.run()``'s
+        pending task-cancellation request (see
+        :func:`_run_subprocess_with_external_sigint`'s own docstring) would
+        be dropped, and the process would finish the warning, emit the
+        original ``unexpected_error`` JSON, and exit ``1``.
+        :func:`~engrava.cli.memory_commands._opened_full_store` therefore
+        awaits ``asyncio.sleep(0)`` after the warning is logged and before
+        the original exception is re-raised, so a cancellation requested
+        during that synchronous stretch is delivered there.
         """
         db = tmp_path / "m.db"
         config_path = tmp_path / "engrava.yaml"
@@ -2233,20 +2219,19 @@ class TestBareTierCleanupLogNowSharesTheSameFix:
     def test_real_external_sigint_during_close_description_now_aborts(
         self, tmp_path: Path, extra_args: list[str]
     ) -> None:
-        """A real, externally delivered ``SIGINT`` during this exact window must now abort.
+        """A real, externally delivered ``SIGINT`` during this exact window must abort.
 
-        Same defect as the ``--config`` tier's own
+        Same window as the ``--config`` tier's own
         ``TestCleanupLogNoLongerReformatsThePropagatingException.test_real_external_sigint_during_close_description_now_aborts``,
-        at this tier's own cleanup site (``main._close_quietly``): confirmed
-        live against this exact commit before the fix, absorbed for both
-        ``--verbose`` on and off -- the process finished the warning below,
-        emitted the original ``unexpected_error`` JSON, and exited ``1``
-        instead of aborting. The fix adds the identical ``await
-        asyncio.sleep(0)`` checkpoint here, after the warning is logged and
-        before this function returns (letting the caller's own ``raise``
-        re-raise the original exception), so a cancellation requested during
-        that synchronous stretch is now delivered inside this function
-        instead of being lost once it returns.
+        at this tier's own cleanup site (``main._close_quietly``): with no
+        suspension point after the warning is logged, the process would
+        finish the warning, emit the original ``unexpected_error`` JSON, and
+        exit ``1`` instead of aborting. ``main._close_quietly`` therefore
+        awaits ``asyncio.sleep(0)`` after the warning is logged and before it
+        returns (letting the caller's own ``raise`` re-raise the original
+        exception), so a cancellation requested during that synchronous
+        stretch is delivered inside this function instead of being lost once
+        it returns.
         """
         db = tmp_path / "m.db"
 
