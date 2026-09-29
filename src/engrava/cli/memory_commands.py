@@ -37,6 +37,7 @@ import uuid
 from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING, NoReturn
 
+import aiosqlite
 import click
 
 from engrava import (
@@ -55,7 +56,15 @@ from engrava import (
     ThoughtType,
 )
 from engrava.cli.exception_reporting import _describe_exception, _frame_only_stack
-from engrava.cli.main import _opened_db, _run, cli
+from engrava.cli.main import (
+    _apply_destructive_schema_gate_for_version,
+    _apply_read_schema_gate_for_version,
+    _close_quietly,
+    _opened_db,
+    _read_schema_version,
+    _run,
+    cli,
+)
 from engrava.cli.store_resolution import ResolvedStore, resolve_store_target
 from engrava.config_validation import ConfigError
 
@@ -107,8 +116,8 @@ class _CliError(Exception):
     """A memory-verb failure already classified by kind, message and exit code.
 
     Raised by :func:`_fail` instead of writing output and exiting on the
-    spot. The actual write is deferred to :func:`_error_boundary`, the one
-    place that performs it -- see that function's docstring for why the
+    spot. The actual write is deferred to :func:`_error_boundary`, which
+    performs it -- see that function's docstring for why the
     write has to happen there, after every ``async with`` block still open
     at the point of failure has finished unwinding, rather than here,
     before it.
@@ -125,15 +134,17 @@ class _CliError(Exception):
 def _emit_and_exit(*, as_json: bool, kind: str, message: str, code: int) -> NoReturn:
     r"""Write the one, terminal line of output for a command's failure, and exit.
 
-    This is the *only* place that writes a memory-verb's failure output --
-    :func:`_fail` no longer does, precisely so that nothing else in the
-    command can write after it (see :func:`_error_boundary`, the only
-    caller). ``message`` is always an *exact* ``str`` instance by the time
-    it reaches here: ``_fail``'s callers pass literal text or the shared
-    fixed-fallback constants, the boundary's own generic branch builds its
-    fallback through :func:`_describe_exception` (which normalizes both
-    halves with :func:`~engrava.config_validation.own_str` before
-    returning), and the two known-error adapters in
+    This writes the failure output of a memory verb that reaches
+    :func:`_error_boundary` -- :func:`_fail` no longer does, precisely so that
+    nothing else in the command can write after it (see
+    :func:`_error_boundary`, the only caller). A schema refusal is written
+    earlier, by the schema gate, and never reaches here. ``message`` is always
+    an *exact* ``str`` instance by the time it reaches here: ``_fail``'s
+    callers pass literal text or the shared fixed-fallback constants, the
+    boundary's own generic branch builds its fallback through
+    :func:`_describe_exception` (which normalizes both halves with
+    :func:`~engrava.config_validation.own_str` before returning), and the two
+    known-error adapters in
     :func:`_resolve_for_command` / ``link`` now check ``type(...) is str``
     on a field before ever using it, falling back to a fixed literal
     otherwise -- so nothing here can be a ``str`` *subclass* whose own
@@ -252,8 +263,9 @@ def _error_boundary(*, as_json: bool, command: str) -> Iterator[_ResolvedDatabas
     signature says what they raise. Catching ``Exception`` once, here, closes
     the *class* of defect instead of chasing its latest instance.
 
-    **This is also the only place that writes a failure's output, and it
-    does so only after everything it wraps has finished unwinding.** The
+    **This is also the only place that writes the output of a failure that
+    reaches it, and it does so only after everything it wraps has finished
+    unwinding.** The
     previous shape -- ``_fail`` itself calling ``click.echo`` and
     ``sys.exit()`` at the point of detection -- let cleanup still running
     *underneath* that call corrupt the output
@@ -274,8 +286,10 @@ def _error_boundary(*, as_json: bool, command: str) -> Iterator[_ResolvedDatabas
     own failure, logged rather than raised -- see ``_opened_full_store``)
     always completes *before* this ``except`` clause below ever runs. The
     write-and-exit in :func:`_emit_and_exit` is therefore always the last
-    thing a failing invocation does, by construction, not by checking that it
-    happened to be.
+    thing a failing invocation that reaches it does, by construction, not by
+    checking that it happened to be. A schema refusal does not reach it: the
+    schema gate prints that refusal and exits before the store is opened, so
+    nothing is left to unwind.
 
     **A kind this module already classifies specifically never reaches the
     generic branch below -- not even for a subclass.** An *exact*
@@ -516,12 +530,84 @@ def _parse_kv_pairs(pairs: tuple[str, ...], *, option_name: str, as_json: bool) 
     return result
 
 
+def _read_only_uri(db_path: Path) -> str:
+    """Build the SQLite URI that opens *db_path* read-only, without creating it."""
+    return f"{db_path.absolute().as_uri()}?mode=ro"
+
+
+@asynccontextmanager
+async def _read_only_connection(db_path: Path) -> AsyncIterator[aiosqlite.Connection]:
+    """Open *db_path* read-only on its own short-lived connection.
+
+    ``mode=ro`` does not create the database file or change it, so this can
+    look at a database the caller has not yet decided to touch. On a
+    WAL-mode database SQLite may create ``-wal`` and ``-shm`` files beside
+    it. It also leaves the journal mode alone: the bare tier's
+    ``_opened_db`` switches
+    every file it opens to WAL, which rewrites the file header, and that is
+    not a change to make to a database a command is about to refuse.
+
+    Closes on every exit. A close failure is only reported when the block
+    succeeded; if the block already raised, that error is the one to see.
+    """
+    conn = await aiosqlite.connect(_read_only_uri(db_path), uri=True)
+    try:
+        yield conn
+    except BaseException:
+        await _close_quietly(conn)
+        raise
+    else:
+        await conn.close()
+
+
+async def _gate_stored_schema(
+    resolved: ResolvedStore,
+    *,
+    command: str,
+    refuse_behind: bool,
+    tolerate_uninitialised: bool,
+) -> None:
+    """Apply the CLI schema-version gate to an existing database, before it is opened.
+
+    The stamped ``user_version`` is read on a separate read-only connection
+    (:func:`_read_only_connection`), so a refused database file is left
+    exactly as it was found: it is not migrated and its journal mode is not
+    switched.
+
+    Args:
+        resolved: The target chosen by :func:`resolve_store_target`. The
+            file at ``resolved.db_path`` must exist.
+        command: The command name, named in the message.
+        refuse_behind: ``True`` refuses a schema below head, naming
+            ``engrava migrate``; ``False`` warns on stderr and lets the
+            command run against the schema as stored. A schema above head is
+            refused either way.
+        tolerate_uninitialised: ``True`` lets a file through that is stamped
+            ``0`` and holds no schema object at all -- a zero-byte or freshly
+            touched file has nothing to migrate, and the command that is
+            allowed to create a database initialises it as it would a new one.
+
+    """
+    async with _read_only_connection(resolved.db_path) as conn:
+        version = await _read_schema_version(conn)
+        cursor = await conn.execute("SELECT COUNT(*) FROM sqlite_master")
+        row = await cursor.fetchone()
+        holds_schema_objects = bool(row and row[0])
+    if tolerate_uninitialised and version == 0 and not holds_schema_objects:
+        return
+    if refuse_behind:
+        _apply_destructive_schema_gate_for_version(version, command=command)
+    else:
+        _apply_read_schema_gate_for_version(version, command=command)
+
+
 @asynccontextmanager
 async def _opened_full_store(
     resolved: ResolvedStore,
     cfg: EngravaCLIConfig,
     *,
     create: bool,
+    command: str,
 ) -> AsyncIterator[SqliteEngravaCore]:
     """Open the resolved target as a fully configured store.
 
@@ -536,19 +622,45 @@ async def _opened_full_store(
     ``create=True`` — a read command (``recall``) must not leave a new empty
     directory behind on a path it is about to refuse.
 
+    A database that already exists is checked against this build's schema
+    version before the file is opened, and a schema above head is refused
+    outright. A schema below head is refused too, naming ``engrava migrate``,
+    when the caller may write (``create=True``: ``remember`` / ``link`` do not
+    migrate a core schema they were not asked to) or when the target is a
+    ``--config`` store (``from_config`` applies pending core migrations as it
+    opens, which a read must not do; it applies pending extension migrations
+    whatever the core version). A read on the bare tiers warns and runs
+    against the schema as stored. A path that does not exist yet is not
+    checked; with ``create=True`` it is created and brought to head. So is an
+    existing file that holds no schema at all (zero bytes, or freshly
+    touched).
+
     Args:
         resolved: The target chosen by :func:`resolve_store_target`.
         cfg: The CLI config, forwarded to ``_opened_db`` for the bare tiers.
         create: Whether this call may create the database (and its parent
             directory) if absent. The caller is responsible for the
             absent-database *read* refusal — this context manager never
-            refuses, it only avoids creating on the caller's behalf.
+            refuses an absent path, it only avoids creating on the caller's
+            behalf.
+        command: The command name, named in a schema-version refusal.
 
     Yields:
         An open, fully configured store. Closed on exit regardless of how the
         block completes.
 
     """
+    # Decided before anything opens the file: the bare tier's ``_opened_db``
+    # creates it, so a later ``exists()`` would always be true.
+    pre_existing = resolved.db_path.exists()
+    if pre_existing:
+        await _gate_stored_schema(
+            resolved,
+            command=command,
+            refuse_behind=create or resolved.source == "config",
+            tolerate_uninitialised=create,
+        )
+
     if create:
         resolved.db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -655,14 +767,12 @@ async def _opened_full_store(
         async with _opened_db(cfg) as conn:
             store = SqliteEngravaCore(conn)
             if create:
-                # A bare connection never migrates on its own -- info /
-                # verify / query / gc rely on that (they refuse or warn
-                # instead, see the schema-version gate above them in
-                # main.py) because they only ever act on a database that
-                # supposedly already exists. remember / link are different:
-                # they are allowed to create the database, and a freshly
-                # created file has no `thought` table at all until this
-                # runs. Idempotent on an already-migrated database.
+                # A bare connection never migrates on its own. remember /
+                # link may create the database, and a freshly created file
+                # has no `thought` table at all until this runs. An existing
+                # file only gets here at head, or holding no schema at all
+                # (see the gate above), so this initialises a new database
+                # or does nothing.
                 await store.ensure_schema()
             yield store
 
@@ -830,7 +940,11 @@ def remember(
     ``--type`` / ``--priority``.
 
     Creates the resolved database if it does not already exist, printing the
-    path to stderr when it does.
+    path to stderr when it does. An existing database's core schema is not
+    migrated: one stamped below this build's head version is refused with a message naming
+    ``engrava migrate``, and one stamped above it is refused as newer than
+    this build understands. Both exit ``1`` with a plain message on stderr,
+    under ``--json`` too, and leave the file untouched.
 
     The whole body below runs under :func:`_error_boundary`: a validation
     failure this function checks for itself keeps its own specific ``error``
@@ -855,7 +969,7 @@ def remember(
 
         async def _remember() -> None:
             pre_existing = resolved.db_path.exists()
-            async with _opened_full_store(resolved, cfg, create=True) as store:
+            async with _opened_full_store(resolved, cfg, create=True, command="remember") as store:
                 if not pre_existing:
                     click.echo(f"Created database: {resolved.db_path}", err=True)
                 _report_resolution(cfg, resolved)
@@ -928,6 +1042,13 @@ def recall(
     Exits ``3`` naming the resolved path when the database does not exist,
     rather than silently reporting zero hits.
 
+    Checks the database's schema version before opening it, and exits ``1``
+    with a plain message on stderr (and nothing on stdout, under ``--json``
+    too) when the schema is newer than this build understands. A schema
+    below head is warned about on stderr and read as stored on ``--db`` and
+    the default path; under ``--config`` it is refused, because a configured
+    store applies pending core migrations as it opens and a read must not.
+
     The whole body below runs under :func:`_error_boundary`: a validation
     failure this function checks for itself — including a malformed
     ``--filter`` key rejected by :class:`~engrava.domain.models.filters.FieldPredicate`
@@ -982,7 +1103,7 @@ def recall(
         metadata_filter = MetadataFilter(predicates) if predicates else None
 
         async def _recall() -> None:
-            async with _opened_full_store(resolved, cfg, create=False) as store:
+            async with _opened_full_store(resolved, cfg, create=False, command="recall") as store:
                 _report_resolution(cfg, resolved)
 
                 result = await store.recall(query, top_k=top_k, filters=metadata_filter)
@@ -1049,7 +1170,11 @@ def link(
 
     Builds an ``EdgeRecord`` and calls the public ``create_edge()`` — there is
     no public ``link()`` to call instead. Creates the resolved database if it
-    does not already exist, printing the path to stderr when it does.
+    does not already exist, printing the path to stderr when it does. An
+    existing database's core schema is not migrated, and is checked before the two thought
+    ids are: one below this build's head version is refused with a message
+    naming ``engrava migrate``, one above it as newer than this build
+    understands, both with exit ``1`` and the file untouched.
 
     The whole body below runs under :func:`_error_boundary`: a validation
     failure this function checks for itself keeps its own specific ``error``
@@ -1091,7 +1216,7 @@ def link(
 
         async def _link() -> None:
             pre_existing = resolved.db_path.exists()
-            async with _opened_full_store(resolved, cfg, create=True) as store:
+            async with _opened_full_store(resolved, cfg, create=True, command="link") as store:
                 if not pre_existing:
                     click.echo(f"Created database: {resolved.db_path}", err=True)
                 _report_resolution(cfg, resolved)

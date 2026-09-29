@@ -343,9 +343,10 @@ Physically deleting rows through an engine that does not understand the
 schema it is deleting from is how this defect reached a user in the first
 place, so `gc` — and every other built-in command that deletes user data —
 now exits non-zero and names `engrava migrate` rather than proceeding on an
-unmigrated database. A read-only command (`info`, `verify`, `export`,
-`snapshot`, and a `query` that parses as `FIND`/`COUNT`/`SELECT`) is still
-allowed to run against a behind schema — refusing an ordinary read because a
+unmigrated database. A read-only command (the list is under
+[Schema-version checks](cli.md#schema-version-checks), which also names the one
+exception, `recall` under `--config`) is still allowed to run against a behind
+schema — refusing an ordinary read because a
 migration is pending would trade this defect for a worse one — but it warns
 on stderr that the schema is behind rather than staying silent about it.
 

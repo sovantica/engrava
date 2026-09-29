@@ -1077,8 +1077,9 @@ the TTL and hygiene delete paths) now delete `edge`, `embedding`, and
 `action` rows explicitly — atomically with the parent delete, which runs
 first — on every schema version, rather than depending on the core-12
 `ON DELETE CASCADE`. Schema
-version checks are also new: destructive commands refuse outside the head
-version, read commands warn below it and refuse above it, and the new
+version checks are also new: destructive commands, `remember` and `link`
+refuse a database outside the head version, read commands warn below it and
+refuse above it (`recall` with `--config` refuses below it too), and the new
 `SchemaVersionError` (exported from the package root) is what `ensure_schema()`,
 `from_config()`, `EngravaManager.get_store()`, and `engrava migrate` raise
 when a database is a populated schema below the bootstrap floor, an empty

@@ -99,20 +99,31 @@ multi-service mode when a services config is present.
 
 ## Schema-version checks
 
-Every built-in command now checks the database's schema version before it
-acts, and the two kinds of command are held to different rules:
+The commands in this table check the database's schema version before they
+act, and the two kinds of command are held to different rules:
 
 | Kind | Commands | On a schema below head | On a schema above head |
 |---|---|---|---|
 | Destructive | `gc`, `restore` | **Refuses**, exit `1`, names `engrava migrate` | **Refuses**, exit `1` |
-| Read | `info`, `verify`, `export`, `snapshot`, a `query` that parses as `FIND`/`COUNT`/`SELECT` | Warns on stderr and runs anyway | **Refuses**, exit `1` |
+| Read | `info`, `verify`, `export`, `snapshot`, `recall` (with `--db` or the default path), a `query` that parses as `FIND`/`COUNT`/`SELECT` | Warns on stderr and runs anyway | **Refuses**, exit `1` |
+
+Under `--config`, `recall` refuses on a schema below head as well as above it,
+because a configured store applies pending core migrations as it opens and a
+read must not. It also applies the pending migrations of the extensions listed
+under [`manifests`](configuration.md#manifests) whatever the core schema's
+version, so a configured `recall` can run those on a database at head.
+
+`remember` and `link` do not migrate the core schema of a database that already
+exists. Below head they refuse, exit `1`, naming `engrava migrate`; above head they refuse
+the way the commands above do. A path that does not exist yet is created at
+head, and so is an empty file (no bytes, no schema).
 
 A destructive command never deletes rows through an engine that does not
 understand the schema it is deleting from — that gap is how a deleted thought
 could come back on an unmigrated database (see
 [Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated)).
-A read command is allowed to attempt anyway, because refusing an ordinary read
-over a pending migration would be a worse failure than the one this replaces —
+Apart from `recall` under `--config`, a read command is allowed to attempt
+anyway, because refusing an ordinary read over a pending migration would be a worse failure than the one this replaces —
 but it is never silent about the gap. `query` classifies by the **parsed**
 command, not by the fact that you typed `query`: a registered extension
 command can write, so it is refused like a destructive one whenever the
@@ -123,9 +134,13 @@ to, when the database is a populated pre-history schema `ensure_schema()`
 cannot safely bootstrap, or is stamped above this build's head version) is
 its entire job.
 
+A refusal is a plain message on stderr, exit `1`, and nothing on stdout —
+also under `--json` and `--format json`. It is not an `engrava.cli.error.v1`
+object.
+
 ```bash
 $ engrava --db old.db gc
-Database schema is at version 11; this engrava build's head version is 20. Run 'engrava migrate' before running 'gc' on it.
+Database schema is at version 11; this engrava build's head version is 21. Run 'engrava migrate' before running 'gc' on it.
 $ echo $?
 1
 ```
@@ -276,7 +291,9 @@ three — that config section is consulted only by `snapshot` / `restore`
 themselves.
 
 **Creation.** `remember` and `link` create the resolved database (and its
-parent directory) if it does not already exist, printing the path to stderr:
+parent directory) if it does not already exist, printing the path to stderr.
+The core schema of a database that already exists is never migrated by them; see
+[Schema-version checks](#schema-version-checks).
 
 ```bash
 $ engrava --db new.db remember "first thought"
@@ -300,7 +317,7 @@ $ echo $?
 | Code | Meaning |
 |---|---|
 | `0` | Success. |
-| `1` | An **unanticipated** failure — anything the command's own validation does not specifically check for (a corrupt database file, a directory given as `--db`, an unreadable or non-UTF-8 `--config`, ...). Every one of these three commands runs its whole body under a single error boundary: a check the command performs itself (below) keeps its own specific code and `error` kind, but *any other* exception is converted here instead of tracebacking. The message names the resolved database's path, right after the command name, followed by the exception's own type and text (e.g. `recall: /data/store.db: unexpected DatabaseError: file is not a database`) — actionable, and specific to *this* invocation's database rather than leaving an operator running against several stores to guess which one failed. It is never a stack trace; either half of the exception's own description falls back to a fixed placeholder if it cannot be read safely, and a genuine Ctrl-C or `sys.exit()` raised while that message is being built escapes immediately instead of becoming this exit code at all. The path is only named once the database has actually been resolved — a failure earlier than that (there is none today) would fall back to the path-free `recall: unexpected ...` form. Rerun with `--verbose` to log the caught exception's stack (to stderr, at `DEBUG`) for a real bug report — deliberately not a full traceback: it lists each frame's filename, line number, and function name, read from the exception's own traceback without calling the exception's formatter (or a cause's, a context's, or an exception group's) a second time. That trade gives up some diagnostic detail — no chained-exception text, no source lines, no local variables — for a Ctrl-C or `sys.exit()` landing while `--verbose` builds that output now escaping immediately too, rather than the earlier behaviour where it could be absorbed and the command would still exit `1` with an ordinary error object. |
+| `1` | A database refused for its schema version (see [Schema-version checks](#schema-version-checks)), or an **unanticipated** failure — anything the command's own validation does not specifically check for (a corrupt database file, a directory given as `--db`, an unreadable or non-UTF-8 `--config`, ...). Every one of these three commands runs its whole body under a single error boundary: a check the command performs itself (below) keeps its own specific code and `error` kind, but *any other* exception is converted here instead of tracebacking. For an unanticipated failure the message names the resolved database's path, right after the command name, followed by the exception's own type and text (e.g. `recall: /data/store.db: unexpected DatabaseError: file is not a database`) — actionable, and specific to *this* invocation's database rather than leaving an operator running against several stores to guess which one failed. It is never a stack trace; either half of the exception's own description falls back to a fixed placeholder if it cannot be read safely, and a genuine Ctrl-C or `sys.exit()` raised while that message is being built escapes immediately instead of becoming this exit code at all. The path is only named once the database has actually been resolved — a failure earlier than that, such as a non-UTF-8 `--config`, falls back to the path-free `recall: unexpected ...` form. Rerun with `--verbose` to log the caught exception's stack (to stderr, at `DEBUG`) for a real bug report — deliberately not a full traceback: it lists each frame's filename, line number, and function name, read from the exception's own traceback without calling the exception's formatter (or a cause's, a context's, or an exception group's) a second time. That trade gives up some diagnostic detail — no chained-exception text, no source lines, no local variables — for a Ctrl-C or `sys.exit()` landing while `--verbose` builds that output now escaping immediately too, rather than the earlier behaviour where it could be absorbed and the command would still exit `1` with an ordinary error object. |
 | `2` | A usage or validation error: an unknown edge type, an empty `TEXT`, a malformed `--meta` / `--filter` token, an out-of-range `--top-k` / `--weight`, or a non-empty `--config` that does not exist or fails to parse. The message names the offending value when available, and for an enum, every valid member. |
 | `3` | The resolved database does not exist (`recall` only — `remember` / `link` create it instead). |
 | `4` | `link` named a `FROM` or `TO` thought that does not exist. The message names it, when available. |
@@ -312,8 +329,8 @@ should apply instead of expecting a closed list.
 
 **`--json` errors.** Once a `--json` failure reaches the command's own code —
 `--type` / `--priority` / `--top-k` / `--weight` already parsed and `--json`
-already known — it is *always* a JSON object, never a bare traceback, no
-matter what ordinary exception raised it: every specific `error` kind below
+already known — an ordinary exception becomes a JSON object, never a bare
+traceback, whatever raised it: every specific `error` kind below
 keeps its documented exit code, and anything neither this command nor its
 libraries were specifically checked for still becomes one, under `"error":
 "unexpected_error"`, exit `1` (see the exit-code table above). This does
@@ -325,7 +342,9 @@ for the full, non-exhaustive list. It also does not cover a genuine Ctrl-C or
 `sys.exit()` — even one that only surfaces while this CLI is building that
 very failure's message, or, under `--verbose`, while it is building that
 message's stack log — which propagates immediately, exactly as it would
-from a command's own body, rather than becoming a JSON object at all.
+from a command's own body, rather than becoming a JSON object at all. A
+schema-version refusal is not covered either: it is a plain message on stderr
+(see [Schema-version checks](#schema-version-checks)).
 
 ```json
 {"schema": "engrava.cli.error.v1", "error": "invalid_edge_type", "message": "Invalid edge type 'MADE_UP'; valid values: ASSOCIATED, DEPENDS_ON, DERIVED_FROM, MESSAGE_OF, BRIDGE, CONSOLIDATED_FROM, CONTESTED_BY"}
@@ -396,9 +415,9 @@ extra argument, an invalid root `--format`, and a missing value for any
 option that takes one (`--db`, `--config`, `--meta`, `--filter`, `--top-k`,
 `--weight`, `--type`, `--priority`). The rule for a consumer: **if `--json`'s
 own JSON object was never confirmed to have been reached — i.e. you cannot
-rule out a parse-phase rejection — do not assume stderr decodes**; attempt
-`json.loads()` and fall back to treating the raw text as a Click usage error
-on failure, rather than relying on an enumerated exception list (this one or
+rule out a parse-phase rejection or a schema-version refusal — do not assume
+stderr decodes**; attempt `json.loads()` and fall back to treating the raw text
+as plain text on failure, rather than relying on an enumerated exception list (this one or
 any other) to be complete.
 
 One parse-phase footgun worth naming explicitly: an option that takes a

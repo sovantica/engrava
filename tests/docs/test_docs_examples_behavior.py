@@ -70,7 +70,9 @@ from engrava import (
     thought,
     utterance,
 )
+from engrava.cli.main import _behind_schema_refusal
 from engrava.config import SearchConfig
+from engrava.infrastructure.sqlite.engrava_core import CORE_SCHEMA_HEAD_VERSION
 from tests.docs._md_blocks import (
     REPO_ROOT,
     CodeBlock,
@@ -1283,6 +1285,35 @@ def test_upgrade_page_publishes_the_error_the_code_actually_raises() -> None:
     raised = str(EmbeddingProviderContractError(provider_class="MyProvider", member="dimension"))
 
     assert published == raised
+
+
+def test_cli_page_publishes_the_head_version_the_build_actually_has() -> None:
+    """cli.md's schema-version example names the head version, so pin it to the constant.
+
+    The example shows the refusal ``gc`` prints on a database below head, which
+    embeds this build's head version. A number typed into the page goes stale at
+    the next schema bump; the message function reads the constant, so compare the
+    published line against what it produces for the version the page shows.
+    """
+    blocks = extract_fenced_blocks(REPO_ROOT / "docs/cli.md", "bash")
+    published_lines = [
+        line
+        for block in blocks
+        for line in block.body.splitlines()
+        if line.startswith("Database schema is at version ")
+    ]
+    assert len(published_lines) == 1, (
+        f"Expected exactly one published schema-version refusal in docs/cli.md, "
+        f"found {len(published_lines)}."
+    )
+    published = published_lines[0]
+
+    match = re.search(r"schema is at version (\d+); .* head version is (\d+)\.", published)
+    assert match is not None, f"Unrecognised refusal text in docs/cli.md: {published!r}"
+    stored_version, published_head = int(match.group(1)), int(match.group(2))
+
+    assert published_head == CORE_SCHEMA_HEAD_VERSION
+    assert published == _behind_schema_refusal(stored_version, command="gc")
 
 
 async def _rank_with_optional_edge(

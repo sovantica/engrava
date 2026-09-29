@@ -371,16 +371,14 @@ async def _opened_db(cfg: EngravaCLIConfig) -> AsyncIterator[Any]:
 # Schema-version gate
 # ------------------------------------------------------------------
 #
-# ``ensure_schema`` is reached from only three built-in command names —
-# ``migrate``, ``restore``, and ``snapshot`` in service mode — so every other
-# built-in (``info``, ``verify``, ``query``, ``export``, plain ``snapshot``,
-# and ``gc``) opens through ``_open_db`` and never learns whether the
-# database it is about to act on is even at the version it understands. This
-# gate classifies every built-in command as destructive or read and checks it
-# against the database's stamped ``user_version`` accordingly: a destructive
-# command refuses on anything but a head schema, a read command warns and
-# proceeds on a behind schema but still refuses above head, and ``query``
-# classifies by its parsed command rather than by the CLI command name.
+# A plain ``_open_db`` connection never learns whether the database it is about
+# to act on is even at the version it understands. This gate checks the
+# database's stamped ``user_version`` before a command acts on it, and
+# classifies the command as destructive or read: a destructive command refuses
+# on anything but a head schema, a read command warns and proceeds on a behind
+# schema (apart from ``recall`` under ``--config``, which refuses one; see
+# ``_opened_full_store``) but still refuses above head, and ``query`` classifies
+# by its parsed command rather than by the CLI command name.
 
 
 async def _read_schema_version(conn: Any) -> int:  # noqa: ANN401
@@ -3732,17 +3730,16 @@ def migrate(ctx: click.Context) -> None:
         # a corrupt existing target, a store-construction failure, or a
         # failure inside ensure_schema() alike — because opening the
         # connection and entering the protected block are the same step.
-        # migrate is the one built-in whose target may not exist yet —
-        # aiosqlite.connect() creates the file, matching today's behaviour
-        # of bootstrapping a fresh database.
+        # migrate's target may not exist yet — aiosqlite.connect() creates
+        # the file, matching today's behaviour of bootstrapping a fresh
+        # database.
         async with _opened_db(cfg) as conn:
             store = SqliteEngravaCore(conn)
             try:
-                # migrate is the one built-in that calls ensure_schema()
-                # unconditionally rather than through the schema-version
-                # gate — that is its entire job. ensure_schema() itself
-                # still refuses a populated sub-floor database or one
-                # stamped above this build's head version
+                # migrate calls ensure_schema() unconditionally rather than
+                # through the schema-version gate — that is its entire job.
+                # ensure_schema() itself still refuses a populated sub-floor
+                # database or one stamped above this build's head version
                 # (SchemaVersionError) rather than mislabelling or silently
                 # opening either; caught here so that refusal reads as a
                 # clean message, not a traceback.

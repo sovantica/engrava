@@ -607,8 +607,7 @@ def pre_cascade_mixed_lifecycle_db(tmp_path: Path) -> Path:
     """Materialise the same corpus on a real pre-cascade (core-11) schema.
 
     ``gc`` opens its database through the CLI's plain connection helper, which
-    sets PRAGMAs and **never migrates** — ``ensure_schema`` is reached only by
-    ``restore`` and by the ``migrate`` command. A database last written before
+    sets PRAGMAs and **never migrates**. A database last written before
     the ``v11 -> v12`` migration added the ``ON DELETE CASCADE`` foreign keys is
     therefore a shape ``engrava gc`` can genuinely be pointed at, and there
     ``PRAGMA foreign_keys = ON`` has no constraints to enforce.
