@@ -86,7 +86,7 @@ keyword arguments and does **not** return a UUID string.
 | `await restore_thought(thought_id, *, current_cycle=None)` | `ThoughtRecord` | Un-archive: transition an `ARCHIVED` thought back to `ACTIVE`, clearing both hygiene markers (`archived_at_cycle` and `archived_at`). It does not restore `expires_at`: an expiry cleared during hygiene archival stays cleared after restore. The reversible counterpart to the memory-hygiene / TTL / manual archive paths, journaled as an `UPDATE_THOUGHT`. Raises `ThoughtNotFoundError` if missing, `InvalidTransitionError` if the thought is not currently `ARCHIVED`, `StaleDataError` if the guarded write matches no row — another guarded write bumped `revision` in between, or deleted the row (see `update_thought` for what that guard does and does not catch). This is the **canonical** un-archive path; a raw `update_thought(lifecycle_status=...)` back to `ACTIVE` does not manage those markers. |
 | `await list_thoughts(...)` | `list[ThoughtRecord]` | List with filters (keyword-only) |
 | `await count_thoughts(...)` | `int` | Count with filters (keyword-only) |
-| `await delete_thought(thought_id)` | `bool` | Hard delete; `True` if a row was removed. Deleting a thought also deletes every edge for which it is either endpoint, its embedding, and its linked actions — deleted explicitly, on every schema version, not only via the `ON DELETE CASCADE` the core-12 migration adds to `edge`, `embedding` and `action`. A vector is owned by the thought it belongs to, enforced the same way in reconciliation, the vector-index purge, and search, so the deleted identifier cannot be returned by a later vector query even on a database still below core-12. See [Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated) for a database that already accumulated damage under an older engrava build. |
+| `await delete_thought(thought_id)` | `bool` | Hard delete; `True` if a row was removed. Deleting a thought also deletes the edges for which it is either endpoint, its embedding, and its linked actions — `delete_thought` issues those deletes itself, in the same savepoint as the parent delete, rather than relying on the `ON DELETE CASCADE` the core-12 migration adds to `edge`, `embedding` and `action`. See [Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated) for a database that already holds dangling `embedding` rows from an older engrava build. |
 | `await invalidate_thought(thought_id, valid_until)` | `ThoughtRecord` | Close the thought's *valid-time* interval at the given ISO-8601 instant — deterministic, idempotent, non-cascading, and **not a delete** (the row stays on file and remains retrievable for instants before `valid_until`). Raises `ThoughtNotFoundError` if missing. See [Bi-temporal Model](bitemporal.md#invalidate-vs-delete) |
 | `await record_access(thought_id)` | `None` | Mark a thought as accessed — bumps `access_count` and sets `last_accessed_at`; raises `ThoughtNotFoundError` if missing. Drives the access-frequency dreaming signal. |
 
@@ -223,18 +223,14 @@ delete cascades to edges where
 the thought is either endpoint; `invalidate_thought()` does not remove or
 invalidate any edge.
 
-**Below core schema 12 this cascade used to not happen — it now does not need to.**
-The `ON DELETE CASCADE` on `edge`, `embedding` and `action` arrives with the core-12
-migration, but `delete_thought` no longer depends on it: it deletes those three rows
-explicitly, atomically with the parent delete that runs first, on every schema
-version. A vector is owned by
-the thought it belongs to, not by the presence of an `embedding` row, and that rule is
-also enforced in reconciliation, in the vector-index purge, and in search itself, so a
-database still below core-12 can no longer make a deleted thought's identifier
-reachable again. See
+**Below core schema 12 there is no such cascade.** The `ON DELETE CASCADE` on
+`edge`, `embedding` and `action` arrives with the core-12 migration.
+`delete_thought` does not rely on it: it issues its own deletes for the thought's
+rows in those three tables, in the same savepoint as the parent delete, which runs
+first. See
 [Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated)
-for the full mechanism and for what a database that already accumulated damage under
-an older engrava build still needs `engrava migrate` to clean up.
+for what `engrava migrate` cleans up on a database that already holds dangling
+`embedding` rows.
 
 ```python
 import uuid

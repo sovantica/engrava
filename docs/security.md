@@ -278,16 +278,11 @@ is retained; deleting a self-consistent suffix, including every entry, does
 not make local verification fail on its own — see [Audit journal threat
 model](#audit-journal-threat-model) above.
 
-A hard delete no longer leaves a version-dependent residue: **`delete_thought`
-deletes the thought's `edge`, `embedding`, and `action` rows explicitly, on every
-schema version**, rather than depending on the `ON DELETE CASCADE` that only exists
-from core schema 12 onward. A vector is owned by the thought it belongs to, and that
-rule also holds in reconciliation, in the vector-index purge, and in search itself,
-so a deleted identifier cannot be returned by a later vector query even on a
-database still below core-12. A database that already accumulated dangling
-`embedding` rows under an older engrava build still needs `engrava migrate` to purge
-them — they cannot be resurfaced by a query any more, but they are not physically
-removed until then. See
+**`delete_thought` issues its own deletes for the thought's `edge`, `embedding`, and
+`action` rows, in the same savepoint as the parent delete**, rather than depending on
+the `ON DELETE CASCADE` that only exists from core schema 12 onward. A dangling
+`embedding` row left by a delete made under an older engrava build still carries its
+vector in the database file; `engrava migrate` purges these rows. See
 [Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated).
 
 See [Data Lifecycle](data-lifecycle.md) for the complete retention and erasure

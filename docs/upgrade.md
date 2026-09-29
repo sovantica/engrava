@@ -204,7 +204,7 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 | 0.3.x | 0.4.0 | Yes | **Schema-changing** minor upgrade — adds the valid-time columns (additive, zero data loss). Back up first and follow the [rolling-upgrades](#rolling-upgrades-multiple-workers) note |
 | 0.4.x | 0.5.0 | Yes | **Schema-changing** minor upgrade (`user_version` 14 → 18), although the library API is drop-in. **Breaking for MCP-server users only:** the `engrava[mcp]` extra and the in-engrava `engrava-mcp` command are removed — the server moved to the standalone [`engrava-mcp`](https://github.com/sovantica/engrava-mcp) package (see the 0.4 → 0.5 note) |
 | 0.5.0 | 0.6.0 | Yes | **Schema-changing** minor upgrade (`user_version` 18 → 20), with two additive columns. Default retrieval now excludes archived thoughts, and wrong-dimension query vectors raise a typed error. An edge `decay_multiplier` of `0.0` no longer reads back as `1.0`, and a later update no longer rewrites it to `1.0` — values a 0.5.x update already overwrote stay overwritten. Back up, quiesce shared-store workers, migrate once, and review the [0.5 → 0.6 notes](#05---06) |
-| 0.6.x | 0.7.0 | Yes | **Schema-changing** minor upgrade (`user_version` 20 → 21): every `thought` / `edge` / `action` row gains a `revision INTEGER NOT NULL DEFAULT 0` column, and stored timestamps are rewritten into one canonical UTC form with no instant changed; `EngravaMetrics.schema_version` separately moves `1 → 2`; and `engrava --format json info` loses its `schema_version` key in favor of `metrics_schema_version` + `database_schema_version` (see below). `update_thought`, `restore_thought`, `update_edge` and `update_action` now check and increment `revision` atomically on every guarded write, so a write that lands after another guarded write touched the same row — including from a second connection or process — raises `StaleDataError` instead of silently overwriting; `update_edge` and `update_action` could never raise it before. No public method signature changed. **Behaviour change:** when the resolved recency weight is `0.0` **and** a cognitive-cycle reference (`current_cycle`, explicit or via `cycle_provider`) is present, the query-less fallback path now treats recency as fully off instead of still decaying by cycle — which can change result order for stores with heterogeneous thought priorities. `recency_now` (transaction-time) callers are unaffected; that axis was already correct. Also in this release: three new `EngravaError` subclasses (`WriteContentionError`, `WriteLockTimeoutError`, `DedupLockReentryError`) can now come out of the dedup and guarded-write paths; a new public override seam, `prepare_thought_for_insert()`, restores pre-insert customization that `get_or_create()` / `upsert_by_hash()` had silently stopped routing through an overridden `create_thought()`; `gc --dry-run` now names everything the real run deletes (edges, embeddings, and actions, not only orphaned edges); a deleted thought's vector can no longer resurface through search on a database that has not run the core-12 migration; a corrupt or truncated database file now makes the CLI exit with an error instead of hanging; and `restore` now refuses an `embedding` row with an empty `owner_type`/`owner_id`, a non-ISO-8601 `created_at`, or a non-positive `dimension` — every such row was already invalid on every prior release, so this only ever rejects a snapshot that already carried a broken record; and a merge restore (no `--clear`) into a target whose `journal_entry` table is non-empty now refuses any record that collides with an existing row and rolls the whole restore back instead of replacing it, unless `--orphan-journal-entries` is also given — journaling is opt-in and the CLI never enables it, so this only reaches a target that already has journaling on. Also in this release, the dreaming clustering cohesion gate (`cluster_quality_cohesion_threshold`) now divides by both vectors' norms instead of using a raw dot product, moving the score for most non-unit-vector providers. Review the [0.6 → 0.7 notes](#06---07) |
+| 0.6.x | 0.7.0 | Yes | **Schema-changing** minor upgrade (`user_version` 20 → 21): every `thought` / `edge` / `action` row gains a `revision INTEGER NOT NULL DEFAULT 0` column, and stored timestamps are rewritten into one canonical UTC form with no instant changed; `EngravaMetrics.schema_version` separately moves `1 → 2`; and `engrava --format json info` loses its `schema_version` key in favor of `metrics_schema_version` + `database_schema_version` (see below). `update_thought`, `restore_thought`, `update_edge` and `update_action` now check and increment `revision` atomically on every guarded write, so a write that lands after another guarded write touched the same row — including from a second connection or process — raises `StaleDataError` instead of silently overwriting; `update_edge` and `update_action` could never raise it before. No public method signature changed. **Behaviour change:** when the resolved recency weight is `0.0` **and** a cognitive-cycle reference (`current_cycle`, explicit or via `cycle_provider`) is present, the query-less fallback path now treats recency as fully off instead of still decaying by cycle — which can change result order for stores with heterogeneous thought priorities. `recency_now` (transaction-time) callers are unaffected; that axis was already correct. Also in this release: three new `EngravaError` subclasses (`WriteContentionError`, `WriteLockTimeoutError`, `DedupLockReentryError`) can now come out of the dedup and guarded-write paths; a new public override seam, `prepare_thought_for_insert()`, restores pre-insert customization that `get_or_create()` / `upsert_by_hash()` had silently stopped routing through an overridden `create_thought()`; `gc --dry-run` now names everything the real run deletes (edges, embeddings, and actions, not only orphaned edges); reconciliation, the vector-index purge and search now resolve a vector through its `thought` row, and `delete_thought` issues its own deletes for a thought's `edge`, `embedding` and `action` rows; a corrupt or truncated database file now makes the CLI exit with an error instead of hanging; and `restore` now refuses an `embedding` row with an empty `owner_type`/`owner_id`, a non-ISO-8601 `created_at`, or a non-positive `dimension` — every such row was already invalid on every prior release, so this only ever rejects a snapshot that already carried a broken record; and a merge restore (no `--clear`) into a target whose `journal_entry` table is non-empty now refuses any record that collides with an existing row and rolls the whole restore back instead of replacing it, unless `--orphan-journal-entries` is also given — journaling is opt-in and the CLI never enables it, so this only reaches a target that already has journaling on. Also in this release, the dreaming clustering cohesion gate (`cluster_quality_cohesion_threshold`) now divides by both vectors' norms instead of using a raw dot product, moving the score for most non-unit-vector providers. Review the [0.6 → 0.7 notes](#06---07) |
 
 For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 `0.x.*` line do not change the schema and are low-risk; **minor** upgrades
@@ -975,15 +975,15 @@ collection if edges, embeddings, or actions on an archived thought matter to
 you independently of the thought itself — the old dry run would not have
 told you they were going.
 
-**A deleted thought's vector can no longer resurface through search.** No
-schema change of its own, but it interacts with whether your
-database has run the core-12 migration.
+**Reconciliation, the vector-index purge and search now resolve a vector through
+its `thought` row.** No schema change of its own, but it interacts with whether
+your database has run the core-12 migration.
 
 **Who is affected.** Anyone running a database that has not run `engrava
 migrate` past core schema 12, with a `sqlite-vec` backend active. On such a
-database, deleting a thought (via `delete_thought`, the TTL `delete`
-strategy, or hygiene GC) purged the thought's own vector immediately, but
-the reconcile pass that runs on the next sqlite-vec-enabled open could read
+database on `0.6.0`, deleting a thought (via `delete_thought`, the TTL
+`delete` strategy, or hygiene GC) purged the thought's own vector immediately,
+but the reconcile pass that runs on the next sqlite-vec-enabled open could read
 the still-present `embedding` row as proof the thought was live and put the
 vector back — after which the deleted id could reappear as an ordinary
 search-similar candidate. Separately, and regardless of schema version:
@@ -1025,14 +1025,13 @@ no `sqlite-vec` backend active was never able to serve the vector arm that
 made the id reappear. Read commands against an already-current schema see no
 new warning; destructive commands against one see no new refusal.
 
-**What changed.** A vector is now owned by whichever thought it belongs to,
-not by the mere presence of an `embedding` row, and that rule is enforced
-everywhere a vector could otherwise be resurrected: reconciliation, the
-vector-index purge, and search's own eligibility check. `delete_thought` (and
-the TTL and hygiene delete paths) now delete `edge`, `embedding`, and
-`action` rows explicitly — atomically with the parent delete, which runs
-first — on every schema version, rather than depending on the core-12
-`ON DELETE CASCADE`. Schema
+**What changed.** Reconciliation (`sync_embeddings`) now backfills a vector
+only for an `embedding` row whose owner id matches a row in `thought`, and
+the vector-index purge and search's own eligibility check require that
+`thought` row too. `delete_thought` (and the TTL and hygiene delete paths)
+now issue their own deletes for the thought's `edge`, `embedding`, and
+`action` rows, in the same savepoint as the parent delete, which runs
+first, rather than depending on the core-12 `ON DELETE CASCADE`. Schema
 version checks are also new: destructive commands, `remember` and `link`
 refuse a database outside the head version, read commands warn below it and
 refuse above it (`recall` with `--config` refuses below it too), and the new
@@ -1119,8 +1118,8 @@ by design, the same as before this change.
 
 **Child deletion stays atomic with the parent delete.** No schema change.
 On `0.6.0`, `delete_thought()` was one `DELETE FROM thought`. On `0.7.0`
-the store deletes the children explicitly (see the vector-ownership entry
-above): the parent delete and the child deletes run inside one savepoint,
+the store deletes the children explicitly (see the entry above on deleted
+vectors): the parent delete and the child deletes run inside one savepoint,
 which is rolled back when the parent delete did not remove a row that
 existed.
 
@@ -1139,9 +1138,9 @@ exercises any of this, on `0.6.0` or `0.7.0` alike.
   explicit child deletes that now follow it inside the same savepoint, have
   not run yet.
 - **The enforcement-off sweep.** `delete_thought` (and the TTL `delete`
-  strategy, and hygiene GC) delete `edge`, `embedding`, and `action` rows
-  explicitly, every time, rather than depending on the core-12
-  `ON DELETE CASCADE`, as the vector-ownership entry above describes: on
+  strategy, and hygiene GC) issue their own deletes for `edge`, `embedding`,
+  and `action` rows rather than depending on the core-12
+  `ON DELETE CASCADE`, as the entry above on deleted vectors describes: on
   `0.6.0`, a connection without `PRAGMA foreign_keys=ON`, or a database
   below core-12, left these rows orphaned behind a deleted thought.
 - **What `RAISE(IGNORE)` does.** A
@@ -1154,9 +1153,10 @@ exercises any of this, on `0.6.0` or `0.7.0` alike.
   it did, a delete that still matched zero rows is not treated as "already
   gone" — the savepoint is rolled back instead of running the child sweep,
   so the still-live parent keeps its children. A genuinely nonexistent
-  `thought_id` takes the other branch, unchanged: the sweep still runs,
-  clearing any orphaned children a schema without a cascade could be
-  carrying. Verified against `RAISE(ABORT)`, `RAISE(FAIL)`, `RAISE(IGNORE)`,
+  `thought_id` takes the other branch: the child deletes run for that id,
+  removing the orphaned `edge`, `embedding`, and `action` rows a schema
+  without a cascade may have left for it. Verified against `RAISE(ABORT)`,
+  `RAISE(FAIL)`, `RAISE(IGNORE)`,
   and a `WHEN EXISTS` guard, with `PRAGMA foreign_keys` both on and off,
   through `delete_thought()`, `cleanup_expired()`'s `delete` strategy, and
   hygiene GC.

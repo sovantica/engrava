@@ -209,18 +209,14 @@ Stage 2 (garbage collection) runs **only** when `auto_gc_enabled` is set (it is
   [REFLECTION](dreaming.md) is left summarising a cluster the delete would empty),
   then cascades to edges/embeddings/actions, then purges the vector index.
 
-**Below core schema 12 this cascade used to not happen — it now does not need to.**
-The `ON DELETE CASCADE` on `edge`, `embedding` and `action` arrives with the core-12
-migration, but `delete_thought` no longer depends on it: it deletes those three rows
-explicitly, atomically with the parent delete that runs first, on every schema
-version. A vector is owned by
-the thought it belongs to, not by the presence of an `embedding` row, and that rule is
-also enforced in reconciliation, in the vector-index purge, and in search itself, so a
-database still below core-12 can no longer make a deleted thought's identifier
-reachable again. See
+**Below core schema 12 there is no such cascade.** The `ON DELETE CASCADE` on
+`edge`, `embedding` and `action` arrives with the core-12 migration.
+`delete_thought` does not rely on it: it issues its own deletes for the thought's
+rows in those three tables, in the same savepoint as the parent delete, which runs
+first. See
 [Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated)
-for the full mechanism and for what a database that already accumulated damage under
-an older engrava build still needs `engrava migrate` to clean up.
+for what `engrava migrate` cleans up on a database that already holds dangling
+`embedding` rows.
 
 > **GC is not erasure.** Garbage collection reclaims the live, queryable working
 > set — it does **not** purge history. When the [hash-chain journal](audit-trail.md)

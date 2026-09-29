@@ -243,17 +243,15 @@ snapshot file made after the delete but before you rotate it out, nor
 deleted-but-still-cached state on a remote embedding provider that received
 the original text — evaluate each against your own threat model.
 
-> **A deleted identifier no longer outlives the content on an un-migrated
-> database.** It used to: on a database still below the **core-12** schema
-> (no foreign-key cascades), with a sqlite-vec backend active, a deleted
-> thought's `embedding` row was not cascaded away, so the reconcile put its
-> vector back and the `vec0` arm kept returning the deleted id. A vector is
-> now treated as owned by a live thought rather than by the presence of an
-> `embedding` row, enforced in reconciliation, in the vector-index purge, and
-> in search itself — so this no longer happens on any schema version, whether
-> or not `engrava migrate` has been run. What migration still does is clean up
-> the dangling `embedding` rows that earlier deletes on such a database left
-> behind: the core-12 step purges them. Full mechanism:
+> **A database below the core-12 schema can carry a deleted thought's
+> `embedding` row.** That schema has no `ON DELETE CASCADE` on `embedding`, so
+> a delete made by an older engrava build could leave the row, vector
+> included, behind. Reconciliation (the pass that runs when a sqlite-vec
+> backend opens) backfills a vector only for an `embedding` row
+> whose owner id matches a row in `thought`, and `delete_thought` issues its
+> own delete for the thought's `embedding` row. The core-12 step of
+> `engrava migrate` purges the dangling `embedding` rows that earlier deletes
+> left behind. Full mechanism:
 > [Known Limitations → Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated).
 
 > **Memory-hygiene GC is a hard delete, not erasure.** The opt-in

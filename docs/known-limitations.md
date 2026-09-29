@@ -292,37 +292,27 @@ a forgotten (archived) thought stops surfacing without being deleted.
 
 ## Deletion on a database that has not been migrated
 
-**This used to be a documented non-guarantee: a deleted thought's identifier
-could become reachable again through the `vec0` vector arm on a database
-below the core-12 schema (the migration that adds `ON DELETE CASCADE` to
-`edge`, `embedding`, and `action`). It no longer can.** A vector is now
-treated as owned by a *live thought*, not by the presence of an `embedding`
-row, and that rule is enforced in every place that could otherwise
-resurrect one:
+A database below the core-12 schema (the migration that adds
+`ON DELETE CASCADE` to `edge`, `embedding`, and `action`) has no cascade to
+remove a deleted thought's child rows. What the code does about that:
 
-- **Deletion no longer depends on the cascade.** `delete_thought`, the TTL
-  `delete` strategy, and hygiene GC each delete a thought's `edge`,
-  `embedding`, and `action` rows explicitly, atomically with the parent
-  delete that runs first — durable on every schema version, not only from
-  core-12 onward.
-- **Reconciliation only backfills a vector whose thought still exists.**
-  `sync_embeddings` (the pass that runs on every sqlite-vec-enabled open)
-  joins to `thought` before treating an `embedding` row as a valid backfill
-  source.
+- **Child rows are deleted explicitly.** `delete_thought`, the TTL `delete`
+  strategy, and hygiene GC each issue their own deletes for a thought's
+  `edge`, `embedding`, and `action` rows, in the same savepoint as the
+  parent delete, which runs first, instead of relying on the cascade.
+- **Reconciliation only backfills for an owner that matches a thought.**
+  `sync_embeddings` (the pass that runs when a sqlite-vec backend opens)
+  backfills a vector only for an `embedding` row whose owner id matches a
+  row in `thought`.
 - **The purge is the same join.** The sweep that removes orphaned
-  `embedding_vec` rows (on reconcile, and in `engrava gc`) now considers a
-  vector orphaned when its owning *thought* is gone, not only when its
-  `embedding` row is gone.
+  `embedding_vec` rows (on reconcile, and in `engrava gc`) treats a vector
+  as orphaned when its `embedding` row is gone or its owner id matches no
+  row in `thought`.
 - **Search resolves through a join that requires the thought row.** Both the
-  `vec0` rowid-to-id resolution and the post-search eligibility check now
-  positively confirm the thought exists (and is otherwise eligible) rather
-  than only checking that it isn't *excluded* — an id that resolves to no
-  thought row at all is dropped, not passed through by default.
-
-**What deletion does, on any schema version.** The `thought` row is removed
-and its `content` with it. Resolving the identifier — `get_thought()`, or
-any read that hydrates an id into a record — returns `None`. The content
-does not come back, and neither, now, does the identifier.
+  `vec0` rowid-to-id resolution and the post-search eligibility check
+  confirm that a `thought` row with that id exists (and is otherwise
+  eligible) rather than only checking that it isn't *excluded*; an id that
+  matches no `thought` row is dropped, not passed through by default.
 
 **Historical residue.** On a pre-core-12 schema an older engrava build left
 a deleted thought's `embedding` row behind, since nothing removed it.
