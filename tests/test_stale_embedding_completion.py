@@ -6,12 +6,11 @@ holding the lock across it would turn every other task's unrelated write into
 a bottleneck on this one call's round trip. That means two updates to the
 *same* thought can have their auto-embed completions land out of persist
 order: the update that persisted first can still be the one whose embed
-finishes last. Before the fix under test, the late completion installed its
-vector unconditionally — overwriting a newer vector with one computed from
-now-superseded content, even though the durable text and FTS index already
-reflect the later write.
+finishes last. The late completion must not install its vector: doing so
+would overwrite a newer vector with one computed from now-superseded content,
+even though the durable text and FTS index already reflect the later write.
 
-The regression here reproduces that ordering deterministically, via an
+The tests here reproduce that ordering deterministically, via an
 ``asyncio.Event`` per registered embed call (never a sleep or a timing
 race): two updates to one thought are issued as separate ``asyncio.Task``s,
 the first's embed call is parked before it can return, the second's update
@@ -21,9 +20,9 @@ what's left standing — the first's completion must recognise its own content
 is stale and drop itself instead of installing.
 
 Parametrized over both vector backends (numpy default, sqlite-vec when
-installed) per the milestone's acceptance bar: the fix lives in the
-completion check made before ``store_embedding`` is ever called, so it must
-hold whichever backend that call ends up writing through.
+installed): the guard is the completion check made before
+``store_embedding`` is ever called, so it must hold whichever backend that
+call ends up writing through.
 """
 
 from __future__ import annotations
@@ -187,15 +186,15 @@ class TestStaleAutoEmbedCompletionCannotOverwriteNewerVector:
             await task_b
 
             # B's vector is installed before A's stale completion is ever
-            # released -- this is the state a pre-fix run overwrites.
+            # released -- the stale completion must leave this state alone.
             assert await _stored_vector(store, "t-1") == pytest.approx([0.0, 1.0, 0.0])
             row = await store._get_thought_row("t-1")
             assert row is not None
             assert row["content"] == "content b"
 
             # Now release A's completion. Its content ("content a") no longer
-            # matches the thought's current content ("content b"), so the
-            # fix must drop it instead of installing over B's vector.
+            # matches the thought's current content ("content b"), so it
+            # must be dropped instead of installing over B's vector.
             a_gate.set()
             await task_a
 
@@ -228,8 +227,8 @@ class TestStaleAutoEmbedCompletionCannotOverwriteNewerVector:
         The thought's ``revision`` column restarts at 0 on a freshly recreated
         row with the same id, so a revision-*number* staleness check could
         coincidentally match a value captured before the row was deleted. This
-        pins that the fix instead compares actual stored content: a stale
-        completion for the deleted incarnation's content must still be
+        pins that the completion check instead compares actual stored content:
+        a stale completion for the deleted incarnation's content must still be
         dropped even though the recreated row's revision matches, and a
         completion whose content genuinely matches the current row (because
         the row was recreated with byte-identical content) is not spuriously

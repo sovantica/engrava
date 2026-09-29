@@ -3,7 +3,7 @@
 Exercises ``search_hybrid`` / ``recall`` with ``collapse_key=`` against a real
 SQLite store, plus unit coverage of the pure collapse/normalize helpers.
 
-Covers, per the acceptance criteria:
+Covers:
 
 * API surface + ``collapse_key=None`` candidate/score/order parity.
 * Recall-neutrality (never drop a distinct unit, never surface a non-candidate).
@@ -17,7 +17,7 @@ Covers, per the acceptance criteria:
 * ``collapse_max_per_unit`` deep-backfill retention: keeping N>1 members of a
   unit (deeper same-unit rows) while distinct deeper units still backfill —
   the ``None`` default staying byte-identical to single-keeper collapse, plus
-  the deeper-pool cliff regression this repairs.
+  the deeper-pool cliff case.
 """
 
 from __future__ import annotations
@@ -1154,7 +1154,7 @@ class TestFallbackCollapse:
         # Distinct single-fragment units first, unit u1's many fragments last —
         # with every row tied on the fallback's flat score, the query-less
         # window is ordered most-recently-written first, so u1's fragments
-        # alone would fill (and, pre-fix, do fill) the top-5 window.
+        # alone would fill the top-5 window.
         for u in range(2, 6):
             await store.create_thought(
                 _thought(f"u{u}", essence="upsilon", metadata={"unit": f"u{u}"})
@@ -1175,9 +1175,8 @@ class TestFallbackCollapse:
         assert "vector" not in result.backends_used
         returned = _ids(result.results)
         units_seen = [tid.split("-")[0] for tid in returned]
-        # Exactly one u1 survivor; the rest are distinct backfilled units —
-        # TODAY (pre-fix) this instead returns 5 raw u1-* fragments, since the
-        # fallback returns directly without ever reaching collapse-by-unit.
+        # Exactly one u1 survivor; the rest are distinct backfilled units.
+        # Without collapse-by-unit the window would be 5 raw u1-* fragments.
         assert units_seen.count("u1") == 1
         assert set(units_seen) == {"u1", "u2", "u3", "u4", "u5"}
         assert len(returned) == 5

@@ -2,29 +2,25 @@
 
 ``update_thought``, ``restore_thought``, ``update_edge`` and ``update_action``
 each write a row, then append the journal entry describing it, and only then
-decide whether to commit. Before this fix, the write-readback savepoint
-(``SqliteEngravaCore._write_readback_savepoint``) released *before* the
-journal append ran: ``JournalWriter.append`` awaits a chain-tail read before
-its own ``INSERT`` (see ``journal_writer.py``), so a failure or a
-cancellation landing in that await left the row write sitting in the
-connection's open transaction with no savepoint protecting it any more --
-guarded only by the store's plain ``_write_lock`` (a lock, not a transaction
-guard). A later, unrelated write on the same connection could then commit it
-without ever producing the journal entry that documents it.
+decide whether to commit. The journal append runs inside the write-readback
+savepoint (``SqliteEngravaCore._write_readback_savepoint``):
+``JournalWriter.append`` awaits a chain-tail read before its own ``INSERT``
+(see ``journal_writer.py``), and a failure or a cancellation landing in that
+await unwinds the row write with it.
 
 This is a different window from the one ``test_update_readback_atomicity.py``
 pins: that file's failures happen *inside* the savepoint (a read-back that
-raises before the savepoint releases), which the savepoint already unwound
-correctly even before this fix. This file's failures happen *after* the
-savepoint would have released and before the journal append's own ``INSERT``
-lands.
+raises before the savepoint releases). This file's failures happen in the
+journal append that follows the row write and its read-back, before the
+append's own ``INSERT`` lands.
 
-Every "standalone" test below was observed failing against the pre-fix code:
-the row write was durable after an unrelated commit and a fresh, independent
-connection, with no corresponding journal entry -- exactly the defect this
-file exists to close. The "already inside a caller-owned outermost
-``suspend_auto_commit()`` window" tests were already passing before this fix
-and are pinned here so the fix does not silently change that path.
+The ``test_failed_append_leaves_no_durable_row_change`` and
+``test_cancelled_append_leaves_no_durable_row_change`` tests commit an
+unrelated write after the failed append, close the store, and read the
+original row through a separate connection. The
+``test_outermost_suspend_auto_commit_rollback_is_unchanged`` tests run the
+update inside a caller-owned outermost ``suspend_auto_commit()`` window and
+check that no transaction is left open and the row is unchanged.
 """
 
 from __future__ import annotations
@@ -176,8 +172,7 @@ class TestUpdateThoughtJournalAppendFailure:
                 await store.update_thought("t-1", essence="should never land")
 
             # An unrelated write on the same connection, committed normally --
-            # the scenario this fix closes: before the fix, this commit would
-            # carry the failed update's row write along with it.
+            # it must not carry the failed update's row write along with it.
             await store.create_thought(_thought("t-2", essence="unrelated"))
         finally:
             await store._db.close()
@@ -227,7 +222,7 @@ class TestUpdateThoughtJournalAppendFailure:
     async def test_outermost_suspend_auto_commit_rollback_is_unchanged(
         self, tmp_path: Path
     ) -> None:
-        """The already-correct outermost-window path must survive this fix untouched."""
+        """Inside an outermost window a failed append leaves no open transaction or row change."""
         db_path = tmp_path / "update-thought-outermost.db"
         store = await _open(db_path)
         try:

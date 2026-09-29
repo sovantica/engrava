@@ -213,9 +213,9 @@ class TestDistractionDensity:
     """Density is a real generation knob, not an ignored parameter."""
 
     def test_density_affects_dataset_at_same_seed(self) -> None:
-        # Same seed, different density → output diverges.  Pre-fix the
-        # density parameter was validated but never threaded through;
-        # this regression test pins the per-slot Bernoulli gate.
+        # Same seed, different density → output diverges: the density
+        # parameter reaches the per-slot Bernoulli gate that keeps or
+        # skips each non-memorable slot.
         sparse = dataset_to_json(
             generate_dataset(
                 seed=20260508,

@@ -1872,15 +1872,13 @@ async def _healthy_reflection_store(
 
 
 class TestRestoreExemptsCentroidRowsFromTheIdentityInvariant:
-    """Regression: a centroid row must never gate provider identity.
+    """A centroid row must never gate provider identity.
 
-    ``_ensure_embedding_model_lock`` already exempts
-    ``CENTROID_MODEL_NAME`` at write time; restore had no
-    counterpart, so a perfectly healthy store containing both provider
-    vectors and reflection centroids was refused on restore into a fresh
-    target, and a merge into an already-healthy centroid-bearing target
-    could be refused too -- even with ``--skip-embeddings``, because the
-    pre-loop existing-rows scan runs before that flag is ever consulted.
+    ``_ensure_embedding_model_lock`` exempts ``CENTROID_MODEL_NAME`` at write
+    time; restore applies the same exemption, so a healthy store containing
+    both provider vectors and reflection centroids restores into a fresh
+    target, and a merge into an already-healthy centroid-bearing target is
+    accepted -- even with ``--skip-embeddings``.
     """
 
     def test_restoring_a_healthy_reflection_snapshot_into_a_fresh_target_succeeds(
@@ -1888,9 +1886,9 @@ class TestRestoreExemptsCentroidRowsFromTheIdentityInvariant:
     ) -> None:
         """A snapshot with both provider and centroid rows must restore clean.
 
-        Before the fix this is refused outright: the centroid row's
-        ``(CENTROID_MODEL_NAME, dimension)`` identity was compared against
-        the provider identity like any other row and rejected as a mismatch.
+        The centroid row's ``(CENTROID_MODEL_NAME, dimension)`` identity is
+        not compared against the provider identity, so it is not rejected as a
+        mismatch.
         """
         source = tmp_path / "source.db"
         asyncio.run(_healthy_reflection_store(source, provider_model="model-P", dimension=3))
@@ -1931,10 +1929,10 @@ class TestRestoreExemptsCentroidRowsFromTheIdentityInvariant:
         """The pre-loop existing-rows scan must not refuse a healthy target.
 
         ``_initial_embedding_state`` runs whether or not ``--skip-embeddings``
-        is set -- so this restore carries no
-        embedding rows of its own (``--skip-embeddings``) and would still be
-        refused before the fix, purely because the *target* already
-        legitimately disagrees-by-sentinel with itself.
+        is set. This restore carries no embedding rows of its own
+        (``--skip-embeddings``), so the only rows the scan sees are the
+        *target*'s own provider and centroid rows, which legitimately differ
+        in model name and must not be treated as a conflict.
         """
         target = tmp_path / "target.db"
         asyncio.run(_healthy_reflection_store(target, provider_model="model-P", dimension=3))
@@ -1962,9 +1960,9 @@ class TestRestoreExemptsCentroidRowsFromTheIdentityInvariant:
         a provider row that genuinely disagrees with the target's lock (not
         exempt) -- only the latter must be refused.
 
-        The centroid row comes **first**: a wrong fix that resets the running
-        identity reference whenever it sees a centroid (instead of leaving it
-        untouched) would clear the target's lock right here, and the
+        The centroid row comes **first**: an implementation that resets the
+        running identity reference whenever it sees a centroid (instead of
+        leaving it untouched) would clear the target's lock right here, and the
         mismatched provider row after it would then silently become the new
         reference instead of being refused. Putting the mismatch first would
         never exercise that path, because the mismatch would already have
@@ -2043,8 +2041,7 @@ class TestRestoreEnforcesOneVectorWidthAcrossCentroidAndProviderRows:
     ) -> None:
         """An unlocked target whose only embedding row is a centroid still
         carries a corpus-wide width -- a provider row of another width must
-        be refused, or the merge leaves the same sqlite-vec open failure the
-        model-name-only exemption used to allow.
+        be refused, or the merge leaves mixed widths in one corpus.
         """
         from engrava.domain.dreaming import CENTROID_MODEL_NAME
 

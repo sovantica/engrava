@@ -392,11 +392,7 @@ class TestReflectionCapInvariant:
         self,
         store: SqliteEngravaCore,
     ) -> None:
-        """With cap=0.3, at least one OBS appears in top-5 result when OBSs exist.
-
-        This validates the 'zero REFLECTION-only top-20' acceptance criterion
-        when scaled down to top-5.
-        """
+        """With cap=0.3, at least one OBS appears in top-5 result when OBSs exist."""
         _, obs_ids = await self._populate_flood(
             store,
             n_reflections=8,
@@ -542,9 +538,8 @@ class TestFallbackReflectionCap:
         8 REFLECTIONs (ranked first via a higher ``updated_cycle``) and 12
         OBSERVATIONs (ranked after, with enough depth to fully backfill the
         evicted slots). With ``top_k=10`` and the fixture's
-        ``reflection_topk_cap=0.3``, at most 3 REFLECTION slots are allowed —
-        TODAY (pre-fix) the fallback returns directly without ever reaching
-        the cap, so the top-10 is REFLECTION-flooded (8 of them).
+        ``reflection_topk_cap=0.3``, at most 3 REFLECTION slots are allowed,
+        where an uncapped top-10 would hold 8 of them.
         """
         for i in range(8):
             await store.create_thought(

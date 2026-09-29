@@ -2,29 +2,21 @@
 
 ``update_thought``, ``restore_thought``, ``update_edge`` and ``update_action``
 all write a row, then read it back to confirm and report what actually landed,
-and only then decide whether to commit. Before this fix, a read-back failure
--- the row vanished, the row mapper rejected a stored value -- propagated
-while the write itself was still pending in the connection's transaction: a
-later, unrelated commit on the same connection would then publish a mutation
-whose own operation had reported failure. There is a second, narrower defect
-in the same shape: ``update_edge`` / ``update_action`` never checked whether
-their own ``UPDATE`` matched a row, so a row deleted after the initial read
-and re-created under the same identifier before the read-back ran was
-reported as though this call had updated it -- when it had written nothing at
-all.
-
-The fix wraps each write + read-back in a ``SAVEPOINT``
-(``SqliteEngravaCore._write_readback_savepoint``), mirroring the established
+and only then decide whether to commit. A read-back failure -- the row
+vanished, the row mapper rejected a stored value -- must not leave the write
+pending in the connection's transaction, where a later, unrelated commit on
+the same connection would publish a mutation whose own operation had
+reported failure. Each write + read-back therefore runs in a ``SAVEPOINT``
+(``SqliteEngravaCore._write_readback_savepoint``), mirroring the
 ``_delete_thought_atomic`` / ``_delete_thought_children_explicit`` pattern
 already in this module, so a read-back failure unwinds only this operation's
-own write -- never a caller-owned transaction already in progress. The two
-affected update paths also now capture their ``UPDATE``'s cursor and reject a
-zero-row match immediately, before the read-back ever runs.
+own write -- never a caller-owned transaction already in progress.
 
-Every test below was observed failing against the pre-fix code before this
-file was written (the savepoint tests raised the injected error but left the
-write durable / the transaction open; the rowcount tests returned a
-fabricated "success" built from the recreated row instead of raising).
+``update_edge`` / ``update_action`` also capture their ``UPDATE``'s cursor and
+reject a zero-row match immediately, before the read-back runs. Without that
+check, a row deleted after the initial read and re-created under the same
+identifier before the read-back would be reported as though this call had
+updated it, when it had written nothing at all.
 """
 
 from __future__ import annotations
@@ -84,13 +76,13 @@ async def journaling_store(db: aiosqlite.Connection) -> SqliteEngravaCore:
 def _fail_once(store: SqliteEngravaCore, method_name: str, exc: BaseException) -> None:
     """Replace ``method_name`` so its first call raises ``exc`` instead of running.
 
-    Stands in for the read-back failure the work item names explicitly --
-    "the row is missing, SQLite errors, or the row mapper rejects a value" --
-    without needing to actually corrupt a stored value: the write that
-    precedes the read-back has already landed in storage by the time this
-    fires, which is what lets these tests assert on the row directly. Only
-    the *first* call raises; a later, legitimate call (e.g. a subsequent,
-    unrelated operation reusing the same read-back method) runs normally.
+    Stands in for a read-back failure (the row is missing, SQLite errors, or
+    the row mapper rejects a value) without needing to actually corrupt a
+    stored value: the write that precedes the read-back has already landed in
+    storage by the time this fires, which is what lets these tests assert on
+    the row directly. Only the *first* call raises; a later, legitimate call
+    (e.g. a subsequent, unrelated operation reusing the same read-back
+    method) runs normally.
     """
     original = getattr(store, method_name)
     fired = False
@@ -232,21 +224,18 @@ class TestZeroRowUpdateIsRejectedDespiteRecreation:
         """The row is absent when the UPDATE runs; a same-id row exists again after.
 
         A delete-and-recreate *after* the UPDATE cannot be caught by that
-        UPDATE's own rowcount (already 1 by then) -- see the work item this
-        pins. The precise sequence that matters is the other one: absent
-        *when the UPDATE runs* (rowcount 0), then recreated before the
-        read-back. Without the rowcount check, the read-back finds the
-        recreated row and reports it as though this call had updated it.
+        UPDATE's own rowcount (already 1 by then). The sequence that matters
+        is the other one: absent *when the UPDATE runs* (rowcount 0), then
+        recreated before the read-back. Without the rowcount check, the
+        read-back finds the recreated row and reports it as though this call
+        had updated it.
 
-        The zero-row match now raises ``StaleDataError`` rather than the
-        plain ``ValueError`` this test originally pinned: a later item gave
-        every guarded update a ``revision`` column, and a row deleted then
-        recreated under the same id is exactly the "matched no row" case
-        that error now names uniformly across ``update_thought`` /
-        ``update_edge`` / ``update_action``. The property this test exists
-        for -- nothing of this call is written, and the recreated row is
-        never reported as this call's own result -- is unchanged; only the
-        exception's type is.
+        The zero-row match raises ``StaleDataError``: a row deleted then
+        recreated under the same id is the "matched no row" case that error
+        names uniformly across ``update_thought`` / ``update_edge`` /
+        ``update_action``. The test pins that the call raises and writes no
+        journal entry, so the recreated row is never reported as this call's
+        own result.
         """
         store = journaling_store
         await store.create_thought(_thought("t-1"))
@@ -284,10 +273,9 @@ class TestZeroRowUpdateIsRejectedDespiteRecreation:
         """The action counterpart of the edge case above.
 
         Hooks ``_get_action_row`` -- the raw-row read ``update_action`` uses
-        internally to reach the ``revision`` a later item added -- rather
-        than ``_get_action`` (the domain-mapped read a different, unrelated
-        caller uses): ``update_action`` does not call ``_get_action`` at
-        all, so hooking it would leave the delete below never firing and the
+        internally to reach the ``revision`` -- rather than ``_get_action``
+        (the domain-mapped read): ``update_action`` does not call
+        ``_get_action`` at all, so hooking it would leave the delete below never firing and the
         recreate below colliding with the still-live row instead of
         reproducing the intended race.
         """

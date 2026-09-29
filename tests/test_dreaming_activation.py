@@ -1,7 +1,7 @@
 """Dreaming activation correctness — reachable scoring + live access substrate.
 
-Covers the activation fixes: active-signal weight redistribution (promotion is
-arithmetically reachable under defaults again), the batched access substrate
+Covers active-signal weight redistribution (promotion is arithmetically
+reachable under defaults), the batched access substrate
 (feeds the ``frequency`` signal without per-read writes), config wiring
 (``from_config`` builds + runs dreaming, partial ``signals`` merges), and the
 default-off byte-identity guarantee.
@@ -141,7 +141,7 @@ class TestActiveWeightRedistribution:
 
 
 # ---------------------------------------------------------------------------
-# Reachability — promotion is possible under defaults again (the core fix)
+# Reachability — promotion is possible under the default threshold
 # ---------------------------------------------------------------------------
 
 
@@ -151,9 +151,9 @@ class TestPromotionReachable:
     ) -> None:
         """A recent + mature OBSERVATION promotes at the shipped 0.7 threshold.
 
-        On the pre-fix score (dead frequency + confirmation dragging the max to
-        0.525) this promotes zero; after active-signal redistribution recency +
-        staleness alone reach 1.0 > 0.7.
+        With frequency and confirmation flat (no data in the pool), the
+        active-signal weights are redistributed onto the remaining signals, so
+        recency + staleness alone clear the 0.7 threshold.
         """
         ext = DreamingExtension(config=_activation_cfg())
         for i in range(4):
@@ -276,7 +276,7 @@ class TestAccessSubstrate:
     ) -> None:
         """A flush whose whole batch is stale writes nothing and commits nothing.
 
-        Mirrors the ``delete_thought`` defect pinned in
+        Mirrors the ``delete_thought`` case pinned in
         ``tests/test_referential_integrity.py``: every buffered id's thought
         was deleted before the flush runs, so the batched ``UPDATE`` matches
         zero rows across the board — this call has nothing of its own to make
@@ -761,9 +761,9 @@ class TestAttachDreamingExtension:
 
         Two identically-seeded stores, one wired through
         ``attach_dreaming_extension`` and one through the private attribute
-        write it replaces, must produce the same ``ConsolidationResult`` for
-        the same input — proving the seam does not just set a flag but drives
-        the same code path as ``consolidate()`` already reads today.
+        write, must produce the same ``ConsolidationResult`` for the same
+        input — proving the seam does not just set a flag but drives the same
+        code path that ``consolidate()`` reads.
         """
         cfg = _activation_cfg()
         seam_db, via_seam = await _seeded_store(tmp_path, "via_seam.db")

@@ -343,15 +343,12 @@ class TestSearchHybrid:
         self,
         store: SqliteEngravaCore,
     ) -> None:
-        # Fusion-level regression for the degenerate min-max corner.
+        # Fusion-level check for the degenerate min-max corner.
         # "only-fts" is the sole FTS match for a rare term (hi == lo → the
         # degenerate branch) with an orthogonal, zero-cosine embedding;
         # "only-vec" is not an FTS match but has a moderate cosine (0.4).
-        # With the old all-1.0 sentinel the degenerate lexical hit
-        # (1.0 * fts_w 0.3 = 0.30) OUT-RANKED the vector row
-        # (0.4 * vec_w 0.55 = 0.22); with the neutral 0.5 (0.5 * 0.3 = 0.15)
-        # the vector row correctly ranks first — and the degenerate row stays
-        # present (0.15, not demoted to the floor as the rejected 0.0 would).
+        # The moderate vector hit is expected to rank first, and the
+        # degenerate lexical hit stays present, above the floor.
         only_fts = await store.create_thought(
             _make("only-fts", essence="anomaly", content="the zorptastic anomaly report"),
         )
@@ -368,8 +365,7 @@ class TestSearchHybrid:
         r = await store.search_hybrid("zorptastic", [1.0, 0.0, 0.0])
         order = [tid for tid, _ in r.results]
         scores = dict(r.results)
-        # The moderate vector hit now ranks above the degenerate lexical hit
-        # (would FAIL on the pre-fix all-1.0 code, which over-ranks only-fts).
+        # The moderate vector hit ranks above the degenerate lexical hit.
         assert order.index("only-vec") < order.index("only-fts")
         # The degenerate lexical hit is still present, above the floor.
         assert scores["only-fts"] > 0.0

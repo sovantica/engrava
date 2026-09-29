@@ -68,7 +68,7 @@ def _tiny_dataset() -> tuple[SyntheticConversation, ...]:
 def _neutral_sanity_dataset() -> tuple[SyntheticConversation, ...]:
     """Sanity subset — only anti-cherry-pick neutrals.
 
-    Sized at 24 conversations so the |ON - OFF| <= 0.02 band has
+    Sized at 24 conversations so the |ON - OFF| <= 0.05 band has
     enough sample-size resolution to be meaningful — at 8 questions
     every difference is at least 1/8 = 0.125 and the band would be
     statistically toothless.
@@ -251,16 +251,14 @@ class TestOffOnPair:
         self,
         embedding_provider: EmbeddingProviderProtocol,
     ) -> None:
-        # AC-8 v0.3.0 tolerance ≤0.05 (v1.4 amendment).
-        #
-        # v1.4 relaxed from ≤0.02 with explicit empirical rationale:
-        # REFLECTIONs participate at parity in retrieval despite
-        # ``reflection_boost=1.0`` (boost is a multiplier on top of
-        # the intrinsic vector / FTS score, not an enable/disable
-        # toggle).  Measured delta is 0.042 — the 0.05
-        # ceiling carries a small safety margin without claiming
-        # neutrality the engrava-core ranking does not provide at
-        # v0.3.0.
+        # Sanity subset: dreaming OFF vs ON changes recall@k by at most
+        # 0.05.  The ceiling is not zero because REFLECTIONs still take
+        # part in retrieval at ``reflection_boost=1.0`` -- the boost is
+        # a multiplier on top of the intrinsic vector / FTS score, not
+        # an enable/disable toggle -- so a REFLECTION can displace a
+        # direct observation from the top-K.  The dataset holds 24
+        # questions, so one changed answer moves recall by 1/24 = 0.042
+        # (inside the ceiling) and two changed the same way by 0.083 (outside it).
         dataset = _neutral_sanity_dataset()
         off = await evaluate_run(
             dataset,
@@ -286,7 +284,7 @@ class TestOffOnPair:
 # out) will surface as a non-empty diff on this set. Deliberate public-API
 # additions are recorded here when they ship.
 #
-# Baseline captured pre-WS from release/v0.3.0 HEAD = bb407ac, then extended
+# Baseline captured at the v0.3.0 release line, then extended
 # with the metadata-filter query surface (FieldOp / FieldPredicate /
 # MetadataFilter / VisibilityQueryFilter + the two typed filter errors), an
 # intentional, ratified public-API addition. Later extended with the
@@ -545,8 +543,7 @@ class TestPublicSurfaceDiscipline:
         current = frozenset(engrava.__all__)
         new_exports = current - _PRE_WS_ALL_BASELINE
         assert not new_exports, f"benchmark suite leaked new public exports: {sorted(new_exports)}"
-        # Defensive: regressions that quietly remove a public export are
-        # not in scope for this WS either.
+        # Also fail when a public export is quietly removed.
         dropped = _PRE_WS_ALL_BASELINE - current
         assert not dropped, (
             f"benchmark suite accidentally dropped public exports: {sorted(dropped)}"
@@ -641,8 +638,9 @@ class TestRunnerDeserialisation:
             _as_int(True)
 
     def test_as_bool_rejects_string(self) -> None:
-        # Regression: pre-fix ``bool("false")`` coerced to ``True``,
-        # silently flipping the self-anchored provenance contract.
+        # A string is not a boolean: ``bool("false")`` is ``True``, so a
+        # coercing loader would silently flip the self-anchored
+        # provenance flag.  ``_as_bool`` rejects it instead.
         from engrava.benchmarks.synthetic.runner import _as_bool
 
         with pytest.raises(SystemExit):
@@ -905,15 +903,14 @@ async def _make_reflection(
 class TestMeasureSynthesisCoverageCleanupClose:
     """``measure_synthesis_coverage`` must not let a close failure replace the body's.
 
-    It used a bare ``async with aiosqlite.connect(...) as db:`` --
     ``aiosqlite.Connection.__aexit__`` is an unconditional ``await
     close()`` and cannot distinguish a cleanup close (something in the
-    body already raised) from a success-path one, so a failure in that
-    close replaced whatever the body actually raised. Same defect
-    ``_close_quietly`` exists to prevent for a raw ``conn.close()``, one
-    layer down in a third party's context manager -- ``evaluate_run`` and
-    ``_process_question`` (``runner.py``) shared the identical bug and
-    fix.
+    body already raised) from a success-path one, so a bare ``async
+    with aiosqlite.connect(...) as db:`` would let a failure in that
+    close replace whatever the body actually raised. The function opens
+    the connection with ``await aiosqlite.connect(...)`` and closes it
+    through ``_close_quietly`` when the body raised, as ``evaluate_run``
+    does.
     """
 
     async def test_body_failure_survives_a_failing_cleanup_close(
@@ -922,10 +919,9 @@ class TestMeasureSynthesisCoverageCleanupClose:
         """A close failure during cleanup must not replace the body's own failure.
 
         Forces ``ensure_schema()`` to raise a ``ValueError`` and the
-        subsequent cleanup close to also raise. Before the fix, the
-        close's ``RuntimeError`` would have replaced the ``ValueError``
-        the caller actually needs to see; after the fix, the
-        ``ValueError`` propagates and the close failure is only logged.
+        subsequent cleanup close to also raise. The ``ValueError`` the
+        caller actually needs to see propagates; the close's
+        ``RuntimeError`` is only logged.
         """
         import engrava.benchmarks.synthetic.evaluate as evaluate_module
 
@@ -939,8 +935,8 @@ class TestMeasureSynthesisCoverageCleanupClose:
             # Patching ``close`` here (before either) keeps the returned
             # object a genuine ``Connection`` that still supports both
             # calling conventions, so this spy works whether the caller
-            # does ``await aiosqlite.connect(...)`` (the fixed shape) or
-            # ``async with aiosqlite.connect(...) as db:`` (the old one).
+            # does ``await aiosqlite.connect(...)`` or
+            # ``async with aiosqlite.connect(...) as db:``.
             conn = real_connect(*args, **kwargs)
             real_close = conn.close
 

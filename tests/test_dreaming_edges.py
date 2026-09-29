@@ -574,8 +574,9 @@ class TestGraphRankingChunkedFetch:
 
         ``t-from`` sits in the first chunk (index 0), ``t-to`` sits alone in
         the second chunk (index 450) — the two chunk queries each match this
-        edge's ``OR`` predicate, so an unfixed fetch returns it twice and
-        doubles its weighted contribution to both endpoints' graph boost.
+        edge's ``OR`` predicate, so a fetch that kept both matches would count
+        it twice and double its weighted contribution to both endpoints' graph
+        boost. Each endpoint must receive it once.
         """
         t_from = await store.create_thought(_make("t-from"))
         t_to = await store.create_thought(_make("t-to"))

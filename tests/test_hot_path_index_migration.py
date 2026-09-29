@@ -189,8 +189,8 @@ async def fresh_db() -> AsyncIterator[aiosqlite.Connection]:
 async def test_v13_base_lacks_the_new_indexes(fresh_db: aiosqlite.Connection) -> None:
     """Guard: the v13 base fixture genuinely omits the four new indexes.
 
-    This is the pre-fix structural assertion — a v13 database has none of
-    the hot-path indexes, which is exactly the gap the migration closes.
+    A v13 database has none of the hot-path indexes, so the migration tests
+    below start from a schema where the migration has something to create.
     """
     await _bootstrap_core_at_v13(fresh_db)
     for index_name in _ALL_NEW_INDEXES:

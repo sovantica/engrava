@@ -450,10 +450,10 @@ class TestExpiredSourceGraphExpansionExclusion:
     async def test_reverting_expiry_gate_leaks_expired_via_expansion(self) -> None:
         """Dropping ONLY the expiry clause from the expansion gate leaks the expired source.
 
-        The stub reproduces the pre-fix ``_filter_observation_ids`` — type +
-        archived + metadata predicate, but no ``expires_at`` gate — proving the
-        expiry clause specifically is what keeps an expired source out of the
-        fused set on the expansion path.
+        The stub is ``_filter_observation_ids`` without its ``expires_at``
+        gate — type + archived + metadata predicate only — proving the expiry
+        clause specifically is what keeps an expired source out of the fused
+        set on the expansion path.
         """
         store, conn = await self._build()
         try:

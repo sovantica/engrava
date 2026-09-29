@@ -644,19 +644,14 @@ class TestEngravaManager:
     ) -> None:
         """A cancellation while closing one store must not abandon the rest.
 
-        ``close_all()`` used to catch only ``Exception``, so a
-        ``CancelledError`` raised while closing the first cached store
-        aborted the loop early. ``store.close()`` completes the real,
-        physical close before it re-raises a ``CancelledError`` from an
-        in-flight cancellation (see its own docstring), so the first
-        store's connection was never actually the problem -- every store
-        *after* it was, left open and leaking its non-daemon worker thread
-        exactly like the corrupt-file hang. This creates two stores, makes
-        the first one's close perform its real close and then raise
-        ``CancelledError`` (matching what ``store.close()`` really does
-        under cancellation), and asserts BOTH workers are gone -- not just
-        the one that raised -- and that the cancellation still reaches the
-        caller rather than being silently absorbed.
+        ``store.close()`` re-raises a ``CancelledError`` from an in-flight
+        cancellation (see its own docstring). A loop that exited early on
+        that cancellation would leave every store *after* it open. This
+        creates two stores, makes the first one's close perform its real
+        close and then raise
+        ``CancelledError``, and asserts BOTH workers are gone -- not just the
+        one that raised -- and that the cancellation still reaches the caller
+        rather than being silently absorbed.
         """
         data_dir = tmp_path / "services"
         mgr = EngravaManager(data_dir=data_dir)
@@ -678,13 +673,10 @@ class TestEngravaManager:
             with pytest.raises(asyncio.CancelledError):
                 await mgr.close_all()
 
-            assert not conn_a._thread.is_alive(), (
-                "store A's own worker survived its own close -- unexpected regardless of this fix"
-            )
+            assert not conn_a._thread.is_alive(), "store A's own worker survived its own close"
             assert not conn_b._thread.is_alive(), (
                 "store B's worker survived -- close_all() abandoned it after "
-                "store A's close raised a cancellation, exactly the defect "
-                "this fix addresses"
+                "store A's close raised a cancellation"
             )
         finally:
             for conn in (conn_a, conn_b):

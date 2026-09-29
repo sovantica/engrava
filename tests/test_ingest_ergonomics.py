@@ -572,14 +572,14 @@ async def test_upsert_by_hash_noop_does_not_commit_callers_pending_work(
 
     The unchanged-record branch writes nothing of its own -- no
     ``UPDATE``, no journal entry -- so it must not call ``_maybe_commit()``
-    either. Regressed to calling it unconditionally, which committed whatever
-    *unrelated* work the caller already had open on the same connection (a
-    rejected journal insert is the motivating case), leaving a later
-    ``rollback()`` with nothing left to undo.
+    either. A commit there would commit whatever *unrelated* work the caller
+    already had open on the same connection (a rejected journal insert is the
+    motivating case), leaving a later ``rollback()`` with nothing left to
+    undo.
 
-    Reproduced here without any journal/rejection machinery: a raw pending
-    ``INSERT`` left uncommitted on the shared connection stands in for "the
-    caller's pending work", exactly the way the residual gap documented on
+    Here a raw pending ``INSERT`` left uncommitted on the shared connection
+    stands in for "the caller's pending work", exactly the way the residual
+    gap documented on
     :meth:`SqliteEngravaCore._serialize_dedup_probe` describes a transaction
     already open when this store's own guard is entered.
     """
@@ -614,9 +614,7 @@ async def test_upsert_by_hash_update_branch_still_commits_pending_work(
     "whoever writes, commits" rule applied correctly. That commit is on the
     one shared connection, so it also makes durable whatever unrelated
     pending write the caller already had open; a later ``rollback()`` finds
-    nothing left to undo. This must hold both before and after the fix to
-    the no-op branch above, since that fix only removes the no-op branch's
-    own, separate commit call.
+    nothing left to undo.
     """
     content = "Content that receives a genuine mutable-field update."
     seeded = await store.upsert_by_hash(
@@ -648,15 +646,9 @@ async def test_upsert_by_hash_noop_inside_suspend_auto_commit_unaffected(
     store: SqliteEngravaCore,
     db: aiosqlite.Connection,
 ) -> None:
-    """``suspend_auto_commit()`` already made ``_maybe_commit()`` a no-op there.
+    """A no-op ``upsert_by_hash()`` inside ``suspend_auto_commit()`` does not commit.
 
-    Confirms the no-op branch's commit-call removal changes nothing
-    observable inside a caller's own ``suspend_auto_commit()`` window: a
-    no-op ``upsert_by_hash()`` call
-    was, and remains, side-effect-free there, because ``_skip_auto_commit``
-    already suppressed the branch's ``_maybe_commit()`` call before this fix
-    removed the call outright. An outer rollback still discards every write
-    made inside the window, exactly as before.
+    An outer rollback still discards the writes made inside the window.
     """
     content = "Content re-upserted with byte-identical mutable fields, nested."
 
@@ -870,10 +862,9 @@ async def test_bulk_store_earlier_duplicate_id_outranks_a_later_ordinary_validat
     A bare loop of ``create_thought()`` calls finishes item *n* -- including
     any insert-time failure -- before item *n + 1* is even looked at, so the
     duplicate id here (item 3) must be what raises, never the oversized
-    metadata on item 4 that comes after it. This pins the two-phase
-    ``bulk_store`` restructuring's failure-ordering fix: an earlier version
-    validated every item, batch-wide, before any insert, which let a later
-    item's ordinary (non-seam) validation error raise first instead.
+    metadata on item 4 that comes after it. This pins ``bulk_store``'s failure
+    ordering: validating every item, batch-wide, before any insert would let
+    a later item's ordinary (non-seam) validation error raise first instead.
     """
     oversized_metadata = {"blob": "x" * 70_000}  # exceeds the 64 KiB metadata cap
     thoughts = [

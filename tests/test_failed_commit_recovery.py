@@ -1,29 +1,22 @@
 """A failed runtime ``COMMIT`` ends its own transaction, one way or another.
 
-Both ``suspend_auto_commit``'s clean-exit commit and the plain ``_maybe_commit``
-call used to hand the ``COMMIT`` straight to the driver with no handling of the
-commit call itself failing. ``COMMIT`` can fail on its own account -- most
-concretely, a concurrent connection still holding a read lock when
-``busy_timeout`` expires, reported as ``SQLITE_BUSY`` -- while the write
-transaction stays open on the connection: SQLite does not roll a transaction
-back just because its own ``COMMIT`` failed. Left alone, a later, unrelated
+``suspend_auto_commit``'s clean-exit commit and the plain ``_maybe_commit``
+call both commit through ``SqliteEngravaCore._commit_or_recover``. ``COMMIT``
+can fail on its own account -- most concretely, a concurrent connection still
+holding a read lock when ``busy_timeout`` expires, reported as
+``SQLITE_BUSY`` -- while the write transaction stays open on the connection:
+SQLite does not roll a transaction back just because its own ``COMMIT``
+failed. Left alone, a later, unrelated
 write on the *same* connection would then commit the failed operation's
-changes right alongside its own -- reproduced below, on a real file-backed
+changes right alongside its own -- exercised below, on a real file-backed
 database, with nothing more exotic than one blocking reader.
 
-The fix (``SqliteEngravaCore._commit_or_recover``, shared by both call sites)
-attempts a rollback of the now-known-bad transaction when the commit itself
-fails, and quarantines the connection via the existing
-``_quarantine_connection`` mechanism when that rollback also cannot be
-trusted -- mirroring ``_write_readback_savepoint``'s own unwind-failure
+When the commit itself fails, ``_commit_or_recover`` attempts a rollback of
+the now-known-bad transaction, and quarantines the connection via the
+existing ``_quarantine_connection`` mechanism when that rollback also cannot
+be trusted -- mirroring ``_write_readback_savepoint``'s own unwind-failure
 handling for the same reason: a caller must never be able to reach a commit
 that could flush an indeterminate transaction.
-
-Every test in this module was confirmed failing against the pre-fix code
-(``suspend_auto_commit``'s commit outside the ``except``, ``_maybe_commit``'s
-bare ``await self._db.commit()``) before this file was written: the two
-real-contention tests reproduced the durability leak this closes, and the
-monkeypatched ones hung or propagated the wrong exception.
 """
 
 from __future__ import annotations
@@ -87,7 +80,7 @@ async def _open_blocking_reader(db_path: str) -> aiosqlite.Connection:
     A small write transaction stays buffered in the writer's page cache and
     only needs to escalate to an ``EXCLUSIVE`` lock at ``COMMIT`` time -- which
     this reader's own ``SHARED`` lock blocks until the writer's
-    ``busy_timeout`` gives up, exactly the precondition the work item names.
+    ``busy_timeout`` gives up.
     """
     reader = await aiosqlite.connect(db_path)
     await reader.execute("BEGIN")

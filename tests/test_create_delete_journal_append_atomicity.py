@@ -7,17 +7,13 @@ append describing them must be one failure-atomic unit, so a failed or
 cancelled append unwinds the write too instead of leaving it durable on a
 later, unrelated commit with no journal entry to show for it.
 
-This file covers the operations that same fix did not yet reach:
+This file covers the other journaled operations:
 ``create_thought`` (its plain-insert branch and both dedup entry points),
 ``delete_thought``, ``create_edge``, ``delete_edge``, ``create_action`` /
 ``update_action`` (including the action-outcome recompute), and
-``cleanup_expired``. Before the fix these either had no savepoint around
-their write at all, or (``delete_thought`` / ``cleanup_expired``'s delete
-branch) a savepoint that had already released by the time the journal append
-ran.
+``cleanup_expired``.
 
-Three transaction contexts are exercised for every row, per the work item's
-acceptance matrix:
+Three transaction contexts are exercised for every row:
 
 * **standalone** -- no transaction open when the call starts.
 * **window** -- the call runs inside a caller-owned ``suspend_auto_commit()``
@@ -28,8 +24,7 @@ acceptance matrix:
 
 Each is tried with an ordinary exception and with ``asyncio.CancelledError``,
 since the two can take different paths through an ``except BaseException``
-unwind. Every case was confirmed against the pre-fix code before the fix was
-applied; see the implementation report for exactly which cells were red.
+unwind.
 """
 
 from __future__ import annotations
@@ -228,8 +223,8 @@ async def _install_thought_delete_ignore_trigger(store: SqliteEngravaCore) -> No
 
 
 # ---------------------------------------------------------------------------
-# The row matrix: one Case per fix row, reused across all three contexts and
-# both injection kinds.
+# The row matrix: one Case per operation variant, reused across all three
+# contexts and both injection kinds.
 # ---------------------------------------------------------------------------
 
 
@@ -553,7 +548,7 @@ async def _run_raw_transaction(case: Case, exc: BaseException, tmp_path: Path) -
 @pytest.mark.parametrize("case", CASES, ids=_CASE_IDS)
 @pytest.mark.parametrize("exc_factory", _INJECTIONS, ids=_INJECTION_IDS)
 class TestFixRowMatrix:
-    """Every fix row, times three transaction contexts, times two injections."""
+    """Each row, in each of three transaction contexts, with each of two injections."""
 
     async def test_standalone(
         self,
@@ -1056,11 +1051,10 @@ class TestQuarantinePrecedence:
     ) -> None:
         """An update_thought unit's unwind fails inside a caller's window.
 
-        ``update_thought`` is already wrapped in ``_write_readback_savepoint``
-        (a prior fix) and ``suspend_auto_commit`` is already an outer frame
-        around it, so this scenario is reachable independently of this work
-        item's own changes -- it is the one frame expected red before this
-        fix, from reading the source.
+        ``update_thought`` runs inside ``_write_readback_savepoint`` and
+        ``suspend_auto_commit`` is an outer frame around it. When the journal
+        append fails and the savepoint's own unwind fails too, the original
+        exception still propagates and the connection is quarantined.
         """
         db = await aiosqlite.connect(":memory:")
         db.row_factory = aiosqlite.Row

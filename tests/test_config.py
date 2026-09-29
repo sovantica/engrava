@@ -337,10 +337,8 @@ hooks:
     def test_non_dict_scalar_reproduces_the_offending_value(self, tmp_path: Path) -> None:
         """A bare scalar document names the value itself, not just its type.
 
-        Reporting only ``got str`` (the pre-fix message) named the type but
-        dropped what was actually written in the file -- a message that must
-        always contain the offending value, per this module's own
-        documented convention, was silently the one exception to it.
+        The message reads ``got str: 'hello'``, so whoever fixes the file
+        sees what was actually written in it, not only that it was a string.
         """
         cfg_file = tmp_path / "scalar.yaml"
         cfg_file.write_text("hello\n", encoding="utf-8")

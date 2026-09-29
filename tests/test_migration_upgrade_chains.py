@@ -1296,17 +1296,9 @@ async def test_atomic_step_busy_commit_rolls_back_and_stays_retryable(
     raising ``OperationalError`` instead of leaving it at sqlite3's
     multi-second default (this bounds SQLite's internal wait, not the
     coroutine's own end-to-end latency, and the test does not depend on
-    wall-clock timing). Every connection is also closed from a ``finally``
-    that runs on every exit path, assertion failures included. On the
-    *unfixed* code the migrating connection is left mid-transaction, which by
-    itself is harmless -- but a `reader` (or any other connection) left open
-    past an early ``assert`` failure leaks its aiosqlite worker thread, and an
-    un-joined non-daemon thread hangs the whole interpreter at shutdown
-    instead of letting pytest ever report the failure. That hang was reproduced
-    live against the unfixed code before this fix (a bare ``reader`` opened
-    without its own ``finally``): the process had to be killed after the
-    external cap, and nothing it had already printed survived the kill,
-    which is indistinguishable from the test itself hanging.
+    wall-clock timing). ``reader`` is closed from a ``finally`` unless the
+    test has already closed it, so an early ``assert`` failure does not leak
+    it.
     """
     db_path = tmp_path / "busy_commit.db"
 

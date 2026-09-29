@@ -73,15 +73,13 @@ _HELPER_FUNCTIONS = frozenset(
 # would. Keyed by fully qualified name, same reasoning as `_HELPER_FUNCTIONS`.
 #
 # Empty on the real tree: `_insert_derived_row` and `_insert_derived_edge`
-# used to be registered here (their appends recovered through a full-
-# transaction compensating rollback instead of their own savepoint unit).
-# Both are now wrapped in their own `_write_readback_savepoint` block like
-# every other journaled insert, so neither needs an exemption any more --
-# the guard protects them lexically instead. Kept as a real, empty registry
-# (not deleted) so the exemption machinery below still has a home; the
-# scratch mutations further down register their own synthetic entries via
-# `monkeypatch` to keep exercising that machinery without a real function on
-# the exemption table.
+# wrap their appends in their own `_write_readback_savepoint` block like
+# every other journaled insert, so neither needs an exemption -- the guard
+# protects them lexically. Kept as a real, empty registry (not deleted) so
+# the exemption machinery below still has a home; the scratch mutations
+# further down register their own synthetic entries via `monkeypatch` to
+# keep exercising that machinery without a real function on the exemption
+# table.
 _EXEMPTIONS: dict[str, tuple[str, int]] = {}
 
 
@@ -102,8 +100,7 @@ class _FunctionScopedCallFinder(ast.NodeVisitor):
     function's own body, so a call is only ever considered wrapped by an
     ``async with`` in its *own* enclosing function, never one belonging to an
     outer function it happens to be lexically nested under (not a shape this
-    module uses, but the scoping rule the work item's wording implies: "in
-    its own function").
+    module uses, but the scoping rule "in its own function" implies).
 
     Functions are attributed by their **fully qualified** scope path --
     ``<class>.<method>``, or ``<class>.<method>.<nested function>`` for a
@@ -262,7 +259,7 @@ class _QualifiedFunctionNameCollector(ast.NodeVisitor):
 def _all_defined_function_names(tree: ast.Module) -> set[str]:
     """Every ``def`` / ``async def``'s fully qualified scope path in the module.
 
-    Used to catch a stale registration directly: a rename (or deletion) of a
+    Lets a stale registration be caught directly: a rename (or deletion) of a
     registered exempt or helper function leaves its old qualified name out of
     this set entirely, distinct from -- and checked before -- whether any
     append call node or call site was found under that name.
@@ -482,10 +479,11 @@ class TestRecurrenceGuardCatchesAnUnprotectedAppend:
         call node added beside the one it was recorded for must trip the count
         check even though the function is still exempt, not merely be waved
         through because the function's name is on the exemption table at all.
-        No function on the real tree is exempt any more (``_insert_derived_row``
-        and ``_insert_derived_edge`` moved to their own savepoint units), so
-        this registers a scratch function as a synthetic exemption instead of
-        depending on one of the real tree's own functions to stay exempt.
+        No function on the real tree is exempt (``_insert_derived_row`` and
+        ``_insert_derived_edge`` each wrap their append in their own savepoint
+        block), so this registers a scratch function as a synthetic exemption
+        instead of depending on one of the real tree's own functions to stay
+        exempt.
         """
         source = _engrava_core_source()
         scratch_method = (
@@ -525,11 +523,10 @@ class TestRecurrenceGuardCatchesEveryWayAnAppendCanBeMissed:
     ) -> None:
         """(i) An exempt function whose only append is gone must still be a count mismatch.
 
-        Before this was fixed, the guard only ever looked at functions that
-        still had at least one append call node (keyed off `by_function`), so
-        a function registered as exempt with count 1 that dropped to 0 simply
-        never got checked at all -- it fell out of the scan, not just out of
-        the count. No function on the real tree is exempt any more, so this
+        The exemption check looks each exempt function's sites up by the
+        exemption table's own name, not through `by_function`, because a
+        function whose appends are all gone is absent from `by_function`
+        altogether. No function on the real tree is exempt, so this
         registers a scratch function -- with no append at all -- as a
         synthetic exemption instead.
         """
@@ -556,7 +553,7 @@ class TestRecurrenceGuardCatchesEveryWayAnAppendCanBeMissed:
     ) -> None:
         """(ii) A stale registration pointing at a function nobody defines must be caught.
 
-        No function on the real tree is exempt any more, so this registers a
+        No function on the real tree is exempt, so this registers a
         synthetic exemption for a name that is never defined anywhere in the
         (unmodified) source -- the same stale-registration shape a rename
         would produce, without depending on a real function to rename.

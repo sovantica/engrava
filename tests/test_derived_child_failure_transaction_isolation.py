@@ -1,16 +1,14 @@
 """A failed derived child undoes only itself, in every transaction context.
 
-Covers the acceptance scenarios that ``tests/test_derived_records_seam.py``
-does not: a per-child failure inside a caller's own ``suspend_auto_commit()``
-window, and inside a caller-held raw ``BEGIN``. Outside any caller
-transaction (per-child commits one at a time) is already covered by the
-existing suite and is unchanged by this file.
+Covers a per-child failure inside a caller's own ``suspend_auto_commit()``
+window, and inside a caller-held raw ``BEGIN``. A per-child failure outside
+any caller transaction (each child commits one at a time) is covered by
+``tests/test_derived_records_seam.py``.
 
 Two variants below (``test_journal_append_failure_in_window_...`` and
-``test_embedding_provider_failure_in_window_...``) reproduce the RED result
-recorded by a probe run before this fix (not part of this public repo):
-a caller's own earlier write in the same window was silently discarded when
-a derived child failed under the default ``on_error="log"``.
+``test_embedding_provider_failure_in_window_...``) pin that a caller's own
+earlier write in the same window survives a derived child failing under the
+default ``on_error="log"``.
 
 **Every database here is file-backed, and every "durable after this point"
 claim is proven by reopening a fresh, separate connection** (``_reopened``)
@@ -313,11 +311,10 @@ async def test_journal_append_failure_in_window_log_leaves_callers_write_durable
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """RED -> GREEN: a child's row-journal failure, inside a window, under "log".
+    """A child's row-journal failure, inside a window, under "log".
 
-    Before the fix, the child's compensating rollback discarded the whole
-    transaction, including the caller's own earlier write (``X``), silently,
-    because ``on_error="log"`` never told the caller.
+    Only the failed child is undone: the caller's own earlier write (``X``)
+    is not discarded, although ``on_error="log"`` raises nothing to the caller.
     """
     source_id = "src-1"
     doomed = "doomed child"
@@ -355,12 +352,11 @@ async def test_embedding_provider_failure_in_window_log_leaves_callers_write_dur
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """RED -> GREEN: the embedding provider raises for one child, inside a window, "log".
+    """The embedding provider raises for one child, inside a window, under "log".
 
     The provider raises before writing anything (``_auto_embed_thought``
     raises ahead of its locked section), so there is nothing of the embed
-    step itself to unwind -- but the old full-transaction compensation still
-    discarded ``X``.
+    step itself to unwind, and ``X`` must not be discarded.
     """
     source_id = "src-1"
     doomed = "doomed child"
