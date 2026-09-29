@@ -661,6 +661,66 @@ def test_scanner_accepts_an_ambiguous_bare_name_inside_its_resolved_section(tmp_
     assert result.resolved[0].matches
 
 
+_WRONG_TABLE = (
+    "| Key | Type | Default | Description |\n"
+    "|-----|------|---------|-------------|\n"
+    "| `reflection_boost` | `float` | `2.0` | Score multiplier |\n"
+)
+_WRONG_PROSE = "The `min_age` gate (default `9`) blocks fresh thoughts.\n"
+
+
+@pytest.mark.parametrize("claim", [_WRONG_TABLE, _WRONG_PROSE], ids=["table", "prose"])
+@pytest.mark.parametrize(
+    "marker",
+    ["    ```", "\t```", "\u00a0```", "    ~~~"],
+    ids=["four-spaces", "tab", "no-break-space", "four-spaces-tilde"],
+)
+def test_scanner_reads_a_claim_between_two_lines_that_only_look_like_fences(
+    tmp_path: Path,
+    marker: str,
+    claim: str,
+) -> None:
+    """Four spaces, a tab or a no-break space before the backticks is not a fence.
+
+    The two marker lines are an indented code block (or a paragraph), so the
+    claim between them is ordinary text and is read; treating the pair as a
+    fence would hide a wrong default from the gate.
+    """
+    result = _fake_scan(tmp_path, f"{marker}\n\n{claim}\n{marker}\n")
+
+    assert len(result.resolved) == 1
+    assert not result.resolved[0].matches
+
+
+@pytest.mark.parametrize("claim", [_WRONG_TABLE, _WRONG_PROSE], ids=["table", "prose"])
+@pytest.mark.parametrize("fence", ["```", "~~~", "   ```", "````"])
+def test_scanner_does_not_read_a_claim_inside_a_fence(
+    tmp_path: Path,
+    fence: str,
+    claim: str,
+) -> None:
+    """Control: text in a real fence is code, whatever it says."""
+    result = _fake_scan(tmp_path, f"{fence}\n{claim}{fence}\n")
+
+    assert not result.resolved
+
+
+@pytest.mark.parametrize("claim", [_WRONG_TABLE, _WRONG_PROSE], ids=["table", "prose"])
+def test_scanner_does_not_read_a_claim_after_a_line_that_does_not_close_a_fence(
+    tmp_path: Path,
+    claim: str,
+) -> None:
+    """A no-break space after the backticks leaves the fence open, so the claim is inside it."""
+    result = _fake_scan(tmp_path, f"```\n```\u00a0\n{claim}```\n")
+
+    assert not result.resolved
+
+
+def test_scanner_rejects_a_fence_that_is_never_closed(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="never closed"):
+        _fake_scan(tmp_path, f"```\n{_WRONG_TABLE}")
+
+
 def test_scanner_does_not_split_a_decimal_number_as_a_clause_boundary(tmp_path: Path) -> None:
     """A decimal point inside a value must not be mistaken for a sentence boundary."""
     result = _fake_scan(tmp_path, "`reflection_boost` defaults to `1.0` in every build.\n")

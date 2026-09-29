@@ -122,6 +122,8 @@ from tests.docs._md_blocks import (
     CodeBlock,
     extract_fenced_blocks,
     extract_python_blocks,
+    lines_outside_fences,
+    markdown_lines,
 )
 
 if TYPE_CHECKING:
@@ -475,17 +477,13 @@ def _page_prose_paragraphs(rel_path: str) -> list[str]:
     a page-wide search would let a claim about one note be satisfied by a
     sentence about another.
     """
-    lines = (REPO_ROOT / rel_path).read_text(encoding="utf-8").splitlines()
+    lines = lines_outside_fences(
+        markdown_lines((REPO_ROOT / rel_path).read_text(encoding="utf-8")), rel_path
+    )
     paragraphs: list[str] = []
     current: list[str] = []
-    in_fence = False
     for raw in lines:
-        if raw.lstrip().startswith("```"):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
-        if raw.strip():
+        if raw.strip(" \t"):
             current.append(raw)
         elif current:
             paragraphs.append(" ".join(" ".join(current).split()))
@@ -493,6 +491,48 @@ def _page_prose_paragraphs(rel_path: str) -> list[str]:
     if current:
         paragraphs.append(" ".join(" ".join(current).split()))
     return paragraphs
+
+
+@pytest.mark.parametrize(
+    ("page", "expected"),
+    [
+        pytest.param(
+            "Before.\n\n```text\nA hidden claim.\n```\n\nAfter.\n",
+            ["Before.", "After."],
+            id="fence-hides-its-text",
+        ),
+        pytest.param(
+            "Before.\n\n    ```\n\nA claim.\n\n    ```\n\nAfter.\n",
+            ["Before.", "```", "A claim.", "```", "After."],
+            id="four-spaces-is-not-a-fence",
+        ),
+        pytest.param(
+            "Before.\n\n```text\n```\u00a0\nA hidden claim.\n```\n\nAfter.\n",
+            ["Before.", "After."],
+            id="no-break-space-does-not-close",
+        ),
+        pytest.param(
+            "First line\nsecond line\n\nNext.\n",
+            ["First line second line", "Next."],
+            id="paragraphs-split-on-blank-lines",
+        ),
+    ],
+)
+def test_page_prose_paragraphs_drops_exactly_the_fenced_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    page: str,
+    expected: list[str],
+) -> None:
+    """The paragraphs are the page's text outside real fences, one per blank-line run.
+
+    The fence rule is the one every documentation gate shares: four spaces open
+    no fence, and a no-break space after the backticks does not close one.
+    """
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+    (tmp_path / "page.md").write_text(page, encoding="utf-8")
+
+    assert _page_prose_paragraphs("page.md") == expected
 
 
 def test_tutorial_page_produces_the_output_it_publishes(tmp_path: Path) -> None:

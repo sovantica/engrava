@@ -91,8 +91,12 @@ ordinary behaviour: every line is a command.
 A ``bash`` block this module cannot check is registered in
 ``EXEMPT_BASH_BLOCKS`` with a reason from the closed
 :class:`~tests.docs._md_blocks.ExemptionReason` vocabulary, never left silently
-uncovered. Most such blocks name no ``engrava`` invocation at all (``pip
-install``, ``make``, ``sqlite3``, ``python -m ...``); one — the CLI's own
+uncovered. The registration also carries a digest of the block's text, and the
+exemption applies only to the block's text (line endings normalised): edit an
+exempt block and it is checked like any other, and
+``test_exempt_bash_registry_digests_match`` names it. Most such blocks name no
+``engrava`` invocation at all (``pip install``,
+``make``, ``sqlite3``, ``python -m ...``); one — the CLI's own
 ``engrava [GLOBAL OPTIONS] COMMAND [ARGS]...`` usage-grammar line — genuinely
 is shaped like an invocation and is filed under a distinct reason for exactly
 that reason (see ``ExemptionReason.USAGE_GRAMMAR_PLACEHOLDER``), rather than
@@ -102,6 +106,7 @@ must contain at least one invocation line this module can check.
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from dataclasses import dataclass
 
@@ -113,6 +118,8 @@ from tests.docs._md_blocks import (
     REPO_ROOT,
     CodeBlock,
     ExemptionReason,
+    block_digest,
+    exemption_digest_problems,
     extract_exact_fenced_blocks,
     markdown_files,
 )
@@ -138,106 +145,148 @@ _ALL_BASH_BLOCKS = _all_bash_blocks()
 # the closed ExemptionReason vocabulary. Every bash block not listed here must
 # contain at least one line this module can check (see
 # test_every_bash_block_is_covered).
-EXEMPT_BASH_BLOCKS: tuple[tuple[str, str, ExemptionReason], ...] = (
-    ("README.md", "pip install engrava", ExemptionReason.NOT_AN_ENGRAVA_INVOCATION),
-    ("README.md", "pip install 'engrava[vec]'", ExemptionReason.NOT_AN_ENGRAVA_INVOCATION),
-    ("README.md", "uvx engrava-mcp", ExemptionReason.NOT_AN_ENGRAVA_INVOCATION),
-    ("README.md", "make install", ExemptionReason.NOT_AN_ENGRAVA_INVOCATION),
+#
+# Entries are (markdown_path, anchor, reason, digest). The anchor finds the
+# block; the digest (see `block_digest`) binds the exemption to the block's text
+# (line endings normalised). An exemption applies only while the block still
+# hashes to its digest: an edited block is checked like any other (so a command
+# appended to an exempt block reports itself), and
+# test_exempt_bash_registry_digests_match names it and prints the digest to
+# register if the edit is deliberate.
+EXEMPT_BASH_BLOCKS: tuple[tuple[str, str, ExemptionReason, str], ...] = (
+    (
+        "README.md",
+        "pip install engrava",
+        ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "5402b543a860c012",
+    ),
+    (
+        "README.md",
+        "pip install 'engrava[vec]'",
+        ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "2c31b4fce4174f49",
+    ),
+    ("README.md", "uvx engrava-mcp", ExemptionReason.NOT_AN_ENGRAVA_INVOCATION, "c78476e34cb67f22"),
+    ("README.md", "make install", ExemptionReason.NOT_AN_ENGRAVA_INVOCATION, "c0230d95890ff568"),
     (
         "docs/backup-and-recovery.md",
         "VACUUM INTO 'engrava-backup.db'",
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "4e3cb5488560033b",
     ),
     (
         "docs/backup-and-recovery.md",
         "wal_checkpoint(TRUNCATE)",
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "fc844eb00d129556",
     ),
     (
         "docs/benchmarks.md",
         "pip install 'engrava[embeddings-local]'",
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "dba79ad4af250b02",
     ),
     (
         "docs/benchmarks.md",
         "--with-reproducibility",
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "007859d1d6ab408b",
     ),
     (
         "docs/benchmarks.md",
         "python -m engrava.benchmarks.longmemeval",
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "f0286eae04210cfb",
     ),
     (
         "docs/cli.md",
         "engrava [GLOBAL OPTIONS] COMMAND [ARGS]...",
         ExemptionReason.USAGE_GRAMMAR_PLACEHOLDER,
+        "f062fe7d84352d8b",
     ),
     (
         "docs/guides/agent-memory.md",
         "python examples/agent_loop.py",
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "6c022454bb3101a5",
     ),
     (
         "docs/guides/embeddings.md",
         'pip install "engrava[embeddings-local]"',
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "e18807c71720cd8e",
     ),
     (
         "docs/guides/embeddings.md",
         'pip install "engrava[embeddings-openai]"',
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "b06d22a879be0b47",
     ),
     (
         "docs/guides/embeddings.md",
         'pip install "engrava[embeddings-ollama]"',
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "4e543da9ca0ec9f9",
     ),
     (
         "docs/guides/embeddings.md",
         'pip install "engrava[embeddings-hf]"',
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "03777e7d057bfae8",
     ),
     (
         "docs/known-limitations.md",
         "brew install python@3.12",
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "0c3806b5ef557a62",
     ),
     (
         "docs/performance.md",
         "pip install 'engrava[vec]'",
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "1e0959f1ef869a29",
     ),
-    ("docs/quickstart.md", "pip install engrava", ExemptionReason.NOT_AN_ENGRAVA_INVOCATION),
+    (
+        "docs/quickstart.md",
+        "pip install engrava",
+        ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "5402b543a860c012",
+    ),
     (
         "docs/quickstart.md",
         "pip install 'engrava[embeddings-local]'",
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "6ac2ca5a345cd808",
     ),
     (
         "docs/quickstart.md",
         "python examples/quickstart.py",
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "3e0a8cf522cfe0df",
     ),
     (
         "docs/quickstart.md",
         "python -m engrava.benchmarks.synthetic",
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "022e31d633869a6a",
     ),
     (
         "docs/troubleshooting.md",
         "sqlite3 engrava.db",
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "090cf395f71ce64e",
     ),
     (
         "docs/upgrade.md",
         'sqlite3 my-data.db ".backup my-data.db.bak"',
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "b1709edea76d249d",
     ),
     (
         "docs/upgrade.md",
         "your app's existing ensure_schema()",
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "fd0f24efc8778771",
     ),
 )
 
@@ -264,9 +313,25 @@ def _unique_block(rel: str, anchor: str) -> CodeBlock:
     return matches[0]
 
 
+def _registered_exemptions() -> list[tuple[CodeBlock, ExemptionReason, str]]:
+    """Resolve every registry entry to ``(block, reason, registered_digest)``."""
+    return [
+        (_unique_block(rel, anchor), reason, digest)
+        for rel, anchor, reason, digest in EXEMPT_BASH_BLOCKS
+    ]
+
+
 def _exempt_locations() -> dict[str, ExemptionReason]:
+    """Map location to reason for each registered block whose text still matches its digest.
+
+    A block edited since it was registered is deliberately absent: the
+    exemption was granted for the text that was reviewed, not for whatever the
+    block says now, so an edited block goes back to being checked.
+    """
     return {
-        _unique_block(rel, anchor).location: reason for rel, anchor, reason in EXEMPT_BASH_BLOCKS
+        block.location: reason
+        for block, reason, digest in _registered_exemptions()
+        if block_digest(block.body) == digest
     }
 
 
@@ -937,7 +1002,22 @@ def test_bash_extractor_found_blocks() -> None:
 
 def test_exempt_bash_registry_anchors_are_unique() -> None:
     """Every EXEMPT_BASH_BLOCKS anchor binds exactly one bash block."""
-    _exempt_locations()
+    _registered_exemptions()
+
+
+def test_exempt_bash_registry_digests_match() -> None:
+    """Every exempt bash block still has the text it was exempted for.
+
+    An exemption that keyed on location alone kept skipping a block after an
+    unchecked command was appended to it. Here each entry also carries a digest
+    of the block's text (line endings normalised), so the edit is reported by
+    block, with the digest to register if the edit is deliberate.
+    """
+    problems = exemption_digest_problems(
+        "EXEMPT_BASH_BLOCKS",
+        [(block, digest) for block, _reason, digest in _registered_exemptions()],
+    )
+    assert not problems, "exempt bash blocks were edited:\n" + "\n".join(problems)
 
 
 def test_every_bash_block_is_covered() -> None:
@@ -972,7 +1052,10 @@ def test_engrava_invocations_match_the_real_cli(block: CodeBlock) -> None:
     ``ExemptionReason.USAGE_GRAMMAR_PLACEHOLDER`` (the CLI's own usage-grammar
     line, ``engrava [GLOBAL OPTIONS] COMMAND [ARGS]...``): it genuinely has the
     shape of an invocation, it just names no real command or option, so
-    checking it would fail for a reason unrelated to documentation drift.
+    checking it would fail for a reason unrelated to documentation drift. An
+    exemption covers only the block's text (line endings normalised) it was
+    registered for (see ``EXEMPT_BASH_BLOCKS``): a block edited since then is not
+    skipped.
     """
     if block.location in _exempt_locations():
         pytest.skip("exempt bash block: filed under its ExemptionReason, see EXEMPT_BASH_BLOCKS")
@@ -1567,3 +1650,70 @@ def test_checker_strips_a_negation_run_before_an_env_assignment() -> None:
 def test_checker_accepts_a_doubly_negated_valid_command() -> None:
     """Control: a negation run over a real, valid invocation must not itself be an error."""
     assert block_invocation_errors(_synthetic_block("! ! engrava info\n")) == []
+
+
+def _edit_registered_block(
+    monkeypatch: pytest.MonkeyPatch,
+    rel: str,
+    anchor: str,
+    suffix: str,
+) -> CodeBlock:
+    """Swap one registered exempt block for a copy with ``suffix`` appended to its text.
+
+    The replacement is made in this module's block list, so the registry, the
+    census and the per-block test all see the edited block exactly as they
+    would see an edited documentation page.
+    """
+    original = _unique_block(rel, anchor)
+    edited = dataclasses.replace(original, body=original.body + suffix)
+    monkeypatch.setitem(
+        globals(),
+        "_ALL_BASH_BLOCKS",
+        [edited if block is original else block for block in _ALL_BASH_BLOCKS],
+    )
+    return edited
+
+
+def test_an_edited_exempt_block_is_checked_again_and_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A command appended to an exempt block is neither hidden nor still exempt.
+
+    ``reindex`` is not a real command, so the raw checker flags it. The
+    exemption was granted for the block's original text, so it no longer
+    applies: the per-block test runs (rather than skips) and fails on the
+    appended command, and the digest census names the block and prints the
+    digest to register if the edit was deliberate.
+    """
+    edited = _edit_registered_block(
+        monkeypatch, "README.md", "pip install engrava", "\nengrava reindex"
+    )
+
+    assert any("reindex" in error.message for error in block_invocation_errors(edited))
+    assert edited.location not in _exempt_locations()
+
+    with pytest.raises(AssertionError, match="reindex"):
+        test_engrava_invocations_match_the_real_cli(edited)
+
+    with pytest.raises(AssertionError, match=re.escape(edited.location)) as census:
+        test_exempt_bash_registry_digests_match()
+    message = str(census.value)
+    assert block_digest(edited.body) in message
+    assert "EXEMPT_BASH_BLOCKS" in message
+
+
+def test_an_edit_that_adds_no_command_still_fails_the_digest_census(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even a harmless edit to an exempt block is reported, not silently absorbed.
+
+    The block is checked again, and passes (nothing in it is an ``engrava``
+    invocation), but the registered digest no longer matches, so a reviewer has
+    to re-register the block deliberately.
+    """
+    edited = _edit_registered_block(monkeypatch, "README.md", "pip install engrava", " --upgrade")
+
+    assert block_invocation_errors(edited) == []
+    assert edited.location not in _exempt_locations()
+    with pytest.raises(AssertionError, match=re.escape(edited.location)):
+        test_exempt_bash_registry_digests_match()

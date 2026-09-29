@@ -109,7 +109,9 @@ rather than silently under-checked.
 
 from __future__ import annotations
 
+import dataclasses
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -122,6 +124,8 @@ from engrava import ConfigError, load_config
 from tests.docs._md_blocks import (
     CodeBlock,
     ExemptionReason,
+    block_digest,
+    exemption_digest_problems,
     extract_exact_fenced_blocks,
     markdown_files,
 )
@@ -141,16 +145,25 @@ _ALL_YAML_BLOCKS = _all_yaml_blocks()
 # top-level key twice to illustrate alternate forms -- a real duplicate key
 # by construction, so the duplicate-key check reports it, and checking the
 # whole block as one document can never validate either form on its own.
-EXEMPT_YAML_BLOCKS: tuple[tuple[str, str, ExemptionReason], ...] = (
+#
+# Each entry is (file, anchor, reason, digest). The anchor finds the block; the
+# digest (block_digest of the block's text) binds the exemption to the text it
+# was granted for. The exemption applies only while the block still matches its
+# digest: edit an exempt block and it goes back to being checked, and
+# test_exempt_yaml_registry_digests_match names it and prints the digest to
+# register if the edit was deliberate.
+EXEMPT_YAML_BLOCKS: tuple[tuple[str, str, ExemptionReason, str], ...] = (
     (
         "docs/configuration.md",
         "# list form",
         ExemptionReason.DUPLICATE_KEY_ALTERNATE_FORMS,
+        "91d1c03d4bfe3f07",
     ),
     (
         "docs/extensions.md",
         "# Explicit dotted paths",
         ExemptionReason.DUPLICATE_KEY_ALTERNATE_FORMS,
+        "7b9ffbfa2ac75990",
     ),
 )
 
@@ -399,9 +412,25 @@ def _unique_block(rel: str, anchor: str) -> CodeBlock:
     return matches[0]
 
 
+def _registered_exemptions() -> list[tuple[CodeBlock, ExemptionReason, str]]:
+    """Resolve every EXEMPT_YAML_BLOCKS entry to (block, reason, registered digest)."""
+    return [
+        (_unique_block(rel, anchor), reason, digest)
+        for rel, anchor, reason, digest in EXEMPT_YAML_BLOCKS
+    ]
+
+
 def _exempt_locations() -> dict[str, ExemptionReason]:
+    """Locations of the blocks that are exempt *now*.
+
+    An entry counts only while its block's text still matches the registered
+    digest. An edited block drops out of this mapping, so it is checked like
+    any other block; the digest census reports it by name.
+    """
     return {
-        _unique_block(rel, anchor).location: reason for rel, anchor, reason in EXEMPT_YAML_BLOCKS
+        block.location: reason
+        for block, reason, digest in _registered_exemptions()
+        if block_digest(block.body) == digest
     }
 
 
@@ -428,7 +457,21 @@ def test_yaml_extractor_found_blocks() -> None:
 
 def test_exempt_yaml_registry_anchors_are_unique() -> None:
     """Every EXEMPT_YAML_BLOCKS anchor binds exactly one yaml block."""
-    _exempt_locations()
+    _registered_exemptions()
+
+
+def test_exempt_yaml_registry_digests_match() -> None:
+    """Every exempt block still has the text its exemption was granted for.
+
+    The text is compared with its line endings normalised. An edited block is
+    checked again (see ``_exempt_locations``) and is named here with the digest
+    to register if the edit was deliberate.
+    """
+    problems = exemption_digest_problems(
+        "EXEMPT_YAML_BLOCKS",
+        [(block, digest) for block, _, digest in _registered_exemptions()],
+    )
+    assert not problems, "exempt yaml blocks were edited:\n" + "\n".join(problems)
 
 
 def test_complete_yaml_registry_anchors_are_unique() -> None:
@@ -471,7 +514,8 @@ def test_documented_config_keys_exist_on_the_real_classes(block: CodeBlock) -> N
     that would fail for the reader who pastes it. A block registered as
     complete is checked exactly as written; a fragment is checked with a
     placeholder ``database.path`` (see the module docstring for what that
-    does and does not prove).
+    does and does not prove). An exempt block is skipped only while its text
+    still matches the digest its exemption was registered with.
     """
     exempt = _exempt_locations()
     if block.location in exempt:
@@ -765,3 +809,55 @@ def test_checker_accepts_overlapping_keys_across_a_merge_sequence() -> None:
     """
     fragment = "database:\n  <<: [{path: a.db}, {path: b.db}]\n"
     assert block_config_error(fragment, complete=True) is None
+
+
+def _edit_registered_block(
+    monkeypatch: pytest.MonkeyPatch,
+    rel: str,
+    anchor: str,
+    suffix: str,
+) -> CodeBlock:
+    """Swap one registered exempt block for a copy with ``suffix`` appended to its text.
+
+    The replacement is made in this module's block list, so the registry, the
+    census and the per-block test all see the edited block exactly as they
+    would see an edited documentation page.
+    """
+    original = _unique_block(rel, anchor)
+    edited = dataclasses.replace(original, body=original.body + suffix)
+    monkeypatch.setitem(
+        globals(),
+        "_ALL_YAML_BLOCKS",
+        [edited if block is original else block for block in _ALL_YAML_BLOCKS],
+    )
+    return edited
+
+
+def test_an_edited_exempt_block_is_checked_again_and_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A key appended to an exempt block does not leave the block exempt.
+
+    The exemption was granted for the block's original text, so it no longer
+    applies: the per-block test runs (rather than skips) and reports a problem
+    with the block, and the digest census names the block and prints the digest
+    to register if the edit was deliberate.
+    """
+    edited = _edit_registered_block(
+        monkeypatch, "docs/configuration.md", "# list form", "\nturbo:\n  enabled: true\n"
+    )
+
+    assert edited.location not in _exempt_locations()
+    with pytest.raises(AssertionError, match="rejected by the real load_config"):
+        test_documented_config_keys_exist_on_the_real_classes(edited)
+
+    with pytest.raises(AssertionError, match=re.escape(edited.location)) as census:
+        test_exempt_yaml_registry_digests_match()
+    message = str(census.value)
+    assert block_digest(edited.body) in message
+    assert "EXEMPT_YAML_BLOCKS" in message
+
+
+def test_the_unedited_exempt_blocks_are_exempt() -> None:
+    """Control: on the shipped documentation both registered blocks are still exempt."""
+    assert len(_exempt_locations()) == len(EXEMPT_YAML_BLOCKS)

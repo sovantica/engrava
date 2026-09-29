@@ -23,13 +23,14 @@ specifically because a name-shape substitute for that check would leave every
 other test in this file green (every currently exported exception happens to
 end in ``Error``), so nothing else here would have proven the claim.
 
-It does **not** validate Markdown table well-formedness. There is no fence
-tracking, no escaped-pipe handling, and no general cell-splitting. A
-malformed table renders visibly wrong in any Markdown viewer and is a problem
-for the human reading the page, not for this gate. A few things below look
-like structural parsing but are not: they are single, narrow predicates over
-one line (or one cell) each, kept only because their absence is a real hole
-this gate has had:
+It does **not** validate Markdown table well-formedness. There is no
+escaped-pipe handling and no general cell-splitting. A malformed table
+renders visibly wrong in any Markdown viewer and is a problem for the human
+reading the page, not for this gate. The structural rules it does apply are
+about fences and about indentation, described next. A few things below look like
+structural parsing
+but are not: they are single, narrow predicates over one line (or one cell)
+each, kept only because their absence is a real hole this gate has had:
 
 * **The header is identified by its first cell being exactly ``"Exception"``**
   (whitespace around it ignored), not by the whole line matching some fixed
@@ -67,6 +68,34 @@ for this purpose as the text between a line's first and second ``|`` (see
 ``_first_cell``) — this is not a general table-cell parser and is not used
 for anything beyond identifying the header and extracting a row's name.
 
+**Fenced text is not part of the document.** A table inside a fenced code
+block renders as literal text, not as a table, so a table that has been
+wrapped in a fence is a table that is not there. Before anything below reads a
+line, every fenced block (opening fence through closing fence) is blanked with
+``tests.docs._md_blocks.lines_outside_fences``, the same extractor the
+example-block gates use, so what counts as a fence is decided in one place
+(CommonMark: an opener or closer indented up to three spaces, backticks or
+tildes, an optional info string). A blanked line stays in the list as an empty
+line, so line numbers in failure messages still match the file and, as in a
+renderer, the gap ends a table. The consequences are the ones a reader would
+expect: a ``## Exceptions`` heading, a header line, a ``## `` line or a
+table row shown inside a fence is example text and is never counted, and a
+fenced table fails as "no header line in the section" (see
+``test_gate_rejects_the_real_table_wrapped_in_a_code_fence``). A fence that is
+opened and never closed swallows the rest of the page and fails loudly. The
+HTML-comment ban below still reads the raw document, so a comment marker inside
+a fence is banned as well.
+
+**An indented table is not a table.** A line indented four or more spaces, or by
+a tab, is part of an indented code block, so a heading, a header line, a
+separator or a row counts only when it is indented by at most three spaces
+(see ``_unindented``). A table shown indented fails as absent for the same
+reason a fenced one does (see
+``test_gate_rejects_the_real_table_indented_as_code``). A table inside a fence
+that sits in a list item and is indented past three spaces is not read as
+absent: the scan refuses the document (see
+``test_gate_refuses_the_real_table_in_a_fence_indented_past_three_under_a_list``).
+
 **Locating "the table body" uses one further structural fact, chosen because
 it needs no parser: a blank line — or, equivalently, any line that does not
 look like a ``|``-prefixed row — always ends a table.** The body is every
@@ -78,23 +107,25 @@ at (see ``test_gate_accepts_a_realistic_second_table_with_plain_text_rows``
 and ``test_gate_accepts_prose_with_a_pipe_prefixed_line_in_the_section``).
 
 Both the ``## Exceptions`` heading and the next ``## `` heading that
-terminates the section tolerate incidental leading/trailing whitespace
-(``.strip()``-equivalent matching on *both* boundaries, symmetrically) — this
-is a content check, not a byte-for-byte text-identity check, and an indented
-heading on either side is not worth a red build (see
-``test_gate_accepts_an_indented_heading_and_indented_terminator``).
+terminates the section tolerate up to three leading spaces and trailing
+spaces or tabs (the same tolerance on *both* boundaries, symmetrically) — this
+is a content check, not a byte-for-byte text-identity check, and a lightly
+indented heading on either side is not worth a red build (see
+``test_gate_accepts_an_indented_heading_and_indented_terminator``). A heading
+indented four or more spaces is code, so it neither starts nor ends the
+section (see ``test_gate_rejects_an_exceptions_heading_indented_as_code`` and
+``test_gate_reads_a_terminator_indented_as_code_as_part_of_the_section``).
 
 This narrow a scope is deliberate and cost something to arrive at. A
 *structural* model of "the table" kept being fooled in a new way
-— a decoy under a subheading, a commented-out table, a fenced table,
-indentation edge cases, escaped pipes, a plausible second table with
-plain-text rows, a stale row hiding in the separator's position, a linked
-name, an extra column, a deprecation annotation, a same-shaped header
-elsewhere, an asymmetric section boundary — because "correctly parse
-Markdown" has no natural stopping point. The blank-line rule has one real,
-accepted cost in exchange: a blank line accidentally inserted in the middle
-of the real table truncates the body there, and every exception documented
-below it reads as undocumented (see
+— a decoy under a subheading, a commented-out table, indentation edge cases,
+escaped pipes, a plausible second table with plain-text rows, a stale row
+hiding in the separator's position, a linked name, an extra column, a
+deprecation annotation, a same-shaped header elsewhere, an asymmetric section
+boundary — because "correctly parse Markdown" has no natural stopping point.
+The blank-line rule has one real, accepted cost in exchange: a blank line
+accidentally inserted in the middle of the real table truncates the body
+there, and every exception documented below it reads as undocumented (see
 ``test_gate_rejects_a_blank_line_truncating_the_real_table``). That is
 treated as a loud, correct failure, not a bug to route around — a human
 fixes the blank line, the gate does not grow a merge-adjacent-fragments
@@ -131,7 +162,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 import engrava
-from tests.docs._md_blocks import REPO_ROOT
+from tests.docs._md_blocks import REPO_ROOT, lines_outside_fences, markdown_lines
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -147,6 +178,10 @@ _EXCEPTIONS_HEADING = "## Exceptions"
 _H2_PREFIX = "## "
 _HEADER_FIRST_CELL = "Exception"
 _HTML_COMMENT_MARKER = "<!--"
+
+# CommonMark: a line indented four or more spaces (or by a tab) is part of an
+# indented code block, so neither a heading nor a table row may start deeper.
+_MAX_INDENT = 3
 
 # A GFM separator cell, once trimmed: one or more "-", optionally flanked by a
 # single leading and/or trailing ":" (alignment markers ":---" / "---:" /
@@ -183,18 +218,50 @@ def _display_path(path: Path) -> str:
 
 
 def _document_lines() -> list[str]:
-    """Return every line of ``API_REFERENCE``, split on newlines."""
-    return API_REFERENCE.read_text(encoding="utf-8").splitlines()
+    """Return every line of ``API_REFERENCE``, split as Markdown splits lines."""
+    return markdown_lines(API_REFERENCE.read_text(encoding="utf-8"))
+
+
+def _lines_outside_fences(lines: list[str]) -> list[str]:
+    """Return ``lines`` with every fenced block blanked, line numbers unchanged.
+
+    Fenced text is code, not document, whatever it looks like, so nothing the
+    gate looks for (a heading, the header, a table row) may be found there. An
+    unclosed fence is reported as a document defect rather than as a traceback.
+    """
+    try:
+        return lines_outside_fences(lines, _display_path(API_REFERENCE))
+    except ValueError as error:
+        pytest.fail(str(error))
+
+
+def _unindented(line: str) -> str | None:
+    """Return ``line`` without its leading spaces, or ``None`` if it is indented too deep.
+
+    Up to three spaces of indentation are incidental; four or more, or a tab,
+    make the line part of an indented code block, where a heading or a table
+    row is only text. ``None`` is returned for those lines so no caller can
+    read them as structure.
+    """
+    stripped = line.lstrip(" ")
+    if len(line) - len(stripped) > _MAX_INDENT:
+        return None
+    return stripped
 
 
 def _exceptions_heading_indices(lines: list[str]) -> list[int]:
     """Return the indices of every line matching the ``## Exceptions`` heading.
 
-    Whitespace-tolerant (``.strip()``) on purpose: a heading with incidental
-    leading or trailing whitespace is not worth a red build. This is a
-    content check, not a byte-for-byte text-identity check.
+    Tolerant of up to three leading spaces and any trailing spaces or tabs on
+    purpose: a heading with incidental whitespace is not worth a red build.
+    This is a content check, not a byte-for-byte text-identity check. A heading
+    indented four or more spaces is code, not a heading, and does not match.
     """
-    return [index for index, line in enumerate(lines) if line.strip() == _EXCEPTIONS_HEADING]
+    return [
+        index
+        for index, line in enumerate(lines)
+        if (text := _unindented(line)) is not None and text.rstrip(" \t") == _EXCEPTIONS_HEADING
+    ]
 
 
 def _exceptions_section_bounds(lines: list[str]) -> tuple[int, int]:
@@ -204,11 +271,12 @@ def _exceptions_section_bounds(lines: list[str]) -> tuple[int, int]:
     heading's line, or ``len(lines)``. Fails loudly, with its own message, if
     the heading is missing or appears more than once — other pages link to
     it directly as an anchor, so it must name one unambiguous section. The
-    terminating H2 match is whitespace-tolerant the same way the opening
-    heading match is (both call ``.strip()`` before comparing) — an indented
+    terminating H2 match is indentation-tolerant the same way the opening
+    heading match is (up to three leading spaces) — an indented
     ``## Protocols`` still ends the section, symmetrically with an indented
-    ``## Exceptions`` still starting one. A bare, title-less ``##`` also
-    counts as a terminator, not only ``## `` followed by text.
+    ``## Exceptions`` still starting one, and a line indented four or more
+    spaces ends nothing. A bare, title-less ``##`` also counts as a
+    terminator, not only ``## `` followed by text.
     """
     indices = _exceptions_heading_indices(lines)
     if not indices:
@@ -221,8 +289,10 @@ def _exceptions_section_bounds(lines: list[str]) -> tuple[int, int]:
     start = indices[0] + 1
     end = len(lines)
     for index in range(start, len(lines)):
-        stripped = lines[index].strip()
-        if stripped == _H2_PREFIX.strip() or stripped.startswith(_H2_PREFIX):
+        text = _unindented(lines[index])
+        if text is None:
+            continue
+        if text.rstrip(" \t") == _H2_PREFIX.strip() or text.startswith(_H2_PREFIX):
             end = index
             break
     return start, end
@@ -257,11 +327,14 @@ def _assert_document_has_no_html_comment_marker(lines: list[str]) -> None:
 def _is_pipe_line(line: str) -> bool:
     """Return whether ``line`` looks like a ``|``-prefixed table row.
 
-    Whitespace-tolerant: incidental leading/trailing whitespace on an
+    Tolerant of up to three leading spaces: incidental indentation on an
     otherwise ``|``-prefixed line is not a reason to misjudge where a table
-    starts, continues, or ends.
+    starts, continues, or ends. A line indented four or more spaces (or by a
+    tab) is part of an indented code block, so it is not a row: an indented
+    table is a table that is not there.
     """
-    return line.strip().startswith("|")
+    text = _unindented(line)
+    return text is not None and text.startswith("|")
 
 
 def _first_cell(line: str) -> str | None:
@@ -273,18 +346,18 @@ def _first_cell(line: str) -> str | None:
     counting). It exists only to isolate the one cell the header's identity
     or a row's exception name is expected to live in — see
     ``_is_header_line`` and ``_row_name``. Returns ``None`` only when
-    ``line`` (after trimming) does not start with ``|`` at all. A line with
-    only one ``|`` in it at all, e.g. ``"| Exception"``, has no second ``|``
-    to stop at, so this falls back to whatever follows that single ``|``
-    instead of returning ``None`` — an unterminated cell is not specially
-    rejected here; the caller's content comparison (exactly ``"Exception"``,
-    or exactly one backtick token) is what actually rejects it, if it should
-    be rejected.
+    ``line`` (after removing up to three leading spaces) does not start with
+    ``|`` at all. A line with only one ``|`` in it at all, e.g.
+    ``"| Exception"``, has no second ``|`` to stop at, so this falls back to
+    whatever follows that single ``|`` instead of returning ``None`` — an
+    unterminated cell is not specially rejected here; the caller's content
+    comparison (exactly ``"Exception"``, or exactly one backtick token) is what
+    actually rejects it, if it should be rejected.
     """
-    stripped = line.strip()
-    if not stripped.startswith("|"):
+    text = _unindented(line)
+    if text is None or not text.startswith("|"):
         return None
-    parts = stripped.split("|", 2)
+    parts = text.split("|", 2)
     return parts[1]
 
 
@@ -313,7 +386,7 @@ def _is_separator_line(line: str) -> bool:
     """
     if not _is_pipe_line(line):
         return False
-    cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+    cells = [cell.strip(" \t") for cell in line.strip(" \t").strip("|").split("|")]
     return bool(cells) and all(_SEPARATOR_CELL_RE.match(cell) is not None for cell in cells)
 
 
@@ -353,21 +426,23 @@ def _table_body() -> list[str]:
     """Return the Exceptions table's data rows.
 
     Confirms the whole document carries no HTML comment marker at all (see
-    ``_assert_document_has_no_html_comment_marker``), then locates the one
-    line, within the ``## Exceptions`` section only, whose first cell is
-    exactly ``"Exception"`` (zero or more than one such line *in that
-    section* is a document defect, reported by name — a same-shaped header
-    belonging to some other, unrelated table elsewhere in the document is
-    never even considered), confirms the line directly under it is a real
-    separator row (not a stale row silently occupying that position), then
-    takes every line from there up to the first line that does not look
-    like a ``|``-prefixed row — a blank line ends a table, and so does
-    anything else that is not a table row; both are treated identically.
-    No column counting, no escape handling, no fence tracking, no notion of
+    ``_assert_document_has_no_html_comment_marker``), blanks every fenced
+    block (see ``_lines_outside_fences``: a table shown inside a fence is
+    not a table), then locates the one line, within the ``## Exceptions``
+    section only, whose first cell is exactly ``"Exception"`` (zero or more
+    than one such line *in that section* is a document defect, reported by
+    name — a same-shaped header belonging to some other, unrelated table
+    elsewhere in the document is never even considered), confirms the line
+    directly under it is a real separator row (not a stale row silently
+    occupying that position), then takes every line from there up to the
+    first line that does not look like a ``|``-prefixed row — a blank line
+    ends a table, and so does anything else that is not a table row; both are
+    treated identically. No column counting, no escape handling, no notion of
     "a table" beyond these two checked lines.
     """
-    lines = _document_lines()
-    _assert_document_has_no_html_comment_marker(lines)
+    raw_lines = _document_lines()
+    _assert_document_has_no_html_comment_marker(raw_lines)
+    lines = _lines_outside_fences(raw_lines)
     start, end = _exceptions_section_bounds(lines)
 
     header_indices = [index for index in range(start, end) if _is_header_line(lines[index])]
@@ -1015,9 +1090,39 @@ def test_gate_rejects_a_duplicated_header_line(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Two lines whose first cell is ``"Exception"``, both inside the
-    ``## Exceptions`` section — even a second one only present inside a
-    fenced example — leave no single, unambiguous table.
+    """Two rendered lines whose first cell is ``"Exception"``, both inside the
+    ``## Exceptions`` section, leave no single, unambiguous table.
+    """
+    decoy = _write_decoy(
+        tmp_path,
+        "## Exceptions\n"
+        "\n"
+        "| Exception | Base | Description |\n"
+        "|-----------|------|-------------|\n"
+        "| `EngravaError` | `Exception` | Base for all engrava errors |\n"
+        "\n"
+        "A second table under the same heading:\n"
+        "\n"
+        "| Exception | Base | Description |\n"
+        "|-----------|------|-------------|\n"
+        "\n"
+        "## Protocols\n",
+    )
+    monkeypatch.setattr(_THIS_MODULE, "API_REFERENCE", decoy)
+
+    with pytest.raises(pytest.fail.Exception, match=r"has 2 lines whose first cell equals"):
+        test_every_exported_exception_has_a_table_row()
+
+
+def test_gate_ignores_a_header_shaped_line_inside_a_fenced_example(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A header-shaped line shown inside a fenced example is text, not a second table.
+
+    This is the counterpart of ``test_gate_rejects_a_duplicated_header_line``:
+    the same second header, but in a code fence, renders as code and must not
+    make the real table ambiguous.
     """
     decoy = _write_decoy(
         tmp_path,
@@ -1036,8 +1141,486 @@ def test_gate_rejects_a_duplicated_header_line(
         "## Protocols\n",
     )
     monkeypatch.setattr(_THIS_MODULE, "API_REFERENCE", decoy)
+    monkeypatch.setattr(
+        _THIS_MODULE,
+        "_exported_exception_classes",
+        lambda: {"EngravaError": Exception},
+    )
+
+    test_every_exported_exception_has_a_table_row()
+    test_every_table_row_names_a_currently_exported_exception()
+    test_exceptions_table_rows_are_backtick_quoted()
+
+
+_TABLE_ABSENT_MESSAGE = (
+    r"no line in the '## Exceptions' section of .* has its first cell equal to 'Exception'"
+)
+_FENCE_AFTER_LIST_MESSAGE = (
+    r"looks like a fence but is indented four or more columns \(or by a tab\) in a document "
+    r"that has a list"
+)
+
+
+@pytest.mark.parametrize(
+    ("opener", "closer"),
+    [
+        ("```markdown", "```"),
+        ("```", "```"),
+        ("~~~markdown", "~~~"),
+        ("````markdown", "````"),
+        ("   ```markdown", "   ```"),
+    ],
+    ids=["backtick-info", "backtick-bare", "tilde", "four-backticks", "three-space-indent"],
+)
+def test_gate_rejects_the_real_table_wrapped_in_a_code_fence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    opener: str,
+    closer: str,
+) -> None:
+    """The whole table inside a code fence renders as code, so the table is absent.
+
+    Every row the gate would read is still there, byte for byte, in the file;
+    only the fence makes it not a table. All three gates that read the table
+    must fail because the table is missing, not pass on the fenced text.
+    """
+    decoy = _write_decoy(
+        tmp_path,
+        "## Exceptions\n"
+        "\n"
+        f"{opener}\n"
+        "| Exception | Base | Description |\n"
+        "|-----------|------|-------------|\n"
+        "| `EngravaError` | `Exception` | Base for all engrava errors |\n"
+        f"{closer}\n"
+        "\n"
+        "## Protocols\n",
+    )
+    monkeypatch.setattr(_THIS_MODULE, "API_REFERENCE", decoy)
+    monkeypatch.setattr(
+        _THIS_MODULE,
+        "_exported_exception_classes",
+        lambda: {"EngravaError": Exception},
+    )
+
+    with pytest.raises(pytest.fail.Exception, match=_TABLE_ABSENT_MESSAGE):
+        test_every_exported_exception_has_a_table_row()
+    with pytest.raises(pytest.fail.Exception, match=_TABLE_ABSENT_MESSAGE):
+        test_every_table_row_names_a_currently_exported_exception()
+    with pytest.raises(pytest.fail.Exception, match=_TABLE_ABSENT_MESSAGE):
+        test_exceptions_table_rows_are_backtick_quoted()
+
+
+def test_gate_reads_a_table_indented_four_spaces_under_its_fence_as_unfenced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A four-space-indented backtick line is not a fence, so it hides nothing.
+
+    Four spaces make an indented code block in CommonMark, not a fence, so the
+    line below opens no block and the real table after it is still read. A
+    fence recogniser that stripped any amount of indent would swallow the table.
+    """
+    decoy = _write_decoy(
+        tmp_path,
+        "## Exceptions\n"
+        "\n"
+        "    ```markdown\n"
+        "\n"
+        "| Exception | Base | Description |\n"
+        "|-----------|------|-------------|\n"
+        "| `EngravaError` | `Exception` | Base for all engrava errors |\n"
+        "\n"
+        "## Protocols\n",
+    )
+    monkeypatch.setattr(_THIS_MODULE, "API_REFERENCE", decoy)
+    monkeypatch.setattr(
+        _THIS_MODULE,
+        "_exported_exception_classes",
+        lambda: {"EngravaError": Exception},
+    )
+
+    test_every_exported_exception_has_a_table_row()
+
+
+_TABLE_LINES = (
+    "| Exception | Base | Description |\n"
+    "|-----------|------|-------------|\n"
+    "| `EngravaError` | `Exception` | Base for all engrava errors |\n"
+)
+
+
+def _prefixed(text: str, prefix: str) -> str:
+    """Return ``text`` with ``prefix`` in front of every non-blank line."""
+    return "".join(
+        prefix + line if line.strip() else line for line in text.splitlines(keepends=True)
+    )
+
+
+@pytest.mark.parametrize(
+    "shown",
+    [
+        pytest.param(_prefixed(_TABLE_LINES, "    "), id="four-spaces"),
+        pytest.param(_prefixed(_TABLE_LINES, "\t"), id="tab"),
+    ],
+)
+def test_gate_rejects_the_real_table_indented_as_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shown: str,
+) -> None:
+    """A table shown as code by indentation is not a table, so the table is absent.
+
+    Four spaces or a tab make an indented code block. markdown-it, a CommonMark
+    implementation, renders each of these documents as code with no table in it.
+    Every row the gate would read is still in the file; the checks must fail
+    because the table is missing, not pass on the indented text.
+    """
+    decoy = _write_decoy(tmp_path, f"## Exceptions\n\n{shown}\n## Protocols\n")
+    monkeypatch.setattr(_THIS_MODULE, "API_REFERENCE", decoy)
+    monkeypatch.setattr(
+        _THIS_MODULE,
+        "_exported_exception_classes",
+        lambda: {"EngravaError": Exception},
+    )
+
+    with pytest.raises(pytest.fail.Exception, match=_TABLE_ABSENT_MESSAGE):
+        test_every_exported_exception_has_a_table_row()
+    with pytest.raises(pytest.fail.Exception, match=_TABLE_ABSENT_MESSAGE):
+        test_every_table_row_names_a_currently_exported_exception()
+    with pytest.raises(pytest.fail.Exception, match=_TABLE_ABSENT_MESSAGE):
+        test_exceptions_table_rows_are_backtick_quoted()
+
+
+@pytest.mark.parametrize(
+    "shown",
+    [
+        pytest.param(
+            "- an item\n\n" + _prefixed("```markdown\n" + _TABLE_LINES + "```\n", "    "),
+            id="fence-in-a-bullet-item",
+        ),
+        pytest.param(
+            "1. an item\n\n" + _prefixed("~~~\n" + _TABLE_LINES + "~~~\n", "    "),
+            id="fence-in-an-ordered-item",
+        ),
+    ],
+)
+def test_gate_refuses_the_real_table_in_a_fence_indented_past_three_under_a_list(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shown: str,
+) -> None:
+    """A fence indented four spaces after a list item is one the gate cannot read, and says so.
+
+    A list item may make a fence of a line indented four spaces, and the scan does
+    not model list items, so it refuses the document instead of choosing a reading.
+    """
+    decoy = _write_decoy(tmp_path, f"## Exceptions\n\n{shown}\n## Protocols\n")
+    monkeypatch.setattr(_THIS_MODULE, "API_REFERENCE", decoy)
+    monkeypatch.setattr(
+        _THIS_MODULE,
+        "_exported_exception_classes",
+        lambda: {"EngravaError": Exception},
+    )
+
+    with pytest.raises(pytest.fail.Exception, match=_FENCE_AFTER_LIST_MESSAGE):
+        test_every_exported_exception_has_a_table_row()
+    with pytest.raises(pytest.fail.Exception, match=_FENCE_AFTER_LIST_MESSAGE):
+        test_every_table_row_names_a_currently_exported_exception()
+    with pytest.raises(pytest.fail.Exception, match=_FENCE_AFTER_LIST_MESSAGE):
+        test_exceptions_table_rows_are_backtick_quoted()
+
+
+def test_gate_refuses_the_real_table_fenced_on_a_list_marker_line(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A table in a fence opened on a list-marker line is code, and the gate says why.
+
+    markdown-it renders it as code with no table in it. The fence scan does not
+    model list items, so the closer would read as an opener and a stray fence at
+    the end of the page would balance it: without the refusal, the table lines
+    sit in plain text and every check passes.
+    """
+    decoy = _write_decoy(
+        tmp_path,
+        "## Exceptions\n\n- ```markdown\n"
+        + _prefixed(_TABLE_LINES, "  ")
+        + "  ```\n\n## Protocols\n\n```\n",
+    )
+    monkeypatch.setattr(_THIS_MODULE, "API_REFERENCE", decoy)
+    monkeypatch.setattr(
+        _THIS_MODULE,
+        "_exported_exception_classes",
+        lambda: {"EngravaError": Exception},
+    )
+
+    with pytest.raises(pytest.fail.Exception, match="opens a fence on a list-item line"):
+        test_every_exported_exception_has_a_table_row()
+    with pytest.raises(pytest.fail.Exception, match="opens a fence on a list-item line"):
+        test_every_table_row_names_a_currently_exported_exception()
+    with pytest.raises(pytest.fail.Exception, match="opens a fence on a list-item line"):
+        test_exceptions_table_rows_are_backtick_quoted()
+
+
+def test_gate_refuses_the_real_table_after_a_blockquoted_fence_loses_its_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fence opened in a blockquote is not closed by a line outside the blockquote.
+
+    markdown-it ends the blockquote at the first unprefixed line, and that line
+    opens a fence of its own, so the table below it is code and no table is
+    rendered. A scan that let the unprefixed line close the blockquoted fence
+    would read the table as plain text and every check would pass.
+    """
+    decoy = _write_decoy(
+        tmp_path,
+        "## Exceptions\n\n> ```markdown\n> sample\n```\n"
+        + _TABLE_LINES
+        + "```\n```\n\n## Protocols\n",
+    )
+    monkeypatch.setattr(_THIS_MODULE, "API_REFERENCE", decoy)
+    monkeypatch.setattr(
+        _THIS_MODULE,
+        "_exported_exception_classes",
+        lambda: {"EngravaError": Exception},
+    )
+
+    with pytest.raises(pytest.fail.Exception, match="has fewer blockquote markers"):
+        test_every_exported_exception_has_a_table_row()
+    with pytest.raises(pytest.fail.Exception, match="has fewer blockquote markers"):
+        test_every_table_row_names_a_currently_exported_exception()
+    with pytest.raises(pytest.fail.Exception, match="has fewer blockquote markers"):
+        test_exceptions_table_rows_are_backtick_quoted()
+
+
+def test_gate_reads_a_table_indented_three_spaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Three spaces of indentation are incidental: the table is still a table.
+
+    The counterpart of ``test_gate_rejects_the_real_table_indented_as_code``, so
+    the four-space limit is pinned from both sides.
+    """
+    decoy = _write_decoy(
+        tmp_path,
+        f"## Exceptions\n\n{_prefixed(_TABLE_LINES, '   ')}\n## Protocols\n",
+    )
+    monkeypatch.setattr(_THIS_MODULE, "API_REFERENCE", decoy)
+    monkeypatch.setattr(
+        _THIS_MODULE,
+        "_exported_exception_classes",
+        lambda: {"EngravaError": Exception},
+    )
+
+    test_every_exported_exception_has_a_table_row()
+    test_every_table_row_names_a_currently_exported_exception()
+    test_exceptions_table_rows_are_backtick_quoted()
+
+
+def test_gate_does_not_close_a_fence_at_a_no_break_space_line(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A line with a no-break space after the backticks does not close a fence.
+
+    A renderer reads the second line below as content of the fence, so the
+    table is code, the fourth line closes the fence, and the fifth opens one that
+    is never closed. A recogniser that let ``str.strip()`` decide what may
+    follow a closer would close the fence at the second line, read the table as
+    outside it, and find the fences balanced. The gate must report the fence
+    that is left open instead of passing on the table.
+    """
+    decoy = _write_decoy(
+        tmp_path,
+        f"## Exceptions\n\n```markdown\n```\u00a0\n{_TABLE_LINES}```\n```\n\n## Protocols\n",
+    )
+    monkeypatch.setattr(_THIS_MODULE, "API_REFERENCE", decoy)
+    monkeypatch.setattr(
+        _THIS_MODULE,
+        "_exported_exception_classes",
+        lambda: {"EngravaError": Exception},
+    )
+
+    with pytest.raises(pytest.fail.Exception, match="never closed"):
+        test_every_exported_exception_has_a_table_row()
+    with pytest.raises(pytest.fail.Exception, match="never closed"):
+        test_every_table_row_names_a_currently_exported_exception()
+    with pytest.raises(pytest.fail.Exception, match="never closed"):
+        test_exceptions_table_rows_are_backtick_quoted()
+
+
+@pytest.mark.parametrize("trailer", ["\u00a0", "\x0c"], ids=["no-break-space", "form-feed"])
+def test_gate_rejects_a_separator_row_with_a_trailing_non_space_character(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    trailer: str,
+) -> None:
+    """A separator row ending in a no-break space is not a separator row.
+
+    The character is content to a renderer, so it does not render a table; the
+    gate trims spaces and tabs only, and so reports the separator missing.
+    """
+    table = _TABLE_LINES.replace("-|\n|", f"-|{trailer}\n|", 1)
+    assert table != _TABLE_LINES
+    decoy = _write_decoy(tmp_path, f"## Exceptions\n\n{table}\n## Protocols\n")
+    monkeypatch.setattr(_THIS_MODULE, "API_REFERENCE", decoy)
+    monkeypatch.setattr(
+        _THIS_MODULE,
+        "_exported_exception_classes",
+        lambda: {"EngravaError": Exception},
+    )
+
+    with pytest.raises(pytest.fail.Exception, match="is not a header/body separator row"):
+        test_every_exported_exception_has_a_table_row()
+
+
+def test_gate_rejects_an_exceptions_heading_indented_as_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A heading indented four spaces is code, so the page has no such section."""
+    decoy = _write_decoy(
+        tmp_path,
+        f"## Usage\n\n    ## Exceptions\n\n{_TABLE_LINES}\n## Protocols\n",
+    )
+    monkeypatch.setattr(_THIS_MODULE, "API_REFERENCE", decoy)
+
+    with pytest.raises(pytest.fail.Exception, match="has no '## Exceptions' heading"):
+        test_every_exported_exception_has_a_table_row()
+
+
+def test_gate_reads_a_terminator_indented_as_code_as_part_of_the_section(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``## `` line indented four spaces is code and does not end the section.
+
+    The second table after it therefore belongs to the ``## Exceptions``
+    section, which then has two header lines.
+    """
+    decoy = _write_decoy(
+        tmp_path,
+        f"## Exceptions\n\n{_TABLE_LINES}\n"
+        "    ## Protocols\n"
+        "\n"
+        "| Exception | Raised by |\n"
+        "|-----------|-----------|\n"
+        "| `EngravaError` | `create_edge` |\n",
+    )
+    monkeypatch.setattr(_THIS_MODULE, "API_REFERENCE", decoy)
 
     with pytest.raises(pytest.fail.Exception, match=r"has 2 lines whose first cell equals"):
+        test_every_exported_exception_has_a_table_row()
+
+
+def test_gate_ignores_a_fenced_h2_line_inside_the_section(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``## `` line inside a fence is code and does not end the section early.
+
+    Without fence blanking the section would end at the fenced ``## Example``
+    line, the real table below it would fall outside the section, and the gate
+    would report the header missing.
+    """
+    decoy = _write_decoy(
+        tmp_path,
+        "## Exceptions\n"
+        "\n"
+        "```markdown\n"
+        "## Example heading in a fenced snippet\n"
+        "```\n"
+        "\n"
+        "| Exception | Base | Description |\n"
+        "|-----------|------|-------------|\n"
+        "| `EngravaError` | `Exception` | Base for all engrava errors |\n"
+        "\n"
+        "## Protocols\n",
+    )
+    monkeypatch.setattr(_THIS_MODULE, "API_REFERENCE", decoy)
+    monkeypatch.setattr(
+        _THIS_MODULE,
+        "_exported_exception_classes",
+        lambda: {"EngravaError": Exception},
+    )
+
+    test_every_exported_exception_has_a_table_row()
+
+
+def test_gate_ignores_a_fenced_exceptions_heading_elsewhere(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``## Exceptions`` line shown inside a fence is not a second heading."""
+    decoy = _write_decoy(
+        tmp_path,
+        "## Usage\n"
+        "\n"
+        "```markdown\n"
+        "## Exceptions\n"
+        "```\n"
+        "\n"
+        "## Exceptions\n"
+        "\n"
+        "| Exception | Base | Description |\n"
+        "|-----------|------|-------------|\n"
+        "| `EngravaError` | `Exception` | Base for all engrava errors |\n"
+        "\n"
+        "## Protocols\n",
+    )
+    monkeypatch.setattr(_THIS_MODULE, "API_REFERENCE", decoy)
+    monkeypatch.setattr(
+        _THIS_MODULE,
+        "_exported_exception_classes",
+        lambda: {"EngravaError": Exception},
+    )
+
+    test_every_exported_exception_has_a_table_row()
+
+
+def test_gate_rejects_a_fenced_only_exceptions_heading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page whose only ``## Exceptions`` heading is inside a fence has no such section."""
+    decoy = _write_decoy(
+        tmp_path,
+        "## Usage\n"
+        "\n"
+        "```markdown\n"
+        "## Exceptions\n"
+        "\n"
+        "| Exception | Base | Description |\n"
+        "|-----------|------|-------------|\n"
+        "| `EngravaError` | `Exception` | Base for all engrava errors |\n"
+        "```\n",
+    )
+    monkeypatch.setattr(_THIS_MODULE, "API_REFERENCE", decoy)
+
+    with pytest.raises(pytest.fail.Exception, match="has no '## Exceptions' heading"):
+        test_every_exported_exception_has_a_table_row()
+
+
+def test_gate_rejects_an_unclosed_fence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fence opened and never closed swallows the page, and is reported as such."""
+    decoy = _write_decoy(
+        tmp_path,
+        "## Exceptions\n"
+        "\n"
+        "```markdown\n"
+        "| Exception | Base | Description |\n"
+        "|-----------|------|-------------|\n"
+        "| `EngravaError` | `Exception` | Base for all engrava errors |\n",
+    )
+    monkeypatch.setattr(_THIS_MODULE, "API_REFERENCE", decoy)
+
+    with pytest.raises(pytest.fail.Exception, match="never closed"):
         test_every_exported_exception_has_a_table_row()
 
 

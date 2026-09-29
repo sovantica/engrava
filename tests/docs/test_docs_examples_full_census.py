@@ -633,7 +633,7 @@ def test_yaml_layer_exemptions_are_the_documented_duplicate_key_examples() -> No
     exhaustiveness test above.
     """
     assert len(EXEMPT_YAML_BLOCKS) == 2
-    assert {reason for _, _, reason in EXEMPT_YAML_BLOCKS} == {
+    assert {reason for _, _, reason, _ in EXEMPT_YAML_BLOCKS} == {
         ExemptionReason.DUPLICATE_KEY_ALTERNATE_FORMS,
     }
     assert len(_yaml_exempt_locations()) == 2

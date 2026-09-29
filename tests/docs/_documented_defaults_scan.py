@@ -90,11 +90,12 @@ import typing
 from dataclasses import dataclass, fields, is_dataclass
 from typing import TYPE_CHECKING
 
+from tests.docs._md_blocks import lines_outside_fences, markdown_lines
+
 if TYPE_CHECKING:
     from pathlib import Path
 
 _BACKTICK_RE = re.compile(r"`([^`]+)`")
-_FENCE_RE = re.compile(r"^\s*(```+|~~~+)")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
 _TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?[\s:|-]+\|?\s*$")
 _KEY_HEADERS = frozenset({"key", "field", "gate", "option", "parameter"})
@@ -309,7 +310,7 @@ def _table_columns(header_line: str) -> tuple[int | None, int | None]:
 def _skip_table_block(lines: list[str], start: int, n: int) -> int:
     """Return the index just past a run of pipe-table rows starting at ``start``."""
     j = start
-    while j < n and lines[j].count("|") >= 2 and not _FENCE_RE.match(lines[j]):
+    while j < n and lines[j].count("|") >= 2:
         j += 1
     return j
 
@@ -424,25 +425,17 @@ class _Scanner:
         return {f.name for f in fields(self.target_classes[cls_name])}
 
     def scan_file(self, path: Path, repo_root: Path) -> None:
-        lines = path.read_text(encoding="utf-8").splitlines()
         rel = path.relative_to(repo_root).as_posix()
+        lines = lines_outside_fences(markdown_lines(path.read_text(encoding="utf-8")), rel)
         self._scan_tables(rel, lines)
         self._scan_prose(rel, lines)
 
     def _scan_tables(self, rel: str, lines: list[str]) -> None:
         n = len(lines)
-        in_fence = False
         scope: type | None = None
         i = 0
         while i < n:
             line = lines[i]
-            if _FENCE_RE.match(line):
-                in_fence = not in_fence
-                i += 1
-                continue
-            if in_fence:
-                i += 1
-                continue
             hm = _HEADING_RE.match(line)
             if hm:
                 scope = _resolve_scope(hm.group(2), self.section_aliases)
@@ -461,7 +454,7 @@ class _Scanner:
         if key_idx is None or default_idx is None:
             return _skip_table_block(lines, header_idx + 2, n)
         j = header_idx + 2
-        while j < n and lines[j].count("|") >= 2 and not _FENCE_RE.match(lines[j]):
+        while j < n and lines[j].count("|") >= 2:
             cells = _split_row(lines[j])
             if len(cells) > max(key_idx, default_idx):
                 key_cell = cells[key_idx]
@@ -535,19 +528,10 @@ class _Scanner:
         n = len(lines)
         already = self._table_claimed_lines.get(rel, set())
         buf = _ParagraphBuffer()
-        in_fence = False
         scope: type | None = None
         i = 0
         while i < n:
             line = lines[i]
-            if _FENCE_RE.match(line):
-                self._flush_paragraph(rel, buf, scope)
-                in_fence = not in_fence
-                i += 1
-                continue
-            if in_fence:
-                i += 1
-                continue
             hm = _HEADING_RE.match(line)
             if hm:
                 self._flush_paragraph(rel, buf, scope)
