@@ -56,16 +56,30 @@ Three interleaving techniques are used, deliberately kept apart:
   ever land (silently, or in a forbidden composite state).
 * ``TestInProcessCriticalSection`` and ``TestSuspendAutoCommitIsStoreWide`` use
   genuinely separate ``asyncio.Task`` objects, paused at a precise point via
-  :class:`asyncio.Event` handshakes (never a sleep or a timeout) — these are the
-  cases the task-reentrant write lock actually changes.
+  :class:`asyncio.Event` handshakes — these are the cases the task-reentrant
+  write lock actually changes.
 * ``TestTwoStoresOneFile`` uses two independent store instances sharing one
   database file to exercise the guard **across connections** — the shape a
   second process has. This is the class this stage exists for: before it, a
   second store's edit was lost with no error at all; now it is rejected.
 
-No test depends on wall-clock timing or on how the event loop happens to
-schedule beyond the FIFO ordering ``asyncio`` itself guarantees for
-``call_soon``/``Event.set()`` callbacks.
+Between the tasks of one test, ordering comes from :class:`asyncio.Event`
+handshakes and from the FIFO ordering ``asyncio`` guarantees for
+``call_soon``/``Event.set()`` callbacks, apart from the four tests below, which
+depend on a time bound:
+
+* ``test_a_child_task_awaited_inside_the_window_raises_instead_of_hanging``
+  sets the write lock's acquire bound to 0.05 s and expects it to expire.
+* ``test_a_slow_legitimate_batch_embed_does_not_time_out_a_waiting_writer``
+  simulates a 0.2 s embedding call and passes only if the writer waiting behind
+  it acquires the lock inside the 2 s bound the test sets.
+* ``test_deduplication_across_stores_raises_instead_of_duplicating`` and
+  ``test_confirmation_counting_across_stores_now_raises_instead_of_racing``
+  set the second store's SQLite busy timeout to 20 ms and expect its attempts
+  to run out.
+
+``TestWriteLockAcquireBoundDefault`` pins the production default of the write
+lock's acquire bound, which the first two tests override.
 """
 
 from __future__ import annotations
@@ -95,6 +109,7 @@ from engrava import (
     WriteContentionError,
     WriteLockTimeoutError,
 )
+from engrava.infrastructure.sqlite.engrava_core import _WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS
 from tests.test_derived_records_seam import ListProducer, _child, _source
 from tests.test_partial_field_updates import _interleave_once
 
@@ -1569,10 +1584,10 @@ class TestSuspendAutoCommitIsStoreWide:
         connection until something else eventually committed, rolled back, or
         closed it.
 
-        Driven by an ``asyncio.Event`` handshake rather than a sleep, matching
-        this module's rule against wall-clock timing: the window signals once
-        its own row is written and it is parked, so the cancellation lands
-        deterministically mid-window instead of hoping a delay was long enough.
+        Driven by an ``asyncio.Event`` handshake rather than a sleep: the
+        window signals once its own row is written and it is parked, so the
+        cancellation lands deterministically mid-window instead of hoping a
+        delay was long enough.
         """
         window_started = asyncio.Event()
 
@@ -1739,3 +1754,52 @@ class TestTwoStoresOneFile:
         assert await _thought_ids(conn_a) == ["t-1"]
         row = await _row(conn_a, "t-1")
         assert row["confirmation_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# The production default of the write lock's acquire bound
+# ---------------------------------------------------------------------------
+
+
+class TestWriteLockAcquireBoundDefault:
+    """The write lock's acquire bound defaults to 600 seconds, however the store is built.
+
+    The slow-embedding test and the deadlock test above override this bound so
+    that they finish quickly, so neither would notice the default drifting.
+    ``docs/api-reference.md`` states the figure: ``600.0`` in the
+    ``write_lock_acquire_timeout_seconds`` row of the constructor table and in
+    the ``from_config`` signature. It is sized to clear a slow but legitimate
+    hold -- ``bulk_store``'s batch embedding call runs inside
+    ``suspend_auto_commit``'s window with the lock held.
+
+    The two store tests read the bound off the lock the built store actually
+    holds, not off a declared default: a signature can keep ``600.0`` while
+    forwarding something else to the constructor.
+    """
+
+    def test_the_documented_default_is_600_seconds(self) -> None:
+        """The constant the constructor and ``from_config`` default to is ``600.0``."""
+        assert _WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS == 600.0
+
+    async def test_a_store_built_with_no_override_holds_the_default_bound(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """``SqliteEngravaCore(conn)`` gives its write lock the default bound."""
+        store = SqliteEngravaCore(db)
+
+        assert store._write_lock._acquire_timeout_seconds == _WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS
+
+    async def test_from_config_with_no_override_holds_the_default_bound(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """``from_config`` with no override gives the store's own write lock the default bound."""
+        config_path = tmp_path / "engrava.yaml"
+        config_path.write_text(f"database:\n  path: {tmp_path / 'store.db'}\n", encoding="utf-8")
+
+        store = await SqliteEngravaCore.from_config(config_path)
+        try:
+            assert store._write_lock._acquire_timeout_seconds == _WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS
+        finally:
+            await store.close()

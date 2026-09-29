@@ -934,21 +934,40 @@ class TestCloseQuietlyCancellation:
     """
 
     async def test_the_close_still_completes_when_cancelled_mid_close(self) -> None:
-        """A cancellation mid-close must not abandon the close itself.
+        """A cancelled cleanup keeps waiting for the shielded close to finish.
 
         The cancellation is delivered only after ``conn.close()`` is
         observed to have actually started (``started.wait()``), and the
-        close is not permitted to finish until after that cancellation has
-        been requested (``may_finish`` is set afterward) -- so this
-        reliably exercises the exact window the escaped-BaseException gap
-        lived in, without depending on timing. Both outcomes are asserted:
-        the cancellation must still reach the caller, and the close must
-        still have run to completion.
+        close is held open (``may_finish`` stays unset) while the
+        cancellation lands, so this exercises the exact window the
+        escaped-BaseException gap lived in, without depending on timing.
+
+        While the close is held, the cleanup task must **not** be done: it
+        has to keep waiting for the shielded close rather than hand the
+        cancellation back at once. That is what tells the real helper apart
+        from one that shields the close but omits the second ``await`` in its
+        ``CancelledError`` handler. Releasing the close straight after
+        ``cancel()`` cannot tell them apart, because the close can finish
+        before anything looks.
+        Once the close is released, the cancellation must still reach the
+        caller and the close must have run to completion.
         """
         conn = _FakeConnection()
         task = asyncio.create_task(_close_quietly(conn))
         await conn.started.wait()
         task.cancel()
+        # Let the cancellation land while the close is still held open: a
+        # helper that hands the cancellation straight back has done so within
+        # these two loop iterations.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert not conn.finished
+        assert not task.done(), (
+            "the cancelled cleanup returned while the close was still in "
+            "flight -- it must keep waiting for the shielded close to finish"
+        )
+
         conn.may_finish.set()
 
         with pytest.raises(asyncio.CancelledError):
