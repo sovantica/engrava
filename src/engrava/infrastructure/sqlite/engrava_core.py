@@ -1535,12 +1535,12 @@ class _DedupLock:
     ``upsert_by_hash``) and, unlike :class:`_TaskReentrantLock`, has no
     legitimate reentrant use: nothing this store does needs the *same* task
     to hold it twice. A second acquisition by the same task is always a bug
-    — the concrete shape is ``upsert_by_hash``'s hit branch calling the
-    overridable ``update_thought`` while still holding this lock (see
-    ``docs/extension-hooks.md`` §1B.3); an ``update_thought`` override that
-    calls back into ``create_thought(deduplicate=True)`` / ``get_or_create``
-    / ``upsert_by_hash`` / ``bulk_store(deduplicate=True)`` on that same
-    task tries to acquire this lock again while its own outer acquisition
+    — the concrete shape is ``upsert_by_hash``'s hit branch, when it updates
+    the row, calling the overridable ``update_thought`` while still holding
+    this lock (see ``docs/extension-hooks.md`` §1B.3); an ``update_thought``
+    override that calls back into ``create_thought(deduplicate=True)`` /
+    ``get_or_create`` / ``upsert_by_hash`` / ``bulk_store(deduplicate=True)``
+    on that same task tries to acquire this lock again while its own outer acquisition
     has not yet released it.
 
     A plain :class:`asyncio.Lock` blocks that second acquisition on itself
@@ -1608,11 +1608,10 @@ class SqliteEngravaCore:
     unconditional write instead; that choice hinges on ``deduplicate``, not on
     which entry point was called, since ``create_thought``, ``bulk_store``,
     and ``remember`` each default to ``deduplicate=False`` — the pre-insert
-    seam every path that can create a new row (``create_thought``,
-    ``get_or_create``, ``upsert_by_hash``, ``bulk_store``, ``remember``) calls
-    through, when it runs at all (two of those skip it entirely on a stable
-    hit); see that method's docstring for its exact invocation-count and
-    locking contract per entry point.
+    seam that ``create_thought``, ``get_or_create``, ``upsert_by_hash``,
+    ``bulk_store`` and ``remember`` call, when it runs at all (two of those
+    skip it entirely on a stable hit); see that method's docstring for its
+    exact invocation-count and locking contract per entry point.
 
     Args:
         db: An open aiosqlite connection (WAL mode, FK enabled).
@@ -6685,42 +6684,44 @@ class SqliteEngravaCore:
         pass-through that returns ``thought`` unchanged.
 
         This exists because ``on_store`` cannot fill this role — it runs
-        *after* the row is (usually) durable, so a rejection there cannot
-        stop the write, and an enrichment there reaches the caller's returned
-        record but never the stored one (see ``docs/upgrade.md``, "0.6 -> 0.7",
-        for the measured failure modes). Overriding ``create_thought`` itself
-        used to be the only way to run code before every insert; it silently
-        stopped covering ``get_or_create`` / ``upsert_by_hash`` once their miss
-        branch was rewritten to call the internal insertion step directly
-        instead of the public, overridable method. This seam is the
+        *after* the row is written, so a rejection there does not stop the
+        write unless the exception leaves an enclosing ``suspend_auto_commit()``
+        window and rolls it back, and an enrichment there reaches the caller's
+        returned record but never the stored one (see ``docs/upgrade.md``,
+        "0.6 -> 0.7", for the measured failure modes). Overriding ``create_thought`` itself
+        silently stopped covering ``get_or_create`` / ``upsert_by_hash`` once
+        their miss branch was rewritten to call the internal insertion step
+        directly instead of the public, overridable method. This seam is the
         restored, and now uniform, replacement for that override point.
 
         **Invocation count — pinned per entry point, not "once per row":**
 
-        * :meth:`create_thought` — exactly once per call, *before* the dedup
-          branch, unconditionally: whether the call goes on to insert, to bump
+        * :meth:`create_thought` — once per call that passes its initial
+          metadata and provenance validation, *before* the dedup branch:
+          whether the call goes on to insert, to bump
           an existing row's ``confirmation_count`` (``deduplicate=True`` hit),
           or (``deduplicate=False``) always inserts. A direct call has no way
           to know in advance which of those it will be, so — matching what a
           subclass override of the whole method could always do before this
-          seam existed — it always runs, exactly once.
+          seam existed — it runs once either way.
         * :meth:`get_or_create` / :meth:`upsert_by_hash` — **zero** times on a
           stable, pre-existing hit (their exploratory probe resolves the call
           before this method is ever reached — an idempotent "ensure it
           exists" call that turns out to be a hit costs nothing extra), and
-          exactly **once** after an observed miss. That includes the race
-          where a second writer wins between the exploratory probe and the
-          mandatory decisive re-probe, turning the miss into a hit: the seam
-          already ran once for this call and does not run again just because
-          the outcome changed underneath it.
-        * :meth:`bulk_store` — once per item, run for the *whole batch*,
-          holding no lock this call itself acquires, before ``bulk_store``
-          takes any lock for its insert
+          **once** when the call reaches this method after a miss. That
+          includes the race where a second writer wins between the
+          exploratory probe and the mandatory decisive re-probe, turning the
+          miss into a hit: the seam already ran once for this call and does
+          not run again just because the outcome changed underneath it.
+        * :meth:`bulk_store` — once per item, in input order until one call
+          raises, run for the *whole batch*, holding no lock this call itself
+          acquires, before ``bulk_store`` takes any lock for its insert
           transaction — not "through" a per-item :meth:`create_thought` call
           the way the other counts might suggest. A dedup hit inside the
           batch still costs one seam call, the same "still runs once" rule
           a direct call follows.
-        * :meth:`remember` — once, through its own :meth:`create_thought` call.
+        * :meth:`remember` — through its own :meth:`create_thought` call, so the
+          :meth:`create_thought` count above applies.
 
         **Never one this call itself acquires — on any entry point — but not
         "never any lock at all".** Neither ``_dedup_lock`` nor ``_write_lock``
@@ -6737,15 +6738,15 @@ class SqliteEngravaCore:
         ``_dedup_lock`` — a plain lock with no legitimate reentrant use — so a
         hook that calls back into a dedup entry point on the *same task*
         raises :class:`~engrava.domain.exceptions.DedupLockReentryError`
-        rather than blocking on it. Because this seam never runs with
-        ``_dedup_lock`` held, on any entry point, regardless of nesting, a
-        recursive call *from inside this method* never contends for it in the
-        first place — the same lock's reentry guard exists for a different
-        call site entirely: ``upsert_by_hash``'s hit branch, which never
-        reaches this method at all (see ``docs/extension-hooks.md`` §1B.3),
+        rather than blocking on it. This call's own machinery does not hold
+        ``_dedup_lock`` while it awaits this seam, so a recursive call *from
+        inside this method* does not contend for a ``_dedup_lock`` this call
+        took. The same lock's reentry guard exists for a different call site:
+        ``upsert_by_hash``'s hit branch (see ``docs/extension-hooks.md`` §1B.3)
         calls the separately overridable ``update_thought`` while still
-        holding ``_dedup_lock``, and it is *that* call, if overridden to
-        recurse on the same task, the reentry guard protects.
+        holding ``_dedup_lock``,
+        and an override of that method which recurses into a dedup entry
+        point on the same task raises ``DedupLockReentryError``.
 
         **That is a statement about locks this call itself takes, not about
         every lock that can be held while it runs.** If you call
@@ -6785,20 +6786,19 @@ class SqliteEngravaCore:
         that follows, so an override that changes ``content`` changes what
         counts as a duplicate for this call.
 
-        **Raising aborts the create.** No row is inserted, and — on every path
-        this seam covers — no journal entry is appended either: a rejection
-        here leaves no trace.
+        **Raising aborts the create.** This call inserts no row and appends no
+        journal entry: the seam runs before either.
 
         **Out of the ``revision`` contract, on the path where it matters
         most.** This seam postdates the revision guard's design and is not
         part of it. On :meth:`bulk_store`'s path in particular, this call runs
         for the whole batch *before* ``bulk_store`` takes its own write lock
         (see the invocation-count note above) — so a subclass override that
-        persists a write of its own here does so **outside** ``_write_lock``
-        and outside any ``revision`` bookkeeping. Such a write is a
-        third-party mutation this store neither guards nor bumps; treat it as
-        unmediated use of the connection, in the same sense the concurrency
-        documentation uses that phrase for a caller's own raw transaction.
+        persists a write of its own here does so before that lock is taken. A
+        write it makes straight on the connection is a mutation this store
+        neither guards nor bumps; treat it as unmediated use of the
+        connection, in the same sense the concurrency documentation uses that
+        phrase for a caller's own raw transaction.
 
         Args:
             thought: The candidate record, already validated (metadata,
@@ -6833,8 +6833,8 @@ class SqliteEngravaCore:
         ``bulk_store(deduplicate=True)`` item reaching this through
         :meth:`_create_thought_from_prepared` — unlike :meth:`get_or_create` /
         :meth:`upsert_by_hash`, this branch takes no two-phase detour of its
-        own: the seam already ran, exactly once, before this method was ever
-        entered, whichever of the hit/miss branches below it resolves to.
+        own: the seam already ran before this method was ever entered,
+        whichever of the hit/miss branches below it resolves to.
 
         Acquires ``self._dedup_lock`` for the entire ``check existing
         → INSERT or UPDATE`` window so concurrent calls **on this store
@@ -7003,8 +7003,8 @@ class SqliteEngravaCore:
 
         The first of :meth:`create_thought`'s two halves (see
         :meth:`_create_thought_from_prepared` for the second): validates the
-        candidate, runs :meth:`prepare_thought_for_insert` on it — exactly
-        once per call, before the dedup branch, unconditionally, since a
+        candidate, runs :meth:`prepare_thought_for_insert` on it — once,
+        after that validation and before the dedup branch, since a
         direct call cannot know in advance whether it will hit or miss — and
         revalidates whatever the seam returns. **Not called by**
         :meth:`_bulk_store_inner`: that method calls
@@ -7286,7 +7286,7 @@ class SqliteEngravaCore:
           still misses, the row is inserted (running the regular journal /
           auto-embed / cleanup pipeline) and returned with ``created=True``;
           if a second writer won the race in between, this call takes the hit
-          branch instead — the seam still ran exactly once. See
+          branch instead — the seam already ran for this call. See
           :meth:`prepare_thought_for_insert` for why the seam runs holding no
           lock this call itself acquires, on either probe.
 
@@ -7452,7 +7452,7 @@ class SqliteEngravaCore:
         :meth:`_finish_create_thought`'s docstring for both cases); if a
         second writer won the race in
         between, this call takes the hit (update-on-match) branch instead —
-        the seam still ran exactly once. **A stable hit costs zero seam
+        the seam already ran for this call. **A stable hit costs zero seam
         calls**, exactly like :meth:`get_or_create`. See
         :meth:`prepare_thought_for_insert` for why the seam runs holding no
         lock this call itself acquires, on either probe.
@@ -7770,8 +7770,8 @@ class SqliteEngravaCore:
         **Why the split is this narrow.** An earlier version of this method
         ran :meth:`_prepare_for_create` — validate, seam, revalidate — for
         the whole batch in phase 1, matching how :meth:`create_thought` does
-        it for one item. That satisfied constraint 1 (the seam never runs
-        under ``_write_lock``) but over-corrected the caller-visible failure
+        it for one item. That satisfied constraint 1 (the seam holding no
+        lock this call itself acquires) but over-corrected the caller-visible failure
         ordering: because *every* item's validation, not only its seam call,
         ran before *any* item's insert, a later item's ordinary
         (non-seam) validation error — invalid ``metadata`` or ``provenance``,

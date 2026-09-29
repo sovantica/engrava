@@ -681,7 +681,7 @@ checking for a task spawned and awaited from inside a `suspend_auto_commit()`
 window on the same store instance — see
 [Concurrency](concurrency.md#a-deadlock-this-store-cannot-resolve-raises-it-does-not-hang).
 
-**Overriding `create_thought()` no longer covers every insert path — override
+**Overriding `create_thought()` no longer runs on three insert paths — override
 `prepare_thought_for_insert()` for that instead.** No schema change. This
 consolidates two commits from the same release, `47bd68e` (routed
 `get_or_create()` / `upsert_by_hash()`'s miss branch off the public method)
@@ -691,11 +691,12 @@ Both landed before `0.7.0` shipped, so a `0.6.x` user upgrading straight to
 the released `0.7.0` sees only the final result below, never an intermediate
 state where the bypass existed with nothing to replace it.
 
-**What a 0.6 user gets.** On `0.6.x`, overriding `create_thought()` reached
-every path in this store able to insert a new row: `get_or_create()`'s and
+**What a 0.6 user gets.** On `0.6.x`, `get_or_create()`'s and
 `upsert_by_hash()`'s miss branch, and each item in `bulk_store()`'s insert
 loop, all called the virtual `self.create_thought(...)`, so an override
-sitting on top of the public method ran on all of them. On the released
+sitting on top of the public method ran on all three as well as on direct
+calls. Other paths that write a thought row, such as derived-record children,
+never called it. On the released
 `0.7.0`, none of the three do — `get_or_create()` / `upsert_by_hash()`'s miss
 branch and `bulk_store()`'s per-item insert all reach internal primitives
 directly, never the public `create_thought()` method, so a `create_thought()`
@@ -707,7 +708,8 @@ doing so as part of adding the seam described next. A hit on `get_or_create()`
 was already routed through `_increment_confirmation()`, not `create_thought()`,
 on every revision, so it was never in scope here either way;
 `upsert_by_hash()`'s hit branch calls the separately-overridable
-`update_thought()` instead, under locks that override can't safely nest into
+`update_thought()` instead when a mutable field differs, under locks that
+override can't safely nest into
 — see [Concurrency](concurrency.md#busy-timeout) and
 [Extension hooks §1B.3](extension-hooks.md#1b3-a-pre-existing-restriction-update_thought-on-upsert_by_hashs-hit-branch)
 for what that means for an `update_thought` override.
@@ -756,40 +758,29 @@ migrate away from either.
 fixed before this release shipped.** No schema change. `47bd68e` added an
 unconditional `self._maybe_commit()` to `upsert_by_hash()`'s no-change
 branch — the one that returns the existing row without writing to it at
-all — to close the `BEGIN IMMEDIATE` window the probe ahead of it always
-opens. On a shared connection that commit also flushed whatever *unrelated*
+all — to close the `BEGIN IMMEDIATE` window the probe ahead of it could
+open. On a shared connection that commit also flushed whatever *unrelated*
 pending work the caller already had open: a rejected journal insert left
 uncommitted, followed by an unrelated no-op `upsert_by_hash()` call on the
 same connection, became durable anyway, and a caller's later `rollback()`
-meant to undo the rejected insert had nothing left to undo. This was found
-and corrected in the same milestone, so anyone upgrading straight from
-`0.6.0` to the released `0.7.0` never observes it: the no-change branch no
-longer calls `_maybe_commit()` at all, matching `0.6.0`'s own behaviour on
-this specific point (and the existing no-op rule already documented on
-`update_action`).
+meant to undo the rejected insert had nothing left to undo. Anyone
+upgrading straight from `0.6.0` to the released `0.7.0` never observes it: the
+no-change branch no longer calls `_maybe_commit()` at all, matching `0.6.0`'s
+own behaviour on this specific point (and the existing no-op rule already
+documented on `update_action`).
 
-**What genuinely remains different from `0.6.0`, on this specific path: nothing.**
-An earlier draft of this note (revised here in place, in the same milestone
-as the fix it describes) reported a no-op match leaving its `BEGIN IMMEDIATE`
-window open indefinitely, for whichever guarded write next ran on the same
-connection to close. That was also caught before release: the no-op branch
-now ends its own probe's transaction with a rollback whenever it was the one
-that opened it — the branch writes nothing, so a rollback has nothing of its
-own to discard, and (per the no-op-commit fix above) it cannot touch a
-caller's own pending work either, because it acts only when this call's own
-probe opened the transaction, never when a caller's own
-`suspend_auto_commit()` window, a batched `bulk_store` row, or an explicit
-`BEGIN` already owned it. A no-op `upsert_by_hash()` match now releases the
-cross-connection write reservation exactly as promptly as a genuine write
-does. `0.6.0` still never opened a cross-connection lock for this path at
-all, and `0.7.0` still does — that is the general `BEGIN IMMEDIATE` change
-documented above (see the `WriteContentionError` section), true of every
-dedup entry point and not specific to a no-op match — but the *extra*,
-no-op-only residual this note used to describe is gone.
+**What remains different from `0.6.0` on this path: a no-op match now takes
+the cross-connection write reservation when the connection has no transaction
+open, and releases it as promptly as a write does; `0.6.0` took none.**
+That is the general `BEGIN IMMEDIATE` change documented above (see the
+`WriteContentionError` section), true of every dedup entry point, so a no-op
+`upsert_by_hash()` match can now raise `WriteContentionError` under
+cross-connection contention where `0.6.0` never contended. The no-op branch
+writes nothing, so it rolls back only a transaction its own probe opened and
+leaves any other open transaction alone.
 
-**What to do.** Nothing. The defect above never reached a release, and the
-residual this section used to warn about — a no-op match holding the write
-reservation open indefinitely — no longer exists either.
+**What to do.** Nothing beyond the `WriteContentionError` handler described
+above; it applies to a no-op match as to any other `upsert_by_hash()` call.
 
 **A dedup hit's journal entry can no longer be lost while its confirmation
 bump survives — no concurrency required.** No schema change. This is
@@ -1557,16 +1548,13 @@ importing the bad row at all. If you must recover the original vector
 first, edit the offending line in the snapshot file directly — it is plain
 JSONL — before restoring.
 
-**This section covers what four large commits were found, by execution, to
-change — not everything they touched.** `f2d2348`, `6e4ed41`, `47bd68e`, and
+**This section covers effects of four large commits, not everything they
+touched.** `f2d2348`, `6e4ed41`, `47bd68e`, and
 `d706f88` — the read-modify-write critical section, vector ownership,
 cross-connection dedup serialisation, and connection cleanup on failure and
 cancellation — each changed between roughly 1,000 and 2,500 lines apiece
-(997 to 2,471 insertions, by commit), reworking transaction boundaries, lock
-scope, dispatch, and cleanup behaviour that every guarded write path shares,
-not one narrow code path apiece. The entries above are the effects twelve
-rounds of executing this section's claims against real code have found and
-confirmed; they are not a closed inventory of these four commits' effects.
+(997 to 2,471 insertions, by commit). The entries above are not a closed
+inventory of these four commits' effects.
 A reader whose store is subclassed, hooked, wrapped in `suspend_auto_commit()`,
 or driven from more than one task in a combination not covered above should
 test that exact combination directly — treating its absence from this list

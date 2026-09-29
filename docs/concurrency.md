@@ -56,8 +56,9 @@ for `create_thought`, its surrounding metadata/provenance validation too —
 itself acquires while they do. `create_thought` validates the candidate,
 runs the seam, and revalidates whatever it returns before it ever takes the
 lock, then takes the lock once for the existence check and the insert or
-confirmation-bump together. `bulk_store` runs the seam once per item, for
-the whole batch, before it ever takes the lock; it then takes the
+confirmation-bump together. `bulk_store` runs the seam item by item, in
+input order until one call raises, for the whole batch, before it takes the lock
+itself; it then takes the
 lock once, for the rest of the batch — per-item validation, the existence
 check, and the insert or bump, item by item — so on both of these entry
 points the seam (and, for `create_thought`, its surrounding validation) is
@@ -71,8 +72,9 @@ call releases `_write_lock`, `_dedup_lock`, and any `BEGIN IMMEDIATE` it
 opened, runs the [pre-insert seam](extension-hooks.md#1b-pre-insert-preparation-seam)
 (`prepare_thought_for_insert`) with **no lock this call itself took still
 held** — a lock an *enclosing* caller took is a different matter, covered
-below — and only then reacquires `_write_lock`, `_dedup_lock`, and a fresh
-`BEGIN IMMEDIATE` for a decisive probe before it inserts. For a *different*
+below — and only then reacquires `_write_lock` and `_dedup_lock` and, when
+the connection has no transaction open, opens a `BEGIN IMMEDIATE` for a
+decisive probe before it inserts. For a *different*
 task, that gap is real: any other guarded write on this instance — a
 second task's `get_or_create` / `upsert_by_hash` /
 `create_thought(deduplicate=True)` / `bulk_store` targeting the same content,
@@ -303,9 +305,8 @@ the in-process lock guarding the dedup probe-and-insert window
 (`create_thought(deduplicate=True)`, `get_or_create`, `upsert_by_hash`) has
 no such legitimate reentrant use, so a second acquisition by the same task
 is always a bug rather than an intentional nesting to accommodate. The
-concrete shape is `upsert_by_hash`'s hit branch calling the overridable
-`update_thought` while still holding `_write_lock`, the dedup lock, and the
-transaction the probe opened, when it opened one (see [Extension hooks
+concrete shape is `upsert_by_hash`'s hit branch, when it updates the row,
+calling the overridable `update_thought` while it holds `_write_lock` and the dedup lock (see [Extension hooks
 §1B.3](extension-hooks.md#1b3-a-pre-existing-restriction-update_thought-on-upsert_by_hashs-hit-branch)):
 an `update_thought` override that calls back into
 `create_thought(deduplicate=True)` / `get_or_create` / `upsert_by_hash` /
@@ -477,7 +478,8 @@ errors; tune it to your write pattern.
 **The content-hash dedup path is the one exception to "raw `database is
 locked`."** `create_thought(deduplicate=True)`, `get_or_create()`,
 `upsert_by_hash()` and `bulk_store(deduplicate=True)` open their probe-and-row
-window with `BEGIN IMMEDIATE` instead of letting the probe's `SELECT` open an
+window with `BEGIN IMMEDIATE` when the connection has no transaction open,
+instead of letting the probe's `SELECT` open an
 implicit deferred transaction — so lock contention surfaces at the start of the
 window rather than only once the eventual `INSERT`/`UPDATE` needs the lock,
 which is where a deferred transaction would otherwise invite the classic
@@ -496,24 +498,26 @@ inside the caller's own `suspend_auto_commit()` window, `_write_lock` stays
 held through auto-embed and the hook too — see [Many async tasks, one
 store](#many-async-tasks-one-store) for why.
 
-**`upsert_by_hash()`'s hit branch is the one place a subclass override runs
-inside this window.** Whether it is the exploratory probe's hit or the
+**`upsert_by_hash()`'s hit branch can run a subclass override inside this
+window.** Whether it is the exploratory probe's hit or the
 decisive probe's hit (see [Many async tasks, one store](#many-async-tasks-one-store)),
 the hit branch updates the matched row by calling the public, overridable
-`update_thought` — and does so *before* the window closes, so `update_thought`
-runs there with `_write_lock`, the in-process `_dedup_lock`, and the
-transaction the probe opened, when it opened one, all still held. Neither hit route ever reaches the
-pre-insert preparation seam. Which of the two routes predates the seam and
-which one the seam introduced is stated once, in [Extension hooks
+`update_thought` when a mutable field differs (otherwise it returns the stored
+row untouched) — before the window closes, so `update_thought`
+is called there while `_write_lock` and the in-process `_dedup_lock` are
+held. The
+exploratory hit never reaches the pre-insert preparation seam; the decisive hit
+comes after the seam has already run once for the call. Which of the two routes
+predates the seam and which one the seam introduced is stated once, in
+[Extension hooks
 §1B.3](extension-hooks.md#1b3-a-pre-existing-restriction-update_thought-on-upsert_by_hashs-hit-branch) —
-not repeated here. Either way it is not something a caller can route around:
-an `update_thought` override reached this way must not call back into
+not repeated here. An `update_thought` override reached this way must not
+call back into
 `create_thought(deduplicate=True)` / `get_or_create` /
 `upsert_by_hash` / `bulk_store(deduplicate=True)` on the same task
 (`_dedup_lock` is not reentrant, so a second acquisition on
 the same task raises `DedupLockReentryError` rather than deadlocking — see
-below) and must not assume a second connection can see the update yet (the
-transaction is not yet committed).
+below).
 
 **The probe-and-row window used to have a second exposure, in-process: a
 concurrent, unrelated write from a *different task on this same instance*

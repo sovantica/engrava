@@ -985,10 +985,10 @@ class DedupLockReentryError(EngravaError):
     with no legitimate reentrant use — unlike the task-reentrant write lock
     (see ``WriteLockTimeoutError``), which exists precisely so a write nested
     inside the caller's own ``suspend_auto_commit()`` window can proceed, a
-    *second* acquisition of the dedup lock by the same task is always a bug.
+    *second* acquisition of the dedup lock by the same task is a bug.
     The concrete shape: ``upsert_by_hash``'s hit branch calls the separately
-    overridable ``update_thought`` while still holding this lock (see
-    ``docs/extension-hooks.md``, "§1B.3 A pre-existing restriction:
+    overridable ``update_thought``, when a mutable field differs, while still
+    holding this lock (see ``docs/extension-hooks.md``, "§1B.3 A pre-existing restriction:
     ``update_thought`` on ``upsert_by_hash``'s hit branch", for the full
     contract) — an ``update_thought`` override that calls back
     into ``create_thought(deduplicate=True)``, ``get_or_create``,
@@ -1006,14 +1006,12 @@ class DedupLockReentryError(EngravaError):
     Reachable on both of ``upsert_by_hash``'s hit routes — the exploratory
     probe's hit and the decisive probe's hit (including its own
     miss-turned-hit race, where a second writer wins between the two
-    probes). ``get_or_create``'s hit branch never reaches this: on a hit,
-    it calls the private, non-overridable ``_increment_confirmation``
-    instead of ``update_thought``, so it offers no recursion point for this
-    error, on either probe. Both of ``upsert_by_hash``'s hit routes hold
-    ``_write_lock``, ``_dedup_lock``, and the transaction the probe opened,
-    when it opened one (an already-open outer transaction otherwise), while
-    ``update_thought`` runs. This store does
-    not track which of ``create_thought`` / ``get_or_create`` /
+    probes) -- whenever the hit calls ``update_thought``. ``get_or_create``'s
+    hit branch calls the private
+    ``_increment_confirmation`` instead of ``update_thought``. Both of
+    ``upsert_by_hash``'s hit routes hold
+    ``_write_lock`` and ``_dedup_lock`` while ``update_thought`` runs. This
+    store does not track which of ``create_thought`` / ``get_or_create`` /
     ``upsert_by_hash`` opened the window still held on this task — only
     that one already has.
 
@@ -1026,8 +1024,6 @@ class DedupLockReentryError(EngravaError):
             "update_thought() override (or something it calls) recursing back "
             "into create_thought(deduplicate=True) / get_or_create() / "
             "upsert_by_hash() / bulk_store(deduplicate=True) on the same task "
-            "while a dedup hit's update is still under _write_lock, "
-            "_dedup_lock and the transaction the probe opened -- or an "
-            "already-open outer transaction, if it reused one; "
-            "see docs/extension-hooks.md §1B.3."
+            "while a dedup hit's update is still under _write_lock and "
+            "_dedup_lock; see docs/extension-hooks.md §1B.3."
         )

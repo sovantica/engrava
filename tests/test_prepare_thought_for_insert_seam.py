@@ -10,10 +10,13 @@ default to ``deduplicate=False``. Not before every probe, either:
 and skip this seam entirely on a stable hit.
 This module pins:
 
-* the exact per-entry-point invocation count: ``create_thought`` always once;
-  ``get_or_create`` / ``upsert_by_hash`` zero on a stable hit, once on a
-  miss, and still exactly once when a race turns the miss into a hit;
-  ``remember`` once; ``bulk_store`` once per item, including a dedup hit
+* the exact per-entry-point invocation count: ``create_thought`` once per
+  call that passes metadata and provenance validation;
+  ``get_or_create`` / ``upsert_by_hash`` zero on a stable hit, once when
+  the call reaches the seam after a miss, and still once when a race turns
+  the miss into a hit;
+  ``remember`` through its own ``create_thought`` call; ``bulk_store`` item
+  by item in input order until one call raises, including a dedup hit
   inside the batch, run for the whole batch holding no lock this call
   itself acquires;
 * that the returned record is revalidated and its ``content`` is decisive for
@@ -39,8 +42,7 @@ This module pins:
   earlier write already opened; and
 * that a same-task callback into a dedup entry point from *inside*
   ``update_thought`` -- reached from ``upsert_by_hash``'s hit branch while
-  ``_write_lock``, ``_dedup_lock`` and the transaction the probe opened,
-  when it opened one, are all three still held -- raises
+  ``_write_lock`` and ``_dedup_lock`` are both still held -- raises
   ``DedupLockReentryError`` instead of
   hanging forever on ``_dedup_lock``, on both the exploratory-probe-hit
   route and the decisive-probe-hit route the seam can newly reach by
@@ -110,9 +112,9 @@ class _SeamHookCore(SqliteEngravaCore):
     record, inject a competing write, or recurse into another entry point,
     exactly like a real subclass override would. An optional ``on_update``
     async callback does the same for the separately-overridable
-    ``update_thought`` -- the call ``upsert_by_hash``'s hit branch makes while
-    still holding ``_write_lock``, ``_dedup_lock`` and the transaction the
-    probe opened, when it opened one (see ``docs/extension-hooks.md`` §1B.3).
+    ``update_thought`` -- the call ``upsert_by_hash``'s hit branch makes, when a
+    mutable field differs, while still holding ``_write_lock`` and
+    ``_dedup_lock`` (see ``docs/extension-hooks.md`` §1B.3).
     """
 
     def __init__(
@@ -205,7 +207,7 @@ async def _open_store(
 
 
 # ---------------------------------------------------------------------------
-# create_thought -- always exactly once, hit or miss, either dedup mode
+# create_thought -- once per call that passes validation, hit or miss, either dedup mode
 # ---------------------------------------------------------------------------
 
 
@@ -234,7 +236,7 @@ async def test_create_thought_dedup_true_calls_seam_once_on_miss_and_once_on_hit
 
 
 # ---------------------------------------------------------------------------
-# get_or_create / upsert_by_hash -- zero on a stable hit, once on a miss
+# get_or_create / upsert_by_hash -- zero on a stable hit, once past a miss
 # ---------------------------------------------------------------------------
 
 
@@ -504,7 +506,7 @@ async def test_seam_returning_invalid_metadata_raises_before_insert(
 async def test_seam_raising_leaves_no_row_and_no_journal_entry(
     db: aiosqlite.Connection,
 ) -> None:
-    """Constraint 5: a pre-insert rejection leaves no trace, on every path."""
+    """Constraint 5: a pre-insert rejection leaves no row and no journal entry."""
 
     async def reject(store: _SeamHookCore, thought: ThoughtRecord) -> ThoughtRecord:
         msg = "rejected by policy"
@@ -526,7 +528,7 @@ async def test_seam_raising_leaves_no_row_and_no_journal_entry(
 async def test_seam_raising_mid_batch_leaves_no_row_and_no_journal_entry(
     db: aiosqlite.Connection,
 ) -> None:
-    """Constraint 5 on ``bulk_store``: a rejection anywhere in the batch leaves no trace.
+    """Constraint 5 on ``bulk_store``: a rejection anywhere in the batch inserts nothing.
 
     The failing item is third of four -- the first two items' seam calls
     already succeeded (phase 1 has no way to know item 3 will fail until it
@@ -692,7 +694,8 @@ async def test_same_task_callback_into_dedup_entry_point_does_not_deadlock(
     inside an already-locked dedup window ran the equivalent recursive call
     while still holding the plain, non-reentrant ``_dedup_lock`` -- a same-task
     callback would then wait forever on a lock it already holds. The seam
-    never runs with ``_dedup_lock`` held, so this must complete quickly.
+    runs holding no ``_dedup_lock`` this call acquires, so this must complete
+    quickly.
     """
 
     async def callback(store: _SeamHookCore, thought: ThoughtRecord) -> ThoughtRecord:
@@ -748,11 +751,11 @@ async def test_spawned_task_callback_into_dedup_entry_point_does_not_deadlock(
 async def test_update_thought_same_task_callback_on_exploratory_hit_raises(
     db: aiosqlite.Connection,
 ) -> None:
-    """``update_thought`` runs under ``_write_lock``, ``_dedup_lock`` and the
-    transaction the probe opened, when it opened one, on
-    ``upsert_by_hash``'s hit branch (see
-    ``docs/extension-hooks.md`` §1B.3) -- this predates the seam, and is not
-    something the seam introduces or could close. An ``update_thought``
+    """``update_thought`` runs under ``_write_lock`` and ``_dedup_lock`` on
+    ``upsert_by_hash``'s hit branch, when a mutable field differs (see
+    ``docs/extension-hooks.md`` §1B.3; the existing row and the candidate
+    differ in ``priority``, so the hit calls it) -- this predates the seam,
+    and is not something the seam introduces or could close. An ``update_thought``
     override that calls back into another dedup entry point on the *same*
     task tries to acquire ``_dedup_lock`` a second time; a plain
     ``asyncio.Lock`` would block that acquisition on itself forever, since
@@ -797,9 +800,8 @@ async def test_update_thought_same_task_callback_on_decisive_hit_raises(
     transforming the candidate's ``content`` to match an existing row --
     deterministically, with no race required, unlike before this seam
     existed. That route reaches the same ``_upsert_matched_row`` ->
-    ``update_thought`` call, under the same three guards
-    (``_write_lock``, ``_dedup_lock``, the transaction the decisive probe
-    opened, when it opened one), as the exploratory-hit case above -- pinned separately
+    ``update_thought`` call, under the same two locks
+    (``_write_lock``, ``_dedup_lock``) as the exploratory-hit case above -- pinned separately
     because the path to it is different.
     """
     entered = asyncio.Event()

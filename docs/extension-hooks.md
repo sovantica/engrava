@@ -274,11 +274,12 @@ the same `X.Y.x` stability guarantee.
 
 ## 1B. Pre-insert preparation seam
 
-`on_store` (§1) runs *after* a thought is (usually) durable, so it cannot
-reject an insert, and any enrichment it returns lands in the caller's copy of
-the record, never in the stored row. For validation or persisted enrichment
-that must run *before the decisive probe* for a duplicate and before any row
-write, override `prepare_thought_for_insert` on your `SqliteEngravaCore` subclass —
+`on_store` (§1) runs *after* the row is inserted (on a plain top-level
+`create_thought`, after it has already committed), so it is not a place for
+pre-insert validation, and any enrichment it returns lands in the caller's
+copy of the record, never in the stored row. For validation or persisted
+enrichment that must run *before the decisive probe* for a duplicate and before
+any row write, override `prepare_thought_for_insert` on your `SqliteEngravaCore` subclass —
 a template method, like `_row_to_thought`, not a method on the hooks object.
 It has no leading underscore: unlike `_row_to_thought`, this one is a public
 override point, and a subclass's override makes the name part of that
@@ -291,8 +292,8 @@ subclass's own public surface — hence the public name.
 | Default | Pass-through — returns the candidate unchanged |
 | Signature | `async def prepare_thought_for_insert(self, thought: ThoughtRecord) -> ThoughtRecord` |
 | Runs before | The **decisive** duplicate probe and any row write. `get_or_create` / `upsert_by_hash` run their own **exploratory** probe *before* this — see below; a stable hit there resolves the call and this seam never runs at all. |
-| Store lock held while it runs | Never one **this call itself** acquires, on any entry point — `create_thought`, `get_or_create`, `upsert_by_hash` and `bulk_store` all release every lock and transaction they opened before calling this, and reacquire from scratch afterward. See the nesting note below for the one case this does not cover. |
-| Raising | Aborts the create — no row, no journal entry |
+| Store lock held while it runs | Never one **this call itself** acquires, on any entry point — `create_thought`, `get_or_create`, `upsert_by_hash` and `bulk_store` all release every lock and transaction they opened before calling this, and reacquire from scratch afterward. See the nesting note below. |
+| Raising | Aborts the create — this call inserts no row and appends no journal entry |
 
 **Nesting note.** "Never one this call itself acquires" is not "never any
 lock at all". If you call `create_thought` / `get_or_create` / `upsert_by_hash`
@@ -309,11 +310,11 @@ identically to a raw `create_thought` call inside your own
 
 | Caller | Count |
 |---|---|
-| `create_thought` (either `deduplicate` value) | Exactly once per call — including a dedup hit |
-| `get_or_create` | Zero on a stable pre-existing hit; once on a miss (a race that turns the miss into a hit still counts once) |
+| `create_thought` (either `deduplicate` value) | Once per call that passes metadata and provenance validation — including a dedup hit |
+| `get_or_create` | Zero on a stable pre-existing hit; once when the call reaches the seam after a miss (a race that turns the miss into a hit still counts once) |
 | `upsert_by_hash` | Same as `get_or_create` |
-| `bulk_store` | Once per item — run for the *whole batch*, holding no lock this call itself acquires (see the nesting note above), before `bulk_store` takes any lock for its insert transaction; not "through" a per-item `create_thought` call the way the other counts might suggest |
-| `remember` | Once, via its own `create_thought` call |
+| `bulk_store` | Once per item, in input order until one call raises — run for the *whole batch*, holding no lock this call itself acquires (see the nesting note above), before `bulk_store` takes any lock for its insert transaction; not "through" a per-item `create_thought` call the way the other counts might suggest |
+| `remember` | Through its own `create_thought` call, so the `create_thought` row applies |
 
 The returned record is revalidated (metadata, provenance) before the decisive
 probe or any row write — for `get_or_create` / `upsert_by_hash`, this
@@ -344,47 +345,44 @@ not assume otherwise.
 If your subclass currently overrides `create_thought` for validation or
 persisted enrichment, move that logic into `prepare_thought_for_insert` and
 let the inherited `create_thought` / `get_or_create` / `upsert_by_hash` /
-`bulk_store` orchestration call it for you — it is the only override point
-that covers every path able to insert a new row, uniformly. Keep only one
-canonical implementation: retaining both the old override and the new seam
-risks running your logic twice on a direct `create_thought` call.
+`bulk_store` orchestration call it for you — every new row written through
+`create_thought`, `get_or_create`, `upsert_by_hash`, `bulk_store` or `remember`
+passes through it. Keep only one canonical implementation: retaining both the
+old override and the new seam risks running your logic twice on a direct
+`create_thought` call.
 
 ### 1B.3 A pre-existing restriction: `update_thought` on `upsert_by_hash`'s hit branch
 
 `upsert_by_hash`'s hit branch — when the content-hash probe matches an
-existing row — updates it by calling the public, overridable `update_thought`
-while still holding `_write_lock`, `_dedup_lock`, and the transaction the
-probe opened, when it opened one (an already-open outer transaction
-otherwise — see the nesting note in §1B.1). **The locked `update_thought`
-shape predates the
+existing row — updates it, if a mutable field differs, by calling the public,
+overridable `update_thought` while `_write_lock` and `_dedup_lock` are held.
+**The locked `update_thought` shape predates the
 pre-insert seam; the decisive-probe hit route does not.** Before the seam
 was wired into `upsert_by_hash`, the method had a single probe — what is
 now called the exploratory probe — whose hit branch already called
-`update_thought` under all three of those guards; that part is unchanged
+`update_thought`, when a field differed, under those two locks; that part is unchanged
 behaviour. The decisive probe exists only because wiring in the seam split
 the miss path into two phases, so that route is new; its hit branch reuses
 the same `_upsert_matched_row` implementation as the exploratory probe's,
 so it inherits the identical restriction on a route this seam introduced.
-Either way, the hit branch never reaches `prepare_thought_for_insert` at
-all (see the invocation-count table above:
-zero seam calls on a hit). If you override `update_thought`, know that your
-override can run under all three of those guards when it is reached this
-way: do not call back into `create_thought(deduplicate=True)` /
-`get_or_create` / `upsert_by_hash` / `bulk_store(deduplicate=True)` from
-inside it on the same task (see the nesting note in
-§1B.1 — `_write_lock` is task-reentrant, so re-entering it is free, but
-`_dedup_lock` has no legitimate reentrant use, and a same-task second
+A hit on the exploratory probe costs zero calls to
+`prepare_thought_for_insert`; a hit on the decisive probe comes after the seam
+has already run once for the call (see the invocation-count table above). If
+you override `update_thought`, know that your override is called while those
+guards are held when it is reached this way: do not call back into
+`create_thought(deduplicate=True)` / `get_or_create` / `upsert_by_hash` /
+`bulk_store(deduplicate=True)` from inside it on the same task (see the
+nesting note in §1B.1 — `_write_lock` is task-reentrant, so re-entering it is
+free, but `_dedup_lock` has no legitimate reentrant use, and a same-task second
 acquisition raises `DedupLockReentryError` — a "raise, don't hang" backstop
 identical in spirit to `WriteLockTimeoutError`'s for a *different* task's
 wait, converting what would otherwise be a silent hang on a lock this same
-task already holds into an attributable error instead), and do not assume
-you can read-your-own-write on a second connection to the same file (the
-transaction is not yet committed).
+task already holds into an attributable error instead).
 
-This restriction is unconditional on **both** hit routes — the exploratory
+This restriction applies on **both** hit routes — the exploratory
 probe's hit and the decisive probe's hit alike, since both resolve through
-this same `update_thought` call while `_write_lock`, `_dedup_lock`, and the
-transaction the probe opened, when it opened one, are all three still held.
+this same `update_thought` call, which is made when a mutable field differs
+and while `_write_lock` and `_dedup_lock` are held.
 
 ---
 

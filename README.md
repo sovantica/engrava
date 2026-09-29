@@ -197,8 +197,8 @@ class MyHooks(DefaultEngravaHooks):
 ```
 
 Core currently invokes `on_store`, `on_retrieve`, and `decay_function`.
-`on_store` runs after the source thought is durable; changing its return value
-does not rewrite the persisted row. `score_function` and
+`on_store` runs after the source thought's row is inserted; changing its
+return value does not rewrite the persisted row. `score_function` and
 `mindql_extension_registry()` remain reserved protocol methods and are not
 called by core.
 
