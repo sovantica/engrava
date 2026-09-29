@@ -61,8 +61,8 @@ class CorpusTurn:
             function words.
         priority: Fusion priority signal. Defaults to ``P2`` — most turns keep
             the default; a subset below is given a different level so the
-            priority signal actually varies across the fixture (see WS note
-            at :data:`_CORPUS`).
+            priority signal actually varies across the fixture (see the comment
+            above the discriminator pairs in :data:`_CORPUS`).
         created_cycle: Cognitive-cycle write time. Defaults to ``0``.
         updated_cycle: Cognitive-cycle last-touch time. Defaults to ``0``;
             staggered across most turns below so the recency signal has
@@ -446,7 +446,7 @@ _CORPUS: tuple[CorpusTurn, ...] = (
         updated_cycle=90,
     ),
     # -----------------------------------------------------------------------
-    # Dedicated ranking-signal discriminator pairs (WS: widen the frozen
+    # Dedicated ranking-signal discriminator pairs (these widen the frozen
     # baseline corpus so priority, cycle and graph each have a pair close
     # enough in fused score that perturbing that signal's own parameter
     # reorders them — see tests/search_contract/golden_fixtures.py and

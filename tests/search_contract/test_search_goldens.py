@@ -120,8 +120,8 @@ async def hybrid_store_from_config() -> AsyncIterator[SqliteEngravaCore]:
     await store.close()
 
 
-# A column-filter query whose scope drop the WS calls out and whose ranked list
-# visibly reshuffles end-to-end — the discriminating hybrid case.
+# A column-filter query whose ranked list visibly reshuffles end-to-end when its
+# scope is dropped — the discriminating hybrid case.
 _HYBRID_DISCRIMINATOR_QUERY = 'content:"three cheeses"'
 
 # ``essence:"office plant"`` etc.: a column filter directly wrapping a phrase —
@@ -316,8 +316,8 @@ class TestHybridRankedFromConfigGolden:
 class TestGoldenDiscriminatingPower:
     """Reverting the column-filter drop must break BOTH goldens.
 
-    A single in-process revert — the exact rewrite the WS rejected — is applied
-    below. It must make the expert-normalizer golden AND the frozen hybrid
+    A single in-process revert — the rewrite that drops the column-filter scope —
+    is applied below. It must make the expert-normalizer golden AND the frozen hybrid
     golden fail, proving each golden discriminates a wrong answer from an answer
     rather than passing vacuously.
     """
@@ -349,7 +349,7 @@ class TestGoldenDiscriminatingPower:
         # Non-column-filter cases are untouched by the surgical revert.
         for query in _EXPERT_CASES.keys() - column_filter_phrase:
             assert engrava_core._normalize_fts_query(query) == _EXPERT_CASES[query]
-        # The canonical WS case: scope dropped to a bare OR query.
+        # The canonical case: scope dropped to a bare OR query.
         assert engrava_core._normalize_fts_query('essence:"a b"') == "essence OR a OR b"
         assert _EXPERT_CASES['essence:"a b"'] == 'essence:"a b"'
 

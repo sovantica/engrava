@@ -856,11 +856,10 @@ def _live_thought_rowids_containing(db_path: Path, term: str) -> set[int]:
 def _assert_fts_index_matches_live_thoughts(db_path: Path, term: str) -> None:
     """Assert ``thought_fts``'s real ``MATCH`` rowids for ``term`` are exactly the live rows.
 
-    This is the acceptance criterion the WS states directly: "per-term MATCH
-    results equal a fresh re-index of the thought rows". A rowid ``MATCH``
-    returns that :func:`_live_thought_rowids_containing` does not is a stale
-    entry FTS5 never cleaned up (the defect this WS fixes); a rowid the other
-    way around is a row the index is missing entirely. Either is a failure.
+    Per-term ``MATCH`` results must equal a fresh re-index of the thought
+    rows. A rowid ``MATCH`` returns that :func:`_live_thought_rowids_containing`
+    does not is a stale entry FTS5 never cleaned up; a rowid the other way
+    around is a row the index is missing entirely. Either is a failure.
     """
     actual = _fts_match_rowids(db_path, term)
     expected = _live_thought_rowids_containing(db_path, term)
@@ -966,11 +965,7 @@ def _full_thought_table_snapshot(db_path: Path) -> list[tuple[object, ...]]:
 def _assert_recall_never_returns_a_mismatch(runner: CliRunner, db_path: Path, term: str) -> None:
     """Assert ``recall(term)`` never returns a thought whose live content lacks ``term``.
 
-    This is the WS's acceptance wording taken literally ("recall never
-    returns a thought missing the query term"), so every acceptance case in
-    :class:`TestRestoreRebuildsFtsIndex` checks it, not just the merge-then-
-    ``--clear`` case the defect was originally measured on. Checked against
-    each returned thought's *live* essence and content read directly from
+    Checked against each returned thought's *live* essence and content read directly from
     the database -- not just ``recall --json``'s own payload, which surfaces
     only ``essence`` -- and case-insensitively, matching the ``unicode61``
     tokenizer's casefolding (the same reason :func:`_live_thought_rowids_containing`
@@ -3513,12 +3508,12 @@ class TestRestoreRebuildsFtsIndex:
     unrelated row later, at which point a keyword search for the old content
     resolves to that unrelated row instead.
 
-    Each test below is one case from the WS acceptance list, asserting via
-    :func:`_assert_fts_index_matches_live_thoughts` that ``thought_fts``'s real
-    ``MATCH`` rowids equal a fresh re-index of ``thought``'s current rows --
-    never a bare ``SELECT COUNT(*) FROM thought_fts``, which reads straight
-    through to ``thought`` on this external-content table and cannot observe
-    any of this (see :func:`_thought_fts_match_count`'s own docstring).
+    The helper :func:`_assert_fts_index_matches_live_thoughts` compares
+    ``thought_fts``'s real ``MATCH`` rowids with a fresh re-index of
+    ``thought``'s current rows. A bare ``SELECT COUNT(*) FROM thought_fts``
+    reads straight through to ``thought`` on this external-content table and
+    cannot observe any of this (see :func:`_thought_fts_match_count`'s own
+    docstring).
     """
 
     def test_merge_restore_into_its_own_source_leaves_no_stale_row(

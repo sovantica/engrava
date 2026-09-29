@@ -394,7 +394,7 @@ class TestOffOnPair:
 # stop *benchmark* code leaking into `__all__`; a core exception is not that,
 # and the correct response to it firing here is a deliberate update to this
 # baseline, not a silenced test.
-_PRE_WS_ALL_BASELINE = frozenset(
+_ALL_BASELINE = frozenset(
     {
         "ActionNotFoundError",
         "ActionOutcomeSignal",
@@ -541,10 +541,10 @@ class TestPublicSurfaceDiscipline:
         import engrava
 
         current = frozenset(engrava.__all__)
-        new_exports = current - _PRE_WS_ALL_BASELINE
+        new_exports = current - _ALL_BASELINE
         assert not new_exports, f"benchmark suite leaked new public exports: {sorted(new_exports)}"
         # Also fail when a public export is quietly removed.
-        dropped = _PRE_WS_ALL_BASELINE - current
+        dropped = _ALL_BASELINE - current
         assert not dropped, (
             f"benchmark suite accidentally dropped public exports: {sorted(dropped)}"
         )

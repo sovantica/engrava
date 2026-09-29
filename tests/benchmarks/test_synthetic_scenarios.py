@@ -21,8 +21,7 @@ from engrava.benchmarks.synthetic.scenarios import (
 )
 
 # Pre-registered v0.3.0 library — count and identifying names.  Bumping the
-# count requires a new WS that explicitly documents the new scenarios in
-# CHANGELOG; this test catches accidental edits.
+# count is a deliberate change; this test catches accidental edits.
 _EXPECTED_LIBRARY_SIZE = 9
 _REQUIRED_NEUTRAL_NAMES = frozenset({"single_unique_fact", "recent_fact_recall"})
 _REQUIRED_NEUTRAL_OR_MINOR_NAMES = frozenset(

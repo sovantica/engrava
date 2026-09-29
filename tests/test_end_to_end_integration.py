@@ -238,7 +238,7 @@ async def test_full_pipeline_derive_embed_recall(
             top_k=5,
         )
         scores = dict(result.results)
-        # The gold answer is recalled: both the derived child (per the WS) and
+        # The gold answer is recalled: both the derived child and
         # its source thought are retrievable.
         assert gold_child_id in scores, scores
         assert "src-roadtrip" in scores, scores
