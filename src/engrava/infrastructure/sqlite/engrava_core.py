@@ -13772,6 +13772,11 @@ class SqliteEngravaCore:
         explicitly. A no-op returning ``0`` when tracking is disabled or the
         buffer is empty.
 
+        The buffer is drained only once the store's write lock is held. When
+        the call cannot take the lock within its bound it raises
+        :class:`~engrava.domain.exceptions.WriteLockTimeoutError` and has
+        taken nothing out of the buffer.
+
         Returns:
             The number of buffered access **entries flushed** — the distinct
             thought ids drained from the buffer. This counts entries submitted
@@ -13783,15 +13788,23 @@ class SqliteEngravaCore:
             and — like :meth:`delete_thought` — does not commit a caller's own
             open transaction on the strength of that empty batch.
 
+        Raises:
+            WriteLockTimeoutError: If this call cannot take the store's write
+                lock within ``write_lock_acquire_timeout_seconds``. It has
+                drained nothing.
+
         """
-        if not self._access_tracking_enabled:
+        if not self._access_tracking_enabled or len(self._access_buffer) == 0:
             return 0
-        pending = self._access_buffer.drain()
-        if not pending:
-            return 0
-        # (delta, last_seen, thought_id) — matches the UPDATE parameter order.
-        params = [(delta, ts, tid) for tid, delta, ts in pending]
         async with self._write_lock:
+            # Drain only now that the lock is held, so a flush that cannot
+            # take it has drained nothing.
+            pending = self._access_buffer.drain()
+            if not pending:
+                # Another flush took the events while this one waited.
+                return 0
+            # (delta, last_seen, thought_id) — matches the UPDATE parameter order.
+            params = [(delta, ts, tid) for tid, delta, ts in pending]
             # Sampled before anything below touches the connection — same
             # ownership test as delete_thought.
             opened_transaction = not self._db.in_transaction

@@ -9,6 +9,8 @@ default-off byte-identity guarantee.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from typing import TYPE_CHECKING
 
@@ -18,12 +20,13 @@ import pytest
 from engrava import SqliteEngravaCore
 from engrava.config import DreamingConfig, DreamingGates, _parse_dreaming
 from engrava.domain.enums import LifecycleStatus, Priority, ThoughtType
+from engrava.domain.exceptions import WriteLockTimeoutError
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.extensions.dreaming import DreamingExtension
 from engrava.infrastructure.sqlite.engrava_core import _AccessBuffer
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable
     from pathlib import Path
 
 # Cycle at which recency == staleness == 1.0: a thought created at cycle 0 and
@@ -355,6 +358,224 @@ class TestAccessSubstrate:
         result = await store.verify_journal()
         assert result.valid is True
         await db.close()
+
+
+class TestFlushOnAContendedWriteLock:
+    """A flush that cannot take the write lock does not drain the buffer.
+
+    The flush needs the store's write lock to apply the buffered events, and
+    taking that lock is bounded (``WriteLockTimeoutError``). Losing events
+    because the database write failed is the documented best-effort behaviour
+    of this telemetry; losing them because the lock could not be *taken* is
+    not a database failure, so a flush that times out on the lock must not
+    drain the buffer.
+    """
+
+    @staticmethod
+    @contextlib.asynccontextmanager
+    async def _tracking_store(
+        tmp_path: Path, *, lock_timeout_seconds: float
+    ) -> AsyncIterator[SqliteEngravaCore]:
+        db = await aiosqlite.connect(str(tmp_path / "contended.db"))
+        db.row_factory = aiosqlite.Row
+        try:
+            s = SqliteEngravaCore(
+                db=db,
+                access_tracking_enabled=True,
+                write_lock_acquire_timeout_seconds=lock_timeout_seconds,
+            )
+            await s.ensure_schema()
+            yield s
+        finally:
+            await db.close()
+
+    @staticmethod
+    @contextlib.asynccontextmanager
+    async def _write_lock_held_by_another_task(
+        store: SqliteEngravaCore,
+    ) -> AsyncIterator[Callable[[], None]]:
+        """Hold the write lock in a separate task; yield the callable that frees it."""
+        held = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _holder() -> None:
+            async with store._write_lock:
+                held.set()
+                await release.wait()
+
+        task = asyncio.create_task(_holder())
+        try:
+            await held.wait()
+            yield release.set
+        finally:
+            release.set()
+            await task
+
+    @staticmethod
+    def _record_connection_calls(
+        monkeypatch: pytest.MonkeyPatch, store: SqliteEngravaCore
+    ) -> list[str]:
+        """Return a list that gains the name of every statement or transaction call made."""
+        calls: list[str] = []
+
+        def recorder(name: str, real: Callable[..., object]) -> Callable[..., object]:
+            def _record(*args: object, **kwargs: object) -> object:
+                calls.append(name)
+                return real(*args, **kwargs)
+
+            return _record
+
+        for name in (
+            "execute",
+            "executemany",
+            "executescript",
+            "execute_insert",
+            "execute_fetchall",
+            "commit",
+            "rollback",
+        ):
+            monkeypatch.setattr(store._db, name, recorder(name, getattr(store._db, name)))
+        return calls
+
+    @staticmethod
+    def _signal_when_lock_requested(
+        monkeypatch: pytest.MonkeyPatch, store: SqliteEngravaCore, *, times: int
+    ) -> asyncio.Event:
+        """Return an event set once the write lock has been requested ``times`` times."""
+        requested = asyncio.Event()
+        calls = 0
+        real_acquire = store._write_lock.acquire
+
+        async def _acquire() -> None:
+            nonlocal calls
+            calls += 1
+            if calls >= times:
+                requested.set()
+            await real_acquire()
+
+        monkeypatch.setattr(store._write_lock, "acquire", _acquire)
+        return requested
+
+    @staticmethod
+    async def _access_count(store: SqliteEngravaCore, thought_id: str) -> int:
+        cursor = await store._db.execute(
+            "SELECT access_count FROM thought WHERE thought_id = ?", (thought_id,)
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        return int(row[0])
+
+    async def test_a_timeout_on_the_write_lock_keeps_the_buffered_events(
+        self, tmp_path: Path
+    ) -> None:
+        async with self._tracking_store(tmp_path, lock_timeout_seconds=0.05) as store:
+            await store.create_thought(_obs("t"))
+            await store.get_thought("t")
+            assert len(store._access_buffer) == 1
+
+            async with self._write_lock_held_by_another_task(store) as release:
+                with pytest.raises(WriteLockTimeoutError):
+                    await store.flush_access_buffer()
+                assert len(store._access_buffer) == 1, (
+                    "a flush that could not take the write lock must not have emptied the buffer"
+                )
+                release()
+
+            assert await store.flush_access_buffer() == 1
+            assert len(store._access_buffer) == 0
+            assert await self._access_count(store, "t") == 1
+
+    async def test_a_flush_cancelled_while_it_waits_keeps_the_buffered_events(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with self._tracking_store(tmp_path, lock_timeout_seconds=30.0) as store:
+            await store.create_thought(_obs("t"))
+            await store.get_thought("t")
+
+            async with self._write_lock_held_by_another_task(store) as release:
+                waiting = self._signal_when_lock_requested(monkeypatch, store, times=1)
+                flush = asyncio.create_task(store.flush_access_buffer())
+                try:
+                    await waiting.wait()  # the flush has started and is waiting for the lock
+
+                    flush.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await flush
+                    assert len(store._access_buffer) == 1, (
+                        "a flush cancelled while it waited for the write lock must not "
+                        "have emptied the buffer"
+                    )
+                finally:
+                    release()
+                    await asyncio.gather(flush, return_exceptions=True)
+
+            assert await store.flush_access_buffer() == 1
+            assert await self._access_count(store, "t") == 1
+
+    async def test_an_access_recorded_while_the_flush_waits_is_included(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with self._tracking_store(tmp_path, lock_timeout_seconds=30.0) as store:
+            await store.create_thought(_obs("t"))
+            await store.get_thought("t")
+
+            async with self._write_lock_held_by_another_task(store) as release:
+                waiting = self._signal_when_lock_requested(monkeypatch, store, times=1)
+                flush = asyncio.create_task(store.flush_access_buffer())
+                try:
+                    await waiting.wait()  # the flush has started and is waiting for the lock
+
+                    await store.get_thought("t")  # a second access of the same id while it waits
+                    release()
+                    flushed = await flush
+                finally:
+                    release()
+                    await asyncio.gather(flush, return_exceptions=True)
+
+            assert flushed == 1  # one distinct id
+            assert len(store._access_buffer) == 0
+            assert await self._access_count(store, "t") == 2
+
+    async def test_an_empty_flush_does_not_wait_for_the_write_lock(self, tmp_path: Path) -> None:
+        async with self._tracking_store(tmp_path, lock_timeout_seconds=0.05) as store:
+            assert len(store._access_buffer) == 0
+
+            async with self._write_lock_held_by_another_task(store):
+                assert await store.flush_access_buffer() == 0
+
+    async def test_the_flush_that_lost_the_race_does_not_touch_the_database(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with self._tracking_store(tmp_path, lock_timeout_seconds=30.0) as store:
+            await store.create_thought(_obs("t"))
+            await store.get_thought("t")
+            calls = self._record_connection_calls(monkeypatch, store)
+            calls.clear()
+
+            assert await store.flush_access_buffer() == 1
+            a_lone_flush = list(calls)
+            assert "executemany" in a_lone_flush
+
+            await store.get_thought("t")
+            calls.clear()
+
+            async with self._write_lock_held_by_another_task(store) as release:
+                both_waiting = self._signal_when_lock_requested(monkeypatch, store, times=2)
+                first = asyncio.create_task(store.flush_access_buffer())
+                second = asyncio.create_task(store.flush_access_buffer())
+                try:
+                    await asyncio.wait_for(both_waiting.wait(), timeout=5)
+                    release()
+                    results = await asyncio.gather(first, second)
+                finally:
+                    release()
+                    await asyncio.gather(first, second, return_exceptions=True)
+
+            assert sorted(results) == [0, 1]
+            assert calls == a_lone_flush, (
+                "the flush that found nothing to write must not call the connection at all"
+            )
+            assert await self._access_count(store, "t") == 2
 
 
 class TestAccessBuffer:

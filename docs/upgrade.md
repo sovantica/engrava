@@ -1479,62 +1479,39 @@ the workaround is no longer necessary, though it remains harmless. If a test
 or monitor was built around detecting this specific hang (a timeout that
 was expected to fire), it will no longer fire for this reason.
 
-**`flush_access_buffer()` can lose already-buffered access events on a
-write-lock timeout.** No schema change. Introduced by `f2d2348` (the
-read-modify-write critical-section commit above), not `47bd68e` (the
-dedup-serialisation commit).
+**`flush_access_buffer()` now takes the store's write lock, so it can wait for
+it and raise `WriteLockTimeoutError`.** No schema change.
 
 **Who is affected.** Anyone with access tracking enabled
 (`access_tracking_enabled=True`) whose `flush_access_buffer()` call —
 explicit, or the automatic one at a consolidation cycle boundary or on
-`close()` — can run while a different task holds the store's write lock
-long enough to exceed `write_lock_acquire_timeout_seconds`.
-`flush_access_buffer()` drains the in-process access buffer *before*
-acquiring the write lock it needs to apply the drained events, so a failed
-acquisition has nowhere to put what it already took out of the buffer.
+`close()` — can run while a different task holds the store's write lock. In
+`v0.6.0` the flush took no lock. It now waits for the lock and raises
+`WriteLockTimeoutError` when it cannot take it within
+`write_lock_acquire_timeout_seconds`. A flush with nothing buffered returns `0`
+without asking for the lock. Otherwise a non-positive value (`0`, or negative)
+raises at once, even against a free lock; a task that already holds the lock
+re-enters it without waiting and does not raise.
 
-**Executed directly:** one access event buffered, a different task holding
-the write lock open (via its own `suspend_auto_commit()` window) for longer
-than a short configured `write_lock_acquire_timeout_seconds`, then
-`flush_access_buffer()` called — it raised `WriteLockTimeoutError`, a retry
-immediately afterward returned `0` (nothing left pending), and the raw
-`access_count` on the target row never moved. Before this commit,
-`flush_access_buffer()` acquired no lock at all; the identical setup, run
-against that source, always drained and persisted the event.
+**What changed.** The flush drains the buffer only after it holds the lock, so
+a call that raises `WriteLockTimeoutError` has taken nothing out of the buffer.
 
-**Who is not affected.** A store never used from more than one task
-concurrently never contends for the write lock against another task — but
-contention is not the only way to fail to acquire it.
-`write_lock_acquire_timeout_seconds` takes no validation, and a non-positive
-value (`0`, or negative) makes `_TaskReentrantLock.acquire()` raise
-`WriteLockTimeoutError` immediately even against a completely free lock,
-single task or not. Executed directly: one buffered event, no other task or
-connection, a store constructed with `write_lock_acquire_timeout_seconds=0`
-— `flush_access_buffer()` raised `WriteLockTimeoutError`, an immediate retry
-returned `0`, and the persisted `access_count` stayed `0`; the identical
-setup with a positive timeout (`0.001`s tested) drained and persisted
-normally. This is a different failure from `flush_access_buffer()`'s own
-return-value contract (what its count actually measures) — that is tracked
-separately; this is about the buffered events themselves going missing, not
-about what the returned number means.
+Executed directly on the current tree: one access event buffered, a different
+task holding the write lock open (via its own `suspend_auto_commit()` window)
+for longer than a `write_lock_acquire_timeout_seconds` of `0.2`, then
+`flush_access_buffer()` called — it raised `WriteLockTimeoutError` and the
+event was still buffered; once the window closed, a retry returned `1` and the
+row's `access_count` was `1`. With `write_lock_acquire_timeout_seconds=0`, one
+buffered event and no other task, two consecutive `flush_access_buffer()`
+calls each raised `WriteLockTimeoutError`, the event was still buffered, and
+the persisted `access_count` stayed `0`; the identical setup with `0.001`
+returned `1` and persisted the count.
 
-**What changed.** The read-modify-write critical-section fix added
-`async with self._write_lock:` around `flush_access_buffer()`'s batched
-`UPDATE`, with the same bounded-wait, typed-timeout behaviour every other
-guarded write path gained. It did not reorder the method to acquire that
-lock *before* draining the buffer, so the drain and the acquisition remain
-two separate steps with nothing between them to put the drained events back
-if the second one fails.
-
-**What to do.** The buffer's existing best-effort framing — a crash before
-a flush undercounts, and self-heals as access continues — does not cover
-this: a crash loses events that were never drained, but a `WriteLockTimeoutError`
-here loses events that *were* drained and then had nowhere to go, with no
-self-healing path back. If access counts must not silently under-count
-beyond that existing tolerance, catch `WriteLockTimeoutError` around
-`flush_access_buffer()` calls, and raise `write_lock_acquire_timeout_seconds`
-if access tracking runs on a store that also holds long
-`suspend_auto_commit()` windows from other tasks.
+**What to do.** Retry the flush when it raises `WriteLockTimeoutError`, and
+raise `write_lock_acquire_timeout_seconds` if access tracking runs on a store
+whose other tasks hold long `suspend_auto_commit()` windows. `close()` catches
+and logs a flush failure, so a `close()` whose flush times out on the lock
+writes nothing.
 
 **`restore` now refuses an `embedding` row that is not a valid domain record —
 not only one whose `model_name`/`dimension` disagree with the target.** No
