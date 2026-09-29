@@ -1094,17 +1094,26 @@ class TestChildTriggerWriteSurvivesAVetoedSweep:
             await db.close()
 
 
-class TestVetoedDeleteEndsTheTransactionItOpened:
-    """A silently-vetoed delete must not leave open a transaction the public call began.
+class TestTransactionStateAfterAVetoedDelete:
+    """The connection's transaction state after a delete that a trigger vetoes.
 
     In these tests a ``RAISE(IGNORE)`` trigger vetoes the delete without
     raising: the parent ``DELETE`` matches zero rows and the row is still
-    there. The first three tests run a public call whose delete is vetoed this
-    way -- ``run_hygiene``'s GC, ``delete_thought`` and ``cleanup_expired``'s
-    delete strategy -- and assert that afterwards ``self._db.in_transaction``
-    is ``False`` and a second connection can take the write lock at once. An
-    open transaction begun with ``BEGIN IMMEDIATE`` keeps holding the write
-    lock against every other connection.
+    there.
+
+    * ``run_hygiene``'s GC, ``delete_thought`` and ``cleanup_expired``'s
+      delete strategy, each called with no transaction open, return with
+      ``in_transaction`` ``False`` and a second connection able to take the
+      write lock at once. A transaction begun with ``BEGIN IMMEDIATE`` holds
+      the write lock until it ends.
+    * ``delete_thought`` called inside a ``suspend_auto_commit`` window, after
+      an earlier write in the window or after ``bulk_store``, returns with the
+      window's transaction still open; the window's writes and the vetoed
+      thought are present once the window closes.
+    * ``_delete_thought_atomic`` called directly with no transaction open
+      returns with ``in_transaction`` ``False``. Called inside a transaction
+      the caller began with an explicit ``BEGIN``, it returns with that
+      transaction still open, with or without a pending edit in it.
 
     A genuine second connection to the same file is required to observe the
     lock from outside -- a shared ``:memory:`` database cannot host
@@ -1138,7 +1147,7 @@ class TestVetoedDeleteEndsTheTransactionItOpened:
             await second.close()
 
     @pytest.mark.parametrize("foreign_keys_on", [True, False])
-    async def test_hygiene_gc_ignore_veto_ends_the_transaction_it_opened(
+    async def test_hygiene_gc_ignore_veto_leaves_no_transaction_open(
         self,
         tmp_path: Path,
         foreign_keys_on: bool,
@@ -1185,7 +1194,7 @@ class TestVetoedDeleteEndsTheTransactionItOpened:
             await db.close()
 
     @pytest.mark.parametrize("foreign_keys_on", [True, False])
-    async def test_delete_thought_ignore_veto_ends_the_transaction_it_opened(
+    async def test_delete_thought_ignore_veto_leaves_no_transaction_open(
         self,
         tmp_path: Path,
         foreign_keys_on: bool,
@@ -1215,7 +1224,7 @@ class TestVetoedDeleteEndsTheTransactionItOpened:
             await db.close()
 
     @pytest.mark.parametrize("foreign_keys_on", [True, False])
-    async def test_ttl_delete_ignore_veto_ends_the_transaction_it_opened(
+    async def test_ttl_delete_ignore_veto_leaves_no_transaction_open(
         self,
         tmp_path: Path,
         foreign_keys_on: bool,
@@ -1375,6 +1384,70 @@ class TestVetoedDeleteEndsTheTransactionItOpened:
             assert await store.get_thought("vetoed") is not None
         finally:
             await db.close()
+
+    @pytest.mark.parametrize("foreign_keys_on", [True, False])
+    async def test_atomic_delete_vetoed_with_no_transaction_open_leaves_none_open(
+        self,
+        store: SqliteEngravaCore,
+        foreign_keys_on: bool,
+    ) -> None:
+        """A vetoed ``_delete_thought_atomic`` called with no transaction open."""
+        db = store._db
+        if not foreign_keys_on:
+            await db.execute("PRAGMA foreign_keys = OFF")
+        await store.create_thought(_make_thought("t1"))
+        await self._install_ignore_trigger(db)
+        await db.commit()
+        assert db.in_transaction is False, "the call starts with no transaction open"
+
+        result = await store._delete_thought_atomic("t1")
+
+        assert result.deleted is False
+        assert db.in_transaction is False, (
+            "the call began with no transaction open and deleted nothing, "
+            "so no transaction may be open when it returns"
+        )
+        assert await store.get_thought("t1") is not None
+
+    @pytest.mark.parametrize("foreign_keys_on", [True, False])
+    async def test_atomic_delete_vetoed_inside_a_callers_transaction_leaves_it_open(
+        self,
+        store: SqliteEngravaCore,
+        foreign_keys_on: bool,
+    ) -> None:
+        """A vetoed ``_delete_thought_atomic`` called inside a caller's ``BEGIN``."""
+        db = store._db
+        if not foreign_keys_on:
+            await db.execute("PRAGMA foreign_keys = OFF")
+        await store.create_thought(_make_thought("t1"))
+        await store.create_thought(_make_thought("t2"))
+        await self._install_ignore_trigger(db)
+        await db.commit()
+
+        await db.execute("BEGIN")
+        await db.execute(
+            "UPDATE thought SET essence = ? WHERE thought_id = ?",
+            ("edited-by-caller", "t2"),
+        )
+
+        result = await store._delete_thought_atomic("t1")
+
+        assert result.deleted is False
+        assert db.in_transaction is True, (
+            "the caller's own transaction, with their pending edit inside it, "
+            "must still be open when the call returns"
+        )
+        cursor = await db.execute("SELECT essence FROM thought WHERE thought_id = 't2'")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row["essence"] == "edited-by-caller", "the caller's pending edit must still be there"
+        await db.rollback()
+        cursor = await db.execute("SELECT essence FROM thought WHERE thought_id = 't2'")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row["essence"] == "essence-t2", (
+            "the edit was still pending, so the caller's own rollback must undo it"
+        )
 
 
 class TestPubliclyVetoedWritesDoNotCommitACallersTransaction:
