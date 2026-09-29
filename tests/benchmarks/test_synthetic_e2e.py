@@ -8,8 +8,7 @@ Two binding gates land here:
   least 80 % of the synthesis questions.  Measured via
   :func:`measure_synthesis_coverage`, which inspects post-dreaming
   store state directly and is invariant to retrieval-layer ranking
-  knobs.  Retrieval surfacing is deferred to a follow-up
-  workstream.
+  knobs.
 
 * ``test_ac8_sanity_with_reflection_boost_off`` — AC-8b binding
   pre-C4 gate.  The benchmark's binding ``SearchConfig`` sets
@@ -66,18 +65,15 @@ _COVERAGE_FLOOR = 0.80
 # 0.02 but the curated direct-only subset measured 0.033 in C4.1; the
 # 0.05 ceiling carries a 34 % safety margin.  Same REFLECTION
 # displacement mechanism as the AC-8 v1.4 amendment (boost is a
-# multiplier, not an on/off toggle).  Follow-up evaluator-ranking
-# workstream tightens back to 0.02.
+# multiplier, not an on/off toggle).
 _DIRECT_DELTA_CEILING = 0.05
 # v0.3.0 tolerance per spec v1.4 amendment.  Pre-amendment value was
 # 0.02 but empirically REFLECTIONs participate in retrieval at parity
 # even with ``reflection_boost=1.0`` — the boost is a multiplier on
 # top of the intrinsic score, not an enable/disable toggle.  Measured
-# delta post-NA-1 sits at 0.042 so the 0.05 ceiling carries a small
+# delta sits at 0.042 so the 0.05 ceiling carries a small
 # safety margin without claiming neutrality the engrava-core ranking
-# does not actually provide at v0.3.0.  The v0.4.0 follow-up
-# workstream tightens this back to 0.02 once REFLECTION ranking is
-# refined.
+# does not actually provide at v0.3.0.
 _SANITY_DELTA_CEILING = 0.05
 
 
@@ -135,9 +131,7 @@ class TestSanityAc8WithBoostDisabled:
     empirical rationale: ``reflection_boost=1.0`` is a multiplier on
     the REFLECTION's intrinsic retrieval score, not an
     enable/disable toggle, so REFLECTIONs still rank in top-K on
-    sanity-subset queries by their own vector / FTS merit.  The
-    v0.4.0 follow-up workstream tightens this back to 0.02 once
-    REFLECTION ranking is refined; this test re-binds at 0.02 then.
+    sanity-subset queries by their own vector / FTS merit.
     """
 
     @pytest.mark.asyncio
@@ -177,13 +171,7 @@ class TestSanityAc8WithBoostDisabled:
         )
         delta = abs(on.aggregate_recall_at_k - off.aggregate_recall_at_k)
         assert delta <= _SANITY_DELTA_CEILING, (
-            f"AC-8b v0.3.0 tolerance ({_SANITY_DELTA_CEILING:.2f}) "
-            f"exceeded: {delta:.3f}.  The v0.4.0 follow-up "
-            f"workstream tightens this back to 0.02 once REFLECTION "
-            f"ranking is refined; until then a regression past the "
-            f"0.05 ceiling here means a NEW source of dreaming-side "
-            f"interference on sanity retrieval, not just the known "
-            f"intrinsic-score participation."
+            f"AC-8b v0.3.0 tolerance ({_SANITY_DELTA_CEILING:.2f}) exceeded: {delta:.3f}."
         )
 
 
@@ -195,10 +183,8 @@ class TestDirectSubsetNeutrality:
     participate in retrieval at parity (``reflection_boost=1.0`` is
     a multiplier on the intrinsic score, not an enable/disable
     toggle) and occasionally displace direct-retrieval OBSERVATIONs
-    from top-K.  Measured 0.033 on the curated direct subset
-    post-NA-1; 0.05 carries a 34 % safety margin.  The v0.4.0
-    follow-up workstream tightens this back to 0.02 once
-    REFLECTION ranking is refined.
+    from top-K.  Measured 0.033 on the curated direct subset;
+    0.05 carries a 34 % safety margin.
     """
 
     @pytest.mark.asyncio
@@ -230,13 +216,7 @@ class TestDirectSubsetNeutrality:
         )
         delta = abs(on.aggregate_recall_at_k - off.aggregate_recall_at_k)
         assert delta <= _DIRECT_DELTA_CEILING, (
-            f"AC-9b v0.3.0 tolerance ({_DIRECT_DELTA_CEILING:.2f}) "
-            f"exceeded: {delta:.3f}.  The v0.4.0 follow-up "
-            f"workstream tightens this back to 0.02 once REFLECTION "
-            f"ranking is refined; a regression past the 0.05 ceiling "
-            f"here means a NEW source of dreaming-side interference "
-            f"on direct retrieval, not just the known intrinsic-score "
-            f"participation."
+            f"AC-9b v0.3.0 tolerance ({_DIRECT_DELTA_CEILING:.2f}) exceeded: {delta:.3f}."
         )
 
 
@@ -253,15 +233,11 @@ class TestRunnerWalltimeBudget:
     seconds for v0.3.0 because the dual-section CLI (binding ACs
     section by default, ``--with-reproducibility`` opt-in) runs
     four full evaluator pairs that cumulatively exceed the 120 s
-    budget on reference hardware.  Spec v1.7 relaxed further to
-    360 seconds with explicit empirical rationale: two
+    budget on reference hardware.  The ceiling is 360 seconds.  Two
     deterministic standalone CLI runs on Windows developer hardware
-    measured 312.79 s and 321.79 s (median ~317 s), 12-15 % under
-    the new 360 s ceiling.  Reference Apple Silicon hardware is
-    expected to land ~250 s based on relative single-core throughput.
-    The
-    follow-up evaluator-optimisation workstream tightens this back
-    to 120 s.
+    measured 312.79 s and 321.79 s (median ~317 s), 11-13 % under it.
+    Reference Apple Silicon hardware is expected to land ~250 s based
+    on relative single-core throughput.
     """
 
     def test_runner_walltime_budget(self) -> None:
@@ -286,8 +262,4 @@ class TestRunnerWalltimeBudget:
         assert result.returncode == 0, (
             f"CLI exited {result.returncode} (expected 0).  stderr tail: {result.stderr[-500:]!r}"
         )
-        assert elapsed <= 360, (
-            f"The v0.3.0 walltime budget (360 s) exceeded: "
-            f"{elapsed:.1f}s.  The v0.4.0 evaluator-optimisation "
-            f"workstream tightens this back to 120 s."
-        )
+        assert elapsed <= 360, f"The v0.3.0 walltime budget (360 s) exceeded: {elapsed:.1f}s."

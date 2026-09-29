@@ -14524,8 +14524,7 @@ class SqliteEngravaCore:
         re-wiring, not a mistake this method can distinguish from one.
 
         Detaching is deliberately **not** part of this seam. There is no
-        supported way to remove an attached extension in this workstream;
-        that gap is not an oversight, it is simply not yet built.
+        supported way to remove an attached extension.
 
         Args:
             extension: A consolidator satisfying

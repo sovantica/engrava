@@ -1351,10 +1351,7 @@ class TestVerboseNoLongerCallsTheExceptionASecondTime:
     :func:`~engrava.cli.memory_commands._describe_exception`'s guards. A
     real interrupt landing during that second call was swallowed by that
     bare ``except``, and the command finished as an ordinary
-    ``unexpected_error`` JSON object at exit ``1`` instead of aborting --
-    confirmed live against ``0da258c`` (see the delivery report for that
-    run's output; reproducing it here would require checking out that
-    commit inside this test, which this module does not do).
+    ``unexpected_error`` JSON object at exit ``1`` instead of aborting.
 
     This test's hostile exception succeeds normally on its *first* call --
     the one read ``_describe_exception`` performs either way, needed for
@@ -1406,10 +1403,9 @@ class _RecordingFormatterError(Exception):
     Used, chained via ``__cause__`` / ``__context__``, to prove ``--verbose``
     adds no further call to the original exception's formatter or to any
     cause/context formatter -- not just that a real interrupt would survive
-    one, but that the call is not made at all. A manual comparison against
-    ``0da258c`` recorded the counts this closes: three total calls
-    (``main`` twice, ``cause`` once) before this fix, one (``main`` once)
-    after, with or without ``--verbose``.
+    one, but that the call is not made at all. The tests below assert that
+    the log holds one entry (``main`` once), with or without ``--verbose``,
+    so neither ``cause`` nor ``context`` is ever formatted.
     """
 
     def __init__(self, label: str) -> None:

@@ -257,11 +257,10 @@ class TestOffOnPair:
         # REFLECTIONs participate at parity in retrieval despite
         # ``reflection_boost=1.0`` (boost is a multiplier on top of
         # the intrinsic vector / FTS score, not an enable/disable
-        # toggle).  Measured delta post-NA-1 is 0.042 — the 0.05
+        # toggle).  Measured delta is 0.042 — the 0.05
         # ceiling carries a small safety margin without claiming
         # neutrality the engrava-core ranking does not provide at
-        # v0.3.0.  The v0.4.0 follow-up workstream tightens this
-        # back to ≤0.02 once REFLECTION ranking is refined.
+        # v0.3.0.
         dataset = _neutral_sanity_dataset()
         off = await evaluate_run(
             dataset,
@@ -274,13 +273,7 @@ class TestOffOnPair:
             embedding_provider=embedding_provider,
         )
         delta = abs(on.aggregate_recall_at_k - off.aggregate_recall_at_k)
-        assert delta <= 0.05, (
-            f"AC-8 v0.3.0 tolerance (0.05) exceeded: {delta:.3f}.  "
-            f"v0.4.0 tightens back to 0.02 post REFLECTION ranking "
-            f"refinement; a regression past 0.05 here means a NEW "
-            f"source of dreaming-side interference, not just the "
-            f"known intrinsic-score participation."
-        )
+        assert delta <= 0.05, f"AC-8 v0.3.0 tolerance (0.05) exceeded: {delta:.3f}."
 
 
 # ---------------------------------------------------------------------------
@@ -400,9 +393,9 @@ class TestOffOnPair:
 # dedup lock used to hang forever on a same-task second acquisition, which
 # `concurrency.md` already forbade ("what it must not become is a silent,
 # unattributable hang"), so the store now raises instead. This guard exists to
-# stop *benchmark* code leaking into `__all__`; a core exception added by a
-# reviewed workstream is not that, and the correct response to it firing here
-# is a recorded decision, not a silenced test.
+# stop *benchmark* code leaking into `__all__`; a core exception is not that,
+# and the correct response to it firing here is a deliberate update to this
+# baseline, not a silenced test.
 _PRE_WS_ALL_BASELINE = frozenset(
     {
         "ActionNotFoundError",

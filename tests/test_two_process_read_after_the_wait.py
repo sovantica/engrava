@@ -121,7 +121,7 @@ _HOLDER_ESSENCE = "essence written by the concurrent holder"
 _SEED_WEIGHT = 0.25
 _HOLDER_DECAY = 0.42
 
-#: The two delete cases named in the workstream's acceptance criteria.
+#: The two delete operations this module exercises.
 _DELETE_OPERATIONS = ("delete_thought", "delete_edge")
 
 #: Recorded once, in the parent process, so a contender's own import can be

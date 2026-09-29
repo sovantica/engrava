@@ -553,11 +553,9 @@ async def test_cancellation_inside_the_probe_releases_the_write_lock(db_path: st
 def test_write_contention_error_is_exported_from_package_root() -> None:
     """``WriteContentionError`` is importable from ``engrava`` and typed correctly.
 
-    Regression pin against the sibling defect noted in the workstream that
-    introduced this error: three pre-existing exceptions are defined in
-    ``engrava.domain.exceptions`` but never imported into ``engrava/__init__.py``,
-    so they are unreachable via ``from engrava import ...``. This error must not
-    repeat that mistake.
+    The error is defined in ``engrava.domain.exceptions``. The test pins that
+    the package root exposes that same class, lists it in ``__all__``, and
+    that it is an ``EngravaError``.
     """
     import engrava
 

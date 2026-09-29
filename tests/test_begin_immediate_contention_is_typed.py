@@ -2,11 +2,8 @@
 
 ``update_thought``, ``restore_thought``, ``update_edge`` and ``update_action``
 each open their unit with a deferred ``BEGIN`` and read the row before
-opening it -- see ``tests/test_two_process_write_busy_wait.py`` for why:
-these four carry a documented contract a caller retries on
-``WriteContentionError``, which reading under the write lock (as a
-since-reverted workstream tried) would have silently turned into a wait that
-could reject a disjoint-column edit as falsely stale instead.
+opening it: these four carry a documented contract that a caller retries on
+``WriteContentionError``.
 
 **The four do not all fail the same way, and this module is deliberately
 built so that difference cannot leak into a false pass.** ``update_thought``
@@ -134,7 +131,7 @@ _SEED_VERIFICATION_STATUS = "PENDING"
 _HOLDER_VERIFICATION_STATUS = "PARTIAL"
 _CONTENDER_ACTION_STATUS = "EXECUTING"
 
-#: The four update paths named in the workstream's acceptance criteria.
+#: The four update paths this module exercises.
 _OPERATIONS = ("update_thought", "restore_thought", "update_edge", "update_action")
 
 #: Recorded once, in the parent process, so a contender's own import can be

@@ -15,9 +15,8 @@ surface for one acceptance criterion:
 
 Exit code is ``0`` iff all four binding ACs pass, ``1`` if any
 binding AC fails, ``2`` if the embeddings extras are missing.
-Reference-hardware walltime is ~5 minutes (the v0.3.0 ceiling is
-300 seconds; a follow-up evaluator-optimisation workstream tightens
-to 120 seconds).
+Reference-hardware walltime is ~5 minutes (the opt-in walltime test,
+enabled with ``BENCH_SLOW=1``, asserts at most 360 seconds).
 
 Pass ``--with-reproducibility`` to additionally print a
 **reproducibility snapshot** on the bundled frozen
@@ -94,8 +93,8 @@ _AC9A_FLOOR = 0.80
 # AC-9b v0.3.0 tolerance per spec v1.6 amendment: pre-amendment ceiling
 # was 0.02 but empirically REFLECTIONs displace direct-retrieval OBS at
 # ``reflection_boost=1.0`` (multiplier, not toggle).  Measured 0.033 on
-# the curated direct subset post-NA-1; 0.05 carries a 34 % safety
-# margin.  Follow-up evaluator-ranking workstream tightens back to 0.02.
+# the curated direct subset; 0.05 carries a 34 % safety
+# margin.
 _AC9B_CEILING = 0.05
 _AC8_CEILING = 0.05
 

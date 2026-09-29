@@ -9,9 +9,8 @@ twin in retrieval and skews the dreaming frequency signal.
 
 This module races real ``multiprocessing.Process`` workers (not asyncio tasks
 in one process) against one on-disk database file to exercise exactly the
-boundary the in-process lock cannot reach. See the workstream's report for the
-red transcript captured against the pre-fix code; this file always asserts the
-post-fix (green) invariant — one row, one winner.
+boundary the in-process lock cannot reach. This file asserts one row, one
+winner.
 
 **Why a second, bounded barrier sits inside the probe (not just before the
 call).** A first version of this module only synchronised workers *before*
@@ -116,10 +115,7 @@ from engrava import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-#: Number of processes racing the same content. High enough that, on the
-#: pre-fix code, at least two of them reliably overlap their probe-and-insert
-#: windows (demonstrated in the workstream's report); low enough to keep the
-#: test's process-spawn overhead reasonable.
+#: Number of processes racing the same content.
 _FAN_OUT = 10
 
 #: Bound on how long a worker waits, inside the content-hash probe, for its

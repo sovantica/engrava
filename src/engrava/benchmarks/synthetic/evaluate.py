@@ -608,8 +608,7 @@ async def measure_synthesis_coverage(
     This is the binding AC-9a v1.3 metric — it measures the dreaming
     mechanism at the data layer (clustering, REFLECTION creation,
     cluster-membership wiring) without depending on retrieval
-    ranking.  Retrieval-layer surfacing is deferred to a follow-up
-    workstream.
+    ranking.
 
     The helper builds its own store + DreamingExtension from the
     benchmark's binding ``_build_dreaming_config`` pair, ingests every

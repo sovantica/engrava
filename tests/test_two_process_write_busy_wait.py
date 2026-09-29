@@ -13,11 +13,11 @@ before anything in the guarded body gets to read. Not every write path reads
 before it writes, though -- see
 :func:`test_write_unit_waits_for_a_busy_lock`'s own docstring for exactly
 which of the five operations exercised here were actually affected.
-``update_thought`` is deliberately not one of them: a later workstream
-reverted its own unit to a deferred ``BEGIN`` on purpose, restoring a
-documented fail-fast-under-contention contract these five never had — see
+``update_thought`` is deliberately not one of them: its unit opens with a
+deferred ``BEGIN`` on purpose, and a caller retries a typed
+``WriteContentionError`` on it (a documented contract) -- see
 ``tests/test_begin_immediate_contention_is_typed.py`` for that path's own,
-now-opposite pinning.
+opposite pinning.
 
 This module races real ``multiprocessing.Process`` workers (not asyncio
 tasks or a second connection in the same process, which shares the
@@ -73,8 +73,7 @@ _CONTENDER_BUSY_TIMEOUT_MS = 5000
 #: Floor on a successful contender's elapsed time. Comfortably below
 #: ``_HOLD_SECONDS`` to absorb scheduling jitter, but an order of magnitude
 #: above the "fails at once" signature this fix closes (observed at ~2 ms
-#: against the unfixed tree -- see the workstream's report for the captured
-#: transcript), so the two shapes cannot be confused.
+#: against the unfixed tree), so the two shapes cannot be confused.
 _MIN_WAIT_SECONDS = _HOLD_SECONDS * 0.5
 
 #: Ceiling on the negative control's elapsed time: with ``busy_timeout=0``
@@ -119,10 +118,9 @@ _NEW_THOUGHT_ID = "contender-created-thought"
 _NEW_EDGE_ID = "contender-created-edge"
 _NEW_ACTION_ID = "contender-created-action"
 
-#: Every operation the workstream's acceptance criteria names.
-#: ``update_thought`` was here too until a later workstream reverted its own
-#: unit to a deferred ``BEGIN`` on purpose, restoring a documented
-#: fail-fast-under-contention contract — see the module docstring.
+#: Every operation this module exercises. ``update_thought`` is not one of
+#: them: its unit opens with a deferred ``BEGIN`` on purpose -- see the module
+#: docstring.
 _OPERATIONS = (
     "create_thought",
     "delete_thought",
@@ -593,20 +591,14 @@ def test_write_unit_waits_for_a_busy_lock(db_path: str, op: str) -> None:
     handler -- so every operation parametrized here waits out the hold and
     succeeds.
 
-    ``update_thought`` originally belonged to the first group (its own
+    ``update_thought`` is not in :data:`_OPERATIONS`, though its own
     content-changing update fires the same FTS5 sync trigger
-    ``create_thought``'s insert does) and, for one workstream, waited here
-    too. A later, narrower-scoped workstream reverted ``update_thought``'s
-    own unit to a deferred ``BEGIN`` on purpose: measured against
-    engrava-validation's full multiprocess suite, having it wait here turned
-    a *documented* fail-fast-under-contention contract (a caller retries a
-    typed ``WriteContentionError``) into a wait that could read a revision
-    before another process's disjoint-column edit and reject it as falsely
-    stale. ``update_thought`` is intentionally absent from
-    :data:`_OPERATIONS` now; see
+    ``create_thought``'s insert does: its unit opens with a deferred
+    ``BEGIN`` on purpose, and a caller retries a typed
+    ``WriteContentionError`` on it (a *documented* contract). See
     ``tests/test_begin_immediate_contention_is_typed.py`` for its own,
-    opposite pinning — contention fails fast there, typed, not this
-    module's "waits and succeeds".
+    opposite pinning -- contention there is typed, not this module's
+    "waits and succeeds".
     """
     ctx = multiprocessing.get_context("spawn")
     holding = ctx.Event()
