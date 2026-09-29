@@ -344,20 +344,14 @@ class TestCascadeOnDelete:
 
 
 class TestDeleteThoughtChildrenAtomicity:
-    """The three explicit child deletes are one indivisible unit.
+    """A ``RAISE(ABORT)`` trigger on ``action`` makes ``delete_thought`` fail with nothing applied.
 
-    ``_delete_thought_children_explicit`` issues three sequential
-    ``DELETE`` statements (edge, embedding, action) rather than relying on
-    ``ON DELETE CASCADE``. A cascade is atomic by construction; three bare
-    statements are not, unless something brackets them. Without that
-    bracket, a rejection on the *third* statement — a trigger vetoing the
-    ``action`` delete is the concrete case — leaves the first two sitting in
-    an open transaction, ``delete_thought`` raises, the thought survives,
-    and the partial child loss becomes durable the moment *any later,
-    unrelated write* on the same connection commits.
+    After the failed call the thought, its edges, its embedding and its action are all still
+    there, and a later unrelated write on the same connection does not make any part of the
+    failed delete durable.
     """
 
-    async def test_action_delete_rejection_rolls_back_the_edge_and_embedding_deletes_too(
+    async def test_a_rejected_action_delete_leaves_the_thought_and_all_its_children_in_place(
         self,
         store: SqliteEngravaCore,
     ) -> None:
@@ -379,9 +373,7 @@ class TestDeleteThoughtChildrenAtomicity:
         )
         await store.create_action(_make_action("a1", "t1"))
 
-        # Rejects the *third* of the three child deletes -- after the edge
-        # and embedding deletes have already run, inside the same
-        # still-open transaction _delete_thought_children_explicit uses.
+        # Rejects every delete on ``action``.
         await store._db.execute(
             "CREATE TRIGGER reject_action_delete BEFORE DELETE ON action "
             "BEGIN SELECT RAISE(ABORT, 'policy: action rows are retained'); END"
@@ -390,11 +382,8 @@ class TestDeleteThoughtChildrenAtomicity:
         with pytest.raises(aiosqlite.IntegrityError):
             await store.delete_thought("t1")
 
-        # The discriminating step. A half-applied delete sitting in an open,
-        # uncommitted transaction is invisible until something commits --
-        # this unrelated write's own commit is exactly the "later ordinary
-        # store write" the defect described, and it must not durably apply
-        # the two deletes the failed call above left behind.
+        # This unrelated write commits its own transaction; it must not make any
+        # part of the failed delete durable.
         await store.create_thought(_make_thought("unrelated-write"))
 
         assert await store.get_thought("t1") is not None
@@ -402,11 +391,11 @@ class TestDeleteThoughtChildrenAtomicity:
             "SELECT edge_id FROM edge WHERE edge_id IN ('e-out', 'e-in')"
         )
         surviving_edges = {row["edge_id"] for row in await cursor.fetchall()}
-        assert surviving_edges == {"e-out", "e-in"}, "the edge deletes must have been rolled back"
+        assert surviving_edges == {"e-out", "e-in"}, "the edges must still be there"
         cursor = await store._db.execute("SELECT COUNT(*) FROM embedding WHERE owner_id = 't1'")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 1, "the embedding delete must have been rolled back"
+        assert row[0] == 1, "the embedding must still be there"
         cursor = await store._db.execute(
             "SELECT COUNT(*) FROM action WHERE source_thought_id = 't1'"
         )
@@ -1106,35 +1095,16 @@ class TestChildTriggerWriteSurvivesAVetoedSweep:
 
 
 class TestVetoedDeleteEndsTheTransactionItOpened:
-    """A silently-vetoed delete must not leave the outer transaction open.
+    """A silently-vetoed delete must not leave open a transaction the public call began.
 
-    ``_delete_thought_atomic`` samples ``opened_transaction = not
-    self._db.in_transaction`` before touching anything, and already closed a
-    transaction it opened on two of its three exits: the happy path releases
-    the savepoint and leaves the (still-open) transaction for the caller's
-    own ``_maybe_commit`` to close, and a *raising* veto (``RAISE(ABORT)``,
-    ``RAISE(FAIL)``, a ``WHEN EXISTS`` guard) is unwound by the ``except``
-    branch, which already ends a transaction it opened with a rollback. The
-    silent ``RAISE(IGNORE)`` veto was the third exit, and the one this class
-    pins: before the fix, that branch released the savepoint but never ended
-    the outer transaction, so ``self._db.in_transaction`` stayed ``True``
-    indefinitely on the connection that ran it.
-
-    ``delete_thought`` and ``cleanup_expired``'s delete strategy also close
-    this gap themselves now, from the other end: each gates its own call to
-    ``_maybe_commit()`` on whether anything was actually written, and rolls
-    back a self-opened, still-empty transaction otherwise (see
-    ``TestPubliclyVetoedWritesDoNotCommitACallersTransaction`` below for what
-    that was fixing — a still-open *caller* transaction the old unconditional
-    commit reached out and closed early). ``run_hygiene`` was already like
-    this: it only commits ``if archived_count or gc_count``, and both stay
-    zero when every eligible thought in the GC batch is vetoed, so nothing
-    else would ever close it — this is the reproduction the fix targets. The
-    first two tests below still pin the general rule directly on
-    ``self._db.in_transaction`` (not just on the GC path) because relying on
-    a caller's own later action is not the same as the veto branch closing
-    what it opened, and a future reordering of any caller must not silently
-    reintroduce the leak.
+    In these tests a ``RAISE(IGNORE)`` trigger vetoes the delete without
+    raising: the parent ``DELETE`` matches zero rows and the row is still
+    there. The first three tests run a public call whose delete is vetoed this
+    way -- ``run_hygiene``'s GC, ``delete_thought`` and ``cleanup_expired``'s
+    delete strategy -- and assert that afterwards ``self._db.in_transaction``
+    is ``False`` and a second connection can take the write lock at once. An
+    open transaction begun with ``BEGIN IMMEDIATE`` keeps holding the write
+    lock against every other connection.
 
     A genuine second connection to the same file is required to observe the
     lock from outside -- a shared ``:memory:`` database cannot host
@@ -1207,9 +1177,8 @@ class TestVetoedDeleteEndsTheTransactionItOpened:
                 "mask the leak instead of exercising it"
             )
             assert db.in_transaction is False, (
-                "the vetoed GC delete opened this transaction itself and must "
-                "end it itself -- run_hygiene's _maybe_commit is unreachable "
-                "when both counts are zero"
+                "nothing survived the veto, so the pass must not leave the "
+                "transaction open -- run_hygiene has nothing to commit"
             )
             await self._assert_second_connection_can_write_immediately(db_path)
         finally:
@@ -1239,11 +1208,7 @@ class TestVetoedDeleteEndsTheTransactionItOpened:
 
             assert deleted is False
             assert db.in_transaction is False, (
-                "delete_thought's own rollback-on-write-free branch also "
-                "closes this transaction (nothing was deleted here, so it "
-                "does not reach _maybe_commit at all), but the veto branch "
-                "inside _delete_thought_atomic must not depend on that -- it "
-                "must close what it opened on its own"
+                "nothing was deleted, so delete_thought must not leave the transaction open"
             )
             await self._assert_second_connection_can_write_immediately(db_path)
         finally:
@@ -1277,11 +1242,8 @@ class TestVetoedDeleteEndsTheTransactionItOpened:
 
             assert result.expired_count == 1
             assert db.in_transaction is False, (
-                "cleanup_expired's own rollback-on-write-free branch also "
-                "closes this transaction (nothing was deleted in this batch, "
-                "so it does not reach _maybe_commit at all), but the veto "
-                "branch inside _delete_thought_atomic must not depend on "
-                "that -- it must close what it opened on its own"
+                "nothing was deleted in this batch, so cleanup_expired must "
+                "not leave the transaction open"
             )
             await self._assert_second_connection_can_write_immediately(db_path)
         finally:

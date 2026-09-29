@@ -1506,8 +1506,7 @@ class _TaskReentrantLock:
 
         Raises:
             RuntimeError: When called by a task that is not the current holder
-                (including a task that never acquired it) — the same misuse
-                :meth:`asyncio.Lock.release` itself guards against.
+                (including a task that never acquired it).
 
         """
         if self._depth <= 0 or asyncio.current_task() is not self._owner:
@@ -5534,11 +5533,8 @@ class SqliteEngravaCore:
         try:
             yield
             # The release lives inside this guarded region, deliberately —
-            # see _delete_thought_children_explicit's docstring for why: a
-            # cancellation delivered while awaiting this specific call can
-            # still see the RELEASE complete on the connection, and the
-            # unwind below has to be able to recognise that as "already
-            # released", not "the write never happened".
+            # so that a failure or cancellation delivered while awaiting it
+            # reaches the unwind below.
             await self._db.execute(f"RELEASE {name}")
         except BaseException as exc:
             if self._connection_quarantined:
@@ -9013,13 +9009,13 @@ class SqliteEngravaCore:
                         # embedding row; the vec0 vector is not FK-reachable and
                         # would otherwise linger as a ghost.
                         vec_rowid = await self._embedding_rowid_for_thought(tid)
-                        # Parent delete and explicit child deletes as one atomic
-                        # unit — see _delete_thought_atomic for why. Its return
+                        # Parent delete and explicit child deletes under one
+                        # savepoint — see _delete_thought_atomic for why. Its return
                         # value must be honoured, not ignored: a RAISE(IGNORE)
-                        # trigger (or any future silent veto) reports False with
-                        # the row still there, and a purge or journal append for
-                        # a parent that still exists would purge a live vector
-                        # and record false history.
+                        # trigger (or any future silent veto) reports False, and
+                        # a purge or journal append for a parent that still
+                        # exists would purge a live vector and record false
+                        # history.
                         result = await self._delete_thought_atomic(tid)
                         wrote_anything = result.wrote_anything or wrote_anything
                         if not result.deleted:
@@ -9573,14 +9569,10 @@ class SqliteEngravaCore:
 
         Returns:
             True if the thought row was deleted. False if it was not found,
-            or if it was found but a trigger silently vetoed the delete of
-            the thought row itself (``RAISE(IGNORE)``) — this call reports
+            or if it was found but the delete removed nothing (a
+            ``RAISE(IGNORE)`` trigger, for one) — this call reports
             both cases identically, since either way there is nothing to
-            purge or journal. A trigger that instead silently vetoes only
-            one of the three child deletes (edge / embedding / action) does
-            **not** change this return value: the thought row is still gone
-            and this reports ``True``, even though that one child row is
-            left behind, orphaned, rather than removed with it.
+            purge or journal.
 
         Raises:
             ConnectionQuarantinedError: When the connection has been quarantined.
@@ -9617,10 +9609,10 @@ class SqliteEngravaCore:
                 # purged explicitly to avoid a ghost.
                 vec_rowid = await self._embedding_rowid_for_thought(thought_id)
 
-                # Parent delete and explicit child deletes as one atomic
-                # unit — see _delete_thought_atomic for why the parent goes
-                # first (a user's own BEFORE DELETE trigger must still see
-                # the children when it checks for them) and why the child
+                # Parent delete and explicit child deletes under one
+                # savepoint — see _delete_thought_atomic for why the parent goes
+                # first (a BEFORE DELETE trigger on thought runs before this
+                # code has deleted any child) and why the child
                 # deletes still run explicitly rather than trusting ON
                 # DELETE CASCADE (a store on a pre-core-12 schema, or a
                 # connection with enforcement off, has no cascade to trust).
@@ -10727,94 +10719,38 @@ class SqliteEngravaCore:
         rule exists to close off. Every physical thought-delete path in the
         core (``delete_thought``, the TTL ``delete`` strategy, and hygiene GC)
         reaches this only through :meth:`_delete_thought_atomic`, which calls
-        it right after the parent row is already gone, so none of them
+        it right after the parent delete, so none of them
         depends on a cascade the database it is running against may not
-        have. On a core-12+ schema the parent delete's own cascade already
-        removed the same rows — issuing these deletes again here is
-        redundant, not incorrect.
+        have.
 
-        **The three deletes are one indivisible unit, not three independent
-        statements.** A rejection on any of them (e.g. an extension-installed
-        trigger vetoing the ``action`` delete) must not leave the earlier
-        ones sitting in an open transaction: with nothing bracketing them,
-        that half-applied state is exactly what a *later, unrelated* write on
-        this connection would then commit as a side effect — the thought
-        survives, but has silently lost its edges and its embedding. Wrapped
-        in a ``SAVEPOINT`` covering the deletes *and* their own release, so a
-        failure anywhere in that span — including one delivered while
-        awaiting the final ``RELEASE`` itself — ``ROLLBACK TO``s all three at
-        once before propagating.
+        **The three deletes share one savepoint, not three independent
+        statements.** A failure of any of them is handled as described under
+        **Failure** below, instead of leaving the earlier deletes in an open
+        transaction for a later write on this connection to commit. The
+        savepoint's ``RELEASE`` runs inside the same guarded region as the
+        deletes.
 
-        The savepoint is kept **nested**, never the outermost one: releasing
-        the outermost savepoint commits the whole transaction immediately
-        (SQLite's rule, not a choice made here), which would force an early,
-        partial commit ahead of :meth:`_delete_thought_atomic`'s own
-        ``RELEASE``, the vector purge, and the journal entry the original
-        caller still has to write — breaking the single deferred commit
-        :meth:`_maybe_commit` (or an active :meth:`suspend_auto_commit`
-        window) is responsible for. So a
-        transaction is opened first when :attr:`self._db.in_transaction
-        <aiosqlite.Connection.in_transaction>` is not already ``True`` — the
-        same check :meth:`_serialize_dedup_probe` uses for the same reason —
-        and, on failure, closed again only if this call is the one that
-        opened it; a transaction the caller already held stays exactly as
-        open as it was, with only this method's own three deletes undone.
-        When this call is the one opening it, it opens with ``BEGIN
-        IMMEDIATE`` rather than a deferred ``BEGIN``, mirroring
-        :meth:`_write_readback_savepoint` and :meth:`_delete_thought_atomic`:
-        a write unit that could still end up reading before it writes must
-        never rely on a deferred transaction's snapshot, which a later write
-        would have to upgrade and SQLite refuses to upgrade while another
-        connection holds the write lock — that refusal surfaces as
-        ``SQLITE_BUSY`` without ever invoking the busy handler, so the unit
-        fails at once under contention instead of waiting out ``PRAGMA
-        busy_timeout``. ``BEGIN IMMEDIATE`` takes the write lock up front,
-        through the busy handler, closing that gap regardless of what order
-        this call's own body happens to read and write in.
+        The savepoint never starts the transaction: releasing a savepoint that
+        started one commits it, which would commit ahead of
+        :meth:`_delete_thought_atomic`'s own ``RELEASE``, the vector purge and
+        the journal entry. So a transaction is opened first when
+        :attr:`self._db.in_transaction <aiosqlite.Connection.in_transaction>`
+        is not already ``True`` — the same check
+        :meth:`_serialize_dedup_probe` uses — with ``BEGIN IMMEDIATE`` rather
+        than a deferred ``BEGIN``, mirroring :meth:`_write_readback_savepoint`
+        and :meth:`_delete_thought_atomic`, so the write lock is taken up
+        front, through the busy handler. This method never commits.
 
-        **A trigger using ``RAISE(ROLLBACK, ...)`` is a real limitation of
-        installing one, not a defect this method can close.**
-        ``RAISE(ABORT, ...)`` — the ordinary case, and the only form the
-        rollback-and-reraise above needs — undoes only the failing
-        statement, leaving the transaction (and this savepoint) intact.
-        ``RAISE(ROLLBACK, ...)`` instead ends the *entire* transaction,
-        taking the savepoint down with it and, if the caller already held a
-        transaction of its own, discarding whatever else that caller had
-        written before ever calling this method — not only this method's
-        three deletes. This method cannot prevent that, and does not try to:
-        when ``self._db.in_transaction`` is already ``False`` on entry to the
-        failure path there is nothing left to unwind, and the trigger's own
-        exception (or a cancellation that raced it) propagates unchanged —
-        loudly, to :meth:`_delete_thought_atomic` and, from there, to
-        whoever called ``delete_thought`` / ``cleanup_expired`` / hygiene GC,
-        never silently.
-
-        **When the transaction survives but the unwind itself cannot be
-        proven to have worked, this method refuses rather than guesses.**
-        Earlier revisions kept trying to *recover* a consistent state after
-        an unwind failure — checking one more condition, swallowing one more
-        secondary error — and each attempt closed one ordering while leaving
-        another: a savepoint the ``RELEASE`` above already consumed despite
-        this coroutine observing a cancellation instead of that success (the
-        same aiosqlite worker-thread quirk noted below) makes ``ROLLBACK TO``
-        fail with ``"no such savepoint"`` even though the transaction is
-        still open — and swallowing *that* left the three deletes sitting
-        uncommitted-but-applied for a later, unrelated write to commit as a
-        side effect, the exact defect this method exists to close. There is
-        no bounded number of special cases that makes "always recover" true
-        on a connection this method does not exclusively own. So when the
-        unwind itself raises — for any reason, including that race — this
-        method stops trying to restore consistency and instead calls
-        :meth:`_quarantine_connection`, which makes the store terminally
-        unusable *by construction*: every later write, on this instance,
-        fails fast with :class:`ConnectionQuarantinedError` instead of ever
-        reaching a commit that could make the dangling deletes durable.
-        Erring toward a quarantined instance costs one store; erring toward
-        "probably fine" costs the data silently, at whatever commit happens
-        to come next. A cancellation raised *by the unwind itself* always
-        wins over whatever error the unwind was trying to recover from — a
-        cleanup that can defeat a cancellation would make shutdown and
-        timeout both unreliable, which is worse than the error it hid.
+        **Failure.** When a delete or the release raises and
+        ``self._db.in_transaction`` is still true, the unwind issues
+        ``ROLLBACK TO`` and ``RELEASE`` for the savepoint, and rolls back the
+        transaction as well if this call opened it; a transaction the caller
+        already held is left open. When it is no longer true — a trigger using
+        ``RAISE(ROLLBACK, ...)`` ends the whole transaction, the savepoint and
+        any earlier work of the caller's in it included — the exception is
+        re-raised with nothing to unwind. If the unwind itself raises, this
+        method calls :meth:`_quarantine_connection` instead of guessing at a
+        consistent state.
 
         Args:
             thought_id: UUID of the thought whose children are being removed.
@@ -10835,18 +10771,13 @@ class SqliteEngravaCore:
 
         Raises:
             aiosqlite.Error: Propagated from any of the three deletes (e.g. a
-                trigger veto) when the savepoint they were made under is
-                still intact and the unwind completes cleanly.
+                trigger that raises).
             asyncio.CancelledError: Propagated when this call is cancelled,
-                or when a cancellation lands during a failed unwind's own
-                cleanup attempt — always in preference to the error that
-                unwind was trying to recover from.
-            ConnectionQuarantinedError: On this store's *next* guarded call,
-                after this method quarantined the connection because an
-                unwind attempt itself failed and a consistent state could
-                not be proven. This call itself still raises the original
-                failure (or the cancellation that pre-empted its cleanup),
-                not this error — quarantine changes what happens *after*.
+                including a cancellation that lands during the unwind, which
+                is raised in preference to the error being unwound.
+            ConnectionQuarantinedError: From this store's next guarded call
+                after the connection was quarantined. This call itself
+                raises the original failure (or the cancellation).
 
         """
         opened_transaction = not self._db.in_transaction
@@ -10876,13 +10807,8 @@ class SqliteEngravaCore:
             )
             wrote_anything = self._db.total_changes > changes_before
             # The release lives INSIDE this guarded region, deliberately —
-            # not after it. With aiosqlite, cancelling the awaiting future
-            # does not cancel a statement already queued on the worker
-            # thread: a cancellation delivered while awaiting this specific
-            # call can still see the RELEASE complete on the connection. A
-            # cancellation landing here is exactly the shape the unwind
-            # below has to be able to recognise as "already released", not
-            # just "the deletes never happened".
+            # not after it — so that a failure or cancellation delivered
+            # while awaiting it reaches the unwind below.
             await self._db.execute("RELEASE delete_thought_children")
         # ``except BaseException`` (not ``Exception``) so a cancellation
         # landing anywhere in the block above — mid-delete or during the
@@ -10923,7 +10849,7 @@ class SqliteEngravaCore:
             raise
         # No ``else`` branch: the release is the last statement inside the
         # ``try`` above, and reaching here means it already succeeded. Never
-        # a commit on any path — the parent row is already gone by the time
+        # a commit on any path — the parent delete has already run by the time
         # this runs (see ``_delete_thought_atomic``), which still has its own
         # ``RELEASE`` to issue, and the original caller (``delete_thought`` /
         # ``cleanup_expired`` / hygiene GC) still has the vector purge and
@@ -10932,140 +10858,40 @@ class SqliteEngravaCore:
         return wrote_anything
 
     async def _delete_thought_atomic(self, thought_id: str) -> _DeleteAtomicResult:
-        """Delete a thought and its children as one indivisible unit.
+        """Delete a thought and its children inside one savepoint.
 
-        Reverses ``6e4ed41``'s ordering, which deleted the edge / embedding /
-        action rows *before* the parent row and released their savepoint the
-        moment those three deletes succeeded — before the parent delete had
-        even run. Two independent defects followed from that ordering, not
-        one:
+        The parent delete comes first, inside the savepoint that also covers
+        :meth:`_delete_thought_children_explicit`'s deletes of the edge,
+        embedding and action rows. The parent goes first so that a
+        ``BEFORE DELETE`` trigger on ``thought`` runs before this method has
+        deleted any child.
+        The child deletes are explicit, not left to ``ON DELETE CASCADE``,
+        because a schema older than core 12 has no cascade and a connection
+        with ``PRAGMA foreign_keys`` off does not apply one.
 
-        1. **Lost atomicity.** Once the children's savepoint released,
-           nothing bracketed the parent delete that came after it. Anything
-           that then prevented, diverted or skipped that delete — a veto, a
-           bug, a caller that stopped short — left the children gone and the
-           parent still there, sitting in the open transaction until any
-           later, unrelated write on the same connection committed it. No
-           error, no quarantine: the loss became durable as a side effect of
-           an ordinary later write.
-        2. **A defeated guard.** A ``BEFORE DELETE ON thought`` trigger
-           written to veto deleting a thought that still has live children
-           (``WHEN EXISTS (SELECT 1 FROM edge/embedding/action WHERE ...)``)
-           never saw them: by the time the parent delete ran, the explicit
-           child deletes had already removed the rows the predicate tests
-           for. The trigger did not misfire — it never fired, and the delete
-           it existed to block **succeeded**.
+        A ``DELETE`` that reports no row deleted cannot say why, so the method
+        first reads, inside the savepoint, whether the row exists. When this call
+        opens the transaction it uses ``BEGIN IMMEDIATE``, so the write lock is
+        taken up front, before that read.
 
-        The fix is the parent delete **first**, inside the same savepoint
-        that then covers the explicit child deletes, released only once both
-        stages are done:
+        When nothing raises there are three outcomes:
 
-        * A ``BEFORE DELETE`` trigger on ``thought`` now runs while the
-          children are still present, exactly as it did before ``6e4ed41`` —
-          restoring case 2 without giving up case 1's ability to veto or
-          divert the delete outright.
-        * ``6e4ed41``'s reason for deleting the children explicitly is
-          untouched: this method still issues the same three ``DELETE``
-          statements, via :meth:`_delete_thought_children_explicit`, so a
-          store on a pre-core-12 schema (no cascade) or a connection with
-          ``PRAGMA foreign_keys`` off (the default, and a documented no-op
-          mid-transaction — see that method's docstring) still has its
-          embedding row removed and cannot resurrect a vector the way the
-          original bug did. On a core-12+ schema with enforcement on, the
-          parent delete's own cascade removes the same rows first; the
-          explicit deletes that follow then affect zero rows — redundant,
-          not incorrect, exactly as documented there.
-        * If the explicit child deletes are rejected by a *raising* trigger
-          (``RAISE(ABORT)`` / ``RAISE(FAIL)`` / a ``WHEN EXISTS`` guard, e.g.
-          on the ``action`` delete) after the parent row is already gone,
-          this savepoint's own ``ROLLBACK TO`` undoes the parent delete
-          along with whatever :meth:`_delete_thought_children_explicit`
-          already undid of its own — the parent and the children succeed or
-          fail together in that case, which is the property ``6e4ed41``
-          broke. **This does not cover a silent ``RAISE(IGNORE)`` veto on a
-          child delete**, because ``RAISE(IGNORE)`` never raises at all: the
-          ``except`` branch below — the only place this savepoint is rolled
-          back — is never reached. :meth:`_delete_thought_children_explicit`
-          sees the vetoed delete's own rowcount stay at zero, finds nothing
-          to raise, and returns normally; this savepoint's own ``RELEASE``
-          then runs instead of a rollback, keeping the parent's deletion. A
-          child a ``RAISE(IGNORE)`` trigger quietly leaves in place is
-          therefore still there, still referencing the now-gone parent,
-          while this method reports the parent as deleted and
-          :meth:`delete_thought` returns ``True``. Closing that gap is a
-          separate, pre-existing behaviour question, not something this fix
-          changes.
-        * The explicit child deletes run **whether or not a parent row
-          existed** — matching the pre-fix call sites exactly, which issued
-          the same three (harmless, zero-row) deletes unconditionally — so a
-          delete of a nonexistent ``thought_id`` still sweeps any orphaned
-          children a schema without a cascade could be carrying.
-
-        **A zero-row parent delete is not, by itself, "nonexistent."**
-        ``RAISE(ABORT)``, ``RAISE(FAIL)`` and a ``WHEN EXISTS`` guard all
-        raise, so the ``except`` branch below already unwinds them. But
-        ``RAISE(IGNORE)`` does not raise — it aborts only the triggering
-        statement itself. Any statement the trigger's own body already ran
-        before reaching the ``RAISE`` (an audit-table insert, say) is *not*
-        undone and stays applied in the open transaction, so the parent
-        ``DELETE`` matches zero rows while the row (and its children) are
-        still there — exactly as if ``thought_id`` had never existed, except
-        for whatever that trigger already wrote. Rowcount alone cannot tell
-        the two apart, so this method establishes the row's existence with a
-        ``SELECT`` **inside this savepoint, immediately before** the parent
-        ``DELETE`` — the same instant several callers already fetch a
-        ``before_row`` for their journal entry, but done here, unconditionally
-        and independently of whether a journal is attached, so every caller
-        gets the discrimination regardless. That ``SELECT`` is exactly why,
-        when this call is the one opening the transaction, it opens with
-        ``BEGIN IMMEDIATE`` rather than a deferred ``BEGIN``: a read inside a
-        deferred transaction takes a WAL snapshot that the ``DELETE`` right
-        after it would then have to upgrade, and SQLite refuses that upgrade
-        while another connection holds the write lock — surfacing
-        ``SQLITE_BUSY`` without ever invoking the busy handler, so this unit
-        would fail at once under contention instead of waiting out
-        ``PRAGMA busy_timeout`` like an ordinary write. ``BEGIN IMMEDIATE``
-        takes the write lock up front, through the busy handler, before this
-        existence check ever runs. Reliable under a concurrent
-        writer for the case this fix targets: both statements run back to
-        back on this connection, inside one still-open transaction, with
-        ``_write_lock`` already held for the whole call, so nothing on *this*
-        connection can intervene between them. A genuinely different writer
-        racing the same row from another connection can only align with our
-        ``DELETE`` after committing first (SQLite allows only one writer's
-        transaction to commit at a time), at which point that writer's own
-        atomic delete already owns the purge and the journal entry for that
-        row — this call correctly sees zero rows, correctly does not treat
-        the row as newly gone, and correctly still performs no purge or
-        journal append of its own either way, so the misclassification (if
-        any) is inert:
-
-        * ``existed_before`` and the parent delete succeeded — the ordinary
-          case, children swept as always.
-        * **not** ``existed_before`` — nothing to protect; sweep any
-          orphaned children as before and report ``False``.
-        * ``existed_before`` **and** the parent delete still matched zero
-          rows — a silent veto. The children are *not* swept: instead this
-          savepoint is rolled back (undoing nothing but the no-op delete
-          itself) so the row and its still-attached children are exactly as
-          they were, and ``False`` is reported. If this call is also the one
-          that opened the outer transaction (``opened_transaction``, sampled
-          before either was touched), it ends that transaction here too —
-          with a rollback, never a commit, since a transaction this call
-          opened cannot hold a caller's pending work. This must not depend on
-          a caller closing it instead: ``run_hygiene`` only commits ``if
-          archived_count or gc_count``, both zero when every candidate in a
-          GC batch is vetoed, so nothing else would ever end it — leaving it
-          open here would strand the write reservation on this connection
-          indefinitely.
+        * The row existed and the parent ``DELETE`` reported a row deleted: the
+          child deletes run and the savepoint is released.
+        * The row did not exist: the child deletes run anyway, and
+          ``deleted`` is ``False``.
+        * The row existed and the parent ``DELETE`` reported no row deleted:
+          the savepoint is rolled back and the child deletes do not run, so
+          the row and its children are as they were, and ``deleted`` is
+          ``False``. A transaction this call opened is rolled back as well.
 
         Quarantine and cancellation handling wrap
         :meth:`_delete_thought_children_explicit`'s rather than duplicating
         it: if that call already quarantined the connection while unwinding
         its own (nested) savepoint, ``self._db`` is now the terminal
         ``_QuarantinedConnection`` proxy, and touching it again — even just
-        reading ``.in_transaction`` — raises :class:`ConnectionQuarantinedError`
-        from *every* attribute access, which would silently replace the
+        reading ``.in_transaction`` — raises
+        :class:`ConnectionQuarantinedError`, which would silently replace the
         real error (an ``asyncio.CancelledError``, in the race that provokes
         this) with that one. So ``self._connection_quarantined`` — a plain
         flag on ``self``, never proxied — is checked *first*, before
@@ -11079,21 +10905,22 @@ class SqliteEngravaCore:
         Returns:
             A :class:`_DeleteAtomicResult`. Its ``deleted`` is ``True`` if a
             thought row was deleted, ``False`` if no row matched
-            ``thought_id`` **or** a row matched but a trigger silently
-            suppressed the delete (``RAISE(IGNORE)``) — in both cases the
+            ``thought_id`` **or** a row matched but the delete removed
+            nothing (a ``RAISE(IGNORE)`` trigger, for one) — in both cases the
             caller must treat this exactly like "nothing was deleted": no
             vector purge, no journal append. Its ``wrote_anything`` is
             ``True`` whenever this call's own return leaves a row change
             intact — the parent, an orphan swept on a never-existed id, or
             both — which callers need to decide whether they have anything
             of their own left to commit; ``deleted`` alone is not that
-            signal (see the class docstring). A silently vetoed parent
-            delete rolls its own savepoint all the way back, so a trigger's
-            write that happened before the veto does not make this ``True``.
+            signal (see the class docstring). A parent delete that matches
+            no row although the row existed rolls its own savepoint all the
+            way back, so a write a trigger made along the way does not make
+            this ``True``.
 
         Raises:
             aiosqlite.Error: Propagated from the parent delete or any of the
-                three child deletes (e.g. a trigger veto), once this
+                three child deletes (e.g. a trigger that raises), once this
                 savepoint's own unwind (if one was needed) has completed.
             asyncio.CancelledError: Propagated on cancellation, in
                 preference to any error an unwind it interrupted was trying
@@ -11109,11 +10936,9 @@ class SqliteEngravaCore:
             await self._db.execute("BEGIN IMMEDIATE")
         await self._db.execute("SAVEPOINT delete_thought_atomic")
         try:
-            # Established inside this savepoint, immediately before the
-            # parent DELETE, so a RAISE(IGNORE) veto (which leaves the row in
-            # place but the DELETE's own rowcount at zero, indistinguishable
-            # from "never existed" by rowcount alone) can be told apart from
-            # a genuinely nonexistent ``thought_id`` — see the docstring.
+            # Read inside this savepoint, immediately before the parent
+            # DELETE, so a DELETE that matches no row can be told apart from
+            # a ``thought_id`` that does not exist — see the docstring.
             existence_cursor = await self._db.execute(
                 "SELECT 1 FROM thought WHERE thought_id = ?", (thought_id,)
             )
@@ -11152,16 +10977,11 @@ class SqliteEngravaCore:
                 wrote_anything = self._db.total_changes > changes_before
             else:
                 # existed_before and not deleted: the row was there and the
-                # DELETE still matched zero rows, so a trigger silently
-                # suppressed it (RAISE(IGNORE) is the only form that does —
-                # RAISE(ABORT)/RAISE(FAIL)/a WHEN EXISTS guard all raise and
-                # are handled by the except clause below instead). Roll the
-                # savepoint back instead of sweeping the children: this
-                # discards the no-op DELETE and, along with it, any earlier
-                # write the vetoing trigger's own body already made (e.g. an
-                # audit insert) inside this savepoint — none of that is kept,
-                # so ``wrote_anything`` is unconditionally ``False`` here,
-                # and skipping the sweep is what keeps the still-live
+                # DELETE still matched zero rows. Roll the savepoint back
+                # instead of sweeping the children: this discards the DELETE
+                # and any write made inside this savepoint since it began
+                # (e.g. an audit insert by a trigger), so ``wrote_anything``
+                # is ``False`` here, and skipping the sweep is what keeps the
                 # parent's children attached to it.
                 wrote_anything = False
                 await self._db.execute("ROLLBACK TO delete_thought_atomic")
@@ -11169,23 +10989,17 @@ class SqliteEngravaCore:
                 if opened_transaction:
                     # This call opened the outer transaction (sampled via
                     # ``opened_transaction`` before anything below it ran),
-                    # and the veto means nothing durable happened inside it
+                    # and nothing durable happened inside it
                     # — the parent row is unchanged and the children were
                     # never swept. Ending it here — rather than trusting a
-                    # caller to do it — is what keeps a vetoed delete from
+                    # caller to do it — is what keeps a delete that removed nothing from
                     # being indistinguishable, to a second connection, from a
-                    # still-open write reservation: ``delete_thought`` and
-                    # ``cleanup_expired`` both gate their own call to
-                    # ``_maybe_commit()`` on whether anything was actually
-                    # written and roll back a self-opened, still-empty
-                    # transaction otherwise, and ``run_hygiene`` commits only
-                    # ``if archived_count or gc_count`` — all three leave a
-                    # vetoed batch's reservation to be closed here, since none
-                    # of them would otherwise. This call must not depend on
-                    # which of the three its caller happens to be. A rollback,
-                    # not a commit — there is nothing of ours to preserve, and
-                    # a transaction we opened ourselves cannot be carrying a
-                    # caller's pending work for a commit to risk instead.
+                    # still-open write reservation. This call must not depend
+                    # on which caller it came from to end a transaction it
+                    # opened itself. A rollback, not a commit — there is
+                    # nothing of ours to preserve, and a transaction we opened
+                    # ourselves cannot be carrying a caller's pending work for
+                    # a commit to risk instead.
                     await self._db.rollback()
         # ``except BaseException`` for the same reason
         # ``_delete_thought_children_explicit`` uses it: a cancellation must
@@ -14466,7 +14280,7 @@ class SqliteEngravaCore:
             if before_row is None:
                 continue
             vec_rowid = await self._embedding_rowid_for_thought(thought.thought_id)
-            # Parent delete and explicit child deletes as one atomic unit —
+            # Parent delete and explicit child deletes under one savepoint —
             # see _delete_thought_atomic for why. Its own ``wrote_anything``
             # is folded in unconditionally (mirroring cleanup_expired's
             # DELETE-strategy loop), not gated on ``deleted``: a candidate a

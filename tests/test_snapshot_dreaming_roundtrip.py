@@ -17,7 +17,7 @@ touches:
   per-row exemption on every *incoming* embedding row.
 * Merging an unrelated snapshot into an already-healthy, centroid-bearing
   target exercises the pre-loop exemption on the target's own *existing*
-  rows -- which runs before ``--skip-embeddings`` is even consulted.
+  rows -- which runs whether or not ``--skip-embeddings`` is set.
 """
 
 from __future__ import annotations
@@ -258,7 +258,7 @@ class TestRealDreamingMergeRestorePreservesExistingReflectionRows:
     """Scenario B: merging an unrelated snapshot with ``--skip-embeddings``
     into an already-healthy, centroid-bearing target exercises the pre-loop
     exemption in ``_initial_embedding_state`` / ``_existing_embedding_identities``
-    -- the scan that runs before ``--skip-embeddings`` is even consulted.
+    -- the scan that runs whether or not ``--skip-embeddings`` is set.
     """
 
     def test_merging_an_unrelated_snapshot_leaves_pre_existing_rows_unchanged(

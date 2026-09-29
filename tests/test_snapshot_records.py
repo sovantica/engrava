@@ -8,8 +8,7 @@ restore path in ``engrava.cli.main``:
 * a non-object record, non-object ``data``, unknown column, and missing
   required column each raise a typed CLI error before any write;
 * a valid snapshot round-trips byte-for-byte across every column;
-* restore streams the snapshot and re-embeds in bounded batches, so memory is
-  bounded by the batch rather than the snapshot size.
+* restore streams the snapshot and re-embeds in batches of at most the batch size.
 """
 
 from __future__ import annotations
@@ -971,7 +970,7 @@ class _FakeProvider:
 
 
 # ---------------------------------------------------------------------------
-# Streaming re-embed: memory is bounded by the batch, not the snapshot.
+# Streaming re-embed: IDs are flushed in batches during the pass.
 # ---------------------------------------------------------------------------
 
 
@@ -1017,8 +1016,7 @@ class TestBatchedReembed:
 
         total = asyncio.run(_run())
 
-        # No batch exceeds the (patched) cap, so peak retained IDs are bounded by
-        # the batch size rather than the total thought count.
+        # No batch exceeds the (patched) cap.
         assert observed_batches == [2, 2, 1]
         assert max(observed_batches) <= 2
         # 5 thoughts inserted + 5 re-embeddings reported.
@@ -1070,7 +1068,8 @@ class TestBatchedReembed:
 
 # ---------------------------------------------------------------------------
 # Embedding identity invariant: the target's lock must agree with the
-# declared model_name/dimension of every embedding row -- enforced from the
+# declared model_name of every non-centroid embedding row and the dimension
+# of every embedding row -- enforced from the
 # snapshot's `embedding` rows and the target's own data, never from a
 # resolved provider or the snapshot's metadata header. Every test here goes
 # through the CLI: the two tests that used to call the guard directly
@@ -1931,8 +1930,8 @@ class TestRestoreExemptsCentroidRowsFromTheIdentityInvariant:
     ) -> None:
         """The pre-loop existing-rows scan must not refuse a healthy target.
 
-        ``_initial_embedding_state`` runs unconditionally, before
-        ``--skip-embeddings`` is even consulted -- so this restore carries no
+        ``_initial_embedding_state`` runs whether or not ``--skip-embeddings``
+        is set -- so this restore carries no
         embedding rows of its own (``--skip-embeddings``) and would still be
         refused before the fix, purely because the *target* already
         legitimately disagrees-by-sentinel with itself.

@@ -65,8 +65,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Re-embedding thought IDs are flushed in batches of this size so restore memory
-# stays bounded by the batch rather than by the total number of thoughts.
+# Re-embedding thought IDs are flushed in batches of this size.
 _REEMBED_BATCH_SIZE = 128
 
 # sqlite3.IntegrityError.sqlite_errorcode values the journalled-merge collision
@@ -320,29 +319,30 @@ async def _open_db(cfg: EngravaCLIConfig) -> Any:  # noqa: ANN401
 
 @asynccontextmanager
 async def _opened_db(cfg: EngravaCLIConfig) -> AsyncIterator[Any]:
-    """Open a connection and guarantee it closes, however the block exits.
+    """Open a connection and attempt to close it however the block exits.
 
     Acquiring the connection and entering the protected block are one
     syntactic step at the call site (``async with _opened_db(cfg) as conn:``),
     so no statement — a store constructor, a schema-version-gate check,
     ``ensure_schema()`` — can sit between a successful open and the
-    guarantee that closes it. A hand-written ``try/finally`` at the call
-    site cannot make that promise: it only protects what is written after
+    close that follows it. A hand-written ``try/finally`` at the call
+    site cannot do that: it only protects what is written after
     it, and a failure in a statement placed before it (by oversight, or by
     a later edit) leaks the connection exactly as an absent ``finally``
-    would. This closes on normal return, on any raised exception — a
+    would. This attempts the close on normal return, on any raised exception — a
     ``sqlite3.DatabaseError`` from a corrupt file, a ``ClickException``, a
     ``SystemExit`` from ``sys.exit()`` — and on cancellation.
 
     **What a close failure itself does differs by which of those it is.**
     If the command body already raised (or was cancelled), that is what
-    the caller needs to see, so a failure in this closing call is logged
-    and swallowed rather than replacing it. If the body succeeded, a
+    the caller needs to see, so the close goes through ``_close_quietly``
+    rather than a bare ``await conn.close()``. If the body succeeded, a
     close failure is not secondary to anything — it is the only error
-    there is, so it propagates normally. A single unconditional
-    ``finally: await conn.close()`` cannot draw that distinction: it
-    would let a genuine close failure on the success path be silently
-    swallowed, so the command would print success and exit ``0``.
+    there is, so it propagates normally. A ``finally`` that always makes
+    the same close call cannot draw that distinction: a bare
+    ``await conn.close()`` would let a close failure replace the body's own
+    error, and ``_close_quietly`` would swallow a close failure on the
+    success path, so the command would print success and exit ``0``.
 
     Yields:
         The open aiosqlite connection from :func:`_open_db`.
@@ -1765,9 +1765,9 @@ def _open_snapshot(input_path: Path) -> TextIO:
 def _iter_snapshot_lines(input_path: Path) -> Iterator[tuple[int, str]]:
     """Stream a snapshot file, yielding non-empty ``(line_number, line)`` pairs.
 
-    Streaming keeps restore memory bounded by a single line rather than the
-    whole snapshot. Lines are stripped and blank lines are skipped; line numbers
-    are 1-based and count every physical line for accurate error context.
+    Streaming reads one line at a time instead of loading the whole snapshot.
+    Lines are stripped and blank lines are skipped; line numbers are 1-based
+    and count every physical line for accurate error context.
 
     This is the only place a restore opens the ``--input`` path, so both restore
     modes — single-database and ``--service`` — surface an unusable path as the
@@ -1827,9 +1827,11 @@ def _track_embedding_identity(
 ) -> tuple[str, int]:
     """Compare one declared embedding identity against the running reference.
 
-    The reference is whatever every embedding row seen so far in this restore
-    agrees on. The first identity ever seen establishes it silently; every
-    later one must match exactly, or restore fails before committing anything.
+    The reference is the identity established so far: the target's stored
+    model, else its existing non-centroid rows, else the first non-centroid
+    row this restore accepts. An identity seen while there is no reference
+    establishes it silently; every later one must match exactly, or restore
+    fails before committing anything.
 
     Args:
         identity: The ``(model_name, dimension)`` pair just observed.
@@ -1858,7 +1860,7 @@ def _track_embedding_identity(
         f"Embedding model mismatch: {reference_label} declares "
         f"{_format_embedding_identity(reference)}, but {subject_label} declares "
         f"{_format_embedding_identity(identity)}. Use --re-embed to regenerate "
-        "embeddings for the target's model, or --skip-embeddings to skip "
+        "embeddings, or --skip-embeddings to skip "
         "importing vectors."
     )
     raise click.ClickException(msg)
@@ -1909,7 +1911,7 @@ def _track_embedding_width(
         f"Embedding model mismatch: {reference_label} declares "
         f"{_format_embedding_identity(reference)}, but {subject_label} declares "
         f"{_format_embedding_identity(identity)}. Use --re-embed to regenerate "
-        "embeddings for the target's model, or --skip-embeddings to skip "
+        "embeddings, or --skip-embeddings to skip "
         "importing vectors."
     )
     raise click.ClickException(msg)
@@ -2014,13 +2016,11 @@ async def _existing_embedding_rows(conn: aiosqlite.Connection) -> list[tuple[str
 async def _write_embedding_lock(conn: aiosqlite.Connection, identity: tuple[str, int]) -> None:
     """Adopt a restored corpus's declared identity as the target's new lock.
 
-    Used only when the target began this restore with neither a stored model
-    nor any non-centroid embedding rows of its own -- a target that starts
-    with only centroid rows, or with none at all, is eligible too. Restore
-    inserts ``embedding`` rows via fixed SQL directly (never through
-    ``store_embedding()``), so nothing else would ever lock a target that
-    starts this way -- it would otherwise end the restore holding vectors
-    under no declared model at all.
+    Used only when ``_initial_embedding_state`` reported the target eligible
+    for adoption (see its docstring). Restore inserts ``embedding`` rows via
+    fixed SQL directly (never through ``store_embedding()``), so nothing else
+    would ever lock such a target -- it would otherwise end the restore
+    holding vectors under no declared model at all.
 
     Writes only ``embedding_model_name`` and ``embedding_dimension``. A
     snapshot carries neither a document-prefix fingerprint nor a query
@@ -2029,8 +2029,8 @@ async def _write_embedding_lock(conn: aiosqlite.Connection, identity: tuple[str,
 
     Args:
         conn: Restore connection with an active transaction.
-        identity: The ``(model_name, dimension)`` every embedding row just
-            inserted was checked to declare.
+        identity: The ``(model_name, dimension)`` every non-centroid embedding
+            row just inserted was checked to declare.
 
     """
     model_name, dimension = identity
@@ -2052,23 +2052,17 @@ async def _finalize_embedding_identity(
 ) -> None:
     """Adopt the restored corpus's declared identity as the target's lock, if eligible.
 
-    ``may_adopt_identity`` is only ever ``True`` when the target began the
-    restore with neither a stored model nor any non-centroid embedding rows
-    (see ``_initial_embedding_state``), so this already implies the identity
-    check ran; ``identity_reference`` is ``None`` when no non-centroid
-    embedding row was ever inserted -- either because none was inserted at
-    all, or because every inserted row was a ``CENTROID_MODEL_NAME`` row,
-    which is exempt from ever becoming the reference (see
-    ``_check_embedding_row_before_insert``) -- and in either case there is
-    nothing to adopt.
+    ``may_adopt_identity`` is ``True`` only when ``_initial_embedding_state``
+    found the target eligible for adoption (see its docstring). The lock is
+    written only then, and only when there is an ``identity_reference`` to
+    write.
 
     Args:
         conn: Restore connection with an active transaction.
-        may_adopt_identity: Whether the target started this restore eligible
-            for adoption.
-        identity_reference: The identity every non-centroid inserted
-            embedding row was checked to declare, or ``None`` if none was
-            inserted.
+        may_adopt_identity: Whether ``_initial_embedding_state`` found the
+            target eligible for adoption.
+        identity_reference: The identity reference as it stands once every
+            row has been checked, or ``None`` if there is none.
 
     """
     if may_adopt_identity and identity_reference is not None:
@@ -2078,17 +2072,21 @@ async def _finalize_embedding_identity(
 async def _initial_embedding_state(
     conn: aiosqlite.Connection,
 ) -> tuple[tuple[str, int] | None, str, tuple[str, int] | None, str, bool]:
-    """Establish the identity and width every embedding in the target must share, pre-restore.
+    """Establish the embedding-model identity and vector-width references, pre-restore.
 
-    Runs unconditionally, regardless of ``--skip-embeddings`` or ``--re-embed``:
-    those flags only decide whether the snapshot's own vectors are imported as
-    incoming rows, never whether the target's pre-existing state is internally
-    consistent. Reads the target's stored embedding-model lock, if any, and
-    every distinct identity already declared by its own ``embedding`` rows,
-    and asserts the two agree before any snapshot row is even parsed -- a
+    Reads the target as it stands when it is called, which is after
+    ``--clear`` (and ``--clear-identity``, if given) has removed what it
+    removes; "starts with" below means that state. Runs whether or not
+    ``--skip-embeddings`` is given: that flag only decides whether the
+    snapshot's own vectors are imported as incoming rows, never
+    whether the target's pre-existing state is internally consistent. Reads
+    the target's stored embedding-model lock, if any, and
+    every distinct non-centroid identity already declared by its own
+    ``embedding`` rows, and asserts the two agree before any snapshot row is
+    even parsed -- a
     merge restore into an already-inconsistent target must not report success
     (criterion: the check covers rows already in the target, not only
-    incoming ones), no matter which import flags are given.
+    incoming ones), whether or not ``--skip-embeddings`` is given.
 
     The corpus carries two separate invariants, tracked separately:
 
@@ -2131,7 +2129,7 @@ async def _initial_embedding_state(
         non-centroid embedding rows. ``width_reference`` is the width every
         embedding row -- centroid included -- must share, or ``None`` when
         the target starts with neither a lock nor any embedding rows at all.
-        ``may_adopt`` is ``True`` only when the target started with neither a
+        ``may_adopt`` is ``True`` only when the target starts with neither a
         lock nor any non-centroid embedding rows, making it eligible to have
         the snapshot's identity written as its new lock once every row has
         been checked to agree on it.
@@ -2382,15 +2380,11 @@ async def _reembed_thoughts(
 
 
 async def _delete_embedding_identity_metadata(conn: aiosqlite.Connection) -> None:
-    """Delete every ``_metadata`` key that makes up a target's embedding identity.
+    """Issue one ``DELETE`` for the four ``_metadata`` keys that hold a target's embedding identity.
 
-    Removes the stored model name, dimension, document-prefix fingerprint,
-    and query-prefix pairing, leaving the target with no embedding lock at
-    all. Shared by the post-re-embed identity replacement (which reinserts a
-    fresh identity right after) and by ``restore --clear --clear-identity``
-    (which does not -- see :func:`_import_records_to_db`), so that a
-    genuinely corrupt ``embedding_dimension`` value cannot survive either
-    path.
+    The keys are the model name, the dimension, the document-prefix fingerprint
+    and the query-prefix pairing. The post-re-embed identity replacement and
+    ``restore --clear --clear-identity`` both call it.
 
     Args:
         conn: Restore connection with an active transaction.
@@ -2870,26 +2864,30 @@ async def _stream_insert(
 
     Each record is fully validated -- structure and values -- immediately before
     it is inserted, so a bad record raises before its own write. Re-embedding IDs
-    are flushed in bounded batches; peak memory is one line plus one batch.
+    are flushed in bounded batches.
 
-    Every ``embedding`` row already in the target, at the very start of this
-    restore, must declare the same ``model_name``/``dimension`` identity as
-    the target's stored embedding-model lock (or, for a target with no lock,
-    as each other) -- checked unconditionally, regardless of
-    ``skip_embeddings`` or ``re_embed``, because those flags only decide
-    whether *incoming* vectors are imported, never whether the target's own
-    pre-existing rows are internally consistent.
+    Every ``embedding`` row in the target when this pass starts must declare
+    the same ``model_name``/``dimension`` identity as the target's stored
+    embedding-model lock (or, for a target with no lock, as each other) --
+    checked whether or not ``skip_embeddings`` is set, because that flag only
+    decides whether *incoming* vectors are imported, never whether the
+    target's own pre-existing rows are internally consistent. A
+    ``dreaming-centroid`` row is exempt from the ``model_name`` comparison,
+    not from the ``dimension`` one.
 
     Unless ``skip_embeddings`` or ``re_embed`` is set, every incoming
     ``embedding`` row about to be inserted must also declare that same
-    identity. This is checked against the snapshot's ``embedding`` rows and
-    the target's own data, never against ``embedding_provider`` or the
-    snapshot's metadata header: a plain restore never resolves a provider,
-    and the header is not proof of anything the rows do not already say for
-    themselves. A target that starts with neither a lock nor any
-    non-centroid embeddings -- whether it holds none at all or only centroid
-    rows -- adopts the snapshot's declared identity as its new lock once
-    every row has been checked to agree on it.
+    identity, with the same centroid exemption. This is checked against the
+    snapshot's ``embedding`` rows and the target's own data, never against
+    ``embedding_provider`` or the snapshot's metadata header: a plain restore
+    never resolves a provider, and the header is not proof of anything the
+    rows do not already say for themselves. With neither flag set, a target
+    that holds neither a lock nor any non-centroid embeddings when the
+    inserts begin -- whether it holds none at all or only centroid rows --
+    and is restoring a
+    snapshot that has a non-centroid embedding row adopts the identity the
+    first such row declares as its new lock once every row has been checked
+    to agree on it.
 
     Args:
         conn: Open aiosqlite connection (inside the caller's transaction).
@@ -3033,8 +3031,7 @@ async def _import_records_to_db(
     and any failure (a malformed record, an embedding-model mismatch, or a bad
     value) rolls the transaction back so nothing is ever committed from an
     invalid snapshot. "Reject before any write" therefore holds as "nothing
-    persists", including the optional ``clear``. The file is read exactly once
-    and peak memory is one line plus one re-embed batch.
+    persists", including the optional ``clear``. The file is read exactly once.
 
     Every path through this function -- an ordinary merge, a journalled merge,
     and ``--clear`` alike -- rebuilds ``thought_fts`` from ``thought`` before

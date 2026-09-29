@@ -410,10 +410,8 @@ A few rules make this safe to adopt incrementally:
   `EmbeddingModelMismatchError` — Engrava never silently re-embeds. Re-embed on
   purpose by restoring a snapshot with `--re-embed` and `--config` (which applies
   the top-level provider in direct mode, or a per-service override before the
-  top-level fallback), or start a fresh store. Restore replaces the model,
-  dimension, document-prefix fingerprint, and query-prefix pairing in the same
-  transaction as the new vectors. Use a fresh target or `--clear` when the
-  target already contains embeddings. If the database has a persisted
+  top-level fallback), or start a fresh store. Use a fresh target or `--clear`
+  when the target already contains embeddings. If the database has a persisted
   sqlite-vec index, restore drops it transactionally and the next configured
   open rebuilds it from `embedding`; keep the `engrava[vec]` extra installed for
   that reset.
