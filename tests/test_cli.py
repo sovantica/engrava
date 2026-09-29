@@ -3902,15 +3902,36 @@ class TestCliRollbackQuietlyCancellation:
 
     A rollback and a close are different statements with the same shape of
     problem: both are aiosqlite suspension points, so an unshielded
-    cancellation could abandon either mid-flight.
+    cancellation could abandon either mid-flight. The cancellation test holds
+    the rollback open while the cancellation lands and checks that the cleanup
+    is still waiting for it.
     """
 
     async def test_the_rollback_still_completes_when_cancelled_mid_rollback(self) -> None:
-        """A cancellation mid-rollback must not abandon the rollback itself."""
+        """A cancelled cleanup keeps waiting for the shielded rollback to finish.
+
+        The rollback is held open (``may_finish`` stays unset) while the
+        cancellation lands, and the cleanup task must not be done yet. A
+        cleanup that hands the cancellation back without waiting for the
+        rollback, or that awaits the rollback without shielding it, fails
+        here. Releasing the rollback straight after ``cancel()`` would not
+        fail the first kind, because the rollback can finish before
+        anything looks.
+        """
         conn = _FakeRollbackConnection()
         task = asyncio.create_task(_rollback_quietly(conn))
         await conn.started.wait()
         task.cancel()
+        # Let the cancellation land while the rollback is still held open.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert not conn.finished
+        assert not task.done(), (
+            "the cancelled cleanup returned while the rollback was still in "
+            "flight -- it must keep waiting for the shielded rollback to finish"
+        )
+
         conn.may_finish.set()
 
         with pytest.raises(asyncio.CancelledError):

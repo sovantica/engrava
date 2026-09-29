@@ -49,7 +49,10 @@ from engrava.config import (
 from engrava.domain.protocols.derived_records import DeriveGates
 from engrava.infrastructure import service_manager as service_manager_module
 from engrava.infrastructure.service_manager import EngravaManager
-from engrava.infrastructure.sqlite.engrava_core import _close_quietly
+from engrava.infrastructure.sqlite.engrava_core import (
+    _close_quietly,
+    _run_cleanup_step_quietly,
+)
 
 
 def _entry_names(directory: Path) -> list[str]:
@@ -1011,6 +1014,51 @@ class TestCloseQuietlyCancellation:
             await _close_quietly(conn)
 
         assert "Error closing connection during cleanup" in caplog.text
+
+
+class TestRunCleanupStepQuietlyCancellation:
+    """``_run_cleanup_step_quietly`` waits for its step and returns a cancellation.
+
+    It is the helper behind ``_rollback_quietly`` and the migration cleanup.
+    The test cancels the calling task while the step is held open and then
+    lets the step finish normally. ``_FakeConnection.close`` serves as the
+    held-open step.
+    """
+
+    async def test_a_cancelled_cleanup_waits_for_the_step_and_returns_the_cancellation(
+        self,
+    ) -> None:
+        """A cancelled cleanup keeps waiting for its shielded step, then returns.
+
+        The step is held open (``may_finish`` stays unset) while the
+        cancellation lands, and the cleanup task must not be done yet. A
+        helper that hands the cancellation back without waiting for the
+        step, or that awaits the step without shielding it, fails here.
+        Once the step is released, the task must finish normally with the
+        ``CancelledError`` as its result rather than raising it.
+        """
+        conn = _FakeConnection()
+        task = asyncio.create_task(_run_cleanup_step_quietly(conn.close, "closing the connection"))
+        await conn.started.wait()
+        task.cancel()
+        # Let the cancellation land while the step is still held open.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert not conn.finished
+        assert not task.done(), (
+            "the cancelled cleanup returned while its step was still in "
+            "flight -- it must keep waiting for the shielded step to finish"
+        )
+
+        conn.may_finish.set()
+        await asyncio.wait({task})
+
+        assert not task.cancelled(), (
+            "the cancellation was raised out of the cleanup -- it must be returned to the caller"
+        )
+        assert isinstance(task.result(), asyncio.CancelledError)
+        assert conn.finished, "the step never ran to completion under cancellation"
 
 
 class TestAexitPreservesBodyException:
