@@ -2,26 +2,17 @@
 
 ``delete_thought`` and ``delete_edge`` each read a row (a before-image for
 the journal, and, for ``delete_thought``, the embedding rowid the vector
-purge needs) before doing their own guarded write. Both open with ``BEGIN
-IMMEDIATE``, so that read can now be preceded by a real wait for another
-process's write lock -- and until this fix, the read still ran *before* that
-wait, not after it. A concurrent delete's journaled before-image should be
-the row actually deleted; at the unfixed revision, the before-image is read
-before the wait too, so it carries whatever the row looked like *before* the
-other process's edit landed, not the row the delete actually removed. There
-is no ``revision`` guard here to preserve either way -- a delete has nothing
-to compare a stale read against, only a row to remove -- so this is a pure
-correctness fix, unlike the update paths (see
-``tests/test_begin_immediate_contention_is_typed.py`` for those, which keep
-their documented fail-fast-under-contention contract instead).
+purge needs) before doing their own guarded write. Both open their own
+``BEGIN IMMEDIATE`` before that read, so the read comes after a real wait for
+another process's write lock, and a concurrent delete's journaled
+before-image is the row actually deleted: the row as the other process left
+it, not as it looked before that process's edit landed. There is no
+``revision`` guard here to preserve -- a delete has nothing to compare a
+stale read against, only a row to remove. The update paths are covered by
+``tests/test_begin_immediate_contention_is_typed.py``.
 
-**The rendezvous is hooked to the read itself, not timed.** An earlier
-version of this test had the holder hold the lock for a fixed duration and
-then cross-checked ``time.monotonic()`` readings from both processes to
-confirm the contender's call had actually started before that hold ended --
-a validity check bolted onto a timing-based design, not a guarantee. This
-version removes the guesswork instead of merely checking for it: the
-contender's own store has its private before-image read
+**The rendezvous is hooked to the read itself, not timed.** The contender's
+own store has its private before-image read
 (``_get_thought_row`` for ``delete_thought``, ``_get_edge_row`` for
 ``delete_edge``) wrapped so that the first call for the target row sets a
 ``read_done`` event, the instant that specific read actually returns. The
@@ -29,28 +20,15 @@ holder takes the lock, makes its edit, signals ``holding``, then waits
 (bounded to ``_READ_DONE_TIMEOUT_SECONDS``) on ``read_done`` before
 committing regardless of whether it arrived -- and records which happened.
 
-What the two revisions do under this protocol:
-
-* At the unfixed revision, the contender's before-image read runs *before*
-  its own ``BEGIN IMMEDIATE`` -- nothing blocks it, so it completes near
-  instantly, almost always while the holder is still waiting out its own
-  bound. ``read_done`` arrives well within ``_READ_DONE_TIMEOUT_SECONDS``,
-  and the before-image the contender captured is the seed value, not the
-  holder's edit -- RED. The one way the unfixed revision escapes RED is a
-  contender stalled for longer than the bound between signalling and its
-  read: it then reads the holder's edit and passes. That is a missed
-  detection on a pathologically stalled run, never a false failure of the
-  fixed revision.
-* At the fixed revision, the contender's ``BEGIN IMMEDIATE`` cannot succeed
-  until the holder's own commit releases the write lock, and that same read
-  cannot run until ``BEGIN IMMEDIATE`` has succeeded. ``read_done`` can
-  therefore *never* arrive before the holder commits: not "is unlikely to",
-  structurally cannot, since the read it guards is provably downstream of
-  the lock release. The holder's bounded wait always elapses in full, the
-  before-image the contender then captures is the holder's own edit, and
-  the holder's own recorded "did it arrive" answer is always
-  ``False`` -- GREEN, and the fact of that ``False`` is itself part of what
-  the test below pins, not an incidental side effect.
+The contender's ``BEGIN IMMEDIATE`` cannot succeed until the holder's own
+commit releases the write lock, and that same read cannot run until
+``BEGIN IMMEDIATE`` has succeeded. ``read_done`` can therefore *never* arrive
+before the holder commits: not "is unlikely to", structurally cannot, since
+the read it guards is provably downstream of the lock release. The holder's
+bounded wait always elapses in full, the before-image the contender then
+captures is the holder's own edit, and the holder's own recorded "did it
+arrive" answer is always ``False`` -- and the fact of that ``False`` is
+itself part of what the test below pins, not an incidental side effect.
 
 This module races real ``multiprocessing.Process`` workers against one
 on-disk database file, reusing ``tests/test_two_process_write_busy_wait.py``'s
@@ -81,11 +59,10 @@ if TYPE_CHECKING:
     from engrava import SqliteEngravaCore
 
 #: Bound on the holder's own wait for ``read_done`` before it commits
-#: regardless of whether it arrived -- see :func:`_holder`. On the fixed
-#: revision this always elapses in full: the contender's own ``BEGIN
-#: IMMEDIATE`` cannot even begin its read until this commit releases the
-#: write lock, so ``read_done`` cannot arrive first -- see the module
-#: docstring.
+#: regardless of whether it arrived -- see :func:`_holder`. This always
+#: elapses in full: the contender's own ``BEGIN IMMEDIATE`` cannot even begin
+#: its read until this commit releases the write lock, so ``read_done``
+#: cannot arrive first -- see the module docstring.
 _READ_DONE_TIMEOUT_SECONDS = 1.0
 
 #: The contender's own ``PRAGMA busy_timeout``, comfortably above
@@ -95,8 +72,8 @@ _CONTENDER_BUSY_TIMEOUT_MS = 5000
 
 #: Floor on a successful contender's elapsed time -- comfortably below
 #: ``_READ_DONE_TIMEOUT_SECONDS`` to absorb scheduling jitter, but well
-#: above the near-instant failure a busy-wait regression would produce, so
-#: the two shapes cannot be confused.
+#: above the near-instant failure of a contender that did not wait, so the
+#: two shapes cannot be confused.
 _MIN_WAIT_SECONDS = _READ_DONE_TIMEOUT_SECONDS * 0.5
 
 #: Bound on waiting for the contender's "about to call" signal.
@@ -205,10 +182,10 @@ def _holder(  # noqa: PLR0917 - multiprocessing.Process passes `args` positional
     then waits (bounded by ``read_done_timeout_seconds``) for ``read_done``
     -- set by the contender's own hooked read, not by a fixed sleep -- and
     commits once that wait ends, whether ``read_done`` arrived or not. See
-    the module docstring for why, on the fixed revision, this bound always
-    elapses in full: the contender's read this signal guards cannot run
-    before this very commit releases the write lock it is waiting on, so
-    there is nothing racy about always using the whole budget.
+    the module docstring for why this bound always elapses in full: the
+    contender's read this signal guards cannot run before this very commit
+    releases the write lock it is waiting on, so there is nothing racy about
+    always using the whole budget.
 
     Args:
         path: Path to the shared SQLite database file.
@@ -553,21 +530,15 @@ def test_delete_journals_the_row_the_holder_left_not_a_stale_snapshot(
     regardless of whether it arrived. The contender deletes the same row.
 
     **This pins two things, not one.** First, the durable delete and its
-    journaled before-image: at the unfixed revision, the before-image is
-    read *before* the contender's own ``BEGIN IMMEDIATE`` waits out the
-    holder, so it carries the seed value, not the holder's edit; after the
-    fix, that read happens only once the contender's own lock wait is over,
-    so it carries the holder's edit. Second -- and this is what makes the
-    first assertion trustworthy rather than assumed -- whether the holder's
-    own wait for ``read_done`` actually saw it arrive before committing.
-    Structurally, on the fixed revision it cannot: the read that sets
-    ``read_done`` is downstream of the very commit the holder is waiting to
-    make, so ``read_done_arrived`` is always ``False`` there. At the unfixed
-    revision it is ``True`` on any run where the contender is not stalled past
-    the bound before its read, because nothing blocks that read. This replaces an earlier version of
-    this test that instead cross-checked ``time.monotonic()`` readings from
-    both processes to *infer* the rendezvous was valid; hooking the read
-    itself proves it directly instead.
+    journaled before-image: the before-image is read only once the
+    contender's own ``BEGIN IMMEDIATE`` has waited out the holder, so it
+    carries the holder's edit, not the seed value. Second -- and this is what
+    makes the first assertion trustworthy rather than assumed -- whether the
+    holder's own wait for ``read_done`` actually saw it arrive before
+    committing. Structurally it cannot: the read that sets ``read_done`` is
+    downstream of the very commit the holder is waiting to make, so
+    ``read_done_arrived`` is always ``False``. A ``True`` there would mean the
+    before-image read ran while the holder still held the lock.
     """
     result, read_done_arrived = _run_holder_and_contender(db_path, op)
 
@@ -576,8 +547,7 @@ def test_delete_journals_the_row_the_holder_left_not_a_stale_snapshot(
     assert not read_done_arrived, (
         "the holder's own bounded wait saw read_done arrive before it committed -- "
         "the contender's before-image read ran while the holder still held the "
-        "lock; a fixed revision cannot produce this, because its read waits for "
-        "the write lock"
+        "lock; that read must wait for the write lock"
     )
 
     elapsed = result["elapsed"]

@@ -1,28 +1,30 @@
 """A contending write waits out ``PRAGMA busy_timeout`` instead of failing at once.
 
-Every store method that opens its own transaction in order to write does so
-with ``BEGIN IMMEDIATE``, not a deferred ``BEGIN``. A deferred transaction's
-first read takes a WAL snapshot; a write later in the same transaction must
-upgrade that snapshot, and SQLite refuses the upgrade while another
-connection holds the write lock -- returning ``SQLITE_BUSY`` *without ever
-invoking the busy handler*. That made a perfectly ordinary write fail at once
-with a raw "database is locked" instead of waiting out
+The write units behind ``create_thought``, ``delete_thought``,
+``create_edge``, ``delete_edge`` and ``create_action`` open their own
+transaction with ``BEGIN IMMEDIATE``, not a deferred ``BEGIN``. A deferred
+transaction's first read takes a WAL snapshot; a write later in the same
+transaction must upgrade that snapshot, and SQLite refuses the upgrade while
+another connection holds the write lock -- returning ``SQLITE_BUSY`` *without
+ever invoking the busy handler*. A write that reads first would therefore
+fail at once with a raw "database is locked" instead of waiting out
 ``PRAGMA busy_timeout`` like every other write on the connection.
 ``BEGIN IMMEDIATE`` takes the write lock up front, through the busy handler,
 before anything in the guarded body gets to read. Not every write path reads
 before it writes, though -- see
-:func:`test_write_unit_waits_for_a_busy_lock`'s own docstring for exactly
-which of the five operations exercised here were actually affected.
-``update_thought`` is deliberately not one of them: its unit opens with a
-deferred ``BEGIN`` on purpose, and a caller retries a typed
-``WriteContentionError`` on it (a documented contract) -- see
-``tests/test_begin_immediate_contention_is_typed.py`` for that path's own,
+:func:`test_write_unit_waits_for_a_busy_lock`'s own docstring for which of the
+five operations exercised here do.
+``update_thought``, ``restore_thought``, ``update_edge`` and ``update_action``
+are deliberately not among them: each opens its unit with a deferred ``BEGIN``
+on purpose, and a caller retries a typed ``WriteContentionError`` on them (a
+documented contract) -- see
+``tests/test_begin_immediate_contention_is_typed.py`` for those paths' own,
 opposite pinning.
 
 This module races real ``multiprocessing.Process`` workers (not asyncio
 tasks or a second connection in the same process, which shares the
-aiosqlite thread model differently and does not exercise the reported
-scenario) against one on-disk database file. The rendezvous between the two
+aiosqlite thread model differently and does not exercise the two-process
+case) against one on-disk database file. The rendezvous between the two
 processes is deliberately explicit rather than time-based, mirroring
 ``tests/test_two_process_dedup.py``'s own bounded rendezvous: the holder
 takes the write lock with its own ``BEGIN IMMEDIATE`` and signals once it
@@ -71,9 +73,9 @@ _HOLD_SECONDS = 1.0
 _CONTENDER_BUSY_TIMEOUT_MS = 5000
 
 #: Floor on a successful contender's elapsed time. Comfortably below
-#: ``_HOLD_SECONDS`` to absorb scheduling jitter, but an order of magnitude
-#: above the "fails at once" signature this fix closes (observed at ~2 ms
-#: against the unfixed tree), so the two shapes cannot be confused.
+#: ``_HOLD_SECONDS`` to absorb scheduling jitter, but far above the
+#: near-instant "fails at once" shape of a write that never waited, so the two
+#: shapes cannot be confused.
 _MIN_WAIT_SECONDS = _HOLD_SECONDS * 0.5
 
 #: Ceiling on the negative control's elapsed time: with ``busy_timeout=0``
@@ -106,8 +108,7 @@ _FORCE_STOP_GRACE_SECONDS = 5.0
 
 # Seed rows every parametrized operation can draw on. One shared seed set
 # (rather than a fixture branching per operation) keeps every operation's
-# setup identical -- the fix under test does not special-case any of them,
-# and neither does this test's own seeding.
+# setup identical.
 _SEED_THOUGHT_A = "seed-thought-a"
 _SEED_THOUGHT_B = "seed-thought-b"
 _SEED_THOUGHT_TO_DELETE = "seed-thought-to-delete"
@@ -221,13 +222,14 @@ def _holder(  # noqa: PLR0917 - multiprocessing.Process passes `args` positional
     imported and connected, so starting a fixed hold clock immediately upon
     acquiring the lock could let a slow contender reach its call only after
     the lock was already released, making the test's outcome depend on
-    scheduling rather than on the fix. If that bounded wait times out, this
-    sets ``rendezvous_failed`` and releases the lock at once, **without**
-    falling through to the normal hold -- a timed-out wait must never be
-    treated as if the rendezvous happened, or the lock could already be gone
-    by the time a slow contender (still within its own, separately bounded
-    window) actually signals and makes its call, and the parent would accept
-    that run's timing as if the hold had genuinely covered it.
+    scheduling rather than on whether the contender waits. If that bounded
+    wait times out, this sets ``rendezvous_failed`` and releases the lock at
+    once, **without** falling through to the normal hold -- a timed-out wait
+    must never be treated as if the rendezvous happened, or the lock could
+    already be gone by the time a slow contender (still within its own,
+    separately bounded window) actually signals and makes its call, and the
+    parent would accept that run's timing as if the hold had genuinely
+    covered it.
 
     Once ``about_to_call`` fires, this holds either for a fixed
     ``hold_seconds`` (when ``release_after_contender`` is ``None``) or until
@@ -573,23 +575,21 @@ def _assert_durable(path: str, op: str) -> None:
 def test_write_unit_waits_for_a_busy_lock(db_path: str, op: str) -> None:
     """A contending write waits out the holder's lock instead of failing at once.
 
-    Before the fix, ``create_thought`` and ``delete_thought`` failed at once
-    under contention: each one's write path reads before it writes, inside
-    the transaction that ``_write_readback_savepoint`` (``create_thought``
-    via ``_insert_new_thought_row``'s FTS5 sync trigger reading its own
-    config on insert) or ``_delete_thought_atomic`` (its own existence-check
-    ``SELECT``) opened with a deferred ``BEGIN``. That read took a WAL
-    snapshot the write then had to upgrade, and SQLite refused the upgrade
-    while the holder process held the lock: ``SQLITE_BUSY`` at once, without
-    the busy handler ever running -- confirmed by running this test against
-    the pre-fix tree, where these two failed in ~2 ms. ``create_edge``,
-    ``delete_edge`` and ``create_action`` already waited and succeeded even
-    before the fix: nothing reads inside their unit before its write, so a
-    deferred ``BEGIN`` never had a snapshot to upgrade there in the first
-    place. With every one of these five write-opening units now using
-    ``BEGIN IMMEDIATE``, the write lock is taken up front, through the busy
-    handler -- so every operation parametrized here waits out the hold and
-    succeeds.
+    Each of the five operations parametrized here opens its write unit with
+    ``BEGIN IMMEDIATE``, so the write lock is taken up front, through the busy
+    handler: the contender waits out the holder's hold, succeeds, and takes at
+    least ``_MIN_WAIT_SECONDS`` to do so.
+
+    ``create_thought`` and ``delete_thought`` read inside their write unit
+    before they write: ``create_thought``'s insert (via
+    ``_insert_new_thought_row``) fires the FTS5 sync trigger, which reads its
+    own config, and ``delete_thought`` reads the row's existence with a
+    ``SELECT`` (in ``_delete_thought_atomic``) before its ``DELETE``. Under a
+    deferred ``BEGIN`` that read would take a WAL snapshot the write then has
+    to upgrade, and SQLite refuses the upgrade while the holder process holds
+    the lock: ``SQLITE_BUSY`` at once, without the busy handler ever running.
+    The success and elapsed-time assertions rule that outcome out. The other
+    three operations run under the same hold and the same assertions.
 
     ``update_thought`` is not in :data:`_OPERATIONS`, though its own
     content-changing update fires the same FTS5 sync trigger
@@ -666,7 +666,7 @@ def test_write_unit_waits_for_a_busy_lock(db_path: str, op: str) -> None:
     assert elapsed is not None
     assert elapsed >= _MIN_WAIT_SECONDS, (
         f"{op} returned after only {elapsed:.3f}s -- too fast to have waited out "
-        f"the {_HOLD_SECONDS}s hold; this is the pre-fix 'fails at once' signature"
+        f"the {_HOLD_SECONDS}s hold; this is the 'fails at once' signature"
     )
 
     _assert_durable(db_path, op)
@@ -675,9 +675,9 @@ def test_write_unit_waits_for_a_busy_lock(db_path: str, op: str) -> None:
 def test_write_unit_with_zero_busy_timeout_fails_at_once(db_path: str) -> None:
     """A negative control: with ``busy_timeout=0`` the contender still fails at once.
 
-    Neither the pre-fix deferred ``BEGIN`` nor the fixed ``BEGIN IMMEDIATE``
-    waits when the busy timeout itself is zero, so this outcome is the same
-    on both sides of the fix. Its purpose is methodological: it proves the
+    Neither a deferred ``BEGIN`` nor ``BEGIN IMMEDIATE`` waits when the busy
+    timeout itself is zero, so this outcome does not depend on which of the two
+    the unit uses. Its purpose is methodological: it proves the
     success and elapsed-time assertions in
     :func:`test_write_unit_waits_for_a_busy_lock` are actually driven by
     ``PRAGMA busy_timeout`` waiting out a real, held lock, and not by some

@@ -10,15 +10,13 @@ built so that difference cannot leak into a false pass.** ``update_thought``
 has an extra, narrower mechanism on top: a content-changing update fires the
 FTS5 sync trigger, which reads its own config as part of the same ``UPDATE``
 statement; that makes the deferred transaction's write-lock upgrade fail at
-once, ``SQLITE_BUSY`` without the busy handler ever running (confirmed
-against this tree: consistently within a few milliseconds, independent of
-``PRAGMA busy_timeout``) -- see
+once, ``SQLITE_BUSY`` without the busy handler ever running, whatever
+``PRAGMA busy_timeout`` is set to -- see
 ``tests/test_two_process_write_busy_wait.py``'s own docstring, which
-documents the identical mechanism for ``create_thought``. ``restore_thought``,
+describes the same mechanism for ``create_thought``. ``restore_thought``,
 ``update_edge`` and ``update_action`` have no such trigger: their guarded
 ``UPDATE`` goes through the *ordinary* busy handler like any other write, and
-waits up to ``PRAGMA busy_timeout`` for the lock -- confirmed empirically
-(a direct probe against this tree, not inferred): given a hold long enough to
+waits up to ``PRAGMA busy_timeout`` for the lock; given a hold long enough to
 outlast that wait, all three resolve only once ``busy_timeout`` itself is
 exhausted, not sooner. Left with a *generous* ``busy_timeout``, that wait
 could run long enough for the holder to release and commit first, at which
@@ -45,18 +43,17 @@ scheduling-delayed run, the contender could still be mid-spawn when a fixed
 sleep elapses, so the holder would release, and commit, before the guarded
 call ever reached the statement this module means to contend on -- passing
 the assertions below for the wrong reason, or flaking under load depending
-on exactly how late the guarded call started. Mirroring engrava-validation's
-own C7(b) probe, the holder instead waits (bounded by a generous safety
-ceiling, since a correct run resolves in milliseconds) for the contender to
-signal that its call has settled -- success or failure alike -- and only
-then commits. On that path, the guarded call is then provably made, and
-settled, while the holder still holds the lock, not merely likely to have
-been. The bound is a safety ceiling, not a second guarantee, though: if the
-contender never signals at all (a crash, a hang, or a delay past the
-ceiling), the holder commits anyway, without ever learning the outcome --
-that path is caught downstream instead, via ``rendezvous_failed``, which the
-test asserts was never set, rather than trusted as if it proved the same
-thing the reporting path does.
+on exactly how late the guarded call started. The holder instead waits
+(bounded by a generous safety ceiling, since a correct run resolves in
+milliseconds) for the contender to signal that its call has settled --
+success or failure alike -- and only then commits. On that path, the guarded
+call is then provably made, and settled, while the holder still holds the
+lock, not merely likely to have been. The bound is a safety ceiling, not a
+second guarantee, though: if the contender never signals at all (a crash, a
+hang, or a delay past the ceiling), the holder commits anyway, without ever
+learning the outcome -- that path is caught downstream instead, via
+``rendezvous_failed``, which the test asserts was never set, rather than
+trusted as if it proved the same thing the reporting path does.
 """
 
 from __future__ import annotations
@@ -80,8 +77,8 @@ if TYPE_CHECKING:
 #: goes through the *ordinary* busy handler (``restore_thought``,
 #: ``update_edge``, ``update_action``) to give up and raise
 #: ``WriteContentionError`` promptly, rather than tying up this test with a
-#: long wait -- the holder now releases only once the contender reports an
-#: outcome, so nothing here depends on outrunning a fixed hold any more.
+#: long wait -- the holder releases only once the contender reports an
+#: outcome, so nothing here depends on outrunning a fixed hold.
 _CONTENDER_BUSY_TIMEOUT_MS = 200
 
 #: Ceiling on the contending call's elapsed time -- a comfortable multiple
@@ -508,37 +505,28 @@ def test_contention_fails_fast_typed_then_a_retry_lands_both_edits(db_path: str,
     bumps ``revision``), then holds the write lock until the contender itself
     reports that its one guarded call has settled -- success or failure alike
     -- bounded by the generous ``_RELEASE_SAFETY_CEILING_SECONDS`` safety
-    ceiling rather than a fixed sleep, mirroring engrava-validation's own
-    C7(b). **This describes the ordinary path, not a guarantee that holds on
-    every path.** When the contender does report in time, the holder commits
-    exactly once that outcome is known, so the guarded call is guaranteed to
-    have settled *while the lock was still held*, not merely likely to have
-    -- closing the flake a fixed-sleep hold would otherwise leave open, and
-    removing any dependence on the two waits happening to race a particular
-    way (see the module docstring for why that matters: two of the four
-    mechanisms this pins would otherwise be timing-dependent in exactly the
-    same way). But the safety ceiling is exactly that: if the contender never
+    ceiling rather than a fixed sleep. **This describes the ordinary path,
+    not a guarantee that holds on every path.** When the contender does
+    report in time, the holder commits exactly once that outcome is known, so
+    the guarded call is guaranteed to have settled *while the lock was still
+    held*, not merely likely to have -- closing the flake a fixed-sleep hold
+    would otherwise leave open, and removing any dependence on the two waits
+    happening to race a particular way (see the module docstring for why that
+    matters). But the safety ceiling is exactly that: if the contender never
     signals -- a crash, a hang, or scheduling delay past
     ``_ABOUT_TO_CALL_TIMEOUT_SECONDS`` or ``_RELEASE_SAFETY_CEILING_SECONDS``
     -- the holder's own bounded wait times out and it commits anyway, with no
     idea what the contender's outcome was or whether the guarded call ever
     even ran under the lock. The holder does know that its own wait timed
-    out, and records it in ``rendezvous_failed``, naming which wait it was.
-    The assertion below on ``rendezvous_failed`` is what turns that
-    silent commit into a failed test rather than a run that trusts an outcome
-    the timeout path never actually guaranteed.
+    out, and records it in ``rendezvous_failed``. The assertion below on
+    ``rendezvous_failed`` is what turns that silent commit into a failed test
+    rather than a run that trusts an outcome the timeout path never actually
+    guaranteed.
 
     Because the call is guaranteed to settle under the lock, it must settle
     within ``_MAX_FAIL_SECONDS`` -- well under any plausible hold -- as
     ``WriteContentionError``, never ``StaleDataError`` and never a raw driver
-    error. At the unfixed revision (each of these four opening its own
-    ``BEGIN IMMEDIATE`` *before* it reads, instead of a deferred ``BEGIN``),
-    that ``BEGIN IMMEDIATE`` is itself what contends for the holder's lock;
-    with this test's short ``_CONTENDER_BUSY_TIMEOUT_MS`` it exhausts that
-    budget and raises a raw, untyped ``sqlite3.OperationalError`` instead --
-    never invoking this call's own guarded ``UPDATE`` (and its typed
-    conversion) at all. Confirmed by running this test against that
-    revision.
+    error.
 
     Once the holder has released (this test joins it before retrying), a
     plain retry -- an ordinary call, no stale state to inherit -- succeeds,
@@ -609,10 +597,8 @@ def test_contention_fails_fast_typed_then_a_retry_lands_both_edits(db_path: str,
     )
     error = str(result["error"])
     assert "WriteContentionError" in error, (
-        f"{op} failed under contention with {error!r}, not the typed "
-        "WriteContentionError this pins -- at the unfixed revision (this unit's own "
-        "BEGIN IMMEDIATE contending for the holder's lock) this is a raw, untyped "
-        "sqlite3.OperationalError instead"
+        f"{op} failed under contention with {error!r}; this pins the typed "
+        "WriteContentionError, not a raw sqlite3.OperationalError or a StaleDataError"
     )
     elapsed = result["elapsed"]
     assert elapsed is not None

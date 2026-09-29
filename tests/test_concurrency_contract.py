@@ -236,7 +236,7 @@ def _pause_after_first_call(
 def _write_lock_is_held(store: SqliteEngravaCore) -> bool | None:
     """Return whether ``store._write_lock`` is held, or ``None`` if it does not exist.
 
-    ``None`` on a store built without this lock (an older version), so a
+    ``None`` on a store that has no ``_write_lock`` attribute, so a
     caller can skip the check gracefully instead of raising ``AttributeError``
     partway through an ``asyncio.Event`` handshake — which would strand the
     paused task forever, waiting on a ``resume`` event nothing would go on to
@@ -671,10 +671,10 @@ class TestInProcessCriticalSection:
         async def _task_b() -> ThoughtRecord:
             await paused.wait()
             # A is parked right after its own read, still holding the write
-            # lock for the rest of its critical section (skipped gracefully
-            # pre-fix, where no such lock exists yet — see
-            # `_write_lock_is_held`'s docstring for why this must not raise
-            # here and strand `_task_a` on `resume.wait()`).
+            # lock for the rest of its critical section (`_write_lock_is_held`
+            # returns None when the store has no `_write_lock`; the check is
+            # then skipped rather than raised, which would strand `_task_a` on
+            # `resume.wait()` -- see its docstring).
             held = _write_lock_is_held(store)
             if held is not None:
                 assert held, (
@@ -1574,15 +1574,14 @@ class TestSuspendAutoCommitIsStoreWide:
     ) -> None:
         """Cancelling a task mid-window rolls back and releases the RESERVED lock.
 
-        ``suspend_auto_commit`` used to catch ``except Exception``, not
-        ``except BaseException``. ``asyncio.CancelledError`` derives from
+        ``suspend_auto_commit`` catches ``except BaseException``, not only
+        ``except Exception``. ``asyncio.CancelledError`` derives from
         ``BaseException``, so a cancellation landing inside the window (a
         ``bulk_store`` call whose caller times out or is torn down, for
-        instance) skipped the rollback entirely: ``finally`` still cleared the
-        deferred-commit flag, but ``db.in_transaction`` stayed ``True`` and the
-        RESERVED lock was left stranded, blocking every other writer on the
-        connection until something else eventually committed, rolled back, or
-        closed it.
+        instance) must still roll the window back: skipping the rollback
+        would leave ``db.in_transaction`` ``True`` and the RESERVED lock
+        stranded, blocking every other writer on the connection until
+        something else eventually committed, rolled back, or closed it.
 
         Driven by an ``asyncio.Event`` handshake rather than a sleep: the
         window signals once its own row is written and it is parked, so the
@@ -1675,19 +1674,17 @@ class TestTwoStoresOneFile:
         self,
         two_stores: tuple[SqliteEngravaCore, SqliteEngravaCore, aiosqlite.Connection],
     ) -> None:
-        """``deduplicate=True`` now serialises across stores instead of racing.
+        """``deduplicate=True`` serialises across stores instead of racing.
 
-        Before the fix, both stores probed the content hash, both missed, and
-        both inserted — two rows for byte-identical content, neither
-        confirmation-counted. Now the first store's probe-and-insert window
-        holds the write lock (``BEGIN IMMEDIATE``) for its duration; a second
-        store reaching the same window while it is open cannot even start its
-        own transaction. Forced — by this test's interleave — to stay open for
-        the whole nested call, the first store's window outlasts every retry
-        the second store makes, so the second store raises
-        ``WriteContentionError``. That exception then unwinds out of the
-        interleaved call and rolls the first store's own attempt back too:
-        neither row lands, rather than one succeeding partially.
+        The first store's probe-and-insert window holds the write lock
+        (``BEGIN IMMEDIATE``) for its duration; a second store reaching the
+        same window while it is open cannot even start its own transaction.
+        Forced — by this test's interleave — to stay open for the whole
+        nested call, the first store's window outlasts every retry the second
+        store makes, so the second store raises ``WriteContentionError``. That
+        exception then unwinds out of the interleaved call and rolls the first
+        store's own attempt back too: neither row lands, rather than one
+        succeeding partially.
         """
         store_a, store_b, conn_a = two_stores
         # A short busy_timeout on the second store: its every attempt is
@@ -1719,16 +1716,12 @@ class TestTwoStoresOneFile:
         self,
         two_stores: tuple[SqliteEngravaCore, SqliteEngravaCore, aiosqlite.Connection],
     ) -> None:
-        """A confirmation racing a second store's open window now fails loudly.
+        """A confirmation racing a second store's open window fails loudly.
 
-        Before the fix, both stores' relative ``confirmation_count + 1`` bumps
-        landed independently, so a race here was harmless in isolation — but
-        it depended on the same unordered probe that the previous test shows
-        is unsafe for an outright insert. Now the first store's window holds
-        the write lock for its duration, so the second store cannot even
-        start counting while it is open; it raises ``WriteContentionError``,
-        which unwinds the first store's own attempt too rather than leaving
-        it half-applied.
+        The first store's window holds the write lock for its duration, so
+        the second store cannot even start counting while it is open; it
+        raises ``WriteContentionError``, which unwinds the first store's own
+        attempt too rather than leaving it half-applied.
         """
         store_a, store_b, conn_a = two_stores
         await store_a.create_thought(_thought(content="identical content"))
