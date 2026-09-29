@@ -5445,12 +5445,9 @@ class SqliteEngravaCore:
             exhausted, this surfaces as typed
             :class:`WriteContentionError`, same as the first case. But if
             the other writer instead commits *while this call is still
-            waiting*, the guarded ``UPDATE`` proceeds once the lock frees,
-            and finds a genuinely changed ``revision`` — raising
-            ``StaleDataError``, correctly, exactly as it would have before
-            a write-opening unit ever used ``BEGIN IMMEDIATE`` at all. That
-            is not a regression this fix removes; it is the documented
-            optimistic-concurrency contract these three have always had.
+            waiting*, the guarded ``UPDATE`` proceeds once the lock frees
+            and raises ``StaleDataError`` if this row's ``revision`` no
+            longer matches.
 
           What ``DEFERRED`` actually buys, for all four uniformly, is
           narrower and does not depend on which of the two shapes above
@@ -5460,9 +5457,7 @@ class SqliteEngravaCore:
           ``IMMEDIATE`` unit here would do — lets a write guard a revision
           it read *after* another process's edit had already landed,
           rejecting a disjoint-column edit as falsely stale instead of the
-          lost update the guard exists to catch. That was measured as a
-          regression in engrava-validation's full multiprocess suite when
-          this unit read under the lock for these four paths.
+          lost update the guard exists to catch.
 
         The body then runs inside a named ``SAVEPOINT``, and on any failure
         it is unwound with ``ROLLBACK TO`` + ``RELEASE`` — undoing only what
@@ -10952,8 +10947,7 @@ class SqliteEngravaCore:
 
             if deleted or not existed_before:
                 # Either the parent delete actually succeeded, or
-                # ``thought_id`` never matched a row at all — the pre-fix
-                # behaviour for a nonexistent id, unchanged: sweep any
+                # ``thought_id`` never matched a row at all: sweep any
                 # orphaned edge / embedding / action rows a schema without a
                 # cascade could still be carrying. That sweep can itself
                 # write real rows even when ``deleted`` is ``False`` — see
@@ -11068,9 +11062,8 @@ class SqliteEngravaCore:
         """Remove a now-orphaned vec0 vector left behind by a thought delete.
 
         Paired with :meth:`_embedding_rowid_for_thought`: the numpy backend
-        yields ``None`` (nothing to do — byte-identical to the pre-fix path),
-        while an active sqlite-vec backend deletes the vector whose FK-cascaded
-        ``embedding`` row has just been removed.
+        yields ``None`` (nothing to do), while an active sqlite-vec backend
+        deletes the vec0 vector at ``rowid``.
 
         Args:
             rowid: The vec0 rowid to delete, or ``None`` to no-op.

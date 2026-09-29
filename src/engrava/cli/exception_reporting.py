@@ -22,9 +22,7 @@ module, to register the memory verbs as commands -- so neither module can
 define these helpers and have the other import them at module level without
 a cycle. Both import them from here instead: one implementation, not a copy
 per module. A duplicated copy is exactly how this kind of fix drifts: a fix
-applied to one module's copy leaves the other module's copy (or, before this
-module existed, the other cleanup site's inline ``exc_info=True``) behind,
-unfixed.
+applied to one module's copy leaves the other module's copy behind.
 
 Both functions below read attributes off an exception they did not raise and
 cannot trust, so both are written to survive one that fights back: a
@@ -198,28 +196,10 @@ def _frame_only_stack(exc: BaseException) -> str:
     cleanup-failure warning (``--config`` tier), and
     :func:`~engrava.cli.main._close_quietly`'s cleanup-failure warning
     (bare/default tier) -- all three want "where did this happen", never
-    "what does this exception say about itself", and all three used to reach
-    for ``exc_info=True`` to get it, which asks Python's own traceback
-    formatter to render the exception a second time: its own ``__str__``,
-    its ``__cause__``/``__context__`` chain, and (since Python 3.11) any
-    exception-group children, all called again, all outside every guard this
-    module builds elsewhere, and that render is not inert: with a *second*,
-    unrelated failure already propagating (a store's ``close()`` raising
-    while the original exception it is cleaning up after is still in
-    flight), the ``--verbose`` cleanup log's ``exc_info=True`` rendered the
-    close exception, the original exception a *second* time, and an attached
-    exception group and its child, all through their own overridable
-    formatters -- and separately, that same standard-library formatter wraps
-    its own rendering in a bare ``except``, so a real OS ``SIGINT`` (or a
-    formatter raising ``SystemExit``) arriving during that render was
-    swallowed before it could reach this module's own guards, leaving the
-    command to still exit ``1`` with an ordinary ``unexpected_error`` object
-    instead of aborting (both verified live). The same defect, unfixed,
-    existed at the bare/default store tier's own cleanup site
-    (``main._close_quietly``): a real SIGINT and a real ``SystemExit(37)``
-    arriving during that tier's ``exc_info=True`` render were both absorbed
-    the same way, live, even though the ``--json`` error object it produced
-    never mentions ``exc_info`` at all.
+    "what does this exception say about itself". ``exc_info=True`` would
+    supply the location, but it also makes Python's own traceback formatter
+    call the exception's ``__str__``, outside every guard this module builds
+    elsewhere.
 
     Each frame contributes only its filename, line number and function
     name -- no source line, no local values, no chained exception, no

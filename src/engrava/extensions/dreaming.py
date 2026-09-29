@@ -542,20 +542,15 @@ class DreamingExtension:
         """Compute the promotion score as a weighted average over the signals.
 
         When ``active_weights`` is provided (the consolidation path always
-        passes it), the score is the weighted average over the signals **active
-        for the run** — inactive signals contribute ``0.0`` and their weight
-        has already been redistributed onto the active ones by
-        :meth:`_compute_active_weights`, so the effective weights sum to
-        ``1.0`` (all-zero when no signal is active, giving a ``0.0`` score that
-        promotes nothing). This is the reachable default scoring: a flat signal
-        no longer drags every score toward a constant.
+        passes it), each signal's value is multiplied by the weight
+        :meth:`_compute_active_weights` gives it; an inactive signal's weight
+        there is ``0.0``.
 
         When ``active_weights`` is ``None`` (direct callers / unit tests) the
-        raw configured weights are used unchanged — the historical weighted
-        sum. **This compatibility path reproduces the pre-fix, arithmetically
-        unreachable scoring** (a structurally-flat signal still consumes its
-        weight); it exists only for direct/legacy callers. The consolidation
-        path MUST pass the redistributed ``active_weights`` from
+        raw configured weights are used unchanged. **On this compatibility
+        path a structurally-flat signal still consumes its weight**; it exists
+        only for direct/legacy callers. The consolidation path MUST pass the
+        redistributed ``active_weights`` from
         :meth:`_compute_active_weights` — it is the only production caller and
         always does. Do not add a new production caller that omits them.
 

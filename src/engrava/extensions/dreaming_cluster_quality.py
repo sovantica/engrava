@@ -6,8 +6,7 @@ consolidation loop on a resolved cluster (``list[ThoughtRecord]`` plus
 its member embedding vectors) *before* materialising the REFLECTION, so
 that clusters failing any quality check are skipped.  This module
 provides the gate functions only; the call-site wiring lives in
-``engrava.extensions.dreaming`` and is added in a separate follow-up
-commit.
+``engrava.extensions.dreaming``.
 
 Gate inventory (priority order — first failure rejects the cluster):
 
@@ -25,7 +24,7 @@ Gate inventory (priority order — first failure rejects the cluster):
    which removes that formula's magnitude sensitivity in the common
    case but is not an exact transform — it changes which side of the
    threshold several non-finite and overflowing input shapes land on,
-   in both directions, relative to the pre-fix formula — see
+   in both directions, relative to the pre-0.7 formula — see
    :func:`cluster_cohesion_score` for exactly which, executed, and the
    0.6 -> 0.7 upgrade note for the gate-level effect.
 5. :func:`is_external_source_homogeneous` — at least the configured
@@ -194,9 +193,8 @@ def is_persona_only_cluster(
 #: directly contradict each other (e.g. "stopped making videos" alongside
 #: "created a video, positive feedback").
 #:
-#: **Limitation:** this lexicon is English-only.  Clusters whose
-#: member content is in another language will simply not be flagged by this
-#: gate — broader multi-language support is deferred to a follow-up.
+#: **Limitation:** this lexicon is English-only, so a contradiction
+#: expressed only in other languages' words is not detected.
 _CONTRADICTION_PAIRS: tuple[tuple[frozenset[str], frozenset[str]], ...] = (
     (
         frozenset({"stopped", "quit", "abandoned", "dropped", "ended"}),
@@ -305,9 +303,9 @@ def _pairwise_cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float
     choice for a *cohesion* gate: a zero vector normally means an embedding
     failure or empty input, and treating it as similar to anything would
     let a broken vector silently prop up a cluster's cohesion score. This
-    happens to match what the pre-fix raw-dot-product formula already
+    happens to match what the pre-0.7 raw-dot-product formula already
     returned for a zero-vector pair (a dot product against the zero vector
-    is trivially zero regardless of the other vector), so it is not an
+    is trivially zero for any finite other vector), so it is not an
     observable behaviour change for that case — what changes is that it is
     now a stated policy rather than an accident of the arithmetic.
 
@@ -336,7 +334,7 @@ def _pairwise_cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float
         overflow ``float64`` when squared and summed (e.g. ``[1e200]``
         against ``[-1e200]``) returns ``nan`` instead. See
         :func:`cluster_cohesion_score` for which of these executed cases
-        change a gate decision relative to the pre-fix raw-dot-product
+        change a gate decision relative to the pre-0.7 raw-dot-product
         formula, and in which direction.
 
     """
@@ -407,15 +405,15 @@ def cluster_cohesion_score(cluster_embeddings: list[list[float]]) -> float:
     reach it, and which instead reach the zero-norm branch and score
     ``0.0``, changed here, in both directions, executed:
 
-    * ``[nan]`` paired with ``[0.0]`` scored ``nan`` under the pre-fix
+    * ``[nan]`` paired with ``[0.0]`` scored ``nan`` under the pre-0.7
       raw-dot-product formula (``nan * 0.0`` is ``nan``) and scores
       ``0.0`` here (:func:`_pairwise_cosine_similarity`'s zero-norm check
       on the genuinely-zero vector fires first). ``nan`` compares as "not
       low cohesion" (admitted); ``0.0`` compares as low cohesion for any
       positive threshold (rejected) — so this pair's cluster flips from
-      admitted to rejected relative to the pre-fix formula.
+      admitted to rejected relative to the pre-0.7 formula.
     * ``[1e200]`` paired with ``[-1e200]`` scored ``-inf`` under the
-      pre-fix raw-dot-product formula (correctly rejected, since ``-inf``
+      pre-0.7 raw-dot-product formula (correctly rejected, since ``-inf``
       is below any threshold) and scores ``nan`` here, because both norms
       overflow to ``inf`` and ``-inf / inf`` is ``nan`` — so this pair's
       cluster flips from rejected to admitted, the opposite direction.
@@ -484,7 +482,7 @@ def is_low_cohesion(
         is not the same as before: see :func:`cluster_cohesion_score`'s
         non-finite-and-overflowing note for two executed input shapes
         that now land on the opposite side of this gate from where the
-        pre-fix formula put them.
+        pre-0.7 formula put them.
 
     """
     score = cluster_cohesion_score(cluster_embeddings)

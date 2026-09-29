@@ -2674,16 +2674,16 @@ async def _rebuild_fts_index_for_restore(conn: aiosqlite.Connection) -> None:
     the old content to a completely different, unrelated thought.
 
     Rebuilding unconditionally after every restore closes this regardless of
-    which of the collisions above produced it, including one an earlier,
-    unfixed build already left behind (a merge or ``--clear`` restore into an
-    already-damaged database comes out consistent too). The FTS5 ``'rebuild'``
-    command reconstructs the index from ``thought``'s current rows using the
-    table's already-configured tokenizer (``thought_fts_config``, the
-    hyphen-aware ``unicode61`` config schema_core.sql sets up) -- it neither
-    touches that configuration nor needs to restate it, so this does not
-    duplicate what :meth:`SqliteEngravaCore._rebuild_fts_index` (the
-    core-schema-v3 migration step) does to *create* that configuration in the
-    first place.
+    which of the collisions above produced it, including a stale entry the
+    target already carried before the restore began (a merge or ``--clear``
+    restore into an already-damaged database comes out consistent too). The
+    FTS5 ``'rebuild'`` command reconstructs the index from ``thought``'s
+    current rows using the table's already-configured tokenizer
+    (``thought_fts_config``, the hyphen-aware ``unicode61`` config
+    schema_core.sql sets up) -- it neither touches that configuration nor
+    needs to restate it, so this does not duplicate what
+    :meth:`SqliteEngravaCore._rebuild_fts_index` (the core-schema-v3
+    migration step) does to *create* that configuration in the first place.
 
     Args:
         conn: Restore connection with an active transaction. Must run before
@@ -3037,7 +3037,7 @@ async def _import_records_to_db(
     and ``--clear`` alike -- rebuilds ``thought_fts`` from ``thought`` before
     committing (see :func:`_rebuild_fts_index_for_restore`), so a restore never
     leaves a stale full-text index entry an ``INSERT OR REPLACE`` collision
-    created, even one an earlier build already left in the target.
+    created, even one the target already carried before the restore.
 
     ``clear`` also empties ``journal_entry``. Without that, a cleared store's
     data and its existing journal would describe two different histories --
@@ -3159,8 +3159,8 @@ async def _import_records_to_db(
         await _refresh_sqlite_vec_for_replaced_rows(conn, stream_result.replaced_embedding_rowids)
         # Unconditional on every restore path -- merge or --clear -- so a
         # stale thought_fts entry (see _rebuild_fts_index_for_restore) can
-        # never survive a restore, including one that inherits damage an
-        # earlier, unfixed build already left in the target.
+        # never survive a restore, including one that inherits damage already
+        # present in the target.
         await _rebuild_fts_index_for_restore(conn)
         await conn.commit()
     except BaseException:

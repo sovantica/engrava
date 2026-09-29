@@ -90,11 +90,9 @@ _DEFAULT_TOP_K = 5
 # ---------------------------------------------------------------------------
 
 _AC9A_FLOOR = 0.80
-# AC-9b v0.3.0 tolerance per spec v1.6 amendment: pre-amendment ceiling
-# was 0.02 but empirically REFLECTIONs displace direct-retrieval OBS at
-# ``reflection_boost=1.0`` (multiplier, not toggle).  Measured 0.033 on
-# the curated direct subset; 0.05 carries a 34 % safety
-# margin.
+# AC-9b direct-neutrality ceiling.  REFLECTIONs displace direct-retrieval
+# OBS at ``reflection_boost=1.0`` (multiplier, not toggle).  Measured 0.033
+# on the curated direct subset; 0.05 carries a 34 % safety margin.
 _AC9B_CEILING = 0.05
 _AC8_CEILING = 0.05
 
@@ -627,10 +625,10 @@ def _as_int(value: object) -> int:
 
 def _as_bool(value: object) -> bool:
     # Strict — reject anything that is not a literal JSON ``true`` /
-    # ``false``.  Pre-fix this coerced via ``bool(value)`` which
-    # silently turned every truthy string (including the literal
-    # ``"false"``) into ``True``, corrupting the self-anchored
-    # provenance contract on malformed datasets.
+    # ``false``.  Coercing via ``bool(value)`` would silently turn every
+    # truthy string (including the literal ``"false"``) into ``True``,
+    # corrupting the self-anchored provenance contract on malformed
+    # datasets.
     if not isinstance(value, bool):
         msg = f"expected JSON boolean, got {type(value).__name__}"
         raise SystemExit(msg)
