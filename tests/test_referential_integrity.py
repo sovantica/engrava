@@ -344,17 +344,24 @@ class TestCascadeOnDelete:
 
 
 class TestDeleteThoughtChildrenAtomicity:
-    """A ``RAISE(ABORT)`` trigger on ``action`` makes ``delete_thought`` fail with nothing applied.
+    """``delete_thought`` and its child deletes when a trigger rejects an ``action`` delete.
 
-    After the failed call the thought, its edges, its embedding and its action are all still
-    there, and a later unrelated write on the same connection does not make any part of the
-    failed delete durable.
+    With foreign keys on, the parent delete's cascade reaches the trigger; with them off, the
+    explicit child deletes do. The tests of a rejected ``delete_thought`` cover both. One test
+    calls ``_delete_thought_children_explicit`` directly inside a transaction it holds and pins
+    that the call undoes its earlier child deletes and leaves that transaction open. Two further
+    tests raise ``CancelledError`` from a statement on the children savepoint and pin that the
+    connection is quarantined.
     """
 
+    @pytest.mark.parametrize("foreign_keys_on", [True, False])
     async def test_a_rejected_action_delete_leaves_the_thought_and_all_its_children_in_place(
         self,
         store: SqliteEngravaCore,
+        foreign_keys_on: bool,
     ) -> None:
+        if not foreign_keys_on:
+            await store._db.execute("PRAGMA foreign_keys = OFF")
         await store.create_thought(_make_thought("t1"))
         await store.create_thought(_make_thought("t2"))
         await store.create_edge(_make_edge("e-out", "t1", "t2"))
@@ -403,9 +410,11 @@ class TestDeleteThoughtChildrenAtomicity:
         assert row is not None
         assert row[0] == 1, "the rejected action row itself must still be there too"
 
+    @pytest.mark.parametrize("foreign_keys_on", [True, False])
     async def test_action_delete_rollback_trigger_surfaces_its_own_error(
         self,
         store: SqliteEngravaCore,
+        foreign_keys_on: bool,
     ) -> None:
         """A ``RAISE(ROLLBACK, ...)`` trigger: the caller sees it, not a savepoint error.
 
@@ -419,6 +428,8 @@ class TestDeleteThoughtChildrenAtomicity:
         else pending for the trigger's rollback to take down except that
         call's own (otherwise-uncommitted) work.
         """
+        if not foreign_keys_on:
+            await store._db.execute("PRAGMA foreign_keys = OFF")
         await store.create_thought(_make_thought("t1"))
         await store.create_action(_make_action("a1", "t1"))
         await store._db.execute(
@@ -439,6 +450,58 @@ class TestDeleteThoughtChildrenAtomicity:
         row = await cursor.fetchone()
         assert row is not None
         assert row[0] == 1
+
+    async def test_a_rejected_action_delete_undoes_the_child_deletes_before_it(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """The edge and embedding deletes run before the ``action`` delete the trigger rejects.
+
+        ``_delete_thought_children_explicit`` is called directly inside a transaction this test
+        opens. The call raises, its edge and embedding deletes are undone, and the transaction is
+        still open.
+        """
+        db = store._db
+        await store.create_thought(_make_thought("t1"))
+        await store.create_thought(_make_thought("t2"))
+        await store.create_edge(_make_edge("e-out", "t1", "t2"))
+        await store.create_edge(_make_edge("e-in", "t2", "t1"))
+        await db.execute(
+            "INSERT INTO embedding "
+            "(embedding_id, owner_type, owner_id, model_name, dimension, "
+            " vector_blob, created_at) "
+            "VALUES (?, 'THOUGHT', ?, 'test', 3, ?, ?)",
+            (
+                f"emb-{uuid.uuid4().hex}",
+                "t1",
+                b"\x00\x01\x02",
+                datetime.datetime.now(tz=datetime.UTC).isoformat(),
+            ),
+        )
+        await store.create_action(_make_action("a1", "t1"))
+        await db.execute(
+            "CREATE TRIGGER reject_action_delete BEFORE DELETE ON action "
+            "BEGIN SELECT RAISE(ABORT, 'policy: action rows are retained'); END"
+        )
+        assert not db.in_transaction
+
+        await db.execute("BEGIN")
+        with pytest.raises(aiosqlite.IntegrityError, match="policy: action rows are retained"):
+            await store._delete_thought_children_explicit("t1")
+
+        assert db.in_transaction, "the transaction the caller opened must still be open"
+        cursor = await db.execute("SELECT edge_id FROM edge WHERE edge_id IN ('e-out', 'e-in')")
+        surviving_edges = {row["edge_id"] for row in await cursor.fetchall()}
+        assert surviving_edges == {"e-out", "e-in"}, "the edge deletes must have been undone"
+        cursor = await db.execute("SELECT COUNT(*) FROM embedding WHERE owner_id = 't1'")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 1, "the embedding delete must have been undone"
+        cursor = await db.execute("SELECT COUNT(*) FROM action WHERE source_thought_id = 't1'")
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 1, "the rejected action row itself must still be there too"
+        await db.rollback()
 
     async def test_cancellation_after_release_with_a_caller_transaction_quarantines(
         self,
