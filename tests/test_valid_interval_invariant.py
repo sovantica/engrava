@@ -7,10 +7,9 @@ construction. These tests pin the two non-obvious store paths:
 
 * **Read path** — ``get_thought`` / ``get_edges`` reconstruct domain models from
   raw rows (``_row_to_thought`` / ``_row_to_edge``), so a row that became
-  inverted *out of band* (written by an older build before this validation
-  existed, or edited directly in the database file) fails loudly with a
-  :class:`pydantic.ValidationError` on read rather than surfacing a corrupt
-  interval.
+  inverted *out of band* (for example edited directly in the database file)
+  fails loudly with a :class:`pydantic.ValidationError` on read rather than
+  surfacing a corrupt interval.
 * **Update path** — ``update_thought`` / ``update_edge`` re-validate the whole
   record via ``model_validate``, so any field change that would invert a stored
   interval is rejected before the row is written.

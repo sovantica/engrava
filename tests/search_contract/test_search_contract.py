@@ -93,9 +93,8 @@ def _ids(results: list[tuple[str, float]]) -> set[str]:
 class TestFindabilityInvariant:
     """Every stored turn is findable from its own distinctive terms.
 
-    This is the property the old implicit-AND normalizer broke: appending
-    ordinary function words to a few distinctive content terms must not stop a
-    turn from being returned.
+    Appending ordinary function words to a few distinctive content terms must
+    not stop a turn from being returned.
     """
 
     async def test_every_turn_found_by_its_distinctive_terms(

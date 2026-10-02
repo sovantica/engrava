@@ -67,7 +67,8 @@ from engrava.config import (
 from engrava.domain.enums import LifecycleStatus, Priority, ThoughtType
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.extensions.dreaming import DreamingExtension
-from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
+from engrava.infrastructure.sqlite.aiosqlite_connect import connect
+from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore, _close_quietly
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -490,7 +491,8 @@ async def _process_question(
     pass are captured (a before/after diff of the ARCHIVED set) and returned.
     """
     db_uri = _db_uri_for_question(question.question_id, db_dir)
-    async with aiosqlite.connect(db_uri) as db:
+    db = await connect(db_uri)
+    try:
         db.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(
             db=db,
@@ -525,6 +527,20 @@ async def _process_question(
             embedding_provider=embedding_provider,
             llm_judge=llm_judge,
         )
+    except BaseException:
+        # The question body already raised (or was cancelled) -- that is
+        # what the caller needs to see, so a failure in this cleanup close
+        # is secondary and goes through ``_close_quietly`` rather than
+        # replacing it. Mirrors ``_opened_db`` in ``engrava.cli.main``:
+        # ``aiosqlite.Connection.__aexit__`` is a bare, unconditional
+        # ``await close()`` and cannot draw this distinction itself.
+        await _close_quietly(db)
+        raise
+    else:
+        # The body succeeded. A close failure here is not secondary to
+        # anything -- it is the only error there is, so it must propagate
+        # normally rather than being logged and swallowed.
+        await db.close()
     return QuestionResult(
         question_id=question.question_id,
         question_type=question.question_type,

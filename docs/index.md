@@ -1,8 +1,10 @@
 # Engrava documentation
 
-Engrava is an embedded, async Python memory database: one SQLite file, no
-required server, and no LLM inside the core. These pages describe the v0.6.0
-product line. When operating an older release, use the documentation at that
+Engrava is an in-process, async Python memory database: one SQLite file and
+no generative-model call in its built-in path — a custom Dreaming signal or
+Memory Hygiene hook you register runs whatever code it contains, including a
+call to a generative model. These pages describe the v0.7.0 product
+line. When operating an older release, use the documentation at that
 release's Git tag and read the [Upgrade Guide](upgrade.md) before opening its
 database with a newer version.
 

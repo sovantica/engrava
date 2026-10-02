@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 @runtime_checkable
 class DreamingStoreProtocol(Protocol):
-    """The fourteen persistence capabilities required by Dreaming.
+    """The fifteen persistence capabilities required by Dreaming.
 
     The protocol deliberately models only operations used by consolidation.
     It lets Dreaming run against compatible stores without depending on a
@@ -39,6 +39,10 @@ class DreamingStoreProtocol(Protocol):
 
     async def create_thought(self, thought: ThoughtRecord) -> ThoughtRecord:
         """Persist a reflection created during consolidation."""
+        ...
+
+    async def delete_thought(self, thought_id: str) -> bool:
+        """Remove a thought, used to undo a reflection left incomplete by a failed create."""
         ...
 
     async def get_edges(

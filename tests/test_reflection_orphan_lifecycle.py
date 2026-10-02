@@ -387,10 +387,10 @@ async def _add_source(
 class TestSweepCoversAllActiveReflections:
     """The sweep retires orphans regardless of how many ACTIVE REFLECTIONs exist.
 
-    Regression: the sweep previously fetched only one capped page ordered by
-    ``updated_cycle DESC``. An orphan with a low ``updated_cycle`` (old,
-    untouched) fell beyond that page and was never retired, violating the
-    "for each ACTIVE REFLECTION" contract.
+    The sweep pages through ACTIVE REFLECTIONs, which ``list_thoughts`` orders
+    by ``updated_cycle DESC``, rather than reading one capped page. The test
+    below puts an orphan with a low ``updated_cycle`` (old, untouched) beyond
+    the first page and checks that it is still retired.
     """
 
     async def test_orphan_beyond_first_page_is_retired(
@@ -407,9 +407,9 @@ class TestSweepCoversAllActiveReflections:
         * ``r-orphan`` (``updated_cycle=1``) has only an ARCHIVED source -> a
           later page -> must transition ACTIVE -> ARCHIVED.
 
-        With ``candidates_limit=1`` and a single-row sweep page, the old capped
-        sweep only ever saw ``r-fresh`` and left ``r-orphan`` ACTIVE forever;
-        the paginated full-coverage sweep walks every page and retires it.
+        With ``candidates_limit=1`` and a single-row sweep page, ``r-fresh``
+        alone would fill the first page; the sweep continues to the next page
+        and retires ``r-orphan``.
         """
         # Force single-row pagination so two REFLECTIONs span two pages. The
         # sweep is store-owned (retire_orphan_reflections), so the page-size

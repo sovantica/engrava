@@ -20,8 +20,10 @@ questions. Keep them apart:
 | `valid_from` / `valid_until` | **valid time** | "During what real-world period is this fact *true*?" | **you** (optional) |
 | `created_cycle` / `updated_cycle` | **logical clock** | "At which agent *tick* did this appear?" | you (your cycle counter) |
 
-- **Transaction time** is bookkeeping: it never moves backwards and you don't
-  manage it. It tells you the order in which your system learned things.
+- **Transaction time** is bookkeeping: Engrava supplies it when you omit it,
+  ordinarily reflecting the order in which your system learned things. Both
+  fields are caller-settable, though, and an explicit update is not checked
+  against the previous value.
 - **Valid time** is about the world, not your database. "The user lived in
   Berlin from January to June" is a statement about reality — it is true for a
   window that has nothing to do with when you happened to write it down. You set
@@ -83,7 +85,7 @@ tables (the two record types that carry valid-time columns). A query that uses
 |---|---|---|---|
 | `valid_now` | none | the interval contains the current instant | tolerant (open bound = always in range) |
 | `valid_at <ts>` | one timestamp | the interval contains `<ts>` | tolerant |
-| `valid_within <start> <end>` | two timestamps | the interval **overlaps** `[<start>, <end>]` | tolerant |
+| `valid_within <start> <end>` | two timestamps | the interval **overlaps** the half-open window `[<start>, <end>)` — not the closed range the arguments might suggest | tolerant |
 | `valid_between <start> <end>` | two timestamps | the interval is **fully contained** in `[<start>, <end>]` | **strict** — open-bound rows are excluded |
 
 ### Worked semantics
@@ -103,8 +105,21 @@ The upper bound is **exclusive** (`valid_until` is the first instant the fact is
 | `valid_at '2026-07-01...'` | no match | upper bound is exclusive — `Jul 1` is already out |
 | `valid_at '2025-12-01...'` | no match | before `valid_from` |
 | `valid_within '2026-06-01...' '2026-12-01...'` | match | the intervals overlap (Jun–Jul) |
+| `valid_within '2026-07-01...' '2026-12-01...'` | no match | the window's own lower bound sits exactly at the fact's exclusive upper bound — the overlap is half-open on **both** intervals, so a shared boundary instant is not itself an overlap |
 | `valid_between '2025-01-01...' '2026-12-31...'` | match | `[Jan, Jul)` is fully inside the range |
 | `valid_between '2026-02-01...' '2026-12-31...'` | no match | starts before the range's lower bound |
+
+**A timestamp without an offset is read as UTC.** Every valid-time value you
+store, and every timestamp you give a temporal predicate, is first converted to
+one canonical UTC form (`2026-07-01T00:00:00+00:00`): an offset-aware value is
+converted to UTC, and a value with no offset is taken to be UTC already. Stored
+values and query timestamps are compared in that form, so `'2026-07-01T00:00:00'`,
+`'2026-07-01 00:00:00'` and `'2026-07-01T00:00:00+00:00'` are the same instant and
+the boundary rules above hold for each of them. For a time in another zone, give
+its offset (`'2026-07-01T02:00:00+02:00'`); without one, it is read as that clock
+time in UTC. Upgrading a database written by an earlier version converts its
+stored values once; the [upgrade notes](upgrade.md#06---07) say which values it
+leaves as they are.
 
 And for a fact with an **open** upper bound — valid `[2026-01-01, ∞)`:
 
@@ -175,6 +190,7 @@ with no known end (`valid_until` left open):
 
 ```python
 import asyncio
+import sys
 import uuid
 
 import aiosqlite
@@ -188,8 +204,24 @@ from engrava import (
 )
 
 
+async def _close_quietly(conn: aiosqlite.Connection) -> None:
+    """Close *conn*, reporting rather than raising if the close itself fails.
+
+    ``aiosqlite.Connection.__aexit__`` is an unconditional ``await
+    close()``, so a bare ``async with aiosqlite.connect(...)`` would let a
+    close failure here replace whatever the block above actually raised.
+    Used only from the exception path below -- the ordinary success-path
+    close still propagates a genuine failure normally.
+    """
+    try:
+        await conn.close()
+    except Exception as exc:  # noqa: BLE001 - deliberately broad: never replace the real error
+        print(f"warning: failed to close the database connection: {exc}", file=sys.stderr)
+
+
 async def main() -> None:
-    async with aiosqlite.connect(":memory:") as conn:
+    conn = await aiosqlite.connect(":memory:")
+    try:
         conn.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(conn)
         await store.ensure_schema()
@@ -214,6 +246,11 @@ async def main() -> None:
         assert fetched.valid_from == "2026-01-01T00:00:00+00:00"
         assert fetched.valid_until is None  # open upper bound
         print("valid_from:", fetched.valid_from, "valid_until:", fetched.valid_until)
+    except BaseException:
+        await _close_quietly(conn)
+        raise
+    else:
+        await conn.close()
 
 
 asyncio.run(main())
@@ -227,6 +264,7 @@ it, one after it does not:
 
 ```python
 import asyncio
+import sys
 import uuid
 
 import aiosqlite
@@ -242,8 +280,24 @@ from engrava import (
 )
 
 
+async def _close_quietly(conn: aiosqlite.Connection) -> None:
+    """Close *conn*, reporting rather than raising if the close itself fails.
+
+    ``aiosqlite.Connection.__aexit__`` is an unconditional ``await
+    close()``, so a bare ``async with aiosqlite.connect(...)`` would let a
+    close failure here replace whatever the block above actually raised.
+    Used only from the exception path below -- the ordinary success-path
+    close still propagates a genuine failure normally.
+    """
+    try:
+        await conn.close()
+    except Exception as exc:  # noqa: BLE001 - deliberately broad: never replace the real error
+        print(f"warning: failed to close the database connection: {exc}", file=sys.stderr)
+
+
 async def main() -> None:
-    async with aiosqlite.connect(":memory:") as conn:
+    conn = await aiosqlite.connect(":memory:")
+    try:
         conn.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(conn)
         await store.ensure_schema()
@@ -276,6 +330,11 @@ async def main() -> None:
         assert len(march.rows) == 1  # inside the valid window
         assert len(september.rows) == 0  # after valid_until
         print("March match:", len(march.rows), "September match:", len(september.rows))
+    except BaseException:
+        await _close_quietly(conn)
+        raise
+    else:
+        await conn.close()
 
 
 asyncio.run(main())
@@ -289,6 +348,7 @@ a query for an instant before the cut-off still finds it:
 
 ```python
 import asyncio
+import sys
 import uuid
 
 import aiosqlite
@@ -304,8 +364,24 @@ from engrava import (
 )
 
 
+async def _close_quietly(conn: aiosqlite.Connection) -> None:
+    """Close *conn*, reporting rather than raising if the close itself fails.
+
+    ``aiosqlite.Connection.__aexit__`` is an unconditional ``await
+    close()``, so a bare ``async with aiosqlite.connect(...)`` would let a
+    close failure here replace whatever the block above actually raised.
+    Used only from the exception path below -- the ordinary success-path
+    close still propagates a genuine failure normally.
+    """
+    try:
+        await conn.close()
+    except Exception as exc:  # noqa: BLE001 - deliberately broad: never replace the real error
+        print(f"warning: failed to close the database connection: {exc}", file=sys.stderr)
+
+
 async def main() -> None:
-    async with aiosqlite.connect(":memory:") as conn:
+    conn = await aiosqlite.connect(":memory:")
+    try:
         conn.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(conn)
         await store.ensure_schema()
@@ -344,6 +420,11 @@ async def main() -> None:
         assert still_there is not None
         assert still_there.valid_until == "2026-06-01T00:00:00+00:00"
         print("valid_now before:", len(before.rows), "after:", len(after.rows))
+    except BaseException:
+        await _close_quietly(conn)
+        raise
+    else:
+        await conn.close()
 
 
 asyncio.run(main())
@@ -353,7 +434,9 @@ asyncio.run(main())
 
 If your application only ever asks "what is true *now*", you do not need to do
 anything. Every record is created with `valid_from = None` and
-`valid_until = None`, which means "valid for all time", so:
+`valid_until = None`, which the point-in-time predicates below treat as
+"valid for all time" (`valid_between` is the deliberate exception — see
+[The four query predicates](#the-four-query-predicates)), so:
 
 - you never have to set a timestamp,
 - queries that use no temporal predicate are unchanged, and

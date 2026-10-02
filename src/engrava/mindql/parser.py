@@ -302,6 +302,14 @@ _CONDITION_RE = re.compile(
     r"(\w+)\s*(!=|>=|<=|=|>|<)\s*(?:'([^']*)'|(\S+))",
 )
 
+# Matches the verb and table-name tokens at the start of a FIND/COUNT query,
+# plus the whitespace that separates the table name from whatever follows.
+# Used to locate the verbatim clause remainder without re-splitting the whole
+# query on whitespace (which would collapse whitespace inside a quoted
+# value). Only the verb and table name are read through this pattern; they
+# are always bare words, never quoted.
+_VERB_AND_TABLE_RE = re.compile(r"\S+\s+\S+\s*")
+
 # Number of timestamp arguments each temporal predicate carries.
 _TEMPORAL_ARITY: dict[TemporalPredicateKind, int] = {
     TemporalPredicateKind.VALID_NOW: 0,
@@ -321,6 +329,39 @@ _OPERATOR_MAP: dict[str, MindQLOperator] = {
     ">=": MindQLOperator.GE,
     "<=": MindQLOperator.LE,
 }
+
+
+def _table_remainder(stripped: str, verb: str) -> str:
+    """Return the verbatim clause tail that follows the table token.
+
+    Only the verb and table-name tokens are read through whitespace
+    splitting — both are always bare words, never quoted. Everything after
+    them is returned exactly as written (only the whitespace separating it
+    from the table name is stripped), so a run of whitespace inside a later
+    quoted value is never collapsed.
+
+    Args:
+        stripped: The full query text with only its outer whitespace
+            trimmed. The caller has already confirmed it splits into at
+            least two whitespace-separated tokens.
+        verb: The command verb, used only to phrase the defensive error
+            below.
+
+    Returns:
+        The clause tail (WHERE / ORDER BY / LIMIT / OFFSET text), or an
+        empty string when nothing follows the table name.
+
+    Raises:
+        MindQLParseError: Defensively, if no verb+table head can be found.
+            Unreachable in practice: the caller only calls this once it has
+            confirmed at least two tokens exist.
+
+    """
+    head_match = _VERB_AND_TABLE_RE.match(stripped)
+    if head_match is None:  # pragma: no cover - defensive, see docstring
+        msg = f"{verb} requires a table name"
+        raise MindQLParseError(msg)
+    return stripped[head_match.end() :]
 
 
 def parse(
@@ -399,8 +440,12 @@ def parse(
         raise MindQLParseError(msg)
     table = _TABLE_MAP[table_raw]
 
-    # Parse remainder for WHERE / ORDER BY / LIMIT / OFFSET.
-    remainder = " ".join(tokens[2:])
+    # Parse remainder for WHERE / ORDER BY / LIMIT / OFFSET. Take the verbatim
+    # text after the table token instead of re-joining the whitespace-split
+    # ``tokens`` — a re-join collapses every run of whitespace (including one
+    # inside a quoted value, such as a double space, a tab, or a newline) to a
+    # single space, which silently changes what a quoted literal matches.
+    remainder = _table_remainder(stripped, verb)
     parsed = _parse_clauses(remainder, command=command)
 
     return MindQLQuery(
@@ -539,7 +584,10 @@ def _strip_trailing_clauses(
         text = text[: limit_match.start()].strip()
 
     order_by: tuple[tuple[str, str], ...] = ()
-    order_match = re.search(r"\bORDER\s+BY\s+(.+?)\s*$", text, re.IGNORECASE)
+    # DOTALL: the sort-item list is now the verbatim source text, so a
+    # newline used as a separator (outside any literal) must stay part of
+    # ``.`` instead of stopping the match, exactly as a space or tab would.
+    order_match = re.search(r"\bORDER\s+BY\s+(.+?)\s*$", text, re.IGNORECASE | re.DOTALL)
     if order_match:
         if command is not MindQLCommand.FIND:
             msg = "ORDER BY is only supported for FIND queries"

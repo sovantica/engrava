@@ -8,16 +8,17 @@ Two binding gates land here:
   least 80 % of the synthesis questions.  Measured via
   :func:`measure_synthesis_coverage`, which inspects post-dreaming
   store state directly and is invariant to retrieval-layer ranking
-  knobs.  Retrieval surfacing (AC-9c) is deferred to a follow-up
-  workstream.
+  knobs.
 
 * ``test_ac8_sanity_with_reflection_boost_off`` — AC-8b binding
-  pre-C4 gate.  The benchmark's binding ``SearchConfig`` sets
-  ``reflection_boost=1.0`` so REFLECTIONs do not displace direct OBS
-  on the sanity subset.  This test exercises that configuration
-  explicitly so a future regression in the default (e.g. the engrava
-  core re-enabling boost > 1.0 somewhere) surfaces as a benchmark
-  failure rather than silent AC-8 drift.
+  gate.  The benchmark's binding ``SearchConfig`` sets
+  ``reflection_boost=1.0``, which leaves REFLECTION scores unscaled
+  but does not keep REFLECTIONs out of the results: the boost is a
+  multiplier, not an enable/disable toggle, so a REFLECTION can still
+  displace a direct OBS from the top-K and the tolerance is 0.05, not
+  zero.  This test passes that configuration explicitly to both runs,
+  so the sanity subset is measured under the binding configuration
+  rather than under whatever the ``SearchConfig`` default is.
 """
 
 from __future__ import annotations
@@ -62,22 +63,16 @@ _SANITY_SCENARIO_NAMES = frozenset(
     },
 )
 _COVERAGE_FLOOR = 0.80
-# AC-9b v0.3.0 tolerance per spec v1.6 amendment.  Pre-amendment was
-# 0.02 but the curated direct-only subset measured 0.033 in C4.1; the
-# 0.05 ceiling carries a 34 % safety margin.  Same REFLECTION
-# displacement mechanism as the AC-8 v1.4 amendment (boost is a
-# multiplier, not an on/off toggle).  Follow-up evaluator-ranking
-# workstream tightens back to 0.02.
+# AC-9b tolerance on the direct-only subset.  REFLECTIONs take part in
+# retrieval at ``reflection_boost=1.0`` (the boost is a multiplier, not
+# an on/off toggle), so a REFLECTION can displace a direct OBSERVATION
+# from the top-K and the delta need not be zero.  The subset holds 30 questions:
+# one changed answer moves recall by 1/30 = 0.033, inside the ceiling;
+# two changed the same way move it by 0.067, outside.
 _DIRECT_DELTA_CEILING = 0.05
-# v0.3.0 tolerance per spec v1.4 amendment.  Pre-amendment value was
-# 0.02 but empirically REFLECTIONs participate in retrieval at parity
-# even with ``reflection_boost=1.0`` — the boost is a multiplier on
-# top of the intrinsic score, not an enable/disable toggle.  Measured
-# delta post-NA-1 sits at 0.042 so the 0.05 ceiling carries a small
-# safety margin without claiming neutrality the engrava-core ranking
-# does not actually provide at v0.3.0.  The v0.4.0 follow-up
-# workstream tightens this back to 0.02 once REFLECTION ranking is
-# refined.
+# AC-8b tolerance on the sanity subset, for the same reason.  The subset
+# holds 24 questions: one changed answer moves recall by 1/24 = 0.042,
+# inside the ceiling; two changed the same way move it by 0.083, outside.
 _SANITY_DELTA_CEILING = 0.05
 
 
@@ -131,13 +126,11 @@ class TestSynthesisCoverage:
 class TestSanityAc8WithBoostDisabled:
     """Binding AC-8b — sanity subset stays within the v0.3.0 tolerance.
 
-    Spec v1.4 relaxed the ceiling from 0.02 to 0.05 with explicit
-    empirical rationale: ``reflection_boost=1.0`` is a multiplier on
-    the REFLECTION's intrinsic retrieval score, not an
-    enable/disable toggle, so REFLECTIONs still rank in top-K on
-    sanity-subset queries by their own vector / FTS merit.  The
-    v0.4.0 follow-up workstream tightens this back to 0.02 once
-    REFLECTION ranking is refined; this test re-binds at 0.02 then.
+    ``reflection_boost=1.0`` is a multiplier on the REFLECTION's
+    intrinsic retrieval score, not an enable/disable toggle, so
+    REFLECTIONs still rank in top-K on sanity-subset queries by their
+    own vector / FTS merit.  The 0.05 ceiling admits one changed
+    answer out of 24 (see ``_SANITY_DELTA_CEILING``).
     """
 
     @pytest.mark.asyncio
@@ -146,7 +139,7 @@ class TestSanityAc8WithBoostDisabled:
         embedding_provider: EmbeddingProviderProtocol,
     ) -> None:
         # 24 conversations on the anti-cherry-pick neutrals — enough
-        # sample-size resolution for the 0.02 band to be meaningful
+        # sample-size resolution for the 0.05 band to be meaningful
         # (8-conversation runs leave every difference at 1/8 = 0.125
         # and the band becomes statistically toothless).
         sanity_mix = dict.fromkeys(_SANITY_SCENARIO_NAMES, 1.0)
@@ -159,9 +152,8 @@ class TestSanityAc8WithBoostDisabled:
         )
 
         # Explicit binding configuration — passes the search_config
-        # the benchmark uses in production rather than relying on the
-        # engrava-core default (which could regress to boost > 1.0
-        # without this gate noticing).
+        # the benchmark runner uses, so both runs are measured under
+        # it rather than under the ``SearchConfig`` default.
         boost_off = SearchConfig(reflection_boost=1.0)
         off = await evaluate_run(
             dataset,
@@ -177,28 +169,19 @@ class TestSanityAc8WithBoostDisabled:
         )
         delta = abs(on.aggregate_recall_at_k - off.aggregate_recall_at_k)
         assert delta <= _SANITY_DELTA_CEILING, (
-            f"AC-8b v0.3.0 tolerance ({_SANITY_DELTA_CEILING:.2f}) "
-            f"exceeded: {delta:.3f}.  The v0.4.0 follow-up "
-            f"workstream tightens this back to 0.02 once REFLECTION "
-            f"ranking is refined; until then a regression past the "
-            f"0.05 ceiling here means a NEW source of dreaming-side "
-            f"interference on sanity retrieval, not just the known "
-            f"intrinsic-score participation."
+            f"AC-8b v0.3.0 tolerance ({_SANITY_DELTA_CEILING:.2f}) exceeded: {delta:.3f}."
         )
 
 
 class TestDirectSubsetNeutrality:
     """Binding AC-9b — direct-retrieval subset stays within v0.3.0 tolerance.
 
-    Spec v1.6 relaxed the ceiling from 0.02 to 0.05 with the same
-    empirical rationale as the v1.4 AC-8 amendment: REFLECTIONs
-    participate in retrieval at parity (``reflection_boost=1.0`` is
-    a multiplier on the intrinsic score, not an enable/disable
-    toggle) and occasionally displace direct-retrieval OBSERVATIONs
-    from top-K.  Measured 0.033 on the curated direct subset
-    post-NA-1; 0.05 carries a 34 % safety margin.  The v0.4.0
-    follow-up workstream tightens this back to 0.02 once
-    REFLECTION ranking is refined.
+    REFLECTIONs participate in retrieval at parity
+    (``reflection_boost=1.0`` is a multiplier on the intrinsic score,
+    not an enable/disable toggle) and can displace direct-retrieval
+    OBSERVATIONs from top-K, so the ceiling is 0.05, not zero.  The
+    subset holds 30 questions: one changed answer (1/30 = 0.033) is
+    inside the ceiling, two changed the same way (0.067) are outside it.
     """
 
     @pytest.mark.asyncio
@@ -230,18 +213,12 @@ class TestDirectSubsetNeutrality:
         )
         delta = abs(on.aggregate_recall_at_k - off.aggregate_recall_at_k)
         assert delta <= _DIRECT_DELTA_CEILING, (
-            f"AC-9b v0.3.0 tolerance ({_DIRECT_DELTA_CEILING:.2f}) "
-            f"exceeded: {delta:.3f}.  The v0.4.0 follow-up "
-            f"workstream tightens this back to 0.02 once REFLECTION "
-            f"ranking is refined; a regression past the 0.05 ceiling "
-            f"here means a NEW source of dreaming-side interference "
-            f"on direct retrieval, not just the known intrinsic-score "
-            f"participation."
+            f"AC-9b v0.3.0 tolerance ({_DIRECT_DELTA_CEILING:.2f}) exceeded: {delta:.3f}."
         )
 
 
 class TestRunnerWalltimeBudget:
-    """AC-11 v0.3.0 budget on the default CLI invocation.
+    """The v0.3.0 walltime budget on the default CLI invocation.
 
     Opt-in via ``BENCH_SLOW=1`` because the test spawns the CLI as a
     subprocess and pays the full evaluator + dreaming-consolidation
@@ -249,19 +226,10 @@ class TestRunnerWalltimeBudget:
     preserve a fast developer feedback loop; nightly /
     pre-merge-gate jobs flip the env var on.
 
-    Pre-amendment budget was 120 seconds.  Spec v1.6 relaxed to 300
-    seconds for v0.3.0 because the dual-section CLI (binding ACs
-    section by default, ``--with-reproducibility`` opt-in) runs
-    four full evaluator pairs that cumulatively exceed the 120 s
-    budget on reference hardware.  Spec v1.7 relaxed further to
-    360 seconds with explicit empirical rationale: two
-    deterministic standalone CLI runs on Windows developer hardware
-    measured 312.79 s and 321.79 s (median ~317 s), 12-15 % under
-    the new 360 s ceiling.  Reference Apple Silicon hardware is
-    expected to land ~250 s based on relative single-core throughput.
-    The
-    follow-up evaluator-optimisation workstream tightens this back
-    to 120 s.
+    The default invocation runs the four binding measurements (one
+    synthesis-coverage run and three OFF / ON evaluator pairs;
+    ``--with-reproducibility`` is opt-in and adds a reproducibility
+    snapshot).  The ceiling on the whole run is 360 seconds.
     """
 
     def test_runner_walltime_budget(self) -> None:
@@ -286,8 +254,4 @@ class TestRunnerWalltimeBudget:
         assert result.returncode == 0, (
             f"CLI exited {result.returncode} (expected 0).  stderr tail: {result.stderr[-500:]!r}"
         )
-        assert elapsed <= 360, (
-            f"AC-11 v0.3.0 walltime budget (360 s) exceeded: "
-            f"{elapsed:.1f}s.  The v0.4.0 evaluator-optimisation "
-            f"workstream tightens this back to 120 s."
-        )
+        assert elapsed <= 360, f"The v0.3.0 walltime budget (360 s) exceeded: {elapsed:.1f}s."

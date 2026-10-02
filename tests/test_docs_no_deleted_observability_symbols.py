@@ -1,4 +1,4 @@
-"""Regression guard — Free public docs must not reference removed observability code.
+"""Free public docs must not reference removed observability code.
 
 Observability hook protocol, dispatcher, gates, and event dataclasses were
 removed from the public engrava package in v0.3.0. Free engrava package docs

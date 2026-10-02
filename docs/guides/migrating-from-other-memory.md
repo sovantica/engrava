@@ -27,9 +27,9 @@ common concepts onto Engrava:
 |---|---|---|
 | "Memory" / "record" / "document" | **`ThoughtRecord`** | The unit you store. Has `essence` (short) + `content` (full). |
 | "Memory type" / "role" | **`thought_type`** (`OBSERVATION`, `BELIEF`, `TASK`, …) | A small fixed taxonomy; see [Core Concepts](../concepts.md). |
-| Free-form metadata / `metadata={...}` | **`ThoughtRecord.metadata`** | An arbitrary JSON dict, persisted and round-tripped. |
+| Free-form metadata / `metadata={...}` | **`ThoughtRecord.metadata`** | A dict with `str` keys whose values are `str`, `int`, finite `float`, `bool`, `None` or nested dicts of the same, persisted and round-tripped. Lists, tuples, sets, custom objects, non-`str` keys, `NaN` / `Infinity` and serialised metadata over 64 KiB are rejected (a 4 KiB soft warning); see [the `metadata` field](../api-reference.md#metadata-field). |
 | "User id" / "session id" / namespace | A key inside **`metadata`** (or `source`) | Engrava has no built-in tenant field — see [scoping](#filtering-scoping--multi-tenancy). |
-| Relationship / link between memories | **`EdgeRecord`** (typed, weighted) | First-class graph. Letting edges feed ranking is **opt-in**: `default_graph_weight` is `0.0`, so imported relationships change no ranking until you raise it — see [Search](../search.md). |
+| Relationship / link between memories | **`EdgeRecord`** (typed, weighted) | First-class graph. Letting edges feed ranking is **opt-in**: `default_graph_weight` is `0.0`, so imported relationships do not feed ranking until you raise it — see [Search](../search.md). The one default exception is candidate-pool expansion over `CONSOLIDATED_FROM` edges out of `REFLECTION` thoughts, controlled separately by `graph_expansion_enabled`; it is on by default and reads those edges only when a reflection ranks among the top candidates. |
 | Embedding / vector | Stored on write only with `embedding_provider=...` **and** `auto_embed=True`; otherwise call `store_embedding(thought_id, vector)` yourself | See the [Embeddings guide](embeddings.md). |
 | Vector / similarity search | **`search_similar(query_vector, …)`** | Needs a ready query vector. |
 | Keyword / BM25 search | **`search_fts(query, …)`** | Returns `list[(thought_id, score)]`. |
@@ -114,6 +114,7 @@ small fake export):
 
 ```python
 import asyncio
+import sys
 import uuid
 
 import aiosqlite
@@ -153,8 +154,24 @@ async def bulk_import(store, items: list[dict[str, str]]) -> int:
     return await store.count_thoughts()
 
 
+async def _close_quietly(conn: aiosqlite.Connection) -> None:
+    """Close *conn*, reporting rather than raising if the close itself fails.
+
+    ``aiosqlite.Connection.__aexit__`` is an unconditional ``await
+    close()``, so a bare ``async with aiosqlite.connect(...)`` would let a
+    close failure here replace whatever the block above actually raised.
+    Used only from the exception path below -- the ordinary success-path
+    close still propagates a genuine failure normally.
+    """
+    try:
+        await conn.close()
+    except Exception as exc:  # noqa: BLE001 - deliberately broad: never replace the real error
+        print(f"warning: failed to close the database connection: {exc}", file=sys.stderr)
+
+
 async def main() -> None:
-    async with aiosqlite.connect(":memory:") as conn:
+    conn = await aiosqlite.connect(":memory:")
+    try:
         conn.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(conn)
         await store.ensure_schema()
@@ -163,6 +180,11 @@ async def main() -> None:
         # 4 exported rows, one duplicate collapsed -> 3 stored.
         assert total == 3
         print(f"Imported {total} thoughts.")
+    except BaseException:
+        await _close_quietly(conn)
+        raise
+    else:
+        await conn.close()
 
 
 if __name__ == "__main__":
@@ -208,12 +230,18 @@ capability. With the seam disabled — the default — the recipe above is compl
 as written.
 
 For large corpora, import in batches (e.g. a few thousand rows per
-`suspend_auto_commit()` block) to keep each transaction short — long
-transactions block the background SQLite thread (see
+`suspend_auto_commit()` block) to keep each transaction short. A slow SQL
+statement blocks the background SQLite thread; an open transaction alone does
+not, but the window holds the store's write lock, so a different task's write
+waits for it, for at most `write_lock_acquire_timeout_seconds`, and raises
+`WriteLockTimeoutError` after that — a long hold can make the waiting write
+fail instead of complete (see
 [Known Limitations](../known-limitations.md#aiosqlite-proxy-architecture)).
-If you have embeddings configured, note that each new thought is embedded on
-write (see the [Embeddings guide](embeddings.md)), so a bulk load pays the
-embedding cost up front — pre-compute vectors or import in batches accordingly.
+Configuring an embedding provider is not enough to embed on write: a new thought
+is embedded only when both `embedding_provider=...` and `auto_embed=True` are set
+(`auto_embed` defaults to `False`; see the [Embeddings guide](embeddings.md)). If
+you have enabled both, a bulk load pays the embedding cost up front — pre-compute
+vectors or import in batches accordingly.
 See the [Performance guide](../performance.md#write-throughput-and-bulk-ingest)
 for the throughput levers in detail.
 
@@ -262,7 +290,7 @@ own lock, so retrieval is naturally scoped and tenants are physically isolated.
 from engrava import EngravaManager, load_config
 
 config = load_config("engrava.yaml")
-async with EngravaManager.from_config(config.services) as mgr:
+async with await EngravaManager.from_config(config.services) as mgr:
     store_u1 = await mgr.get_store("u1")  # u1.db
     result = await store_u1.search_hybrid("dark mode", top_k=5)
 ```

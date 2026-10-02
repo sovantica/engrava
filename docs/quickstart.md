@@ -2,6 +2,23 @@
 
 Get up and running with engrava in 5 minutes.
 
+## Which profile do you want?
+
+Before your first `pip install`, decide whether a machine-learning model
+should ever load into your process — the base install itself never pulls
+one in.
+
+| If you want... | Install | Cost |
+|---|---|---|
+| Keyword search only, nothing else to think about | `pip install engrava` | none — semantic search is inert, not degraded |
+| Semantic search, model stays out of your process | `pip install 'engrava[embeddings-ollama]'` + a running [Ollama](https://ollama.com) | one extra service to run; no local download |
+| Semantic search, offline after first use (only with 2 env vars set) | `pip install 'engrava[embeddings-local]'` | a large one-time download (`sentence-transformers` + `torch`, ~550+ MB) plus a first-use model download |
+
+Each option ships as a ready-to-copy `engrava.yaml` — see
+[Configuration → Quick-start profiles](configuration.md#quick-start-profiles)
+for the exact files, what each trades off, and where every number above came
+from.
+
 ## Installation
 
 Engrava requires Python `>=3.11`; the maintained CI matrix covers Python 3.11,
@@ -14,17 +31,25 @@ pip install engrava
 ```
 
 For vector search and the bundled walkthrough you also need a local
-embedding encoder — install the `embeddings-local` extra:
+embedding encoder — install the `embeddings-local` extra (the `local`
+profile above):
 
 ```bash
 pip install 'engrava[embeddings-local]'
 ```
 
-The extra pulls `sentence-transformers` and `torch` and downloads a
-small (~30-90 MB) encoder model on first use. The encoder is **not** a
-language model: it turns text into a fixed-size vector. There are no
-API keys, and there is no network traffic after the first download.
-Engrava itself does not call any LLM at any time.
+The extra pulls `sentence-transformers` and `torch` — a large one-time
+download (~550+ MB on the PyPI Linux/x86_64 wheel for Python 3.11; see
+[Configuration → Quick-start profiles](configuration.md#quick-start-profiles)
+for the exact, platform-scoped numbers) — plus a further encoder model
+download on first use. The encoder is **not** a language model: it
+turns text into a fixed-size vector. There are no API keys, and — once
+`HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` are set — no network traffic
+after the first download (see
+[Configuration → `local`](configuration.md#local--sentence-transformers-offline-after-warm-up)
+for why those two variables are needed). Engrava's built-in path
+does not call any LLM; a custom Dreaming signal or Memory Hygiene hook you
+register runs whatever code it contains, including a call to one.
 
 ## Run the bundled walkthrough
 
@@ -99,25 +124,53 @@ reports the REFLECTION coverage dreaming produces. See
 
 ```python
 import asyncio
+import sys
 import aiosqlite
 from engrava import SqliteEngravaCore
+
+
+async def _close_quietly(conn: aiosqlite.Connection) -> None:
+    """Close *conn*, reporting rather than raising if the close itself fails.
+
+    ``aiosqlite.Connection.__aexit__`` is an unconditional ``await
+    close()``, so a bare ``async with aiosqlite.connect(...)`` would let a
+    close failure here replace whatever the block above actually raised.
+    Used only from the exception path below -- the ordinary success-path
+    close still propagates a genuine failure normally.
+    """
+    try:
+        await conn.close()
+    except Exception as exc:  # noqa: BLE001 - deliberately broad: never replace the real error
+        print(f"warning: failed to close the database connection: {exc}", file=sys.stderr)
+
 
 async def main() -> None:
     # SqliteEngravaCore wraps an open aiosqlite connection.
     # Use ":memory:" for experimentation, or a file path to persist.
-    async with aiosqlite.connect(":memory:") as conn:
+    conn = await aiosqlite.connect(":memory:")
+    try:
         conn.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(conn)
         await store.ensure_schema()
         print("Store ready!")
+    except BaseException:
+        await _close_quietly(conn)
+        raise
+    else:
+        await conn.close()
 
 asyncio.run(main())
 ```
 
-> The rest of this page assumes you are inside the `async with` block above,
-> so `store` and `conn` are in scope. For a configuration-driven alternative,
+> The rest of this page assumes you are inside the `try` block above, so
+> `store` and `conn` are in scope. For a configuration-driven alternative,
 > use `await SqliteEngravaCore.from_config("engrava.yaml")` (it opens and owns
-> the connection for you).
+> the connection for you). A bare `async with aiosqlite.connect(...)` looks
+> like a shortcut for the same thing, but its `__aexit__` unconditionally
+> calls `close()` — if the block raised, a close failure there replaces the
+> real error. See ["Graceful shutdown"](deployment.md#graceful-shutdown) for
+> why the explicit `try`/`except`/`else` shape above is what production code
+> should use instead.
 
 ## Store and search a memory — the short way
 
@@ -294,6 +347,47 @@ engrava --db my_thoughts.db snapshot -o backup.jsonl
 # Restore from backup
 engrava --db my_thoughts.db restore -i backup.jsonl
 ```
+
+### Store and search a memory, from a shell
+
+`remember` and `recall` are the CLI's own two-call path — the shell
+equivalent of `store.remember()` / `store.recall()` above, for a script,
+agent harness, or CI job that has no Python of its own in the loop. `remember`
+creates `my_thoughts.db` if it does not exist yet (and says so on stderr);
+`recall` never does — it exits `3` naming the path instead of silently
+reporting zero hits against a database nobody created.
+
+```bash
+$ engrava --db my_thoughts.db remember "User prefers concise answers"
+Created database: my_thoughts.db
+091aa106-fcc0-45a3-a19b-d335ad05ea45
+
+$ engrava --db my_thoughts.db remember "User works in Berlin" --type OBSERVATION --priority P2
+f4620859-3dfa-4f13-8d2e-d35df62dbba4
+
+$ engrava --db my_thoughts.db recall "concise answers"
+thought_id                            score               essence
+------------------------------------  ------------------  ----------------------------
+091aa106-fcc0-45a3-a19b-d335ad05ea45  0.4714285714285715  User prefers concise answers
+```
+
+A broader query such as `"what does the user prefer?"` also matches the
+second, unrelated thought through the shared word "user" — hybrid search
+ranks by relevance, it does not require every query word to appear.
+
+`link` builds the edge the same way `create_edge()` does above, without the
+Python:
+
+```bash
+$ engrava --db my_thoughts.db link 091aa106-fcc0-45a3-a19b-d335ad05ea45 f4620859-3dfa-4f13-8d2e-d35df62dbba4 --type ASSOCIATED --weight 0.8
+b190dc41-9c87-4a66-9291-d70974fd2342
+```
+
+All three honour `--config` — a database resolved from `engrava.yaml`'s
+`database.path` is opened through `from_config()`, so a configured embedding
+provider, hybrid-search weights, and journal settings apply exactly as they
+would to a direct library call. See [CLI reference](cli.md#remember) for the
+full option list, exit codes, and `--json` schemas.
 
 ## Next Steps
 

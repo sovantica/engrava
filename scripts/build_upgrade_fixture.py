@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import sys
-
+import tempfile
+from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 if str(REPOSITORY_ROOT) not in sys.path:
@@ -17,7 +17,9 @@ from tests.upgrade.fixtures import create_venv, install_package, populate_fixtur
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--from-spec", required=True, help="Package spec used to build the fixture.")
+    parser.add_argument(
+        "--from-spec", required=True, help="Package spec used to build the fixture."
+    )
     parser.add_argument("--out", required=True, help="Output SQLite database path.")
     parser.add_argument(
         "--editable",
@@ -32,8 +34,6 @@ def main() -> int:
     args = parse_args()
     output_path = Path(args.out).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    import tempfile
 
     with tempfile.TemporaryDirectory(prefix="engrava-upgrade-fixture-") as temp_dir:
         venv_dir = Path(temp_dir) / "venv"

@@ -18,6 +18,13 @@ recency reference nor a cycle provider can resolve recency, or no embeddings
 can resolve the vector arm),
 its weight is **redistributed proportionally** across active signals.
 
+**The table's defaults apply only when a `SearchConfig` is passed to the
+store.** `SqliteEngravaCore(conn, ...)` with no `search_config` argument
+resolves `default_recency_weight` to `0.0`, not `0.10` — the two are separate
+defaults that disagree, and recency is silently inert on a store built the
+plain way until you pass a `SearchConfig` explicitly (or an explicit per-call
+`recency_weight`).
+
 ## Graceful Degradation
 
 - FTS5 unavailable or empty query → FTS skipped.
@@ -25,22 +32,40 @@ its weight is **redistributed proportionally** across active signals.
 - No explicit `current_cycle`, no configured cycle provider, and no
   `recency_now` → recency skipped.
 - `priority_weight` is `0.0` → priority skipped.
-- `graph_weight` is `0.0` → graph skipped, zero overhead.
+- `graph_weight` is `0.0` → the graph ranking signal is skipped and costs
+  nothing. (Reflection-source candidate expansion is a separate step; see
+  [below](#reflection-source-candidate-expansion).)
 - All signals disabled → a dedicated query-less window of `top_k` rows (not a
   `list_thoughts` call), pre-ordered `updated_cycle DESC` so the truncation keeps
-  the freshest rows. With no cycle reference to decay against, every row scores a
-  flat `0.0`; a `current_cycle` supplied at `recency_weight=0.0` still yields
-  cycle-decayed scores rather than flat ones, though the resulting order is the
-  same either way, because the window is already ordered by `updated_cycle` and
-  the decay rises with it. The compiled `filters=` / `visibility=` predicate is
-  applied in-query and archived thoughts stay excluded unless `include_archived`
-  is set, so this path enforces the same eligibility as the FTS and vector arms.
+  the freshest rows. With no cycle reference, every row scores a flat `0.0`. A
+  reference supplied at `recency_weight=0.0` — `current_cycle` or `recency_now`
+  — is **accepted but inert** here too: the weight gates recency on this
+  query-less path the same way it does everywhere else, so the row still scores
+  a flat `0.0` rather than a decayed one. If another signal is active on this
+  same path (`priority_weight` defaults on), zeroing `recency_weight` can
+  change which row ranks first, not just shrink the scores, because the
+  now-flat recency term stops competing with it. The compiled `filters=` /
+  `visibility=` predicate is applied in-query and archived thoughts stay
+  excluded unless `include_archived` is set, so this path enforces the same
+  eligibility as the FTS and vector arms.
 - That same query-less window serves whenever **both** the FTS and vector arms
   are out, even if recency survives — recency stays active only with a reference
   **and** a recency weight above `0.0`. The window is then ordered and scored
   along the active recency axis: `COALESCE(updated_at, created_at) DESC` with
   transaction-time decay when the transaction axis is active, `updated_cycle DESC`
   with cognitive-cycle decay otherwise (the two axes are mutually exclusive).
+- **A fallback result is still a result:** `collapse_key` /
+  `collapse_max_per_unit` and `reflection_topk_cap` apply to this query-less
+  window exactly as they do to an ordinary FTS/vector-active search — a
+  fragmented unit is still collapsed to its best-ranked row(s), and
+  REFLECTIONs are still capped at `top_k * reflection_topk_cap`, with the
+  same off-list-candidate backfill. When `collapse_key` is set (or the
+  reflection cap is below `1.0`, which the default `0.3` is), the fallback
+  also widens its own row window by `search.collapse_pool_factor` beyond
+  `top_k`, the same bounded headroom collapse and the cap already get from
+  the FTS/vector arms' larger `fts_top_k` / `vector_top_k` budgets — so
+  backfill has distinct candidates to draw from. See the "De-fragmentation /
+  collapse" and `reflection_topk_cap` sections below.
 
 The vector arm distinguishes two bad-query-vector cases:
 
@@ -95,8 +120,11 @@ The exclusion is **reversible**:
 > **Behaviour change.** Marking a thought `ARCHIVED` — including via the TTL
 > `archive` strategy — now removes it from default retrieval; previously an
 > archived thought still surfaced in search. It is still counted by
-> `count_thoughts()` / `list_thoughts()` (those are not ranked retrieval); to
-> exclude it there, filter on `lifecycle_status` yourself. The retired-reflection
+> `count_thoughts()` / `list_thoughts()` (those are not ranked retrieval),
+> provided it is not also expired — both methods default to excluding expired
+> rows regardless of lifecycle status, so an archived-and-expired row needs
+> `include_expired=True` too. To exclude an archived row deliberately, filter
+> on `lifecycle_status` yourself. The retired-reflection
 > freshness floor is independent — a retired `REFLECTION` stays excluded even under
 > `include_archived=True`. See [Data lifecycle](data-lifecycle.md#lifecycle-states)
 > and [Known Limitations](known-limitations.md#archived-thoughts-and-default-retrieval).
@@ -205,14 +233,19 @@ score and the connecting edge weight.
 ### Algorithm
 
 ```
+candidate_scores = { C: max(fts_score[C], vector_score[C]) for C in fusion pool }  # pool members only
 For each candidate C in the fusion pool:
   neighbours = get_edges(C, direction="BOTH", limit=max_neighbors)
                ordered by edge.weight DESC (deterministic)
   For each (edge, neighbour):
-    neighbour_base = max(fts_score[neighbour], vector_score[neighbour])
+    neighbour_base = candidate_scores.get(neighbour, 0.0)  # 0 if neighbour is off-pool
     boost[C] += edge.weight × neighbour_base × graph_edge_decay
 final_score[C] += graph_weight × boost[C]
 ```
+
+A neighbour outside the fusion pool contributes `0`, not its own fts/vector
+score — only pool members' base scores propagate (see
+[Graph-aware search](dreaming.md#graph-aware-search)).
 
 Key properties:
 
@@ -245,10 +278,20 @@ result = await store.search_hybrid(
 
 ### Performance
 
-When `graph_weight=0.0` (default), no graph queries are executed and
-there is zero performance impact.  When active, the implementation
-uses a single batch SQL query bounded by
-`O(top_k × max_neighbors_per_candidate)` rows.
+When `graph_weight=0.0` (default), the graph ranking signal is off: its
+1-hop neighbour query is not executed and it adds no ranking cost. This does
+not switch off [reflection-source candidate
+expansion](#reflection-source-candidate-expansion), which is controlled
+separately by `graph_expansion_enabled` (default `true`) and reads
+`CONSOLIDATED_FROM` edges whenever a `REFLECTION` ranks among the top
+candidates. When the ranking signal is active, the implementation batches the
+candidate pool into fixed-size ID chunks (one query per chunk, needed to stay
+under SQLite's bound-parameter ceiling once the pool is large) and each
+chunk's query itself is bounded at the SQL layer to at most
+`max_neighbors_per_candidate` rows per candidate — via a ranking window over
+that candidate's edges, not a limit applied in Python after fetching
+everything — so the total rows returned across all chunks is
+`O(top_k × max_neighbors_per_candidate)`, not the size of the full adjacency.
 
 ### Observability
 

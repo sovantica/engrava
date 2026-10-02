@@ -59,7 +59,10 @@ garbage-collection stage removes the row.
 > by the TTL `archive` strategy or manually), whether or not that loop is enabled.
 > It is **still counted** by `count_thoughts()` /
 > `list_thoughts()` (those are not ranked retrieval) — filter on `lifecycle_status`
-> yourself to exclude it there. **Expired** thoughts are likewise excluded from
+> yourself to exclude it there — **provided it is not also expired**: both methods
+> default to excluding expired rows regardless of lifecycle status, so an
+> archived row whose `expires_at` has passed still needs `include_expired=True`
+> to be counted or listed. **Expired** thoughts are likewise excluded from
 > the four ranked retrieval methods listed above; those methods do not offer an
 > `include_expired` escape hatch. `include_expired=True` applies only to
 > `list_thoughts()` and `count_thoughts()`. A retired `REFLECTION` (one whose
@@ -81,6 +84,14 @@ When more than one is available at creation, precedence is explicit and
 deterministic: the `expires_after_seconds` argument wins, then the record's own
 `expires_at`, then the configured store default. The default is used only when
 neither per-call nor per-record expiry was supplied.
+
+`expires_at` is stored in one canonical UTC form (`2026-07-01T00:00:00+00:00`),
+whichever ISO-8601 form you pass: an offset-aware value is converted to UTC, and
+a value with no offset is read as UTC. Expiry compares that stored value with the
+current UTC time, so `2026-07-01 00:00:00`, `20260701T000000` and
+`2026-07-01T02:00:00+02:00` all expire at the same instant. Upgrading a database
+written by an earlier version converts its stored values once; the
+[upgrade notes](upgrade.md#06---07) say which values it leaves as they are.
 
 Expiry is **not** automatic on a timer. Expired thoughts remain until a cleanup
 pass runs (see [running cleanup](#running-cleanup) below). By default, expired
@@ -125,17 +136,26 @@ print(result.strategy_applied)  # "archive" or "delete" (per config)
 print(result.timestamp)  # ISO-8601 time of the pass
 ```
 
-You can also have the store run cleanup automatically every *N* operations via
-`ttl.check_every_n_operations` (default `0` = manual only).
+You can also have the store run cleanup automatically via
+`ttl.check_every_n_operations` (default `0` = manual only): the counter
+advances on thought create/update calls, not on every store operation, and
+triggers a cleanup pass once it reaches *N*.
 
 **From the CLI:** `engrava gc --expired` runs the expiry cleanup per your TTL
 strategy. What it does next depends on that strategy:
 
 ```bash
 engrava gc --expired            # run expiry cleanup (per ttl.strategy)
-engrava gc --expired --dry-run  # show what would happen, change nothing
+engrava gc --expired --dry-run  # preview only, changes nothing
 engrava gc                      # delete ARCHIVED thoughts + their edges/embeddings/actions
 ```
+
+**`--dry-run` does not mirror the real run's stop condition under
+`ttl.strategy: archive`.** A real `gc --expired` run stops after archiving
+when it archived at least one row (below), but `--dry-run` always also
+previews the archived-collection step when pre-existing `ARCHIVED` rows
+exist — even on a preview where expired rows would have been archived and
+the corresponding real run would have stopped there.
 
 - **With `ttl.strategy: delete`:** the expired rows are deleted outright, and the
   same pass then garbage-collects any pre-existing `ARCHIVED` thoughts.
@@ -176,8 +196,8 @@ archived data is finally deleted from the live table.
 ## GDPR and hard deletion
 
 If you must erase a user's data (e.g. a GDPR erasure request), be aware that
-**neither archiving nor a single delete is sufficient on its own**. Three places
-can retain the content:
+**neither archiving nor a single delete is sufficient on its own**. The
+procedure below addresses the following:
 
 1. **Archive does not erase.** Under the default `ttl.strategy: archive`, an
    "expired" thought is only marked `ARCHIVED` — the row and its `content` remain
@@ -189,33 +209,49 @@ can retain the content:
    the row deliberately, run a **separate** `engrava gc`, or use
    `ttl.strategy: delete` so the row is deleted outright.
 2. **The audit journal retains a content delta.** If the
-   [audit journal](audit-trail.md) is enabled, deleting a thought does **not**
-   remove its content from the journal. The original `INSERT_THOUGHT` entry holds
-   the content in its `delta`, and the `DELETE_THOUGHT` entry records the deletion
-   delta too — so the data survives in `journal_entry` after the thought row is
-   gone. A true erasure must also purge the relevant journal entries (and doing so
-   breaks the hash chain from that point — re-baseline if you depend on
-   verification).
+   [audit journal](audit-trail.md) is enabled, the thought's content can live in
+   that journal independently of how it is later deleted: the original
+   `INSERT_THOUGHT` entry (and any `UPDATE_THOUGHT` entry) holds the content in
+   its `delta` from whenever it was written through a journal-enabled store
+   method, and a journal-enabled `delete_thought()` additionally records a
+   `DELETE_THOUGHT` entry carrying the same content — so the data survives in
+   `journal_entry` after the thought row is gone, in the insert/update entry if
+   nothing else. The CLI's `engrava gc` (and `gc --expired`) construct their own
+   connection without journaling, so a deletion made that way records no
+   `DELETE_THOUGHT` entry at all even when `journal.enabled` is set in config —
+   see [Audit Trail](audit-trail.md#what-gets-recorded) — but that does not
+   remove the earlier insert or update entry either way. A true erasure must
+   purge every journal entry that carries this content: the original insert
+   (and any update), and the delete entry if one exists. Purging a non-tail
+   entry breaks the retained chain's linkage and requires an explicit
+   re-baseline if journal verification is retained; purging a self-consistent
+   suffix, including every entry, does not by itself make local verification
+   fail — see
+   [Security → Audit journal threat model](security.md#audit-journal-threat-model).
 3. **Backups.** Any snapshot or file backup taken before the deletion still
    contains the data. Erasure must extend to your backup retention.
 
-A correct hard-erasure procedure therefore looks like: delete (or
-archive-then-gc) the thought rows → purge the matching `journal_entry` rows if
-journaling is on → roll the deletion through your backup retention. Don't treat
-"the thought no longer appears in search" as "the data is gone."
+A hard-erasure procedure therefore covers: delete (or archive-then-gc) the
+thought rows → purge every `journal_entry` row that carries this thought's
+content, if journaling was ever enabled while it existed → roll the deletion
+through your backup retention. Don't treat
+"the thought no longer appears in search" as "the data is gone." This list is
+not exhaustive: it does not address SQLite WAL or freelist page residue (a
+page holding the old content can persist in `-wal` or the freelist after the
+row is gone, depending on your `secure_delete` setting), nor any export or
+snapshot file made after the delete but before you rotate it out, nor
+deleted-but-still-cached state on a remote embedding provider that received
+the original text — evaluate each against your own threat model.
 
-> **On an un-migrated database the identifier outlives the content.** This is a
-> fourth residue and it is not content: on a database still below the **core-12**
-> schema (no foreign-key cascades), with a sqlite-vec backend actually active, a
-> deleted thought's `embedding` row is not cascaded away, so the reconcile puts
-> its vector back and the `vec0` arm keeps returning the **deleted id**. That arm
-> serves `search_similar()` always, and `search_hybrid()` / `recall()` whenever
-> `filters` / `visibility` compile to no effective predicate — which includes an
-> **empty** `MetadataFilter`, so passing one is not protection. The row and its
-> `content` really are gone — hydrating that id yields `None` — but the index
-> still discloses that a thought matching the query existed, and if the phantom
-> reaches the returned window it consumes one of the `top_k` slots. Run
-> `engrava migrate` before treating a deletion as an erasure. Full mechanism:
+> **A database below the core-12 schema can carry a deleted thought's
+> `embedding` row.** That schema has no `ON DELETE CASCADE` on `embedding`, so
+> a delete made by an older engrava build could leave the row, vector
+> included, behind. Reconciliation (the pass that runs when a sqlite-vec
+> backend opens) backfills a vector only for an `embedding` row
+> whose owner id matches a row in `thought`, and `delete_thought` issues its
+> own delete for the thought's `embedding` row. The core-12 step of
+> `engrava migrate` purges the dangling `embedding` rows that earlier deletes
+> left behind. Full mechanism:
 > [Known Limitations → Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated).
 
 > **Memory-hygiene GC is a hard delete, not erasure.** The opt-in
@@ -227,21 +263,29 @@ journaling is on → roll the deletion through your backup retention. Don't trea
 ## Reclaiming disk space
 
 Deleting rows — whether via `ttl.strategy: delete`, `engrava gc`, or a hard
-erasure — **does not shrink the database file**. SQLite returns the freed pages
-to an internal free-list and reuses them for future writes; the file stays the
-same size on disk.
+erasure — **does not shrink the database file** under SQLite's default
+`auto_vacuum=NONE`, which engrava does not override. SQLite returns the freed
+pages to an internal free-list and reuses them for future writes; the file
+stays the same size on disk. A database externally configured with
+`auto_vacuum=FULL` can instead truncate freed tail pages automatically at
+commit — engrava neither sets nor requires a particular `auto_vacuum` mode.
 
-To actually reclaim file size you must run `VACUUM`, which rebuilds the database
-into a compact file. Plan for its cost:
+To actually reclaim file size on the default configuration you must run
+`VACUUM`, which rebuilds the database into a compact file. Plan for its cost:
 
-- **Exclusive lock.** `VACUUM` takes an exclusive lock for its whole duration —
-  no concurrent reads or writes. Run it during a maintenance window.
+- **Exclusive lock, with a WAL exception for existing readers.** `VACUUM`
+  requires write access and blocks competing writers for its whole duration.
+  Because engrava uses WAL mode by default, a reader that already has an
+  established snapshot can continue running concurrently with it; a new
+  connection still needs to wait its turn. Run it during a maintenance window.
 - **Temporary space.** It writes a fresh copy before swapping, so it needs
-  roughly **2× the database size** in free disk (temp + final) transiently.
+  additional temporary disk space that depends on the database's contents and
+  SQLite's own temporary-storage behavior — measure it for your database
+  rather than assuming a fixed multiple.
 - **Off-peak.** On a large database this can take a while; schedule it off-peak.
 
 ```sql
-VACUUM;                 -- rebuild in place (exclusive lock, ~2x temp space)
+VACUUM;                 -- rebuild in place (exclusive lock against writers)
 VACUUM INTO 'copy.db';  -- write a compacted copy without locking in place as long
 ```
 

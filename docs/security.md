@@ -1,15 +1,15 @@
 # Security and Trust Boundaries
 
-Engrava is an embedded memory database, not an authentication gateway. It runs
+Engrava is an in-process memory database, not an authentication gateway. It runs
 inside the caller's Python process and stores data in SQLite. This page defines
-the security boundary of Engrava v0.6 and the controls an application or
-operator must provide around it.
+Engrava's security boundary and the controls an application or operator must
+provide around it.
 
 For vulnerability reporting and disclosure timelines, see the repository
 [Security Policy](../SECURITY.md). This guide covers deployment and data trust;
 it does not replace that reporting policy.
 
-## Default posture: local and embedded
+## Default posture: local and in-process
 
 The core library opens a local SQLite database and exposes an in-process Python
 API. It does not start a network listener or require an external service. With
@@ -25,11 +25,11 @@ the caller:
 - dependency or model acquisition performed by an optional provider.
 
 Treat those components as separate trust decisions. The fact that Engrava core
-is embedded does not make arbitrary extensions or provider endpoints local.
+runs in-process does not make arbitrary extensions or provider endpoints local.
 
 ## Data at rest
 
-Engrava v0.6 uses ordinary SQLite through `aiosqlite`. It does **not** provide
+Engrava uses ordinary SQLite through `aiosqlite`. It does **not** provide
 built-in database encryption, encryption keys, or field-level encryption. The
 database can contain thought text, metadata, provenance, actions, embeddings,
 and audit-journal deltas. In WAL mode, recent data may also be present in the
@@ -58,10 +58,12 @@ and permission details.
 
 Embedding generation sends the input text to the configured provider. That can
 include newly stored thought content, re-embedded content, and search queries.
-The resulting vectors are persisted locally and are sensitive derived data;
-they should receive the same storage protection as the source text.
+Vectors generated for stored or re-embedded content are persisted locally and
+are sensitive derived data; they should receive the same storage protection as
+the source text. A vector generated for a search query is used transiently for
+that query and is not inserted into the `embedding` table.
 
-Provider boundaries in v0.6 are:
+Provider boundaries are:
 
 | Provider | Data path |
 |---|---|
@@ -69,6 +71,7 @@ Provider boundaries in v0.6 are:
 | `openai-compatible` | Sends text to the configured HTTP API; the default endpoint is OpenAI. |
 | `huggingface` | Sends text to the Hugging Face Inference API. |
 | `ollama` | Sends text to the configured Ollama endpoint; the default is loopback, but `base_url` can point elsewhere. |
+| `callback` | Wraps a caller-supplied synchronous function, run on a worker thread. The data path is whatever that function does — local computation, a remote call, or anything else the callback contains — and is not something engrava constrains or can describe generically. |
 
 Before enabling a remotely addressed provider:
 
@@ -84,9 +87,12 @@ For supported remote providers, YAML accepts a whole-value environment
 reference such as `api_key: "${EMBEDDING_API_KEY}"`. Prefer runtime secret
 injection over a literal credential in a tracked configuration file. Engrava
 resolves the value into process memory; it is not a secret manager and does not
-rotate, scope, or revoke credentials. The built-in OpenAI-compatible provider's
-HTTP error paths do not include the request authorization header, but application
-logging and third-party clients remain part of the surrounding threat model.
+rotate, scope, or revoke credentials. The built-in OpenAI-compatible provider
+does not itself interpolate the request's own `Authorization` header into its
+error text, but a non-success HTTP response's error includes the raw response
+body verbatim; a server that echoes a header or token back in that body can
+still put it in the raised message. Application logging and third-party
+clients remain part of the surrounding threat model.
 
 ## Tenant isolation and authorization
 
@@ -173,17 +179,36 @@ provider. Review external snapshots as imports, including for instruction-like
 or otherwise adversarial content. Restore only from a completed file that is no
 longer being modified.
 
-A logical snapshot excludes the audit journal, so restoring one starts with an
-empty journal. A physical backup preserves the journal but is tied to the
-database file and must be captured with a WAL-safe method. See [Backup &
+A logical snapshot excludes the audit journal. A fresh restore target therefore
+starts with an empty journal, and `restore --clear` empties an existing target's
+journal along with the data it wipes. A restore without `--clear` merges into
+the target — and if that target's journal is non-empty, it refuses any record
+that collides with an existing row (primary key or `UNIQUE` constraint) and
+rolls the whole restore back, rather than silently replacing it. This gate
+never applies to an empty journal, the ordinary case, since journaling is
+opt-in. `--orphan-journal-entries` allows the merge anyway and restores the
+prior behaviour, where it can orphan journal entries even when no incoming ID
+collides with what the journal already describes: a duplicate
+`(from_thought_id, to_thought_id, edge_type)` triple replaces an existing
+edge, and replacing a thought cascades to that thought's own edges,
+embeddings, and actions — neither needs its own ID to collide. The journal
+entries describing the earlier row stay behind; `verify` still reports the
+chain as **valid** even though it no longer matches what is stored. A physical
+backup preserves the journal but is tied to the database file and must be
+captured with a WAL-safe method. See [Backup &
 Recovery](backup-and-recovery.md) for the supported boundary and procedures.
 
 ## Audit journal threat model
 
 The optional journal is a keyless SHA-256 hash chain stored in the same SQLite
-file as the records it describes. It can detect accidental corruption and
-unsophisticated edits that do not recompute the chain. It is not a signature,
-an HMAC, or cryptographic non-repudiation.
+file as the records it describes. It can detect accidental corruption and an
+edit to a retained entry, or to the linkage between retained entries, that
+does not recompute the chain from that point forward. It cannot detect the
+deletion of a self-consistent suffix — including every entry — since nothing
+in the store proves how long the chain should be; that requires an externally
+captured high-water mark (see
+[Audit Trail → verifying integrity](audit-trail.md#verifying-integrity)). It is not a
+signature, an HMAC, or cryptographic non-repudiation.
 
 An actor who can rewrite the database can alter journal entries and recompute
 all subsequent hashes. The journal also covers a defined mutation subset, not
@@ -229,7 +254,7 @@ For a stronger control:
 - compare the verified local chain tail with that external anchor during audits
   and incident response.
 
-Engrava v0.6 does not publish or manage an off-box anchor for you. See [Audit
+Engrava does not publish or manage an off-box anchor for you. See [Audit
 Trail](audit-trail.md) for exact coverage and verification APIs.
 
 ## Backup, retention, and erasure
@@ -240,24 +265,24 @@ required, restrict restore privileges, and test recovery using non-production
 destinations.
 
 Archiving is reversible retention, not erasure. A hard delete removes the live
-row but audited content can remain in journal deltas, old copies can remain in
-backups, and freed SQLite pages do not shrink the file until a rebuild such as
-`VACUUM`. An erasure process must account for the live database, the journal,
-snapshots and physical backups, replicas or exports, and the retention policy of
-any remote provider that received the text. Purging journal entries breaks the
-chain and requires an explicit re-baseline if journal verification is retained.
+row but audited content can remain in journal deltas, and old copies can
+remain in backups. Under SQLite's default `auto_vacuum=NONE`, which engrava
+does not override, freed pages do not shrink the file until a rebuild such as
+`VACUUM`; a database externally configured with `auto_vacuum=FULL` can
+truncate freed tail pages automatically at commit. An erasure process must
+account for the live database, the journal, snapshots and physical backups,
+replicas or exports, and the retention policy of any remote provider that
+received the text. Deleting a non-tail journal entry breaks the retained
+chain's linkage and requires an explicit re-baseline if journal verification
+is retained; deleting a self-consistent suffix, including every entry, does
+not make local verification fail on its own — see [Audit journal threat
+model](#audit-journal-threat-model) above.
 
-One residue is version-dependent and easy to miss: **on a database still below
-core schema 12 a hard delete leaves the thought's `embedding` row behind**. The
-delete does purge that thought's own `vec0` vector, so the index is clean
-immediately afterwards — but the reconcile on the next sqlite-vec-enabled open
-backfills it from the surviving `embedding` row, and from then on the deleted
-**identifier** — not its content, which is gone — is returned by a vector query
-that carries no effective metadata predicate on an active sqlite-vec backend.
-That is an existence signal about a record an erasure request asked you to
-remove, and checking the index straight after the delete will not reveal it.
-`engrava migrate` closes it and purges the orphans that had already accumulated.
-See
+**`delete_thought` issues its own deletes for the thought's `edge`, `embedding`, and
+`action` rows, in the same savepoint as the parent delete**, rather than depending on
+the `ON DELETE CASCADE` that only exists from core schema 12 onward. A dangling
+`embedding` row left by a delete made under an older engrava build still carries its
+vector in the database file; `engrava migrate` purges these rows. See
 [Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated).
 
 See [Data Lifecycle](data-lifecycle.md) for the complete retention and erasure

@@ -10,7 +10,7 @@ Extension-specific fields can be added by subclassing.
 from __future__ import annotations
 
 import datetime
-from typing import Self
+from typing import Final, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing_extensions import TypeAliasType
@@ -24,10 +24,47 @@ from engrava.domain.enums import (
 )
 from engrava.domain.exceptions import InvalidTransitionError
 from engrava.domain.models._temporal import (
+    canonical_timestamp_or_none,
     validate_interval_ordering,
     validate_iso8601_nullable,
 )
 from engrava.domain.models.provenance import ProvenanceContext
+
+#: The ``ThoughtRecord`` fields held in the canonical UTC timestamp form (see
+#: :func:`~engrava.domain.models._temporal.validate_iso8601_nullable`). A path
+#: that writes these columns without building a record — ``engrava restore``,
+#: for one — reads this to put them into the same form.
+THOUGHT_TIMESTAMP_FIELDS: Final = (
+    "created_at",
+    "updated_at",
+    "last_accessed_at",
+    "expires_at",
+    "valid_from",
+    "valid_until",
+    "archived_at",
+)
+
+
+def _restates_timestamp(candidate: object, stored: str) -> bool:
+    """Return whether ``candidate`` names the instant ``stored`` already holds.
+
+    ``stored`` is in the canonical UTC form the validator returns, so the
+    candidate is put through the same validator before comparing: a caller
+    passing back the naive or offset form it first used restates the value
+    rather than changing it.
+
+    Args:
+        candidate: The value a caller passed for the field.
+        stored: The field's current, canonical value.
+
+    Returns:
+        ``True`` when ``candidate`` is ``stored`` or another accepted spelling
+        of the same instant; ``False`` for any other instant, and for a value
+        that is not an ISO-8601 timestamp at all.
+
+    """
+    return candidate == stored or canonical_timestamp_or_none(candidate) == stored
+
 
 #: Allowed value types for ``ThoughtRecord.metadata`` entries.
 #:
@@ -49,7 +86,7 @@ from engrava.domain.models.provenance import ProvenanceContext
 #: triggers infinite recursion in Pydantic's schema builder on 3.11+).
 MetadataValue = TypeAliasType(
     "MetadataValue",
-    "str | int | float | bool | None | dict[str, MetadataValue]",
+    "str | int | float | bool | dict[str, MetadataValue] | None",
 )
 
 
@@ -131,9 +168,8 @@ class ThoughtRecord(BaseModel):
             paired with ``archived_at_cycle``; a restore (un-archive) clears both
             back to ``None``.  It backs the garbage-collection **wall-clock**
             restore window (``archived_at <= now - gc_restore_window_seconds``),
-            required in addition to the cycle window before the irreversible GC
-            stage may reap the thought, so a fast-cycling store cannot delete a
-            just-archived thought before a real-time chance to restore it.  A
+            which the irreversible GC stage applies in addition to the cycle
+            window while ``gc_restore_window_seconds`` is greater than zero.  A
             thought archived by any other path (TTL / manual) keeps ``None``.
             Defaults to ``None``.
 
@@ -223,28 +259,21 @@ class ThoughtRecord(BaseModel):
             raise ValueError(msg)
         return v
 
-    @field_validator(
-        "created_at",
-        "updated_at",
-        "last_accessed_at",
-        "expires_at",
-        "valid_from",
-        "valid_until",
-        "archived_at",
-    )
+    @field_validator(*THOUGHT_TIMESTAMP_FIELDS)
     @classmethod
     def _validate_iso8601_nullable(cls, v: str | None) -> str | None:
-        """Validate ISO-8601 format and normalize to UTC when not None.
+        """Validate ISO-8601 format and store the canonical UTC form when not None.
 
-        Timezone-aware timestamps are converted to UTC so that SQLite
-        TEXT comparisons (lexicographic) produce correct results
-        regardless of the original offset.
+        Every accepted value, naive or timezone-aware, is rewritten to one
+        canonical UTC string (a naive value is read as UTC), so SQLite TEXT
+        comparisons (lexicographic) order the column by instant whatever
+        shape the caller passed.
 
         Args:
             v: Timestamp string or None.
 
         Returns:
-            The validated (and UTC-normalized) string, or None.
+            The canonical UTC string, or None.
 
         Raises:
             ValueError: If string is not valid ISO-8601.
@@ -288,7 +317,10 @@ class ThoughtRecord(BaseModel):
         Validates lifecycle transitions when lifecycle_status is changed.
         Automatically sets ``updated_at`` to the current UTC time unless
         the caller provides an explicit value.  ``created_at`` is
-        immutable — attempting to change it raises ``ValueError``.
+        immutable — attempting to change it raises ``ValueError``.  Passing
+        the same instant again in any accepted form (for example the naive
+        value first given, which is stored in canonical UTC form) is not a
+        change.
 
         Args:
             **changes: Fields to override in the new instance.
@@ -308,7 +340,7 @@ class ThoughtRecord(BaseModel):
         """
         if "created_at" in changes and self.created_at is not None:
             new_val = changes["created_at"]
-            if new_val != self.created_at:
+            if not _restates_timestamp(new_val, self.created_at):
                 msg = (
                     "created_at is immutable once set "
                     f"(current={self.created_at!r}, attempted={new_val!r})"

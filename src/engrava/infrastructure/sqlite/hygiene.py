@@ -8,11 +8,13 @@ two-stage archive then garbage-collect, journaling, and database access) lives
 on :class:`~engrava.infrastructure.sqlite.engrava_core.SqliteEngravaCore`.
 
 The keep-score reuses the inward dreaming signal library
-(:mod:`engrava.domain.dreaming`) and the same active-signal
-redistribution the dreaming scorer uses (a signal whose data source is flat
-across the candidate pool is dropped and its weight renormalised over the active
-set), but carries the hygiene weight vector and threshold so the two loops tune
-independently.
+(:mod:`engrava.domain.dreaming`) and the same active-signal redistribution
+the dreaming scorer uses for its default signals (a signal is dropped and
+its weight renormalised over the active set when none of the candidates
+carries a value for its data at all — not merely when the candidates'
+values are identical — except ``frequency``, which is also dropped
+whenever access tracking is disabled), but carries the hygiene weight
+vector and threshold so the two loops tune independently.
 """
 
 from __future__ import annotations
@@ -113,8 +115,9 @@ class HygieneResult:
             information is in the journal instead). Ordered by the deterministic
             archive selection order.
         flat_signals: Names of configured keep-signals that were inactive this
-            run (their data source was flat across the candidate pool), so their
-            weight was redistributed onto the active signals. Sorted.
+            run (their data source recorded no value at all for any candidate
+            this run, not merely a uniform one), so their weight was
+            redistributed onto the active signals. Sorted.
 
     Examples:
         >>> result = HygieneResult(archived_count=3, gc_count=0)
@@ -169,9 +172,8 @@ def compute_active_hygiene_weights(
     Returns:
         A ``(weights, flat_signals)`` pair. ``weights`` maps every configured
         signal name to its effective (renormalised) weight — ``0.0`` for
-        inactive signals; the active entries sum to ``1.0`` unless the active
-        set is empty (all-zero). ``flat_signals`` is the sorted list of
-        configured signals found inactive this run.
+        inactive signals. ``flat_signals`` is the sorted list of configured
+        signals found inactive this run.
 
     """
     active_names: list[str] = []
@@ -262,12 +264,11 @@ def compute_keep_score(
     ctx: DreamingContext,
     active_weights: Mapping[str, float],
 ) -> tuple[float, dict[str, float]]:
-    """Compute a thought's keep-score as a weighted average of active signals.
+    """Compute a thought's keep-score as a weighted sum of active signals.
 
     The score is ``Σ active-signal weight · signal(thought)`` over the signals
     with a non-zero effective weight (inactive signals have already been
-    redistributed to ``0.0`` by :func:`compute_active_hygiene_weights`, so the
-    effective weights sum to ``1.0`` and the score lands in ``[0.0, 1.0]``).
+    redistributed to ``0.0`` by :func:`compute_active_hygiene_weights`).
 
     Args:
         thought: The thought to score.

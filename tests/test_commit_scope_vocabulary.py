@@ -11,7 +11,7 @@ What this module checks:
 
 1. **The documented tiers equal the JSON tiers**, in both directions.  Both sides
    are parsed, never restated here — a list of expected scopes in this file would
-   be a third hand-maintained copy and would reintroduce the defect it closes.
+   be a third hand-maintained copy that could drift from the other two.
 2. **The config contains the pinned wiring text** — the two lines of
    ``.commitlintrc.js`` that load the JSON file and spread it into the enum are
    present somewhere in the file.
@@ -111,10 +111,7 @@ def _normalised_config() -> str:
     """Return ``.commitlintrc.js`` with every whitespace run collapsed to a space.
 
     The file is read as written — comments included.  Nothing here tries to tell
-    code from comment: a previous version stripped ``//`` comments to make a token
-    count meaningful, and the strip was unsound in both directions (a ``//`` inside
-    a string URL swallowed live code; a comment between two tokens joined them into
-    the pinned text).  Presence of a substring needs no such distinction.
+    code from comment: presence of a substring needs no such distinction.
 
     Returns:
         The config source as a single normalised line, so that re-indenting or

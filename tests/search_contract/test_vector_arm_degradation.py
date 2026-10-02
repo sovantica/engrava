@@ -14,9 +14,7 @@ vector arm:
   differs from the store's embedding dimension is a caller-contract violation,
   not a benign miss, so it raises
   :class:`~engrava.domain.exceptions.VectorDimensionMismatchError` instead of
-  silently returning ``[]``. (Before this contract, a wrong-length *non-zero*
-  vector raised an opaque numpy ``ValueError`` and a wrong-length *all-zero*
-  vector silently returned ``[]`` — the latent silent-empty this suite closes.)
+  silently returning ``[]``.
 
 The standing safety invariant (:class:`TestVectorArmSafetyInvariant`) drives a
 deterministic, enumerated adversarial query-vector corpus through a real store
@@ -396,9 +394,9 @@ class TestVectorArmSafetyInvariant:
 class TestVectorArmDiscriminatingPower:
     """The invariant is only meaningful if reverting a guard breaks it.
 
-    Each test reverts one guard in-process to its pre-fix (buggy) form and
-    asserts the observable the invariant relies on changes — proving the
-    corpus/counter carry real discriminating power rather than passing vacuously.
+    Each test disables one guard in-process and asserts the observable the
+    invariant relies on changes — proving the corpus/counter carry real
+    discriminating power rather than passing vacuously.
     """
 
     async def test_reverting_degeneracy_guard_stops_the_counter(
@@ -408,11 +406,11 @@ class TestVectorArmDiscriminatingPower:
     ) -> None:
         """With degeneracy detection reverted, an all-zero query stops counting.
 
-        Baseline: an all-zero vector degrades observably (counter +1). Revert
-        the boundary degeneracy detector to the pre-fix ``always False`` and the
-        same vector slips past the counter, degrading to ``[]`` *silently* (delta
-        0) via the numpy arm's zero-norm guard — exactly the silent degradation
-        the counter exists to surface.
+        Baseline: an all-zero vector degrades observably (counter +1). Replace
+        the boundary degeneracy detector with one that is always ``False`` and
+        the same vector slips past the counter, degrading to ``[]`` *silently*
+        (delta 0) via the numpy arm's zero-norm guard — exactly the silent
+        degradation the counter exists to surface.
         """
         import engrava.infrastructure.sqlite.engrava_core as core_mod
 
@@ -440,11 +438,11 @@ class TestVectorArmDiscriminatingPower:
 
         Baseline: a wrong-length all-zero vector raises the typed dimension error
         (dimension is checked *before* degeneracy, so magnitude is irrelevant).
-        Revert the store's declared dimension to ``None`` — the pre-fix state
-        where ``search_similar`` could not know the expected length up front — and
-        the same vector is now swallowed as a degenerate degradation (counter +1,
-        ``[]``) instead of a loud rejection: the latent silent-empty this contract
-        closes.
+        Set the store's declared dimension to ``None`` — a store where
+        ``search_similar`` cannot know the expected length up front — and the
+        same vector is now swallowed as a degenerate degradation (counter +1,
+        ``[]``) instead of a loud rejection: the silent-empty result this
+        contract rules out.
         """
         wrong_length_zero = [0.0] * (_EMBED_DIM - 1)
 

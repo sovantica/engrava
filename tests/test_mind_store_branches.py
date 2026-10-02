@@ -1,4 +1,4 @@
-"""Tests for previously-uncovered branches in SqliteEngravaCore.
+"""Tests for branches in SqliteEngravaCore.
 
 Covers:
 - list_thoughts() filter branches: thought_type, min_cycle, max_cycle,

@@ -554,6 +554,206 @@ class TestGraphAwareSearch:
 
 
 # ---------------------------------------------------------------------------
+# TestGraphRankingChunkedFetch
+# ---------------------------------------------------------------------------
+
+
+class TestGraphRankingChunkedFetch:
+    """``_load_graph_signal``'s 450-candidate chunked edge fetch.
+
+    The candidate-ID list is split into 450-wide chunks, one query per
+    chunk. An edge whose two endpoints land in different chunks must still
+    contribute exactly once to each endpoint's boost.
+    """
+
+    async def test_edge_crossing_chunk_boundary_contributes_once_per_endpoint(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """A 451-candidate pool with an edge crossing the 450 boundary.
+
+        ``t-from`` sits in the first chunk (index 0), ``t-to`` sits alone in
+        the second chunk (index 450) — the two chunk queries each match this
+        edge's ``OR`` predicate, so a fetch that kept both matches would count
+        it twice and double its weighted contribution to both endpoints' graph
+        boost. Each endpoint must receive it once.
+        """
+        t_from = await store.create_thought(_make("t-from"))
+        t_to = await store.create_thought(_make("t-to"))
+        edge = EdgeRecord(
+            edge_id="e-cross-chunk",
+            from_thought_id=t_from.thought_id,
+            to_thought_id=t_to.thought_id,
+            edge_type=EdgeType.ASSOCIATED,
+            weight=0.8,
+            created_cycle=1,
+        )
+        await store.create_edge(edge)
+
+        from_base_score = 0.4
+        to_base_score = 0.6
+        candidate_scores: dict[str, float] = {t_from.thought_id: from_base_score}
+        # 449 filler candidates pad the rest of the first 450-wide chunk.
+        # They reference no edges, so they need no backing thought rows —
+        # ``_load_graph_signal`` only ever queries the ``edge`` table.
+        for i in range(449):
+            candidate_scores[f"filler-{i}"] = 0.1
+        candidate_scores[t_to.thought_id] = to_base_score
+        assert len(candidate_scores) == 451
+
+        graph_edge_decay = 0.5
+        max_neighbors = 5  # >= 2, so a duplicate isn't hidden by [:max_neighbors] slicing
+
+        boosts = await store._load_graph_signal(
+            candidate_scores=candidate_scores,
+            graph_edge_decay=graph_edge_decay,
+            max_neighbors=max_neighbors,
+        )
+
+        expected_from_boost = edge.weight * to_base_score * graph_edge_decay
+        expected_to_boost = edge.weight * from_base_score * graph_edge_decay
+
+        assert boosts[t_from.thought_id] == pytest.approx(expected_from_boost)
+        assert boosts[t_to.thought_id] == pytest.approx(expected_to_boost)
+
+    async def test_edge_within_single_chunk_unaffected(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """Both endpoints in the same (small) chunk — ordinary, unchanged case."""
+        t_a = await store.create_thought(_make("t-a-same-chunk"))
+        t_b = await store.create_thought(_make("t-b-same-chunk"))
+        edge = EdgeRecord(
+            edge_id="e-same-chunk",
+            from_thought_id=t_a.thought_id,
+            to_thought_id=t_b.thought_id,
+            edge_type=EdgeType.ASSOCIATED,
+            weight=0.7,
+            created_cycle=1,
+        )
+        await store.create_edge(edge)
+
+        a_base_score = 0.3
+        b_base_score = 0.9
+        candidate_scores = {
+            t_a.thought_id: a_base_score,
+            t_b.thought_id: b_base_score,
+        }
+        graph_edge_decay = 0.5
+
+        boosts = await store._load_graph_signal(
+            candidate_scores=candidate_scores,
+            graph_edge_decay=graph_edge_decay,
+            max_neighbors=5,
+        )
+
+        assert boosts[t_a.thought_id] == pytest.approx(
+            edge.weight * b_base_score * graph_edge_decay
+        )
+        assert boosts[t_b.thought_id] == pytest.approx(
+            edge.weight * a_base_score * graph_edge_decay
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestGraphRankingChunkQueryBounded
+# ---------------------------------------------------------------------------
+
+
+class TestGraphRankingChunkQueryBounded:
+    """``_load_graph_signal``'s per-chunk query is bounded at the SQL layer.
+
+    A candidate's neighbour count must not make its per-chunk query return
+    more than ``max_neighbors`` rows for it — the cap has to be enforced by
+    the query itself (a per-candidate ranking window), not by fetching every
+    matching edge and truncating the Python list afterwards.
+    """
+
+    async def test_hub_candidate_adjacency_bounded_at_sql_layer(
+        self,
+        store: SqliteEngravaCore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A hub with far more edges than ``max_neighbors`` reads a bounded row count.
+
+        Instruments the actual rows the SQLite cursor hands back to Python
+        for the chunk query — not just the length of the final adjacency —
+        so a regression that fetches everything and slices in Python
+        afterwards would still fail this even though the *final* adjacency
+        size would look identical.
+        """
+        t_hub = await store.create_thought(_make("t-hub-bound"))
+        t_other = await store.create_thought(_make("t-other-bound"))
+        # A second, lightly-connected candidate in the same chunk, to prove
+        # the bound is per-candidate (both get up to max_neighbors), not a
+        # single shared budget for the whole chunk.
+        t_other_neighbour = await store.create_thought(_make("t-other-neighbour-bound"))
+        await store.create_edge(
+            EdgeRecord(
+                edge_id="e-other-bound",
+                from_thought_id=t_other.thought_id,
+                to_thought_id=t_other_neighbour.thought_id,
+                edge_type=EdgeType.ASSOCIATED,
+                weight=0.42,
+                created_cycle=1,
+            ),
+        )
+
+        hub_edge_count = 600
+        async with store.suspend_auto_commit():
+            for i in range(hub_edge_count):
+                neighbour = await store.create_thought(_make(f"t-hub-bound-n-{i}"))
+                await store.create_edge(
+                    EdgeRecord(
+                        edge_id=f"e-hub-bound-{i}",
+                        from_thought_id=t_hub.thought_id,
+                        to_thought_id=neighbour.thought_id,
+                        edge_type=EdgeType.ASSOCIATED,
+                        weight=(i + 1) / (hub_edge_count + 1),
+                        created_cycle=1,
+                    ),
+                )
+
+        rows_read: list[int] = []
+        real_fetchall = aiosqlite.Cursor.fetchall
+
+        async def _counting_fetchall(self: aiosqlite.Cursor) -> list[aiosqlite.Row]:
+            result = list(await real_fetchall(self))
+            rows_read.append(len(result))
+            return result
+
+        monkeypatch.setattr(aiosqlite.Cursor, "fetchall", _counting_fetchall)
+
+        max_neighbors = 5
+        candidate_scores = {
+            t_hub.thought_id: 0.5,
+            t_other.thought_id: 0.5,
+        }
+        adjacency = await store._fetch_candidate_adjacency(
+            list(candidate_scores.keys()),
+            max_neighbors=max_neighbors,
+        )
+
+        assert len(adjacency[t_hub.thought_id]) == max_neighbors
+        # The hub's kept neighbours are its highest-weight ones — edges
+        # (hub_edge_count - 4) .. (hub_edge_count - 1) got weights
+        # (hub_edge_count - 3)/(hub_edge_count+1) .. hub_edge_count/(hub_edge_count+1).
+        kept_weights = sorted((w for _nid, w in adjacency[t_hub.thought_id]), reverse=True)
+        expected_top_weights = sorted(
+            ((hub_edge_count - k) / (hub_edge_count + 1) for k in range(max_neighbors)),
+            reverse=True,
+        )
+        assert kept_weights == pytest.approx(expected_top_weights)
+
+        assert len(adjacency[t_other.thought_id]) == 1
+
+        # Two candidates, each capped to max_neighbors: the query must never
+        # hand Python more than 2 * max_neighbors rows total for this chunk —
+        # nowhere near the hub's real 600-edge degree.
+        assert sum(rows_read) <= 2 * max_neighbors
+
+
+# ---------------------------------------------------------------------------
 # TestEdgeCreationConfig
 # ---------------------------------------------------------------------------
 

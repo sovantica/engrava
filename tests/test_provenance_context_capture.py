@@ -63,7 +63,7 @@ from engrava.mindql.executor import MindQLExecutor
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-_HEAD_VERSION = 20
+_HEAD_VERSION = 21
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +408,7 @@ class TestRoundTrip:
 
 
 # ---------------------------------------------------------------------------
-# Byte-identical when provenance is None (regression)
+# provenance=None: stored as NULL and read back as None
 # ---------------------------------------------------------------------------
 
 

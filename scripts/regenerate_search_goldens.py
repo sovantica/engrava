@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from pathlib import Path
 import sys
+from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 if str(REPOSITORY_ROOT) not in sys.path:
@@ -27,8 +27,10 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from tests.search_contract.golden_fixtures import (
     EXPERT_NORMALIZATION_GOLDEN_PATH,
+    HYBRID_RANKED_FROM_CONFIG_GOLDEN_PATH,
     HYBRID_RANKED_GOLDEN_PATH,
     render_expert_normalization_golden,
+    render_hybrid_ranked_from_config_golden,
     render_hybrid_ranked_golden,
 )
 
@@ -49,6 +51,10 @@ def _render_all() -> list[tuple[Path, str]]:
     return [
         (EXPERT_NORMALIZATION_GOLDEN_PATH, render_expert_normalization_golden()),
         (HYBRID_RANKED_GOLDEN_PATH, asyncio.run(render_hybrid_ranked_golden())),
+        (
+            HYBRID_RANKED_FROM_CONFIG_GOLDEN_PATH,
+            asyncio.run(render_hybrid_ranked_from_config_golden()),
+        ),
     ]
 
 
@@ -66,7 +72,9 @@ def main() -> int:
         for path in stale:
             print(f"STALE: {path.relative_to(REPOSITORY_ROOT)}")
         if stale:
-            print("Search goldens are out of date; run: python scripts/regenerate_search_goldens.py")
+            print(
+                "Search goldens are out of date; run: python scripts/regenerate_search_goldens.py"
+            )
             return 1
         print("Search goldens are up to date.")
         return 0

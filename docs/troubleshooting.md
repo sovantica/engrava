@@ -4,7 +4,7 @@ Common symptoms, their cause, and the fix. Each entry shows the error (or the
 surprising behaviour) you actually see, then what to change.
 
 If your problem is a platform constraint rather than a mistake (macOS extension
-loading, the ~100k brute-force ceiling, FTS5 availability), see
+loading, the NumPy brute-force vector fallback, FTS5 availability), see
 [Known Limitations](known-limitations.md) instead.
 
 ## `AttributeError: 'tuple' object has no attribute 'keys'` on read
@@ -68,7 +68,7 @@ erroring when its prerequisite is missing. Work through this checklist:
 
 | If… | then… |
 |---|---|
-| No `embedding_provider` is configured | the **vector** signal is skipped — only FTS/priority run. A purely semantic query with no shared keywords may find nothing. |
+| No `embedding_provider` is configured (and you pass no `query_vector`) | the **vector** signal is skipped — only FTS/priority run. A purely semantic query with no shared keywords may find nothing. Passing your own `query_vector` re-enables the vector signal without a provider, for thoughts whose vectors you stored with `store_embedding`. |
 | You pass `query_text` but no provider and no `query_vector` | same as above — there is no vector to compare against. |
 | No explicit `current_cycle` or `recency_now`, and no configured `cycle_provider` | the **recency** signal is skipped because no recency reference is available. |
 | `recency_weight` is `0.0` | recency is disabled even when a cycle or transaction-time reference is available. |
@@ -129,21 +129,72 @@ though a rising `fts_match_failure_count` is how you see it happening. See
 [Keyword query syntax (FTS)](search.md#keyword-query-syntax-fts) and
 [Observability signals](observability.md#observability-signals).
 
+## Keyword search returns a thought after restore that does not contain the word
+
+**Symptom.** After `restore` (a plain merge or `--clear`), `search_fts` /
+`recall` returns a thought whose essence and content plainly do not contain
+the word you searched for.
+
+**Cause.** On `0.6.0`, `restore` inserted records with `INSERT OR REPLACE`, so
+a record that collided with an existing row on a primary key
+or `UNIQUE` constraint made SQLite delete the old row and re-insert it
+internally to resolve the conflict — and because nothing in engrava sets
+`PRAGMA recursive_triggers` (SQLite's default is off), the FTS delete trigger
+never fires for a row removed this way, only the insert trigger for its
+replacement. The old, stale index entry survived, pointing at a rowid the
+`thought` table could later hand to a completely unrelated row (a later
+`--clear` restore, for instance) — at which point a keyword search for the
+original word resolved to that unrelated thought instead.
+
+**Fix.** `restore` can still resolve a collision with `INSERT OR REPLACE`,
+but it now rebuilds the full-text index unconditionally, inside its own
+transaction, after every merge or `--clear`, so `0.7.0` cannot leave a stale
+entry behind this way.
+
+**Repair a database an older build already restored into.** Rebuild its
+index directly with the SQLite CLI:
+
+```bash
+sqlite3 engrava.db "INSERT INTO thought_fts(thought_fts) VALUES('rebuild');"
+```
+
+This is FTS5's own index-rebuild command: it reconstructs `thought_fts` from
+the `thought` table's current rows, using the table's already-configured
+tokenizer. Verified directly against a database carrying stale entries built
+this way: afterward, a `MATCH` for each of that database's thoughts named only
+rows that actually contain the term, every column of every `thought` row came
+back unchanged (not just which ids survived), and the `journal_entry` row
+count was unchanged, and `engrava verify` afterward reported the journal valid
+with that same number of entries.
+
 ## Dreaming promotes nothing (consolidation is inert)
 
 **Symptom.** `run_consolidation(...)` returns `promoted_count == 0` every time.
 
-**Cause.** Promotion requires a candidate to clear **two independent bars**, and
-either one alone keeps the count at zero:
+**Cause.** A candidate has to pass every stage below, and failing any one keeps
+the count at zero. Check them in this order:
 
 1. **The age gate.** A thought is eligible only when
    `current_cycle - created_cycle >= min_age_cycles` (default `1`). If you never
    advance your cycle counter — every thought stays at the same `current_cycle`
    you created it in — `0 >= 1` is false and nothing is ever eligible. This is
    the most common cause. See [Core Concepts → Cycle](concepts.md).
-2. **The promotion threshold.** Even after the gate passes, a candidate's
-   weighted signal score must reach `promote_threshold`. Brand-new, unconfirmed,
+2. **The confirmation gate.** Unless `allow_zero_confirmation` is `True` (the
+   default), `confirmation_count` must be at least `min_confirmations` (default
+   `2`). With the flag turned off and no confirmations recorded, nothing passes.
+3. **Eligibility filters.** By default only `OBSERVATION` thoughts are promoted
+   (`promote_targets`), and the metadata filters can reject a thought, for
+   example the default `excluded_content_types` entry `code`. See
+   [Dreaming → Eligibility filters and corpus caps](dreaming.md#eligibility-filters-and-corpus-caps).
+4. **The promotion threshold.** Even after the stages above pass, a candidate's
+   weighted signal score must be **strictly greater than** `promote_threshold`; a
+   score exactly equal to it does not promote. Brand-new, unconfirmed,
    never-accessed thoughts score low, so a high threshold promotes nothing.
+5. **The caps.** A run promotes at most `max_promoted_per_run` thoughts (default
+   `20`), and it needs a free P1 slot. The number of free P1 slots for a run is
+   `max_p1_fraction` of the store (default `0.05`), rounded down but never below
+   one thought, minus the thoughts that are already P1, so a small store has
+   only a few slots and none once its P1 count has reached that number.
 
 **Fix.**
 
@@ -174,9 +225,9 @@ See [Dreaming](dreaming.md) for the full gate-and-signal model.
 either immediately or after a few seconds of retrying.
 
 **Cause / what to expect.** `OpenAICompatibleProvider` retries a request with
-bounded exponential backoff on a *transient* failure — a read timeout or network
-blip, or a transient HTTP status (`408`, `409`, `425`, `429`, `500`, `502`, `503`,
-`504`). Two outcomes:
+bounded linear backoff (`base_retry_delay_s * attempt_number`) on a
+*transient* failure — a read timeout or network blip, or a transient HTTP
+status (`408`, `409`, `425`, `429`, `500`, `502`, `503`, `504`). Two outcomes:
 
 - **A transient failure that persists across every attempt** is raised as a
   `RuntimeError` once `max_attempts` is exhausted (it never loops forever). If you
@@ -202,9 +253,19 @@ different model name or a different dimension, the stored vectors are
 incompatible with new ones, so it refuses rather than silently mixing
 dimensions (which would corrupt similarity results).
 
-**Fix.** Use the same embedding model the database was created with, or restore
-a trusted snapshot with a configured provider and deliberately re-embed the
-corpus. Direct mode uses top-level `embeddings`:
+The same error is raised when only the provider's `document_prefix` differs from
+the one the corpus was embedded with: adding one to a store built without,
+changing it, or removing it. A non-empty prefix is recorded as a fingerprint
+next to the model name; a store built without one records none. Adding,
+changing or removing a prefix is therefore a change to the corpus identity, and
+the vectors already stored were produced under the old one. A change to the
+`query_prefix` alone does not raise this error; it raises
+`EmbeddingQueryPrefixMismatchError` at search time instead. See
+[Embeddings guide → Asymmetric prefixes](guides/embeddings.md#asymmetric-prefixes-for-instruction-tuned-models).
+
+**Fix.** Use the same embedding model and `document_prefix` the database was
+created with, or restore a trusted snapshot with a configured provider and
+deliberately re-embed the corpus. Direct mode uses top-level `embeddings`:
 
 ```bash
 engrava --db restored.db --config engrava.yaml restore \
@@ -227,7 +288,7 @@ model/dimension/prefix identity.
 
 See [Known Limitations → Embedding Dimension Consistency](known-limitations.md#embedding-dimension-consistency).
 
-## `ReferentialIntegrityError` — and you can't import it from `engrava`
+## `ReferentialIntegrityError` when creating an edge
 
 **Symptom.** Creating an edge to a thought that doesn't exist raises:
 
@@ -235,36 +296,19 @@ See [Known Limitations → Embedding Dimension Consistency](known-limitations.md
 referential integrity violation: edge.to_thought_id='...' does not reference an existing thought
 ```
 
-…and the obvious import fails:
+**Cause.** One endpoint of the edge (`from_thought_id` or `to_thought_id`) is
+not a real thought id. Create both thoughts before the edge that links them.
+
+**Fix.**
 
 ```python
-from engrava import ReferentialIntegrityError  # ImportError!
-```
-
-**Cause (two parts).**
-
-1. **The error itself** means one endpoint of an edge (`from_thought_id` or
-   `to_thought_id`) is not a real thought id. Create both thoughts before the
-   edge that links them.
-2. **The import:** `ReferentialIntegrityError` is **not** re-exported from the
-   top-level `engrava` package. It lives in `engrava.domain.exceptions`.
-
-**Fix.** Import it from its real module, and ensure both endpoints exist first:
-
-```python
-from engrava.domain.exceptions import ReferentialIntegrityError
+from engrava import ReferentialIntegrityError
 
 try:
     await store.create_edge(edge)
 except ReferentialIntegrityError:
     ...  # one endpoint is missing — create the thought, then retry
 ```
-
-The exceptions that *are* re-exported at the top level are `EngravaError` (the
-base), `ConfigError`, `EmbeddingModelMismatchError`, `ExtensionMigrationError`,
-`InvalidTransitionError`, `MindQLParseError`, `ReadOnlyViolationError`,
-`StaleDataError`, and `ThoughtNotFoundError`. Anything else lives under
-`engrava.domain.exceptions`.
 
 ## Still stuck?
 

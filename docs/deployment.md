@@ -1,9 +1,8 @@
 # Deployment
 
 How to run Engrava in production: opening the store, the database files on disk,
-multi-worker setups, and shutting down cleanly. Engrava is an embedded library —
-there is no server to deploy; "deployment" means how your process opens and owns
-the database.
+multi-worker setups, and shutting down cleanly. Engrava is an in-process library;
+"deployment" means how your process opens and owns the database.
 
 For the concurrency model behind these recommendations, see
 [Concurrency](concurrency.md). For backups, see
@@ -35,13 +34,16 @@ async def main() -> None:
   [Concurrency](concurrency.md#many-async-tasks-one-store). One store belongs to
   one running loop.
 - **Share that one store across the tasks in the loop.** You do **not** need a
-  pool of stores for in-process concurrency. What the store does not do is make a
-  read-modify-write atomic: two tasks editing the *same field* of the same row
-  lose one of the two writes, silently, and a task that stamps `updated_cycle`
-  gets a concurrent update rejected with `StaleDataError` whatever field it
-  touched. See
+  pool of stores for in-process concurrency. A guarded write's own read and
+  write are one critical section across tasks, so a genuinely concurrent
+  task's whole operation does not land in the middle of another's, except that
+  `get_or_create` and `upsert_by_hash` release the lock between their two
+  probes on a miss when not nested inside a `suspend_auto_commit()` window. Two
+  tasks editing the *same field* of the same row leave only the later one's
+  value in place. What this does not cover is a read-modify-write *your own
+  code* spans across two separate calls. See
   [Concurrency](concurrency.md#many-async-tasks-one-store) for the exact
-  guarantees and the idioms that close the gap.
+  guarantees and the idioms that close that gap.
 
 ## The database files on disk
 
@@ -87,11 +89,18 @@ Operational consequences:
 Engrava supports **one writing store per database file**. For multi-worker app
 servers (Gunicorn/Uvicorn workers, etc.):
 
-- **Reads scale freely** under WAL — many readers and one writer coexist, across
-  processes as well as within one.
+- **WAL lets many readers and one writer coexist**, across processes as well
+  as within one. Reads issued through one store instance still serialise on
+  that store's single connection (see
+  [Concurrency](concurrency.md#many-async-tasks-one-store)); it is separate
+  store instances, including across processes, that read concurrently.
 - **Route every write to one process.** Two workers writing one file is not a
-  contention trade-off you can tune with `busy_timeout`; it silently loses updates
-  and can duplicate deduplicated content. See
+  contention trade-off you can tune with `busy_timeout`. A guarded update
+  whose read-to-write window another writer's guarded write lands in raises
+  `StaleDataError` instead of silently overwriting that write (the write that
+  landed first succeeds; the stale one raises). Deduplication does not duplicate
+  across stores apart from a raw-transaction fallback. Other cross-store races
+  remain, so one writer per file is the contract. See
   [Concurrency → Multiple stores, one database file](concurrency.md#multiple-stores-one-database-file).
 - **Per-tenant or per-worker isolation:** give each its own database file via
   [`EngravaManager`](concurrency.md#per-service-isolation) when you need
@@ -123,17 +132,93 @@ only closes a connection it **owns**:
   close the connection you created:
 
   ```python
-  conn = await aiosqlite.connect("engrava.db")
-  conn.row_factory = aiosqlite.Row
-  store = SqliteEngravaCore(conn)
-  ...
-  await conn.close()  # the caller owns and closes the connection
+  import aiosqlite
+  from engrava import SqliteEngravaCore
+
+
+  async def run_with_manual_connection() -> None:
+      conn = await aiosqlite.connect("engrava.db")
+      conn.row_factory = aiosqlite.Row
+      store = SqliteEngravaCore(conn)
+      try:
+          ...
+      except BaseException:
+          # A failure above is what the caller needs to see; a close failure in
+          # this cleanup is secondary, so it is reported rather than allowed to
+          # replace it.
+          try:
+              await conn.close()
+          except Exception as exc:  # noqa: BLE001 - never replace the real error
+              print(f"warning: failed to close the database connection: {exc}")
+          raise
+      else:
+          await conn.close()  # the caller owns and closes the connection
   ```
 
-  (Using `async with aiosqlite.connect(...) as conn:` handles this for you.)
+  A bare `async with aiosqlite.connect(...) as conn:` looks like a shortcut
+  for this, but `aiosqlite.Connection.__aexit__` is an unconditional `await
+  close()` — if the block above raised, a close failure there replaces the
+  real error instead of the caller ever seeing it. Use the explicit
+  `try`/`except`/`else` shape above whenever a close failure must never hide
+  the original one.
 
 Wire whichever applies into your framework's shutdown hook (e.g. FastAPI
 `lifespan`, a signal handler) so an interrupted process still closes cleanly.
+
+### If the worker never answers
+
+`store.close()` waits for the background worker to finish whatever it was
+doing before it can close the connection — including flushing buffered
+access-tracking data first, when that feature is on. Those are two separate
+waits, each bounded on its own by `close_timeout_seconds` (30 seconds by
+default; tune it on `from_config()` / the manual constructor) rather than
+open-ended — **not one shared budget for the call, and not the same
+consequence if either one expires:**
+
+- **The flush wait's bound expiring** is treated as an ordinary flush
+  failure — the buffered access-tracking counts are best-effort telemetry
+  that self-heals from a lost flush — so it quarantines nothing by itself.
+  `close()` still goes on to attempt the physical close afterwards on an
+  owned connection.
+- **The physical-close wait's bound expiring** is the one with a lasting
+  consequence: the store is left permanently unusable — every further
+  operation on it raises `ConnectionQuarantinedError` — because the worker's
+  last operation never reported and the connection's true state can no
+  longer be trusted. A second `close()` call is the one exception with a
+  timing-dependent outcome: while the abandoned physical close is still
+  pending, it waits out its own bound on that same close and raises
+  `ConnectionQuarantinedError` too, but once that close finishes, a later
+  `close()` call returns normally instead — every other operation on the
+  store still raises.
+
+A worker that never answers at all can therefore make one `close()` call on
+an owned connection wait up to *twice* `close_timeout_seconds` (60 seconds
+at the default) before returning: up to the full bound stuck in the flush
+(no lasting effect on its own), then up to the full bound again stuck in the
+physical close (the one that quarantines). Either way, a caller closing a
+store whose worker has stopped responding still gets control back instead
+of hanging forever — just not within a single `close_timeout_seconds`
+window.
+
+Bounding `close()` does not bound the ordinary ~20-second residual delay
+measured behind this bound, and for that delay the reason is not the worker
+thread: a daemon and a non-daemon worker thread took the same ~20 seconds to
+exit, and by the time that residual delay is even observed the worker
+thread has already finished. That delay instead lives inside the
+interpreter's own async-runtime shutdown sequence, which runs *after* your
+code — including a returned `close()` — has already handed back control, so
+nothing about how `close()` waits (bounded or not) can shorten it.
+
+That measurement did not test, and does not rule out, a worker that never
+finishes at all. aiosqlite creates its connection's worker thread non-daemon,
+so a genuinely wedged worker leaves that thread running indefinitely even
+after `close()` has abandoned the wait and raised `ConnectionQuarantinedError`
+— and a live non-daemon thread is what keeps a Python process from exiting,
+regardless of the async-runtime delay above. If a clean, prompt process exit
+matters for your deployment, treat a `ConnectionQuarantinedError` from
+`close()` as a signal to end the process explicitly (rather than trusting the
+ordinary shutdown path) — that is a choice about how you exit, not a fix to
+either delay.
 
 ## See also
 

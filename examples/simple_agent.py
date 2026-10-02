@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Minimal agent using only engrava — no external services, no LLM.
 
 Demonstrates:
@@ -12,9 +11,10 @@ Usage::
     pip install -e packages/engrava
     python packages/engrava/examples/simple_agent.py
 
-Requires ``sentence-transformers`` for embeddings::
-
-    pip install sentence-transformers
+Embeddings here are a deterministic NumPy pseudo-embedding (see ``embed()``
+below), not a real model. ``numpy`` is already a core engrava dependency, so
+nothing extra needs installing to run this script; swap in
+``sentence-transformers`` or an API-backed embedder for a real agent.
 
 """
 

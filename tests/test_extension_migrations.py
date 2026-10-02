@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -20,7 +22,7 @@ from engrava.infrastructure.sqlite.extension_migrations import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Sequence
 
 
 # ---------------------------------------------------------------------------
@@ -970,3 +972,266 @@ class TestMigrationSafety:
             ("my ext.plugin/2",),
         )
         assert (await cursor.fetchone())[0] == 1
+
+    async def test_cancellation_after_first_statement_rolls_back_savepoint(
+        self, db: aiosqlite.Connection, tmp_path: Path
+    ) -> None:
+        """A cancellation mid-step must roll back exactly like a SQL error.
+
+        Simulates ``asyncio.CancelledError`` being delivered while executing
+        the second statement of a two-statement migration step, i.e. after
+        the first (mutating) statement already ran inside the step's own
+        savepoint. ``CancelledError`` is a ``BaseException`` subclass, not an
+        ``Exception`` one, so a guard that only catches ``Exception`` misses
+        it entirely and leaves the savepoint open with the first statement's
+        effect intact.
+        """
+        migrations_dir = tmp_path / "migrations"
+        migrations_dir.mkdir()
+        (migrations_dir / "001_cancel.sql").write_text(
+            "CREATE TABLE cancel_ok (id TEXT PRIMARY KEY);\n"
+            "INSERT INTO cancel_ok (id) VALUES ('should-not-persist');",
+            encoding="utf-8",
+        )
+        manifest = _make_manifest(migrations=[migrations_dir / "001_cancel.sql"])
+        runner = ExtensionMigrationRunner()
+
+        real_execute = db.execute
+
+        async def _execute_or_cancel(sql: str, parameters: object = None) -> aiosqlite.Cursor:
+            if sql.strip().startswith("INSERT INTO cancel_ok"):
+                raise asyncio.CancelledError
+            return await real_execute(sql, parameters)
+
+        db.execute = _execute_or_cancel  # type: ignore[method-assign]
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await runner.apply_pending(manifest, db)
+        finally:
+            db.execute = real_execute  # type: ignore[method-assign]
+
+        # The step's first statement must not have survived: a cancellation
+        # mid-step rolls back exactly like an ordinary SQL error.
+        cursor = await db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='cancel_ok'"
+        )
+        assert await cursor.fetchone() is None
+
+        cursor = await db.execute("SELECT COUNT(*) FROM extension_schema_migrations")
+        assert (await cursor.fetchone())[0] == 0
+        cursor = await db.execute("SELECT COUNT(*) FROM extension_schema_versions")
+        assert (await cursor.fetchone())[0] == 0
+
+        # The savepoint itself must not be left open. Releasing the exact
+        # savepoint name the runner would have used must fail with "no such
+        # savepoint" -- proof the runner released it during its own
+        # rollback, not that nothing was ever opened.
+        savepoint = ExtensionMigrationRunner._savepoint_name(manifest.name, "1")
+        with pytest.raises(sqlite3.OperationalError, match="no such savepoint"):
+            await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+
+    async def test_legacy_history_adoption_cancellation_rolls_back_savepoint(
+        self, db: aiosqlite.Connection, tmp_path: Path
+    ) -> None:
+        """A cancellation mid-adoption must roll back exactly like an adoption failure.
+
+        Simulates ``asyncio.CancelledError`` being delivered while backfilling the
+        second history row of a two-migration legacy baseline, i.e. after the
+        first row already inserted inside the adoption's own savepoint.
+        ``CancelledError`` is a ``BaseException`` subclass, not an ``Exception``
+        one, so a guard that only catches ``Exception`` misses it entirely and
+        leaves the savepoint open with the first row's effect intact.
+        """
+        migrations_dir = tmp_path / "migrations"
+        migrations_dir.mkdir()
+        f1 = migrations_dir / "001_init.sql"
+        f2 = migrations_dir / "002_more.sql"
+        f3 = migrations_dir / "003_extra.sql"
+        f1.write_text("CREATE TABLE adopt_cancel_a (id TEXT PRIMARY KEY);", encoding="utf-8")
+        f2.write_text("CREATE TABLE adopt_cancel_b (id TEXT PRIMARY KEY);", encoding="utf-8")
+        f3.write_text("CREATE TABLE adopt_cancel_c (id TEXT PRIMARY KEY);", encoding="utf-8")
+        runner = ExtensionMigrationRunner()
+
+        # An older build applied 001 and 002 and tracked no checksum history.
+        await runner.apply_pending(_make_manifest(migrations=[f1, f2]), db)
+        await db.execute("DROP TABLE extension_schema_migrations")
+        await db.commit()
+
+        real_execute = db.execute
+        injected_error = asyncio.CancelledError()
+
+        async def _execute_or_cancel(
+            sql: str, parameters: Sequence[object] | None = None
+        ) -> aiosqlite.Cursor:
+            if (
+                sql.strip().startswith("INSERT INTO extension_schema_migrations")
+                and parameters is not None
+                and parameters[1] == 2
+            ):
+                raise injected_error
+            return await real_execute(sql, parameters)
+
+        db.execute = _execute_or_cancel  # type: ignore[method-assign]
+        try:
+            with pytest.raises(asyncio.CancelledError) as exc_info:
+                await runner.apply_pending(_make_manifest(migrations=[f1, f2, f3]), db)
+        finally:
+            db.execute = real_execute  # type: ignore[method-assign]
+
+        # (a) the *original* CancelledError propagates -- not a look-alike
+        # raised fresh after swallowing it, and not wrapped in
+        # ExtensionMigrationError.
+        assert exc_info.value is injected_error
+
+        # (b) nothing the cancelled adoption wrote survives: the first history
+        # row (index 1), inserted before the cancellation arrived on index 2,
+        # must also be gone -- it shares the adoption's savepoint.
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM extension_schema_migrations WHERE extension_name = 'test-ext'"
+        )
+        assert (await cursor.fetchone())[0] == 0
+
+        # The pre-existing legacy summary row is untouched by the aborted
+        # adoption (this table is outside its savepoint) -- still at version 2.
+        cursor = await db.execute(
+            "SELECT version FROM extension_schema_versions WHERE extension_name = 'test-ext'"
+        )
+        assert (await cursor.fetchone())[0] == 2
+
+        # The savepoint itself must not be left open. Releasing the exact
+        # savepoint name the runner would have used must fail with "no such
+        # savepoint" -- proof the runner released it during its own
+        # rollback, not that nothing was ever opened.
+        savepoint = ExtensionMigrationRunner._savepoint_name("test-ext", "adopt")
+        with pytest.raises(sqlite3.OperationalError, match="no such savepoint"):
+            await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+
+        # (c) the connection remains usable for a subsequent write and commit.
+        await db.execute("CREATE TABLE adoption_cancel_probe (id INTEGER)")
+        await db.commit()
+        cursor = await db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='adoption_cancel_probe'"
+        )
+        assert await cursor.fetchone() is not None
+
+    async def test_cancellation_landing_on_savepoint_statement_itself_unwinds(
+        self, db: aiosqlite.Connection, tmp_path: Path
+    ) -> None:
+        """A cancellation while the ``SAVEPOINT`` await itself is in flight must still unwind.
+
+        aiosqlite runs every statement on its own worker thread; a cancellation
+        delivered while the caller awaits the future for that statement does
+        not stop the thread, so the ``SAVEPOINT`` completes regardless. This
+        reproduces exactly that: the fake lets the real ``SAVEPOINT`` execute
+        run to completion and only then raises the cancellation, so it never
+        reaches the code that follows a successfully-returned ``SAVEPOINT``
+        await -- unlike a cancellation injected at a later statement.
+        """
+        migrations_dir = tmp_path / "migrations"
+        migrations_dir.mkdir()
+        (migrations_dir / "001_init.sql").write_text(
+            "CREATE TABLE savepoint_cancel_ok (id TEXT PRIMARY KEY);",
+            encoding="utf-8",
+        )
+        manifest = _make_manifest(migrations=[migrations_dir / "001_init.sql"])
+        runner = ExtensionMigrationRunner()
+
+        real_execute = db.execute
+        injected_error = asyncio.CancelledError()
+
+        async def _execute_then_cancel_savepoint(
+            sql: str, parameters: object = None
+        ) -> aiosqlite.Cursor:
+            if sql.strip().startswith("SAVEPOINT "):
+                await real_execute(sql, parameters)
+                raise injected_error
+            return await real_execute(sql, parameters)
+
+        db.execute = _execute_then_cancel_savepoint  # type: ignore[method-assign]
+        try:
+            with pytest.raises(asyncio.CancelledError) as exc_info:
+                await runner.apply_pending(manifest, db)
+        finally:
+            db.execute = real_execute  # type: ignore[method-assign]
+
+        # The original cancellation propagates -- not a look-alike raised
+        # fresh after swallowing it, and not wrapped in ExtensionMigrationError.
+        assert exc_info.value is injected_error
+
+        # The connection is left with no open transaction, not just no error.
+        assert db.in_transaction is False
+
+        # A subsequent BEGIN on the same connection must succeed.
+        await db.execute("BEGIN")
+        await db.execute("ROLLBACK")
+
+        cursor = await db.execute("SELECT COUNT(*) FROM extension_schema_migrations")
+        assert (await cursor.fetchone())[0] == 0
+
+        # The savepoint itself must not be left open. Releasing the exact
+        # savepoint name the runner would have used must fail with "no such
+        # savepoint" -- proof the runner released it, not that nothing was
+        # ever opened.
+        savepoint = ExtensionMigrationRunner._savepoint_name(manifest.name, "1")
+        with pytest.raises(sqlite3.OperationalError, match="no such savepoint"):
+            await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+
+    async def test_legacy_history_adoption_cancellation_on_savepoint_statement_unwinds(
+        self, db: aiosqlite.Connection, tmp_path: Path
+    ) -> None:
+        """The same real cancellation window as above, for the adoption savepoint.
+
+        The fake lets the real ``SAVEPOINT`` execute for the legacy-history
+        backfill run to completion and only then raises the cancellation, so
+        it never reaches the code that follows a successfully-returned
+        ``SAVEPOINT`` await.
+        """
+        migrations_dir = tmp_path / "migrations"
+        migrations_dir.mkdir()
+        f1 = migrations_dir / "001_init.sql"
+        f2 = migrations_dir / "002_more.sql"
+        f1.write_text(
+            "CREATE TABLE adopt_savepoint_cancel_a (id TEXT PRIMARY KEY);", encoding="utf-8"
+        )
+        f2.write_text(
+            "CREATE TABLE adopt_savepoint_cancel_b (id TEXT PRIMARY KEY);", encoding="utf-8"
+        )
+        runner = ExtensionMigrationRunner()
+
+        # An older build applied 001 and 002 and tracked no checksum history.
+        await runner.apply_pending(_make_manifest(migrations=[f1, f2]), db)
+        await db.execute("DROP TABLE extension_schema_migrations")
+        await db.commit()
+
+        real_execute = db.execute
+        injected_error = asyncio.CancelledError()
+
+        async def _execute_then_cancel_savepoint(
+            sql: str, parameters: object = None
+        ) -> aiosqlite.Cursor:
+            if sql.strip().startswith("SAVEPOINT "):
+                await real_execute(sql, parameters)
+                raise injected_error
+            return await real_execute(sql, parameters)
+
+        db.execute = _execute_then_cancel_savepoint  # type: ignore[method-assign]
+        try:
+            with pytest.raises(asyncio.CancelledError) as exc_info:
+                await runner.apply_pending(_make_manifest(migrations=[f1, f2]), db)
+        finally:
+            db.execute = real_execute  # type: ignore[method-assign]
+
+        assert exc_info.value is injected_error
+        assert db.in_transaction is False
+
+        await db.execute("BEGIN")
+        await db.execute("ROLLBACK")
+
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM extension_schema_migrations WHERE extension_name = 'test-ext'"
+        )
+        assert (await cursor.fetchone())[0] == 0
+
+        savepoint = ExtensionMigrationRunner._savepoint_name("test-ext", "adopt")
+        with pytest.raises(sqlite3.OperationalError, match="no such savepoint"):
+            await db.execute(f"RELEASE SAVEPOINT {savepoint}")

@@ -1,20 +1,82 @@
 # Single automated release pipeline — push to dev.
 #
 # semantic-release (the `release` job) owns versioning: it analyses the
-# Conventional-Commit history, bumps the version in pyproject.toml, updates
-# CHANGELOG.md, creates the git tag, and publishes the GitHub Release (via the
-# bundled @semantic-release/github plugin). It commits the bumped files back to
-# dev with [skip ci] so the pipeline does not re-trigger itself.
+# Conventional-Commit history and bumps the version in pyproject.toml. Before
+# it commits, tags, or announces anything, its `prepare` step also runs this
+# repository's fallible release gates — the smoke gate, the one and only
+# `python -m build`, the package-data verifier, a real install-and-run of the
+# built wheel in a fresh environment, and `twine check` — against that exact
+# on-disk state, and records a sha256 manifest of the resulting dist/. Only
+# if every one of those succeeds does semantic-release commit
+# CHANGELOG.md + pyproject.toml back to dev, create the tag, push it, and
+# publish the GitHub Release (via the bundled @semantic-release/github
+# plugin). It commits with [skip ci] so the pipeline does not re-trigger
+# itself.
+#
+# This ordering is not a job-level `if:` or a separate CI stage — it falls
+# directly out of the semantic-release plugin contract: a lifecycle step
+# (here, `prepare`) runs its plugins in the order they are listed in
+# .releaserc.json and aborts the whole run on the first one that fails,
+# and semantic-release always creates the tag and pushes it itself
+# immediately after `prepare` succeeds, before any `publish` plugin (such as
+# @semantic-release/github, which creates the Release) runs. So the release
+# gate is configured as an @semantic-release/exec `prepareCmd` positioned
+# after the version-bump prepareCmd and before @semantic-release/git: if it
+# fails, @semantic-release/git never commits or pushes, and semantic-release
+# never reaches the tag/push/Release code at all. See
+# scripts/verify_release_artifacts.sh for the gate itself.
+#
+# Nothing above names the version this release train *intends* to publish --
+# commit-analyzer only derives one from whatever the commit range on `dev`
+# happens to type as. `release-target.json` at the repository root is the
+# declared target: a single git-tracked file, independent of the branch name
+# that carried the work here (by the time this job runs, the source
+# `release/vX.Y.Z` branch has already been merged and deleted, so there is no
+# branch name left to read). Two checks compare the declared target against
+# reality, for the two different ways they can disagree:
+#
+#   - F1, the wrong version being published: `prepare`'s *first* plugin --
+#     ahead of the changelog, the version bump, and the artifact gate above,
+#     let alone @semantic-release/git -- runs
+#     scripts/check_computed_version_matches_target.py against
+#     `${nextRelease.version}` and fails the whole lifecycle step (by the
+#     same abort-on-first-failure contract described above) if it disagrees
+#     with release-target.json.
+#   - F2, no version being published at all: when every commit types as
+#     no-release, semantic-release's `prepare` step never runs, so there is
+#     no lifecycle step left to hook a check into. The "Fail if the
+#     declared release target's tag is not reachable from HEAD" step below
+#     runs unconditionally after semantic-release, not as a plugin. It
+#     fails when no such tag exists in this checkout; it cannot tell this
+#     run's tag from an earlier run's.
 #
 # `dev` is the release-trigger branch (portfolio-wide convention). `main` is a
 # stable mirror — it inherits the tagged release-commit via a separate forward
 # merge from `dev` after each release. Regular-merge strategy on `dev → main`
 # preserves SHA equality, so the tagged commit is reachable from both branches.
 #
-# When (and only when) semantic-release publishes a new version, the gated
-# `publish` job checks out dev HEAD (which now carries the bumped version),
-# runs the smoke gate, builds the sdist + wheel, and uploads to PyPI via
-# trusted publishing (OIDC — no API token).
+# When (and only when) semantic-release publishes a new version, this job
+# uploads the dist/ built and verified above (plus its sha256 manifest) as a
+# workflow artifact keyed to that version. The gated `publish` job downloads
+# that exact artifact — it never checks out source and never rebuilds — so
+# there is nothing for it to check out that could have moved, and no second
+# build that could silently differ from the one the gates ran against. It
+# re-verifies the recorded hashes, runs `twine check` again on the artefact
+# it is about to upload, and then uploads to PyPI via trusted publishing.
+#
+# The checks that can fail because of what is *in* this release run
+# before the tag, inside `prepare`, and some of them run again after it.
+# A failure after the tag leaves the release announced with its package
+# published partially or not at all — and the version spent either way,
+# because a distribution filename that has once been uploaded to PyPI
+# can never be reused, cleaned up or not. The PyPI upload comes last
+# because it is the one step in this pipeline whose effect cannot be
+# undone.
+#
+# The publish job runs under the `pypi` GitHub Environment. If that
+# environment requires an approval, the approval is decided after the tag
+# and the Release already exist, not before them. Which protection rules
+# the environment has is set in the repository settings, not here.
 #
 # Only GitHub-owned (actions/*) and verified-publisher (pypa/*) actions are
 # used, to satisfy the repository's "allow select actions" policy. The
@@ -42,7 +104,7 @@ concurrency:
 
 jobs:
   release:
-    name: semantic-release
+    name: semantic-release (gated)
     runs-on: ubuntu-latest
     outputs:
       # Raw semantic-release CLI does not emit GitHub Actions step outputs, so
@@ -56,6 +118,15 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # scripts/verify_release_content_scan.sh runs later, from inside the
+      # `prepare` step of "Run semantic-release" below, and expects a
+      # gitleaks binary already at the repository root. Installed here,
+      # before semantic-release even starts, via the same pinned-and-
+      # verified install this repository's ordinary secret scan
+      # (secret-scan.yml) uses — one trusted binary, not a second copy of
+      # the pin.
+      - name: Install gitleaks (pinned binary, checksum-verified)
+        run: bash scripts/install_gitleaks.sh
       - name: Setup Node
         uses: actions/setup-node@v7
         with:
@@ -63,7 +134,8 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.12"
+          cache: "pip"
       - name: Install semantic-release
         run: |
           npm install --no-save \
@@ -73,6 +145,19 @@ jobs:
             @semantic-release/github@11 \
             @semantic-release/exec@6 \
             conventional-changelog-conventionalcommits@8
+      # The pre-publish smoke gate loads the real all-MiniLM-L6-v2 model; cache
+      # the Hub store (and go offline on a cache hit) so a release is never
+      # blocked by transient HF 429 rate limiting. Needed before the release
+      # gate below, which runs the smoke gate from inside semantic-release's
+      # `prepare` step.
+      - name: Cache HuggingFace models
+        id: hf-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-sentence-transformers-all-MiniLM-L6-v2-v1
+      - name: Install release-gate dependencies
+        run: pip install -e ".[embeddings-local]" build twine
       - name: Generate release app token
         id: app-token
         uses: actions/create-github-app-token@v3
@@ -85,6 +170,9 @@ jobs:
           # push the release commit + tag back to the protected dev branch — the
           # app is a branch-protection bypass actor; the default token is not.
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          HF_HUB_OFFLINE: ${{ steps.hf-cache.outputs.cache-hit == 'true' && '1' || '0' }}
+          TRANSFORMERS_OFFLINE: ${{ steps.hf-cache.outputs.cache-hit == 'true' && '1' || '0' }}
+          HF_HUB_DISABLE_TELEMETRY: "1"
         run: npx semantic-release
       - name: Detect whether a release was published
         id: detect
@@ -99,53 +187,75 @@ jobs:
             echo "published=false" >> "$GITHUB_OUTPUT"
             echo "::notice::No release-triggering commits — nothing published."
           fi
+      # No `if:` on steps.detect.outputs.published here — that is the whole
+      # point of this step. It runs whether or not a release just happened,
+      # because the case it is aimed at (F2: release-target.json declares a
+      # version and this run published nothing) is one the `detect` step
+      # above treats as a clean, green no-op. See
+      # scripts/check_release_target_was_published.py for the check and its
+      # documented boundary (it only proves the declared target's tag
+      # exists somewhere in this checkout's history, this run or an earlier
+      # one — not that this run was the one that produced it).
+      - name: Fail if the declared release target's tag is not reachable from HEAD
+        run: python scripts/check_release_target_was_published.py
+      # dist/ at this point is exactly what scripts/verify_release_artifacts.sh
+      # built and gated inside semantic-release's `prepare` step, before the
+      # tag and the GitHub Release above were created. The publish job
+      # consumes this artifact rather than rebuilding.
+      #
+      # retention-days is 90 (the GitHub maximum), not the default 90-day-or-
+      # less shorter window some teams pick for build scratch: by the time
+      # this artifact exists, the tag and the GitHub Release already exist
+      # too, so if `publish` needs to be re-run after the artifact has
+      # expired, the release is permanently half-finished — announced, with
+      # no way to complete it without a second build the gates never saw.
+      # Failing closed (no artifact, no re-run) is correct; making that
+      # failure unlikely is worth the retention budget.
+      - name: Upload verified release artifacts
+        if: steps.detect.outputs.published == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dist-${{ steps.detect.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
 
   publish:
-    name: build + publish to PyPI
+    name: publish verified artifacts to PyPI
     needs: release
     if: needs.release.outputs.published == 'true'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
+      # id-token is the only GITHUB_TOKEN scope this job uses (trusted
+      # publishing to PyPI via OIDC). Artifact download/upload authenticates
+      # via the run-scoped Actions runtime token, not GITHUB_TOKEN, so it
+      # needs no entry here; there is no checkout, so no `contents` scope
+      # either.
       id-token: write
-      contents: read
     steps:
-      - name: Checkout released commit
-        uses: actions/checkout@v7
+      # No checkout: this job ships the exact bytes the release job already
+      # gated, and never rebuilds them, so there is no source ref for it to
+      # resolve — mutable or otherwise.
+      - name: Download gated release artifacts
+        uses: actions/download-artifact@v4
         with:
-          ref: dev
-          fetch-depth: 0
+          name: release-dist-${{ needs.release.outputs.version }}
+          path: dist
+      - name: Verify artifacts are byte-identical to what was gated
+        run: |
+          cd dist
+          sha256sum -c SHA256SUMS
+          # The manifest isn't a distribution file: pypa/gh-action-pypi-publish
+          # globs everything in packages-dir for `twine check`/`twine upload`,
+          # so it has to be gone before that step, not just ignored by us.
+          rm SHA256SUMS
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-          cache: "pip"
-      # The pre-publish smoke gate loads the real all-MiniLM-L6-v2 model; cache
-      # the Hub store (and go offline on a cache hit) so a release is never
-      # blocked by transient HF 429 rate limiting.
-      - name: Cache HuggingFace models
-        id: hf-cache
-        uses: actions/cache@v6
-        with:
-          path: ~/.cache/huggingface
-          key: hf-${{ runner.os }}-sentence-transformers-all-MiniLM-L6-v2-v1
-      - name: Pre-publish smoke gate
-        env:
-          HF_HUB_OFFLINE: ${{ steps.hf-cache.outputs.cache-hit == 'true' && '1' || '0' }}
-          TRANSFORMERS_OFFLINE: ${{ steps.hf-cache.outputs.cache-hit == 'true' && '1' || '0' }}
-          HF_HUB_DISABLE_TELEMETRY: "1"
+      - name: twine check on the artifact that ships
         run: |
-          pip install -e ".[embeddings-local]"
-          python scripts/check_smoke_gate.py
-      - name: Build sdist + wheel
-        run: |
-          pip install build
-          python -m build
-      # Gate the publish on package-data integrity: verify the freshly built
-      # wheel actually bundles the required non-Python data (schema SQL +
-      # synthetic dataset) before it can reach PyPI. Catches a packaging
-      # regression (e.g. a file falling out of [tool.setuptools.package-data])
-      # at the one point where it would otherwise ship broken.
-      - name: Verify wheel package data
-        run: python scripts/verify_wheel_data.py
+          pip install twine
+          python -m twine check dist/*.whl dist/*.tar.gz
       - name: Publish to PyPI (OIDC, no token)
         uses: pypa/gh-action-pypi-publish@release/v1

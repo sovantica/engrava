@@ -76,7 +76,7 @@ from engrava.cli.main import cli
 
 # The extension's own load sequence, reused so the read-back connections in this
 # module cannot come to load sqlite-vec differently from the code under test.
-from engrava.extensions.vector_sqlite_vec import _load_sqlite_vec_sync
+from engrava.infrastructure.sqlite.vector_sqlite_vec import _load_sqlite_vec_sync
 
 # The real-shape per-version schema builder the migration-ladder suite already
 # maintains. Reused rather than re-derived so the pre-cascade fixture below
@@ -607,8 +607,7 @@ def pre_cascade_mixed_lifecycle_db(tmp_path: Path) -> Path:
     """Materialise the same corpus on a real pre-cascade (core-11) schema.
 
     ``gc`` opens its database through the CLI's plain connection helper, which
-    sets PRAGMAs and **never migrates** — ``ensure_schema`` is reached only by
-    ``restore`` and by the ``migrate`` command. A database last written before
+    sets PRAGMAs and **never migrates**. A database last written before
     the ``v11 -> v12`` migration added the ``ON DELETE CASCADE`` foreign keys is
     therefore a shape ``engrava gc`` can genuinely be pointed at, and there
     ``PRAGMA foreign_keys = ON`` has no constraints to enforce.
@@ -1066,60 +1065,67 @@ class TestGcArchivedBlastRadius:
             for aid, before in snapshots.items():
                 assert _sync_row(conn, _ACTION_BY_ID, aid) == before, f"action {aid} was modified"
 
-    def test_gc_collects_the_archived_subtree_without_a_cascade(
+    def test_gc_refuses_on_a_pre_cascade_schema_instead_of_collecting(
         self,
         runner: CliRunner,
         pre_cascade_mixed_lifecycle_db: Path,
     ) -> None:
-        """On a pre-cascade schema the child deletes are the only thing that runs.
+        """``gc`` refuses a pre-cascade schema outright rather than collecting on it.
 
-        ``gc`` never migrates, so a database written before the ``v11 -> v12``
-        foreign keys existed is a shape it can be pointed at. There the parent
-        delete cannot cascade, and the three child statements in
-        ``_gc_archived`` are solely responsible for removing an archived
-        thought's edges, embeddings and actions — the same statements whose
-        effect is entirely masked on a head schema.
-
-        The blast radius is asserted in both directions on all three child
-        tables, exactly as on a head schema.
+        A destructive operation refuses on a schema below head, applied
+        to every built-in command that deletes user data, ``gc`` included.
+        The three explicit child-delete statements in ``_gc_archived`` make
+        a collection *correct* even without a foreign-key cascade (see
+        ``test_gc_archived_helper_still_deletes_children_explicitly_on_pre_cascade``
+        below for that coverage, exercised directly against the helper), but
+        "correct collection" is not the same question as "should this ever run against
+        a database this build has never brought current." The answer here is
+        no: the command exits non-zero, names ``engrava migrate``, and the
+        entire corpus — collectible thoughts included — is untouched.
         """
         with _reopen(pre_cascade_mixed_lifecycle_db) as conn:
-            # Corpus precondition: this really is a pre-cascade schema, so a
-            # cascade cannot be doing the work the child deletes are credited
-            # with. Without it the fixture could silently become a second head
-            # -schema test and prove nothing new.
+            # Corpus precondition: this really is a pre-cascade schema, so the
+            # refusal below is exercising the schema-version gate and not
+            # some other, unrelated failure.
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             assert version == _PRE_CASCADE_VERSION
             for table in ("edge", "embedding", "action"):
                 foreign_keys = conn.execute(f"PRAGMA foreign_key_list({table})").fetchall()
                 assert foreign_keys == [], f"{table} already carries a cascade at v{version}"
 
-            for doomed, query in (
-                *((eid, _EDGE_BY_ID) for eid in self._DOOMED_EDGES),
-                *((tid, _EMBEDDING_BY_OWNER) for tid in self._DOOMED),
-                *((aid, _ACTION_BY_ID) for aid in self._DOOMED_ACTIONS),
-            ):
-                _require(_sync_row(conn, query, doomed), doomed)
+            all_thought_ids = {tid for tid, _status in _GC_THOUGHTS}
+            all_edge_ids = {eid for eid, *_rest in _GC_EDGES}
+            all_embedding_owners = {tid for tid, _vector in _GC_EMBEDDINGS}
+            all_action_ids = {aid for aid, _src in _GC_ACTIONS}
+            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == all_thought_ids
+            thoughts_before = {
+                tid: _require(_sync_row(conn, _THOUGHT_BY_ID, tid), tid) for tid in all_thought_ids
+            }
             edges_before = {
-                eid: _require(_sync_row(conn, _EDGE_BY_ID, eid), eid)
-                for eid in self._SURVIVING_EDGES
+                eid: _require(_sync_row(conn, _EDGE_BY_ID, eid), eid) for eid in all_edge_ids
             }
             embeddings_before = {
                 tid: _require(_sync_row(conn, _EMBEDDING_BY_OWNER, tid), tid)
-                for tid in self._SURVIVORS
+                for tid in all_embedding_owners
             }
             actions_before = {
-                aid: _require(_sync_row(conn, _ACTION_BY_ID, aid), aid)
-                for aid in self._SURVIVING_ACTIONS
+                aid: _require(_sync_row(conn, _ACTION_BY_ID, aid), aid) for aid in all_action_ids
             }
 
-        self._collect(runner, pre_cascade_mixed_lifecycle_db)
+        result = runner.invoke(cli, ["--db", str(pre_cascade_mixed_lifecycle_db), "gc"])
+
+        assert result.exit_code != 0, result.output
+        assert "migrate" in result.output.lower(), result.output
 
         with _reopen(pre_cascade_mixed_lifecycle_db) as conn:
-            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == set(self._SURVIVORS)
-            assert _sync_id_set(conn, _ALL_EDGE_IDS) == set(self._SURVIVING_EDGES)
-            assert _sync_id_set(conn, _ALL_EMBEDDING_OWNERS) == set(self._SURVIVORS)
-            assert _sync_id_set(conn, _ALL_ACTION_IDS) == set(self._SURVIVING_ACTIONS)
+            version_after = conn.execute("PRAGMA user_version").fetchone()[0]
+            assert version_after == _PRE_CASCADE_VERSION, "a refusal must not migrate the schema"
+            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == all_thought_ids
+            assert _sync_id_set(conn, _ALL_EDGE_IDS) == all_edge_ids
+            assert _sync_id_set(conn, _ALL_EMBEDDING_OWNERS) == all_embedding_owners
+            assert _sync_id_set(conn, _ALL_ACTION_IDS) == all_action_ids
+            for tid, before in thoughts_before.items():
+                assert _sync_row(conn, _THOUGHT_BY_ID, tid) == before, f"thought {tid} was modified"
             for eid, before in edges_before.items():
                 assert _sync_row(conn, _EDGE_BY_ID, eid) == before, f"edge {eid} was modified"
             for tid, before in embeddings_before.items():
@@ -1127,6 +1133,39 @@ class TestGcArchivedBlastRadius:
                 assert after == before, f"embedding of {tid} was modified"
             for aid, before in actions_before.items():
                 assert _sync_row(conn, _ACTION_BY_ID, aid) == before, f"action {aid} was modified"
+
+    async def test_gc_archived_helper_still_deletes_children_explicitly_on_pre_cascade(
+        self,
+        pre_cascade_mixed_lifecycle_db: Path,
+    ) -> None:
+        """``_gc_archived`` itself still needs no cascade — exercised directly.
+
+        The CLI-level refusal above means ``gc`` never reaches
+        ``_gc_archived`` on a pre-cascade schema in practice, but the helper
+        (``cli/main.py``'s ``_gc_archived``) deletes the children explicitly
+        rather than relying on a cascade the database may not have, and
+        calling it directly (bypassing the CLI's schema-version gate) is what
+        keeps that coverage rather than losing it entirely alongside the
+        CLI-level test above.
+        """
+        import aiosqlite as _aiosqlite
+
+        from engrava.cli.main import _gc_archived
+
+        conn = await _aiosqlite.connect(str(pre_cascade_mixed_lifecycle_db))
+        conn.row_factory = _aiosqlite.Row
+        try:
+            version = (await (await conn.execute("PRAGMA user_version")).fetchone())[0]
+            assert version == _PRE_CASCADE_VERSION
+            await _gc_archived(conn, dry_run=False, quiet=False)
+        finally:
+            await conn.close()
+
+        with _reopen(pre_cascade_mixed_lifecycle_db) as conn:
+            assert _sync_id_set(conn, _ALL_THOUGHT_IDS) == set(self._SURVIVORS)
+            assert _sync_id_set(conn, _ALL_EDGE_IDS) == set(self._SURVIVING_EDGES)
+            assert _sync_id_set(conn, _ALL_EMBEDDING_OWNERS) == set(self._SURVIVORS)
+            assert _sync_id_set(conn, _ALL_ACTION_IDS) == set(self._SURVIVING_ACTIONS)
 
     @sqlite_vec_required
     def test_gc_purges_only_the_collected_thoughts_vectors(
@@ -1223,7 +1262,7 @@ class TestGcArchivedBlastRadius:
             return False
 
         monkeypatch.setattr(
-            "engrava.extensions.vector_sqlite_vec.load_sqlite_vec",
+            "engrava.infrastructure.sqlite.vector_sqlite_vec.load_sqlite_vec",
             _refuse_to_load,
         )
         with _reopen_with_vector_index(vec_indexed_mixed_lifecycle_db) as conn:
@@ -1292,7 +1331,7 @@ class TestGcArchivedBlastRadius:
             return False
 
         monkeypatch.setattr(
-            "engrava.extensions.vector_sqlite_vec.load_sqlite_vec",
+            "engrava.infrastructure.sqlite.vector_sqlite_vec.load_sqlite_vec",
             _refuse_to_load,
         )
         with _reopen_with_vector_index(vec_indexed_mixed_lifecycle_db) as conn:
@@ -1335,7 +1374,7 @@ class TestGcArchivedBlastRadius:
         """
         removed_by_the_stub: list[int] = []
         monkeypatch.setattr(
-            "engrava.extensions.vector_sqlite_vec.purge_orphan_vectors",
+            "engrava.infrastructure.sqlite.vector_sqlite_vec.purge_orphan_vectors",
             _purge_that_removes_a_vector_then_fails(removed_by_the_stub),
         )
         with _reopen_with_vector_index(vec_indexed_mixed_lifecycle_db) as conn:
@@ -1360,7 +1399,15 @@ class TestGcArchivedBlastRadius:
             assert _sync_id_set(conn, _ALL_EMBEDDING_OWNERS) == thoughts_before
             assert _sync_id_set(conn, _ALL_ACTION_IDS) == actions_before
             assert _sync_vec_rowids(conn) == vectors_before
-        assert isinstance(result.exception, sqlite3.OperationalError), result.exception
+        # The purge failure does not escape as a raw, uncaught
+        # OperationalError: `_run_command` (engrava.cli.main) converts it
+        # into a clean exit-1 message naming the resolved database. The
+        # rollback this test exists to prove does not depend on how the
+        # failure is reported.
+        assert isinstance(result.exception, SystemExit), result.exception
+        assert result.exception.code == 1
+        assert str(vec_indexed_mixed_lifecycle_db) in result.output
+        assert "OperationalError" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -1604,6 +1651,8 @@ class TestGcExpiredBlastRadius:
             The exact row expected afterwards.
 
         """
+        before_revision = before["revision"]
+        assert isinstance(before_revision, int)
         return {
             **before,
             "lifecycle_status": LifecycleStatus.ARCHIVED.value,
@@ -1613,6 +1662,16 @@ class TestGcExpiredBlastRadius:
             "expires_at": None,
             "archived_at_cycle": None,
             "archived_at": None,
+            # A maintenance sweep must not be defeated by a stale caller
+            # expectation, so archival advances the row's revision counter --
+            # but it does not check that counter itself, because nothing about
+            # a maintenance archival depends on what any caller last read. The
+            # expected value is computed from the row's own before-state
+            # (never read back from the row under test): a build that stopped
+            # bumping on archive would leave the after-row's revision equal to
+            # ``before_revision``, one short of this expectation, and this
+            # assertion would catch it.
+            "revision": before_revision + 1,
         }
 
     @classmethod
@@ -2089,7 +2148,7 @@ class TestGcExpiredBlastRadius:
             return False
 
         monkeypatch.setattr(
-            "engrava.extensions.vector_sqlite_vec.load_sqlite_vec",
+            "engrava.infrastructure.sqlite.vector_sqlite_vec.load_sqlite_vec",
             _refuse_to_load,
         )
         before = self._read_thoughts(vec_indexed_ttl_lifecycle_db)
@@ -2132,7 +2191,7 @@ class TestGcExpiredBlastRadius:
         config = _write_ttl_config(tmp_path / "delete.yaml", vec_indexed_ttl_lifecycle_db, "delete")
         removed_by_the_stub: list[int] = []
         monkeypatch.setattr(
-            "engrava.extensions.vector_sqlite_vec.purge_orphan_vectors",
+            "engrava.infrastructure.sqlite.vector_sqlite_vec.purge_orphan_vectors",
             _purge_that_removes_a_vector_then_fails(removed_by_the_stub),
         )
         all_edges = {eid for eid, _src, _dst, _weight in _TTL_EDGES}
@@ -2162,4 +2221,11 @@ class TestGcExpiredBlastRadius:
             assert _sync_id_set(conn, _ALL_EMBEDDING_OWNERS) == set(_TTL_THOUGHT_IDS)
             assert _sync_id_set(conn, _ALL_ACTION_IDS) == all_actions
             assert _sync_vec_rowids(conn) == vectors_before
-        assert isinstance(result.exception, sqlite3.OperationalError), result.exception
+        # See the matching comment in TestGcArchivedBlastRadius's own
+        # purge-failure test: `_run_command` converts this into a clean
+        # exit-1 message naming the resolved database instead of an
+        # uncaught OperationalError -- the rollback is unaffected.
+        assert isinstance(result.exception, SystemExit), result.exception
+        assert result.exception.code == 1
+        assert str(vec_indexed_ttl_lifecycle_db) in result.output
+        assert "OperationalError" in result.output

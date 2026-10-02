@@ -138,7 +138,7 @@ class TestInvalidateThought:
             await store.invalidate_thought("t1", "not-a-date")
 
     async def test_backdated_valid_until_rejected(self, store: SqliteEngravaCore) -> None:
-        # AC-4: closing the interval before the stored valid_from is rejected at
+        # Closing the interval before the stored valid_from is rejected at
         # the mutation path — the guard runs before the row is updated.
         await store.create_thought(_mk_thought("t1"))  # valid_from == _T_JAN
         before_from = "2024-06-01T00:00:00+00:00"  # precedes _T_JAN
@@ -248,7 +248,7 @@ class TestInvalidateEdge:
             await store.invalidate_edge("e1", "not-a-date")
 
     async def test_backdated_valid_until_rejected(self, store: SqliteEngravaCore) -> None:
-        # AC-4: closing the interval before the stored valid_from is rejected at
+        # Closing the interval before the stored valid_from is rejected at
         # the mutation path — the guard runs before the row is updated.
         await self._seed_edge(store)  # valid_from == _T_JAN
         before_from = "2024-06-01T00:00:00+00:00"  # precedes _T_JAN

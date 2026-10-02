@@ -5,7 +5,7 @@ Represents a lightweight directional edge in the thought graph.
 
 from __future__ import annotations
 
-from typing import Self
+from typing import Final, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -15,6 +15,11 @@ from engrava.domain.models._temporal import (
     validate_iso8601_nullable,
 )
 from engrava.domain.models.thought import MetadataValue
+
+#: The ``EdgeRecord`` fields held in the canonical UTC timestamp form — the
+#: edge counterpart of
+#: :data:`~engrava.domain.models.thought.THOUGHT_TIMESTAMP_FIELDS`.
+EDGE_TIMESTAMP_FIELDS: Final = ("valid_from", "valid_until")
 
 
 class EdgeRecord(BaseModel):
@@ -82,20 +87,20 @@ class EdgeRecord(BaseModel):
             raise ValueError(msg)
         return v
 
-    @field_validator("valid_from", "valid_until")
+    @field_validator(*EDGE_TIMESTAMP_FIELDS)
     @classmethod
     def _validate_iso8601_nullable(cls, v: str | None) -> str | None:
-        """Validate ISO-8601 format and normalize to UTC when not None.
+        """Validate ISO-8601 format and store the canonical UTC form when not None.
 
-        Uses the shared timestamp validator so edge valid-time fields
-        normalise timezone-aware values to UTC exactly like the thought
-        record's timestamp columns, keeping SQLite TEXT ordering correct.
+        Uses the shared timestamp validator so edge valid-time fields are
+        stored in the same canonical UTC form as the thought record's
+        timestamp columns, keeping SQLite TEXT ordering correct.
 
         Args:
             v: Timestamp string or None.
 
         Returns:
-            The validated (and UTC-normalized) string, or None.
+            The canonical UTC string, or None.
 
         Raises:
             ValueError: If string is not valid ISO-8601.

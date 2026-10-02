@@ -68,7 +68,7 @@ def _tiny_dataset() -> tuple[SyntheticConversation, ...]:
 def _neutral_sanity_dataset() -> tuple[SyntheticConversation, ...]:
     """Sanity subset — only anti-cherry-pick neutrals.
 
-    Sized at 24 conversations so the |ON - OFF| <= 0.02 band has
+    Sized at 24 conversations so the |ON - OFF| <= 0.05 band has
     enough sample-size resolution to be meaningful — at 8 questions
     every difference is at least 1/8 = 0.125 and the band would be
     statistically toothless.
@@ -217,7 +217,8 @@ class TestSelfAnchoredMetadata:
 
 
 # ---------------------------------------------------------------------------
-# OFF / ON pair contracts — used by the AC-9 floor and the AC-8 sanity band.
+# OFF / ON pair contracts — used by the synthesis-coverage / direct-neutrality
+# floors and the sanity band.
 # ---------------------------------------------------------------------------
 
 
@@ -250,17 +251,14 @@ class TestOffOnPair:
         self,
         embedding_provider: EmbeddingProviderProtocol,
     ) -> None:
-        # AC-8 v0.3.0 tolerance ≤0.05 (v1.4 amendment).
-        #
-        # v1.4 relaxed from ≤0.02 with explicit empirical rationale:
-        # REFLECTIONs participate at parity in retrieval despite
-        # ``reflection_boost=1.0`` (boost is a multiplier on top of
-        # the intrinsic vector / FTS score, not an enable/disable
-        # toggle).  Measured delta post-NA-1 is 0.042 — the 0.05
-        # ceiling carries a small safety margin without claiming
-        # neutrality the engrava-core ranking does not provide at
-        # v0.3.0.  The v0.4.0 follow-up workstream tightens this
-        # back to ≤0.02 once REFLECTION ranking is refined.
+        # Sanity subset: dreaming OFF vs ON changes recall@k by at most
+        # 0.05.  The ceiling is not zero because REFLECTIONs still take
+        # part in retrieval at ``reflection_boost=1.0`` -- the boost is
+        # a multiplier on top of the intrinsic vector / FTS score, not
+        # an enable/disable toggle -- so a REFLECTION can displace a
+        # direct observation from the top-K.  The dataset holds 24
+        # questions, so one changed answer moves recall by 1/24 = 0.042
+        # (inside the ceiling) and two changed the same way by 0.083 (outside it).
         dataset = _neutral_sanity_dataset()
         off = await evaluate_run(
             dataset,
@@ -273,17 +271,11 @@ class TestOffOnPair:
             embedding_provider=embedding_provider,
         )
         delta = abs(on.aggregate_recall_at_k - off.aggregate_recall_at_k)
-        assert delta <= 0.05, (
-            f"AC-8 v0.3.0 tolerance (0.05) exceeded: {delta:.3f}.  "
-            f"v0.4.0 tightens back to 0.02 post REFLECTION ranking "
-            f"refinement; a regression past 0.05 here means a NEW "
-            f"source of dreaming-side interference, not just the "
-            f"known intrinsic-score participation."
-        )
+        assert delta <= 0.05, f"AC-8 v0.3.0 tolerance (0.05) exceeded: {delta:.3f}."
 
 
 # ---------------------------------------------------------------------------
-# Public-export discipline — AC-14
+# Public-export discipline
 # ---------------------------------------------------------------------------
 
 
@@ -292,7 +284,7 @@ class TestOffOnPair:
 # out) will surface as a non-empty diff on this set. Deliberate public-API
 # additions are recorded here when they ship.
 #
-# Baseline captured pre-WS from release/v0.3.0 HEAD = bb407ac, then extended
+# Baseline captured at the v0.3.0 release line, then extended
 # with the metadata-filter query surface (FieldOp / FieldPredicate /
 # MetadataFilter / VisibilityQueryFilter + the two typed filter errors), an
 # intentional, ratified public-API addition. Later extended with the
@@ -348,9 +340,7 @@ class TestOffOnPair:
 # producer byte-identical, and the producer stays inert unless the seam is enabled.
 # Later extended with VectorDimensionMismatchError, the typed error the vector-arm
 # no-silent-degradation guard raises when a search_similar query vector's length
-# differs from the store's embedding dimension (previously an opaque numpy error or
-# a silent empty result) — an additive public-API addition raised only on a
-# malformed query vector, never on any well-formed vector-search path.
+# differs from the store's embedding dimension — an additive public-API addition.
 # Later extended with EngravaReadProtocol, the runtime-checkable read (non-mutating)
 # half of EngravaCoreProtocol — extracted so the write-blocking ReadOnlyEngrava view
 # declares and is type-checked against exactly the capabilities it forwards. An
@@ -358,10 +348,50 @@ class TestOffOnPair:
 # and every full store satisfies it by construction, so no existing consumer changes.
 # Later extended with EmbeddingProviderContractError, raised when a configured
 # embedding provider omits a required EmbeddingProviderProtocol member (today:
-# a public ``dimension``). The protocol has always required it; the error only
-# replaces the bare AttributeError the core previously raised from internals, so
-# it is additive and unreachable for any conformant provider.
-_PRE_WS_ALL_BASELINE = frozenset(
+# a public ``dimension``). The protocol has always required it, so the error is
+# additive and unreachable for any conformant provider.
+# Later extended with WriteContentionError, raised when the content-hash dedup
+# probe-and-insert window (create_thought(deduplicate=True), get_or_create,
+# upsert_by_hash) cannot acquire its cross-connection BEGIN IMMEDIATE write lock
+# after retrying — an additive public-API addition, unrelated to this benchmark
+# suite, raised only under genuine write contention on that specific path.
+# Later extended with WriteLockTimeoutError, raised when a task cannot acquire
+# the store's in-process write lock within a configurable bound — an additive
+# public-API addition, unrelated to this benchmark suite, raised only when a
+# different task is spawned and awaited from inside another task's own
+# suspend_auto_commit() window (an out-of-contract deadlock this store cannot
+# otherwise resolve) or when that bound is configured too small for a
+# legitimately slow embedding provider.
+# Later extended with SchemaVersionError, raised by ensure_schema() when a
+# database is a populated sub-floor schema (below the bootstrap floor but
+# already carrying a row, rather than genuinely empty) or is stamped above
+# this build's head version — cases that were previously either silently
+# mislabelled current or silently opened with every migration step skipped.
+# An additive public-API addition, unreachable for any database that is
+# either genuinely empty or already at or below this build's head version;
+# reachable through EngravaManager.get_store() and any other caller of
+# ensure_schema() / from_config(), not only the CLI.
+# Later extended with ReferentialIntegrityError and DuplicateEdgeError, raised
+# by the existing public create_edge() on a missing endpoint and on an
+# existing (from_thought_id, to_thought_id, edge_type) relationship
+# respectively. Unlike the entries above, neither is new behaviour: both were
+# already reachable through a documented public method and named in the
+# documentation as the thing to catch — only the export from __all__ was
+# missing. Also extended with CoreMigrationError, raised from the existing
+# public ensure_schema() when a migration step's postcondition (a required
+# column, table, index, foreign key, or trigger) is not met after running —
+# likewise a pre-existing gap: the method was already public and the error
+# already reachable, just unexported and, until now, undocumented.
+#
+# Extended again with DedupLockReentryError. This one *is* new behaviour,
+# and the update is deliberate rather than an accommodation: the
+# dedup lock used to hang forever on a same-task second acquisition, which
+# `concurrency.md` already forbade ("what it must not become is a silent,
+# unattributable hang"), so the store now raises instead. This guard exists to
+# stop *benchmark* code leaking into `__all__`; a core exception is not that,
+# and the correct response to it firing here is a deliberate update to this
+# baseline, not a silenced test.
+_ALL_BASELINE = frozenset(
     {
         "ActionNotFoundError",
         "ActionOutcomeSignal",
@@ -377,9 +407,11 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "ConfirmationSignal",
         "ConnectionQuarantinedError",
         "ConsolidationResult",
+        "CoreMigrationError",
         "CoreThoughtRecord",
         "CycleProvider",
         "CycleProviderError",
+        "DedupLockReentryError",
         "DefaultEngravaHooks",
         "DefaultMindStoreHooks",
         "DeriveContext",
@@ -393,6 +425,7 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "DreamingExtension",
         "DreamingGates",
         "DreamingSignalProtocol",
+        "DuplicateEdgeError",
         "EdgeCounts",
         "EdgeRecord",
         "EdgeType",
@@ -456,7 +489,9 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "ReadOnlyViolationError",
         "RecencyModeConflictError",
         "RecencySignal",
+        "ReferentialIntegrityError",
         "RoleAwareEmbeddingProvider",
+        "SchemaVersionError",
         "ScoringContext",
         "SearchConfig",
         "SentenceTransformerProvider",
@@ -481,6 +516,8 @@ _PRE_WS_ALL_BASELINE = frozenset(
         "VectorDimensionMismatchError",
         "VerificationStatus",
         "VisibilityQueryFilter",
+        "WriteContentionError",
+        "WriteLockTimeoutError",
         "discover_manifests",
         "load_config",
         "parse",
@@ -501,11 +538,10 @@ class TestPublicSurfaceDiscipline:
         import engrava
 
         current = frozenset(engrava.__all__)
-        new_exports = current - _PRE_WS_ALL_BASELINE
+        new_exports = current - _ALL_BASELINE
         assert not new_exports, f"benchmark suite leaked new public exports: {sorted(new_exports)}"
-        # Defensive: regressions that quietly remove a public export are
-        # not in scope for this WS either.
-        dropped = _PRE_WS_ALL_BASELINE - current
+        # Also fail when a public export is quietly removed.
+        dropped = _ALL_BASELINE - current
         assert not dropped, (
             f"benchmark suite accidentally dropped public exports: {sorted(dropped)}"
         )
@@ -599,8 +635,9 @@ class TestRunnerDeserialisation:
             _as_int(True)
 
     def test_as_bool_rejects_string(self) -> None:
-        # Regression: pre-fix ``bool("false")`` coerced to ``True``,
-        # silently flipping the self-anchored provenance contract.
+        # A string is not a boolean: ``bool("false")`` is ``True``, so a
+        # coercing loader would silently flip the self-anchored
+        # provenance flag.  ``_as_bool`` rejects it instead.
         from engrava.benchmarks.synthetic.runner import _as_bool
 
         with pytest.raises(SystemExit):
@@ -858,6 +895,78 @@ async def _make_reflection(
     )
     persisted = await store.create_thought(thought)
     return persisted.thought_id
+
+
+class TestMeasureSynthesisCoverageCleanupClose:
+    """``measure_synthesis_coverage`` must not let a close failure replace the body's.
+
+    ``aiosqlite.Connection.__aexit__`` is an unconditional ``await
+    close()`` and cannot distinguish a cleanup close (something in the
+    body already raised) from a success-path one, so a bare ``async
+    with aiosqlite.connect(...) as db:`` would let a failure in that
+    close replace whatever the body actually raised. The function opens
+    the connection with ``await aiosqlite.connect(...)`` and closes it
+    through ``_close_quietly`` when the body raised, as ``evaluate_run``
+    does.
+    """
+
+    async def test_body_failure_survives_a_failing_cleanup_close(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A close failure during cleanup must not replace the body's own failure.
+
+        Forces ``ensure_schema()`` to raise a ``ValueError`` and the
+        subsequent cleanup close to also raise. The ``ValueError`` the
+        caller actually needs to see propagates; the close's
+        ``RuntimeError`` is only logged.
+        """
+        import engrava.benchmarks.synthetic.evaluate as evaluate_module
+
+        close_calls = {"n": 0}
+        real_connect = evaluate_module.aiosqlite.connect
+
+        def _spy_connect(*args: object, **kwargs: object) -> object:
+            # ``aiosqlite.connect()`` itself is synchronous -- it returns
+            # a ``Connection`` proxy immediately without opening anything;
+            # the real connect happens lazily on ``await``/``async with``.
+            # Patching ``close`` here (before either) keeps the returned
+            # object a genuine ``Connection`` that still supports both
+            # calling conventions, so this spy works whether the caller
+            # does ``await aiosqlite.connect(...)`` or
+            # ``async with aiosqlite.connect(...) as db:``.
+            conn = real_connect(*args, **kwargs)
+            real_close = conn.close
+
+            async def _close_blows_up() -> None:
+                # Still performs the real close -- only its own failure
+                # report afterward is what this test is about.
+                close_calls["n"] += 1
+                await real_close()
+                msg = "close blew up during cleanup"
+                raise RuntimeError(msg)
+
+            conn.close = _close_blows_up
+            return conn
+
+        monkeypatch.setattr(evaluate_module.aiosqlite, "connect", _spy_connect)
+
+        async def _ensure_schema_blows_up(self: SqliteEngravaCore) -> None:
+            msg = "original body failure"
+            raise ValueError(msg)
+
+        monkeypatch.setattr(SqliteEngravaCore, "ensure_schema", _ensure_schema_blows_up)
+
+        with pytest.raises(ValueError, match="original body failure"):
+            await evaluate_module.measure_synthesis_coverage(
+                [object()],  # never inspected -- ensure_schema raises first
+                embedding_provider=object(),  # type: ignore[arg-type]
+            )
+
+        assert close_calls["n"] == 1, (
+            "the cleanup close was never attempted -- a regression that "
+            "drops the close call entirely would also let the original "
+            "ValueError escape untouched, so that alone is not enough"
+        )
 
 
 class TestRunEvaluationWrapper:

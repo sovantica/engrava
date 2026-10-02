@@ -22,8 +22,11 @@ import datetime
 import json
 import logging
 import os
+import secrets
+import sqlite3
 import sys
-from dataclasses import asdict
+from contextlib import asynccontextmanager
+from dataclasses import asdict, dataclass
 from importlib.metadata import entry_points
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -31,6 +34,7 @@ from typing import TYPE_CHECKING, Any
 import click
 
 from engrava.cli.config import EngravaCLIConfig
+from engrava.cli.exception_reporting import _describe_exception, _frame_only_stack
 from engrava.cli.snapshot_records import (
     CoreTable,
     MetadataRecord,
@@ -43,11 +47,16 @@ from engrava.config import (
     resolve_embedding_provider,
 )
 from engrava.config_validation import ConfigError
+from engrava.domain.dreaming import CENTROID_MODEL_NAME
 from engrava.domain.protocols.hooks import MindQLExtension
-from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
+from engrava.infrastructure.sqlite.engrava_core import (
+    CORE_SCHEMA_HEAD_VERSION,
+    SqliteEngravaCore,
+    _run_cleanup_step_quietly,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping, Sequence
+    from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, Mapping, Sequence
     from typing import TextIO
 
     import aiosqlite
@@ -56,9 +65,21 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Re-embedding thought IDs are flushed in batches of this size so restore memory
-# stays bounded by the batch rather than by the total number of thoughts.
+# Re-embedding thought IDs are flushed in batches of this size.
 _REEMBED_BATCH_SIZE = 128
+
+# sqlite3.IntegrityError.sqlite_errorcode values the journalled-merge collision
+# gate (see `_import_records_to_db`) treats as a refused collision, rather than
+# an unrelated integrity failure it must let propagate unchanged (a foreign-key
+# violation, SQLITE_CONSTRAINT_FOREIGNKEY = 787, is one such unrelated case).
+# The exception's *message* is not used to tell these apart: SQLite's own text
+# reads "UNIQUE constraint failed" even for a primary-key violation, since a
+# ``PRIMARY KEY`` is implemented as a ``UNIQUE`` index internally.
+_SQLITE_CONSTRAINT_PRIMARYKEY = 1555
+_SQLITE_CONSTRAINT_UNIQUE = 2067
+_JOURNAL_GATE_CONSTRAINT_CODES = frozenset(
+    {_SQLITE_CONSTRAINT_PRIMARYKEY, _SQLITE_CONSTRAINT_UNIQUE}
+)
 
 _DISABLE_EXTENSIONS_META_KEY = "engrava_disable_extensions"
 _FALSE_ENV_FLAG_VALUES = frozenset({"", "0", "false", "no", "off"})
@@ -80,13 +101,184 @@ _CORE_TABLES_DELETE_ORDER: tuple[CoreTable, ...] = (
     CoreTable.THOUGHT,
 )
 
+# The journal is deliberately not a CoreTable member: that enum is the
+# allow-list of tables a *snapshot* may contain (see
+# ``engrava.cli.snapshot_records.CoreTable``), and a snapshot never carries
+# journal rows. But ``restore --clear`` still has to remove ``journal_entry``
+# alongside the four core tables above -- leaving it in place would let the
+# cleared store's data and its append-only journal describe two different
+# histories, and ``verify_journal()`` would keep reporting that mismatched
+# chain as valid. It is deleted by its own fixed literal below rather than
+# through this enum, since the enum exists to keep every *snapshot-derived*
+# SQL identifier off the trust boundary -- a concern that does not apply to a
+# name that is never read from snapshot input.
+
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
 
 
+async def _close_quietly(conn: Any) -> None:  # noqa: ANN401
+    """Close *conn*, logging rather than raising if the close itself fails.
+
+    Cleanup code that closes a connection while another exception -- or a
+    cancellation -- is already propagating must not let a failure in the
+    close itself replace what the caller actually needs to see: a bare
+    ``raise`` after an unconditional ``await conn.close()`` only re-raises
+    the original error when that close *succeeds*. If the close itself
+    raises, its exception becomes the one that propagates and the original
+    -- a ``sqlite3.DatabaseError``, a ``ClickException``, an
+    ``asyncio.CancelledError`` -- is lost. A close failure is real
+    information, but it belongs logged underneath the original error, not
+    raised in front of it. Every place in this module that closes a
+    connection during cleanup (as opposed to on the ordinary success path,
+    where a close failure is the only thing to report) goes through this
+    rather than re-deriving the same try/except. The infrastructure layer
+    has the same rule under the same name in
+    :mod:`engrava.infrastructure.sqlite.engrava_core` -- not shared as one
+    function across the CLI/infrastructure boundary, but copied rather
+    than re-derived.
+
+    ``await conn.close()`` is itself a suspension point, so a bare
+    ``try/except Exception`` around it has the identical gap this whole
+    helper exists to close: a cancellation arriving while the close is
+    in flight is a ``BaseException``, skips that handler, and can leave
+    the close abandoned mid-way with aiosqlite's non-daemon worker thread
+    still alive. The close is run as its own task and shielded so that
+    cancelling *this* coroutine does not also cancel the close itself;
+    the shield alone would not be enough, though, since it only stops the
+    cancellation from reaching the close, not from being re-thrown into
+    this coroutine before the close finishes running. So on cancellation
+    this explicitly awaits the same task again -- now cancellation-proof,
+    since a second throw only happens on an explicit second
+    ``cancel()`` -- to hold this coroutine (and so whatever awaits it,
+    keeping the event loop alive) open until the real close has actually
+    completed, before letting the cancellation propagate.
+
+    **The warning below does not pass ``exc_info=True``.** This function is
+    reached by the memory verbs' own bare/default store tier
+    (``remember`` / ``recall`` / ``link`` with no ``--config``, via
+    ``_opened_db`` above), not just the other built-ins this module owns.
+    ``exc_info=True`` would ask the standard library's traceback formatter
+    to render the close exception through its own overridable ``__str__``,
+    and that formatter wraps its own rendering in a bare ``except``, which
+    absorbs a ``KeyboardInterrupt`` or ``SystemExit`` raised during that
+    render instead of propagating it. ``_frame_only_stack`` and
+    ``_describe_exception``, shared with :mod:`engrava.cli.memory_commands`
+    through :mod:`engrava.cli.exception_reporting` (see that module's own
+    docstring for why they live there), are used instead: the
+    frame-only stack gives "where" without touching the close exception's
+    own formatting at all, and the description gives "why" -- an ordinary
+    ``PermissionError``, a full disk, a locked file -- through the same
+    single, guarded, non-absorbing read
+    :func:`~engrava.cli.exception_reporting._describe_exception` performs,
+    once, never a second render of anything.
+
+    Args:
+        conn: The aiosqlite connection to close.
+
+    """
+    try:
+        close_task = asyncio.ensure_future(conn.close())
+        await asyncio.shield(close_task)
+    except asyncio.CancelledError:
+        try:
+            await close_task
+        except Exception as close_exc:  # noqa: BLE001
+            logger.warning(
+                "Error closing connection during cleanup: %s; stack (file:line "
+                "in function, not a full exception-chain rendering):\n%s",
+                _describe_exception(close_exc),
+                _frame_only_stack(close_exc),
+            )
+        raise
+    except Exception as close_exc:  # noqa: BLE001
+        logger.warning(
+            "Error closing connection during cleanup: %s; stack (file:line "
+            "in function, not a full exception-chain rendering):\n%s",
+            _describe_exception(close_exc),
+            _frame_only_stack(close_exc),
+        )
+        # A real OS SIGINT delivered here -- after the warning above was
+        # already logged -- would otherwise be absorbed instead of
+        # aborting. `asyncio.run()`'s own SIGINT handler (see `asyncio.runners.Runner`)
+        # does not raise anything into this coroutine: on the first Ctrl-C it
+        # only calls the main task's `cancel()`, which *requests* a
+        # `CancelledError` but only actually throws one in at this
+        # coroutine's *next* suspension point. Nothing above this line
+        # suspends -- `_describe_exception`, `_frame_only_stack`, and
+        # `logger.warning` are all synchronous -- so a synchronous function
+        # simply cannot observe a pending cancellation at all; without an
+        # `await` here, this function would return normally, the caller's
+        # `raise` would re-raise the original error object, and the request
+        # to cancel would be silently dropped once this task finishes. This
+        # `await asyncio.sleep(0)` is a real suspension point purely to give
+        # that pending cancellation somewhere to be delivered -- it does not
+        # sleep in the timer sense, it just returns control to the event
+        # loop for one iteration, which is exactly when `Task.__step` checks
+        # for and throws in a cancellation that was requested while this
+        # coroutine was running synchronously.
+        await asyncio.sleep(0)
+
+
+async def _rollback_quietly(conn: Any) -> None:  # noqa: ANN401
+    """Roll back *conn*'s transaction, logging rather than raising if that fails.
+
+    ``_import_records_to_db`` runs the whole restore in one transaction and
+    rolls it back on any validation or insert failure. That rollback runs
+    while the failure that triggered it is already propagating, so it must
+    follow the same rule :func:`_close_quietly`'s docstring states for a
+    connection close: a cleanup failure is real information, but it belongs
+    logged underneath the original error, not raised in front of it. A bare
+    ``await conn.rollback()`` in that cleanup would let a rollback failure
+    silently replace the record/insert error the caller actually needs to
+    see.
+
+    Delegates the actual shield-then-redraw mechanics to the infrastructure
+    layer's :func:`~engrava.infrastructure.sqlite.engrava_core._run_cleanup_step_quietly`
+    rather than re-deriving them here: unlike :func:`_close_quietly` -- which
+    is copied, not shared, between this module and the infrastructure layer --
+    there is no import cycle blocking a shared helper here, so this uses it
+    directly instead of adding a third copy of the same technique. Only the
+    logging shape is CLI-specific (``_describe_exception``/
+    ``_frame_only_stack`` instead of a bare ``exc_info=True``), so that is the
+    one thing passed in.
+
+    Args:
+        conn: The aiosqlite connection whose transaction to roll back.
+
+    """
+
+    def _log_rollback_failure(rollback_exc: Exception) -> None:
+        logger.warning(
+            "Error rolling back transaction during cleanup: %s; stack (file:line "
+            "in function, not a full exception-chain rendering):\n%s",
+            _describe_exception(rollback_exc),
+            _frame_only_stack(rollback_exc),
+        )
+
+    cancelled = await _run_cleanup_step_quietly(
+        conn.rollback,
+        "rolling back the transaction",
+        log_failure=_log_rollback_failure,
+    )
+    if cancelled is not None:
+        raise cancelled
+
+
 async def _open_db(cfg: EngravaCLIConfig) -> Any:  # noqa: ANN401
     """Open an aiosqlite connection with WAL + row_factory.
+
+    ``aiosqlite.connect()`` succeeding only means the background worker
+    thread started — a corrupt or truncated file is not discovered until
+    the first ``PRAGMA`` actually runs against it, below. If that fails,
+    the connection is closed before the error propagates: aiosqlite's
+    connection worker thread is not a daemon and only stops when
+    ``close()`` sends it the shutdown sentinel, so an open-but-never-closed
+    connection left behind by a raised exception here would hang interpreter
+    shutdown indefinitely instead of exiting on the error. Every command
+    reaches this through :func:`_opened_db` rather than calling it directly,
+    so this is the one place that has to get the connect-time failure right.
 
     Args:
         cfg: Resolved CLI config with db_path.
@@ -95,20 +287,202 @@ async def _open_db(cfg: EngravaCLIConfig) -> Any:  # noqa: ANN401
         An open aiosqlite Connection.
 
     Raises:
-        click.ClickException: If the database file does not exist (for read commands).
+        sqlite3.DatabaseError: If the file is not a valid SQLite database
+            (connection is closed first).
 
     """
     import aiosqlite  # noqa: PLC0415
 
-    conn = await aiosqlite.connect(str(cfg.db_path))
-    conn.row_factory = aiosqlite.Row
-    await conn.execute("PRAGMA journal_mode = WAL")
-    await conn.execute("PRAGMA foreign_keys = ON")
+    from engrava.infrastructure.sqlite.aiosqlite_connect import connect  # noqa: PLC0415
+
+    conn = await connect(str(cfg.db_path))
+    try:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA journal_mode = WAL")
+        await conn.execute("PRAGMA foreign_keys = ON")
+    except BaseException:
+        await _close_quietly(conn)
+        raise
     return conn
+
+
+@asynccontextmanager
+async def _opened_db(cfg: EngravaCLIConfig) -> AsyncIterator[Any]:
+    """Open a connection and attempt to close it however the block exits.
+
+    Acquiring the connection and entering the protected block are one
+    syntactic step at the call site (``async with _opened_db(cfg) as conn:``),
+    so no statement — a store constructor, a schema-version-gate check,
+    ``ensure_schema()`` — can sit between a successful open and the
+    close that follows it. A hand-written ``try/finally`` at the call
+    site cannot do that: it only protects what is written after
+    it, and a failure in a statement placed before it (by oversight, or by
+    a later edit) leaks the connection exactly as an absent ``finally``
+    would. This attempts the close on normal return, on any raised exception — a
+    ``sqlite3.DatabaseError`` from a corrupt file, a ``ClickException``, a
+    ``SystemExit`` from ``sys.exit()`` — and on cancellation.
+
+    **What a close failure itself does differs by which of those it is.**
+    If the command body already raised (or was cancelled), that is what
+    the caller needs to see, so the close goes through ``_close_quietly``
+    rather than a bare ``await conn.close()``. If the body succeeded, a
+    close failure is not secondary to anything — it is the only error
+    there is, so it propagates normally. A ``finally`` that always makes
+    the same close call cannot draw that distinction: a bare
+    ``await conn.close()`` would let a close failure replace the body's own
+    error, and ``_close_quietly`` would swallow a close failure on the
+    success path, so the command would print success and exit ``0``.
+
+    Yields:
+        The open aiosqlite connection from :func:`_open_db`.
+
+    """
+    conn = await _open_db(cfg)
+    try:
+        yield conn
+    except BaseException:
+        # The command body raised (or was cancelled) -- that is what the
+        # caller needs to see, so a close failure here is secondary and
+        # goes through ``_close_quietly`` rather than replacing it.
+        await _close_quietly(conn)
+        raise
+    else:
+        # The command body succeeded. A close failure here is not secondary
+        # to anything -- it is the *only* error there is, so it must
+        # propagate normally rather than being logged and swallowed by
+        # ``_close_quietly``. An unconditional ``finally: await
+        # _close_quietly(conn)`` would silently turn a genuine close
+        # failure into a command that prints success and exits 0.
+        await conn.close()
+
+
+# ------------------------------------------------------------------
+# Schema-version gate
+# ------------------------------------------------------------------
+#
+# A plain ``_open_db`` connection never learns whether the database it is about
+# to act on is even at the version it understands. This gate checks the
+# database's stamped ``user_version`` before a command acts on it, and
+# classifies the command as destructive or read: a destructive command refuses
+# on anything but a head schema, a read command warns and proceeds on a behind
+# schema (apart from ``recall`` under ``--config``, which refuses one; see
+# ``_opened_full_store``) but still refuses above head, and ``query`` classifies
+# by its parsed command rather than by the CLI command name.
+
+
+async def _read_schema_version(conn: Any) -> int:  # noqa: ANN401
+    """Read a connection's stamped ``user_version`` (0 if never set).
+
+    A plain ``PRAGMA`` read — it never migrates the database, which is the
+    point: the gate's own check must not itself be the implicit migration no
+    command is meant to perform.
+
+    Args:
+        conn: An open connection (aiosqlite or the ``sqlite3`` it wraps).
+
+    Returns:
+        The stamped ``user_version``.
+
+    """
+    cursor = await conn.execute("PRAGMA user_version")
+    row = await cursor.fetchone()
+    return int(row[0]) if row else 0
+
+
+def _behind_schema_warning(version: int, *, command: str) -> str:
+    """Build the stderr warning for a read-classified command on a behind schema."""
+    return (
+        f"Warning: database schema is at version {version}, behind this "
+        f"engrava build's head version ({CORE_SCHEMA_HEAD_VERSION}). "
+        f"'{command}' will run against the schema as stored — run "
+        "'engrava migrate' to bring it current."
+    )
+
+
+def _behind_schema_refusal(version: int, *, command: str) -> str:
+    """Build the refusal message for a destructive command on a behind schema."""
+    return (
+        f"Database schema is at version {version}; this engrava build's head "
+        f"version is {CORE_SCHEMA_HEAD_VERSION}. Run 'engrava migrate' before "
+        f"running '{command}' on it."
+    )
+
+
+def _ahead_schema_refusal(version: int, *, command: str) -> str:
+    """Build the refusal message for any command on a newer-than-head schema."""
+    return (
+        f"Database schema is at version {version}, newer than this engrava "
+        f"build's head version ({CORE_SCHEMA_HEAD_VERSION}). Refusing to run "
+        f"'{command}' — upgrade engrava before opening this database."
+    )
+
+
+def _apply_read_schema_gate_for_version(version: int, *, command: str) -> None:
+    """Apply the schema-version gate for a read-classified built-in command.
+
+    Warns and proceeds on a behind schema (refusing would make a pending
+    migration block an ordinary read); refuses unconditionally on a schema
+    newer than this build's head, which it cannot understand at all.
+
+    Args:
+        version: The database's stamped ``user_version``.
+        command: The command name, named in the message.
+
+    """
+    if version > CORE_SCHEMA_HEAD_VERSION:
+        click.echo(_ahead_schema_refusal(version, command=command), err=True)
+        sys.exit(1)
+    if version < CORE_SCHEMA_HEAD_VERSION:
+        click.echo(_behind_schema_warning(version, command=command), err=True)
+
+
+def _apply_destructive_schema_gate_for_version(version: int, *, command: str) -> None:
+    """Apply the schema-version gate for a destructive built-in command.
+
+    Refuses on any schema that is not exactly head — below head because a
+    destructive operation must not delete rows through an engine that does
+    not understand the schema it is deleting from, and above head because
+    this build cannot understand it either.
+
+    Args:
+        version: The database's stamped ``user_version``.
+        command: The command name, named in the message.
+
+    """
+    if version > CORE_SCHEMA_HEAD_VERSION:
+        click.echo(_ahead_schema_refusal(version, command=command), err=True)
+        sys.exit(1)
+    if version < CORE_SCHEMA_HEAD_VERSION:
+        click.echo(_behind_schema_refusal(version, command=command), err=True)
+        sys.exit(1)
+
+
+async def _apply_read_schema_gate(conn: Any, *, command: str) -> None:  # noqa: ANN401
+    """Read-then-gate convenience wrapper — see :func:`_apply_read_schema_gate_for_version`."""
+    _apply_read_schema_gate_for_version(await _read_schema_version(conn), command=command)
+
+
+async def _apply_destructive_schema_gate(conn: Any, *, command: str) -> None:  # noqa: ANN401
+    """Read-then-gate convenience wrapper.
+
+    See :func:`_apply_destructive_schema_gate_for_version`.
+    """
+    _apply_destructive_schema_gate_for_version(await _read_schema_version(conn), command=command)
 
 
 def _run(coro: Any) -> Any:  # noqa: ANN401
     """Run an async coroutine from sync CLI context.
+
+    Shared with ``engrava.cli.memory_commands``, whose three verbs run their
+    own coroutine under this exact call but already have their own
+    catch-all -- :func:`~engrava.cli.memory_commands._error_boundary` wraps
+    the call itself, not just the coroutine -- so this stays a bare
+    ``asyncio.run()`` rather than gaining the failure-conversion
+    :func:`_run_command` below adds for this module's own eight built-ins.
+    Giving this shared, lower-level function that behaviour too would run it
+    a second time for every memory-verb failure, replacing
+    ``_error_boundary``'s own ``--json``-aware conversion with this module's
+    plainer, stderr-only one.
 
     Args:
         coro: Awaitable to execute.
@@ -118,6 +492,76 @@ def _run(coro: Any) -> Any:  # noqa: ANN401
 
     """
     return asyncio.run(coro)
+
+
+def _run_command(coro: Any, *, command: str, db_path: Path | None) -> Any:  # noqa: ANN401
+    """Run one of this module's eight built-in commands, naming its database on failure.
+
+    Every one of them (``info``, ``verify``, ``query``, ``snapshot``,
+    ``restore``, ``gc``, ``migrate``, ``export``) ends by calling this once
+    with its own async body -- the single choke point their failures funnel
+    through. A failure none of them checks for
+    specifically -- a corrupt or truncated ``--db`` file surfacing as
+    ``sqlite3.DatabaseError`` from :func:`_open_db`'s first ``PRAGMA``, a
+    directory given as ``--db`` surfacing as ``OSError``, a close failure on
+    the success path -- is converted here to a message on stderr and
+    exit ``1``, naming ``command`` and, when there is one, the database. Left
+    to propagate out of ``asyncio.run()``, it would be a raw Python
+    traceback, silent about *which* database it happened to, since neither
+    the traceback's own frames (they name this module's source file, never
+    the caller's database) nor several of these exceptions' own text
+    (``sqlite3``'s "file is not a database" and "no such table" carry no path
+    at all) say so.
+
+    ``click.ClickException`` and ``click.Abort`` propagate unconverted:
+    both are Click's own clean-failure vocabulary -- raised throughout the
+    restore/snapshot record-import path with a message already written for
+    the operator -- and Click's own top-level dispatcher already gives each
+    its documented formatting and exit code. Converting one here would
+    replace that with this function's generic, ``unexpected``-prefixed
+    shape instead of leaving it alone.
+
+    Mirrors :func:`~engrava.cli.memory_commands._error_boundary`'s generic
+    branch (same ``_describe_exception`` / ``_frame_only_stack`` primitives,
+    same ``--verbose``-gated ``DEBUG`` stack log), but plainer: this module's
+    commands have no ``--json`` error envelope for a failure, so the
+    converted message is written straight to stderr.
+
+    Args:
+        coro: Awaitable to execute.
+        command: This invocation's command name (e.g. ``"info"``), named at
+            the front of a converted failure.
+        db_path: The single-file database this run acts on, if any -- named
+            in a converted failure right after ``command``. ``None`` for the
+            ``--service`` branch of ``snapshot`` / ``restore``, which never
+            opens ``db_path`` at all (it resolves a per-service path through
+            :class:`~engrava.infrastructure.service_manager.EngravaManager`
+            instead): naming ``db_path`` there would name a file the failure
+            never touched.
+
+    Returns:
+        The coroutine result, on success.
+
+    """
+    try:
+        return asyncio.run(coro)
+    except (click.ClickException, click.Abort):
+        raise
+    except Exception as exc:  # noqa: BLE001 -- deliberate: this module's one catch-all boundary
+        description = _describe_exception(exc)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Unexpected %s in %r; caught exception's stack (file:line in "
+                "function, not a full exception-chain rendering):\n%s",
+                description,
+                command,
+                _frame_only_stack(exc),
+            )
+        if db_path is not None:
+            click.echo(f"{command}: {db_path}: unexpected {description}", err=True)
+        else:
+            click.echo(f"{command}: unexpected {description}", err=True)
+        sys.exit(1)
 
 
 def _format_rows(
@@ -192,7 +636,7 @@ def _load_mindql_extensions() -> dict[str, MindQLExtension]:
                 manifest = manifest()
             for ext in getattr(manifest, "mindql_extensions", []):
                 registry[ext.command_name] = ext
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning("Failed to load extension %s", ep.name, exc_info=True)
 
     return registry
@@ -222,7 +666,7 @@ def _discover_extension_commands() -> list[click.Command]:
                     commands.extend(item for item in result if isinstance(item, click.Command))
                 elif isinstance(result, click.Command):
                     commands.append(result)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning("Failed to load CLI extension %s", ep.name, exc_info=True)
 
     return commands
@@ -334,9 +778,68 @@ def _configure_verbose_logging(ctx: click.Context) -> None:
 # CLI group
 # ------------------------------------------------------------------
 
+#: Subcommands that read ``ctx.obj["services_config"]`` / ``["default_embeddings"]``
+#: — see the ``cli()`` group callback below, which loads a ``--config`` file
+#: only when the invoked subcommand is one of these two.
+_SERVICES_CONFIG_COMMANDS = frozenset({"snapshot", "restore"})
+
+
+def _reject_option_shaped_value(
+    ctx: click.Context, param: click.Parameter, value: str | None
+) -> str | None:
+    """Refuse a value that looks like another option instead of silently taking it.
+
+    ``--db`` and ``--config`` are plain string options: like ``argparse``,
+    Click's parser treats whatever token immediately follows one as its
+    value -- even when that token itself starts with ``-`` and spells out
+    another known flag. ``engrava --db --json remember "x"`` therefore
+    parsed as ``--db`` bound to the literal string ``"--json"``: it created
+    a database called ``--json``, stored the thought, and exited ``0``
+    without the caller's requested ``--json`` output ever taking effect --
+    a silent write to the wrong place that defeats the very flag meant to
+    make the outcome machine-readable.
+
+    A previous revision of the documentation called this "ordinary
+    argparse behaviour" and left it alone. That claim was false: running
+    the equivalent ``argparse`` program on the same value rejects it with
+    "expected one argument" rather than accepting it. This closes the gap
+    by rejecting any ``--db`` / ``--config`` value starting with ``-`` --
+    the whole shape of the ambiguity, not just the ``--json`` instance of
+    it -- as a Click-level usage error, before either option's value ever
+    reaches a memory-verb's own resolution logic. A caller who genuinely
+    needs such a path can disambiguate it the usual shell way, by
+    prefixing it (``./--json``).
+
+    Args:
+        ctx: The option's Click context, forwarded to ``BadParameter`` for
+            its usage-message formatting.
+        param: The option being validated (``--db`` or ``--config``).
+        value: The parsed value, or ``None`` when the option was omitted.
+
+    Returns:
+        ``value`` unchanged, when it does not look like another option.
+
+    Raises:
+        click.BadParameter: ``value`` starts with ``-``.
+
+    """
+    if value is not None and value.startswith("-"):
+        message = (
+            f"{value!r} looks like an option, not a path. "
+            f"Prefix it (e.g. './{value}') if this is really the intended path."
+        )
+        raise click.BadParameter(message, ctx=ctx, param=param)
+    return value
+
 
 @click.group(cls=_ExtensionAwareGroup)
-@click.option("--db", "db_path", default=None, help="Path to SQLite database.")
+@click.option(
+    "--db",
+    "db_path",
+    default=None,
+    callback=_reject_option_shaped_value,
+    help="Path to SQLite database.",
+)
 @click.option(
     "--format",
     "output_format",
@@ -356,6 +859,7 @@ def _configure_verbose_logging(ctx: click.Context) -> None:
     "--config",
     "config_path",
     default=None,
+    callback=_reject_option_shaped_value,
     help="Path to engrava.yaml (also ENGRAVA_CONFIG env).",
 )
 @click.pass_context
@@ -387,17 +891,38 @@ def cli(
         _configure_verbose_logging(ctx)
         logger.debug("Verbose logging enabled")
 
-    # Pre-load services config for --service default resolution.
+    # Pre-load services config for --service default resolution. Gated on the
+    # two commands that actually read ``services_config`` / ``default_embeddings``
+    # off ``ctx.obj`` (``snapshot`` and ``restore`` — see their own bodies
+    # below): every other command, including the memory verbs (they resolve
+    # their own database through engrava.cli.store_resolution and never touch
+    # either value), skips this load — and its failure. A group callback runs
+    # before Click even knows which subcommand's options to parse, so an
+    # unconditional load would raise on a broken --config before a
+    # subcommand's own precedence logic ever ran, whatever --db said.
     services_cfg = None
     default_embeddings = None
-    if cfg.config_path and cfg.config_path.exists():
+    if ctx.invoked_subcommand in _SERVICES_CONFIG_COMMANDS and cfg.config_path is not None:
         from engrava.config import load_config  # noqa: PLC0415
 
-        ms_config = load_config(cfg.config_path)
+        try:
+            ms_config = load_config(cfg.config_path)
+        except ConfigError as exc:
+            click.echo(f"Error: {exc}", err=True)
+            sys.exit(1)
         services_cfg = ms_config.services
         default_embeddings = ms_config.embeddings
     ctx.obj["services_config"] = services_cfg
     ctx.obj["default_embeddings"] = default_embeddings
+
+    # Whether --db (or ENGRAVA_DB) was actually supplied, as opposed to
+    # cfg.db_path holding the CLI's own hardcoded default. EngravaCLIConfig
+    # folds "explicit" and "defaulted" into one value once resolved, so the
+    # memory verbs' shared store-resolution helper (see
+    # engrava.cli.store_resolution) needs this computed the same way here,
+    # from the raw option, mirroring EngravaCLIConfig.resolve's own
+    # truthiness check rather than re-deriving a different one.
+    ctx.obj["db_explicit"] = bool(db_path) or bool(os.environ.get("ENGRAVA_DB"))
 
 
 # ------------------------------------------------------------------
@@ -416,20 +941,28 @@ def info(ctx: click.Context) -> None:
             click.echo(f"Database not found: {cfg.db_path}")
             sys.exit(1)
 
-        conn = await _open_db(cfg)
-        try:
+        async with _opened_db(cfg) as conn:
+            database_schema_version = await _read_schema_version(conn)
+            _apply_read_schema_gate_for_version(database_schema_version, command="info")
             store = SqliteEngravaCore(conn)
             metrics = await store.metrics()
+            metrics_fields = asdict(metrics)
+            metrics_schema_version = metrics_fields.pop("schema_version")
             stats: dict[str, Any] = {
                 "db_path": str(cfg.db_path.resolve()),
-                **asdict(metrics),
+                "metrics_schema_version": metrics_schema_version,
+                "database_schema_version": database_schema_version,
+                **metrics_fields,
             }
 
             if cfg.output_format == "json":
                 click.echo(json.dumps(stats, indent=2))
             else:
                 click.echo(f"Database: {stats['db_path']}")
-                click.echo(f"Schema version: {stats['schema_version']}")
+                click.echo(
+                    f"Metrics schema version: {stats['metrics_schema_version']} "
+                    f"(database schema version: {stats['database_schema_version']})"
+                )
                 click.echo(
                     f"Thoughts: {stats['thoughts']['total']} ({stats['thoughts']['by_type']})"
                 )
@@ -442,10 +975,8 @@ def info(ctx: click.Context) -> None:
                     f"p95={stats['search_latency']['p95_ms']:.1f}ms "
                     f"p99={stats['search_latency']['p99_ms']:.1f}ms"
                 )
-        finally:
-            await conn.close()
 
-    _run(_info())
+    _run_command(_info(), command="info", db_path=cfg.db_path)
 
 
 # ------------------------------------------------------------------
@@ -473,8 +1004,8 @@ def verify(ctx: click.Context) -> None:
             click.echo(f"Database not found: {cfg.db_path}")
             sys.exit(1)
 
-        conn = await _open_db(cfg)
-        try:
+        async with _opened_db(cfg) as conn:
+            await _apply_read_schema_gate(conn, command="verify")
             store = SqliteEngravaCore(conn)
             result = await store.verify_journal()
 
@@ -491,10 +1022,8 @@ def verify(ctx: click.Context) -> None:
 
             if not result.valid:
                 sys.exit(1)
-        finally:
-            await conn.close()
 
-    _run(_verify())
+    _run_command(_verify(), command="verify", db_path=cfg.db_path)
 
 
 # ------------------------------------------------------------------
@@ -523,31 +1052,240 @@ def query(ctx: click.Context, mql: str) -> None:
             click.echo(f"Database not found: {cfg.db_path}")
             sys.exit(1)
 
-        conn = await _open_db(cfg)
-        try:
-            from engrava.mindql.executor import MindQLExecutor  # noqa: PLC0415
-            from engrava.mindql.parser import MindQLParseError, parse  # noqa: PLC0415
+        from engrava.mindql.executor import MindQLExecutor  # noqa: PLC0415
+        from engrava.mindql.parser import (  # noqa: PLC0415
+            MindQLCommand,
+            MindQLParseError,
+            parse,
+        )
 
-            # Gather extension commands from loaded extensions
-            extensions = _load_mindql_extensions() if cfg.extensions_enabled else {}
-            known_names = set(extensions.keys())
-
+        async with _opened_db(cfg) as conn:
             try:
-                parsed = parse(mql, known_extensions=known_names)
+                # Gather extension commands from loaded extensions
+                extensions = _load_mindql_extensions() if cfg.extensions_enabled else {}
+                known_names = set(extensions.keys())
+
+                try:
+                    parsed = parse(mql, known_extensions=known_names)
+                except MindQLParseError as exc:
+                    click.echo(f"Parse error: {exc}", err=True)
+                    sys.exit(1)
+
+                # The schema-version gate classifies the *parsed* command, not
+                # the CLI command name — FIND/COUNT/SELECT are reads (warn and
+                # attempt on a behind schema); EXTENSION can write (there is
+                # today no read-only accessor for an extension handler to run
+                # under, so it is refused on a behind schema like any other
+                # destructive operation). Every classification also refuses a
+                # newer-than-head schema outright.
+                schema_version = await _read_schema_version(conn)
+                if parsed.command is MindQLCommand.EXTENSION:
+                    _apply_destructive_schema_gate_for_version(schema_version, command="query")
+                else:
+                    _apply_read_schema_gate_for_version(schema_version, command="query")
+
+                executor = MindQLExecutor(conn, extensions=extensions)
+                result = await executor.execute(parsed)
+                click.echo(_format_rows(result.rows, cfg.output_format, columns=result.columns))
             except MindQLParseError as exc:
-                click.echo(f"Parse error: {exc}", err=True)
+                click.echo(f"Query error: {exc}", err=True)
                 sys.exit(1)
 
-            executor = MindQLExecutor(conn, extensions=extensions)
-            result = await executor.execute(parsed)
-            click.echo(_format_rows(result.rows, cfg.output_format, columns=result.columns))
-        except MindQLParseError as exc:
-            click.echo(f"Query error: {exc}", err=True)
-            sys.exit(1)
-        finally:
-            await conn.close()
+    _run_command(_query(), command="query", db_path=cfg.db_path)
 
-    _run(_query())
+
+# ------------------------------------------------------------------
+# Atomic output writing (shared by snapshot and export)
+# ------------------------------------------------------------------
+#
+# Both writers write to a temporary file in *the target's own directory*
+# first, flush and fsync it, and only publish it onto the real path with
+# `os.replace` once every read it depends on has completed successfully.
+# Opening the `-o` path directly (`open("w")` / `Path.write_text`) would
+# truncate whatever was already there before a single byte of the new output
+# exists, so a write that fails part-way -- a full disk, a cancelled task, a
+# `KeyboardInterrupt` -- would leave the previous good file destroyed and
+# replaced by a truncated one.
+# `os.replace` is only guaranteed atomic across a *rename*, not a copy, and
+# only when both paths share a filesystem -- a system-wide temp directory
+# cannot promise that, which is why the temporary file is created next to
+# its target instead. Everything up to a successful `os.replace` can fail
+# without disturbing an existing target and always removes the temporary
+# file; nothing after a successful replace runs except reporting the result.
+
+
+def _resolve_real_output_path(out: Path) -> Path:
+    """Resolve *out* to its real, symlink-followed filesystem path.
+
+    The temporary file and the final publish both target this, not *out*
+    itself: ``os.replace`` on a symlink destination replaces the link's own
+    directory entry, not the file it points to, so publishing straight onto
+    a symlinked ``-o`` would silently sever it and leave the old target file
+    it pointed to untouched and orphaned. Resolving first, and then writing
+    and replacing the real file underneath the link, is what keeps a
+    symlinked ``-o`` path pointing at the (now-updated) real file.
+
+    A plain sync helper — not inlined in the async writers that call it — so
+    ``os.path.realpath``'s blocking filesystem lookup happens in one place
+    outside their coroutine bodies, matching this module's other blocking
+    path helpers (:func:`_refuse_output_onto_live_database`,
+    :func:`_open_same_directory_tempfile`).
+
+    Args:
+        out: The user-requested output path, not yet resolved.
+
+    Returns:
+        The real path *out* resolves to. A hard-linked ``-o`` has no
+        distinct "real path" to resolve to beyond itself — replacing it
+        necessarily creates a new file under a shared name, leaving any
+        other hard link to the old one holding the old content.
+
+    """
+    return Path(os.path.realpath(out))
+
+
+def _refuse_output_onto_live_database(out: Path, db_path: Path) -> None:
+    """Exit cleanly if *out* would publish over the live database or its WAL/SHM files.
+
+    The atomic replace below is unconditional -- it does not inspect what it
+    is about to overwrite -- so without this guard, pointing ``-o`` at the
+    very database being read (directly, through a relative spelling, or
+    through a symlink) would silently swap the live database for a
+    snapshot/export of itself the moment the replace lands. The database's
+    ``-wal`` / ``-shm`` companions are refused the same way: replacing either
+    out from under a WAL-mode connection corrupts it exactly as replacing the
+    main file would.
+
+    Both paths are resolved (``Path.resolve()``) before comparison, which
+    already catches a relative spelling and a symlink to the same file --
+    resolving follows symlinks and normalizes the result. ``Path.samefile``
+    is checked too, for the same-inode cases resolution alone can miss (e.g.
+    a hard link), whenever both paths exist to ask it about.
+
+    Args:
+        out: The user-requested output path, not yet resolved.
+        db_path: The database file this command is reading from.
+
+    """
+    resolved_out = out.resolve()
+    resolved_db = db_path.resolve()
+    protected = (resolved_db, Path(f"{resolved_db}-wal"), Path(f"{resolved_db}-shm"))
+
+    def _names_the_same_file(candidate: Path) -> bool:
+        if resolved_out == candidate:
+            return True
+        try:
+            return resolved_out.exists() and candidate.exists() and resolved_out.samefile(candidate)
+        except OSError:
+            return False
+
+    for candidate in protected:
+        if _names_the_same_file(candidate):
+            click.echo(
+                f"Refusing to write output to {out}: it names the live "
+                f"database ({db_path}) or one of its -wal/-shm files. Choose "
+                "a different --output path.",
+                err=True,
+            )
+            sys.exit(1)
+
+
+# Bounded so a persistent name collision can't retry forever -- with a
+# 64-bit random suffix, exhausting this is not expected to happen in
+# practice; it exists so a pathological directory fails loudly instead of
+# hanging.
+_MAX_TEMP_NAME_ATTEMPTS = 10
+
+
+def _open_same_directory_tempfile(out: Path) -> tuple[Path, TextIO]:
+    """Open a temporary file in *out*'s own directory, ready to become *out*.
+
+    Same directory, never a shared temp directory -- see this section's own
+    docstring above for why. Created with ``os.open(..., O_CREAT | O_EXCL,
+    0o666)`` under a randomly-suffixed name, rather than ``tempfile.mkstemp``:
+    the kernel applies the process umask to that ``0o666`` exactly as a plain
+    ``open(path, "w")`` would, so a fresh output file comes out with the
+    same permissions, not ``mkstemp``'s always-``0o600``. Reading the umask to
+    replicate that ourselves would mean flipping it to ``0`` and back, which
+    is process-wide state. When *out* already exists, it keeps its permission
+    bits (read, write and execute for user, group and other), copied onto the
+    new file with ``os.fchmod`` instead: a replace must not silently widen or
+    narrow permissions on an existing file.
+
+    Args:
+        out: The path this temporary file is standing in for.
+
+    Returns:
+        The temporary file's path and its already-open text-mode handle.
+
+    Raises:
+        FileExistsError: If a unique name could not be found within
+            :data:`_MAX_TEMP_NAME_ATTEMPTS` tries.
+
+    """
+    directory = out.parent
+    for _attempt in range(_MAX_TEMP_NAME_ATTEMPTS):
+        tmp_path = directory / f".{out.name}.{secrets.token_hex(8)}.tmp"
+        try:
+            fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        except FileExistsError:
+            continue
+        break
+    else:
+        msg = (
+            f"could not create a unique temporary file next to {out} after "
+            f"{_MAX_TEMP_NAME_ATTEMPTS} attempts"
+        )
+        raise FileExistsError(msg)
+
+    try:
+        try:
+            target_mode = out.stat().st_mode & 0o777
+        except FileNotFoundError:
+            pass
+        else:
+            os.fchmod(fd, target_mode)
+        f = os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        # `f` (the `fdopen` wrapper) never came into being on this path --
+        # `fd` has no owner yet, so it's closed directly rather than leaked
+        # along with the file it names. This covers a failing `fchmod` and a
+        # failing `fdopen` itself alike: both leave `fd` unwrapped.
+        os.close(fd)
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return tmp_path, f
+
+
+def _discard_atomic_temp(tmp_path: Path) -> None:
+    """Best-effort removal of a temporary file that must not be published."""
+    tmp_path.unlink(missing_ok=True)
+
+
+def _publish_atomic_replacement(tmp_path: Path, out: Path) -> None:
+    """Publish *tmp_path* onto *out* -- the guarantee's boundary.
+
+    Before a successful call, any failure here leaves an existing *out*
+    byte-identical and removes *tmp_path*. After it, *out* holds the
+    complete new output, and nothing that follows may undo that -- this must
+    be the last operation that can fail before the caller reports success.
+
+    Args:
+        tmp_path: The fully-written temporary file, in the same directory as
+            *out*.
+        out: The publication target.
+
+    """
+    try:
+        # `os.replace` explicitly, not `Path.replace`: this is the exact
+        # publication call the acceptance tests patch to inject a
+        # publication-boundary failure, and the one thing standing between
+        # this whole module and a `shutil.copy`-shaped implementation that
+        # would silently drop the atomicity this section exists for.
+        os.replace(tmp_path, out)  # noqa: PTH105
+    except BaseException:
+        _discard_atomic_temp(tmp_path)
+        raise
 
 
 # ------------------------------------------------------------------
@@ -555,27 +1293,25 @@ def query(ctx: click.Context, mql: str) -> None:
 # ------------------------------------------------------------------
 
 
-async def _export_db_to_jsonl(conn: Any, out: Path) -> int:  # noqa: ANN401
-    """Export all core tables from a connection to a JSONL file.
+async def _snapshot_metadata_record(conn: Any) -> dict[str, Any]:  # noqa: ANN401
+    """Build the ``{"_type": "metadata", ...}`` header record for a snapshot.
 
-    Writes metadata header, then thought/edge/embedding/action records.
+    Reads the stamped schema version and, if present, the embedding-model
+    lock (name + dimension). Called from inside the same read transaction
+    :func:`_export_db_to_jsonl` opens for its table scans, so this header
+    describes the same database state the four table streams do.
 
     Args:
-        conn: Open aiosqlite connection.
-        out: Output file path.
+        conn: Open aiosqlite connection, inside an open read transaction.
 
     Returns:
-        Total number of records exported.
+        The metadata record, ready to serialize as the snapshot's first line.
 
     """
-    total = 0
-
-    # Write metadata header.
     cursor = await conn.execute("PRAGMA user_version")
     row = await cursor.fetchone()
     schema_version = int(row[0]) if row else 0
 
-    # Read embedding model lock if present.
     model_name: str | None = None
     dimension: int | None = None
     try:
@@ -592,45 +1328,228 @@ async def _export_db_to_jsonl(conn: Any, out: Path) -> int:  # noqa: ANN401
     except Exception:  # noqa: BLE001
         logger.debug("_metadata table not available for snapshot headers")
 
-    with out.open("w", encoding="utf-8") as f:
-        meta_record: dict[str, Any] = {
-            "_type": "metadata",
-            "schema_version": schema_version,
-        }
-        if model_name is not None:
-            meta_record["embedding_model_name"] = model_name
-        if dimension is not None:
-            meta_record["embedding_dimension"] = dimension
-        f.write(json.dumps(meta_record, ensure_ascii=False) + "\n")
-        total += 1
+    meta_record: dict[str, Any] = {
+        "_type": "metadata",
+        "schema_version": schema_version,
+    }
+    if model_name is not None:
+        meta_record["embedding_model_name"] = model_name
+    if dimension is not None:
+        meta_record["embedding_dimension"] = dimension
+    return meta_record
 
-        _select_all_sql = {
-            CoreTable.THOUGHT: "SELECT * FROM thought",
-            CoreTable.EDGE: "SELECT * FROM edge",
-            CoreTable.EMBEDDING: "SELECT * FROM embedding",
-            CoreTable.ACTION: "SELECT * FROM action",
-        }
-        for table in _CORE_TABLES:
-            cursor = await conn.execute(_select_all_sql[table])
-            keys = [desc[0] for desc in cursor.description] if cursor.description else []
-            async for row in cursor:
-                record: dict[str, Any] = {}
-                for i, key in enumerate(keys):
-                    val = row[i]
-                    if isinstance(val, bytes):
-                        import base64  # noqa: PLC0415
 
-                        val = base64.b64encode(val).decode("ascii")
-                    record[key] = val
-                line = json.dumps(
-                    {"_type": table.value, "data": record},
-                    default=str,
-                    ensure_ascii=False,
-                )
-                f.write(line + "\n")
-                total += 1
+_SELECT_ALL_CORE_TABLE_SQL: dict[CoreTable, str] = {
+    CoreTable.THOUGHT: "SELECT * FROM thought",
+    CoreTable.EDGE: "SELECT * FROM edge",
+    CoreTable.EMBEDDING: "SELECT * FROM embedding",
+    CoreTable.ACTION: "SELECT * FROM action",
+}
 
-    return total
+
+async def _stream_table_records(conn: Any, f: TextIO, table: CoreTable) -> int:  # noqa: ANN401
+    """Scan one core table and append its rows to an open snapshot file.
+
+    Called once per table, inside the same read transaction every other
+    call in the same export shares -- this function itself runs exactly one
+    ``SELECT`` and does not open or close a transaction.
+
+    Args:
+        conn: Open aiosqlite connection, inside an open read transaction.
+        f: The snapshot file, already open for text writing.
+        table: Which core table to scan.
+
+    Returns:
+        The number of records written for this table.
+
+    """
+    written = 0
+    cursor = await conn.execute(_SELECT_ALL_CORE_TABLE_SQL[table])
+    keys = [desc[0] for desc in cursor.description] if cursor.description else []
+    async for row in cursor:
+        record: dict[str, Any] = {}
+        for i, key in enumerate(keys):
+            val = row[i]
+            if isinstance(val, bytes):
+                import base64  # noqa: PLC0415
+
+                val = base64.b64encode(val).decode("ascii")
+            record[key] = val
+        line = json.dumps(
+            {"_type": table.value, "data": record},
+            default=str,
+            ensure_ascii=False,
+        )
+        f.write(line + "\n")
+        written += 1
+    return written
+
+
+async def _export_db_to_jsonl(
+    conn: Any,  # noqa: ANN401
+    out: Path,
+    *,
+    db_path: Path,
+) -> tuple[int, Path, Path]:
+    """Export all core tables from a connection to a JSONL file.
+
+    Writes metadata header, then thought/edge/embedding/action records, into
+    a temporary file next to *out*'s real target -- see the "Atomic output
+    writing" section above. **Does not publish.** Publication (``os.replace``)
+    is the caller's job, once the caller has finished closing whatever it
+    used to read *conn* (a `commit()`, a connection close, a manager
+    teardown) -- only the caller knows when that is fully done, and a
+    failure in any of it must still discard the temporary file this
+    function created rather than let a partially-closed read publish
+    anyway. Every failure from here through a successful return -- opening
+    the read transaction, streaming rows, closing it -- leaves an existing
+    *out* byte-identical and removes the temporary file itself.
+
+    **Precondition:** the caller has exclusive use of *conn* for the
+    duration of this call -- no other task issues statements on it while
+    this call is in flight. Every caller satisfies this today: the
+    single-database ``snapshot`` path's own ``_opened_db`` connection, the
+    ``--service`` path's store connection (opened fresh for that one
+    command), and the upgrade-path verification script's own connection are
+    each used by nothing else for as long as the call is running. The
+    rollback rule below reads *conn*'s transaction state once, before this
+    call touches it at all, and relies on nothing else changing that state
+    concurrently -- a transaction opened by some other task on the same
+    connection between that read and this call's own ``BEGIN`` would not be
+    this function's to roll back, and nothing here could tell the two
+    apart.
+
+    Args:
+        conn: Open aiosqlite connection, exclusively owned by the caller
+            for the duration of this call -- see the precondition above.
+        out: Output file path. A symlink is followed to its real target,
+            which is what actually gets written and later replaced -- the
+            symlink itself is never touched, so it keeps pointing at the
+            (now-replaced) real file.
+        db_path: The database file *conn* is reading. Refused as an output
+            target, along with its ``-wal``/``-shm`` companions -- see
+            :func:`_refuse_output_onto_live_database`.
+
+    Returns:
+        The total number of records exported, the fully-written,
+        not-yet-published temporary file's path, and the real (symlink-
+        resolved) path it must be published onto -- pass both to
+        :func:`_publish_atomic_replacement` once every closing step that can
+        fail has completed.
+
+    """
+    total = 0
+    _refuse_output_onto_live_database(out, db_path)
+    real_out = _resolve_real_output_path(out)
+    tmp_path, f = _open_same_directory_tempfile(real_out)
+
+    # Read before this call touches `conn` at all -- see the `except` block
+    # for why that matters more than tracking whether our own `await
+    # conn.execute("BEGIN")` below returned successfully.
+    caller_in_transaction = conn.in_transaction
+    try:
+        try:
+            # Opening the transaction is inside this same discard-on-failure
+            # region: a failing or cancelled `BEGIN` must still remove the
+            # temporary file this function already created, not leak it
+            # along with `f`'s file handle.
+            #
+            # Opened explicitly, before any read, so the metadata header and
+            # all four table scans below observe one consistent database
+            # state -- the same before-or-after state relative to any
+            # concurrent writer, for the whole export -- rather than each
+            # `await conn.execute(...)` running as its own independent
+            # implicit read. A writer committing a new thought and its edge
+            # between two scans could otherwise leave the edge in the
+            # snapshot while the thought it references never made it in,
+            # which restore later refuses as a dangling foreign key. This
+            # mirrors how `_import_records_to_db` opens its own explicit
+            # `BEGIN` rather than depending on the driver's
+            # implicit-transaction default -- read-only here, so the
+            # transaction is closed with a `commit()` (equivalent to
+            # `rollback()` for a read, but matches the pattern the write
+            # path already uses) rather than left open.
+            await conn.execute("BEGIN")
+            meta_record = await _snapshot_metadata_record(conn)
+            f.write(json.dumps(meta_record, ensure_ascii=False) + "\n")
+            total += 1
+            for table in _CORE_TABLES:
+                total += await _stream_table_records(conn, f, table)
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            f.close()
+        # The transaction closes only after the temporary file's content is
+        # fully written and durable on disk -- a failing or cancelled
+        # `commit()` here must still leave `out` untouched, which it can
+        # only do while nothing has been published onto it yet.
+        await conn.commit()
+    except BaseException:
+        # Roll back only when `conn` had no transaction open before this
+        # call touched it -- at that point any transaction found now is
+        # necessarily ours, whether or not our own `await
+        # conn.execute("BEGIN")` above ever returned to us. aiosqlite runs
+        # `BEGIN` on its worker thread: a cancellation arriving after that
+        # thread has already executed it, but before the `await` resumes
+        # here, would leave a flag set only on a *successful return* still
+        # false, while the transaction it was meant to track is very much
+        # open -- checking the connection's state up front instead of
+        # trusting our own control flow to have observed it is what closes
+        # that gap. `conn` can also arrive already inside a transaction it
+        # did not start -- SQLite then refuses this function's own `BEGIN`
+        # with "cannot start a transaction within a transaction", and an
+        # unconditional rollback here would discard the *caller's*
+        # uncommitted writes, which this function never touched and has no
+        # business undoing. `_rollback_quietly` on a connection with no
+        # transaction open is already a documented no-op, so this never
+        # needs to guess which case it is in.
+        if not caller_in_transaction:
+            await _rollback_quietly(conn)
+        _discard_atomic_temp(tmp_path)
+        raise
+
+    return total, tmp_path, real_out
+
+
+async def _run_export_then_discard_on_failure(
+    body: Callable[[list[Path]], Coroutine[Any, Any, tuple[int, Path, Path]]],
+) -> tuple[int, Path, Path]:
+    """Call *body*, discarding its temporary file if anything about the call failed.
+
+    *body* is expected to read the database, call :func:`_export_db_to_jsonl`,
+    and finish every step needed to close its own read (a connection close,
+    a service manager's ``close_all()``) before returning -- see
+    :func:`_export_db_to_jsonl`'s own docstring for why that ordering
+    matters. Publication is still the caller's job, once this returns.
+
+    *body* takes one argument: a list to append the temporary file's path to
+    as soon as it has one, before doing anything else that can fail (in
+    particular, before its own connection/manager teardown). A closing step
+    that fails *after* :func:`_export_db_to_jsonl` already returned
+    successfully raises from inside the very statement that would otherwise
+    return that result -- the return value itself is never handed back, so
+    nothing at the call site here could otherwise learn what temporary file
+    needs discarding. Recording it into a mutable list *body* already holds
+    a reference to, rather than trying to recover it from a raised
+    exception or a return value that failure prevented, is what lets this
+    function discard it regardless of which step inside *body* failed.
+
+    Args:
+        body: The full per-mode export body (single-database or
+            per-service), already bound to its own connection/config.
+
+    Returns:
+        Whatever *body* returned: the record count, the temporary file, and
+        its real publication target.
+
+    """
+    produced: list[Path] = []
+    try:
+        return await body(produced)
+    except BaseException:
+        if produced:
+            _discard_atomic_temp(produced[0])
+        raise
 
 
 @cli.command()
@@ -683,34 +1602,93 @@ def snapshot(ctx: click.Context, output_path: str | None, service_name: str | No
                     err=True,
                 )
                 sys.exit(1)
-            try:
-                store = await manager.get_store(effective_service)
-                db = store._db  # noqa: SLF001
-                out = (
-                    Path(output_path)
-                    if output_path
-                    else data_dir / f"{effective_service}.snapshot.jsonl"
-                )
-                total = await _export_db_to_jsonl(db, out)
-                click.echo(f"Exported {total} records from service {effective_service!r} to {out}")
-            finally:
-                await manager.close_all()
+            service_db_path = manager._service_db_path(effective_service)  # noqa: SLF001
+            out = (
+                Path(output_path)
+                if output_path
+                else data_dir / f"{effective_service}.snapshot.jsonl"
+            )
+            # Checked here, before `get_store()` below opens a connection and
+            # (via `ensure_schema`'s own WAL setup) stamps the database file's
+            # own header -- an output path this refuses must leave that file
+            # exactly as it was, not just refuse to publish a snapshot onto it.
+            _refuse_output_onto_live_database(out, service_db_path)
+
+            async def _service_export_body(produced: list[Path]) -> tuple[int, Path, Path]:
+                try:
+                    # snapshot is read-classified, so a behind target is
+                    # warned about and attempted rather than refused — but
+                    # attempting must not itself migrate the service
+                    # database, which calling manager.get_store() on a
+                    # behind target would. peek_schema_version() reads the
+                    # stamped version without migrating it.
+                    existing_version = await manager.peek_schema_version(effective_service)
+                    if existing_version is not None:
+                        _apply_read_schema_gate_for_version(existing_version, command="snapshot")
+                    # service_exists() above already confirmed this service
+                    # has a database, so migrate=False opens it exactly as
+                    # stored — never a silent implicit migration on a behind
+                    # target.
+                    store = await manager.get_store(effective_service, migrate=False)
+                    db = store._db  # noqa: SLF001
+                    result = await _export_db_to_jsonl(db, out, db_path=service_db_path)
+                    # Recorded before `close_all()` below runs -- a failure
+                    # there must still find this. See
+                    # `_run_export_then_discard_on_failure`'s own docstring.
+                    produced.append(result[1])
+                finally:
+                    # `close_all()` can itself fail -- it must finish, along
+                    # with everything above, before publication runs.
+                    # `_run_export_then_discard_on_failure` discards
+                    # `produced`'s temporary file if it does.
+                    await manager.close_all()
+                return result
+
+            total, tmp_path, real_out = await _run_export_then_discard_on_failure(
+                _service_export_body
+            )
+            _publish_atomic_replacement(tmp_path, real_out)
+            click.echo(f"Exported {total} records from service {effective_service!r} to {out}")
         else:
             if not cfg.db_path.exists():
                 click.echo(f"Database not found: {cfg.db_path}")
                 sys.exit(1)
 
-            conn = await _open_db(cfg)
-            try:
-                out = (
-                    Path(output_path) if output_path else cfg.db_path.with_suffix(".snapshot.jsonl")
-                )
-                total = await _export_db_to_jsonl(conn, out)
-                click.echo(f"Exported {total} records to {out}")
-            finally:
-                await conn.close()
+            out = Path(output_path) if output_path else cfg.db_path.with_suffix(".snapshot.jsonl")
+            # Checked here, before `_opened_db` below opens a connection and
+            # stamps the database file's own header (WAL mode) -- an output
+            # path this refuses must leave that file exactly as it was, not
+            # just refuse to publish a snapshot onto it.
+            _refuse_output_onto_live_database(out, cfg.db_path)
 
-    _run(_snapshot())
+            async def _single_db_export_body(produced: list[Path]) -> tuple[int, Path, Path]:
+                async with _opened_db(cfg) as conn:
+                    await _apply_read_schema_gate(conn, command="snapshot")
+                    result = await _export_db_to_jsonl(conn, out, db_path=cfg.db_path)
+                    # Recorded before this `async with` block exits below --
+                    # a close failure there must still find this. See
+                    # `_run_export_then_discard_on_failure`'s own docstring.
+                    produced.append(result[1])
+                # `_opened_db`'s own exit has now closed the connection
+                # successfully -- a close failure above propagates from this
+                # call exactly like a failure reading the database would.
+                return result
+
+            total, tmp_path, real_out = await _run_export_then_discard_on_failure(
+                _single_db_export_body
+            )
+            _publish_atomic_replacement(tmp_path, real_out)
+            click.echo(f"Exported {total} records to {out}")
+
+    _run_command(
+        _snapshot(),
+        command="snapshot",
+        # None for --service: that branch never opens cfg.db_path at all, it
+        # resolves its own per-service path through EngravaManager instead
+        # (see _run's own docstring on why naming cfg.db_path there would
+        # name the wrong file).
+        db_path=None if effective_service else cfg.db_path,
+    )
 
 
 # ------------------------------------------------------------------
@@ -766,9 +1744,9 @@ def _open_snapshot(input_path: Path) -> TextIO:
 def _iter_snapshot_lines(input_path: Path) -> Iterator[tuple[int, str]]:
     """Stream a snapshot file, yielding non-empty ``(line_number, line)`` pairs.
 
-    Streaming keeps restore memory bounded by a single line rather than the
-    whole snapshot. Lines are stripped and blank lines are skipped; line numbers
-    are 1-based and count every physical line for accurate error context.
+    Streaming reads one line at a time instead of loading the whole snapshot.
+    Lines are stripped and blank lines are skipped; line numbers are 1-based
+    and count every physical line for accurate error context.
 
     This is the only place a restore opens the ``--input`` path, so both restore
     modes — single-database and ``--service`` — surface an unusable path as the
@@ -805,28 +1783,518 @@ def _iter_snapshot_lines(input_path: Path) -> Iterator[tuple[int, str]]:
             raise _unreadable_snapshot_error(input_path, exc) from exc
 
 
-def _assert_embedding_model_match(
-    record: MetadataRecord,
-    embedding_provider: EmbeddingProviderProtocol,
-) -> None:
-    """Reject a snapshot whose embedding model differs from the target's.
+def _format_embedding_identity(identity: tuple[str, int]) -> str:
+    """Render a declared ``(model_name, dimension)`` pair for an error message.
 
     Args:
-        record: The snapshot metadata header.
-        embedding_provider: The target embedding provider.
+        identity: The identity to render.
 
-    Raises:
-        click.ClickException: On model mismatch without an override flag.
+    Returns:
+        A human-readable ``'<model>' at dimension <n>`` fragment.
 
     """
-    source_model = record.embedding_model_name
-    if source_model is not None and source_model != embedding_provider.model_name:
+    model_name, dimension = identity
+    return f"{model_name!r} at dimension {dimension}"
+
+
+def _track_embedding_identity(
+    identity: tuple[str, int],
+    reference: tuple[str, int] | None,
+    reference_label: str,
+    *,
+    subject_label: str,
+) -> tuple[str, int]:
+    """Compare one declared embedding identity against the running reference.
+
+    The reference is the identity established so far: the target's stored
+    model, else its existing non-centroid rows, else the first non-centroid
+    row this restore accepts. An identity seen while there is no reference
+    establishes it silently; every later one must match exactly, or restore
+    fails before committing anything.
+
+    Args:
+        identity: The ``(model_name, dimension)`` pair just observed.
+        reference: The identity established so far, or ``None`` if this is
+            the first one seen.
+        reference_label: A phrase describing where ``reference`` came from
+            (the target's stored model, its existing rows, or an earlier
+            snapshot row), for the mismatch message.
+        subject_label: A phrase describing where ``identity`` came from, for
+            the mismatch message.
+
+    Returns:
+        ``reference`` unchanged when it already matched, or ``identity`` when
+        no reference was established yet.
+
+    Raises:
+        click.ClickException: If ``identity`` differs from an already
+            established ``reference``.
+
+    """
+    if reference is None:
+        return identity
+    if identity == reference:
+        return reference
+    msg = (
+        f"Embedding model mismatch: {reference_label} declares "
+        f"{_format_embedding_identity(reference)}, but {subject_label} declares "
+        f"{_format_embedding_identity(identity)}. Use --re-embed to regenerate "
+        "embeddings, or --skip-embeddings to skip "
+        "importing vectors."
+    )
+    raise click.ClickException(msg)
+
+
+def _track_embedding_width(
+    identity: tuple[str, int],
+    reference: tuple[str, int] | None,
+    reference_label: str,
+    *,
+    subject_label: str,
+) -> tuple[str, int]:
+    """Compare one declared embedding row's vector width against the running reference.
+
+    Unlike :func:`_track_embedding_identity`, only the dimension component of
+    ``identity`` is compared. Every embedding row in a restore -- a centroid
+    included -- must declare the same vector width, even though a centroid is
+    exempt from the model-name half of the check (see
+    :func:`_check_embedding_row_before_insert`); ``identity`` and
+    ``reference`` still each carry a model name so the mismatch message can
+    name the row that declared it, centroid or provider alike.
+
+    Args:
+        identity: The ``(model_name, dimension)`` pair just observed.
+        reference: The width reference established so far, together with the
+            model name of whichever row set it, or ``None`` if this is the
+            first embedding row seen.
+        reference_label: A phrase describing where ``reference`` came from
+            (the target's stored model, its existing rows, or an earlier
+            snapshot row), for the mismatch message.
+        subject_label: A phrase describing where ``identity`` came from, for
+            the mismatch message.
+
+    Returns:
+        ``reference`` unchanged when its width already matched, or
+        ``identity`` when no reference was established yet.
+
+    Raises:
+        click.ClickException: If ``identity``'s dimension differs from an
+            already established ``reference``'s dimension.
+
+    """
+    if reference is None:
+        return identity
+    if identity[1] == reference[1]:
+        return reference
+    msg = (
+        f"Embedding model mismatch: {reference_label} declares "
+        f"{_format_embedding_identity(reference)}, but {subject_label} declares "
+        f"{_format_embedding_identity(identity)}. Use --re-embed to regenerate "
+        "embeddings, or --skip-embeddings to skip "
+        "importing vectors."
+    )
+    raise click.ClickException(msg)
+
+
+async def _read_embedding_lock(conn: aiosqlite.Connection) -> tuple[str, int] | None:
+    """Read the target's stored embedding-model lock, if any.
+
+    Args:
+        conn: Restore connection with an active transaction.
+
+    Returns:
+        The ``(model_name, dimension)`` recorded in ``_metadata``, or ``None``
+        when the target has never locked a model.
+
+    Raises:
+        click.ClickException: If the target has a stored
+            ``embedding_dimension`` that is not a valid integer -- the
+            target's ``_metadata`` is corrupt and restore cannot verify
+            embedding identity against it.
+
+    """
+    cursor = await conn.execute("SELECT value FROM _metadata WHERE key = 'embedding_model_name'")
+    row = await cursor.fetchone()
+    if row is None:
+        return None
+    model_name = str(row[0])
+    dim_cursor = await conn.execute("SELECT value FROM _metadata WHERE key = 'embedding_dimension'")
+    dim_row = await dim_cursor.fetchone()
+    if dim_row is None:
+        return model_name, 0
+    try:
+        dimension = int(dim_row[0])
+    except ValueError as exc:
         msg = (
-            f"Embedding model mismatch: snapshot has '{source_model}', "
-            f"target has '{embedding_provider.model_name}'. "
-            f"Use --re-embed to re-generate or --skip-embeddings to skip."
+            "The target's stored embedding_dimension "
+            f"({dim_row[0]!r}) is not a valid integer; its _metadata is "
+            "corrupt. Repair the target's _metadata directly, or restore "
+            "with --clear --clear-identity to reset it, before restoring "
+            "again -- plain --clear alone preserves the existing identity "
+            "metadata and will not resolve this."
         )
+        raise click.ClickException(msg) from exc
+    return model_name, dimension
+
+
+async def _existing_embedding_identities(conn: aiosqlite.Connection) -> list[tuple[str, int]]:
+    """Return every distinct declared identity already in the target's ``embedding`` table.
+
+    Excludes rows whose ``model_name`` is :data:`CENTROID_MODEL_NAME`: a
+    ``dreaming-centroid`` row is a computed mean of member vectors, not
+    something a configured embedding provider produced, so it is bookkeeping
+    rather than corpus identity -- exactly as it already is at write time in
+    ``SqliteEngravaCore._ensure_embedding_model_lock``. A healthy store with
+    reflections legitimately carries both, and comparing the centroid tag
+    against the provider identity would refuse that healthy store.
+
+    This is the model-name half only. A centroid row's *width* is not
+    excused the same way -- see :func:`_existing_embedding_rows`.
+
+    Args:
+        conn: Restore connection with an active transaction.
+
+    Returns:
+        Distinct non-centroid ``(model_name, dimension)`` pairs currently
+        stored, in no particular order.
+
+    """
+    cursor = await conn.execute(
+        "SELECT DISTINCT model_name, dimension FROM embedding WHERE model_name != ?",
+        (CENTROID_MODEL_NAME,),
+    )
+    rows = await cursor.fetchall()
+    return [(str(row[0]), int(row[1])) for row in rows]
+
+
+async def _existing_embedding_rows(conn: aiosqlite.Connection) -> list[tuple[str, int]]:
+    """Return every distinct declared ``(model_name, dimension)`` pair already stored.
+
+    Centroid rows are included.
+
+    Unlike :func:`_existing_embedding_identities`, nothing is excluded: a
+    target's vector width must be consistent across every embedding row it
+    holds, ``dreaming-centroid`` bookkeeping included, or a merge restore can
+    leave a target whose vec0 index cannot be built on its next open (see
+    :func:`_track_embedding_width`). The model-name identity check stays
+    centroid-exempt; only the width half widens to cover every row.
+
+    Args:
+        conn: Restore connection with an active transaction.
+
+    Returns:
+        Distinct ``(model_name, dimension)`` pairs currently stored, in no
+        particular order.
+
+    """
+    cursor = await conn.execute("SELECT DISTINCT model_name, dimension FROM embedding")
+    rows = await cursor.fetchall()
+    return [(str(row[0]), int(row[1])) for row in rows]
+
+
+async def _write_embedding_lock(conn: aiosqlite.Connection, identity: tuple[str, int]) -> None:
+    """Adopt a restored corpus's declared identity as the target's new lock.
+
+    Used only when ``_initial_embedding_state`` reported the target eligible
+    for adoption (see its docstring). Restore inserts ``embedding`` rows via
+    fixed SQL directly (never through ``store_embedding()``), so nothing else
+    would ever lock such a target -- it would otherwise end the restore
+    holding vectors under no declared model at all.
+
+    Writes only ``embedding_model_name`` and ``embedding_dimension``. A
+    snapshot carries neither a document-prefix fingerprint nor a query
+    prefix, so this cannot -- and does not -- set them (see the restore
+    entry in ``docs/cli.md`` for that limit).
+
+    Args:
+        conn: Restore connection with an active transaction.
+        identity: The ``(model_name, dimension)`` every non-centroid embedding
+            row just inserted was checked to declare.
+
+    """
+    model_name, dimension = identity
+    await conn.execute(
+        "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
+        ("embedding_model_name", model_name),
+    )
+    await conn.execute(
+        "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
+        ("embedding_dimension", str(dimension)),
+    )
+
+
+async def _finalize_embedding_identity(
+    conn: aiosqlite.Connection,
+    *,
+    may_adopt_identity: bool,
+    identity_reference: tuple[str, int] | None,
+) -> None:
+    """Adopt the restored corpus's declared identity as the target's lock, if eligible.
+
+    ``may_adopt_identity`` is ``True`` only when ``_initial_embedding_state``
+    found the target eligible for adoption (see its docstring). The lock is
+    written only then, and only when there is an ``identity_reference`` to
+    write.
+
+    Args:
+        conn: Restore connection with an active transaction.
+        may_adopt_identity: Whether ``_initial_embedding_state`` found the
+            target eligible for adoption.
+        identity_reference: The identity reference as it stands once every
+            row has been checked, or ``None`` if there is none.
+
+    """
+    if may_adopt_identity and identity_reference is not None:
+        await _write_embedding_lock(conn, identity_reference)
+
+
+async def _initial_embedding_state(
+    conn: aiosqlite.Connection,
+) -> tuple[tuple[str, int] | None, str, tuple[str, int] | None, str, bool]:
+    """Establish the embedding-model identity and vector-width references, pre-restore.
+
+    Reads the target as it stands when it is called, which is after
+    ``--clear`` (and ``--clear-identity``, if given) has removed what it
+    removes; "starts with" below means that state. Runs whether or not
+    ``--skip-embeddings`` is given: that flag only decides whether the
+    snapshot's own vectors are imported as incoming rows, never
+    whether the target's pre-existing state is internally consistent. Reads
+    the target's stored embedding-model lock, if any, and
+    every distinct non-centroid identity already declared by its own
+    ``embedding`` rows, and asserts the two agree before any snapshot row is
+    even parsed -- a
+    merge restore into an already-inconsistent target must not report success
+    (criterion: the check covers rows already in the target, not only
+    incoming ones), whether or not ``--skip-embeddings`` is given.
+
+    The corpus carries two separate invariants, tracked separately:
+
+    * **Model-name identity** -- covers non-centroid rows only (a centroid is
+      bookkeeping, not a provider's output). Sourced from the stored lock,
+      else the target's existing non-centroid rows, else the first
+      non-centroid row this restore accepts.
+    * **Vector width** -- covers *every* embedding row, centroid included,
+      because a merge that lets a mismatched width in leaves a target whose
+      vec0 index cannot be built on its next open. Sourced from the stored
+      lock, else *every* existing embedding row the target already holds
+      (centroids included), else the first embedding row of any kind this
+      restore accepts.
+
+    A target with a lock and no vectors, and a target with non-centroid
+    vectors and no lock, are different states: the former's reference is its
+    lock and never changes; the latter's reference comes from its own
+    non-centroid rows, and is never written back as a fresh lock (see
+    ``_stream_insert``). A target with **no** lock and **no** non-centroid
+    vectors -- whether it holds no embedding rows at all or only centroid
+    ones -- is a third state: it has no model-name reference yet, so it is
+    eligible to adopt the identity the first incoming non-centroid
+    embedding row declares, once every row has been checked to agree on it.
+    A centroid must never establish the model-name reference,
+    which cuts both ways -- it must not block this adoption either, or a
+    centroid-only target that merges a consistent provider corpus would end
+    the restore still unlocked, leaving a later, unrelated
+    ``store_embedding()`` call free to lock it to whatever it is given. Its
+    width still has to agree, though -- see the width reference above, which
+    a centroid row's own existing width does bind.
+
+    Args:
+        conn: Restore connection with an active transaction.
+
+    Returns:
+        A ``(identity_reference, identity_reference_label, width_reference,
+        width_reference_label, may_adopt)`` tuple. ``identity_reference`` is
+        the ``(model_name, dimension)`` every non-centroid embedding row must
+        share, or ``None`` when the target starts with neither a lock nor any
+        non-centroid embedding rows. ``width_reference`` is the width every
+        embedding row -- centroid included -- must share, or ``None`` when
+        the target starts with neither a lock nor any embedding rows at all.
+        ``may_adopt`` is ``True`` only when the target starts with neither a
+        lock nor any non-centroid embedding rows, making it eligible to have
+        the snapshot's identity written as its new lock once every row has
+        been checked to agree on it.
+
+    Raises:
+        click.ClickException: If the target's own existing embedding rows
+            disagree with its stored lock, or with each other when there is
+            no lock -- on model name (non-centroid rows) or on width (every
+            row).
+
+    """
+    stored_lock = await _read_embedding_lock(conn)
+    existing_identities = await _existing_embedding_identities(conn)
+    existing_rows = await _existing_embedding_rows(conn)
+
+    if stored_lock is not None:
+        identity_reference_label = "the target's stored embedding model"
+    elif existing_identities:
+        identity_reference_label = "the target's existing embedding rows"
+    else:
+        identity_reference_label = "an earlier row in this snapshot"
+
+    if stored_lock is not None:
+        width_reference_label = "the target's stored embedding model"
+    elif existing_rows:
+        width_reference_label = "the target's existing embedding rows"
+    else:
+        width_reference_label = "an earlier row in this snapshot"
+
+    identity_reference = stored_lock
+    for existing_identity in existing_identities:
+        identity_reference = _track_embedding_identity(
+            existing_identity,
+            identity_reference,
+            identity_reference_label,
+            subject_label="one of the target's existing embedding rows",
+        )
+
+    width_reference = stored_lock
+    for existing_row in existing_rows:
+        width_reference = _track_embedding_width(
+            existing_row,
+            width_reference,
+            width_reference_label,
+            subject_label="one of the target's existing embedding rows",
+        )
+
+    may_adopt = stored_lock is None and not existing_identities
+    return (
+        identity_reference,
+        identity_reference_label,
+        width_reference,
+        width_reference_label,
+        may_adopt,
+    )
+
+
+async def _check_embedding_row_before_insert(
+    record: TableRecord,
+    identity_reference: tuple[str, int] | None,
+    identity_reference_label: str,
+    width_reference: tuple[str, int] | None,
+    width_reference_label: str,
+) -> tuple[tuple[str, int] | None, tuple[str, int] | None]:
+    """Validate one about-to-be-inserted embedding row and update both references.
+
+    Called only for an ``embedding``-table record that will actually be
+    inserted (the caller has already excluded ``--skip-embeddings`` /
+    ``--re-embed``), so this is where the structural check (dimension vs.
+    blob), the width check, and the model-name identity check all happen.
+
+    A row declaring ``model_name == CENTROID_MODEL_NAME`` still gets the
+    structural check -- its ``dimension`` must still match its own
+    ``vector_blob`` -- and its width must still agree with
+    ``width_reference``: every embedding row this restore inserts, centroid
+    or provider, shares one vector width, or a later open with sqlite-vec
+    fails trying to index the odd one out. Only the model-name identity
+    check is centroid-exempt, in both directions: a centroid row is never
+    compared against ``identity_reference``, and it never becomes (or
+    updates) that reference for the rows after it. See
+    :func:`_existing_embedding_identities` for why -- the same exemption
+    already exists at write time and this mirrors it for restore.
+
+    Args:
+        record: A validated ``embedding``-table record about to be inserted.
+        identity_reference: The model-name identity established so far, or
+            ``None``.
+        identity_reference_label: A phrase describing where
+            ``identity_reference`` came from, for a mismatch message.
+        width_reference: The vector width established so far, or ``None``.
+        width_reference_label: A phrase describing where ``width_reference``
+            came from, for a mismatch message.
+
+    Returns:
+        The ``(identity_reference, width_reference)`` every later row must
+        now agree on -- ``identity_reference`` unchanged when this row is a
+        centroid row.
+
+    Raises:
+        click.ClickException: If the row is structurally invalid, its
+            declared width differs from ``width_reference``, or (for a
+            non-centroid row) its declared identity differs from
+            ``identity_reference``.
+
+    """
+    row_identity = await _assert_embedding_row_structurally_valid(record)
+    width_reference = _track_embedding_width(
+        row_identity,
+        width_reference,
+        width_reference_label,
+        subject_label="a row in the snapshot",
+    )
+    if row_identity[0] == CENTROID_MODEL_NAME:
+        return identity_reference, width_reference
+    identity_reference = _track_embedding_identity(
+        row_identity,
+        identity_reference,
+        identity_reference_label,
+        subject_label="a row in the snapshot",
+    )
+    return identity_reference, width_reference
+
+
+async def _assert_embedding_row_structurally_valid(record: TableRecord) -> tuple[str, int]:
+    """Validate one embedding row's declared identity against its own bytes.
+
+    ``EmbeddingRecord`` already validates that ``dimension`` matches the
+    decoded ``vector_blob`` length; restore had never imported it, so a row
+    claiming, say, dimension 384 backed by 16 bytes was accepted as-is. This
+    reuses that same validator rather than re-implementing it.
+
+    Args:
+        record: A validated ``embedding``-table record about to be inserted.
+
+    Returns:
+        The row's declared ``(model_name, dimension)`` identity.
+
+    Raises:
+        click.ClickException: If the row's ``vector_blob`` is not valid
+            base64 (surfaced by ``to_insert()``), or if the decoded record
+            fails an ``EmbeddingRecord`` constraint -- including a
+            ``dimension`` that does not match the decoded blob length.
+
+    """
+    from pydantic import ValidationError  # noqa: PLC0415
+
+    from engrava.domain.models.embedding import EmbeddingRecord  # noqa: PLC0415
+
+    _sql, values = record.to_insert()
+    (
+        embedding_id,
+        owner_type,
+        owner_id,
+        model_name,
+        dimension,
+        vector_blob,
+        created_at,
+    ) = values
+    if not (
+        isinstance(embedding_id, str)
+        and isinstance(owner_type, str)
+        and isinstance(owner_id, str)
+        and isinstance(model_name, str)
+        and isinstance(dimension, int)
+        and isinstance(vector_blob, bytes)
+        and isinstance(created_at, str)
+    ):
+        # Unreachable in practice: TableSpec.validate() already enforced these
+        # exact types for every required `embedding` column before a
+        # TableRecord could exist.
+        msg = f"Snapshot line {record.line_number} has a malformed embedding record."
         raise click.ClickException(msg)
+    try:
+        embedding = EmbeddingRecord(
+            embedding_id=embedding_id,
+            owner_type=owner_type,
+            owner_id=owner_id,
+            model_name=model_name,
+            dimension=dimension,
+            vector_blob=vector_blob,
+            created_at=created_at,
+        )
+    except ValidationError as exc:
+        msg = f"Snapshot line {record.line_number} has an invalid embedding record: {exc}"
+        raise click.ClickException(msg) from exc
+    return embedding.model_name, embedding.dimension
 
 
 async def _reembed_thoughts(
@@ -890,6 +2358,33 @@ async def _reembed_thoughts(
     return count
 
 
+async def _delete_embedding_identity_metadata(conn: aiosqlite.Connection) -> None:
+    """Issue one ``DELETE`` for the four ``_metadata`` keys that hold a target's embedding identity.
+
+    The keys are the model name, the dimension, the document-prefix fingerprint
+    and the query-prefix pairing. The post-re-embed identity replacement and
+    ``restore --clear --clear-identity`` both call it.
+
+    Args:
+        conn: Restore connection with an active transaction.
+
+    """
+    from engrava.infrastructure.sqlite.engrava_core import (  # noqa: PLC0415
+        _METADATA_DOCUMENT_PREFIX_FINGERPRINT,
+        _METADATA_QUERY_PREFIX,
+    )
+
+    await conn.execute(
+        "DELETE FROM _metadata WHERE key IN (?, ?, ?, ?)",
+        (
+            "embedding_model_name",
+            "embedding_dimension",
+            _METADATA_DOCUMENT_PREFIX_FINGERPRINT,
+            _METADATA_QUERY_PREFIX,
+        ),
+    )
+
+
 async def _replace_embedding_model_metadata(
     conn: aiosqlite.Connection,
     embedding_provider: EmbeddingProviderProtocol | None,
@@ -910,15 +2405,7 @@ async def _replace_embedding_model_metadata(
         _role_prefixes,
     )
 
-    await conn.execute(
-        "DELETE FROM _metadata WHERE key IN (?, ?, ?, ?)",
-        (
-            "embedding_model_name",
-            "embedding_dimension",
-            _METADATA_DOCUMENT_PREFIX_FINGERPRINT,
-            _METADATA_QUERY_PREFIX,
-        ),
-    )
+    await _delete_embedding_identity_metadata(conn)
     if embedding_provider is None:
         return
 
@@ -1007,7 +2494,7 @@ async def _reset_sqlite_vec_index_for_restore(conn: aiosqlite.Connection) -> Non
     if not await _has_persisted_vector_index(conn):
         return
 
-    from engrava.extensions.vector_sqlite_vec import load_sqlite_vec  # noqa: PLC0415
+    from engrava.infrastructure.sqlite.vector_sqlite_vec import load_sqlite_vec  # noqa: PLC0415
 
     if not await load_sqlite_vec(conn):
         msg = (
@@ -1018,9 +2505,181 @@ async def _reset_sqlite_vec_index_for_restore(conn: aiosqlite.Connection) -> Non
     await conn.execute("DROP TABLE embedding_vec")
 
 
+async def _stale_embedding_rowids_before_replace(
+    conn: aiosqlite.Connection,
+    record: TableRecord,
+) -> list[int]:
+    """Return ``embedding`` rowids one incoming record's own insert is about to destroy.
+
+    An ordinary merge restore inserts every record with ``INSERT OR REPLACE``.
+    Two of those replacements destroy an existing ``embedding`` row without
+    routing through :func:`_reset_sqlite_vec_index_for_restore` (that helper
+    only runs for ``--clear``/``--re-embed``): replacing a ``thought`` whose
+    id already exists cascade-deletes every ``embedding`` row it owns, and
+    replacing an ``embedding`` row that collides on its own ``embedding_id``
+    deletes-then-reinserts it directly. Either way the destroyed row's rowid
+    is freed, and SQLite is then free to hand that same rowid to a later
+    ``embedding`` insert in this same restore -- at which point a vec0 entry
+    still keyed to the old rowid would silently resolve to the new row.
+
+    Must be called *before* the record that does the replacing is inserted --
+    once it runs, the row this looks up is already gone.
+
+    Args:
+        conn: Restore connection with an active transaction.
+        record: The about-to-be-inserted record that may replace an existing
+            row (only ``thought`` and ``embedding`` records ever do).
+
+    Returns:
+        The rowids of ``embedding`` rows this insert is about to destroy,
+        empty when the record introduces no collision (the common case).
+
+    """
+    if record.spec.table is CoreTable.THOUGHT:
+        thought_id = record.data.get("thought_id")
+        if not isinstance(thought_id, str):
+            return []
+        cursor = await conn.execute(
+            "SELECT rowid FROM embedding WHERE owner_type = 'THOUGHT' AND owner_id = ?",
+            (thought_id,),
+        )
+    elif record.spec.table is CoreTable.EMBEDDING:
+        embedding_id = record.data.get("embedding_id")
+        if not isinstance(embedding_id, str):
+            return []
+        cursor = await conn.execute(
+            "SELECT rowid FROM embedding WHERE embedding_id = ?",
+            (embedding_id,),
+        )
+    else:
+        return []
+    rows = await cursor.fetchall()
+    return [int(row[0]) for row in rows]
+
+
+async def _refresh_sqlite_vec_for_replaced_rows(
+    conn: aiosqlite.Connection,
+    rowids: frozenset[int],
+) -> None:
+    """Purge vec0 entries at rowids an ordinary merge restore just replaced.
+
+    Complements :func:`_reset_sqlite_vec_index_for_restore`, which handles
+    ``--clear``/``--re-embed`` by dropping the whole index. An ordinary merge
+    never drops it, but it can still replace an existing ``embedding`` row
+    (directly, or by cascade-deleting it off a replaced ``thought``) and have
+    a later insert in the same restore land on the freed rowid -- see
+    :func:`_stale_embedding_rowids_before_replace`. ``embedding_vec`` is
+    keyed by rowid, and :meth:`SqliteVecSearchBackend.sync_embeddings`'s
+    startup reconciliation only backfills a rowid that is entirely *absent*
+    from it, never one that is merely stale, so a vec0 entry left behind
+    under a reused rowid would keep resolving search hits to the wrong
+    vector forever.
+
+    Deleting exactly these rowids here, inside the same restore transaction,
+    makes each one absent again by the time this transaction commits, so the
+    next sqlite-vec-enabled open's reconciliation treats it as missing and
+    backfills it from the ``embedding`` table's current row -- the
+    replacement's own vector, never the one it displaced.
+
+    Args:
+        conn: Restore connection with an active transaction.
+        rowids: Rowids of ``embedding`` rows this restore replaced or
+            cascade-deleted, collected before each replacing insert. A no-op
+            when empty, which is the common case.
+
+    Raises:
+        click.ClickException: If a persisted vec0 index exists but sqlite-vec
+            cannot be loaded to refresh it safely.
+
+    """
+    if not rowids:
+        return
+    if not await _has_persisted_vector_index(conn):
+        return
+
+    from engrava.infrastructure.sqlite.vector_sqlite_vec import load_sqlite_vec  # noqa: PLC0415
+
+    if not await load_sqlite_vec(conn):
+        msg = (
+            "Restore replaced embedding rows covered by an existing sqlite-vec "
+            "index but could not load sqlite-vec to refresh it safely. Install "
+            "'engrava[vec]' and retry."
+        )
+        raise click.ClickException(msg)
+    placeholders = ",".join("?" * len(rowids))
+    await conn.execute(
+        f"DELETE FROM embedding_vec WHERE rowid IN ({placeholders})",  # noqa: S608
+        tuple(rowids),
+    )
+
+
+async def _has_fts_index(conn: aiosqlite.Connection) -> bool:
+    """Report whether the target carries the ``thought_fts`` virtual table.
+
+    Mirrors :func:`_has_persisted_vector_index`: a build without the FTS5
+    extension compiled in tolerates its absence (``ensure_schema``'s
+    ``_probe_fts`` simply leaves ``thought_fts`` unset rather than failing
+    bootstrap), so a restore against such a target must skip the rebuild
+    below instead of failing on ``no such table: thought_fts``.
+
+    Args:
+        conn: An open connection to the database.
+
+    Returns:
+        ``True`` when a ``thought_fts`` table exists.
+
+    """
+    cursor = await conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'thought_fts'"
+    )
+    return await cursor.fetchone() is not None
+
+
+async def _rebuild_fts_index_for_restore(conn: aiosqlite.Connection) -> None:
+    """Rebuild ``thought_fts`` from ``thought`` so restore never leaves a stale entry behind.
+
+    Every restore path -- an ordinary merge (``INSERT OR REPLACE``), a
+    journalled merge (plain ``INSERT``), and ``--clear`` -- writes every
+    imported row through :func:`_insert_record`. Without
+    ``PRAGMA recursive_triggers`` (unset anywhere under ``src/``, so it stays
+    at SQLite's default of off), an ``INSERT OR REPLACE`` that resolves a
+    primary-key or ``UNIQUE`` collision by deleting the existing row and
+    re-inserting fires ``thought_fts_insert`` for the new row but never fires
+    ``thought_fts_delete`` for the one it removed: the delete trigger only
+    runs for a ``DELETE`` statement a caller actually issued, not for one
+    SQLite performs internally to satisfy a conflicting ``REPLACE``. The old
+    entry survives in the index, keyed to a rowid the ``thought`` table may
+    later reuse -- at which point the index would resolve a search hit for
+    the old content to a completely different, unrelated thought.
+
+    Rebuilding unconditionally after every restore closes this regardless of
+    which of the collisions above produced it, including a stale entry the
+    target already carried before the restore began (a merge or ``--clear``
+    restore into an already-damaged database comes out consistent too). The
+    FTS5 ``'rebuild'`` command reconstructs the index from ``thought``'s
+    current rows using the table's already-configured tokenizer
+    (``thought_fts_config``, the hyphen-aware ``unicode61`` config
+    schema_core.sql sets up) -- it neither touches that configuration nor
+    needs to restate it, so this does not duplicate what
+    :meth:`SqliteEngravaCore._rebuild_fts_index` (the core-schema-v3
+    migration step) does to *create* that configuration in the first place.
+
+    Args:
+        conn: Restore connection with an active transaction. Must run before
+            the transaction commits, so a failed restore still rolls the
+            rebuild back with everything else.
+
+    """
+    if not await _has_fts_index(conn):
+        return
+    await conn.execute("INSERT INTO thought_fts(thought_fts) VALUES ('rebuild')")
+
+
 async def _insert_record(
     conn: aiosqlite.Connection,
     record: TableRecord,
+    *,
+    plain_insert: bool,
 ) -> None:
     """Insert one validated snapshot record via fixed, allow-listed SQL.
 
@@ -1031,9 +2690,18 @@ async def _insert_record(
     Args:
         conn: Open aiosqlite connection.
         record: A validated core-table record.
+        plain_insert: When ``True``, insert with an ordinary ``INSERT`` so a
+            colliding primary key or ``UNIQUE`` constraint raises instead of
+            silently replacing (see the journalled-merge collision gate in
+            :func:`_import_records_to_db`).
+
+    Raises:
+        sqlite3.IntegrityError: If ``plain_insert`` is set and the record
+            collides with an existing row. The caller (:func:`_stream_insert`)
+            translates this into a ``click.ClickException``.
 
     """
-    sql, values = record.to_insert()
+    sql, values = record.to_insert(plain_insert=plain_insert)
     await conn.execute(sql, values)
 
 
@@ -1060,6 +2728,108 @@ def _reembed_id(
     return tid if isinstance(tid, str) else None
 
 
+async def _insert_record_under_gate(
+    conn: aiosqlite.Connection,
+    record: TableRecord,
+    *,
+    plain_insert: bool,
+) -> None:
+    """Insert one record, translating a gate-relevant collision into a clean error.
+
+    Thin wrapper around :func:`_insert_record` that exists only to keep the
+    ``try``/``except`` out of :func:`_stream_insert`'s already-long loop body.
+
+    Args:
+        conn: Open aiosqlite connection.
+        record: A validated core-table record.
+        plain_insert: See :func:`_insert_record`.
+
+    Raises:
+        click.ClickException: If ``plain_insert`` is set and the record
+            collides on a primary key or ``UNIQUE`` constraint.
+
+    """
+    try:
+        await _insert_record(conn, record, plain_insert=plain_insert)
+    except sqlite3.IntegrityError as exc:
+        if exc.sqlite_errorcode in _JOURNAL_GATE_CONSTRAINT_CODES:
+            raise _journal_gate_collision_error(record.line_number) from exc
+        raise
+
+
+async def _insert_record_tracking_replacement(
+    conn: aiosqlite.Connection,
+    record: TableRecord,
+    *,
+    plain_insert: bool,
+    replaced_rowids: set[int],
+) -> None:
+    """Insert one record, first recording any ``embedding`` rowid it is about to replace.
+
+    Thin wrapper around :func:`_insert_record_under_gate` that exists only to
+    keep the pre-insert lookup out of :func:`_stream_insert`'s already-long
+    loop body. Under ``plain_insert`` a collision is refused outright (see
+    :func:`_insert_record_under_gate`) rather than replacing anything, so
+    there is nothing to look up in that case.
+
+    Args:
+        conn: Open aiosqlite connection.
+        record: A validated core-table record about to be inserted.
+        plain_insert: See :func:`_insert_record`.
+        replaced_rowids: Mutated in place with the rowids of any ``embedding``
+            row this record's own insert is about to destroy -- see
+            :func:`_stale_embedding_rowids_before_replace`.
+
+    Raises:
+        click.ClickException: If ``plain_insert`` is set and the record
+            collides on a primary key or ``UNIQUE`` constraint.
+
+    """
+    if not plain_insert:
+        replaced_rowids.update(await _stale_embedding_rowids_before_replace(conn, record))
+    await _insert_record_under_gate(conn, record, plain_insert=plain_insert)
+
+
+def _journal_gate_collision_error(line_number: int) -> click.ClickException:
+    """Describe a refused collision under the journalled-merge collision gate.
+
+    Args:
+        line_number: 1-based snapshot line number of the record that collided.
+
+    Returns:
+        A ``click.ClickException`` naming the gate and its override.
+
+    """
+    msg = (
+        f"Restore refused: snapshot line {line_number} collides with an existing row "
+        "(matching primary key or UNIQUE constraint), and the target's journal_entry "
+        "table is not empty. Replacing that row would leave the audit trail describing "
+        "data this merge discarded, while 'engrava verify' kept reporting the chain as "
+        "valid. Re-run with --orphan-journal-entries to allow the merge and accept that "
+        "gap, or with --clear to discard the journal along with the data."
+    )
+    return click.ClickException(msg)
+
+
+@dataclass(frozen=True, slots=True)
+class StreamInsertResult:
+    """Outcome of one streaming pass over a snapshot's records.
+
+    Attributes:
+        total_records: Total number of records written (inserts plus
+            re-embeddings).
+        replaced_embedding_rowids: Rowids of ``embedding`` rows this pass
+            replaced or cascade-deleted -- directly, or by replacing the
+            ``thought`` that owned them -- collected so the caller can refresh
+            any persisted vec0 entry still keyed to one of them. Empty for
+            the overwhelmingly common restore that replaces nothing.
+
+    """
+
+    total_records: int
+    replaced_embedding_rowids: frozenset[int]
+
+
 async def _stream_insert(
     conn: aiosqlite.Connection,
     input_path: Path,
@@ -1067,12 +2837,36 @@ async def _stream_insert(
     skip_embeddings: bool,
     re_embed: bool,
     embedding_provider: EmbeddingProviderProtocol | None,
-) -> int:
+    plain_insert: bool,
+) -> StreamInsertResult:
     """Stream a snapshot once, validating and inserting each record in order.
 
     Each record is fully validated -- structure and values -- immediately before
     it is inserted, so a bad record raises before its own write. Re-embedding IDs
-    are flushed in bounded batches; peak memory is one line plus one batch.
+    are flushed in bounded batches.
+
+    Every ``embedding`` row in the target when this pass starts must declare
+    the same ``model_name``/``dimension`` identity as the target's stored
+    embedding-model lock (or, for a target with no lock, as each other) --
+    checked whether or not ``skip_embeddings`` is set, because that flag only
+    decides whether *incoming* vectors are imported, never whether the
+    target's own pre-existing rows are internally consistent. A
+    ``dreaming-centroid`` row is exempt from the ``model_name`` comparison,
+    not from the ``dimension`` one.
+
+    Unless ``skip_embeddings`` or ``re_embed`` is set, every incoming
+    ``embedding`` row about to be inserted must also declare that same
+    identity, with the same centroid exemption. This is checked against the
+    snapshot's ``embedding`` rows and the target's own data, never against
+    ``embedding_provider`` or the snapshot's metadata header: a plain restore
+    never resolves a provider, and the header is not proof of anything the
+    rows do not already say for themselves. With neither flag set, a target
+    that holds neither a lock nor any non-centroid embeddings when the
+    inserts begin -- whether it holds none at all or only centroid rows --
+    and is restoring a
+    snapshot that has a non-centroid embedding row adopts the identity the
+    first such row declares as its new lock once every row has been checked
+    to agree on it.
 
     Args:
         conn: Open aiosqlite connection (inside the caller's transaction).
@@ -1080,31 +2874,58 @@ async def _stream_insert(
         skip_embeddings: Skip embedding records during import.
         re_embed: Re-embed thoughts via the embedding provider after insert.
         embedding_provider: ``EmbeddingProviderProtocol`` for re-embedding.
+        plain_insert: When ``True``, every record is written with an ordinary
+            ``INSERT`` instead of ``INSERT OR REPLACE`` (the journalled-merge
+            collision gate computed once by :func:`_import_records_to_db`), so
+            a colliding primary key or ``UNIQUE`` constraint is refused rather
+            than silently replacing (or cascade-deleting) the existing row.
 
     Returns:
-        Total number of records written (inserts plus re-embeddings).
+        The total records written and the ``embedding`` rowids this pass
+        replaced (see :class:`StreamInsertResult`).
 
     Raises:
-        click.ClickException: On a malformed record, an invalid value, or an
-            embedding-model mismatch without an override flag.
+        click.ClickException: On a malformed record, an invalid value, an
+            embedding identity mismatch without an override flag, a
+            journalled-merge collision refused under ``plain_insert`` (see
+            above), or the target's own existing rows already disagreeing
+            among themselves or with its lock.
 
     """
-    check_model = embedding_provider is not None and not re_embed and not skip_embeddings
+    check_incoming = not re_embed and not skip_embeddings
     total = 0
     reembedded = 0
     reembed_batch: list[str] = []
+    replaced_rowids: set[int] = set()
+
+    (
+        identity_reference,
+        identity_reference_label,
+        width_reference,
+        width_reference_label,
+        may_adopt_identity,
+    ) = await _initial_embedding_state(conn)
+
     for line_number, line in _iter_snapshot_lines(input_path):
         record = parse_snapshot_record(line, line_number=line_number)
         if isinstance(record, MetadataRecord):
-            if check_model and embedding_provider is not None:
-                _assert_embedding_model_match(record, embedding_provider)
             continue
         if not isinstance(record, TableRecord):
             continue
-        if record.spec.table is CoreTable.EMBEDDING and (skip_embeddings or re_embed):
-            continue
+        if record.spec.table is CoreTable.EMBEDDING:
+            if not check_incoming:
+                continue
+            identity_reference, width_reference = await _check_embedding_row_before_insert(
+                record,
+                identity_reference,
+                identity_reference_label,
+                width_reference,
+                width_reference_label,
+            )
 
-        await _insert_record(conn, record)
+        await _insert_record_tracking_replacement(
+            conn, record, plain_insert=plain_insert, replaced_rowids=replaced_rowids
+        )
         total += 1
 
         tid = _reembed_id(record, re_embed=re_embed, embedding_provider=embedding_provider)
@@ -1125,7 +2946,49 @@ async def _stream_insert(
             conn,
             embedding_provider if reembedded else None,
         )
-    return total
+    await _finalize_embedding_identity(
+        conn, may_adopt_identity=may_adopt_identity, identity_reference=identity_reference
+    )
+    return StreamInsertResult(
+        total_records=total, replaced_embedding_rowids=frozenset(replaced_rowids)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RestoreImportResult:
+    """Outcome of importing snapshot records into one database connection.
+
+    Attributes:
+        total_records: Total records inserted from the snapshot (the whole
+            historical return value of :func:`_import_records_to_db`).
+        journal_entries_cleared: Rows removed from ``journal_entry`` by
+            ``--clear``. Always ``0`` when ``clear`` is not set, since a
+            restore without ``--clear`` never touches the journal.
+
+    """
+
+    total_records: int
+    journal_entries_cleared: int
+
+
+async def _journal_entry_has_rows(conn: aiosqlite.Connection) -> bool:
+    """Report whether the target's ``journal_entry`` table currently holds a row.
+
+    Scopes the journalled-merge collision gate in :func:`_import_records_to_db`:
+    journalling is opt-in and the CLI never enables it itself, so the
+    overwhelmingly common restore target has an empty ``journal_entry`` and
+    this returns ``False``, leaving the merge behaviour exactly as it always
+    was.
+
+    Args:
+        conn: Restore connection with an active transaction.
+
+    Returns:
+        ``True`` when at least one row exists in ``journal_entry``.
+
+    """
+    cursor = await conn.execute("SELECT 1 FROM journal_entry LIMIT 1")
+    return await cursor.fetchone() is not None
 
 
 async def _import_records_to_db(
@@ -1133,10 +2996,12 @@ async def _import_records_to_db(
     input_path: Path,
     *,
     clear: bool = False,
+    clear_identity: bool = False,
     skip_embeddings: bool = False,
     re_embed: bool = False,
     embedding_provider: EmbeddingProviderProtocol | None = None,
-) -> int:
+    orphan_journal_entries: bool = False,
+) -> RestoreImportResult:
     """Import JSONL records into a database connection atomically.
 
     The whole restore runs in a **single transaction over a single streaming
@@ -1145,28 +3010,89 @@ async def _import_records_to_db(
     and any failure (a malformed record, an embedding-model mismatch, or a bad
     value) rolls the transaction back so nothing is ever committed from an
     invalid snapshot. "Reject before any write" therefore holds as "nothing
-    persists", including the optional ``clear``. The file is read exactly once
-    and peak memory is one line plus one re-embed batch.
+    persists", including the optional ``clear``. The file is read exactly once.
+
+    Every path through this function -- an ordinary merge, a journalled merge,
+    and ``--clear`` alike -- rebuilds ``thought_fts`` from ``thought`` before
+    committing (see :func:`_rebuild_fts_index_for_restore`), so a restore never
+    leaves a stale full-text index entry an ``INSERT OR REPLACE`` collision
+    created, even one the target already carried before the restore.
+
+    ``clear`` also empties ``journal_entry``. Without that, a cleared store's
+    data and its existing journal would describe two different histories --
+    the journal would keep authenticating thoughts the clear just removed --
+    and ``verify_journal()`` would keep reporting that mismatched chain as
+    valid.
+
+    A restore without ``--clear`` never writes to ``journal_entry`` itself,
+    but that is not the same as leaving the journal *consistent*. Without the
+    gate described below, every record is inserted with ``INSERT OR
+    REPLACE``, and an incoming thought, edge, or action whose id matches one
+    the journal already describes replaces it outright. But an id match is
+    not the only way a journalled row is orphaned this way: an incoming edge
+    with a brand-new ``edge_id`` still replaces a journalled edge if it
+    repeats that table's composite
+    ``UNIQUE(from_thought_id, to_thought_id, edge_type)`` (schema_core.sql),
+    with no id ever colliding, and replacing a journalled thought cascades an
+    ``ON DELETE CASCADE`` foreign-key delete onto *that thought's own* edges,
+    embeddings, and actions -- rows whose ids never appeared in the incoming
+    snapshot at all. Either way, the journal entries describing what was just
+    removed are left behind unchanged, and ``verify_journal()`` keeps
+    reporting that mismatched chain as valid, because the chain itself stays internally
+    self-consistent; it simply no longer matches what is stored.
+
+    The **journalled-merge collision gate** closes this for every case above,
+    because it does not try to enumerate them: when this restore has no
+    ``--clear``, no ``orphan_journal_entries`` override, and the target's
+    ``journal_entry`` table is non-empty, every incoming record is instead
+    written with a plain ``INSERT``, so SQLite itself refuses any uniqueness
+    violation -- primary key or ``UNIQUE``, including the composite one above
+    -- with a ``click.ClickException`` instead of silently replacing (or
+    cascade-deleting) the row. Nothing is deleted first, so the cascade path
+    is not merely caught, it never fires. The gate is conservative, not
+    precise: it refuses *any* such collision once a journal exists, including
+    one on a row the journal never described, and ``orphan_journal_entries``
+    exists for a caller who has weighed that and wants the merge anyway --
+    which restores exactly the unconditional ``INSERT OR REPLACE`` behaviour
+    described above. The gate never applies when ``journal_entry`` is empty,
+    which is the overwhelmingly common case since journalling is opt-in and
+    the CLI never enables it itself -- that restore's merge behaviour is
+    unchanged.
 
     Args:
         conn: Open aiosqlite connection with schema applied.
         input_path: Path to the JSONL snapshot file.
         clear: Delete existing data before import.
+        clear_identity: Also delete the target's stored embedding identity
+            (model name, dimension, and prefix metadata) while clearing.
+            Only meaningful when ``clear`` is also set -- the caller
+            (``restore()``) rejects it otherwise before this function is
+            ever reached. Exists to recover a target whose stored
+            ``embedding_dimension`` is corrupt: plain ``clear`` deletes the
+            core tables but deliberately preserves an existing lock (see
+            :func:`_read_embedding_lock`), so it cannot clear a corrupt one.
         skip_embeddings: Skip embedding records during import.
         re_embed: Re-embed thoughts via the embedding provider after import.
         embedding_provider: ``EmbeddingProviderProtocol`` for re-embedding.
+        orphan_journal_entries: Opt out of the journalled-merge collision gate
+            described above, restoring the unconditional ``INSERT OR REPLACE``
+            merge even when the target's journal is non-empty.
 
     Returns:
-        Total number of records imported.
+        The total records imported and how many journal entries ``--clear``
+        discarded (zero when ``clear`` is not set).
 
     Raises:
         click.ClickException: On a malformed snapshot record, an invalid value,
-            or an embedding-model mismatch without an override flag. The
-            transaction is rolled back before the error propagates.
+            an embedding-model mismatch without an override flag, or a
+            collision refused by the journalled-merge collision gate. The
+            transaction is rolled back before the error propagates; a
+            failure in that rollback itself is logged and does not replace
+            the error above -- see :func:`_rollback_quietly`.
 
     """
     total = 0
-    committed = False
+    journal_entries_cleared = 0
     # Open the transaction explicitly so atomicity holds regardless of the
     # connection's isolation configuration (it does not depend on the driver's
     # implicit-transaction default).
@@ -1179,20 +3105,54 @@ async def _import_records_to_db(
         if clear:
             for table in _CORE_TABLES_DELETE_ORDER:
                 await conn.execute(f"DELETE FROM {table.value}")  # noqa: S608
-        total = await _stream_insert(
+            # Fixed literal, never interpolated -- see the module comment
+            # above `_CORE_TABLES_DELETE_ORDER` for why `journal_entry` is
+            # cleared this way instead of through that enum. `rowcount` on a
+            # bare `DELETE FROM` (no `WHERE`) reports the exact number of
+            # rows removed.
+            journal_cursor = await conn.execute("DELETE FROM journal_entry")
+            journal_entries_cleared = journal_cursor.rowcount
+            if clear_identity:
+                await _delete_embedding_identity_metadata(conn)
+        # The journalled-merge collision gate's three-part condition,
+        # evaluated once, before the insert loop below. `clear` short-circuits
+        # the query entirely -- a `--clear` restore has already emptied
+        # `journal_entry` above, so the query would return `False` anyway.
+        plain_insert = (
+            not clear and not orphan_journal_entries and await _journal_entry_has_rows(conn)
+        )
+        stream_result = await _stream_insert(
             conn,
             input_path,
             skip_embeddings=skip_embeddings,
             re_embed=re_embed,
             embedding_provider=embedding_provider,
+            plain_insert=plain_insert,
         )
+        total = stream_result.total_records
+        # Ordinary merge never drops the vec0 index the way clear/re_embed do
+        # (via _reset_sqlite_vec_index_for_restore above), but it can still
+        # have replaced embedding rows whose freed rowid a later insert in
+        # this same pass reused -- refresh exactly those before committing.
+        await _refresh_sqlite_vec_for_replaced_rows(conn, stream_result.replaced_embedding_rowids)
+        # Unconditional on every restore path -- merge or --clear -- so a
+        # stale thought_fts entry (see _rebuild_fts_index_for_restore) can
+        # never survive a restore, including one that inherits damage already
+        # present in the target.
+        await _rebuild_fts_index_for_restore(conn)
         await conn.commit()
-        committed = True
-    finally:
-        if not committed:
-            # Any validation or insert failure discards the whole restore.
-            await conn.rollback()
-    return total
+    except BaseException:
+        # Any validation or insert failure -- or a failure in the commit
+        # itself, or a cancellation -- discards the whole restore. That is
+        # what the caller needs to see, so a rollback failure here is
+        # secondary and goes through ``_rollback_quietly`` rather than
+        # replacing it.
+        await _rollback_quietly(conn)
+        raise
+    return RestoreImportResult(
+        total_records=total,
+        journal_entries_cleared=journal_entries_cleared,
+    )
 
 
 def _require_valid_cli_service_name(service_name: str) -> None:
@@ -1231,8 +3191,10 @@ async def _restore_service_snapshot(
     effective_service: str,
     input_path: str,
     clear: bool,
+    clear_identity: bool,
     skip_embeddings: bool,
     re_embed: bool,
+    orphan_journal_entries: bool,
     cfg: EngravaCLIConfig,
     services_cfg: ServicesConfig | None,
     default_embeddings: EmbeddingConfig | None,
@@ -1255,6 +3217,14 @@ async def _restore_service_snapshot(
         services_config=services_cfg,
     )
     try:
+        # restore is destructive (an existing target can be cleared, and is
+        # always rewritten), and no CLI command migrates a database
+        # implicitly. An existing service target must already be at head; a
+        # target that does not exist yet is a fresh service, which
+        # get_store() below still bootstraps to head as it always has.
+        existing_version = await manager.peek_schema_version(effective_service)
+        if existing_version is not None:
+            _apply_destructive_schema_gate_for_version(existing_version, command="restore")
         try:
             store = await manager.get_store(effective_service)
         except ConfigError as exc:
@@ -1274,15 +3244,22 @@ async def _restore_service_snapshot(
                     "use --skip-embeddings instead."
                 )
                 raise click.ClickException(msg)
-        total = await _import_records_to_db(
+        result = await _import_records_to_db(
             store._db,  # noqa: SLF001
             Path(input_path),
             clear=clear,
+            clear_identity=clear_identity,
             skip_embeddings=skip_embeddings,
             re_embed=re_embed,
             embedding_provider=emb_provider,
+            orphan_journal_entries=orphan_journal_entries,
         )
-        click.echo(f"Restored {total} records to service {effective_service!r} from {input_path}")
+        click.echo(
+            f"Restored {result.total_records} records to service {effective_service!r} "
+            f"from {input_path}"
+        )
+        if clear:
+            click.echo(f"Discarded {result.journal_entries_cleared} journal entries")
     finally:
         await manager.close_all()
 
@@ -1291,8 +3268,10 @@ async def _restore_single_db(
     *,
     input_path: str,
     clear: bool,
+    clear_identity: bool,
     skip_embeddings: bool,
     re_embed: bool,
+    orphan_journal_entries: bool,
     cfg: EngravaCLIConfig,
     default_embeddings: EmbeddingConfig | None,
 ) -> None:
@@ -1303,8 +3282,6 @@ async def _restore_single_db(
             a missing ``--re-embed`` provider.
 
     """
-    import aiosqlite as _aiosqlite  # noqa: PLC0415
-
     from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore  # noqa: PLC0415
 
     emb_provider = None
@@ -1322,31 +3299,57 @@ async def _restore_single_db(
             )
             raise click.ClickException(msg)
 
-    conn = await _aiosqlite.connect(str(cfg.db_path))
-    conn.row_factory = _aiosqlite.Row
-    await conn.execute("PRAGMA journal_mode = WAL")
-    await conn.execute("PRAGMA foreign_keys = ON")
+    # restore is destructive, and no CLI command migrates a database
+    # implicitly. Checked *before* connecting opens (and therefore creates)
+    # the file, so a target that does not exist yet is unambiguously a fresh
+    # restore rather than "behind" — there is nothing to be behind.
+    pre_existing = cfg.db_path.exists()
 
-    store = SqliteEngravaCore(conn)
-    await store.ensure_schema()
+    # _opened_db closes the connection on any exit from this block — a
+    # corrupt existing target, a schema-gate refusal, or a failure inside
+    # ensure_schema() while bootstrapping a fresh one — because opening the
+    # connection and entering the protected block are the same step. Neither
+    # the constructor below nor ensure_schema() can leak by sitting in front
+    # of a try that starts later.
+    async with _opened_db(cfg) as conn:
+        store = SqliteEngravaCore(conn)
+        if pre_existing:
+            await _apply_destructive_schema_gate(conn, command="restore")
+            # Schema confirmed at head above; ensure_schema() here would be a
+            # no-op, so it is skipped entirely rather than called for its side
+            # effect of none — no command migrates implicitly.
+        else:
+            await store.ensure_schema()
 
-    try:
-        total = await _import_records_to_db(
+        result = await _import_records_to_db(
             conn,
             Path(input_path),
             clear=clear,
+            clear_identity=clear_identity,
             skip_embeddings=skip_embeddings,
             re_embed=re_embed,
             embedding_provider=emb_provider,
+            orphan_journal_entries=orphan_journal_entries,
         )
-        click.echo(f"Restored {total} records from {input_path}")
-    finally:
-        await conn.close()
+        click.echo(f"Restored {result.total_records} records from {input_path}")
+        if clear:
+            click.echo(f"Discarded {result.journal_entries_cleared} journal entries")
 
 
 @cli.command()
 @click.option("-i", "--input", "input_path", required=True, help="JSONL snapshot file to restore.")
 @click.option("--clear", is_flag=True, help="Clear existing data before restore.")
+@click.option(
+    "--clear-identity",
+    is_flag=True,
+    help=(
+        "Also clear the target's stored embedding identity (model name, "
+        "dimension, and prefix metadata) while clearing. Requires --clear. "
+        "Use this to recover a target whose stored embedding_dimension is "
+        "corrupt -- plain --clear alone preserves an existing identity, "
+        "corrupt or not."
+    ),
+)
 @click.option(
     "--skip-embeddings",
     is_flag=True,
@@ -1356,6 +3359,16 @@ async def _restore_single_db(
     "--re-embed",
     is_flag=True,
     help="Re-embed all thoughts via the target provider (ignores source embeddings).",
+)
+@click.option(
+    "--orphan-journal-entries",
+    is_flag=True,
+    help=(
+        "Allow a merge restore (no --clear) to replace rows in a target whose "
+        "journal_entry table is not empty, even though the journal will then "
+        "describe data the merge discarded. Without this flag, such a "
+        "collision is refused."
+    ),
 )
 @click.option(
     "--service",
@@ -1369,14 +3382,21 @@ def restore(
     input_path: str,
     *,
     clear: bool,
+    clear_identity: bool,
     skip_embeddings: bool,
     re_embed: bool,
+    orphan_journal_entries: bool,
     service_name: str | None,
 ) -> None:
     """Restore database from a JSONL snapshot file.
 
     Supports model-mismatch handling via ``--re-embed`` (re-generate
     embeddings) or ``--skip-embeddings`` (import without vectors).
+
+    A merge restore (no ``--clear``) into a target whose ``journal_entry``
+    table is not empty refuses any record that collides with an existing row,
+    to keep the audit trail from silently describing data the merge replaced
+    or removed. Pass ``--orphan-journal-entries`` to allow that merge anyway.
     """
     cfg: EngravaCLIConfig = ctx.obj["config"]
     services_cfg: ServicesConfig | None = ctx.obj.get("services_config")
@@ -1384,6 +3404,10 @@ def restore(
 
     if re_embed and skip_embeddings:
         click.echo("Error: --re-embed and --skip-embeddings are mutually exclusive.", err=True)
+        sys.exit(1)
+
+    if clear_identity and not clear:
+        click.echo("Error: --clear-identity requires --clear.", err=True)
         sys.exit(1)
 
     # Resolve default service from config if --service not given.
@@ -1404,8 +3428,10 @@ def restore(
                 effective_service=effective_service,
                 input_path=input_path,
                 clear=clear,
+                clear_identity=clear_identity,
                 skip_embeddings=skip_embeddings,
                 re_embed=re_embed,
+                orphan_journal_entries=orphan_journal_entries,
                 cfg=cfg,
                 services_cfg=services_cfg,
                 default_embeddings=default_embeddings,
@@ -1414,13 +3440,21 @@ def restore(
             await _restore_single_db(
                 input_path=input_path,
                 clear=clear,
+                clear_identity=clear_identity,
                 skip_embeddings=skip_embeddings,
                 re_embed=re_embed,
+                orphan_journal_entries=orphan_journal_entries,
                 cfg=cfg,
                 default_embeddings=default_embeddings,
             )
 
-    _run(_restore())
+    _run_command(
+        _restore(),
+        command="restore",
+        # None for --service: see the matching comment on snapshot's own
+        # _run call, and _run's docstring.
+        db_path=None if effective_service else cfg.db_path,
+    )
 
 
 # ------------------------------------------------------------------
@@ -1460,7 +3494,7 @@ async def _prepare_vector_index_purge(conn: aiosqlite.Connection) -> bool:
     if not await _has_persisted_vector_index(conn):
         return False
 
-    from engrava.extensions.vector_sqlite_vec import load_sqlite_vec  # noqa: PLC0415
+    from engrava.infrastructure.sqlite.vector_sqlite_vec import load_sqlite_vec  # noqa: PLC0415
 
     if not await load_sqlite_vec(conn):
         msg = (
@@ -1492,7 +3526,9 @@ async def _reconcile_vector_index(conn: aiosqlite.Connection) -> None:
             :func:`_prepare_vector_index_purge`.
 
     """
-    from engrava.extensions.vector_sqlite_vec import purge_orphan_vectors  # noqa: PLC0415
+    from engrava.infrastructure.sqlite.vector_sqlite_vec import (  # noqa: PLC0415
+        purge_orphan_vectors,
+    )
 
     await purge_orphan_vectors(conn)
 
@@ -1564,7 +3600,7 @@ async def _gc_archived(
     dry_run: bool,
     quiet: bool,
 ) -> None:
-    """Physically delete all ARCHIVED thoughts, their orphaned edges and vectors.
+    """Physically delete all ARCHIVED thoughts, their edges, embeddings, actions and vectors.
 
     Every statement below — the child deletes, the parent delete and the vector
     purge — runs in the one transaction this function's ``commit`` closes, so a
@@ -1581,7 +3617,10 @@ async def _gc_archived(
         return
 
     if dry_run:
-        click.echo(f"Would delete {archived_count} archived thoughts and orphaned edges.")
+        click.echo(
+            f"Would delete {archived_count} archived thoughts, "
+            "plus their edges, embeddings, and actions."
+        )
         return
 
     purge_vectors = await _prepare_vector_index_purge(conn)
@@ -1617,7 +3656,7 @@ async def _gc_archived(
 )
 @click.pass_context
 def gc(ctx: click.Context, *, dry_run: bool, expired: bool) -> None:
-    """Garbage-collect archived thoughts and their orphaned edges.
+    """Garbage-collect archived thoughts, their edges, embeddings, and actions.
 
     With ``--expired``, also clean up expired TTL thoughts first (archived
     or deleted per the configured ``ttl.strategy``).
@@ -1629,17 +3668,22 @@ def gc(ctx: click.Context, *, dry_run: bool, expired: bool) -> None:
             click.echo(f"Database not found: {cfg.db_path}")
             sys.exit(1)
 
-        conn = await _open_db(cfg)
-        try:
+        async with _opened_db(cfg) as conn:
+            # gc is destructive and never migrates the schema itself (see
+            # _gc_archived's own docstring below on the explicit child
+            # deletes that limit today's damage) — so it refuses outright on
+            # anything but a head schema rather than deleting rows through an
+            # engine that does not understand the schema it is deleting from.
+            # A database maintained only through gc never migrates, so it
+            # must never be allowed to run destructive deletes there either.
+            await _apply_destructive_schema_gate(conn, command="gc")
             if expired:
                 skip_archived_gc = await _gc_expired(conn, cfg, dry_run=dry_run)
                 if skip_archived_gc:
                     return
             await _gc_archived(conn, dry_run=dry_run, quiet=expired)
-        finally:
-            await conn.close()
 
-    _run(_gc())
+    _run_command(_gc(), command="gc", db_path=cfg.db_path)
 
 
 # ------------------------------------------------------------------
@@ -1654,26 +3698,102 @@ def migrate(ctx: click.Context) -> None:
     cfg: EngravaCLIConfig = ctx.obj["config"]
 
     async def _migrate() -> None:
-        import aiosqlite  # noqa: PLC0415, I001
+        from engrava.domain.exceptions import SchemaVersionError  # noqa: PLC0415
         from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore  # noqa: PLC0415
 
-        conn = await aiosqlite.connect(str(cfg.db_path))
-        conn.row_factory = aiosqlite.Row
-        await conn.execute("PRAGMA journal_mode = WAL")
-        await conn.execute("PRAGMA foreign_keys = ON")
-
-        store = SqliteEngravaCore(conn)
-        await store.ensure_schema()
-        await conn.commit()
-        await conn.close()
+        # _opened_db closes the connection on any exit from this block —
+        # a corrupt existing target, a store-construction failure, or a
+        # failure inside ensure_schema() alike — because opening the
+        # connection and entering the protected block are the same step.
+        # migrate's target may not exist yet — aiosqlite.connect() creates
+        # the file, matching today's behaviour of bootstrapping a fresh
+        # database.
+        async with _opened_db(cfg) as conn:
+            store = SqliteEngravaCore(conn)
+            try:
+                # migrate calls ensure_schema() unconditionally rather than
+                # through the schema-version gate — that is its entire job.
+                # ensure_schema() itself still refuses a populated sub-floor
+                # database or one stamped above this build's head version
+                # (SchemaVersionError) rather than mislabelling or silently
+                # opening either; caught here so that refusal reads as a
+                # clean message, not a traceback.
+                await store.ensure_schema()
+                await conn.commit()
+            except SchemaVersionError as exc:
+                click.echo(str(exc), err=True)
+                sys.exit(1)
         click.echo(f"Schema up to date: {cfg.db_path}")
 
-    _run(_migrate())
+    _run_command(_migrate(), command="migrate", db_path=cfg.db_path)
 
 
 # ------------------------------------------------------------------
 # export (portable JSON with thought details)
 # ------------------------------------------------------------------
+
+
+async def _read_thoughts_and_edges_in_one_transaction(
+    conn: Any,  # noqa: ANN401
+    *,
+    status_filter: str | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Read the ``thought`` and ``edge`` tables from one consistent point in time.
+
+    Opened explicitly, before either scan, so both observe one consistent
+    database state -- the same before-or-after state relative to any
+    concurrent writer -- rather than each ``await conn.execute(...)``
+    running as its own independent implicit read. A writer committing a new
+    thought and its edge between the two scans could otherwise leave the
+    edge in the export while the thought it references never made it in.
+    Mirrors :func:`_export_db_to_jsonl`'s own ``BEGIN``, but without that
+    function's caller-supplied-transaction handling -- see the precondition
+    below for why.
+
+    ``status_filter`` narrows ``thought`` only. An exported edge can still
+    reference a thought the filter excluded -- that is a property of the
+    filter, not a defect of the transaction this function opens.
+
+    **Precondition:** every caller of this function today is ``export_cmd``'s
+    own ``_opened_db`` connection, freshly opened for that command alone and
+    used by nothing else, so it can never already be inside a transaction
+    this call did not itself start -- the unconditional rollback on any
+    failure below is always this call's own transaction, never a caller's.
+
+    Args:
+        conn: Open aiosqlite connection, exclusively owned by the caller for
+            the duration of this call -- see the precondition above.
+        status_filter: Optional ``lifecycle_status`` value to filter
+            ``thought`` rows by; ``None`` reads every thought.
+
+    Returns:
+        The thought rows, then the edge rows, each as a list of
+        column-name-to-value dicts, both read from the same transaction.
+
+    """
+    try:
+        await conn.execute("BEGIN")
+        if status_filter:
+            cursor = await conn.execute(
+                "SELECT * FROM thought WHERE lifecycle_status = ?", (status_filter,)
+            )
+        else:
+            cursor = await conn.execute("SELECT * FROM thought")
+        keys = [desc[0] for desc in cursor.description] if cursor.description else []
+        thoughts = [dict(zip(keys, row, strict=True)) for row in await cursor.fetchall()]
+
+        cursor = await conn.execute("SELECT * FROM edge")
+        edge_keys = [desc[0] for desc in cursor.description] if cursor.description else []
+        edges = [dict(zip(edge_keys, row, strict=True)) for row in await cursor.fetchall()]
+
+        # Closed here, before the caller writes any output, so the read
+        # lock is not held during the file write -- matches
+        # `_export_db_to_jsonl`'s own ordering.
+        await conn.commit()
+    except BaseException:
+        await _rollback_quietly(conn)
+        raise
+    return thoughts, edges
 
 
 @cli.command(name="export")
@@ -1689,45 +3809,67 @@ def export_cmd(ctx: click.Context, output_path: str | None, status_filter: str |
             click.echo(f"Database not found: {cfg.db_path}")
             sys.exit(1)
 
-        conn = await _open_db(cfg)
+        out = Path(output_path) if output_path else cfg.db_path.with_suffix(".export.json")
+        _refuse_output_onto_live_database(out, cfg.db_path)
+        real_out = _resolve_real_output_path(out)
+        tmp_path, f = _open_same_directory_tempfile(real_out)
+
         try:
-            # Fetch thoughts
-            if status_filter:
-                cursor = await conn.execute(
-                    "SELECT * FROM thought WHERE lifecycle_status = ?", (status_filter,)
-                )
-            else:
-                cursor = await conn.execute("SELECT * FROM thought")
-            keys = [desc[0] for desc in cursor.description] if cursor.description else []
-            thoughts = [dict(zip(keys, row, strict=True)) for row in await cursor.fetchall()]
+            try:
+                async with _opened_db(cfg) as conn:
+                    await _apply_read_schema_gate(conn, command="export")
+                    thoughts, edges = await _read_thoughts_and_edges_in_one_transaction(
+                        conn, status_filter=status_filter
+                    )
 
-            # Fetch edges
-            cursor = await conn.execute("SELECT * FROM edge")
-            edge_keys = [desc[0] for desc in cursor.description] if cursor.description else []
-            edges = [dict(zip(edge_keys, row, strict=True)) for row in await cursor.fetchall()]
+                    export_data = {
+                        "format": "engrava-export",
+                        "version": "0.1.0",
+                        "thoughts": thoughts,
+                        "edges": edges,
+                        "stats": {
+                            "thought_count": len(thoughts),
+                            "edge_count": len(edges),
+                        },
+                    }
 
-            export_data = {
-                "format": "engrava-export",
-                "version": "0.1.0",
-                "thoughts": thoughts,
-                "edges": edges,
-                "stats": {
-                    "thought_count": len(thoughts),
-                    "edge_count": len(edges),
-                },
-            }
+                    f.write(json.dumps(export_data, indent=2, default=str, ensure_ascii=False))
+                    f.flush()
+                    os.fsync(f.fileno())
+                    # `_opened_db`'s own exit closes the connection right
+                    # here, once this `async with` block returns -- after the
+                    # temporary file's content is fully written and durable,
+                    # before publication. The read transaction
+                    # `_read_thoughts_and_edges_in_one_transaction` opened is
+                    # already committed by this point, so this close is only
+                    # about releasing the connection itself: a failure here
+                    # must still leave `out` untouched, which only holds
+                    # while nothing has been published onto it yet.
+            finally:
+                f.close()
+        except BaseException:
+            _discard_atomic_temp(tmp_path)
+            raise
 
-            out = Path(output_path) if output_path else cfg.db_path.with_suffix(".export.json")
-            out.write_text(
-                json.dumps(export_data, indent=2, default=str, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            click.echo(f"Exported {len(thoughts)} thoughts, {len(edges)} edges to {out}")
-        finally:
-            await conn.close()
+        _publish_atomic_replacement(tmp_path, real_out)
+        click.echo(f"Exported {len(thoughts)} thoughts, {len(edges)} edges to {out}")
 
-    _run(_export())
+    _run_command(_export(), command="export", db_path=cfg.db_path)
 
+
+# ------------------------------------------------------------------
+# One-shot memory verbs (remember / recall / link)
+# ------------------------------------------------------------------
+#
+# Defined in their own module — engrava.cli.memory_commands — rather than
+# inline here, and registered on `cli` purely by importing it: each command
+# is declared there with `@cli.command()` against the very `cli` group
+# object this module defines above, so the import's only observable effect
+# is that import-time decoration running. Kept as a separate module so the
+# three new verbs, their shared store-resolution helper, and this file's own
+# long-standing commands stay in different files -- this module already
+# carries unrelated in-flight changes on sibling branches.
+from engrava.cli import memory_commands as _memory_commands  # noqa: E402, F401
 
 # ------------------------------------------------------------------
 # Entry point
@@ -1745,4 +3887,15 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Running this file directly (``python -m engrava.cli.main``, or
+    # ``python path/to/main.py``) executes it as ``__main__`` — a module
+    # object distinct from ``engrava.cli.main`` even though they share this
+    # file's code. ``engrava.cli.memory_commands`` (imported above via the
+    # dotted path) decorates the ``cli`` Group belonging to *that* import,
+    # registering remember / recall / link on it — not on this run's
+    # ``__main__.cli``, which therefore never gains the three new commands.
+    # Re-entering through the dotted import's own ``main()`` runs the
+    # canonical, fully-decorated module instead of this half-decorated one.
+    from engrava.cli.main import main as _canonical_main
+
+    _canonical_main()

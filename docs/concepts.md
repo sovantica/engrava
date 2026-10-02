@@ -12,6 +12,11 @@ more sense.
 
 ```
                  ┌──────────────────────────────────────────┐
+   REFLECTION    │  cluster summary of related thoughts      │  (higher-order, system-made)
+                 └───────────────┬──────────────────────────┘
+                                 │ CONSOLIDATED_FROM  (created by dreaming)
+                                 │ (the edge points from the reflection to its member)
+                 ┌───────────────▼──────────────────────────┐
    OBSERVATION   │  "User prefers email over phone"         │  essence (prompt-facing)
    (a thought)   │  content: "Stated during onboarding..."  │  content (full text)
                  │  priority P2 · lifecycle ACTIVE           │
@@ -19,10 +24,6 @@ more sense.
                                  │ ASSOCIATED  (an edge: typed, weighted)
                  ┌───────────────▼──────────────────────────┐
    BELIEF        │  "This user is low-touch"                 │
-                 └───────────────┬──────────────────────────┘
-                                 │ CONSOLIDATED_FROM  (created by dreaming)
-                 ┌───────────────▼──────────────────────────┐
-   REFLECTION    │  cluster summary of related thoughts      │  (higher-order, system-made)
                  └──────────────────────────────────────────┘
 ```
 
@@ -41,7 +42,7 @@ Every thought carries **two** texts, and the split is deliberate:
   (1–200 characters, enforced). This is the text you inject into an LLM prompt
   when this memory is retrieved. Keep it short and self-contained.
 - **`content`** — the **full** source text, retained for full-text search and
-  provenance. It can be as long as you like.
+  provenance.
 
 > Why it matters: when you retrieve memories to build a prompt, you want the
 > tight `essence`, not the whole `content`. Putting the same long text in both
@@ -52,9 +53,12 @@ Every thought carries **two** texts, and the split is deliberate:
 A thought also carries two optional, nullable timestamps — `valid_from` and
 `valid_until` — that record **when the fact is true in the world**, a separate
 axis from when Engrava stored it (`created_at`) and from the [cycle](#cycle-the-agent-clock).
-Both default to `None` (an open interval = "valid for all time"), so you can
-ignore them entirely until you need point-in-time history. The same two fields
-exist on an [edge](#edge). See [The Bi-temporal Model](bitemporal.md) for the full
+Both default to `None`, which the point-in-time predicates (`valid_now`,
+`valid_at`) treat as an open interval = "valid for all time" — the interval
+predicate `valid_between` is the exception and requires real bounds on both
+ends — so you can ignore them entirely until you need point-in-time history.
+The same two fields exist on an [edge](#edge). See
+[The Bi-temporal Model](bitemporal.md) for the full
 semantics and the query predicates.
 
 ### Thought types
@@ -78,8 +82,9 @@ behaviour.
 ### Priority
 
 `Priority` is `P1` (highest) … `P4` (lowest). It is one of the signals that
-hybrid search fuses into a ranking, so higher-priority thoughts surface more
-readily. Set it to reflect how important a memory is to keep at hand.
+hybrid search fuses into a ranking: when priority weighting is enabled and
+positive, a higher-priority thought already in the candidate set scores
+higher. Set it to reflect how important a memory is to keep at hand.
 
 ### Lifecycle
 
@@ -91,7 +96,11 @@ CREATED -> ACTIVE -> DONE -> ARCHIVED
 ARCHIVED --restore_thought()--> ACTIVE
 ```
 
-`LifecycleStatus` transitions are enforced (`evolve()` rejects illegal jumps).
+`LifecycleStatus` transitions are checked when you pass a `LifecycleStatus`
+member: `evolve(lifecycle_status=LifecycleStatus.DONE)` (and the equivalent
+`update_thought` call) raises `InvalidTransitionError` on an illegal jump. The
+check does not run when the target is given as a plain string such as `"DONE"`,
+so pass the enum member and do not rely on the guard for string input.
 Most thoughts you create will start `ACTIVE`; `ACTIVE -> ARCHIVED` is a valid
 direct transition and does not require an intermediate `DONE`. The canonical
 reverse transition is `restore_thought()`, which restores `ARCHIVED -> ACTIVE`
@@ -138,17 +147,14 @@ journal entry. For a recommended direction convention for claims, evidence, and
 `CONTESTED_BY`, see
 [Evidence and conflicts](evidence-and-conflicts.md).
 
-**Below core schema 12 this cascade does not happen.** The `ON DELETE CASCADE` on
-`edge`, `embedding` and `action` arrives with the core-12 migration, so on a database
-carried forward from an older engrava and never migrated the thought's `embedding` row
-outlives the delete. The delete does still purge that thought's own `vec0` vector, so
-the identifier is **not** reachable straight afterwards; it returns once the reconcile
-that runs on the next sqlite-vec-enabled open backfills the index from the surviving
-`embedding` row. From then on it is an ordinary candidate on that arm whenever a
-sqlite-vec backend is **active** on the store and the query carries no effective
-metadata predicate — the arm *can* return it, subject to the same similarity threshold
-and `top_k` window as any live row. Run `engrava migrate`. See
-[Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated).
+**Below core schema 12 there is no such cascade.** The `ON DELETE CASCADE` on
+`edge`, `embedding` and `action` arrives with the core-12 migration.
+`delete_thought` does not rely on it: it issues its own deletes for the thought's
+rows in those three tables, in the same savepoint as the parent delete, which runs
+first. See
+[Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated)
+for what `engrava migrate` cleans up on a database that already holds dangling
+`embedding` rows.
 
 ## Embedding
 
@@ -161,12 +167,12 @@ docs for the provider options.
 
 ## Reflection
 
-A **reflection** is a `ThoughtType.REFLECTION` thought created by **dreaming**:
-Engrava clusters semantically related thoughts and writes a higher-order summary
-node, linked back to its members by `CONSOLIDATED_FROM` edges, with a centroid
-embedding. Reflections are how a pile of individual observations becomes
-fewer, more retrievable, higher-level memories over an agent's lifetime. You do
-not create reflections by hand — dreaming makes them. See
+A **reflection** is a `ThoughtType.REFLECTION` thought. A reflection that
+**dreaming** creates is centroid-embedded and carries lineage: Engrava
+clusters semantically related thoughts and writes a higher-order summary
+node, linked back to its members by `CONSOLIDATED_FROM` edges. Reflections
+are how a pile of individual observations becomes fewer, more retrievable,
+higher-level memories over an agent's lifetime. See
 [Dreaming](dreaming.md).
 
 ## Cycle (the agent clock)
@@ -273,9 +279,12 @@ Resolution is deliberately simple, and an explicit argument always wins:
 2. Otherwise, if a provider is configured, its value is pulled **and validated**
    — it must be a real, non-negative `int` (a `bool` is rejected). An invalid
    value raises `CycleProviderError`.
-3. Otherwise the cycle stays `None` — exactly today's behaviour (recency off, no
-   age-gating). **No provider configured = unchanged**: a store built without one
-   behaves byte-for-byte as before.
+3. Otherwise the cycle stays `None`. `search_hybrid` then applies no cycle
+   (recency off, no age-gating). `consolidate()` and `run_hygiene()` are the
+   exception: their age-gating needs a cycle, so once a real pass is about to run
+   they raise `ValueError` rather than invent a default. (A disabled hygiene policy
+   is a no-op that needs no cycle.) Pass `current_cycle=...` or configure a
+   provider for those two.
 
 > **Read-time only.** The provider feeds ranking and eligibility; it **never**
 > stamps `created_cycle` / `updated_cycle` on writes. Write-side cycles stay your
@@ -359,12 +368,14 @@ boundary between what the agent knows and what it's allowed to say.
 A thought carries **two different** notions of how much to trust it, and they
 feed dreaming as separate signals:
 
-- **`confidence`** — a static `0.0–1.0` belief-strength **you assign** at
-  creation (nullable; treated as `0.5` when unset). "How sure am I of this?"
-- **`confirmation_count`** — a counter of how many times the thought has been
-  **independently re-encountered / validated** over time. It grows via
-  `deduplicate=True` on `create_thought` (identical content bumps the count) or
-  your own logic. "How many times has reality re-confirmed this?"
+- **`confidence`** — a `0.0–1.0` belief-strength **you assign**, at creation
+  or a later update (nullable; treated as `0.5` when unset). "How sure am I of
+  this?"
+- **`confirmation_count`** — a counter that grows on a deduplication hash hit
+  via `deduplicate=True` on `create_thought` (identical content bumps the
+  count), or via your own logic. Engrava counts the hits; it does not
+  establish that they are independent re-encounters. "How many times has a
+  matching write recurred?"
 
 Dreaming's `ConfidenceSignal` reads the first and `ConfirmationSignal` reads the
 second, so they tune consolidation in different ways. (Relatedly,

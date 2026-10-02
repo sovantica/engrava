@@ -2,21 +2,23 @@
 
 > The memory database for AI agents.
 >
-> Graph memory, hybrid search, and a tamper-evident thought/edge journal — one `pip install`, no server, no LLM.
+> A queryable memory graph with bi-temporal valid-time predicates — in an in-process Python library over one SQLite file, with no generative-model call in the core write path.
 
 [![CI](https://github.com/sovantica/engrava/actions/workflows/ci.yml/badge.svg)](https://github.com/sovantica/engrava/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/engrava.svg)](https://pypi.org/project/engrava/)
 [![Python](https://img.shields.io/pypi/pyversions/engrava.svg)](https://pypi.org/project/engrava/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Engrava** is a standalone embedded database for AI agent memory. Built on
+**Engrava** is a standalone, in-process database for AI agent memory. Built on
 SQLite, it provides thought CRUD, edge-based knowledge graphs, embedding-based
 similarity search, full-text search (FTS5/BM25), and a declarative extension
 system — all in a single package with zero external service dependencies.
 
 Benchmark results are published, and the runs are reproducible from a separate repository. Every
 published run is Group A — `memory_pipeline_llms: []`, no language model anywhere in the memory
-layer. That is a property of the architecture rather than a measurement, so it holds across releases.
+layer's built-in path. That is a property of the architecture's default signals and hooks rather
+than a measurement, unless a custom Dreaming signal or Memory Hygiene hook is configured to call
+one.
 
 - **[Benchmark results](https://engrava.ai/benchmarks/)** — the live table: every published row with the comparability segment it belongs to.
 - **[engrava-benchmark](https://github.com/sovantica/engrava-benchmark)** — the runner. Clone it and reproduce a result against the package from PyPI. MIT.
@@ -50,6 +52,19 @@ pip install 'engrava[embeddings-hf]'      # HuggingFace Inference API embeddings
 
 Dreaming/consolidation and the knowledge graph need **no extra** — they are part
 of the base install.
+
+> **`embeddings-local` carries a large first-run download.** It pulls
+> `sentence-transformers` and `torch` — `torch`'s current PyPI Linux/x86_64
+> wheel for Python 3.11 alone measures 554.6 MB — plus a further, separate
+> model download (~88 MB for `all-MiniLM-L6-v2`, cached under
+> `~/.cache/huggingface/hub`) on first use. `engrava-mcp[local]` is the exact
+> same download, reached through the server package instead of this one. If
+> you do not need semantic search in-process, `pip install engrava` alone
+> (no extra, no download, no model) already gives you keyword search, the
+> graph, and MindQL — see
+> [Configuration → Quick-start profiles](https://github.com/sovantica/engrava/blob/main/docs/configuration.md#quick-start-profiles)
+> for that and the Ollama-backed alternative that keeps the model out of
+> this process entirely.
 
 ### Basic Usage
 
@@ -182,29 +197,34 @@ class MyHooks(DefaultEngravaHooks):
 ```
 
 Core currently invokes `on_store`, `on_retrieve`, and `decay_function`.
-`on_store` runs after the source thought is durable; changing its return value
-does not rewrite the persisted row. `score_function` and
+`on_store` runs after the source thought's row is inserted; changing its
+return value does not rewrite the persisted row. `score_function` and
 `mindql_extension_registry()` remain reserved protocol methods and are not
 called by core.
 
 ### Dreaming / Memory Consolidation
 
 Built-in `DreamingExtension` for periodic memory consolidation — scores
-thoughts via configurable signals, promotes high-value entries, and
-creates **REFLECTION thoughts** by clustering semantically related
-thoughts and computing centroid embeddings (no LLM required). Available
-since 0.3.0.
+thoughts via its default signals (no LLM calls), promotes high-value
+entries, and creates **REFLECTION thoughts** by clustering semantically
+related thoughts and computing centroid embeddings through a deterministic
+structural function, not an LLM. A custom signal you register with
+`DreamingExtension` runs whatever code it contains. Available since 0.3.0.
 
 → See [`docs/benchmarks.md`](https://github.com/sovantica/engrava/blob/main/docs/benchmarks.md) for reproducible
 evidence (synthetic benchmark suite runnable in ~5 minutes).
 
 ### Forgetting / Memory Hygiene
 
-The subtractive half of memory maintenance, paired with Dreaming: an **opt-in,
-reversible**, no-LLM loop that **archives** cold, low-signal thoughts — and, as a
-*separately* opted-in step, garbage-collects them only after both a cycle and a
-wall-clock restore window. OFF by default; once enabled, archived thoughts drop out
-of default retrieval and can be restored (`restore_thought` / `include_archived`).
+The subtractive half of memory maintenance, paired with Dreaming: an **opt-in**
+loop whose built-in scoring makes no LLM calls, that **archives** cold,
+low-signal thoughts — the default action, reversible via `restore_thought` —
+and, as a *separately* opted-in step, garbage-collects them (not reversible)
+once both restore windows have elapsed under their non-zero defaults — a
+cycle count and a wall-clock duration, either of which can be configured to
+`0` to disable that window. OFF by default; once enabled, archived thoughts
+drop out of default retrieval and can be restored (`restore_thought` /
+`include_archived`).
 
 → See [`docs/memory-hygiene.md`](https://github.com/sovantica/engrava/blob/main/docs/memory-hygiene.md) for the
 loop, protection, restore windows, and the honest deletion posture.
@@ -258,6 +278,18 @@ the `import engrava` library. See the
 client configuration, the full tool/resource/prompt reference, and read-only
 mode.
 
+**`uvx` vs. a persistent install.** `uvx engrava-mcp` (equivalently `uv tool
+run engrava-mcp`) installs into "an ephemeral virtual environment in the uv
+cache directory" per uv's own `--help` text — fine for the lexical/network
+profiles above, which add nothing heavier than `httpx`. Once you are on the
+`local` profile (`engrava-mcp[local]`, the same `sentence-transformers` +
+`torch` download as `engrava[embeddings-local]`), `uv tool install
+'engrava-mcp[local]'` is the better fit: it installs once into a persistent
+environment — the same `uvx engrava-mcp` invocation then reuses that
+installed environment instead of resolving a fresh ephemeral one — and a
+later `uv tool upgrade engrava-mcp` re-pays only the changed packages, not
+the whole dependency tree.
+
 ## CLI
 
 ```bash
@@ -279,8 +311,12 @@ installed — a pass that is about to delete stops **before deleting anything** 
 exits `1` rather than stranding those vectors in an index nothing can then reach
 them through.
 
-`engrava info` now renders the same metrics snapshot contract exposed by
-`await store.metrics()`.
+`engrava info`'s `--format json` output carries every field of the metrics
+snapshot exposed by `await store.metrics()`, with the snapshot's own schema
+version renamed `metrics_schema_version`, plus two fields the snapshot itself
+does not carry, `db_path` and `database_schema_version` — see [Upgrade
+Guide](docs/upgrade.md#06---07). The default text output is a shorter summary
+of that same data, not the full snapshot.
 
 See the [CLI reference](https://github.com/sovantica/engrava/blob/main/docs/cli.md) for every command and option.
 
@@ -331,12 +367,17 @@ See the [CLI reference](https://github.com/sovantica/engrava/blob/main/docs/cli.
 ## Development
 
 ```bash
-pip install -e ".[dev]"
-ruff check src/ tests/            # Lint
-ruff format --check src/ tests/   # Format check
-mypy --strict src/                # Type check
-pytest --cov                      # Test with coverage
+make install   # deps + dev extras + local git hooks -- from the primary checkout
+make gate      # fast: hooks-active + lint + format check + type check + goldens drift, ~70s
+make check     # lint + format check + type check + the full test suite with coverage (unchanged; no hooks-active, no goldens drift)
 ```
+
+`make install` also wires a `commit-msg` hook that lints the message of the
+commit a squash merge creates — including on a local branch that never opens
+a pull request, where nothing else does. It refuses to install from a linked
+worktree (`core.hooksPath` is shared across all of them). See
+[CONTRIBUTING.md](https://github.com/sovantica/engrava/blob/main/CONTRIBUTING.md#git-hooks)
+for what it covers and what it does not.
 
 ## License
 

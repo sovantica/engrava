@@ -34,11 +34,11 @@ but do not expect core to invoke them.
 
 | Method | When | Returns | Status in core |
 |--------|------|---------|----------------|
-| `on_store` | After a thought is persisted | `ThoughtRecord` (enriched or unchanged) | **active** |
-| `on_retrieve` | After a thought is loaded from storage | `ThoughtRecord` (enriched or unchanged) | **active** |
+| `on_store` | After a thought row is inserted — **not** necessarily durable yet. On a plain `create_thought`, the row has already committed by this point. Inside `bulk_store`, every item's `on_store` fires as the batch is built, *before* the batch's single commit — a row error later in the same batch rolls the transaction back, and `on_store` has already run for the rows that never persist | `ThoughtRecord` (enriched or unchanged) | **active** |
+| `on_retrieve` | After a thought is loaded from storage — but only via `get_thought` and `list_thoughts`. `update_thought`, `restore_thought`, `invalidate_thought`, and the read-back inside `get_or_create` / `upsert_by_hash` all read a row back without calling it | `ThoughtRecord` (enriched or unchanged) | **active** |
 | `decay_function(thought, elapsed_cycles)` | Per-candidate decay factor, multiplied into the hygiene eviction-score | `float` in `[0.0, 1.0]` | **active** — called for each candidate when an enabled `run_hygiene()` pass reaches archive scoring; it is never consulted in search, ranking, or promotion |
 | `score_function(thought, context)` | Custom relevance score | `float` | reserved — not called by core |
-| `mindql_extension_registry()` | Register custom MindQL verbs | `dict[str, MindQLExtension]` | reserved — core wires MindQL verbs via `ExtensionManifest.mindql_extensions`, not this hook |
+| `mindql_extension_registry()` | Register custom MindQL verbs | `dict[str, MindQLExtension]` | reserved — the store itself never reads `ExtensionManifest.mindql_extensions` either; the only consumer of that field is the `engrava` CLI, which discovers verbs through the `engrava.extensions` entry-point group, not through a manifest passed to the constructor |
 
 ---
 
@@ -132,6 +132,7 @@ import aiosqlite
 from engrava import DeriveGates, SqliteEngravaCore, StructuralSplitProducer
 
 conn = await aiosqlite.connect("engrava.db")
+conn.row_factory = aiosqlite.Row
 store = SqliteEngravaCore(
     conn,
     hooks=StructuralSplitProducer(),
@@ -254,9 +255,134 @@ print(result.thought_id, result.created, result.reused, result.skipped)
   identity collision) under `on_error="raise"`.
 - A source that is itself a derived record (it carries an outgoing `DERIVED_FROM`
   edge) is never re-derived.
+- Unlike the automatic on-store trigger, `derive_existing` does not defer inside
+  a caller-held `suspend_auto_commit()` window (or a raw `BEGIN`): the source is
+  already durable, so the children simply join that transaction. A failed child
+  undoes only its own failing step (its row, its edge, or an embedding attempt)
+  — never an earlier child's work, and never the caller's other pending writes
+  in the same transaction, under either `on_error` policy. Who decides *when*
+  that becomes durable differs by transaction kind: a `suspend_auto_commit()`
+  window suppresses every write's own auto-commit, so nothing commits before
+  the window's own single, final commit; a raw `BEGIN` does not, so a child's
+  own successful step still commits the shared transaction — the caller's
+  pending write included — as soon as that step succeeds.
 
 `SplitMode`, `DeriveResult`, and `SourceThoughtNotFoundError` are public API under
 the same `X.Y.x` stability guarantee.
+
+---
+
+## 1B. Pre-insert preparation seam
+
+`on_store` (§1) runs *after* the row is inserted (on a plain top-level
+`create_thought`, after it has already committed), so it is not a place for
+pre-insert validation, and any enrichment it returns lands in the caller's
+copy of the record, never in the stored row. For validation or persisted
+enrichment that must run *before the decisive probe* for a duplicate and before
+any row write, override `prepare_thought_for_insert` on your `SqliteEngravaCore` subclass —
+a template method, like `_row_to_thought`, not a method on the hooks object.
+It has no leading underscore: unlike `_row_to_thought`, this one is a public
+override point, and a subclass's override makes the name part of that
+subclass's own public surface — hence the public name.
+
+### 1B.1 Contract
+
+| Aspect | Behaviour |
+|---|---|
+| Default | Pass-through — returns the candidate unchanged |
+| Signature | `async def prepare_thought_for_insert(self, thought: ThoughtRecord) -> ThoughtRecord` |
+| Runs before | The **decisive** duplicate probe and any row write. `get_or_create` / `upsert_by_hash` run their own **exploratory** probe *before* this — see below; a stable hit there resolves the call and this seam never runs at all. |
+| Store lock held while it runs | Never one **this call itself** acquires, on any entry point — `create_thought`, `get_or_create`, `upsert_by_hash` and `bulk_store` all release every lock and transaction they opened before calling this, and reacquire from scratch afterward. See the nesting note below. |
+| Raising | Aborts the create — this call inserts no row and appends no journal entry |
+
+**Nesting note.** "Never one this call itself acquires" is not "never any
+lock at all". If you call `create_thought` / `get_or_create` / `upsert_by_hash`
+/ `bulk_store` from *inside your own* `suspend_auto_commit()` window, that
+window's `_write_lock` is still held while this seam runs — it is *your*
+lock, acquired before you ever reached this call, not one the call took for
+itself. This is not something a pre-insert override can close (a plain
+in-process `asyncio.Lock` cannot distinguish "the caller's own reentrant
+hold" from "a lock this call should release"), and it is not new: it applies
+identically to a raw `create_thought` call inside your own
+`suspend_auto_commit()` block, seam or no seam.
+
+**Invocation count, by entry point:**
+
+| Caller | Count |
+|---|---|
+| `create_thought` (either `deduplicate` value) | Once per call that passes metadata and provenance validation — including a dedup hit |
+| `get_or_create` | Zero on a stable pre-existing hit; once when the call reaches the seam after a miss (a race that turns the miss into a hit still counts once) |
+| `upsert_by_hash` | Same as `get_or_create` |
+| `bulk_store` | Once per item, in input order until one call raises — run for the *whole batch*, holding no lock this call itself acquires (see the nesting note above), before `bulk_store` takes any lock for its insert transaction; not "through" a per-item `create_thought` call the way the other counts might suggest |
+| `remember` | Through its own `create_thought` call, so the `create_thought` row applies |
+
+The returned record is revalidated (metadata, provenance) before the decisive
+probe or any row write — for `get_or_create` / `upsert_by_hash`, this
+revalidation runs *after* their own exploratory probe already found nothing,
+not before any probe at all — and — for those two — its
+`content` supplies the hash used for the decisive probe that follows: an
+override that changes `content` changes what counts as a duplicate for that
+call.
+
+**`bulk_store` is the one entry point where this seam does not see
+pre-validated input.** Everywhere else, the candidate's `metadata` /
+`provenance` are validated immediately before this call runs, so an override
+can rely on that precondition. `bulk_store` runs this seam, batch-wide,
+holding no lock this call itself acquires, over every item *before* its own
+per-item validation — moving validation itself into that same batch-wide
+pre-phase would have let a later item's ordinary (non-seam) validation
+failure pre-empt an
+earlier item's duplicate-id error or `on_store` call, which a bare loop of
+`create_thought` calls never does (see `_bulk_store_inner`'s docstring for
+the full reasoning). Restoring that per-item failure ordering means
+`bulk_store`'s per-item validation now runs in its insert phase, after this
+seam already ran for the whole batch — so an override reached through
+`bulk_store` sees whatever was passed to `bulk_store`, unvalidated, and must
+not assume otherwise.
+
+### 1B.2 Migrating from a `create_thought` override
+
+If your subclass currently overrides `create_thought` for validation or
+persisted enrichment, move that logic into `prepare_thought_for_insert` and
+let the inherited `create_thought` / `get_or_create` / `upsert_by_hash` /
+`bulk_store` orchestration call it for you — every new row written through
+`create_thought`, `get_or_create`, `upsert_by_hash`, `bulk_store` or `remember`
+passes through it. Keep only one canonical implementation: retaining both the
+old override and the new seam risks running your logic twice on a direct
+`create_thought` call.
+
+### 1B.3 A pre-existing restriction: `update_thought` on `upsert_by_hash`'s hit branch
+
+`upsert_by_hash`'s hit branch — when the content-hash probe matches an
+existing row — updates it, if a mutable field differs, by calling the public,
+overridable `update_thought` while `_write_lock` and `_dedup_lock` are held.
+**The locked `update_thought` shape predates the
+pre-insert seam; the decisive-probe hit route does not.** Before the seam
+was wired into `upsert_by_hash`, the method had a single probe — what is
+now called the exploratory probe — whose hit branch already called
+`update_thought`, when a field differed, under those two locks; that part is unchanged
+behaviour. The decisive probe exists only because wiring in the seam split
+the miss path into two phases, so that route is new; its hit branch reuses
+the same `_upsert_matched_row` implementation as the exploratory probe's,
+so it inherits the identical restriction on a route this seam introduced.
+A hit on the exploratory probe costs zero calls to
+`prepare_thought_for_insert`; a hit on the decisive probe comes after the seam
+has already run once for the call (see the invocation-count table above). If
+you override `update_thought`, know that your override is called while those
+guards are held when it is reached this way: do not call back into
+`create_thought(deduplicate=True)` / `get_or_create` / `upsert_by_hash` /
+`bulk_store(deduplicate=True)` from inside it on the same task (see the
+nesting note in §1B.1 — `_write_lock` is task-reentrant, so re-entering it is
+free, but `_dedup_lock` has no legitimate reentrant use, and a same-task second
+acquisition raises `DedupLockReentryError` — a "raise, don't hang" backstop
+identical in spirit to `WriteLockTimeoutError`'s for a *different* task's
+wait, converting what would otherwise be a silent hang on a lock this same
+task already holds into an attributable error instead).
+
+This restriction applies on **both** hit routes — the exploratory
+probe's hit and the decisive probe's hit alike, since both resolve through
+this same `update_thought` call, which is made when a mutable field differs
+and while `_write_lock` and `_dedup_lock` are held.
 
 ---
 

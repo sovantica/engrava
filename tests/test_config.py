@@ -334,6 +334,17 @@ hooks:
         with pytest.raises(ConfigError, match="must be a YAML mapping"):
             load_config(cfg_file)
 
+    def test_non_dict_scalar_reproduces_the_offending_value(self, tmp_path: Path) -> None:
+        """A bare scalar document names the value itself, not just its type.
+
+        The message reads ``got str: 'hello'``, so whoever fixes the file
+        sees what was actually written in it, not only that it was a string.
+        """
+        cfg_file = tmp_path / "scalar.yaml"
+        cfg_file.write_text("hello\n", encoding="utf-8")
+        with pytest.raises(ConfigError, match=r"got str: 'hello'"):
+            load_config(cfg_file)
+
     def test_missing_database_path(self, tmp_path: Path) -> None:
         cfg_file = tmp_path / "no_path.yaml"
         cfg_file.write_text("database:\n  wal_mode: true\n", encoding="utf-8")

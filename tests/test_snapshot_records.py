@@ -8,8 +8,7 @@ restore path in ``engrava.cli.main``:
 * a non-object record, non-object ``data``, unknown column, and missing
   required column each raise a typed CLI error before any write;
 * a valid snapshot round-trips byte-for-byte across every column;
-* restore streams the snapshot and re-embeds in bounded batches, so memory is
-  bounded by the batch rather than the snapshot size.
+* restore streams the snapshot and re-embeds in batches of at most the batch size.
 """
 
 from __future__ import annotations
@@ -29,7 +28,6 @@ from click.testing import CliRunner
 
 from engrava.cli import main as cli_main
 from engrava.cli.main import (
-    _assert_embedding_model_match,
     _import_records_to_db,
     _iter_snapshot_lines,
     cli,
@@ -89,6 +87,70 @@ def _embedding_data(vector: bytes, owner_id: str = "t-1") -> dict[str, object]:
         "vector_blob": base64.b64encode(vector).decode("ascii"),
         "created_at": "2026-01-01T00:00:00+00:00",
     }
+
+
+def _embedding_line(
+    embedding_id: str,
+    owner_id: str,
+    model_name: str,
+    dimension: int,
+    vector_blob: bytes,
+) -> str:
+    """Serialise an embedding data record with an explicit declared identity.
+
+    Unlike :func:`_embedding_data`, ``model_name`` and ``dimension`` are
+    caller-controlled, so a test can build a row that declares an identity
+    consistent -- or deliberately inconsistent -- with its own blob length or
+    with another row.
+    """
+    return json.dumps(
+        {
+            "_type": "embedding",
+            "data": {
+                "embedding_id": embedding_id,
+                "owner_type": "THOUGHT",
+                "owner_id": owner_id,
+                "model_name": model_name,
+                "dimension": dimension,
+                "vector_blob": base64.b64encode(vector_blob).decode("ascii"),
+                "created_at": "2026-01-01T00:00:00+00:00",
+            },
+        }
+    )
+
+
+def _embedding_line_fields(
+    *,
+    embedding_id: str = "e-1",
+    owner_type: str = "THOUGHT",
+    owner_id: str = "t-1",
+    model_name: str = "model-F",
+    dimension: int = 4,
+    vector_blob: bytes = b"",
+    created_at: str = "2026-01-01T00:00:00+00:00",
+) -> str:
+    """Serialise an embedding data record with every column caller-controlled.
+
+    Unlike :func:`_embedding_line`, ``owner_type`` and ``created_at`` are also
+    overridable, so a test can build a row that is well-typed (passes
+    ``TableSpec.validate``) but violates one of ``EmbeddingRecord``'s own
+    content constraints (a non-empty ``owner_type``/``owner_id``, an
+    ISO-8601 ``created_at``, a positive ``dimension``).
+    """
+    return json.dumps(
+        {
+            "_type": "embedding",
+            "data": {
+                "embedding_id": embedding_id,
+                "owner_type": owner_type,
+                "owner_id": owner_id,
+                "model_name": model_name,
+                "dimension": dimension,
+                "vector_blob": base64.b64encode(vector_blob).decode("ascii"),
+                "created_at": created_at,
+            },
+        }
+    )
 
 
 async def _fresh_schema_conn(db_path: Path) -> aiosqlite.Connection:
@@ -184,6 +246,26 @@ class TestFixedSql:
         expected = f"INSERT OR REPLACE INTO edge ({column_list}) VALUES ({placeholders})"  # noqa: S608
         assert sql == expected
         assert len(values) == len(spec.columns)
+
+    def test_plain_insert_selects_the_ordinary_insert_verb(self) -> None:
+        # The journalled-merge collision gate (engrava.cli.main) sets this when
+        # it wants SQLite itself to refuse a colliding primary key or UNIQUE
+        # constraint, instead of the default INSERT OR REPLACE silently
+        # overwriting (or cascade-deleting) the existing row.
+        spec = table_spec(CoreTable.THOUGHT)
+        data = _minimal_thought_data()
+        sql, _values = spec.build_insert(data, plain_insert=True)
+        assert sql.startswith("INSERT INTO thought ")
+        assert "OR REPLACE" not in sql
+
+    def test_plain_insert_defaults_to_false(self) -> None:
+        # Every other caller (export/verify tooling, the embedding-identity
+        # check in cli/main.py) must keep getting INSERT OR REPLACE without
+        # having to say so.
+        spec = table_spec(CoreTable.THOUGHT)
+        data = _minimal_thought_data()
+        sql, _values = spec.build_insert(data)
+        assert sql.startswith("INSERT OR REPLACE INTO thought ")
 
     def test_injection_shaped_key_is_rejected_not_interpolated(self) -> None:
         # A key crafted to escape the identifier list must be rejected as an
@@ -285,6 +367,12 @@ class TestParseHappyPath:
         assert record.data["vector_blob"] == base64.b64encode(vector).decode("ascii")
         _sql, values = record.to_insert()
         assert vector in values
+
+    def test_to_insert_forwards_plain_insert(self) -> None:
+        record = parse_snapshot_record(_thought_line(_minimal_thought_data()), line_number=1)
+        assert isinstance(record, TableRecord)
+        sql, _values = record.to_insert(plain_insert=True)
+        assert sql.startswith("INSERT INTO thought ")
 
 
 class TestValueValidation:
@@ -524,6 +612,149 @@ async def _dump_table(db_path: Path, table: str) -> list[dict[str, object]]:
     return sorted(rows, key=lambda row: str(next(iter(row.values()))))
 
 
+async def _metadata_map(db_path: Path) -> dict[str, str]:
+    """Return every ``_metadata`` row as a ``{key: value}`` dict."""
+    conn = await aiosqlite.connect(str(db_path))
+    try:
+        cursor = await conn.execute("SELECT key, value FROM _metadata")
+        rows = await cursor.fetchall()
+    finally:
+        await conn.close()
+    return {str(key): str(value) for key, value in rows}
+
+
+async def _locked_target(
+    db_path: Path,
+    *,
+    model_name: str,
+    dimension: int,
+    existing_embedding: tuple[str, int, bytes] | None = None,
+) -> None:
+    """Build a target database whose ``_metadata`` locks it to a given identity.
+
+    Args:
+        db_path: Path to create the database at.
+        model_name: The locked ``embedding_model_name``.
+        dimension: The locked ``embedding_dimension``.
+        existing_embedding: When given, an ``(model_name, dimension,
+            vector_blob)`` triple for one embedding row inserted directly via
+            raw SQL -- bypassing ``store_embedding()`` and its lock check --
+            against a real pre-existing thought. Used to build a target whose
+            own existing rows already disagree with its lock, the state a
+            merge restore must refuse to build on.
+
+    """
+    from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+
+    conn = await aiosqlite.connect(str(db_path))
+    conn.row_factory = aiosqlite.Row
+    try:
+        store = SqliteEngravaCore(conn)
+        await store.ensure_schema()
+        await conn.execute(
+            "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
+            ("embedding_model_name", model_name),
+        )
+        await conn.execute(
+            "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
+            ("embedding_dimension", str(dimension)),
+        )
+        if existing_embedding is not None:
+            ex_model, ex_dimension, ex_blob = existing_embedding
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id="pre-existing",
+                    essence="essence",
+                    content="content",
+                    thought_type=ThoughtType.OBSERVATION,
+                    source="test",
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    priority=Priority.P2,
+                    created_cycle=1,
+                    updated_cycle=1,
+                )
+            )
+            await conn.execute(
+                "INSERT INTO embedding "
+                "(embedding_id, owner_type, owner_id, model_name, dimension, "
+                "vector_blob, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "pre-existing-emb",
+                    "THOUGHT",
+                    "pre-existing",
+                    ex_model,
+                    ex_dimension,
+                    ex_blob,
+                    "2026-01-01T00:00:00+00:00",
+                ),
+            )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
+async def _unlocked_target_with_vector(
+    db_path: Path,
+    *,
+    model_name: str,
+    dimension: int,
+    vector_blob: bytes,
+    thought_id: str,
+) -> None:
+    """Build a target with an ``embedding`` row but no ``_metadata`` lock.
+
+    Restore inserts ``embedding`` rows via fixed SQL directly, never through
+    ``store_embedding()``. This state is built directly here (rather than via
+    two restores); it is reachable by direct data manipulation and must be
+    handled correctly when it is.
+
+    Args:
+        db_path: Path to create the database at.
+        model_name: The declared model of the one existing embedding row.
+        dimension: The declared dimension of the one existing embedding row.
+        vector_blob: The existing row's vector bytes.
+        thought_id: The thought the embedding row belongs to.
+
+    """
+    from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+
+    conn = await aiosqlite.connect(str(db_path))
+    conn.row_factory = aiosqlite.Row
+    try:
+        store = SqliteEngravaCore(conn)
+        await store.ensure_schema()
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id=thought_id,
+                essence="essence",
+                content="content",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=1,
+                updated_cycle=1,
+            )
+        )
+        await conn.execute(
+            "INSERT INTO embedding "
+            "(embedding_id, owner_type, owner_id, model_name, dimension, "
+            "vector_blob, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                f"{thought_id}-emb",
+                "THOUGHT",
+                thought_id,
+                model_name,
+                dimension,
+                vector_blob,
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
 class TestRestoreInputBoundary:
     """The CLI restore command enforces the input boundary before any write."""
 
@@ -734,22 +965,8 @@ class _FakeProvider:
     dimension = 4
 
 
-class TestModelMismatchValidation:
-    """The metadata model-compatibility check gates restore."""
-
-    def test_mismatch_raises(self) -> None:
-        with pytest.raises(click.ClickException, match="model mismatch"):
-            _assert_embedding_model_match(MetadataRecord("other-model"), _FakeProvider())
-
-    def test_matching_model_passes(self) -> None:
-        _assert_embedding_model_match(MetadataRecord("fake-model"), _FakeProvider())
-
-    def test_absent_model_passes(self) -> None:
-        _assert_embedding_model_match(MetadataRecord(None), _FakeProvider())
-
-
 # ---------------------------------------------------------------------------
-# Streaming re-embed: memory is bounded by the batch, not the snapshot.
+# Streaming re-embed: IDs are flushed in batches during the pass.
 # ---------------------------------------------------------------------------
 
 
@@ -783,19 +1000,19 @@ class TestBatchedReembed:
         async def _run() -> int:
             conn = await _fresh_schema_conn(tmp_path / "target.db")
             try:
-                return await _import_records_to_db(
+                result = await _import_records_to_db(
                     conn,
                     snap,
                     re_embed=True,
                     embedding_provider=_FakeProvider(),  # type: ignore[arg-type]
                 )
+                return result.total_records
             finally:
                 await conn.close()
 
         total = asyncio.run(_run())
 
-        # No batch exceeds the (patched) cap, so peak retained IDs are bounded by
-        # the batch size rather than the total thought count.
+        # No batch exceeds the (patched) cap.
         assert observed_batches == [2, 2, 1]
         assert max(observed_batches) <= 2
         # 5 thoughts inserted + 5 re-embeddings reported.
@@ -830,15 +1047,1163 @@ class TestBatchedReembed:
         async def _run() -> int:
             conn = await _fresh_schema_conn(target)
             try:
-                return await _import_records_to_db(
+                result = await _import_records_to_db(
                     conn,
                     snap,
                     re_embed=True,
                     embedding_provider=_FakeProvider(),  # type: ignore[arg-type]
                 )
+                return result.total_records
             finally:
                 await conn.close()
 
         asyncio.run(_run())
         assert len(asyncio.run(_dump_table(target, "thought"))) == 1
+        assert asyncio.run(_dump_table(target, "embedding")) == []
+
+
+# ---------------------------------------------------------------------------
+# Embedding identity invariant: the target's lock must agree with the
+# declared model_name of every non-centroid embedding row and the dimension
+# of every embedding row -- enforced from the
+# snapshot's `embedding` rows and the target's own data, never from a
+# resolved provider or the snapshot's metadata header. Every test here goes
+# through the CLI.
+# ---------------------------------------------------------------------------
+
+
+class TestEmbeddingIdentityInvariant:
+    """A plain restore enforces the target's lock against declared identities."""
+
+    def test_restore_fails_when_incoming_row_declarations_disagree_with_the_targets_lock(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """A plain restore into a target locked to one model must refuse a
+        snapshot whose embedding rows declare another, naming both identities
+        -- not silently import them and leave the lock lying about what is
+        actually stored.
+        """
+        target = tmp_path / "target.db"
+        asyncio.run(_locked_target(target, model_name="model-A", dimension=384))
+
+        vector = struct.pack("4f", 0.1, 0.2, 0.3, 0.4)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-mismatch"))
+            + "\n"
+            + _embedding_line("e-mismatch", "t-mismatch", "model-B", 4, vector)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert "'model-A' at dimension 384" in result.output
+        assert "'model-B' at dimension 4" in result.output
+        # Rejected before any write lands: neither the thought nor the lock moved.
+        assert asyncio.run(_dump_table(target, "thought")) == []
+        assert asyncio.run(_metadata_map(target))["embedding_model_name"] == "model-A"
+
+    def test_restore_fails_when_incoming_rows_disagree_with_each_other(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """Reachable today, and never checked until now: two embedding rows in
+        the same snapshot declaring different identities, restored into a
+        target with no lock of its own to arbitrate between them.
+        """
+        target = tmp_path / "target.db"
+        vector_c = struct.pack("3f", 0.1, 0.2, 0.3)
+        vector_d = struct.pack("5f", 0.1, 0.2, 0.3, 0.4, 0.5)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-1"))
+            + "\n"
+            + _embedding_line("e-1", "t-1", "model-C", 3, vector_c)
+            + "\n"
+            + _thought_line(_minimal_thought_data("t-2"))
+            + "\n"
+            + _embedding_line("e-2", "t-2", "model-D", 5, vector_d)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert "'model-C' at dimension 3" in result.output
+        assert "'model-D' at dimension 5" in result.output
+        assert asyncio.run(_dump_table(target, "thought")) == []
+
+    def test_skip_embeddings_restores_a_mismatched_snapshot_without_error(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "target.db"
+        asyncio.run(_locked_target(target, model_name="model-A", dimension=384))
+
+        vector = struct.pack("4f", 0.1, 0.2, 0.3, 0.4)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-mismatch"))
+            + "\n"
+            + _embedding_line("e-mismatch", "t-mismatch", "model-B", 4, vector)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            cli, ["--db", str(target), "restore", "-i", str(snap), "--skip-embeddings"]
+        )
+
+        assert result.exit_code == 0
+        assert asyncio.run(_dump_table(target, "thought")) != []
+        assert asyncio.run(_dump_table(target, "embedding")) == []
+        assert asyncio.run(_metadata_map(target))["embedding_model_name"] == "model-A"
+
+    def test_re_embed_restores_a_mismatched_snapshot_without_error(
+        self, runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "target.db"
+        asyncio.run(_locked_target(target, model_name="model-A", dimension=384))
+
+        vector = struct.pack("4f", 0.1, 0.2, 0.3, 0.4)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-mismatch"))
+            + "\n"
+            + _embedding_line("e-mismatch", "t-mismatch", "model-B", 4, vector)
+            + "\n",
+            encoding="utf-8",
+        )
+        config_path = tmp_path / "engrava.yaml"
+        config_path.write_text(
+            f"database:\n  path: {target}\nembeddings:\n  provider: ollama\n  model: model-A\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(cli_main, "resolve_embedding_provider", lambda _config: _FakeProvider())
+
+        async def _fake_reembed(_conn: object, thought_ids: list[str], _provider: object) -> int:
+            return len(thought_ids)
+
+        monkeypatch.setattr(cli_main, "_reembed_thoughts", _fake_reembed)
+
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(target),
+                "--config",
+                str(config_path),
+                "restore",
+                "-i",
+                str(snap),
+                "--re-embed",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert asyncio.run(_dump_table(target, "thought")) != []
+        metadata = asyncio.run(_metadata_map(target))
+        assert metadata["embedding_model_name"] == _FakeProvider.model_name
+        assert metadata["embedding_dimension"] == str(_FakeProvider.dimension)
+
+    def test_restore_adopts_the_snapshots_identity_into_a_target_with_neither_lock_nor_vectors(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """A target that starts with no stored model and no embeddings of its
+        own locks to the snapshot's declared identity -- restore inserts
+        `embedding` rows directly, so nothing else would ever lock it. This
+        is the invariant itself: after the restore, the lock agrees with
+        every stored row, not merely 'the command exited zero'.
+        """
+        target = tmp_path / "fresh.db"
+        vector = struct.pack("6f", *([0.1] * 6))
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-adopt"))
+            + "\n"
+            + _embedding_line("e-adopt", "t-adopt", "model-E", 6, vector)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code == 0
+        metadata = asyncio.run(_metadata_map(target))
+        assert metadata["embedding_model_name"] == "model-E"
+        assert metadata["embedding_dimension"] == "6"
+        rows = asyncio.run(_dump_table(target, "embedding"))
+        assert [(row["model_name"], row["dimension"]) for row in rows] == [("model-E", 6)]
+
+    def test_restore_refuses_when_the_targets_own_rows_already_disagree_with_its_lock(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """The check covers rows already in the target, not only incoming
+        ones: a merge restore into a store whose existing row declarations
+        disagree with its own lock must not report success, even when the
+        snapshot carries no embedding rows of its own.
+        """
+        target = tmp_path / "target.db"
+        corrupt_blob = struct.pack("10f", *([0.0] * 10))
+        asyncio.run(
+            _locked_target(
+                target,
+                model_name="model-A",
+                dimension=384,
+                existing_embedding=("model-Z", 10, corrupt_blob),
+            )
+        )
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(_thought_line(_minimal_thought_data("t-new")) + "\n", encoding="utf-8")
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert "'model-A' at dimension 384" in result.output
+        assert "'model-Z' at dimension 10" in result.output
+        thought_ids = {row["thought_id"] for row in asyncio.run(_dump_table(target, "thought"))}
+        assert "t-new" not in thought_ids
+
+    def test_restore_checks_rows_not_the_metadata_header(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """A header that matches the target must not paper over rows that
+        don't: the header is not proof of anything the rows do not already
+        say for themselves, so it must not be consulted at all.
+        """
+        target = tmp_path / "target.db"
+        asyncio.run(_locked_target(target, model_name="model-A", dimension=3))
+
+        vector = struct.pack("4f", 0.1, 0.2, 0.3, 0.4)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            json.dumps(
+                {"_type": "metadata", "schema_version": 20, "embedding_model_name": "model-A"}
+            )
+            + "\n"
+            + _thought_line(_minimal_thought_data("t-header"))
+            + "\n"
+            + _embedding_line("e-header", "t-header", "model-B", 4, vector)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert "'model-A' at dimension 3" in result.output
+        assert "'model-B' at dimension 4" in result.output
+
+    def test_restore_refuses_a_dimension_that_contradicts_its_own_vector_blob(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "target.db"
+        short_blob = struct.pack("4f", 0.1, 0.2, 0.3, 0.4)  # 16 bytes, not 384 floats
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-bad-dim"))
+            + "\n"
+            + _embedding_line("e-bad-dim", "t-bad-dim", "model-F", 384, short_blob)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert "invalid embedding record" in result.output
+        assert asyncio.run(_dump_table(target, "thought")) == []
+
+    def test_restore_refuses_an_empty_owner_type(self, runner: CliRunner, tmp_path: Path) -> None:
+        """Restore now constructs the whole ``EmbeddingRecord``, not only its
+        dimension-vs-blob relationship -- an empty ``owner_type`` passes
+        ``TableSpec.validate`` (a well-typed, non-null string) but must still
+        be rejected by ``EmbeddingRecord``'s own content constraint.
+        """
+        target = tmp_path / "target.db"
+        vector = struct.pack("4f", 0.1, 0.2, 0.3, 0.4)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-empty-owner-type"))
+            + "\n"
+            + _embedding_line_fields(
+                embedding_id="e-empty-owner-type",
+                owner_type="",
+                owner_id="t-empty-owner-type",
+                dimension=4,
+                vector_blob=vector,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert "invalid embedding record" in result.output
+        assert asyncio.run(_dump_table(target, "thought")) == []
+
+    def test_restore_refuses_an_empty_owner_id(self, runner: CliRunner, tmp_path: Path) -> None:
+        """Same widening as the empty-``owner_type`` case, for ``owner_id``:
+        well-typed and non-null, but empty -- rejected only because restore
+        now builds the real ``EmbeddingRecord`` rather than trusting the
+        snapshot's declared columns as-is.
+        """
+        target = tmp_path / "target.db"
+        vector = struct.pack("4f", 0.1, 0.2, 0.3, 0.4)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-empty-owner-id"))
+            + "\n"
+            + _embedding_line_fields(
+                embedding_id="e-empty-owner-id",
+                owner_id="",
+                dimension=4,
+                vector_blob=vector,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert "invalid embedding record" in result.output
+        assert asyncio.run(_dump_table(target, "thought")) == []
+
+    def test_restore_refuses_a_non_iso8601_created_at(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """A ``created_at`` that is a well-typed, non-null string but not an
+        ISO-8601 timestamp passes ``TableSpec.validate`` and must still be
+        rejected by ``EmbeddingRecord``'s own timestamp constraint.
+        """
+        target = tmp_path / "target.db"
+        vector = struct.pack("4f", 0.1, 0.2, 0.3, 0.4)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-bad-created-at"))
+            + "\n"
+            + _embedding_line_fields(
+                embedding_id="e-bad-created-at",
+                owner_id="t-bad-created-at",
+                dimension=4,
+                vector_blob=vector,
+                created_at="not-a-timestamp",
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert "invalid embedding record" in result.output
+        assert asyncio.run(_dump_table(target, "thought")) == []
+
+    def test_restore_refuses_a_zero_dimension(self, runner: CliRunner, tmp_path: Path) -> None:
+        """A ``dimension`` of zero is a well-typed integer -- ``TableSpec``
+        only checks the column's SQL type -- but ``EmbeddingRecord`` requires
+        a positive dimension, and restore must still refuse it rather than
+        insert a vector no query could ever match.
+        """
+        target = tmp_path / "target.db"
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-zero-dim"))
+            + "\n"
+            + _embedding_line_fields(
+                embedding_id="e-zero-dim",
+                owner_id="t-zero-dim",
+                dimension=0,
+                vector_blob=b"",
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert "invalid embedding record" in result.output
+        assert asyncio.run(_dump_table(target, "thought")) == []
+
+    def test_service_mode_restore_also_enforces_the_identity_invariant(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """The defect lived in a helper both restore entry points share; a
+        test exercising only single-database mode does not prove the
+        service-mode entry point reaches the same check.
+        """
+        data_dir = tmp_path / "services"
+        data_dir.mkdir()
+        target_db = data_dir / "target.db"
+        asyncio.run(_locked_target(target_db, model_name="model-A", dimension=384))
+
+        vector = struct.pack("4f", 0.1, 0.2, 0.3, 0.4)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-svc"))
+            + "\n"
+            + _embedding_line("e-svc", "t-svc", "model-B", 4, vector)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(data_dir / "any.db"),
+                "restore",
+                "-i",
+                str(snap),
+                "--service",
+                "target",
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "'model-A' at dimension 384" in result.output
+        assert "'model-B' at dimension 4" in result.output
+
+    def test_restore_with_no_embedding_rows_ignores_a_mismatched_header(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """A snapshot carrying no `embedding` rows restores as it does today,
+        whatever its header says: a missing or mismatched header model does
+        not mean the source never embedded -- it can equally mean the source
+        was an unlocked store.
+        """
+        target = tmp_path / "target.db"
+        asyncio.run(_locked_target(target, model_name="model-A", dimension=384))
+
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            json.dumps(
+                {"_type": "metadata", "schema_version": 20, "embedding_model_name": "model-B"}
+            )
+            + "\n"
+            + _thought_line(_minimal_thought_data("t-no-vectors"))
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code == 0
+        thought_ids = {row["thought_id"] for row in asyncio.run(_dump_table(target, "thought"))}
+        assert "t-no-vectors" in thought_ids
+        assert asyncio.run(_metadata_map(target))["embedding_model_name"] == "model-A"
+
+    def test_restore_into_a_target_with_vectors_but_no_lock_merges_when_consistent(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """A target with vectors and no lock is a different state from a
+        target with a lock and no vectors, and must be handled separately: a
+        consistent merge succeeds, but the target must not have a lock
+        manufactured for it -- only a target that starts with neither a lock
+        nor any vectors gets its incoming identity adopted.
+        """
+        target = tmp_path / "target.db"
+        vector_g1 = struct.pack("5f", *([0.1] * 5))
+        asyncio.run(
+            _unlocked_target_with_vector(
+                target,
+                model_name="model-G",
+                dimension=5,
+                vector_blob=vector_g1,
+                thought_id="t-old",
+            )
+        )
+
+        vector_g2 = struct.pack("5f", *([0.2] * 5))
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-new"))
+            + "\n"
+            + _embedding_line("e-new", "t-new", "model-G", 5, vector_g2)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code == 0
+        assert "embedding_model_name" not in asyncio.run(_metadata_map(target))
+        rows = asyncio.run(_dump_table(target, "embedding"))
+        assert {row["model_name"] for row in rows} == {"model-G"}
+        assert {row["dimension"] for row in rows} == {5}
+
+    def test_restore_into_a_target_with_vectors_but_no_lock_refuses_a_disagreeing_row(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "target.db"
+        vector_g = struct.pack("5f", *([0.1] * 5))
+        asyncio.run(
+            _unlocked_target_with_vector(
+                target,
+                model_name="model-G",
+                dimension=5,
+                vector_blob=vector_g,
+                thought_id="t-old",
+            )
+        )
+
+        vector_h = struct.pack("7f", *([0.2] * 7))
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-new"))
+            + "\n"
+            + _embedding_line("e-new", "t-new", "model-H", 7, vector_h)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert "'model-G' at dimension 5" in result.output
+        assert "'model-H' at dimension 7" in result.output
+        thought_ids = {row["thought_id"] for row in asyncio.run(_dump_table(target, "thought"))}
+        assert "t-new" not in thought_ids
+
+    def test_skip_embeddings_still_refuses_an_already_inconsistent_target(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """``--skip-embeddings`` imports no vectors, so it cannot -- and must
+        not -- change whether the target's own pre-existing rows already
+        disagree with its lock. The flag only ever skips *incoming* vectors;
+        it must not also skip validating what is already there. A snapshot
+        without embedding rows must still be refused when the target it is
+        merged into is already inconsistent.
+        """
+        target = tmp_path / "target.db"
+        corrupt_blob = struct.pack("10f", *([0.0] * 10))
+        asyncio.run(
+            _locked_target(
+                target,
+                model_name="model-A",
+                dimension=384,
+                existing_embedding=("model-Z", 10, corrupt_blob),
+            )
+        )
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(_thought_line(_minimal_thought_data("t-new")) + "\n", encoding="utf-8")
+
+        result = runner.invoke(
+            cli, ["--db", str(target), "restore", "-i", str(snap), "--skip-embeddings"]
+        )
+
+        assert result.exit_code != 0
+        assert "'model-A' at dimension 384" in result.output
+        assert "'model-Z' at dimension 10" in result.output
+        thought_ids = {row["thought_id"] for row in asyncio.run(_dump_table(target, "thought"))}
+        assert "t-new" not in thought_ids
+
+    def test_restore_refuses_a_third_lockless_existing_row_not_only_the_second(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """Two lock-less existing rows that already disagree with each other
+        must fail even when the incoming snapshot carries no embedding rows
+        of its own -- the check walks every existing row, not only the first
+        one it happens to compare.
+        """
+        target = tmp_path / "target.db"
+        vector_1 = struct.pack("5f", *([0.1] * 5))
+        vector_2 = struct.pack("7f", *([0.2] * 7))
+        asyncio.run(
+            _unlocked_target_with_vector(
+                target,
+                model_name="model-I",
+                dimension=5,
+                vector_blob=vector_1,
+                thought_id="t-existing-1",
+            )
+        )
+        asyncio.run(
+            _unlocked_target_with_vector(
+                target,
+                model_name="model-J",
+                dimension=7,
+                vector_blob=vector_2,
+                thought_id="t-existing-2",
+            )
+        )
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(_thought_line(_minimal_thought_data("t-new")) + "\n", encoding="utf-8")
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert "'model-I' at dimension 5" in result.output
+        assert "'model-J' at dimension 7" in result.output
+        thought_ids = {row["thought_id"] for row in asyncio.run(_dump_table(target, "thought"))}
+        assert "t-new" not in thought_ids
+
+    def test_clear_preserves_the_lock_and_rejects_a_mismatched_import(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """``--clear`` wipes ``thought``/``embedding``/``edge``/``action`` but
+        must not erase the target's ``_metadata`` lock: a mismatched import
+        under ``--clear`` must still be refused against that surviving lock,
+        and the whole restore -- including the clear itself -- must roll
+        back so the target is left exactly as it was found.
+        """
+        target = tmp_path / "target.db"
+        asyncio.run(_locked_target(target, model_name="model-A", dimension=384))
+
+        vector = struct.pack("4f", 0.1, 0.2, 0.3, 0.4)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-clear-mismatch"))
+            + "\n"
+            + _embedding_line("e-clear-mismatch", "t-clear-mismatch", "model-B", 4, vector)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap), "--clear"])
+
+        assert result.exit_code != 0
+        assert "'model-A' at dimension 384" in result.output
+        assert "'model-B' at dimension 4" in result.output
+        assert asyncio.run(_metadata_map(target))["embedding_model_name"] == "model-A"
+        assert asyncio.run(_metadata_map(target))["embedding_dimension"] == "384"
+        assert asyncio.run(_dump_table(target, "thought")) == []
+
+    def test_restore_reports_a_corrupt_lock_dimension_as_a_cli_error(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """A stored ``embedding_dimension`` that is not a valid integer fails
+        closed -- restore must not commit anything -- but it must do so with
+        an actionable CLI error, the same treatment as a genuine identity
+        mismatch, rather than letting a bare ``ValueError`` propagate.
+        """
+        target = tmp_path / "target.db"
+
+        async def _corrupt_dimension() -> None:
+            from engrava import SqliteEngravaCore
+
+            conn = await aiosqlite.connect(str(target))
+            try:
+                store = SqliteEngravaCore(conn)
+                await store.ensure_schema()
+                await conn.execute(
+                    "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
+                    ("embedding_model_name", "model-A"),
+                )
+                await conn.execute(
+                    "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
+                    ("embedding_dimension", "not-a-number"),
+                )
+                await conn.commit()
+            finally:
+                await conn.close()
+
+        asyncio.run(_corrupt_dimension())
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(_thought_line(_minimal_thought_data("t-new")) + "\n", encoding="utf-8")
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert not isinstance(result.exception, ValueError)
+        assert "embedding_dimension" in result.output
+        assert "not-a-number" in result.output
+        assert asyncio.run(_dump_table(target, "thought")) == []
+
+    def test_clear_identity_without_clear_is_rejected(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """``--clear-identity`` alone is refused -- it only makes sense
+        alongside ``--clear``, which is what actually empties the core
+        tables before the identity is dropped as well.
+        """
+        target = tmp_path / "target.db"
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(_thought_line(_minimal_thought_data("t-1")) + "\n", encoding="utf-8")
+
+        result = runner.invoke(
+            cli, ["--db", str(target), "restore", "-i", str(snap), "--clear-identity"]
+        )
+
+        assert result.exit_code != 0
+        assert "--clear-identity requires --clear" in result.output
+
+    def test_clear_with_clear_identity_recovers_a_corrupt_lock_dimension(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """Following the corrupt-identity error message's own recommended
+        recovery command must actually resolve the corrupt state: plain
+        ``--clear`` alone preserves ``_metadata`` (see
+        ``test_clear_preserves_the_lock_and_rejects_a_mismatched_import``
+        above), so it cannot fix a corrupt ``embedding_dimension`` on its
+        own -- only ``--clear --clear-identity`` does.
+        """
+        target = tmp_path / "target.db"
+
+        async def _corrupt_dimension() -> None:
+            from engrava import SqliteEngravaCore
+
+            conn = await aiosqlite.connect(str(target))
+            try:
+                store = SqliteEngravaCore(conn)
+                await store.ensure_schema()
+                await conn.execute(
+                    "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
+                    ("embedding_model_name", "model-A"),
+                )
+                await conn.execute(
+                    "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
+                    ("embedding_dimension", "not-a-number"),
+                )
+                await conn.commit()
+            finally:
+                await conn.close()
+
+        asyncio.run(_corrupt_dimension())
+
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(_thought_line(_minimal_thought_data("t-new")) + "\n", encoding="utf-8")
+
+        # Plain --clear alone does not resolve it.
+        plain_clear = runner.invoke(
+            cli, ["--db", str(target), "restore", "-i", str(snap), "--clear"]
+        )
+        assert plain_clear.exit_code != 0
+        assert "not-a-number" in plain_clear.output
+
+        # The recovery command the error message recommends.
+        result = runner.invoke(
+            cli,
+            ["--db", str(target), "restore", "-i", str(snap), "--clear", "--clear-identity"],
+        )
+
+        assert result.exit_code == 0
+        assert asyncio.run(_dump_table(target, "thought"))
+        metadata = asyncio.run(_metadata_map(target))
+        assert "embedding_dimension" not in metadata
+
+
+# ---------------------------------------------------------------------------
+# Centroid rows are corpus-identity bookkeeping, never a provider to lock to.
+# ---------------------------------------------------------------------------
+
+
+async def _healthy_reflection_store(
+    db_path: Path,
+    *,
+    provider_model: str,
+    dimension: int,
+) -> None:
+    """Build a database with real provider embeddings and a real centroid row.
+
+    Mirrors ``extensions/dreaming.py``'s own write path: two ordinary
+    thoughts embedded under a configured provider's ``(model_name,
+    dimension)`` via ``store_embedding()``, and a REFLECTION thought embedded
+    under the ``CENTROID_MODEL_NAME`` sentinel via the exact same
+    ``store_embedding()`` call dreaming.py itself makes
+    (``extensions/dreaming.py:1500-1505``). This is the shape of a healthy
+    store that genuinely uses reflections -- restore must not treat the
+    sentinel as a disagreeing provider identity.
+
+    Args:
+        db_path: Path to create the database at.
+        provider_model: The provider model name the two source thoughts are
+            embedded under.
+        dimension: Shared vector dimension for every embedding written here.
+
+    """
+    from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+    from engrava.domain.dreaming import CENTROID_MODEL_NAME
+
+    conn = await aiosqlite.connect(str(db_path))
+    conn.row_factory = aiosqlite.Row
+    try:
+        store = SqliteEngravaCore(conn)
+        await store.ensure_schema()
+        for i in range(2):
+            tid = f"t-src-{i}"
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id=tid,
+                    essence=f"essence {tid}",
+                    content=f"content {tid}",
+                    thought_type=ThoughtType.OBSERVATION,
+                    source="test",
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    priority=Priority.P2,
+                    created_cycle=1,
+                    updated_cycle=1,
+                )
+            )
+            vector = [0.0] * dimension
+            vector[i % dimension] = 1.0
+            await store.store_embedding(tid, vector, model_name=provider_model)
+
+        reflection_id = "t-reflection"
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id=reflection_id,
+                essence="reflection essence",
+                content="reflection content",
+                thought_type=ThoughtType.REFLECTION,
+                source="dreaming:test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=1,
+                updated_cycle=1,
+            )
+        )
+        centroid_vector = [0.5] * dimension
+        await store.store_embedding(reflection_id, centroid_vector, model_name=CENTROID_MODEL_NAME)
+    finally:
+        await conn.close()
+
+
+class TestRestoreExemptsCentroidRowsFromTheIdentityInvariant:
+    """A centroid row must never gate provider identity.
+
+    ``_ensure_embedding_model_lock`` exempts ``CENTROID_MODEL_NAME`` at write
+    time; restore applies the same exemption, so a healthy store containing
+    both provider vectors and reflection centroids restores into a fresh
+    target, and a merge into an already-healthy centroid-bearing target is
+    accepted -- even with ``--skip-embeddings``.
+    """
+
+    def test_restoring_a_healthy_reflection_snapshot_into_a_fresh_target_succeeds(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """A snapshot with both provider and centroid rows must restore clean.
+
+        The centroid row's ``(CENTROID_MODEL_NAME, dimension)`` identity is
+        not compared against the provider identity, so it is not rejected as a
+        mismatch.
+        """
+        source = tmp_path / "source.db"
+        asyncio.run(_healthy_reflection_store(source, provider_model="model-P", dimension=3))
+
+        snap = tmp_path / "snap.jsonl"
+        snap_result = runner.invoke(cli, ["--db", str(source), "snapshot", "-o", str(snap)])
+        assert snap_result.exit_code == 0, snap_result.output
+
+        fresh_target = tmp_path / "fresh.db"
+        result = runner.invoke(cli, ["--db", str(fresh_target), "restore", "-i", str(snap)])
+
+        assert result.exit_code == 0, result.output
+
+        source_thoughts = asyncio.run(_dump_table(source, "thought"))
+        target_thoughts = asyncio.run(_dump_table(fresh_target, "thought"))
+        assert target_thoughts == source_thoughts
+
+        source_embeddings = asyncio.run(_dump_table(source, "embedding"))
+        target_embeddings = asyncio.run(_dump_table(fresh_target, "embedding"))
+        assert {row["embedding_id"] for row in target_embeddings} == {
+            row["embedding_id"] for row in source_embeddings
+        }
+        model_names = {row["model_name"] for row in target_embeddings}
+        assert model_names == {"model-P", "dreaming-centroid"}
+
+        source_edges = asyncio.run(_dump_table(source, "edge"))
+        target_edges = asyncio.run(_dump_table(fresh_target, "edge"))
+        assert target_edges == source_edges
+
+        # The lock adopts the real provider identity, never the sentinel.
+        metadata = asyncio.run(_metadata_map(fresh_target))
+        assert metadata["embedding_model_name"] == "model-P"
+        assert metadata["embedding_dimension"] == "3"
+
+    def test_merging_into_an_already_healthy_centroid_bearing_target_succeeds(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """The pre-loop existing-rows scan must not refuse a healthy target.
+
+        ``_initial_embedding_state`` runs whether or not ``--skip-embeddings``
+        is set. This restore carries no embedding rows of its own
+        (``--skip-embeddings``), so the only rows the scan sees are the
+        *target*'s own provider and centroid rows, which legitimately differ
+        in model name and must not be treated as a conflict.
+        """
+        target = tmp_path / "target.db"
+        asyncio.run(_healthy_reflection_store(target, provider_model="model-P", dimension=3))
+
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-unrelated")) + "\n", encoding="utf-8"
+        )
+
+        result = runner.invoke(
+            cli, ["--db", str(target), "restore", "-i", str(snap), "--skip-embeddings"]
+        )
+
+        assert result.exit_code == 0, result.output
+        thought_ids = {row["thought_id"] for row in asyncio.run(_dump_table(target, "thought"))}
+        assert "t-unrelated" in thought_ids
+        assert "t-reflection" in thought_ids
+
+    def test_a_genuine_provider_mismatch_is_still_rejected_alongside_a_centroid_row(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """The centroid exemption must not loosen a real identity mismatch.
+
+        The incoming snapshot carries a legitimate centroid row (exempt) and
+        a provider row that genuinely disagrees with the target's lock (not
+        exempt) -- only the latter must be refused.
+
+        The centroid row comes **first**: an implementation that resets the
+        running identity reference whenever it sees a centroid (instead of
+        leaving it untouched) would clear the target's lock right here, and the
+        mismatched provider row after it would then silently become the new
+        reference instead of being refused. Putting the mismatch first would
+        never exercise that path, because the mismatch would already have
+        been rejected before the centroid row was ever read.
+        """
+        target = tmp_path / "target.db"
+        asyncio.run(_locked_target(target, model_name="model-A", dimension=3))
+        before_thoughts = asyncio.run(_dump_table(target, "thought"))
+        before_embeddings = asyncio.run(_dump_table(target, "embedding"))
+
+        from engrava.domain.dreaming import CENTROID_MODEL_NAME
+
+        centroid_vector = struct.pack("3f", 0.4, 0.4, 0.4)
+        mismatched_vector = struct.pack("3f", 0.1, 0.2, 0.3)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-reflection"))
+            + "\n"
+            + _embedding_line("e-centroid", "t-reflection", CENTROID_MODEL_NAME, 3, centroid_vector)
+            + "\n"
+            + _thought_line(_minimal_thought_data("t-mismatch"))
+            + "\n"
+            + _embedding_line("e-mismatch", "t-mismatch", "model-B", 3, mismatched_vector)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert "'model-A' at dimension 3" in result.output
+        assert "'model-B' at dimension 3" in result.output
+        # Rejected before any write lands: the target's own pre-existing
+        # rows -- there are none here -- are exactly as they were.
+        assert asyncio.run(_dump_table(target, "thought")) == before_thoughts
+        assert asyncio.run(_dump_table(target, "embedding")) == before_embeddings
+
+
+class TestRestoreEnforcesOneVectorWidthAcrossCentroidAndProviderRows:
+    """A centroid row is exempt from the model-name identity check, never
+    from the vector-width check: every embedding row a restore accepts,
+    centroid or provider, must share one width, or the next open with
+    sqlite-vec fails trying to index the odd one out.
+    """
+
+    def test_merge_into_a_locked_target_refuses_a_centroid_of_another_width(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "target.db"
+        asyncio.run(_locked_target(target, model_name="model-A", dimension=3))
+        before_thoughts = asyncio.run(_dump_table(target, "thought"))
+        before_embeddings = asyncio.run(_dump_table(target, "embedding"))
+
+        from engrava.domain.dreaming import CENTROID_MODEL_NAME
+
+        centroid_vector = struct.pack("4f", 0.1, 0.2, 0.3, 0.4)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-reflection"))
+            + "\n"
+            + _embedding_line("e-centroid", "t-reflection", CENTROID_MODEL_NAME, 4, centroid_vector)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert "'model-A' at dimension 3" in result.output
+        assert f"{CENTROID_MODEL_NAME!r} at dimension 4" in result.output
+        assert asyncio.run(_dump_table(target, "thought")) == before_thoughts
+        assert asyncio.run(_dump_table(target, "embedding")) == before_embeddings
+
+    def test_merge_into_an_unlocked_centroid_only_target_refuses_a_provider_of_another_width(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """An unlocked target whose only embedding row is a centroid still
+        carries a corpus-wide width -- a provider row of another width must
+        be refused, or the merge leaves mixed widths in one corpus.
+        """
+        from engrava.domain.dreaming import CENTROID_MODEL_NAME
+
+        target = tmp_path / "target.db"
+        centroid_vector = struct.pack("3f", 0.5, 0.5, 0.5)
+        asyncio.run(
+            _unlocked_target_with_vector(
+                target,
+                model_name=CENTROID_MODEL_NAME,
+                dimension=3,
+                vector_blob=centroid_vector,
+                thought_id="t-reflection",
+            )
+        )
+        before_thoughts = asyncio.run(_dump_table(target, "thought"))
+        before_embeddings = asyncio.run(_dump_table(target, "embedding"))
+        assert before_thoughts  # setup sanity: the pre-existing row is really there
+
+        provider_vector = struct.pack("4f", 0.1, 0.2, 0.3, 0.4)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-new"))
+            + "\n"
+            + _embedding_line("e-new", "t-new", "model-P", 4, provider_vector)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert f"{CENTROID_MODEL_NAME!r} at dimension 3" in result.output
+        assert "'model-P' at dimension 4" in result.output
+        # The target's pre-existing thought row -- not only the absence of
+        # the incoming one -- must survive the refusal unchanged.
+        assert asyncio.run(_dump_table(target, "thought")) == before_thoughts
+        assert asyncio.run(_dump_table(target, "embedding")) == before_embeddings
+
+    def test_merge_into_an_unlocked_centroid_only_target_adopts_a_same_width_provider(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """A centroid never blocks adoption, only a real provider row does.
+
+        The target starts unlocked with only a centroid row -- the same
+        state the previous test refuses a wrong-width provider row into. A
+        *same*-width provider row must merge cleanly, and because the
+        target began this restore with no non-centroid row of its own
+        either, it must end up locked to that provider's identity: the
+        centroid is bookkeeping, not a reason to leave the target unlocked
+        for a later, unrelated ``store_embedding()`` call to lock however it
+        likes.
+        """
+        from engrava.domain.dreaming import CENTROID_MODEL_NAME
+
+        target = tmp_path / "target.db"
+        centroid_vector = struct.pack("3f", 0.5, 0.5, 0.5)
+        asyncio.run(
+            _unlocked_target_with_vector(
+                target,
+                model_name=CENTROID_MODEL_NAME,
+                dimension=3,
+                vector_blob=centroid_vector,
+                thought_id="t-reflection",
+            )
+        )
+        assert "embedding_model_name" not in asyncio.run(_metadata_map(target))
+
+        provider_vector = struct.pack("3f", 0.1, 0.2, 0.3)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-new"))
+            + "\n"
+            + _embedding_line("e-new", "t-new", "model-P", 3, provider_vector)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code == 0, result.output
+        thought_ids = {row["thought_id"] for row in asyncio.run(_dump_table(target, "thought"))}
+        assert {"t-reflection", "t-new"} <= thought_ids
+        metadata = asyncio.run(_metadata_map(target))
+        assert metadata["embedding_model_name"] == "model-P"
+        assert metadata["embedding_dimension"] == "3"
+
+    def test_fresh_target_refuses_a_provider_row_then_a_centroid_of_another_width(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        from engrava.domain.dreaming import CENTROID_MODEL_NAME
+
+        target = tmp_path / "fresh.db"
+        provider_vector = struct.pack("3f", 0.1, 0.2, 0.3)
+        centroid_vector = struct.pack("4f", 0.4, 0.4, 0.4, 0.4)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-src"))
+            + "\n"
+            + _embedding_line("e-src", "t-src", "model-P", 3, provider_vector)
+            + "\n"
+            + _thought_line(_minimal_thought_data("t-reflection"))
+            + "\n"
+            + _embedding_line("e-centroid", "t-reflection", CENTROID_MODEL_NAME, 4, centroid_vector)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert "'model-P' at dimension 3" in result.output
+        assert f"{CENTROID_MODEL_NAME!r} at dimension 4" in result.output
+        assert asyncio.run(_dump_table(target, "thought")) == []
+        assert asyncio.run(_dump_table(target, "embedding")) == []
+
+    def test_fresh_target_refuses_a_centroid_then_a_provider_row_of_another_width(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        from engrava.domain.dreaming import CENTROID_MODEL_NAME
+
+        target = tmp_path / "fresh.db"
+        centroid_vector = struct.pack("4f", 0.4, 0.4, 0.4, 0.4)
+        provider_vector = struct.pack("3f", 0.1, 0.2, 0.3)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-reflection"))
+            + "\n"
+            + _embedding_line("e-centroid", "t-reflection", CENTROID_MODEL_NAME, 4, centroid_vector)
+            + "\n"
+            + _thought_line(_minimal_thought_data("t-src"))
+            + "\n"
+            + _embedding_line("e-src", "t-src", "model-P", 3, provider_vector)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert f"{CENTROID_MODEL_NAME!r} at dimension 4" in result.output
+        assert "'model-P' at dimension 3" in result.output
+        assert asyncio.run(_dump_table(target, "thought")) == []
+        assert asyncio.run(_dump_table(target, "embedding")) == []
+
+    def test_fresh_target_refuses_two_centroids_of_different_widths(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        from engrava.domain.dreaming import CENTROID_MODEL_NAME
+
+        target = tmp_path / "fresh.db"
+        centroid_3 = struct.pack("3f", 0.1, 0.1, 0.1)
+        centroid_4 = struct.pack("4f", 0.2, 0.2, 0.2, 0.2)
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_line(_minimal_thought_data("t-reflection-1"))
+            + "\n"
+            + _embedding_line("e-centroid-1", "t-reflection-1", CENTROID_MODEL_NAME, 3, centroid_3)
+            + "\n"
+            + _thought_line(_minimal_thought_data("t-reflection-2"))
+            + "\n"
+            + _embedding_line("e-centroid-2", "t-reflection-2", CENTROID_MODEL_NAME, 4, centroid_4)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(cli, ["--db", str(target), "restore", "-i", str(snap)])
+
+        assert result.exit_code != 0
+        assert f"{CENTROID_MODEL_NAME!r} at dimension 3" in result.output
+        assert f"{CENTROID_MODEL_NAME!r} at dimension 4" in result.output
+        assert asyncio.run(_dump_table(target, "thought")) == []
         assert asyncio.run(_dump_table(target, "embedding")) == []

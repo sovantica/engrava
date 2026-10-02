@@ -25,10 +25,13 @@ for soft, in-file partitioning.
 
 ## Dreaming / consolidation: mechanism, not a proven retrieval lift
 
-The built-in `DreamingExtension` performs no-LLM consolidation (promotion →
-priority boost, association edges, reflections). With a fixed store,
-configuration, cycle, embedding inputs, and deterministic custom signals, its
-result is reproducible. Those are real
+The built-in `DreamingExtension`'s default signals make no LLM calls, and
+reflection content is built by a deterministic structural function; a custom
+signal registered via `custom_signals` runs whatever code it contains,
+including a call to an LLM. Consolidation is: scoring, and, conditional on
+gates, thresholds, and caps, promotion to priority boost, association edges,
+and reflections. With a fixed store, configuration, cycle, embedding inputs,
+and deterministic custom signals, its result is reproducible. Those are real
 **mechanical** ranking effects, but Engrava makes **no claim that enabling
 dreaming improves retrieval accuracy. The v0.5/v0.6-candidate frozen synthetic
 snapshot measured aggregate recall@5 at `0.80` with Dreaming off and `0.70` with
@@ -69,14 +72,19 @@ The bi-temporal `valid_from` / `valid_until` bounds on a `ThoughtRecord` or
   interval is refused; and `invalidate_thought()` / `invalidate_edge()` reject a
   `valid_until` earlier than the record's stored `valid_from`.
 - **On read** — the invariant lives in the domain model, and the store
-  reconstructs that model whenever it loads a row (`get_thought()`,
-  `get_edges()`, and every ranked/query read). A row that became inverted **out
-  of band** — for example one written by an older engrava build before this
-  validation existed, or edited directly in the database file — therefore raises
-  a `ValidationError` when it is read back, rather than silently returning a
-  corrupt interval. This is a deliberate fail-loud choice for a data-integrity
-  fault. If you are upgrading a database that may contain such rows, repair them
-  (set the offending bound to `NULL`, or correct the order) before reading.
+  reconstructs that model whenever it loads a full record (`get_thought()`,
+  `list_thoughts()`, `get_edges()` and `list_edges()`). A row that became
+  inverted **out of band** — for example one written by an older engrava build
+  before this validation existed, or edited directly in the database file —
+  therefore raises a `ValidationError` when it is loaded through one of those
+  calls, rather than silently returning a corrupt interval. This is a
+  deliberate fail-loud choice for a data-integrity fault. Ranked search is the
+  exception: `search_fts()`, `search_similar()`, `search_hybrid()` and
+  `recall()` return ids and scores without rebuilding the model, so an inverted
+  row can still appear in their results, and the `ValidationError` surfaces
+  only when you load that record (for example with `get_thought()`). If you are
+  upgrading a database that may contain such rows, repair them (set the
+  offending bound to `NULL`, or correct the order) before reading.
 
 Bounds are compared as UTC-normalised instants, so differing offsets are
 reconciled before the check. Two cases are **not** inversions and remain
@@ -115,8 +123,14 @@ SQLite on a dedicated background thread and proxies calls via `asyncio`.
 This has implications:
 
 - **Connection objects** should not be shared across event loops.
-- **Long-running transactions** block the background thread — keep transactions
-  short.
+- **Long-running SQL statements** block the background thread: it runs one call
+  at a time, so a slow statement delays every other call on that connection. An
+  open transaction alone does not — while a `suspend_auto_commit()` window sits
+  idle, other tasks' reads still run. What the window does hold is the store's
+  write lock, so a different task's write waits for it, for at most
+  `write_lock_acquire_timeout_seconds`, and raises `WriteLockTimeoutError`
+  after that — a long hold can make the waiting write fail instead of complete
+  (see [Concurrency](concurrency.md)). Keep transactions short.
 - **WAL mode** is used by default for concurrent read access. Writes are
   serialized by SQLite's single-writer lock.
 
@@ -126,19 +140,24 @@ The [sqlite-vec](https://github.com/asg017/sqlite-vec) extension is pre-v1.
 engrava pins `>=0.1.0,<0.2.0` to avoid breaking changes. When sqlite-vec
 reaches 1.0, the pin will be relaxed.
 
-Without the `vec` extra, engrava falls back to brute-force cosine similarity
-search in Python. This works well for databases up to ~100k embeddings. For
-larger collections, run `pip install 'engrava[vec]'` to use the compact compiled `vec0`
-backend, but note that the pinned sqlite-vec 0.1.x line still performs an
-**exhaustive linear KNN scan**. It reduces the constant factor and memory
-overhead; it is not an approximate or sub-linear index. Measure your own p95
-latency and see [Performance](performance.md#the-brute-force-ceiling-and-how-to-pass-it).
+Without the `vec` extra, engrava falls back to a brute-force cosine scan done
+with NumPy: cost grows with the eligible embedding population. Run
+`pip install 'engrava[vec]'` to use the compact compiled `vec0` backend
+instead, but note that the pinned sqlite-vec 0.1.x line still performs an
+**exhaustive linear KNN scan** over a tightly packed columnar store — it is
+not an approximate or sub-linear index. Relative latency and memory use
+between the two backends depend on your data and hardware; measure your own
+p95 latency and see
+[Performance](performance.md#the-brute-force-ceiling-and-how-to-pass-it).
 
 ## FTS5 Availability
 
 FTS5 is included in the standard SQLite build since version 3.9.0 (2015).
-Most Python distributions include it. If FTS5 is not available, `search_fts()`
-raises an error at schema creation time.
+Most Python distributions include it. If FTS5 is not available, creating the
+schema fails: `ensure_schema()` (and so opening a new store) raises a
+`sqlite3.DatabaseError` and the store does not open. Separately, on a store that
+is already open, `search_fts()` returns an empty list rather than raising when
+the `thought_fts` table does not exist.
 
 To verify FTS5 support:
 
@@ -156,22 +175,32 @@ SQLite supports one writer at a time. With WAL mode, readers do not block
 writers and vice versa. `aiosqlite` marshals every call onto one background
 thread, so concurrent tasks' **statements** do not run at the same time.
 
-That is statement-level serialisation, and it is not the same as operation-level
+That is statement-level serialisation, and it is not by itself operation-level
 safety. Engrava's update methods (`update_thought`, `restore_thought`,
 `upsert_by_hash`, `update_edge`, `update_action`) read the row, apply the change
-in memory, then write — and another writer's whole update can land in that
-window. Two writers editing the **same field** of the same row therefore lose one
-of the two writes, silently and without an error. Editing different fields is
-safe — an update writes only the columns it owns — **except** when one of the two
-writers stamps a new `updated_cycle`: every thought update carries a version
-guard on that column, so the other update then matches no row and is rejected in
-full with `StaleDataError`, sharing no field with it or not.
+in memory, then write. Two genuinely concurrent tasks **sharing one store
+instance** are serialised end to end by an in-process write lock, so one
+task's own read-modify-write cannot be corrupted by another's landing mid-way
+— see [Concurrency](concurrency.md#many-async-tasks-one-store). What survives
+as a real gap is a competing write from **outside** that lock: a same-task
+nested call reached through a caller-owned hook, or a write from a *second
+store on the same database file* (a second connection, or a second process).
+Every core row now carries a `revision` column that every guarded update
+checks and increments atomically, so a competing write landing in either of
+those gaps makes the guard match no row and raises `StaleDataError` — nothing
+of the rejected update is written — rather than silently overwriting. Two
+writers editing the same field, serialised through that guard, still resolve
+last-write-wins, which is the correct outcome for two genuine edits; what the
+guard removes is a write being torn or lost without any signal at all. See
+[Optimistic concurrency](concurrency.md#optimistic-concurrency-and-staledataerror)
+for the full contract.
 
 **Only one store may write a given database file.** The locks that order
 engrava's own operations live on the store instance, so a second store — in
 another process, or a second connection in this one — is outside all of them.
-WAL and `busy_timeout` keep the *file* intact under that topology; they do not
-make the *operations* correct.
+WAL and `busy_timeout` keep the *file* intact under that topology, and the
+`revision` guard above keeps a lost-update race from landing silently; neither
+makes multiple concurrent writers on one file a supported topology.
 
 The full contract, the guarantees that do hold, and the idioms that close the
 gap are in [Concurrency](concurrency.md). For multi-service setups via
@@ -180,23 +209,42 @@ locking — that is the supported way to run independent writers.
 
 Separately: if the store ever quarantines its connection
 (an internal safety response to an indeterminate transaction), quarantine
-revokes admission synchronously: every new operation on the store or its journal
-then fails fast with `ConnectionQuarantinedError`, so no write can flush an
-orphaned transaction. It does not retract an operation already in flight — a
-reader admitted just before quarantine may complete a possibly-stale read on the
-pre-quarantine connection (never a commit). During quarantine the physical
-connection close is a detached, best-effort cleanup; a permanently-hung close is
-only a pending-task lifecycle nicety, not a safety concern.
+revokes admission synchronously: any new operation that touches the database or
+its journal then fails fast with `ConnectionQuarantinedError`, so no write can
+flush an orphaned transaction. A call that never reaches the database can still
+return, for example a search with an empty query text or a degenerate query
+vector, which returns `[]`. Quarantine does not retract an operation already in
+flight — a reader admitted just before quarantine may complete a possibly-stale
+read on the pre-quarantine connection (never a commit). During quarantine the
+physical connection close is a detached, best-effort cleanup; a permanently-hung
+close is only a pending-task lifecycle nicety, not a safety concern.
 
 ## Embedding Dimension Consistency
 
 All embeddings for a given database must use the same dimensionality. Mixing
-dimensions (e.g., 384 and 768) is not supported and will cause search to
-return incorrect results.
+dimensions (e.g., 384 and 768) is not supported. What happens depends on the
+vector backend:
 
-Engrava validates the stored model identity and raises
-`EmbeddingModelMismatchError` rather than mixing incompatible vectors. A
-deliberate CLI re-embed is available while restoring a snapshot into a
+- With the sqlite-vec backend, storing a vector whose length differs from the
+  backend's dimension raises `sqlite3.OperationalError`.
+- With the NumPy backend, once a store holds vectors of two lengths, a search
+  raises: `VectorDimensionMismatchError` for a query whose length differs from
+  the first stored vector's, and a `ValueError` from NumPy for a query of that
+  length.
+
+Engrava also checks the stored model identity (name, dimension and document
+prefix); a mismatch it finds is reported as `EmbeddingModelMismatchError`. The
+model check runs on every embedding write and on every `verify_embedding_model()`
+call on a store that has a provider — not only the first — so it does not stop
+comparing after the first write.
+
+A first `store_embedding()` call whose own write fails — a vector whose length
+disagrees with the sqlite-vec backend's configured width, or a `thought_id`
+naming no `thought` row — locks nothing: the model identity commits only
+together with that first write actually landing, so a corrected retry on the
+same store is not refused by an identity a failed call left behind.
+
+A deliberate CLI re-embed is available while restoring a snapshot into a
 configured direct database or service. Pass `--config`: direct mode uses the
 top-level `embeddings` provider, while service mode prefers its per-service
 override and otherwise uses the top-level provider. Without a configured
@@ -244,85 +292,49 @@ a forgotten (archived) thought stops surfacing without being deleted.
 
 ## Deletion on a database that has not been migrated
 
-Foreign-key `ON DELETE CASCADE` on the child tables (`edge`, `embedding`,
-`action`) arrives with the **core-12** schema migration. A database carried
-forward from an older engrava and never migrated is still below that version, so
-nothing cascades. On such a database a deleted thought's **identifier** becomes
-reachable again through the `vec0` vector arm — not immediately. The delete does
-purge that thought's own vector from the index; what it cannot remove is the
-`embedding` row behind it, and the reconcile that runs on the next
-sqlite-vec-enabled open puts the vector back from that row. Everything below
-describes the state **after** that reconcile.
+A database below the core-12 schema (the migration that adds
+`ON DELETE CASCADE` to `edge`, `embedding`, and `action`) has no cascade to
+remove a deleted thought's child rows. What the code does about that:
 
-**Three conditions must all hold.**
+- **Child rows are deleted explicitly.** `delete_thought`, the TTL `delete`
+  strategy, and hygiene GC each issue their own deletes for a thought's
+  `edge`, `embedding`, and `action` rows, in the same savepoint as the
+  parent delete, which runs first, instead of relying on the cascade.
+- **Reconciliation only backfills for an owner that matches a thought.**
+  `sync_embeddings` (the pass that runs when a sqlite-vec backend opens)
+  backfills a vector only for an `embedding` row whose owner id matches a
+  row in `thought`.
+- **The purge is the same join.** The sweep that removes orphaned
+  `embedding_vec` rows (on reconcile, and in `engrava gc`) treats a vector
+  as orphaned when its `embedding` row is gone or its owner id matches no
+  row in `thought`.
+- **Search resolves through a join that requires the thought row.** Both the
+  `vec0` rowid-to-id resolution and the post-search eligibility check
+  confirm that a `thought` row with that id exists (and is otherwise
+  eligible) rather than only checking that it isn't *excluded*; an id that
+  matches no `thought` row is dropped, not passed through by default.
 
-1. The database is **below core-12**. A freshly created store is not affected: a
-   new database is bootstrapped at the head schema version, cascades included.
-2. **A sqlite-vec backend is actually active on the store** — `vector_backend:
-   sqlite-vec` *and* the extension loaded. If the load fails the store logs a
-   warning and falls back to NumPy, which closes the gap; so does the default
-   `vector_backend: numpy`. Either way the NumPy candidate query joins
-   `thought`, and a row that is gone cannot be scored.
-3. **The query reaches the `vec0` arm**, which it does whenever no *effective*
-   metadata predicate applies. `search_similar()` takes no filter argument, so
-   it is always on that arm. For `search_hybrid()` / `recall()`, `filters` and
-   `visibility` are compiled together into one predicate, and a query carrying
-   one is routed to the NumPy path even under sqlite-vec (the `vec0` table
-   declares no metadata columns, so the predicate could only run as a
-   post-`MATCH` join). What matters is whether that compilation produces
-   anything:
-   - `filters=None`, **an empty `MetadataFilter`**, and `visibility=None`
-     compile to nothing. The query stays on the `vec0` arm and **is** affected —
-     passing an empty filter is not protection.
-   - a `MetadataFilter` holding at least one predicate, or **any**
-     `VisibilityQueryFilter` at all, compiles to a predicate. That query takes
-     the NumPy path, which joins `thought` and excludes the orphan on any schema
-     version.
-
-**What deletion does regardless of schema version.** The `thought` row is
-removed and its `content` with it. Resolving the identifier — `get_thought()`,
-or any read that hydrates an id into a record — returns `None`. The content does
-not come back.
-
-**What survives below core-12.** Nothing removes the thought's `embedding` row,
-so it stays. Two lookups then read ownership as that row rather than as the
-thought behind it:
-
-- `sync_embeddings`, the reconcile that runs when a sqlite-vec-enabled
-  connection opens, picks backfill candidates from the `embedding` table alone.
-  The leftover row qualifies, so its vector is re-inserted into `embedding_vec`
-  — including the vector that `delete_thought` had explicitly removed moments
-  earlier.
-- Vector search maps `embedding_vec` rowids back to ids through that same
-  `embedding` table, and the post-search eligibility filter is an *exclusion*
-  query over `thought`: a thought row that no longer exists produces no
-  exclusion, so the id passes through.
-
-So on such a database, after a delete that reported success **and after that
-reconcile has run** — the delete itself leaves the index clean:
-
-- the `vec0` arm returns the **deleted identifier** with a similarity score.
-  From `search_similar()` that arm's output *is* the result; in
-  `search_hybrid()` / `recall()` it is one input to fusion;
-- a caller therefore learns that **a thought matching this query exists** in the
-  index. Where the deletion answered an erasure request rather than being
-  routine housekeeping, that existence signal is the disclosure that matters;
-- **if the phantom reaches the returned window** it consumes one of the `top_k`
-  slots. It need not: on a hybrid query, fusion and the final truncation to
-  `top_k` can leave it outside the window altogether. And when it does land
-  there, it costs you a live result only if at least one further live candidate
-  would otherwise have qualified — the window is a truncation of whatever
-  ranked, not a fixed-size budget the phantom takes a share of.
-
-**What to do: migrate.** Run `engrava migrate` (or open the store through
-`from_config()`, which calls `ensure_schema()`). The core-12 step recreates the
-three child tables with `ON DELETE CASCADE` and purges any orphan rows that had
-already accumulated. After it, deleting a thought takes its `embedding` row with
-it and the reconcile has nothing left to backfill.
+**Historical residue.** On a pre-core-12 schema an older engrava build left
+a deleted thought's `embedding` row behind, since nothing removed it.
+`engrava migrate` runs the core-12 step, which recreates the three child
+tables with `ON DELETE CASCADE` and purges the orphan rows that had already
+accumulated.
 
 ```bash
 engrava --db engrava.db migrate
 ```
+
+**`engrava gc` refuses instead of running on a database below head.**
+Physically deleting rows through an engine that does not understand the
+schema it is deleting from is how this defect reached a user in the first
+place, so `gc` — and every other built-in command that deletes user data —
+now exits non-zero and names `engrava migrate` rather than proceeding on an
+unmigrated database. A read-only command (the list is under
+[Schema-version checks](cli.md#schema-version-checks), which also names the one
+exception, `recall` under `--config`) is still allowed to run against a behind
+schema — refusing an ordinary read because a
+migration is pending would trade this defect for a worse one — but it warns
+on stderr that the schema is behind rather than staying silent about it.
 
 ## Maximum Database Size
 

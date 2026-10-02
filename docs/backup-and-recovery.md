@@ -9,12 +9,15 @@ data** — both are explained below.
 
 | Method | What it captures | Portable across versions? |
 |---|---|---|
-| **Logical snapshot** (`engrava snapshot`) | Thoughts, edges, embeddings, and actions as JSONL records | Yes — it's data, not file format |
+| **Logical snapshot** (`engrava snapshot`) | Thoughts, edges, embeddings, and actions as JSONL records | Data, not file format — but restore validates every record against a fixed column set per table, so it is portable only to a build whose recognized tables accept the same columns |
 | **Physical file backup** | The exact database file(s) — *everything*, including the audit journal | Tied to the SQLite file format (very stable) |
 
-Pick the logical snapshot for portability and selective restore; pick a physical
-backup when you need a byte-exact copy (including the journal) or point-in-time
-file recovery.
+Pick the logical snapshot for selective restore across compatible schema
+versions; pick a physical backup when you need the audit journal preserved or
+point-in-time file recovery. A filesystem-level copy of the complete file set
+can be byte-exact; `VACUUM INTO` and the Online Backup API instead produce a
+consistent logical copy that is not guaranteed byte-identical to the source
+(see below).
 
 ## Logical snapshot and restore
 
@@ -24,22 +27,90 @@ engrava --db fresh.db   restore  -i backup.jsonl   # import into a fresh db
 ```
 
 The snapshot is JSONL: a metadata header line, then one record per
-thought / edge / embedding / action.
+thought / edge / embedding / action. The export reads the metadata header and
+all four tables inside one read transaction opened before the first read
+(`src/engrava/cli/main.py:1466`), so the snapshot is a consistent point-in-time
+view rather than four independent scans that a concurrent writer could
+interleave with. It writes that content to a temporary file next to `-o` and
+publishes it there only once the read transaction has closed successfully, so
+a write that fails part-way never disturbs an existing file at `-o` — see
+[CLI Reference](cli.md#snapshot) for the full guarantee and the `-wal`/`-shm`
+output restriction.
 
 > **A snapshot does NOT include the audit journal.** The `journal_entry` table —
 > the tamper-evident hash chain — is **not** exported by `engrava snapshot`, and
-> therefore is **not** recreated by `restore`. A database restored from a snapshot
-> starts with an **empty journal**: the data is intact, but its prior audit
-> history is gone. If audit continuity matters, use a **physical file backup**
-> (which copies the journal verbatim), not a logical snapshot. See
+> therefore is **not** recreated by `restore`. What that leaves in the
+> *target's* journal depends on which of the three restore shapes you used:
+>
+> - **A fresh target** (the database file did not exist yet) starts with an
+>   empty journal — there was no prior journal for it to have.
+> - **`restore --clear`** empties `journal_entry` along with the four core
+>   tables it wipes, so the journal ends empty too. Otherwise it would keep
+>   describing thoughts the clear had just discarded.
+> - **A restore without `--clear`** merges into an existing database — and if
+>   that database's journal is non-empty, **it now refuses any record that
+>   collides** with an existing row on a primary key or `UNIQUE` constraint,
+>   rolling the whole restore back rather than writing anything from that
+>   snapshot. Restoring a one-thought snapshot back into the journalled
+>   database it came from failed like this:
+>
+>   ```text
+>   Error: Restore refused: snapshot line 2 collides with an existing row (matching primary key or UNIQUE constraint), and the target's journal_entry table is not empty. Replacing that row would leave the audit trail describing data this merge discarded, while 'engrava verify' kept reporting the chain as valid. Re-run with --orphan-journal-entries to allow the merge and accept that gap, or with --clear to discard the journal along with the data.
+>   ```
+>
+>   exit code `1`. This **journalled-merge collision gate** is conservative,
+>   not precise — it refuses *any* uniqueness collision once a journal exists,
+>   including one on a row the journal never described, rather than trying to
+>   work out which collisions are actually dangerous. It never triggers when
+>   the target's journal is empty, which is the ordinary case: journaling is
+>   opt-in and the CLI never turns it on itself, so a merge restore into a
+>   database that has never enabled it behaves exactly as it always has.
+>
+>   **`--orphan-journal-entries`** allows the merge anyway, and restores that
+>   prior behaviour: the merged-in records are inserted directly and are not
+>   themselves journalled, and a journal entry can be orphaned even when no
+>   incoming ID collides with one the journal already describes. Within the
+>   stock core schema, an incoming edge with a fresh `edge_id` but the same
+>   `(from_thought_id, to_thought_id, edge_type)` triple as a journalled edge
+>   replaces it through the table's own UNIQUE constraint — no ID collision
+>   needed. And replacing a thought whose **own** ID does collide cascades the
+>   delete, by foreign key, to that thought's edges, embeddings, and actions —
+>   rows whose IDs never appeared in the snapshot. An action only has a
+>   journal entry to orphan once it has been updated at least once:
+>   `create_action` writes no journal entry, only `update_action` does, so a
+>   freshly created action that was never updated cascades away with nothing
+>   stale left behind. A database carrying an extension-installed or
+>   user-defined trigger on these tables can open further routes: the
+>   extension migration runner applies a migration's SQL verbatim, including
+>   `CREATE TRIGGER` (see [Extensions](extensions.md#migration-files)), so a
+>   trigger that deletes a row elsewhere in the schema can orphan its journal
+>   entry on a restore insert that collides with nothing the target holds. In
+>   every case the journal entries describing the earlier row stay behind
+>   unchanged; `verify` still reports the chain as **valid**, even though
+>   those entries no longer describe what the database now holds — confirmed
+>   directly: restoring the collision above under `--orphan-journal-entries`
+>   still leaves `engrava verify` reporting `Journal integrity OK — 1 entries
+>   verified.`.
+>
+> If audit continuity matters, use a **physical file backup** (which copies
+> the journal verbatim), not a logical snapshot. See
 > [Audit Trail](audit-trail.md).
 
 `restore` options worth knowing (see the [CLI reference](cli.md#restore) for the
-full list): `--clear` to wipe the target first, `--skip-embeddings` / `--re-embed`
-to control embedding handling, and `--service` for multi-service targets.
-When `--clear` encounters a persisted sqlite-vec index, restore drops the derived
-table transactionally and the next configured open rebuilds it. Keep
-`engrava[vec]` installed for that virtual-table reset.
+full list): `--clear` to empty the target's four core tables and its journal
+first (not `_metadata`, `extension_schema_versions`, or extension-owned
+tables — see above), `--skip-embeddings` / `--re-embed`
+to control embedding handling, `--orphan-journal-entries` to allow a merge that
+would otherwise be refused by the collision gate above, and `--service` for
+multi-service targets. When `--clear` encounters a persisted sqlite-vec index,
+restore drops the derived table transactionally and the next configured open
+rebuilds it. Keep `engrava[vec]` installed for that virtual-table reset.
+
+Every restore — merge or `--clear` — also rebuilds the full-text search index
+from the target's `thought` rows before committing, so a colliding record
+restore replaces can never leave keyword search matching stale content behind.
+See [Troubleshooting](troubleshooting.md#keyword-search-returns-a-thought-after-restore-that-does-not-contain-the-word)
+if you restored with an older build before this was unconditional.
 
 ### Embedding handling during restore
 
@@ -98,8 +169,8 @@ The general `--clear` sqlite-vec reset described above also protects this path.
 `restore` is designed for **snapshots you produced yourself** with `engrava
 snapshot` — your own trusted backups. That is the supported input boundary.
 
-Restore does not blindly trust the file. Every line must be a JSON object, and
-each record targeting a known table (thought, edge, embedding, action) is
+Restore does not blindly trust the file. Every non-blank line must be a JSON
+object — blank lines are skipped — and each record targeting a known table (thought, edge, embedding, action) is
 validated against a fixed, code-owned schema: its columns must be a known subset
 of that table's columns, the required columns must be present and non-null, and
 each value must match its column's type (an imported embedding vector must be
@@ -153,14 +224,30 @@ the `-wal`/`-shm` files.
 ### If you can stop or quiesce writers
 
 When you can take the database offline (or guarantee no writes for the duration),
-a file copy is safe — preferably after folding the WAL back into the main file:
+a file copy is safe once it captures every committed change. Committed changes
+can still sit in the `-wal` file, so either copy the main file only after a
+checkpoint has folded the WAL back into it, or copy the whole file set (below).
+Stopping writers alone does not guarantee the checkpoint completes: an existing
+reader can still pin WAL frames, so check its result before copying rather than
+copying unconditionally.
 
-**Checkpoint, then copy the single file:**
+**Checkpoint, then copy the single file only if the checkpoint fully completed:**
 
 ```bash
-# with no writers active:
-sqlite3 engrava.db "PRAGMA wal_checkpoint(TRUNCATE);"
-cp engrava.db engrava.db.bak
+# With no writers (and, ideally, no readers) active. The PRAGMA prints
+# busy|log_frames|checkpointed_frames. busy = 0 means the checkpoint
+# completed, so the main file alone holds every committed change. A non-zero
+# busy means it did not complete (an open reader is a common cause), and the
+# main file may then lack changes still in the WAL. `test -f` comes first
+# because the sqlite3 CLI creates an empty database at a path that does not
+# exist. The copy goes to a temporary name and replaces the backup only once
+# complete, so a failed copy leaves an earlier backup intact. Each step runs
+# only if the one before it succeeded.
+test -f engrava.db &&
+  [ "$(sqlite3 engrava.db 'PRAGMA wal_checkpoint(TRUNCATE);' | cut -d'|' -f1)" = "0" ] &&
+  cp engrava.db engrava.db.bak.tmp &&
+  mv engrava.db.bak.tmp engrava.db.bak ||
+  { echo "no backup made: missing file, incomplete checkpoint, or failed copy" >&2; false; }
 ```
 
 **Or copy the file set** (`engrava.db` + `-wal` + `-shm`) **as one atomic unit** —

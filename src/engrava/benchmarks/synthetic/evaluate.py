@@ -41,7 +41,8 @@ from engrava.config import DreamingConfig, DreamingGates, SearchConfig
 from engrava.domain.enums import LifecycleStatus, Priority, ThoughtType
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.extensions.dreaming import DreamingExtension
-from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
+from engrava.infrastructure.sqlite.aiosqlite_connect import connect
+from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore, _close_quietly
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -234,7 +235,8 @@ async def evaluate_run(
     binding_dreaming, binding_search = _build_dreaming_config()
     effective_search = search_config if search_config is not None else binding_search
 
-    async with aiosqlite.connect(db_uri) as db:
+    db = await connect(db_uri)
+    try:
         db.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(
             db=db,
@@ -270,6 +272,20 @@ async def evaluate_run(
                     top_k=retrieval_top_k,
                 )
                 per_question_records.append(record)
+    except BaseException:
+        # The evaluation body already raised (or was cancelled) -- that is
+        # what the caller needs to see, so a failure in this cleanup close
+        # is secondary and goes through ``_close_quietly`` rather than
+        # replacing it. Mirrors ``_opened_db`` in ``engrava.cli.main``:
+        # ``aiosqlite.Connection.__aexit__`` is a bare, unconditional
+        # ``await close()`` and cannot draw this distinction itself.
+        await _close_quietly(db)
+        raise
+    else:
+        # The body succeeded. A close failure here is not secondary to
+        # anything -- it is the only error there is, so it must propagate
+        # normally rather than being logged and swallowed.
+        await db.close()
 
     return _aggregate(
         records=per_question_records,
@@ -593,8 +609,7 @@ async def measure_synthesis_coverage(
     This is the binding AC-9a v1.3 metric — it measures the dreaming
     mechanism at the data layer (clustering, REFLECTION creation,
     cluster-membership wiring) without depending on retrieval
-    ranking.  Retrieval-layer surfacing is the deferred AC-9c gate
-    that lands in a follow-up workstream.
+    ranking.
 
     The helper builds its own store + DreamingExtension from the
     benchmark's binding ``_build_dreaming_config`` pair, ingests every
@@ -628,7 +643,8 @@ async def measure_synthesis_coverage(
     binding_dreaming, binding_search = _build_dreaming_config()
 
     db_uri = str(db_path) if db_path is not None else ":memory:"
-    async with aiosqlite.connect(db_uri) as db:
+    db = await connect(db_uri)
+    try:
         db.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(
             db=db,
@@ -652,15 +668,40 @@ async def measure_synthesis_coverage(
             fact_to_thoughts=fact_to_thoughts,
         )
         if not question_records:
-            return 0.0
-
-        reflection_memberships = await _collect_reflection_memberships(store)
-        covered = sum(
-            1
-            for _qid, expected in question_records
-            if any(expected & members for members in reflection_memberships)
-        )
-        return covered / len(question_records)
+            # A ``return`` here would exit the function from inside this
+            # ``try`` and skip the ``else`` clause below entirely (an
+            # early-return in a ``try`` body bypasses ``else``, unlike a
+            # ``finally``) -- leaving ``db`` unclosed on this path. Fall
+            # through to the single ``return`` after the try/except/else
+            # instead, so this branch closes the connection the same way
+            # the other one below does. That still is not an absolute: a
+            # failure inside the earlier ``aiosqlite.connect(...)`` call
+            # never reaches this ``try`` at all, and a close interrupted by
+            # a cancellation may not run to completion either.
+            coverage = 0.0
+        else:
+            reflection_memberships = await _collect_reflection_memberships(store)
+            covered = sum(
+                1
+                for _qid, expected in question_records
+                if any(expected & members for members in reflection_memberships)
+            )
+            coverage = covered / len(question_records)
+    except BaseException:
+        # The body already raised (or was cancelled) -- that is what the
+        # caller needs to see, so a failure in this cleanup close is
+        # secondary and goes through ``_close_quietly`` rather than
+        # replacing it. Mirrors ``_opened_db`` in ``engrava.cli.main``:
+        # ``aiosqlite.Connection.__aexit__`` is a bare, unconditional
+        # ``await close()`` and cannot draw this distinction itself.
+        await _close_quietly(db)
+        raise
+    else:
+        # The body succeeded. A close failure here is not secondary to
+        # anything -- it is the only error there is, so it must propagate
+        # normally rather than being logged and swallowed.
+        await db.close()
+    return coverage
 
 
 async def _ingest_and_consolidate(

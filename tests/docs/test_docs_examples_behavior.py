@@ -33,6 +33,7 @@ from engrava import (
     ActionStatus,
     ActionType,
     CallbackProvider,
+    ConsolidationResult,
     DefaultEngravaHooks,
     DeriveContext,
     DerivedRecord,
@@ -69,7 +70,9 @@ from engrava import (
     thought,
     utterance,
 )
+from engrava.cli.main import _behind_schema_refusal
 from engrava.config import SearchConfig
+from engrava.infrastructure.sqlite.engrava_core import CORE_SCHEMA_HEAD_VERSION
 from tests.docs._md_blocks import (
     REPO_ROOT,
     CodeBlock,
@@ -693,6 +696,55 @@ async def test_dreaming_consolidate_result_fields() -> None:
         assert isinstance(result.reflections_created, int)
 
 
+async def test_dreaming_attach_dreaming_extension_wires_consolidate() -> None:
+    """dreaming.md 'Attaching a hand-built extension to a store'.
+
+    ``attach_dreaming_extension()`` is the doc's supported alternative to the
+    private-attribute write: before it is called, ``consolidate()`` has
+    nothing wired and raises (the same guard proven by the from_config-less
+    case above); after ``store.attach_dreaming_extension(ext)``, ``consolidate()``
+    runs that attached extension and returns its real ``ConsolidationResult``
+    rather than merely accepting the call. A spy wrapping the real extension
+    proves the run actually happened -- with the store and cycle it should
+    have received -- and that the returned result is the extension's own
+    object, not merely a same-shaped value ``consolidate()`` could have
+    produced without calling anything.
+    """
+
+    class _RecordingDreamingExtension:
+        def __init__(self, wrapped: DreamingExtension) -> None:
+            self._wrapped = wrapped
+            self.calls: list[tuple[SqliteEngravaCore, int]] = []
+            self.returned: ConsolidationResult | None = None
+
+        async def run_consolidation(
+            self, store: SqliteEngravaCore, current_cycle: int
+        ) -> ConsolidationResult:
+            self.calls.append((store, current_cycle))
+            self.returned = await self._wrapped.run_consolidation(store, current_cycle)
+            return self.returned
+
+    async with aiosqlite.connect(":memory:") as conn:
+        store = await _fresh_store(conn)
+        await store.create_thought(_observation())
+
+        with pytest.raises(RuntimeError):
+            await store.consolidate(current_cycle=2)
+
+        ext = DreamingExtension(
+            config=DreamingConfig(enabled=True, promote_threshold=0.55),
+        )
+        spy = _RecordingDreamingExtension(ext)
+        store.attach_dreaming_extension(spy)
+
+        result = await store.consolidate(current_cycle=2)
+        assert spy.calls == [(store, 2)]
+        assert result is spy.returned
+        assert isinstance(result.promoted_count, int)
+        assert isinstance(result.edges_created, int)
+        assert isinstance(result.reflections_created, int)
+
+
 def test_hooks_protocol_conformance() -> None:
     """README + extensions + extension-hooks custom hooks satisfy the protocol.
 
@@ -826,10 +878,10 @@ async def test_troubleshooting_thought_type_member_access() -> None:
 async def test_troubleshooting_referential_integrity_error() -> None:
     """troubleshooting.md ReferentialIntegrityError import + raise.
 
-    The exception imports from ``engrava.domain.exceptions`` (not the top-level
-    package) and ``create_edge`` raises it when an endpoint is missing.
+    The exception imports directly from the top-level ``engrava`` package, and
+    ``create_edge`` raises it when an endpoint is missing.
     """
-    from engrava.domain.exceptions import ReferentialIntegrityError
+    from engrava import ReferentialIntegrityError
 
     async with aiosqlite.connect(":memory:") as conn:
         store = await _fresh_store(conn)
@@ -1235,6 +1287,35 @@ def test_upgrade_page_publishes_the_error_the_code_actually_raises() -> None:
     assert published == raised
 
 
+def test_cli_page_publishes_the_head_version_the_build_actually_has() -> None:
+    """cli.md's schema-version example names the head version, so pin it to the constant.
+
+    The example shows the refusal ``gc`` prints on a database below head, which
+    embeds this build's head version. A number typed into the page goes stale at
+    the next schema bump; the message function reads the constant, so compare the
+    published line against what it produces for the version the page shows.
+    """
+    blocks = extract_fenced_blocks(REPO_ROOT / "docs/cli.md", "bash")
+    published_lines = [
+        line
+        for block in blocks
+        for line in block.body.splitlines()
+        if line.startswith("Database schema is at version ")
+    ]
+    assert len(published_lines) == 1, (
+        f"Expected exactly one published schema-version refusal in docs/cli.md, "
+        f"found {len(published_lines)}."
+    )
+    published = published_lines[0]
+
+    match = re.search(r"schema is at version (\d+); .* head version is (\d+)\.", published)
+    assert match is not None, f"Unrecognised refusal text in docs/cli.md: {published!r}"
+    stored_version, published_head = int(match.group(1)), int(match.group(2))
+
+    assert published_head == CORE_SCHEMA_HEAD_VERSION
+    assert published == _behind_schema_refusal(stored_version, command="gc")
+
+
 async def _rank_with_optional_edge(
     *,
     edge: bool,
@@ -1301,11 +1382,11 @@ async def _rank_with_optional_edge(
 async def test_migration_guide_edges_do_not_feed_ranking_at_defaults() -> None:
     """migrating-from-other-memory.md: letting edges feed ranking is opt-in.
 
-    The concept table used to say edges "also feed ranking"; it now says the
-    graph signal is opt-in at ``default_graph_weight = 0.0``. That is a claim
-    about ranked output, so pin it as a frozen order: the same corpus and query,
-    with and without an ``ASSOCIATED`` edge, rank identically at defaults — and
-    the search reports no graph signal at all.
+    The concept table says the graph signal is opt-in at
+    ``default_graph_weight = 0.0``. That is a claim about ranked output, so pin
+    it as a frozen order: the same corpus and query, with and without an
+    ``ASSOCIATED`` edge, rank identically at defaults — and the search reports
+    no graph signal at all.
 
     Both stores are exercised, because the two resolve the default from
     different places: one from ``SearchConfig.default_graph_weight``, which the

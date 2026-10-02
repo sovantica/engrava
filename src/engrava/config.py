@@ -94,11 +94,11 @@ _DEFAULT_DREAMING_SIGNALS: dict[str, float] = {
 
 The six weights intentionally sum to more than 1.0. The scoring path
 renormalises over the signals that are *active* for a given run (an inactive
-signal — one whose data source is flat across the candidate pool — is dropped
-from the denominator), so the configured map is a set of relative priorities,
-not a probability distribution. In particular ``action_outcome`` is inactive in
-an action-free store, so the remaining five renormalise exactly as before this
-signal existed.
+signal — one whose data source recorded no value at all for any candidate this
+run, not merely a uniform one — is dropped from the denominator), so the
+configured map is a set of relative priorities, not a probability distribution.
+In particular ``action_outcome`` is inactive in an action-free store, so the
+remaining five renormalise exactly as before this signal existed.
 """
 
 _DEFAULT_HYGIENE_SIGNALS: dict[str, float] = {
@@ -115,9 +115,10 @@ dreaming promotion weights: hygiene carries its own weight vector and threshold
 so a change to one loop's tuning never silently perturbs the other, even though
 both read the same signal library. The weights are relative priorities, not a
 probability distribution — the keep-score path renormalises over the signals
-that are *active* for a given run (an inactive signal, one whose data source is
-flat across the candidate pool, is dropped from the denominator), mirroring the
-active-signal redistribution the dreaming scorer uses. A high keep-score marks a
+that are *active* for a given run (an inactive signal, one whose data source
+recorded no value at all for any candidate this run, not merely a uniform one,
+is dropped from the denominator), mirroring the active-signal redistribution
+the dreaming scorer uses. A high keep-score marks a
 thought as worth retaining; a low keep-score (times the decay multiplier) is
 what drives an archive.
 """
@@ -163,9 +164,7 @@ class DreamingGates:
         cluster_allowed_types: Thought types eligible to enter the
             agglomerative clustering candidate pool. Defaults to
             ``("OBSERVATION",)`` so REFLECTIONs created in earlier
-            cycles are NOT re-clustered into meta-reflections
-            (fixes meta-cascade pathology and cuts the O(n²) cost
-            of cluster buildup across cycles by ~30-45%). Operators
+            cycles are NOT re-clustered into meta-reflections. Operators
             who explicitly want meta-consolidation can pass
             e.g. ``("OBSERVATION", "REFLECTION")``.
         clustering_min_new_candidates: Minimum number of new eligible
@@ -207,7 +206,16 @@ class DreamingGates:
             mean pairwise cosine of its member embeddings is strictly
             below this value; defaults to ``0.40`` (calibrated on
             sentence-transformer embeddings whose member cosines
-            cluster around 0.3-0.7).
+            cluster around 0.3-0.7). The cosine is computed as
+            ``dot / (||a|| * ||b||)``, which removes that formula's old
+            magnitude sensitivity in the common case but is not an exact
+            transform in floating-point arithmetic, and changes which
+            side of this threshold several non-finite and overflowing
+            input shapes land on (in both directions) relative to the
+            pre-0.7 raw dot product — see ``cluster_cohesion_score`` in
+            ``engrava.extensions.dreaming_cluster_quality`` for the
+            executed cases and the 0.6 -> 0.7 upgrade note for what to
+            check if this threshold was tuned before that change.
         cluster_quality_external_homogeneity_threshold: External-source
             homogeneity threshold passed to
             ``is_external_source_homogeneous``.  A cluster is flagged
@@ -887,9 +895,7 @@ class HygienePolicyConfig:
             thought — required **in addition to** ``gc_min_archive_age_cycles``.
             A thought is GC-eligible only once it has been hygiene-archived for at
             least this many seconds of real time
-            (``archived_at <= now - gc_restore_window_seconds``), so a bulk /
-            fast-cycling store cannot permanently delete a just-archived thought
-            before any real-time chance to ``restore_thought`` it. Measured off
+            (``archived_at <= now - gc_restore_window_seconds``). Measured off
             the explicit ``archived_at`` column; a hygiene-archived row that
             predates that column (``archived_at`` is ``None``) is never GC-eligible
             while this window is active (fail closed). Default ``2592000``
@@ -1035,10 +1041,27 @@ class EmbeddingConfig:
             provider's own exception — byte-identical to the pre-existing
             behaviour. When ``True``, that failure is normalised into a typed
             :class:`~engrava.domain.exceptions.EmbeddingGenerationError`, the
-            explicit fail-fast an operator opts into (the thought is still
-            persisted, since auto-embed runs after the commit; the error
-            surfaces that it is unembedded). Only takes effect when
-            ``auto_embed`` is enabled.
+            explicit fail-fast an operator opts into. What happens to the
+            thought row is two independent questions. If the call does
+            not own the outermost transaction — nested inside the
+            caller's own ``suspend_auto_commit()`` window — nothing is
+            durable yet, on any path: the outermost window's exit
+            decides, committing the rows if it is caught and exits
+            cleanly, rolling them back if not. If the call does own it,
+            the path decides: ``create_thought``/``update_thought`` have
+            already committed by the time auto-embed runs, so the
+            failure cannot undo them; a standalone ``bulk_store`` has
+            not — its inserts and the single trailing embed call share
+            one transaction, so the failure rolls the whole batch back.
+            What is left behind is path-specific and only meaningful for
+            whatever actually committed: ``create_thought`` leaves no
+            embedding row at all. ``update_thought`` leaves any
+            embedding the row already had in place — if the update
+            committed, that embedding is now stale against the new
+            content and the row is still findable by vector search
+            against that outdated vector; if the row had no embedding
+            before, it still has none, and remains unfindable by vector
+            search. Only takes effect when ``auto_embed`` is enabled.
         device: Compute device for local providers (``"cpu"``, ``"cuda"``).
         batch_size: Batch encoding size for local providers.
         base_url: Base URL for remote providers.
@@ -1829,7 +1852,10 @@ def load_config(path: str | Path) -> EngravaConfig:
         raise ConfigError(msg) from exc
 
     if not isinstance(raw, dict):
-        msg = "Config must be a YAML mapping (dict), got " + type(raw).__name__
+        # Names the offending value itself, not just its type -- a bare
+        # scalar document (e.g. a config file containing only `hello`) is
+        # reported as "got str: 'hello'".
+        msg = f"Config must be a YAML mapping (dict), got {type(raw).__name__}: {raw!r}"
         raise ConfigError(msg)
 
     return _parse_config(raw)

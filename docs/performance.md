@@ -16,34 +16,43 @@ A query touches up to five signals; each scales differently:
 
 | Signal | Cost driver | Scaling |
 |---|---|---|
-| **FTS5 / BM25** | SQLite's FTS5 inverted index | Sub-linear; scales well into large corpora. |
-| **Vector** | The vector backend (see below) | Linear in #embeddings for both backends; **sqlite-vec scans a compact `vec0` table with a much smaller constant factor** than the Python path. |
+| **FTS5 / BM25** | SQLite's FTS5 inverted index | Depends on query shape, term frequency, and match count; no corpus-wide sub-linear bound is guaranteed. |
+| **Vector** | The vector backend (see below) | Linear in #embeddings for both backends; **sqlite-vec scans a compact `vec0` table**, while the fallback loads eligible vectors into NumPy for a vectorised cosine computation. |
 | **Recency** | A cheap per-candidate arithmetic decay | Negligible. |
 | **Priority** | A per-candidate enum→multiplier lookup | Negligible. |
-| **Graph** | 1-hop neighbour expansion over edges | Proportional to the fusion-pool size × average degree; **opt-in** (`graph_weight=0.0` makes zero graph queries). |
+| **Graph** | 1-hop neighbour expansion over edges | Proportional to the fusion-pool size × average degree; **opt-in** (`graph_weight=0.0` skips this ranking signal; candidate-pool expansion over `CONSOLIDATED_FROM` edges is separate, controlled by `graph_expansion_enabled`, is on by default, and reads those edges only when a reflection ranks among the top candidates). |
 
-The dominant term at scale is almost always the **vector** signal, because both
-backends compare the query against every stored embedding — the difference is how
-efficiently they do it (see below).
+When the vector arm is active, its scan **can dominate** large-store queries.
+Both backends perform an exhaustive search over their respective eligible or
+indexed candidate set — not necessarily every stored embedding — but they
+apply eligibility at different points. The NumPy fallback excludes expired
+and (by default) archived rows in SQL *before* computing cosine. The
+`vec0` backend cannot filter inside its own nearest-neighbour query, so it
+runs that query first over the full indexed set, over-fetching a bounded
+multiple of `top_k` to compensate, then filters to live, eligible rows
+afterward and trims back to `top_k`.
 
 ## The brute-force ceiling (and how to pass it)
 
-Without the `vec` extra, vector search is **brute-force cosine similarity in
-Python**: every `search_similar` / `search_hybrid` query scans all embeddings.
-This is simple and dependency-free, and works well up to roughly **100k
-embeddings**. Past that, vector-query latency grows linearly and becomes the
-bottleneck.
+Without the `vec` extra, vector search is a **brute-force cosine scan done
+with NumPy**: a `search_similar` call, or a `search_hybrid` call whose
+vector arm is active, decodes the eligible embeddings and computes cosine
+similarity over all of them in one vectorised batch (not a per-embedding
+Python loop). A `search_hybrid` call with no active vector arm — no
+embedding provider and no explicit `query_vector` — skips this step
+entirely and runs the FTS-only path instead. This is simple and
+dependency-free. Latency grows with the eligible embedding population;
+measure your own workload's latency and switch when it exceeds your budget.
 
 The fix is the **sqlite-vec** backend, which stores vectors in a dedicated,
 compact `vec0` virtual table. In the pinned `sqlite-vec` 0.1.x line a `vec0`
 query is still an **exhaustive k-nearest-neighbour scan** — not an approximate or
-sub-linear index — but over a tightly packed, chunked columnar store, so it runs
-with a far smaller constant factor (and lower memory overhead) than the Python
-brute-force path. The practical effect is that the same corpus stays well under
-your latency budget for much longer. FTS5 scales independently and usually needs
-no special handling.
+sub-linear index — but over a tightly packed, chunked columnar store. Relative
+latency and memory use between the two backends depend on your data and
+hardware and should be measured for your deployment. FTS5 scales independently
+of the vector backend.
 
-> The ~100k figure is a rule of thumb, not a cliff — see
+> There is no fixed corpus-size threshold for switching backends — see
 > [Known Limitations → sqlite-vec](known-limitations.md#sqlite-vec-pre-v1-status).
 > Measure your own p95 query latency and switch when it stops meeting your budget.
 
@@ -66,13 +75,15 @@ Note the first term: a selective filter shrinks the *cosine* work, but the
 eligibility scan still visits the whole embedding-bearing population. Both the
 filtered (NumPy) and unfiltered (`vec0`) paths are already **exhaustive** in the
 pinned `sqlite-vec` 0.1.x line (see
-[the brute-force ceiling](#the-brute-force-ceiling-and-how-to-pass-it)), so a
-filter is a **constant-factor** slowdown, not a change in scaling.
+[the brute-force ceiling](#the-brute-force-ceiling-and-how-to-pass-it)). Adding
+a filter changes the execution path and adds SQL eligibility work; depending on
+selectivity and constants, total latency can go either up or down relative to
+the unfiltered query, while worst-case corpus scaling remains linear either way.
 
 **When it matters.** A *selective* filter (one project, one session, one user)
 keeps the eligible set small — the filtered path stays acceptable, and can be
 faster than scanning the whole `vec0` table when the filter is highly selective
-(the eligibility scan still runs, so this is not guaranteed). The slow corner is
+(the eligibility scan still runs regardless of selectivity). The slow corner is
 a **broad filter on a large
 store** at the same time — for example `visibility=` admitting *public-or-mine*
 where "mine" is most of the store, on a base approaching the brute-force ceiling.
@@ -209,8 +220,10 @@ clustering algorithm:
 
 - Run it **periodically**, not every turn (every N cycles, a cron job, or
   manually).
-- `candidates_limit` caps how many thoughts are evaluated per pass — keep it
-  bounded on large stores.
+- `candidates_limit` bounds the promotion query and each per-type
+  agglomerative-clustering candidate query — keep it bounded on large stores.
+  It is not a global cap on every thought a pass examines, and it does not
+  bound the LPA path, which reads the existing dream-edge graph in full.
 - Clustering has two backends via `extensions.dreaming.clustering_backend`
   (`"numpy"` default, or `"python"`); `numpy` is faster for the similarity math
   on larger candidate sets.
@@ -220,8 +233,8 @@ clustering algorithm:
 
 ## Checklist: scaling Engrava
 
-1. **Past ~100k embeddings or missing your latency budget?** Switch to
-   `sqlite-vec` (above).
+1. **Missing your vector-search latency budget?** Switch to `sqlite-vec`
+   (above).
 2. **Bulk loading?** Batch writes with `suspend_auto_commit()` and consider
    `deduplicate=True`.
 3. **Embedding is the bottleneck?** Use a batching provider or pre-compute

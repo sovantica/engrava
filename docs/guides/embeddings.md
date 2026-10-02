@@ -6,9 +6,12 @@ provider so retrieval actually understands meaning, and how the query side
 works.
 
 > **Embeddings are optional.** With no provider configured, search still works
-> using the bundled lexical FTS5/BM25 index — the vector signal is simply
-> skipped (`HybridSearchResult.backends_used` will not contain `"vector"`). Add
-> a provider to get semantic retrieval.
+> using the bundled lexical FTS5/BM25 index — the vector signal is skipped
+> (`HybridSearchResult.backends_used` will not contain `"vector"`) unless you
+> pass your own `query_vector` to `search_hybrid` for thoughts whose vectors you
+> stored with `store_embedding`. A provider plus `auto_embed=True` (new
+> thoughts are embedded on write) gives semantic retrieval without supplying
+> vectors yourself; otherwise store vectors yourself with `store_embedding`.
 
 ## Two things a provider gives you
 
@@ -17,6 +20,10 @@ works.
    leading prefix of `content` (a common convention, e.g. `essence = content[:200]`),
    only `content` is embedded — the redundant prefix is dropped so it can't dominate
    the vector. A genuinely distinct `essence` is still embedded alongside `content`.
+   **`restore --re-embed` does not apply this dedup** — it always embeds
+   `essence + "\n" + content`, unconditionally. For a corpus using the
+   `essence = content[:200]` convention, a re-embedded restore is therefore
+   *not* vector-identical to the corpus it replaces.
 2. **Query-time embedding** — at search time the query must also be a vector.
    `search_hybrid` takes the query *text* and, when a provider is configured,
    embeds it **for you** (unless you pass an explicit `query_vector`).
@@ -38,6 +45,9 @@ import aiosqlite
 from engrava import SqliteEngravaCore, SentenceTransformerProvider
 
 provider = SentenceTransformerProvider(model_name="all-MiniLM-L6-v2")
+# Abbreviated for brevity: a bare async-with here can let a close failure
+# mask a real error. See "Graceful shutdown" in deployment.md for the safe
+# explicit-close shape.
 async with aiosqlite.connect("engrava.db") as conn:
     conn.row_factory = aiosqlite.Row
     store = SqliteEngravaCore(conn, embedding_provider=provider, auto_embed=True)
@@ -63,26 +73,54 @@ async with await SqliteEngravaCore.from_config("engrava.yaml") as store:
 
 ### When auto-embed fails (the honest boundary)
 
-`create_thought` commits the thought **before** it auto-embeds. So if the
+`create_thought` runs auto-embed **after** inserting the thought row — but
+whether that row is durable yet depends on whether this call owns the
+outermost transaction. On its own (the common case, no enclosing
+`suspend_auto_commit()` window), the insert has already committed, so if the
 embedding provider fails (network blip, rate limit, a crashing local model), the
 thought is already persisted — it just has no embedding, which means it is
-**invisible to vector search** until re-embedded. This is an existing property,
-not a new one, and it is surfaced two ways:
+**invisible to vector search** until re-embedded. Nested inside the caller's
+own `suspend_auto_commit()` window, nothing is durable yet: the outermost
+window's exit decides — caught and exited cleanly, the row commits; uncaught,
+it rolls back with the rest of that window. This is surfaced two ways:
 
-- The failure is **never silent**: a `WARNING` naming the thought id and the
-  provider error is always logged, then the provider's own exception propagates
-  (unchanged default behaviour).
+- An `Exception` that escapes the guarded embed call (`provider.embed()` /
+  `embed_batch()`, or their role-aware equivalents) is never silent for the
+  thought a caller directly created or updated: a `WARNING` naming the
+  thought id and the provider error's type is always logged, then the
+  provider's own exception propagates (unchanged default behaviour). That guarantee is
+  scoped to that one call, not to provider failures in general — a provider
+  whose `model_name` property raises (read right after a successful embed,
+  to store alongside the vector) skips the logging and typing entirely,
+  regardless of `require_embedding` or exception type. A provider that
+  raises `asyncio.CancelledError` (or any other `BaseException` that is not
+  an `Exception`) from inside the guarded embed call also skips it — it
+  propagates directly, with no `WARNING` and without ever becoming
+  `EmbeddingGenerationError`. A derived child's own embed failure does not
+  reach the originating call at all: under the default derivation
+  `on_error="log"` gate, it is logged and derivation continues.
 - Set `require_embedding: true` (config) or `require_embedding=True` (constructor)
   to turn that failure into a typed `EmbeddingGenerationError` — the explicit
   fail-fast for operators who would rather the write raise loudly than leave an
-  unembedded thought behind. The thought is still committed either way; the flag
-  only governs how loudly the missing embedding is reported.
+  unembedded thought behind. The flag decides the exception *type*, not the
+  durability outcome above by itself — but that type *can* affect durability
+  when the failure happens nested inside a caller's own
+  `suspend_auto_commit()` window, if the caller's own exception handling
+  distinguishes the two types: an `except EmbeddingGenerationError` clause
+  around the call catches the strict-mode error and lets that window exit
+  cleanly (so it commits), while the same clause does not catch the untyped
+  provider exception raised by default, which escapes the window and rolls
+  it back. A caller that instead catches both types, or neither, sees the
+  same outcome regardless of this flag.
 
 ```python
 import aiosqlite
 from engrava import SqliteEngravaCore, EmbeddingGenerationError
 
 async def strict_ingest(provider: object, text: str) -> None:
+    # Abbreviated for brevity: a bare async-with here can let a close
+    # failure mask a real error. See "Graceful shutdown" in deployment.md
+    # for the safe explicit-close shape.
     async with aiosqlite.connect("engrava.db") as conn:
         conn.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(
@@ -101,11 +139,21 @@ async def strict_ingest(provider: object, text: str) -> None:
 
 ### Batch ingest embeds in one call
 
-`bulk_store` persists many thoughts in a single all-or-nothing transaction and,
-when `auto_embed` is on, embeds them all in **one** batch provider call (using
+`bulk_store` persists many thoughts in a single transaction that is
+all-or-nothing when it owns that transaction outright — nested inside a
+caller's own `suspend_auto_commit()`, a caught failure can still commit the
+batch's already-inserted rows (see the [API reference](../api-reference.md))
+— and, when `auto_embed` is on, embeds them all in **one** batch provider call (using
 the role-aware `embed_document_batch` when the provider exposes it, else
-`embed_batch`) instead of one round trip per thought. The stored vectors are
-identical to embedding each thought individually. `get_or_create` and
+`embed_batch`). Whether that call saves round trips depends on the provider:
+`OpenAICompatibleProvider` and `OllamaProvider` send the whole batch in one
+request per attempt (`OpenAICompatibleProvider` sends it again when it retries a
+transient failure; `OllamaProvider` does not retry), and
+`SentenceTransformerProvider` encodes it in a single model call, but
+`HuggingFaceProvider` and `CallbackProvider` implement the batch as a loop that
+still calls the underlying API or callback once per text. A custom provider
+can implement a genuine batch. The stored vectors are identical to embedding
+each thought individually. `get_or_create` and
 `upsert_by_hash` are content-hash convenience writes over the same
 deduplication — see [the write-API guide](agent-memory.md) and the
 [API reference](../api-reference.md).
@@ -115,6 +163,9 @@ import aiosqlite
 from engrava import SqliteEngravaCore, ThoughtRecord, ThoughtType, Priority, LifecycleStatus
 
 async def batch_ingest(provider: object, texts: list[str]) -> None:
+    # Abbreviated for brevity: a bare async-with here can let a close
+    # failure mask a real error. See "Graceful shutdown" in deployment.md
+    # for the safe explicit-close shape.
     async with aiosqlite.connect("engrava.db") as conn:
         conn.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(
@@ -164,8 +215,10 @@ provider = SentenceTransformerProvider(
 )
 ```
 
-No API key, no network after the first model download. Best default for
-self-hosting.
+No API key, and no network after the first model download once
+`HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` are set (see
+[Configuration → `local`](../configuration.md#local--sentence-transformers-offline-after-warm-up)
+for why those two variables are needed). Best default for self-hosting.
 
 On load, this provider raises the model's `max_seq_length` to the architecture's
 true maximum when the shipped checkpoint reports a conservatively-low value — the
@@ -198,7 +251,8 @@ provider = OpenAICompatibleProvider(
 Set `base_url` to target a compatible gateway (Azure OpenAI, a local proxy, etc.).
 
 **Automatic retry on transient failures.** This provider retries a request with
-bounded exponential backoff when the endpoint reports a transient failure — a read
+linear backoff (`base_retry_delay_s * attempt` — not exponential, despite how
+this is sometimes described) when the endpoint reports a transient failure — a read
 timeout or network blip, or a transient HTTP status (`408`, `409`, `425`, `429`,
 `500`, `502`, `503`, `504`) — so a short outage is absorbed instead of failing your
 ingest. Non-transient statuses (`400`, `401`, `403`, `404`) surface immediately
@@ -213,7 +267,7 @@ applies to `OpenAICompatibleProvider` only — `OllamaProvider` and
 provider = OpenAICompatibleProvider(
     model_name="text-embedding-3-small",
     max_attempts=5,           # up to 5 tries on transient failures
-    base_retry_delay_s=0.5,   # exponential backoff starting at 0.5s
+    base_retry_delay_s=0.5,   # linear backoff starting at 0.5s (attempt 2 waits 1.0s, ...)
 )
 ```
 
@@ -352,14 +406,12 @@ A few rules make this safe to adopt incrementally:
   not passed to it.
 - **Changing `document_prefix` requires a deliberate re-embed.** The document prefix
   is part of the corpus identity: change it and every stored vector would change.
-  Turning it on (or changing it) on a store that already holds vectors raises
+  Turning it on, changing it, or turning it off on a store that already holds vectors raises
   `EmbeddingModelMismatchError` — Engrava never silently re-embeds. Re-embed on
   purpose by restoring a snapshot with `--re-embed` and `--config` (which applies
   the top-level provider in direct mode, or a per-service override before the
-  top-level fallback), or start a fresh store. Restore replaces the model,
-  dimension, document-prefix fingerprint, and query-prefix pairing in the same
-  transaction as the new vectors. Use a fresh target or `--clear` when the
-  target already contains embeddings. If the database has a persisted
+  top-level fallback), or start a fresh store. Use a fresh target or `--clear`
+  when the target already contains embeddings. If the database has a persisted
   sqlite-vec index, restore drops it transactionally and the next configured
   open rebuilds it from `embedding`; keep the `engrava[vec]` extra installed for
   that reset.

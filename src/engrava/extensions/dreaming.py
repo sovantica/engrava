@@ -63,9 +63,12 @@ class DreamingExtension:
 
     Args:
         config: Parsed ``DreamingConfig`` with weights, gates, and schedule.
-        custom_signals: Optional overrides / additions for signal functions.
-            Keys matching a default signal name replace the default; new
-            keys extend the signal set.
+        custom_signals: Optional overrides for signal functions, keyed by
+            signal name. Only supplies the *callable*: a key here is
+            resolved only if that same name also carries a weight in
+            ``config.signals`` — a name matching a default signal replaces
+            the default callable, and a name absent from ``config.signals``
+            is never resolved, never scored, and raises no error.
 
     Raises:
         ValueError: If a signal name from config is unknown and not
@@ -218,6 +221,16 @@ class DreamingExtension:
           ``config.promote_targets`` are eligible for promotion.
           Default is ``"OBS_ONLY"`` (OBSERVATION thoughts only).
 
+        Beyond promotion, this call also: creates dream edges from each
+        promoted thought to its most-similar prior candidates, when
+        ``config.edges.enabled``; clusters the candidate pool and
+        materialises new REFLECTION thoughts from qualifying clusters, when
+        ``config.gates.enable_reflections``; and — unconditionally, gated by
+        neither of those two flags nor by Memory Hygiene — sweeps orphaned
+        REFLECTIONs, flipping any whose entire ``CONSOLIDATED_FROM`` source
+        set has left ``ACTIVE`` from ``ACTIVE`` to ``ARCHIVED``. The sweep is
+        this method's only data-archiving step.
+
         Args:
             store: A store implementing the Dreaming capability protocol.
             current_cycle: Current cognitive cycle number.
@@ -367,7 +380,7 @@ class DreamingExtension:
     ) -> tuple[dict[str, float], list[str]]:
         """Compute the redistributed per-signal weights for this run.
 
-        The promotion score is a **weighted average over the signals active
+        The promotion score is a **weighted sum over the signals active
         for the run**. A signal is active when its data source yields a
         non-default value for at least one candidate in the pool (see
         :func:`~engrava.domain.dreaming.default_signal_active`);
@@ -378,13 +391,20 @@ class DreamingExtension:
         the active set, so flat signals fall out of the denominator instead of
         dragging every score toward a constant.
 
-        Custom signals (registered via ``custom_signals``) have no
-        introspectable data source, so they are always treated as active — the
-        operator opted into them deliberately.
+        A custom signal (registered via ``custom_signals``) under a name that
+        is not one of :data:`DEFAULT_SIGNALS` has no introspectable data
+        source, so it is always treated as active — the operator opted into
+        it deliberately. One that reuses a default name is scored
+        differently: the check below is keyed on the *name*, not on which
+        callable implements it, so it follows that default's own activeness
+        rule (see :func:`~engrava.domain.dreaming.default_signal_active`)
+        even though a different function actually computes its value.
 
-        **Degenerate guard.** When no signal is active the returned weights are
-        all zero, so every score is ``0.0`` and nothing promotes — the exact
-        analogue of the precedent's ``active_weight == 0 -> zeros`` branch.
+        **Degenerate guard.** When the configured weights of the active signals
+        sum to ``0.0`` (which includes no signal being active) the returned
+        weights are all zero, so every score is ``0.0`` and nothing promotes —
+        the exact analogue of the precedent's ``active_weight == 0 -> zeros``
+        branch.
 
         **Pool-relative, once per run.** Activeness is decided over the whole
         candidate pool a single time; it is never recomputed per thought (a
@@ -399,9 +419,8 @@ class DreamingExtension:
         Returns:
             A ``(weights, flat_signals)`` pair. ``weights`` maps every
             configured signal name to its effective (renormalised) weight —
-            ``0.0`` for inactive signals; the active entries sum to ``1.0``
-            unless no signal is active (all-zero). ``flat_signals`` is the
-            sorted list of configured signals found inactive this run.
+            ``0.0`` for inactive signals. ``flat_signals`` is the sorted list
+            of configured signals found inactive this run.
 
         """
         active_names: list[str] = []
@@ -436,6 +455,7 @@ class DreamingExtension:
 
     async def _apply_promotions(
         self,
+        *,
         store: DreamingStoreProtocol,
         candidates: list[ThoughtRecord],
         ctx: DreamingContext,
@@ -520,23 +540,18 @@ class DreamingExtension:
         ctx: DreamingContext,
         active_weights: dict[str, float] | None = None,
     ) -> float:
-        """Compute the promotion score as a weighted average over the signals.
+        """Compute the promotion score as a weighted sum of the signal values.
 
         When ``active_weights`` is provided (the consolidation path always
-        passes it), the score is the weighted average over the signals **active
-        for the run** — inactive signals contribute ``0.0`` and their weight
-        has already been redistributed onto the active ones by
-        :meth:`_compute_active_weights`, so the effective weights sum to
-        ``1.0`` (all-zero when no signal is active, giving a ``0.0`` score that
-        promotes nothing). This is the reachable default scoring: a flat signal
-        no longer drags every score toward a constant.
+        passes it), each signal's value is multiplied by the weight
+        :meth:`_compute_active_weights` gives it; an inactive signal's weight
+        there is ``0.0``.
 
         When ``active_weights`` is ``None`` (direct callers / unit tests) the
-        raw configured weights are used unchanged — the historical weighted
-        sum. **This compatibility path reproduces the pre-fix, arithmetically
-        unreachable scoring** (a structurally-flat signal still consumes its
-        weight); it exists only for direct/legacy callers. The consolidation
-        path MUST pass the redistributed ``active_weights`` from
+        raw configured weights are used unchanged. **On this compatibility
+        path a structurally-flat signal still consumes its weight**; it exists
+        only for direct/legacy callers. The consolidation path MUST pass the
+        redistributed ``active_weights`` from
         :meth:`_compute_active_weights` — it is the only production caller and
         always does. Do not add a new production caller that omits them.
 
@@ -1100,7 +1115,9 @@ class DreamingExtension:
 
         1. Compute centroid embedding (mean of member vectors).
         2. Build structured content (top-N keywords + member IDs).
-        3. Derive an idempotence hash from sorted member IDs.
+        3. Derive an idempotence hash from the sorted, eligibility-filtered
+           member IDs (a cluster member the metadata filter rejects does not
+           feed the hash).
         4. Skip if a REFLECTION with the same hash already exists.
         5. Derive the REFLECTION's valid-time extent from its members
            (see ``derive_reflection_extent``), unless the caller pins an
@@ -1478,7 +1495,34 @@ class DreamingExtension:
                 try:
                     await store.create_thought(reflection)
                 except Exception:  # noqa: BLE001
-                    logger.debug("Could not create reflection thought %s", reflection_id)
+                    # By the time create_thought can fail here (most often
+                    # the provider call behind auto-embed), its row can
+                    # already be inserted-but-not-yet-durable: this whole
+                    # pass runs inside the suspend_auto_commit() window
+                    # opened above, so nothing commits until that window's
+                    # own clean exit -- and catching the failure here, then
+                    # continuing to the next cluster, is exactly what keeps
+                    # it clean. Left at that, the eventual commit would still
+                    # make the half-written REFLECTION (no centroid, no
+                    # CONSOLIDATED_FROM edges) durable, and its now-persisted
+                    # source hash would make every future pass skip the
+                    # cluster as "already handled" forever. Undo the partial
+                    # insert explicitly instead, so a failed attempt leaves
+                    # nothing durable behind and the next pass re-attempts
+                    # the same cluster from a clean slate.
+                    logger.debug(
+                        "Could not create reflection thought %s; rolling back",
+                        reflection_id,
+                    )
+                    try:
+                        await store.delete_thought(reflection_id)
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "Could not roll back partially created reflection "
+                            "%s after a failed create_thought; it may be left "
+                            "incomplete",
+                            reflection_id,
+                        )
                     continue
 
                 # --- Store centroid embedding ---

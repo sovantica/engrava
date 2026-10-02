@@ -85,7 +85,8 @@ class TestLatencyRingBuffer:
 class TestMetricsSnapshot:
     async def test_defaults_schema(self) -> None:
         snapshot = EngravaMetrics()
-        assert snapshot.schema_version == 1
+        assert snapshot.schema_version == 2
+        assert snapshot.measured is False
         assert snapshot.thoughts.total == 0
         assert snapshot.edges.total == 0
         assert snapshot.search_latency.sample_count == 0
@@ -178,6 +179,41 @@ class TestMetricsSnapshot:
         assert snapshot.edges.total == 0
         assert snapshot.search_latency.sample_count == 0
         mock_conn.execute.assert_not_called()
+
+    async def test_disabled_metrics_snapshot_reports_unmeasured(self) -> None:
+        """The zero-filled early return must never be mistaken for a real zero.
+
+        Nothing else in the snapshot states whether a measurement happened.
+        Every field a caller might read instead is a proxy that fails in at
+        least one direction: ``storage.db_bytes`` reads ``0`` for a disabled
+        store and for a measured in-memory one (a freshly created, empty
+        file-backed store instead measures a real, nonzero
+        ``storage.db_bytes``, but that same field reads ``0`` again on a
+        measured store whose file later goes missing under an open
+        connection); ``search_latency.sample_count`` reads ``0`` for a
+        disabled store and for a measured store that has served no searches.
+        ``measured`` states it directly, so this is the one assertion a
+        Prometheus-style scraper actually needs.
+        """
+        mock_conn = AsyncMock()
+        store = SqliteEngravaCore(mock_conn, metrics_config=MetricsConfig(enabled=False))
+
+        snapshot = await store.metrics()
+
+        assert snapshot.measured is False
+        mock_conn.execute.assert_not_called()
+
+    async def test_enabled_metrics_snapshot_reports_measured(
+        self, metrics_store: SqliteEngravaCore
+    ) -> None:
+        """The converse: the one measuring path must set ``measured=True``.
+
+        Without this, the default of ``False`` could be silently left in
+        place on the real path and the guard above would still pass.
+        """
+        snapshot = await metrics_store.metrics()
+
+        assert snapshot.measured is True
 
     async def test_metrics_concurrent_safe(self, metrics_store: SqliteEngravaCore) -> None:
         await metrics_store.create_thought(_thought("t-conc", essence="alpha concurrent"))

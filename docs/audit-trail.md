@@ -42,6 +42,9 @@ Or when constructing the store directly:
 import aiosqlite
 from engrava import SqliteEngravaCore
 
+# Abbreviated for brevity: a bare async-with here can let a close failure
+# mask a real error. See "Graceful shutdown" in deployment.md for the safe
+# explicit-close shape.
 async with aiosqlite.connect("engrava.db") as conn:
     conn.row_factory = aiosqlite.Row
     store = SqliteEngravaCore(conn, journal_enabled=True)
@@ -110,17 +113,14 @@ are outside journal coverage generally; only action status and verification
 transitions are covered. Call `delete_edge()` explicitly when an individually
 journaled edge deletion is required.
 
-**Below core schema 12 this cascade does not happen.** The `ON DELETE CASCADE` on
-`edge`, `embedding` and `action` arrives with the core-12 migration, so on a database
-carried forward from an older engrava and never migrated the thought's `embedding` row
-outlives the delete. The delete does still purge that thought's own `vec0` vector, so
-the identifier is **not** reachable straight afterwards; it returns once the reconcile
-that runs on the next sqlite-vec-enabled open backfills the index from the surviving
-`embedding` row. From then on it is an ordinary candidate on that arm whenever a
-sqlite-vec backend is **active** on the store and the query carries no effective
-metadata predicate — the arm *can* return it, subject to the same similarity threshold
-and `top_k` window as any live row. Run `engrava migrate`. See
-[Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated).
+**Below core schema 12 there is no such cascade.** The `ON DELETE CASCADE` on
+`edge`, `embedding` and `action` arrives with the core-12 migration.
+`delete_thought` does not rely on it: it issues its own deletes for the thought's
+rows in those three tables, in the same savepoint as the parent delete, which runs
+first. See
+[Deletion on a database that has not been migrated](known-limitations.md#deletion-on-a-database-that-has-not-been-migrated)
+for what `engrava migrate` cleans up on a database that already holds dangling
+`embedding` rows.
 
 ## The `JournalEntry` schema
 
@@ -181,7 +181,7 @@ deletions = await store.journal.get_entries(
 |---|---|---|
 | `target_id` | `None` | Filter by the affected entity ID |
 | `mutation_type` | `None` | Filter by mutation type string |
-| `since` | `None` | ISO-8601 lower bound on `created_at` (inclusive) |
+| `since` | `None` | ISO-8601 lower bound on `created_at` (inclusive), compared by instant; a value without an offset is read as UTC, and a value that cannot be read as a UTC instant raises `ValueError` |
 | `limit` | `100` | Maximum entries returned |
 
 > **`since=` is a convenience filter, not an audit boundary.** It compares
@@ -300,6 +300,7 @@ one-time cost to every open. For periodic rather than on-open checking, call
 
 ```python
 import aiosqlite
+import sys
 import uuid
 from engrava import (
     SqliteEngravaCore,
@@ -309,7 +310,24 @@ from engrava import (
     LifecycleStatus,
 )
 
-async with aiosqlite.connect(":memory:") as conn:
+
+async def _close_quietly(conn: aiosqlite.Connection) -> None:
+    """Close *conn*, reporting rather than raising if the close itself fails.
+
+    ``aiosqlite.Connection.__aexit__`` is an unconditional ``await
+    close()``, so a bare ``async with aiosqlite.connect(...)`` would let a
+    close failure here replace whatever the block above actually raised.
+    Used only from the exception path below -- the ordinary success-path
+    close still propagates a genuine failure normally.
+    """
+    try:
+        await conn.close()
+    except Exception as exc:  # noqa: BLE001 - deliberately broad: never replace the real error
+        print(f"warning: failed to close the database connection: {exc}", file=sys.stderr)
+
+
+conn = await aiosqlite.connect(":memory:")
+try:
     conn.row_factory = aiosqlite.Row
     store = SqliteEngravaCore(conn, journal_enabled=True)
     await store.ensure_schema()
@@ -335,6 +353,11 @@ async with aiosqlite.connect(":memory:") as conn:
     # The chain verifies.
     result = await store.journal.verify_integrity()
     assert result.valid and result.entries_checked == 2
+except BaseException:
+    await _close_quietly(conn)
+    raise
+else:
+    await conn.close()
 ```
 
 ## Security model & guarantees
@@ -368,6 +391,14 @@ with `target_id="x|"` collides with `mutation_type="INSERT_THOUGHT|x"` and no
 `target_id`. Exploiting it takes in-process code execution against your own store,
 which is already past the boundary this chain defends; treat the binding as a
 property of the store's own field grammars, not of the encoding.
+
+**A direct `append()` call also sits outside the store's in-process write lock**
+(see [Concurrency](concurrency.md#many-async-tasks-one-store)) — a separate,
+non-security concern worth knowing here too: every mutation the store journals
+on your behalf runs the append under the same lock as the write it describes,
+but `JournalWriter` does not hold that lock itself. Appending directly through
+`store.journal` can still land inside another task's open transaction-deferral
+window and be rolled back with it. Let the store journal its own mutations.
 
 Verification also re-serialises the stored `delta` before hashing it
 (`json.loads` in, `json.dumps(..., sort_keys=True)` out), so what the chain binds
@@ -430,9 +461,59 @@ cryptographic non-repudiation against a file-level adversary.
 The logical snapshot/restore path (`engrava snapshot` / `engrava restore`)
 covers the thought / edge / embedding / action tables — it does **not** include
 the `journal_entry` table. A snapshot is therefore **not** a backup of the audit
-trail, and restoring from one starts a fresh chain. To preserve the journal,
-back up the database file itself (see the upgrade/backup guidance), and note
-that hard-deleting an audited thought still leaves its content in the journal's
+trail. What restoring from one leaves the target's journal holding depends on
+how it was restored: a fresh target starts with no journal at all, and `restore
+--clear` empties `journal_entry` along with the data it wipes so the chain does
+not outlive the data it described. A restore without `--clear` merges into the
+target, and if that target's journal is non-empty, a merged-in record that
+collides with an existing row — on a primary key or a `UNIQUE` constraint — is
+refused outright: the whole restore rolls back, so nothing from that snapshot
+is written, not even the records that would have inserted cleanly. This is the
+**journalled-merge collision gate**. Restoring a snapshot back into the
+journalled database it came from — one thought, one matching `INSERT_THOUGHT`
+journal entry — fails with exit code `1` and:
+
+```text
+Error: Restore refused: snapshot line 2 collides with an existing row (matching primary key or UNIQUE constraint), and the target's journal_entry table is not empty. Replacing that row would leave the audit trail describing data this merge discarded, while 'engrava verify' kept reporting the chain as valid. Re-run with --orphan-journal-entries to allow the merge and accept that gap, or with --clear to discard the journal along with the data.
+```
+
+The gate is conservative, not precise: it refuses *any* such
+collision once a journal exists, including one on a row the journal never
+described anything about — it does not try to work out which collisions are
+actually dangerous. It never triggers when the target's journal is empty,
+which is the overwhelmingly common case since journalling is opt-in and the
+CLI never enables it itself; an ordinary merge restore into an unjournalled
+target is exactly as before.
+
+Pass `--orphan-journal-entries` to allow the merge anyway, accepting that the
+journal may end up describing data the merge just discarded. Under that
+override, the merged-in records are inserted directly and are not themselves
+journalled, and a journalled row can be orphaned even when none of the
+snapshot's IDs collide with anything the journal describes. Within the stock
+core schema, two paths do that: an incoming edge with a fresh `edge_id` but
+the same `(from_thought_id, to_thought_id, edge_type)` triple as a journalled
+edge replaces it through the table's UNIQUE constraint on that triple; and
+replacing a thought whose own ID **does** collide cascades the delete, by
+foreign key, to that thought's edges, embeddings, and actions — rows whose IDs
+never appeared in the snapshot. An action only has a journal entry to orphan
+once it has been updated at least once: `create_action` writes no journal
+entry, only `update_action` does, so a freshly created action that was never
+updated cascades away with nothing stale left behind. A database that carries
+an extension-installed or user-defined trigger on these tables can open
+further routes that need no collision at all: the extension migration runner
+executes a migration's SQL verbatim, including `CREATE TRIGGER` (see
+[Extensions](extensions.md#migration-files)), so an `AFTER INSERT ON thought`
+trigger that deletes some other row can orphan that row's journal entry on a
+restore insert that collides with nothing the target holds. In every case the
+journal entries describing the earlier row stay behind unchanged; `verify`
+still reports the chain as **valid** even though it no longer matches what the
+database holds — confirmed against the collision above: restoring it under
+`--orphan-journal-entries` still leaves `engrava verify` reporting `Journal
+integrity OK — 1 entries verified.`. `restore --clear` sidesteps all of this
+by discarding the journal along with the data it described, rather than
+letting the two disagree. To preserve the journal, back
+up the database file itself (see the upgrade/backup guidance), and note that
+hard-deleting an audited thought still leaves its content in the journal's
 `before`/`after` delta — relevant when handling erasure requests.
 
 ## See also

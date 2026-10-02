@@ -7,295 +7,421 @@
     "content:\"three cheeses\"": [
       [
         "turn-recipe-lasagna",
-        0.382198
+        0.41003
       ],
       [
-        "turn-yoga-class",
-        0.131189
-      ],
-      [
-        "turn-spanish-greeting",
-        0.12763
+        "turn-priority-target",
+        0.200635
       ],
       [
         "turn-flight-delay",
-        0.116495
+        0.182392
       ],
       [
         "turn-timestamp-meeting",
-        0.108556
+        0.179728
       ],
       [
-        "turn-long-conference",
-        0.061951
+        "turn-yoga-class",
+        0.156054
       ],
       [
-        "turn-allergy",
-        0.033333
+        "turn-priority-control",
+        0.155181
       ],
       [
-        "turn-bike-commute",
-        0.033333
+        "turn-french-school",
+        0.130276
       ],
       [
-        "turn-book-club",
-        0.033333
+        "turn-spanish-greeting",
+        0.127709
       ],
       [
-        "turn-budget-spreadsheet",
-        0.033333
+        "turn-volunteer",
+        0.109737
+      ],
+      [
+        "turn-guitar-lessons",
+        0.106414
       ]
     ],
     "essence:\"office plant\"": [
       [
         "turn-plant-a",
-        0.609498
+        0.556811
       ],
       [
         "turn-plant-b",
-        0.500013
+        0.487706
       ],
       [
         "turn-plant-c",
-        0.334224
-      ],
-      [
-        "turn-german-train",
-        0.124432
-      ],
-      [
-        "turn-allergy",
-        0.12154
-      ],
-      [
-        "turn-long-conference",
-        0.119187
-      ],
-      [
-        "turn-puzzle",
-        0.118906
+        0.334048
       ],
       [
         "turn-guitar-lessons",
-        0.116495
+        0.174455
       ],
       [
-        "turn-desk-b",
-        0.112227
+        "turn-puzzle",
+        0.167682
+      ],
+      [
+        "turn-long-conference",
+        0.14973
       ],
       [
         "turn-camera",
-        0.106902
+        0.143427
+      ],
+      [
+        "turn-desk-b",
+        0.138391
+      ],
+      [
+        "turn-french-school",
+        0.130276
+      ],
+      [
+        "turn-long-meeting",
+        0.125036
       ]
     ],
     "what did I say about the marketing specialist job": [
       [
         "turn-job-marketing",
-        0.55872
-      ],
-      [
-        "turn-long-meeting",
-        0.212313
-      ],
-      [
-        "turn-podcast",
-        0.2098
-      ],
-      [
-        "turn-names-people",
-        0.197586
+        0.502589
       ],
       [
         "turn-flight-delay",
-        0.196672
+        0.252704
       ],
       [
-        "turn-promotion",
-        0.195872
+        "turn-long-meeting",
+        0.242368
       ],
       [
-        "turn-keyboard-don't",
-        0.195109
+        "turn-houseplant-tip",
+        0.224265
       ],
       [
         "turn-budget-spreadsheet",
-        0.192403
+        0.219772
+      ],
+      [
+        "turn-podcast",
+        0.217298
+      ],
+      [
+        "turn-volunteer",
+        0.21679
+      ],
+      [
+        "turn-names-people",
+        0.215335
+      ],
+      [
+        "turn-guitar-lessons",
+        0.213477
       ],
       [
         "turn-desk-b",
-        0.188853
-      ],
-      [
-        "turn-camera",
-        0.17963
+        0.211943
       ]
     ],
     "who gave the compression talk at the conference": [
       [
         "turn-long-conference",
-        0.664485
+        0.595883
       ],
       [
         "turn-long-roadtrip",
-        0.414492
-      ],
-      [
-        "turn-coffee-shop",
-        0.330927
-      ],
-      [
-        "turn-names-people",
-        0.325823
+        0.369195
       ],
       [
         "turn-houseplant-tip",
-        0.322894
+        0.339531
       ],
       [
         "turn-long-meeting",
-        0.314192
-      ],
-      [
-        "turn-plant-a",
-        0.299341
+        0.323908
       ],
       [
         "turn-volunteer",
-        0.296165
+        0.32092
       ],
       [
-        "turn-garden-tomatoes",
-        0.292606
+        "turn-timestamp-meeting",
+        0.320442
+      ],
+      [
+        "turn-names-people",
+        0.311372
+      ],
+      [
+        "turn-flight-delay",
+        0.30069
       ],
       [
         "turn-desk-b",
-        0.292606
+        0.29488
+      ],
+      [
+        "turn-coffee-shop",
+        0.292832
       ]
     ],
     "marketing specialist startup lessons": [
       [
         "turn-job-marketing",
-        0.582727
-      ],
-      [
-        "turn-paris-trip",
-        0.112227
-      ],
-      [
-        "turn-sister-dog",
-        0.109722
-      ],
-      [
-        "turn-coffee-shop",
-        0.107441
+        0.522231
       ],
       [
         "turn-guitar-lessons",
-        0.105353
+        0.165339
       ],
       [
         "turn-names-people",
-        0.105353
+        0.134915
       ],
       [
-        "turn-allergy",
-        0.033333
+        "turn-french-school",
+        0.130276
       ],
       [
-        "turn-bike-commute",
-        0.033333
+        "turn-recipe-lasagna",
+        0.124596
       ],
       [
-        "turn-book-club",
-        0.033333
+        "turn-sister-dog",
+        0.119762
       ],
       [
-        "turn-budget-spreadsheet",
-        0.033333
+        "turn-timestamp-meeting",
+        0.118182
+      ],
+      [
+        "turn-paris-trip",
+        0.117929
+      ],
+      [
+        "turn-flight-delay",
+        0.114351
+      ],
+      [
+        "turn-coffee-shop",
+        0.113841
       ]
     ],
     "office fiddle leaf fig": [
       [
         "turn-plant-a",
-        0.717163
+        0.644943
       ],
       [
         "turn-plant-b",
-        0.611013
+        0.57853
       ],
       [
         "turn-plant-c",
-        0.359057
-      ],
-      [
-        "turn-book-club",
-        0.114996
-      ],
-      [
-        "turn-german-train",
-        0.112227
-      ],
-      [
-        "turn-numbers-invoice",
-        0.112227
+        0.354366
       ],
       [
         "turn-volunteer",
-        0.112227
-      ],
-      [
-        "turn-puzzle",
-        0.107441
-      ],
-      [
-        "turn-bike-commute",
-        0.105353
+        0.174287
       ],
       [
         "turn-guitar-lessons",
-        0.105353
+        0.165339
+      ],
+      [
+        "turn-puzzle",
+        0.158302
+      ],
+      [
+        "turn-long-meeting",
+        0.146169
+      ],
+      [
+        "turn-french-school",
+        0.130276
+      ],
+      [
+        "turn-recipe-lasagna",
+        0.124596
+      ],
+      [
+        "turn-numbers-invoice",
+        0.119803
       ]
     ],
     "the hazelnut coffee creamer coupon": [
       [
         "turn-coffee-creamer",
-        0.764373
-      ],
-      [
-        "turn-long-roadtrip",
-        0.250531
+        0.685373
       ],
       [
         "turn-long-meeting",
-        0.224641
+        0.252694
       ],
       [
-        "turn-garden-tomatoes",
-        0.216667
+        "turn-graph-target",
+        0.24529
       ],
       [
-        "turn-car-repair",
-        0.183024
+        "turn-long-roadtrip",
+        0.237013
       ],
       [
-        "turn-long-conference",
-        0.166337
-      ],
-      [
-        "turn-coffee-shop",
-        0.165902
-      ],
-      [
-        "turn-dentist-appointment",
-        0.165902
-      ],
-      [
-        "turn-houseplant-tip",
-        0.162167
+        "turn-graph-control",
+        0.232574
       ],
       [
         "turn-flight-delay",
-        0.162167
+        0.21976
+      ],
+      [
+        "turn-timestamp-meeting",
+        0.213528
+      ],
+      [
+        "turn-houseplant-tip",
+        0.211823
+      ],
+      [
+        "turn-graph-neighbor",
+        0.206473
+      ],
+      [
+        "turn-garden-tomatoes",
+        0.195778
+      ]
+    ],
+    "lighthouse keeper aurora Kelso Sound": [
+      [
+        "turn-priority-target",
+        0.648703
+      ],
+      [
+        "turn-priority-control",
+        0.603248
+      ],
+      [
+        "turn-car-repair",
+        0.186668
+      ],
+      [
+        "turn-french-school",
+        0.184508
+      ],
+      [
+        "turn-recipe-lasagna",
+        0.182331
+      ],
+      [
+        "turn-flight-delay",
+        0.167055
+      ],
+      [
+        "turn-timestamp-meeting",
+        0.165855
+      ],
+      [
+        "turn-houseplant-tip",
+        0.159118
+      ],
+      [
+        "turn-puzzle",
+        0.151901
+      ],
+      [
+        "turn-budget-spreadsheet",
+        0.136324
+      ]
+    ],
+    "quail migration route survey near the delta": [
+      [
+        "turn-cycle-target",
+        0.779397
+      ],
+      [
+        "turn-cycle-control",
+        0.738488
+      ],
+      [
+        "turn-plant-a",
+        0.223655
+      ],
+      [
+        "turn-long-roadtrip",
+        0.216626
+      ],
+      [
+        "turn-flight-delay",
+        0.203438
+      ],
+      [
+        "turn-long-conference",
+        0.202114
+      ],
+      [
+        "turn-timestamp-meeting",
+        0.198764
+      ],
+      [
+        "turn-houseplant-tip",
+        0.195501
+      ],
+      [
+        "turn-long-meeting",
+        0.19066
+      ],
+      [
+        "turn-paris-trip",
+        0.179597
+      ]
+    ],
+    "apprentice welder night shift inspection fire drill": [
+      [
+        "turn-graph-target",
+        0.733562
+      ],
+      [
+        "turn-graph-control",
+        0.708486
+      ],
+      [
+        "turn-graph-neighbor",
+        0.371293
+      ],
+      [
+        "turn-coffee-creamer",
+        0.17892
+      ],
+      [
+        "turn-flight-delay",
+        0.158894
+      ],
+      [
+        "turn-long-meeting",
+        0.152864
+      ],
+      [
+        "turn-puzzle",
+        0.143503
+      ],
+      [
+        "turn-french-school",
+        0.130276
+      ],
+      [
+        "turn-plant-c",
+        0.128156
+      ],
+      [
+        "turn-recipe-lasagna",
+        0.124596
       ]
     ]
   }

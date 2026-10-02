@@ -3,7 +3,7 @@
 Exercises ``search_hybrid`` / ``recall`` with ``collapse_key=`` against a real
 SQLite store, plus unit coverage of the pure collapse/normalize helpers.
 
-Covers, per the acceptance criteria:
+Covers:
 
 * API surface + ``collapse_key=None`` candidate/score/order parity.
 * Recall-neutrality (never drop a distinct unit, never surface a non-candidate).
@@ -17,7 +17,7 @@ Covers, per the acceptance criteria:
 * ``collapse_max_per_unit`` deep-backfill retention: keeping N>1 members of a
   unit (deeper same-unit rows) while distinct deeper units still backfill —
   the ``None`` default staying byte-identical to single-keeper collapse, plus
-  the deeper-pool cliff regression this repairs.
+  the deeper-pool cliff case.
 """
 
 from __future__ import annotations
@@ -174,8 +174,8 @@ class TestCollapseRankedByUnit:
         # 'b' missing -> own unit, survives.
         assert _collapse_ranked_by_unit(ranked, keys) == ranked
 
-    def test_d8_order_preserved(self) -> None:
-        """Survivor order follows the input D8 order; no re-sort is introduced."""
+    def test_ranking_order_preserved(self) -> None:
+        """Survivor order follows the input ranking order; no re-sort is introduced."""
         ranked = [("z", 0.9), ("y", 0.8), ("x", 0.7)]
         keys: dict[str, tuple[object, ...] | None] = {
             "z": ("u1",),
@@ -234,8 +234,8 @@ class TestRetainRankedByUnit:
         }
         assert _retain_ranked_by_unit(ranked, keys, max_per_unit=5) == ranked
 
-    def test_d8_order_preserved_under_retention(self) -> None:
-        """Survivor order follows the input D8 order under N>1 retention too."""
+    def test_ranking_order_preserved_under_retention(self) -> None:
+        """Survivor order follows the input ranking order under N>1 retention too."""
         ranked = [("z", 0.9), ("y", 0.8), ("x", 0.7), ("w", 0.6)]
         keys: dict[str, tuple[object, ...] | None] = {
             "z": ("u1",),
@@ -368,7 +368,7 @@ class TestBestPerUnitBackfill:
         assert len(returned) == 5
 
     async def test_keeper_is_highest_ranked_member(self, store: SqliteEngravaCore) -> None:
-        """The retained member of a unit is its highest-D8-ranked fragment.
+        """The retained member of a unit is its highest-ranked fragment.
 
         Both fragments share the same essence (equal BM25); the keeper is made
         unambiguous via the priority signal (P1 boosts ``strong`` above
@@ -852,7 +852,7 @@ class TestMaxPerUnitNoneParity:
 
 
 class TestDeepBackfillCliffRegression:
-    """A3 — the per-defect regression: deeper distinct unit + deeper answer chunk.
+    """A3 — a deeper distinct unit and a deeper answer chunk.
 
     Fully controlled ranks via the exhaustive vector arm (a ``no-fts-match``
     query text isolates the vector arm, so BM25 length normalization never
@@ -877,7 +877,7 @@ class TestDeepBackfillCliffRegression:
             await s.store_embedding(tid, vec)
 
     async def test_today_none_path_misses_deeper_distinct_unit(self, tmp_path: Path) -> None:
-        """BEFORE (default path): the distinct deeper unit is unreachable.
+        """Default path (no ``collapse_key``): the distinct deeper unit is unreachable.
 
         ``collapse_key=None`` never widens the pool, so with ``vector_top_k=2``
         the candidate set is only the two strongest ``u1`` fragments and the
@@ -902,11 +902,11 @@ class TestDeepBackfillCliffRegression:
             await conn.close()
 
     async def test_today_single_keeper_drops_deeper_answer_chunk(self, tmp_path: Path) -> None:
-        """BEFORE (single-keeper collapse): the long turn's deeper answer chunk is dropped.
+        """Single-keeper collapse (no ``collapse_max_per_unit``) drops the deeper answer chunk.
 
         ``collapse_key`` widens the pool (so ``u2-best`` is reachable) but keeps
         exactly one row per unit, so the deeper ``u1-ans`` answer chunk is
-        evicted in favour of ``u1-top`` — the ss-assistant regression pattern.
+        evicted in favour of ``u1-top``.
         """
         conn = await aiosqlite.connect(str(tmp_path / "cliff_keeper.db"))
         conn.row_factory = aiosqlite.Row
@@ -930,11 +930,11 @@ class TestDeepBackfillCliffRegression:
             await conn.close()
 
     async def test_h_a_surfaces_distinct_unit_and_keeps_answer_chunk(self, tmp_path: Path) -> None:
-        """AFTER (H-A on, N>=2): distinct deeper unit present AND answer chunk kept.
+        """H-A on, N>=2: distinct deeper unit present AND answer chunk kept.
 
         The widened pool still reaches ``u2-best`` (distinct-unit backfill), and
         raising the retention depth to 2 keeps the deeper ``u1-ans`` answer chunk
-        alongside ``u1-top`` — repairing both halves of the defect at once.
+        alongside ``u1-top``.
         """
         conn = await aiosqlite.connect(str(tmp_path / "cliff_ha.db"))
         conn.row_factory = aiosqlite.Row
@@ -1135,3 +1135,48 @@ class TestMaxPerUnitComposition:
         assert len(refl_in_final) <= 1
         # No duplicate ids across the retention + cap backfill stages.
         assert len(returned) == len(set(returned))
+
+
+# ---------------------------------------------------------------------------
+# Query-less fallback honours collapse_key too
+# ---------------------------------------------------------------------------
+
+
+class TestFallbackCollapse:
+    """The all-signals-off fallback must collapse by unit exactly like an
+    ordinary FTS/vector-active search — a fallback result is still a result.
+    """
+
+    async def test_fallback_collapses_repeated_unit_fragments(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        """No query text, no vector: still one keeper per unit, backfilled."""
+        # Distinct single-fragment units first, unit u1's many fragments last —
+        # with every row tied on the fallback's flat score, the query-less
+        # window is ordered most-recently-written first, so u1's fragments
+        # alone would fill the top-5 window.
+        for u in range(2, 6):
+            await store.create_thought(
+                _thought(f"u{u}", essence="upsilon", metadata={"unit": f"u{u}"})
+            )
+        for i in range(6):
+            await store.create_thought(
+                _thought(f"u1-{i}", essence="upsilon", metadata={"unit": "u1"})
+            )
+        # Empty query_text + no vector + no priority/recency arm -> the
+        # query-less fallback (neither FTS nor vector active).
+        result = await store.search_hybrid(
+            "",
+            top_k=5,
+            collapse_key="$.unit",
+            priority_weight=0.0,
+        )
+        assert "fts5" not in result.backends_used
+        assert "vector" not in result.backends_used
+        returned = _ids(result.results)
+        units_seen = [tid.split("-")[0] for tid in returned]
+        # Exactly one u1 survivor; the rest are distinct backfilled units.
+        # Without collapse-by-unit the window would be 5 raw u1-* fragments.
+        assert units_seen.count("u1") == 1
+        assert set(units_seen) == {"u1", "u2", "u3", "u4", "u5"}
+        assert len(returned) == 5

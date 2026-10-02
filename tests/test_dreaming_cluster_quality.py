@@ -256,8 +256,88 @@ class TestClusterCohesion:
         vectors = [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
         assert cluster_cohesion_score(vectors) == pytest.approx(1 / 3)
 
+    def test_non_unit_vectors_produce_true_cosine_not_dot_product(self) -> None:
+        # Same direction, different magnitudes (as a non-normalising
+        # provider such as HuggingFaceProvider / OllamaProvider /
+        # OpenAICompatibleProvider / CallbackProvider would return): the
+        # raw dot product (6.0) is not even in the [-1, 1] range a cosine
+        # can take.
+        vec_a = [3.0, 0.0]
+        vec_b = [2.0, 0.1]
+        score = cluster_cohesion_score([vec_a, vec_b])
+        raw_dot_product = sum(x * y for x, y in zip(vec_a, vec_b, strict=False))
+        assert raw_dot_product == pytest.approx(6.0)
+        assert -1.0 <= score <= 1.0
+        assert score == pytest.approx(0.9987523388778448)
+
+    def test_magnitude_alone_does_not_inflate_cohesion(self) -> None:
+        # Two members scaled by very different factors but pointing in
+        # the same direction must score identically to their unit-length
+        # equivalents: cohesion is direction-only, not magnitude-sensitive.
+        unit_pair_score = cluster_cohesion_score([[1.0, 0.0], [1.0, 0.0]])
+        scaled_pair_score = cluster_cohesion_score([[50.0, 0.0], [0.01, 0.0]])
+        assert scaled_pair_score == pytest.approx(unit_pair_score)
+        assert scaled_pair_score == pytest.approx(1.0)
+
+    def test_zero_length_vector_contributes_deliberate_zero(self) -> None:
+        # A zero vector has no direction, so its cosine with anything is
+        # undefined; the gate deliberately treats that pair's contribution
+        # as 0.0 rather than raising or guessing a value.
+        zero = [0.0, 0.0, 0.0]
+        nonzero = [1.0, 2.0, 3.0]
+        assert cluster_cohesion_score([zero, nonzero]) == pytest.approx(0.0)
+        assert cluster_cohesion_score([zero, zero]) == pytest.approx(0.0)
+
+    def test_already_normalised_vectors_unaffected(self) -> None:
+        # For THIS pair, whose squared components happen to sum to exactly
+        # 1.0 in float64 (0.6**2 + 0.8**2 == 1.0 with no rounding error),
+        # dividing by the norm is dividing by 1.0 and changes nothing. That
+        # is a property of this specific pair, not a general guarantee for
+        # every already-normalised provider — see
+        # test_already_normalised_pair_pinned_exact_not_approx below for a
+        # pair whose norm is *not* exactly 1.0 after rounding, where the
+        # two scores differ by one representable bit.
+        unit_a = [0.6, 0.8]
+        unit_b = [0.8, 0.6]
+        raw_dot_product = sum(x * y for x, y in zip(unit_a, unit_b, strict=False))
+        assert cluster_cohesion_score([unit_a, unit_b]) == pytest.approx(raw_dot_product)
+        assert cluster_cohesion_score([unit_a, unit_b]) == pytest.approx(0.96)
+
+    def test_already_normalised_pair_pinned_exact_not_approx(self) -> None:
+        # Exact-equality pin for an already-normalising provider:
+        # [0.7071067811865475]*2 is, to
+        # float64 precision, a unit vector, but its norm computes to
+        # 0.9999999999999999, not exactly 1.0. Dividing by that norm shifts
+        # the score by one representable bit relative to the raw dot
+        # product. A pytest.approx comparison cannot see a one-ULP
+        # difference (its default tolerance is far coarser); exact equality
+        # can, so a future change to the normalisation arithmetic that
+        # widens, removes, or reintroduces this difference is visible here
+        # instead of silently absorbed.
+        unit_a = [0.7071067811865475, 0.7071067811865475]
+        unit_b = [1.0, 0.0]
+        raw_dot_product = sum(x * y for x, y in zip(unit_a, unit_b, strict=False))
+        assert raw_dot_product == 0.7071067811865475
+        score = cluster_cohesion_score([unit_a, unit_b])
+        assert score == 0.7071067811865476
+        assert score != raw_dot_product
+
 
 class TestIsLowCohesion:
+    def test_magnitude_disagreement_case_admits_before_rejects_after(self) -> None:
+        # This is the case that shows the normalisation matters: a
+        # large-magnitude member paired with a mostly-orthogonal,
+        # small-magnitude member. A raw dot product (1.5) would clear the
+        # 0.40 threshold and admit the pair; the true cosine (~0.29) is below
+        # it and rejects the pair.
+        vec_c = [5.0, 0.0]
+        vec_d = [0.3, 1.0]
+        raw_dot_product = sum(x * y for x, y in zip(vec_c, vec_d, strict=False))
+        assert raw_dot_product == pytest.approx(1.5)  # as a score: NOT low cohesion
+        is_loose, score = is_low_cohesion([vec_c, vec_d], cohesion_threshold=0.40)
+        assert score == pytest.approx(0.2873478855663454)
+        assert is_loose is True
+
     def test_high_cohesion_pass(self) -> None:
         vec = [1.0, 0.0, 0.0]
         is_loose, score = is_low_cohesion([vec, vec])
@@ -295,6 +375,48 @@ class TestIsLowCohesion:
         is_loose, score = is_low_cohesion([[1.0, 0.0]])
         assert is_loose is False
         assert score == pytest.approx(1.0)
+
+    def test_nan_paired_with_zero_vector_now_rejects_not_admits(self) -> None:
+        # A member vector containing nan, paired with a member vector whose
+        # own norm is exactly zero, scores 0.0 (0.0 < threshold is True for
+        # any positive threshold, so the cluster is rejected). A raw dot
+        # product would score nan (nan * 0.0 is nan; nan < threshold is
+        # False, so the cluster would be admitted).
+        is_loose, score = is_low_cohesion([[float("nan")], [0.0]], cohesion_threshold=0.40)
+        assert score == 0.0
+        assert is_loose is True
+
+    def test_inf_paired_with_zero_vector_now_rejects_not_admits(self) -> None:
+        # Like the nan case above: inf * 0.0 is nan in a raw dot product
+        # (which would admit the cluster); this pair scores 0.0 instead
+        # (rejected).
+        is_loose, score = is_low_cohesion([[float("inf")], [0.0]], cohesion_threshold=0.40)
+        assert score == 0.0
+        assert is_loose is True
+
+    def test_overflowing_antiparallel_pair_now_admits_not_rejects(self) -> None:
+        # The opposite-direction case: an anti-parallel pair whose
+        # magnitudes overflow float64 would score -inf as a raw dot product
+        # (1e200 * -1e200 overflows straight to -inf), which is rejected,
+        # since -inf is below any threshold. Here both norms also overflow
+        # to inf, and -inf / inf is nan, which is neither below nor above any
+        # threshold, so the cluster is admitted instead.
+        import math
+
+        is_loose, score = is_low_cohesion([[1e200], [-1e200]], cohesion_threshold=0.40)
+        assert math.isnan(score)
+        assert is_loose is False
+
+    def test_overflowing_orthogonal_pair_stays_rejected(self) -> None:
+        # Not every overflowing pair changes: this orthogonal pair's dot
+        # product is exactly 0.0 (not an inf/inf or 0*inf shape), so it
+        # scores 0.0 — and stays rejected — under both formulas.
+        is_loose, score = is_low_cohesion(
+            [[1e200, 0.0], [0.0, 1e200]],
+            cohesion_threshold=0.40,
+        )
+        assert score == 0.0
+        assert is_loose is True
 
 
 # ---------------------------------------------------------------------------

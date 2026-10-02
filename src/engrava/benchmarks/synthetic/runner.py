@@ -15,9 +15,8 @@ surface for one acceptance criterion:
 
 Exit code is ``0`` iff all four binding ACs pass, ``1`` if any
 binding AC fails, ``2`` if the embeddings extras are missing.
-Reference-hardware walltime is ~5 minutes (AC-11 v0.3.0 ceiling is
-300 seconds; a follow-up evaluator-optimisation workstream tightens
-to 120 seconds).
+Reference-hardware walltime is ~5 minutes (the opt-in walltime test,
+enabled with ``BENCH_SLOW=1``, asserts at most 360 seconds).
 
 Pass ``--with-reproducibility`` to additionally print a
 **reproducibility snapshot** on the bundled frozen
@@ -91,11 +90,9 @@ _DEFAULT_TOP_K = 5
 # ---------------------------------------------------------------------------
 
 _AC9A_FLOOR = 0.80
-# AC-9b v0.3.0 tolerance per spec v1.6 amendment: pre-amendment ceiling
-# was 0.02 but empirically REFLECTIONs displace direct-retrieval OBS at
-# ``reflection_boost=1.0`` (multiplier, not toggle).  Measured 0.033 on
-# the curated direct subset post-NA-1; 0.05 carries a 34 % safety
-# margin.  Follow-up evaluator-ranking workstream tightens back to 0.02.
+# AC-9b direct-neutrality ceiling.  REFLECTIONs displace direct-retrieval
+# OBS at ``reflection_boost=1.0`` (multiplier, not toggle).  Measured 0.033
+# on the curated direct subset; 0.05 carries a 34 % safety margin.
 _AC9B_CEILING = 0.05
 _AC8_CEILING = 0.05
 
@@ -149,7 +146,7 @@ class _BindingResult:
     value: float
     threshold: float
     passed: bool
-    rule_text: str  # e.g. ">= 0.80" or "<= 0.02"
+    rule_text: str  # e.g. ">= 0.80" or "<= 0.05"
 
 
 @dataclass(frozen=True)
@@ -628,10 +625,10 @@ def _as_int(value: object) -> int:
 
 def _as_bool(value: object) -> bool:
     # Strict — reject anything that is not a literal JSON ``true`` /
-    # ``false``.  Pre-fix this coerced via ``bool(value)`` which
-    # silently turned every truthy string (including the literal
-    # ``"false"``) into ``True``, corrupting the self-anchored
-    # provenance contract on malformed datasets.
+    # ``false``.  Coercing via ``bool(value)`` would silently turn every
+    # truthy string (including the literal ``"false"``) into ``True``,
+    # corrupting the self-anchored provenance contract on malformed
+    # datasets.
     if not isinstance(value, bool):
         msg = f"expected JSON boolean, got {type(value).__name__}"
         raise SystemExit(msg)

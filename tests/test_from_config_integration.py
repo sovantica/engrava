@@ -150,7 +150,7 @@ class TestFromConfig:
         reflects availability: a live ``SqliteVecSearchBackend`` when the
         package imports, or ``None`` (numpy fallback) when it does not.
         """
-        from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
+        from engrava.infrastructure.sqlite.vector_sqlite_vec import SqliteVecSearchBackend
 
         sqlite_vec_available = importlib.util.find_spec("sqlite_vec") is not None
 

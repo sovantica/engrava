@@ -6,23 +6,76 @@ a *withheld* promise drifts just as quietly, because nothing fails when the docs
 keep claiming safety the code stopped providing. Every claim on that page that
 can be exercised in-process is pinned here, in both directions:
 
-* **Guarantees** — an edit writes only the columns it owns, so two edits to
-  different fields both survive; a confirmation bump is relative, so it survives
-  a second connection.
-* **Non-guarantees** — the read-modify-write inside ``update_thought`` is not a
-  critical section, so a competing edit to the same field is silently discarded;
-  ``StaleDataError`` fires only when a competing writer moved ``updated_cycle``,
-  and the edge/action write paths carry no version guard at all; a state-machine
-  check is made against the row the call read, so two legal transitions can
-  compose into a forbidden one; a ``suspend_auto_commit`` window belongs to the
-  store instance, not to the task that opened it; and nothing that orders
-  operations inside one store reaches a second store on the same file.
+* **Guarantees** — an edit writes only the columns it owns, so two *sequential*
+  edits to different fields both survive; a confirmation bump is relative, so
+  it survives a second connection; the in-process task-reentrant write lock
+  (see ``TestInProcessCriticalSection`` below) makes the read, the validation,
+  and the write of ``update_thought`` / ``restore_thought`` / ``update_edge`` /
+  ``update_action`` one critical section **across genuinely concurrent tasks**
+  on this instance; ``suspend_auto_commit()`` genuinely excludes every other
+  task's guarded write for its duration; and **every guarded update's
+  row-version check is enforced in the database itself** (the ``revision``
+  guard, carried by ``update_thought``, ``restore_thought``, ``update_edge``
+  and ``update_action``), so it also catches a competing write from a
+  *different store on the same file* (``TestTwoStoresOneFile`` below) as
+  well as from a different task on this instance.
+* **Non-guarantees** — same-field edits still resolve last-write-wins when
+  nothing else moved the row's ``revision`` in between (the correct outcome
+  for two genuine, sequential edits); and a same-*task* nested call reached
+  through a caller-owned hook, not a second ``asyncio`` task, is unaffected
+  by the task-scoped write lock — but the ``revision`` guard catches it,
+  because ``revision`` moves on *every* guarded write to a row, whatever
+  field it touched, with no caller action required to arm it.
+  ``TestOneStoreManyTasks`` below uses the single-task ``_interleave_once``
+  stand-in for that same-task shape; there the second write raises
+  ``StaleDataError`` before anything is written.
+* **The dedup probe-and-insert window** — the content-hash window
+  (``create_thought(deduplicate=True)``, ``get_or_create``,
+  ``upsert_by_hash``) orders across a second store on the same file: it opens
+  with ``BEGIN IMMEDIATE``, so a second store reaching the same window while it
+  is open cannot even start its own transaction. It waits out ordinary
+  contention and, only past a bounded number of retries, raises
+  ``WriteContentionError`` instead of racing the probe. This is independent of
+  the ``revision`` guard — it orders the probe itself, not a later guarded
+  update.
 
-The interleavings are deterministic. The single-store cases reuse the one-shot
-seam from ``test_partial_field_updates`` to run the competing write at the exact
-point between an operation's read and its write; the transaction-window case is
-driven by :class:`asyncio.Event` handshakes. No test depends on wall-clock timing
-or on how the event loop happens to schedule.
+Three interleaving techniques are used, deliberately kept apart:
+
+* ``TestOneStoreManyTasks`` / ``TestEdgeAndActionUpdatesCarryARevisionGuard`` /
+  ``TestStateMachineChecksUseTheStateThisCallRead`` reuse the one-shot seam from
+  ``test_partial_field_updates`` (``_interleave_once``) to run a competing
+  operation **inline, on the same task**, at the exact point between an
+  operation's read and its write. This is a same-task TOCTOU stand-in, not a
+  second ``asyncio`` task — the write lock's task-reentrancy deliberately
+  does not block it (that is what makes a write issued from inside the
+  caller's own ``suspend_auto_commit`` complete instead of deadlocking) — but
+  the ``revision`` guard rejects it.
+* ``TestInProcessCriticalSection`` and ``TestSuspendAutoCommitIsStoreWide`` use
+  genuinely separate ``asyncio.Task`` objects, paused at a precise point via
+  :class:`asyncio.Event` handshakes — these are the cases the task-reentrant
+  write lock actually changes.
+* ``TestTwoStoresOneFile`` uses two independent store instances sharing one
+  database file to exercise the guard **across connections** — the shape a
+  second process has. A second store's competing edit is rejected, not
+  silently overwritten.
+
+Between the tasks of one test, ordering comes from :class:`asyncio.Event`
+handshakes and from the FIFO ordering ``asyncio`` guarantees for
+``call_soon``/``Event.set()`` callbacks, apart from the four tests below, which
+depend on a time bound:
+
+* ``test_a_child_task_awaited_inside_the_window_raises_instead_of_hanging``
+  sets the write lock's acquire bound to 0.05 s and expects it to expire.
+* ``test_a_slow_legitimate_batch_embed_does_not_time_out_a_waiting_writer``
+  simulates a 0.2 s embedding call and passes only if the writer waiting behind
+  it acquires the lock inside the 2 s bound the test sets.
+* ``test_deduplication_across_stores_raises_instead_of_duplicating`` and
+  ``test_confirmation_counting_across_stores_now_raises_instead_of_racing``
+  set the second store's SQLite busy timeout to 20 ms and expect its attempts
+  to run out.
+
+``TestWriteLockAcquireBoundDefault`` pins the production default of the write
+lock's acquire bound, which the first two tests override.
 """
 
 from __future__ import annotations
@@ -37,8 +90,10 @@ from engrava import (
     ActionRecord,
     ActionStatus,
     ActionType,
+    DeriveGates,
     EdgeRecord,
     EdgeType,
+    InvalidTransitionError,
     KnowledgeSource,
     LifecycleStatus,
     Priority,
@@ -47,7 +102,11 @@ from engrava import (
     ThoughtRecord,
     ThoughtType,
     VerificationStatus,
+    WriteContentionError,
+    WriteLockTimeoutError,
 )
+from engrava.infrastructure.sqlite.engrava_core import _WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS
+from tests.test_derived_records_seam import ListProducer, _child, _source
 from tests.test_partial_field_updates import _interleave_once
 
 if TYPE_CHECKING:
@@ -124,6 +183,67 @@ async def _thought_ids(db: aiosqlite.Connection) -> list[str]:
     return [row["thought_id"] for row in await cursor.fetchall()]
 
 
+def _pause_after_first_call(
+    store: SqliteEngravaCore,
+    method_name: str,
+) -> tuple[asyncio.Event, asyncio.Event]:
+    """Patch ``method_name`` so its *first* call pauses after returning.
+
+    Unlike ``_interleave_once`` (which runs the competing operation inline, on
+    the calling task, and is the right tool for the same-task TOCTOU stand-in
+    used elsewhere in this module), this parks the **calling task itself** —
+    still holding whatever lock it acquired to get this far — right after the
+    wrapped method's first call returns, until a second, genuinely separate
+    task releases it. That makes it possible to launch a real concurrent
+    ``asyncio.Task`` while the first task is provably still inside its own
+    critical section, and to observe what that second task can and cannot do
+    while it waits.
+
+    Args:
+        store: The store whose method is patched (in place, on the instance).
+        method_name: Name of the (async, no-side-effect-on-args) method to
+            pause after its first invocation. Typically a read such as
+            ``_get_thought_row``.
+
+    Returns:
+        A ``(paused, resume)`` pair: ``paused`` is set once the first call has
+        returned its result and is about to block; the caller must ``.set()``
+        ``resume`` to let it continue.
+
+    """
+    original = getattr(store, method_name)
+    paused = asyncio.Event()
+    resume = asyncio.Event()
+    fired = False
+
+    async def wrapper(*args: object, **kwargs: object) -> object:
+        nonlocal fired
+        result = await original(*args, **kwargs)
+        if not fired:
+            fired = True
+            paused.set()
+            await resume.wait()
+        return result
+
+    setattr(store, method_name, wrapper)
+    return paused, resume
+
+
+def _write_lock_is_held(store: SqliteEngravaCore) -> bool | None:
+    """Return whether ``store._write_lock`` is held, or ``None`` if it does not exist.
+
+    ``None`` on a store that has no ``_write_lock`` attribute, so a
+    caller can skip the check gracefully instead of raising ``AttributeError``
+    partway through an ``asyncio.Event`` handshake — which would strand the
+    paused task forever, waiting on a ``resume`` event nothing would go on to
+    set.
+    """
+    write_lock = getattr(store, "_write_lock", None)
+    if write_lock is None:
+        return None
+    return bool(write_lock._lock.locked())
+
+
 async def _connect(path: str) -> aiosqlite.Connection:
     """Open a connection configured the way ``from_config`` configures one."""
     conn = await aiosqlite.connect(path)
@@ -182,20 +302,17 @@ async def two_stores(
 class TestOneStoreManyTasks:
     """What sharing a single store between concurrent tasks does and does not buy."""
 
-    async def test_interleaved_edits_to_different_fields_both_survive(
+    async def test_interleaved_edits_to_different_fields_now_reject_the_second(
         self,
         store: SqliteEngravaCore,
         db: aiosqlite.Connection,
     ) -> None:
-        """Two edits that touch different columns do not overwrite each other.
+        """An interleaved edit to a different column is rejected too, not merged.
 
-        The guarantee the docs state: an update writes only the columns the
-        operation gave a new value to, so a competing edit landing between this
-        one's read and its write is preserved as long as the two edits do not
-        name the same field. The guarantee has an exception, pinned by
-        ``test_a_competing_cycle_stamp_rejects_an_edit_to_a_different_field``
-        below: a competing writer who moves ``updated_cycle`` trips the version
-        guard and this update is rejected outright, different field or not.
+        ``revision`` moves on **every** guarded write, whatever field it
+        touched, so this call's guard — captured against the row it read,
+        before the competing edit landed — no longer matches. The whole update
+        is rejected: even the essence field this call owns is not written.
         """
         await store.create_thought(_thought())
         landed: list[str] = []
@@ -206,26 +323,27 @@ class TestOneStoreManyTasks:
 
         _interleave_once(store, "_get_thought_row", _competing_edit)
 
-        await store.update_thought("t-1", essence="mine")
+        with pytest.raises(StaleDataError):
+            await store.update_thought("t-1", essence="mine")
 
         # Precondition: the competing edit really reached storage first.
         assert landed == [Priority.P1.value]
         row = await _row(db, "t-1")
-        assert row["essence"] == "mine"
+        assert row["essence"] == "essence"
         assert row["priority"] == Priority.P1.value
 
-    async def test_interleaved_edits_to_one_field_keep_only_the_later_write(
+    async def test_interleaved_edits_to_one_field_now_reject_the_second(
         self,
         store: SqliteEngravaCore,
         db: aiosqlite.Connection,
     ) -> None:
-        """A competing edit to the same field is discarded, silently.
+        """A competing edit to the same field is caught, not silently discarded.
 
-        The non-guarantee. ``update_thought`` reads the row, evolves it in
-        memory, then writes — and aiosqlite serialises *statements*, not method
-        bodies, so a second task's whole update can land in that window. The
-        write that issues its UPDATE last wins and the other is gone, with no
-        error and nothing in the row to show it ever happened.
+        ``update_thought`` reads the row, evolves it in memory, then writes.
+        A same-task hook (``_interleave_once``) runs a competing update right
+        after the read. The outer call's guard no longer matches once that
+        update has bumped ``revision``, so it raises ``StaleDataError``
+        instead of silently winning.
         """
         await store.create_thought(_thought())
         landed: list[str] = []
@@ -236,29 +354,29 @@ class TestOneStoreManyTasks:
 
         _interleave_once(store, "_get_thought_row", _competing_edit)
 
-        returned = await store.update_thought("t-1", essence="from this task")
+        with pytest.raises(StaleDataError):
+            await store.update_thought("t-1", essence="from this task")
 
         # Precondition: the competing edit really reached storage first, so the
-        # assertion below is about it being overwritten, not about it never
+        # assertion below is about it surviving unclobbered, not about it never
         # having happened.
         assert landed == ["from the other task"]
         row = await _row(db, "t-1")
-        assert row["essence"] == "from this task"
-        assert returned.essence == "from this task"
+        assert row["essence"] == "from the other task"
 
     async def test_a_competing_cycle_stamp_rejects_an_edit_to_a_different_field(
         self,
         store: SqliteEngravaCore,
         db: aiosqlite.Connection,
     ) -> None:
-        """The version guard is on every update, so it rejects unrelated edits too.
+        """The revision guard is on every update, so it rejects unrelated edits too.
 
-        This is the limit of the "different fields both survive" guarantee. The
-        competing writer here touches **only** ``updated_cycle``; this call
-        touches only ``essence``. They share no column — and the edit is still
-        rejected, because the guard is part of every update's ``WHERE`` clause,
-        not something that fires only when the two edits collide. Nothing of the
-        rejected update reaches storage.
+        This is one instance of the general rule pinned by the two tests
+        above: the competing writer here touches **only** ``updated_cycle``;
+        this call touches only ``essence``. They share no column — and the
+        edit is still rejected, because ``revision`` bumps on every guarded
+        write regardless of which columns it touches. Nothing of the rejected
+        update reaches storage.
         """
         await store.create_thought(_thought())
 
@@ -310,7 +428,7 @@ class TestOneStoreManyTasks:
         assert exc_info.value.entity_id == "t-1"
         assert exc_info.value.expected_version == 0
 
-    async def test_upsert_by_hash_overwrites_a_competing_edit_without_raising(
+    async def test_upsert_by_hash_now_raises_on_a_competing_edit(
         self,
         store: SqliteEngravaCore,
         db: aiosqlite.Connection,
@@ -319,8 +437,10 @@ class TestOneStoreManyTasks:
 
         ``upsert_by_hash`` documents ``StaleDataError`` for a row modified
         between its probe and its update. It inherits ``update_thought``'s
-        guard, so an ordinary competing edit passes straight through it: the
-        upsert's value overwrites the competing one and no error is raised.
+        guard: the competing edit bumps
+        ``revision`` between the probe and the upsert's own guarded write, so
+        the upsert's write matches no row and raises — the competing edit's
+        value survives untouched rather than being silently overwritten.
         """
         await store.create_thought(_thought(content="shared content"))
         landed: list[str] = []
@@ -331,31 +451,36 @@ class TestOneStoreManyTasks:
 
         _interleave_once(store, "_get_thought_row", _competing_edit)
 
-        await store.upsert_by_hash(
-            _thought("t-unused", essence="from the upsert", content="shared content"),
-        )
+        with pytest.raises(StaleDataError):
+            await store.upsert_by_hash(
+                _thought("t-unused", essence="from the upsert", content="shared content"),
+            )
 
         # Precondition: the competing edit really reached storage first.
         assert landed == ["from the other task"]
         row = await _row(db, "t-1")
-        assert row["essence"] == "from the upsert"
+        assert row["essence"] == "from the other task"
         assert await _thought_ids(db) == ["t-1"]
 
 
-class TestEdgeAndActionUpdatesCarryNoVersionGuard:
-    """The other update paths have the window too, and not even the cycle guard."""
+class TestEdgeAndActionUpdatesCarryARevisionGuard:
+    """``update_edge`` rejects a competing edit with ``StaleDataError``.
 
-    async def test_interleaved_edge_edits_to_one_field_keep_only_the_later_write(
+    An ``update_edge`` call that changes a column writes through a
+    ``revision``-guarded ``UPDATE``, so a competing edit that landed after
+    the row was read raises ``StaleDataError`` rather than being discarded.
+    ``update_action`` also writes through a ``revision``-guarded ``UPDATE``
+    when its status changes;
+    ``test_interleaved_action_moves_now_reject_before_landing`` below
+    exercises that case.
+    """
+
+    async def test_interleaved_edge_edits_to_one_field_now_reject_the_second(
         self,
         store: SqliteEngravaCore,
         db: aiosqlite.Connection,
     ) -> None:
-        """``update_edge`` is keyed on the id alone, so it cannot reject anything.
-
-        Thought updates at least carry an ``updated_cycle`` guard, narrow as it
-        is. The edge write path carries none, so a competing edit is discarded
-        with nothing that could ever have flagged it.
-        """
+        """``update_edge``'s guard rejects a competing edit instead of losing it."""
         await store.create_thought(_thought("t-1"))
         await store.create_thought(_thought("t-2", content="the other end"))
         await store.create_edge(_edge())
@@ -370,30 +495,42 @@ class TestEdgeAndActionUpdatesCarryNoVersionGuard:
 
         _interleave_once(store, "_get_edge_row", _competing_edit)
 
-        await store.update_edge("e-1", weight=0.1)
+        with pytest.raises(StaleDataError):
+            await store.update_edge("e-1", weight=0.1)
 
         # Precondition: the competing edit really reached storage first.
         assert landed == [0.9]
         cursor = await db.execute("SELECT weight FROM edge WHERE edge_id = 'e-1'")
         row = await cursor.fetchone()
         assert row is not None
-        assert row["weight"] == 0.1
+        assert row["weight"] == 0.9
 
 
 class TestStateMachineChecksUseTheStateThisCallRead:
-    """A lifecycle check that already passed is not re-checked against storage."""
+    """A lifecycle check that already passed is not re-checked against storage.
 
-    async def test_interleaved_lifecycle_moves_can_produce_a_forbidden_state(
+    Two legal transitions read against a stale snapshot could compose into a
+    state the machine forbids. The guarded write's ``revision`` check catches
+    the second call before its already-validated transition can land, so the
+    forbidden composite state is not reachable this way.
+    """
+
+    async def test_interleaved_lifecycle_moves_now_reject_before_landing(
         self,
         store: SqliteEngravaCore,
         db: aiosqlite.Connection,
     ) -> None:
-        """Two legal transitions compose into one the state machine forbids.
+        """The second, stale-validated write is rejected, not merely mis-validated.
 
-        ``update_thought`` validates the transition against the record *it*
-        read. A competing writer moving the row in between does not invalidate
-        that check, so ``ACTIVE -> DONE`` can land on a row that is already
-        ``ARCHIVED`` — and ``ARCHIVED -> DONE`` is not an allowed edge.
+        ``update_thought`` still validates the transition against the record
+        *it* read — a competing writer moving the row in between does not
+        invalidate that in-memory check. The guarded write is what stops it:
+        ``ACTIVE -> DONE``, validated against the pre-interleave ``ACTIVE``
+        snapshot, would land on a row already moved to ``ARCHIVED`` (and
+        ``ARCHIVED -> DONE`` is not an allowed edge) — but the guarded
+        ``UPDATE`` matches no row, since ``revision`` moved when the competing
+        archive landed, so nothing is written and ``StaleDataError`` is
+        raised instead.
         """
         await store.create_thought(_thought())
         landed: list[str] = []
@@ -404,25 +541,29 @@ class TestStateMachineChecksUseTheStateThisCallRead:
 
         _interleave_once(store, "_get_thought_row", _competing_archive)
 
-        await store.update_thought("t-1", lifecycle_status=LifecycleStatus.DONE)
+        with pytest.raises(StaleDataError):
+            await store.update_thought("t-1", lifecycle_status=LifecycleStatus.DONE)
 
         # Precondition: the row really was ARCHIVED when the second write landed.
         assert landed == [LifecycleStatus.ARCHIVED.value]
         row = await _row(db, "t-1")
-        assert row["lifecycle_status"] == LifecycleStatus.DONE.value
-        # ...and that edge is not one the state machine would have allowed.
+        assert row["lifecycle_status"] == LifecycleStatus.ARCHIVED.value
+        # ...and that edge is not one the state machine would have allowed,
+        # which is exactly why the rejection matters here.
         assert not LifecycleStatus.ARCHIVED.can_transition_to(LifecycleStatus.DONE)
 
-    async def test_interleaved_action_moves_can_produce_a_forbidden_state(
+    async def test_interleaved_action_moves_now_reject_before_landing(
         self,
         store: SqliteEngravaCore,
         db: aiosqlite.Connection,
     ) -> None:
-        """The same hole in the action state machine.
+        """The same rule in the action state machine.
 
-        ``PLANNED -> BLOCKED`` is validated against the read state, so it lands
-        on a row another writer already moved to ``EXECUTING`` — and
-        ``EXECUTING -> BLOCKED`` is not an allowed edge.
+        ``PLANNED -> BLOCKED`` is validated against the read state, which
+        would land on a row another writer already moved to
+        ``EXECUTING`` (``EXECUTING -> BLOCKED`` is not an allowed edge) — but
+        ``update_action``'s own ``revision`` guard rejects the write
+        first.
         """
         await store.create_thought(_thought())
         await store.create_action(_action())
@@ -435,18 +576,746 @@ class TestStateMachineChecksUseTheStateThisCallRead:
             assert row is not None
             landed.append(row["status"])
 
-        _interleave_once(store, "_get_action", _competing_start)
+        _interleave_once(store, "_get_action_row", _competing_start)
 
-        await store.update_action("a-1", status=ActionStatus.BLOCKED)
+        with pytest.raises(StaleDataError):
+            await store.update_action("a-1", status=ActionStatus.BLOCKED)
 
         # Precondition: the row really was EXECUTING when the second write landed.
         assert landed == [ActionStatus.EXECUTING.value]
         cursor = await db.execute("SELECT status FROM action WHERE action_id = 'a-1'")
         row = await cursor.fetchone()
         assert row is not None
-        assert row["status"] == ActionStatus.BLOCKED.value
-        # ...and that edge is not one the state machine would have allowed.
+        assert row["status"] == ActionStatus.EXECUTING.value
+        # ...and that edge is not one the state machine would have allowed,
+        # which is exactly why the rejection matters here.
         assert not ActionStatus.EXECUTING.can_transition_to(ActionStatus.BLOCKED)
+
+
+# ---------------------------------------------------------------------------
+# An in-process task-reentrant lock across two real tasks
+# ---------------------------------------------------------------------------
+
+
+class TestInProcessCriticalSection:
+    """A task-reentrant ``_write_lock`` makes the read-validate-write span atomic.
+
+    The tests here that use ``_pause_after_first_call`` launch a **second,
+    genuine ``asyncio.Task``** while the first is paused between its own read
+    and its own write — not the same-task ``_interleave_once`` stand-in used
+    elsewhere in this module. The second task cannot start its own read
+    until the first task's entire critical section — read, validate, write,
+    read-back, journal, commit — has completed, because both go through the
+    same ``SqliteEngravaCore._write_lock``.
+    """
+
+    async def test_a_second_tasks_read_now_sees_the_firsts_committed_write(
+        self,
+        store: SqliteEngravaCore,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """Two tasks editing the **same field**: the second's read is never stale.
+
+        The discriminating fact is not the row's *final* contents — last write
+        wins for two genuine, independent edits either way — it is what task
+        B's own internal read (inside its own ``update_thought`` call)
+        observed. B's call cannot begin its own read until A's write lock is
+        released, which happens only once A's write is durable — so B's read
+        sees A's committed essence, never the pre-A one.
+
+        Every ``_get_thought_row`` call's essence is recorded, in order, to
+        make that observable. The order is deterministic, not a scheduling
+        gamble: task creation via ``asyncio.ensure_future`` schedules the new
+        task's first step with ``call_soon``, and ``resume.set()`` schedules
+        the paused task's continuation the same way — both calls happen
+        inside ``_task_b``, in that fixed order, so ``asyncio``'s FIFO
+        ``call_soon`` ordering guarantees B's task starts running (up to its
+        own first suspension point, inside its own read) before A's
+        continuation runs.
+        """
+        await store.create_thought(_thought())
+        reads: list[str] = []
+        paused = asyncio.Event()
+        resume = asyncio.Event()
+        original_get_thought_row = store._get_thought_row
+        fired = False
+
+        async def _tracking_get_thought_row(thought_id: str) -> object:
+            nonlocal fired
+            row = await original_get_thought_row(thought_id)
+            if row is not None:
+                reads.append(row["essence"])
+            if not fired:
+                fired = True
+                paused.set()
+                await resume.wait()
+            return row
+
+        setattr(store, "_get_thought_row", _tracking_get_thought_row)  # noqa: B010 -- mypy rejects a direct method-assign here
+
+        async def _task_a() -> ThoughtRecord:
+            return await store.update_thought("t-1", essence="from A")
+
+        async def _task_b() -> ThoughtRecord:
+            await paused.wait()
+            # A is parked right after its own read, still holding the write
+            # lock for the rest of its critical section (`_write_lock_is_held`
+            # returns None when the store has no `_write_lock`; the check is
+            # then skipped rather than raised, which would strand `_task_a` on
+            # `resume.wait()` -- see its docstring).
+            held = _write_lock_is_held(store)
+            if held is not None:
+                assert held, (
+                    "task A must still hold _write_lock while paused between "
+                    "its own read and its own write"
+                )
+            b_task = asyncio.ensure_future(store.update_thought("t-1", essence="from B"))
+            resume.set()
+            return await b_task
+
+        a_result, b_result = await asyncio.gather(_task_a(), _task_b())
+
+        # reads[0] is A's own initial read (the original, pre-edit essence);
+        # reads[1] is B's own initial read -- the one this test is about.
+        assert reads[0] == "essence"
+        assert reads[1] == "from A", (
+            "task B's own read must see task A's already-committed essence, "
+            f"not a stale value -- full read order was {reads!r}"
+        )
+        assert a_result.essence == "from A"
+        assert b_result.essence == "from B"
+        row = await _row(db, "t-1")
+        assert row["essence"] == "from B"
+
+    async def test_a_committed_cycle_stamp_no_longer_spuriously_rejects_a_pending_edit(
+        self,
+        store: SqliteEngravaCore,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """A committed cycle stamp does not reject a pending unrelated edit.
+
+        Task A stamps ``updated_cycle`` while task B edits the essence. B's
+        read cannot happen until A's stamp is already durable, so B's guard is
+        captured against the *post-A* value and matches when B writes: B's
+        edit is not rejected with ``StaleDataError``, even though A's stamp
+        landed while B was pending.
+        """
+        await store.create_thought(_thought())
+        paused, resume = _pause_after_first_call(store, "_get_thought_row")
+
+        async def _task_a() -> ThoughtRecord:
+            return await store.update_thought("t-1", updated_cycle=5)
+
+        async def _task_b() -> ThoughtRecord:
+            await paused.wait()
+            held = _write_lock_is_held(store)
+            if held is not None:
+                assert held
+            b_task = asyncio.ensure_future(store.update_thought("t-1", essence="from B"))
+            resume.set()
+            return await b_task
+
+        a_result, b_result = await asyncio.gather(_task_a(), _task_b())
+
+        assert a_result.updated_cycle == 5
+        assert b_result.essence == "from B"
+        # B's own guard picked up A's already-committed cycle stamp.
+        assert b_result.updated_cycle == 5
+        row = await _row(db, "t-1")
+        assert row["updated_cycle"] == 5
+        assert row["essence"] == "from B"
+
+    async def test_a_committed_lifecycle_move_is_what_the_next_transition_validates_against(
+        self,
+        store: SqliteEngravaCore,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """Two tasks moving one row's state machine: the second sees the first's move.
+
+        B's read cannot happen until task A's ``ACTIVE -> ARCHIVED`` move is
+        durable, so B's ``ACTIVE -> DONE`` move is validated against the row A
+        actually left behind (``ARCHIVED``) and is rejected, because
+        ``ARCHIVED -> DONE`` is not an allowed transition.
+        """
+        await store.create_thought(_thought())
+        paused, resume = _pause_after_first_call(store, "_get_thought_row")
+
+        async def _task_a() -> ThoughtRecord:
+            return await store.update_thought("t-1", lifecycle_status=LifecycleStatus.ARCHIVED)
+
+        async def _task_b() -> ThoughtRecord:
+            await paused.wait()
+            held = _write_lock_is_held(store)
+            if held is not None:
+                assert held
+            b_task = asyncio.ensure_future(
+                store.update_thought("t-1", lifecycle_status=LifecycleStatus.DONE)
+            )
+            resume.set()
+            return await b_task
+
+        outcomes = await asyncio.gather(_task_a(), _task_b(), return_exceptions=True)
+        a_outcome, b_outcome = outcomes
+        assert not isinstance(a_outcome, BaseException)
+        assert isinstance(b_outcome, InvalidTransitionError)
+
+        # A's legal move landed; B's illegal composite move never reached storage.
+        row = await _row(db, "t-1")
+        assert row["lifecycle_status"] == LifecycleStatus.ARCHIVED.value
+        assert not LifecycleStatus.ARCHIVED.can_transition_to(LifecycleStatus.DONE)
+
+    async def test_two_tasks_editing_different_fields_still_survive_each_other(
+        self,
+        store: SqliteEngravaCore,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """Serialising the critical sections does not reject unrelated edits.
+
+        Two genuinely concurrent tasks editing **different** fields of the
+        same row both land — the lock serialises the two critical sections
+        (one runs, then the other), it does not reject or drop either edit.
+        """
+        await store.create_thought(_thought())
+        paused, resume = _pause_after_first_call(store, "_get_thought_row")
+
+        async def _task_a() -> ThoughtRecord:
+            return await store.update_thought("t-1", essence="from A")
+
+        async def _task_b() -> ThoughtRecord:
+            await paused.wait()
+            b_task = asyncio.ensure_future(store.update_thought("t-1", priority=Priority.P1))
+            resume.set()
+            return await b_task
+
+        a_result, b_result = await asyncio.gather(_task_a(), _task_b())
+
+        assert a_result.essence == "from A"
+        assert b_result.priority == Priority.P1
+        row = await _row(db, "t-1")
+        # Both edits landed: neither serialised call clobbered the other's column.
+        assert row["essence"] == "from A"
+        assert row["priority"] == Priority.P1.value
+
+    async def test_a_write_issued_inside_suspend_auto_commit_completes(
+        self,
+        store: SqliteEngravaCore,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """Re-entrancy: a write inside the caller's own window does not deadlock.
+
+        A plain (non-reentrant) lock around ``suspend_auto_commit`` would
+        deadlock the moment the caller issues a write of its own from inside
+        the window, because that write also acquires ``_write_lock``. The lock
+        is task-reentrant, so this completes instead.
+        """
+        async with store.suspend_auto_commit():
+            created = await store.create_thought(_thought("t-inside", content="written inside"))
+            updated = await store.update_thought("t-inside", essence="edited inside the window")
+
+        assert created.thought_id == "t-inside"
+        assert updated.essence == "edited inside the window"
+        row = await _row(db, "t-inside")
+        assert row["essence"] == "edited inside the window"
+
+    async def test_a_child_task_awaited_inside_the_window_raises_instead_of_hanging(
+        self,
+        store: SqliteEngravaCore,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """Contract violation: spawning and awaiting a writer from inside the window.
+
+        Re-entrancy is keyed on the *task*, not the call: a task the window's
+        own task spawns (``asyncio.create_task``, ``gather``, ``wait_for``, an
+        ``on_store`` hook or embedding provider callback that does the same)
+        is a different task, so it cannot reuse the window's re-entrant grant.
+        If the window's own task then awaits that child before its window
+        closes, neither can make progress: the child can never get the lock
+        the parent holds, and the parent can never release it while still
+        awaiting the child. This is already out of the documented contract —
+        drive every write inside an open ``suspend_auto_commit`` window from
+        the one task that opened it — so the failure mode this test pins is
+        not "this becomes supported", it is "violating it raises a typed,
+        catchable error instead of hanging the process forever with nothing
+        in any log to explain why".
+
+        ``_acquire_timeout_seconds`` is set short here purely so the test
+        does not wait out the real, generous production bound; the mechanism
+        is identical either way — a real deadlock never resolves on its own,
+        so any positive bound eventually fires.
+        """
+        store._write_lock._acquire_timeout_seconds = 0.05
+
+        async def _window() -> None:
+            async with store.suspend_auto_commit():
+                await store.create_thought(_thought("t-window", content="the window's own row"))
+                # A task the window's own task spawns and then awaits before
+                # the window closes -- the exact deadlock shape. The child
+                # can never acquire `_write_lock` (the parent holds it and
+                # is not the same task), and the parent cannot finish (and
+                # release it) while still awaiting the child.
+                child = asyncio.create_task(
+                    store.create_thought(_thought("t-child", content="from a spawned task"))
+                )
+                await child
+
+        with pytest.raises(WriteLockTimeoutError):
+            await _window()
+
+        # The deadlock ending in a raise, not a hang, is also what lets the
+        # window's own task resume and roll back cleanly: nothing from this
+        # attempt is left durable, and the store is still usable afterward.
+        assert await _thought_ids(db) == []
+        recovered = await store.create_thought(_thought("t-after", content="store still works"))
+        assert recovered.thought_id == "t-after"
+
+    async def test_a_slow_legitimate_batch_embed_does_not_time_out_a_waiting_writer(
+        self,
+        store: SqliteEngravaCore,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """The acquire bound must survive real, network-bound embedding latency.
+
+        ``bulk_store``'s batch embedding call runs *inside*
+        ``suspend_auto_commit``'s window, which holds ``_write_lock`` for its
+        whole duration — so the lock's acquire bound has to clear that
+        legitimate, genuinely slow round trip, not just "ordinary" contention.
+        An unrelated task's write must still succeed after waiting out the
+        slow-but-real embedding call driven below, not time out on it. The
+        embedding provider below is deliberately slower than the store's
+        configured bound would be *if it were sized wrong* (a plain
+        ``asyncio.sleep`` standing in for real network latency); the bound
+        configured here is sized to clear it, exactly as the derivation in
+        ``_WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS`` intends for the real default.
+
+        The final assertions alone would not discriminate: with ``_write_lock``
+        removed entirely, the unrelated writer would run immediately (never
+        blocked), finish long before the batch, and every assertion on the
+        final state would still pass — the lock could be doing nothing and
+        this test would not notice. ``order`` records the real sequence
+        instead: ``_db.commit`` is patched to log the moment the batch's
+        window actually closes (which is the only thing that releases
+        ``_write_lock`` here), and ``_get_thought_row`` is patched to log the
+        writer's own existence-check read for ``t-other`` specifically. The
+        assertion below requires the commit to precede that read, which is
+        only possible if the writer was genuinely blocked until the batch's
+        window closed.
+        """
+
+        class _SlowProvider:
+            """A provider whose batch call is slow but eventually succeeds."""
+
+            dimension = 3
+            model_name = "slow-test-model"
+
+            def __init__(self, embed_started: asyncio.Event, delay_seconds: float) -> None:
+                self._embed_started = embed_started
+                self._delay_seconds = delay_seconds
+
+            async def embed(self, text: str) -> list[float]:
+                return [0.1, 0.2, 0.3]
+
+            async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+                self._embed_started.set()
+                await asyncio.sleep(self._delay_seconds)
+                return [[0.1, 0.2, 0.3] for _ in texts]
+
+        embed_started = asyncio.Event()
+        embed_delay_seconds = 0.2
+        slow_store = SqliteEngravaCore(
+            db,
+            embedding_provider=_SlowProvider(embed_started, embed_delay_seconds),
+            auto_embed=True,
+            # Comfortably above the artificial delay above, standing in for a
+            # bound correctly sized to the provider's real worst case -- the
+            # point under test is that clearing it lets the waiting writer
+            # through rather than timing out.
+            write_lock_acquire_timeout_seconds=embed_delay_seconds * 10,
+        )
+
+        order: list[str] = []
+        original_commit = slow_store._db.commit
+
+        async def _tracking_commit() -> None:
+            order.append("bulk-commit")
+            await original_commit()
+
+        setattr(slow_store._db, "commit", _tracking_commit)  # noqa: B010 -- mypy rejects a direct method-assign here
+
+        original_get_thought_row = slow_store._get_thought_row
+
+        async def _tracking_get_thought_row(thought_id: str) -> object:
+            if thought_id == "t-other":
+                order.append("writer-read")
+            return await original_get_thought_row(thought_id)
+
+        setattr(slow_store, "_get_thought_row", _tracking_get_thought_row)  # noqa: B010 -- mypy rejects a direct method-assign here
+
+        async def _bulk() -> list[ThoughtRecord]:
+            return await slow_store.bulk_store([_thought("t-bulk-1", content="batch content")])
+
+        async def _unrelated_writer() -> ThoughtRecord:
+            await embed_started.wait()
+            # The batch embedding call is now in flight, holding `_write_lock`
+            # for the whole `suspend_auto_commit` window. This call must wait
+            # out the artificial delay above and still succeed.
+            return await slow_store.create_thought(
+                _thought("t-other", content="unrelated content"),
+            )
+
+        bulk_result, writer_result = await asyncio.gather(_bulk(), _unrelated_writer())
+
+        assert bulk_result[0].thought_id == "t-bulk-1"
+        assert writer_result.thought_id == "t-other"
+        assert set(await _thought_ids(db)) == {"t-bulk-1", "t-other"}
+        # The writer's own create_thought call (auto_embed=True on this
+        # store too) contributes further commits of its own after its read,
+        # so the exact count is not asserted -- only that at least one
+        # commit (the batch's) precedes the writer's read, and that the
+        # read itself is not the very first event.
+        assert "bulk-commit" in order, f"expected a batch commit to be observed -- got {order!r}"
+        assert "writer-read" in order, (
+            f"expected the writer's own read to be observed -- got {order!r}"
+        )
+        assert order.index("writer-read") > order.index("bulk-commit"), (
+            "the unrelated writer's own read must be provably ordered after "
+            f"the batch's window released the lock -- got {order!r}"
+        )
+
+    async def test_nested_suspend_auto_commit_inner_exit_does_not_commit_early(
+        self,
+        store: SqliteEngravaCore,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """Nesting failure 1: a clean inner exit must not commit the outer window.
+
+        Only the outermost ``suspend_auto_commit`` call commits; an inner
+        block's clean exit shares the outer window's transaction and does not
+        commit it. This raises *after* the inner block exits and checks that
+        the eventual rollback still discards everything, including what the
+        inner block wrote.
+        """
+
+        async def _run() -> None:
+            async with store.suspend_auto_commit():
+                await store.create_thought(_thought("t-outer", content="outer, before nesting"))
+                async with store.suspend_auto_commit():
+                    await store.create_thought(_thought("t-inner", content="inner"))
+                # The inner block has already exited cleanly here. Had its exit
+                # committed, the two rows above would already be durable and
+                # the rollback below could not undo them.
+                msg = "abort after the nested block"
+                raise RuntimeError(msg)
+
+        with pytest.raises(RuntimeError, match="abort after the nested block"):
+            await _run()
+
+        assert await _thought_ids(db) == []
+
+    async def test_nested_suspend_auto_commit_finally_does_not_resume_autocommit(
+        self,
+        store: SqliteEngravaCore,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """Nesting failure 2: an inner exit must not resume per-call autocommit.
+
+        The inner block's exit leaves the outer window open, so per-call
+        autocommit stays suspended for the rest of the *outer* block. A write
+        placed *after* the nested block is therefore still inside the outer
+        window and rolls back with everything else.
+        """
+
+        async def _run() -> None:
+            async with store.suspend_auto_commit():
+                await store.create_thought(_thought("t-outer-1", content="before nesting"))
+                async with store.suspend_auto_commit():
+                    await store.create_thought(_thought("t-inner", content="inner"))
+                # Had the inner block's `finally` resumed per-call autocommit,
+                # this write would commit on its own, right here.
+                await store.create_thought(_thought("t-outer-2", content="after nesting"))
+                msg = "abort the whole outer window"
+                raise RuntimeError(msg)
+
+        with pytest.raises(RuntimeError, match="abort the whole outer window"):
+            await _run()
+
+        assert await _thought_ids(db) == []
+
+    async def test_dedup_probe_rollback_no_longer_discards_another_tasks_write(
+        self,
+        store: SqliteEngravaCore,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """A failed dedup window's rollback does not discard another task's write.
+
+        Task A opens the dedup probe-and-insert window
+        (``create_thought(deduplicate=True)``) and is driven to fail *inside*
+        it — by a natural id collision on the insert, not a monkeypatch —
+        forcing ``_serialize_dedup_probe``'s own rollback.
+        Task B's plain, unrelated write is proven not to ride along: it cannot
+        even start until A's whole window (including A's own rollback) has
+        closed, so it survives regardless of A's failure.
+        """
+        # A pre-existing row at the id A's dedup insert will collide on, with
+        # different content so the hash probe misses and the collision is
+        # only discovered once `_insert_new_thought_row` runs, inside the
+        # already-open `BEGIN IMMEDIATE` window.
+        await store.create_thought(_thought("t-a", content="pre-existing, different content"))
+        paused, resume = _pause_after_first_call(store, "_get_thought_by_content_hash")
+
+        async def _task_a() -> None:
+            with pytest.raises(ValueError, match="Thought already exists"):
+                await store.create_thought(
+                    _thought("t-a", content="dedup content that misses the probe"),
+                    deduplicate=True,
+                )
+
+        async def _task_b() -> ThoughtRecord:
+            await paused.wait()
+            held = _write_lock_is_held(store)
+            if held is not None:
+                assert held, "task A must still hold _write_lock inside the dedup window"
+            b_task = asyncio.ensure_future(
+                store.create_thought(_thought("t-b", content="unrelated content"))
+            )
+            resume.set()
+            return await b_task
+
+        _, b_result = await asyncio.gather(_task_a(), _task_b())
+
+        assert b_result.thought_id == "t-b"
+        # A's failed dedup insert contributed nothing; B's unrelated write is
+        # unaffected by A's rollback — both the pre-existing row and B's row
+        # are present, and nothing was discarded that should not have been.
+        assert set(await _thought_ids(db)) == {"t-a", "t-b"}
+
+    async def test_cleanup_expired_read_is_now_inside_its_own_critical_section(
+        self,
+        store: SqliteEngravaCore,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """The candidate SELECT runs under ``_write_lock``, not before it.
+
+        ``cleanup_expired`` reads the candidate ids inside the same lock
+        acquisition as the writes that act on them. Reading first and locking
+        afterwards would leave a gap in which a concurrent task extending a
+        thought's ``expires_at`` — or a suspended transaction exposing a value
+        it then rolls back — could land, and the call would archive or delete
+        a row that was no longer expired by the time it acted. This pins that
+        the read itself runs while the lock is held, not just the writes that
+        follow it.
+        """
+        await store.create_thought(
+            _thought("t-expired", content="already expired"),
+            expires_after_seconds=-100,
+        )
+        select_prefix = "SELECT thought_id FROM thought WHERE expires_at"
+        original_execute = store._db.execute
+        observed_lock_state: list[bool | None] = []
+
+        async def _tracking_execute(sql: str, *args: object, **kwargs: object) -> object:
+            if sql.strip().startswith(select_prefix):
+                observed_lock_state.append(_write_lock_is_held(store))
+            return await original_execute(sql, *args, **kwargs)
+
+        setattr(store._db, "execute", _tracking_execute)  # noqa: B010 -- mypy rejects a direct method-assign here
+
+        result = await store.cleanup_expired()
+
+        assert result.expired_count == 1
+        assert observed_lock_state == [True], (
+            "the candidate SELECT must run while _write_lock is held, not before "
+            f"it is acquired -- observed {observed_lock_state!r}"
+        )
+
+    async def test_derived_child_compensation_stays_under_the_same_lock(
+        self,
+        store: SqliteEngravaCore,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """A failed derived-child insert's unwind must not release the lock first.
+
+        ``_insert_derived_row`` wraps its insert and journal append in its own
+        ``_write_readback_savepoint`` unit, and that whole call — attempt and,
+        on failure, the unit's own ``ROLLBACK TO`` / ``RELEASE`` unwind — runs
+        inside one ``async with self._write_lock:`` acquisition. If the unwind
+        instead ran under a *fresh* acquisition taken after the failing
+        attempt's own lock had already released, a different, waiting task
+        could acquire the lock in that gap, join the still-open transaction,
+        and have its own successful write discarded once the unwind finally
+        ran — the exact cross-task exposure the write lock exists to close.
+        This pins that a waiting task's write still cannot land in that gap.
+        """
+        producer = ListProducer([_child("derived content")])
+        store_with_producer = SqliteEngravaCore(
+            db,
+            hooks=producer,
+            derive_gates=DeriveGates(enabled=False, on_error="raise"),
+            journal_enabled=True,
+        )
+        await store_with_producer.create_thought(_source("src-1"), deduplicate=False)
+
+        paused = asyncio.Event()
+        resume = asyncio.Event()
+        assert store_with_producer.journal is not None
+        original_append = store_with_producer.journal.append
+        call_count = 0
+
+        async def _failing_append(
+            mutation_type: str, target_id: str | None, delta: dict[str, object]
+        ) -> object:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                paused.set()
+                await resume.wait()
+                msg = "forced journal failure for the derived child's own insert"
+                raise RuntimeError(msg)
+            return await original_append(mutation_type, target_id, delta)
+
+        setattr(store_with_producer.journal, "append", _failing_append)  # noqa: B010 -- mypy rejects a direct method-assign here
+
+        async def _derive() -> None:
+            with pytest.raises(RuntimeError, match="forced journal failure"):
+                await store_with_producer.derive_existing("src-1")
+
+        async def _unrelated_writer() -> ThoughtRecord:
+            await paused.wait()
+            held = _write_lock_is_held(store_with_producer)
+            if held is not None:
+                assert held, (
+                    "the derived child's insert unit must still hold _write_lock "
+                    "while it unwinds, when a different task tries to acquire it"
+                )
+            writer_task = asyncio.ensure_future(
+                store_with_producer.create_thought(
+                    _thought("t-other", content="unrelated content"),
+                )
+            )
+            resume.set()
+            return await writer_task
+
+        _, writer_result = await asyncio.gather(_derive(), _unrelated_writer())
+
+        assert writer_result.thought_id == "t-other"
+        # The failed derived child never landed (its insert was unwound); the
+        # source and the unrelated writer's row are both present and
+        # unaffected by that unwind.
+        assert set(await _thought_ids(db)) == {"src-1", "t-other"}
+
+    async def test_derived_child_embed_failure_rolls_back_and_writer_survives(
+        self,
+        store: SqliteEngravaCore,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """An embedding failure *after* the row is written must not corrupt a writer.
+
+        A realistic post-DML failure here (a vec0 write failing right after the
+        ``embedding`` table row is already written) unwinds through
+        ``store_embedding``'s own ``_write_readback_savepoint`` unit -- no
+        compensation of any kind runs in ``_persist_derived_child`` itself for
+        the embed step (see its docstring). ``_persist_derived_child`` still
+        holds one continuous ``_write_lock`` acquisition spanning the whole
+        embed step, and ``store_embedding``'s own acquisition nests inside it
+        as a free re-entrant no-op (:class:`_TaskReentrantLock`), so that unit's
+        unwind runs under the *same* lock hold the failing write did, without
+        any special-casing: a waiting writer cannot land in the gap between the
+        failing write and its unwind.
+
+        This pins both required outcomes: the writer's row survives, and the
+        connection is left with no open transaction (the unwind actually ran
+        to completion rather than being skipped or raced).
+        """
+
+        class _WorkingEmbeddingProvider:
+            """A provider whose embed call always succeeds."""
+
+            dimension = 3
+            model_name = "test-model"
+
+            async def embed(self, text: str) -> list[float]:
+                return [0.1, 0.2, 0.3]
+
+            async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+                return [[0.1, 0.2, 0.3] for _ in texts]
+
+        producer = ListProducer([_child("derived content")])
+        store_with_producer = SqliteEngravaCore(
+            db,
+            hooks=producer,
+            derive_gates=DeriveGates(enabled=False, on_error="raise"),
+            auto_embed=True,
+            embedding_provider=_WorkingEmbeddingProvider(),
+        )
+        await store_with_producer.create_thought(_source("src-1"), deduplicate=False)
+
+        paused = asyncio.Event()
+        resume = asyncio.Event()
+        original_execute = store_with_producer._db.execute
+        embed_insert_count = 0
+
+        async def _failing_execute(sql: str, *args: object, **kwargs: object) -> object:
+            nonlocal embed_insert_count
+            if sql.strip().upper().startswith("INSERT INTO EMBEDDING"):
+                embed_insert_count += 1
+                if embed_insert_count == 1:
+                    # Let the derived child's own embedding row actually get
+                    # written -- the realistic failure point is *after* that,
+                    # not instead of it (e.g. the vec0 write that follows it).
+                    await original_execute(sql, *args, **kwargs)
+                    paused.set()
+                    await resume.wait()
+                    msg = "forced post-write embedding failure (simulating a vec0 failure)"
+                    raise RuntimeError(msg)
+            return await original_execute(sql, *args, **kwargs)
+
+        setattr(store_with_producer._db, "execute", _failing_execute)  # noqa: B010 -- mypy rejects a direct method-assign here
+
+        async def _derive() -> None:
+            with pytest.raises(RuntimeError, match="forced post-write embedding failure"):
+                await store_with_producer.derive_existing("src-1")
+
+        async def _unrelated_writer() -> ThoughtRecord:
+            await paused.wait()
+            held = _write_lock_is_held(store_with_producer)
+            if held is not None:
+                assert held, (
+                    "the embed phase's store_embedding unit must still hold "
+                    "_write_lock while it unwinds, when a different task tries "
+                    "to acquire it"
+                )
+            writer_task = asyncio.ensure_future(
+                store_with_producer.create_thought(
+                    _thought("t-other", content="unrelated content"),
+                )
+            )
+            resume.set()
+            return await writer_task
+
+        _, writer_result = await asyncio.gather(_derive(), _unrelated_writer())
+
+        assert writer_result.thought_id == "t-other"
+        # The unwind actually completed -- not skipped by a timeout on a fresh
+        # acquisition, and not raced by the writer's own commit closing the
+        # transaction first.
+        assert not db.in_transaction
+        # Per-child transaction isolation: the derived child's *row*
+        # already committed as its own durable unit in the insert phase --
+        # that is unaffected by a later embed-phase failure and correctly
+        # survives. What store_embedding's own unit unwinds is only its own
+        # not-yet-committed work: the embedding row never lands. The source
+        # and the unrelated writer's row are both present.
+        thought_ids = set(await _thought_ids(db))
+        remaining = thought_ids - {"src-1", "t-other"}
+        assert len(remaining) == 1, (
+            f"expected exactly the derived child's own row left over -- got {thought_ids!r}"
+        )
+        child_id = next(iter(remaining))
+        embedding_cursor = await db.execute(
+            "SELECT 1 FROM embedding WHERE owner_id = ?", (child_id,)
+        )
+        assert await embedding_cursor.fetchone() is None, (
+            "the derived child's embedding must not have survived the unwound embed phase"
+        )
 
 
 class TestOneStorePerEventLoop:
@@ -562,44 +1431,149 @@ class TestOneStorePerEventLoop:
 
 
 class TestSuspendAutoCommitIsStoreWide:
-    """An open transaction window captures every writer on that store instance."""
+    """A second task's write waits for the window instead of joining it.
 
-    async def test_another_tasks_write_is_rolled_back_with_the_window(
+    ``suspend_auto_commit`` holds :attr:`SqliteEngravaCore._write_lock`
+    — a task-reentrant lock — for its whole duration, so a *different* task's
+    guarded write cannot land inside the window's transaction. It
+    blocks until the window closes, then runs as its own, independent write.
+    """
+
+    async def test_another_tasks_write_now_waits_and_survives_the_window(
         self,
         store: SqliteEngravaCore,
         db: aiosqlite.Connection,
     ) -> None:
-        """A second task's unrelated write joins the window and dies with it.
+        """An unrelated write waits out the window and survives its rollback.
 
-        The deferred-commit flag lives on the store instance, so a write issued
-        by any task while the window is open is part of the window's
-        transaction. When the window rolls back it takes that write with it —
-        the other task saw no error and has no way to learn its write is gone.
-        The row committed before the window survives, which is what separates
-        "the rollback discarded the open transaction" from "the rollback
-        discarded everything".
+        ``suspend_auto_commit`` holds the task-reentrant write lock for its
+        whole duration: ``_unrelated_writer`` below cannot even start its own
+        read until ``_window``'s task has released it, which only happens once
+        the window has already rolled back.
+
+        The ordering is asserted directly, not inferred from the final state:
+        signalling ``window_open`` and then immediately raising does not, on
+        its own, prove the unrelated writer's operation started *after* the
+        rollback rather than being queued and simply resolved later with the
+        same end result either way. ``order`` records the real sequence:
+        ``store._db.rollback`` is patched to log when the window's own
+        rollback actually runs, and ``_get_thought_row`` is patched to log
+        the unrelated writer's own existence-check read (the first such read
+        after ``window_open`` fires — the window's own row was already
+        written before that point). The assertion below requires the
+        rollback to precede that read, which is only possible if the writer
+        was genuinely blocked until the window closed.
         """
         await store.create_thought(_thought("t-committed", content="committed earlier"))
         window_open = asyncio.Event()
-        other_written = asyncio.Event()
+        order: list[str] = []
+
+        original_rollback = store._db.rollback
+
+        async def _tracking_rollback() -> None:
+            order.append("window-rollback")
+            await original_rollback()
+
+        setattr(store._db, "rollback", _tracking_rollback)  # noqa: B010 -- mypy rejects a direct method-assign here
+
+        original_get_thought_row = store._get_thought_row
+        writer_read_logged = False
+
+        async def _tracking_get_thought_row(thought_id: str) -> object:
+            nonlocal writer_read_logged
+            if window_open.is_set() and not writer_read_logged:
+                writer_read_logged = True
+                order.append("writer-read")
+            return await original_get_thought_row(thought_id)
+
+        setattr(store, "_get_thought_row", _tracking_get_thought_row)  # noqa: B010 -- mypy rejects a direct method-assign here
 
         async def _window() -> None:
             async with store.suspend_auto_commit():
                 await store.create_thought(_thought("t-window", content="the window's own row"))
                 window_open.set()
-                await other_written.wait()
                 msg = "the window's own work failed"
                 raise RuntimeError(msg)
 
         async def _unrelated_writer() -> None:
             await window_open.wait()
+            # This call blocks on `_write_lock` until `_window`'s task releases
+            # it -- which happens only after the window has rolled back. A
+            # `gather` without `return_exceptions=True` would not wait for this
+            # task once `_window` raises (it does not cancel siblings), so the
+            # outcomes are collected explicitly below instead.
             await store.create_thought(_thought("t-other", content="an unrelated row"))
-            other_written.set()
 
-        with pytest.raises(RuntimeError, match="the window's own work failed"):
-            await asyncio.gather(_window(), _unrelated_writer())
+        outcomes = await asyncio.gather(_window(), _unrelated_writer(), return_exceptions=True)
+        window_outcome, writer_outcome = outcomes
+        assert isinstance(window_outcome, RuntimeError)
+        assert str(window_outcome) == "the window's own work failed"
+        assert writer_outcome is None
 
-        assert await _thought_ids(db) == ["t-committed"]
+        # The discriminating assertion: the writer's own read happened only
+        # after the window's rollback actually ran -- not merely that the
+        # final row set looks right, which a queued-then-resolved rollback
+        # could also produce.
+        assert order == ["window-rollback", "writer-read"], (
+            f"the unrelated writer's read must be provably ordered after the "
+            f"window's rollback, not merely consistent with it -- got {order!r}"
+        )
+
+        # The window's own row rolled back with it; the unrelated write, which
+        # had to wait for the window to close, was never part of that
+        # transaction and survives on its own.
+        assert set(await _thought_ids(db)) == {"t-committed", "t-other"}
+
+    async def test_cancellation_inside_the_window_releases_the_lock(
+        self,
+        store: SqliteEngravaCore,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """Cancelling a task mid-window rolls back and releases the RESERVED lock.
+
+        ``suspend_auto_commit`` catches ``except BaseException``, not only
+        ``except Exception``. ``asyncio.CancelledError`` derives from
+        ``BaseException``, so a cancellation landing inside the window (a
+        ``bulk_store`` call whose caller times out or is torn down, for
+        instance) must still roll the window back: skipping the rollback
+        would leave ``db.in_transaction`` ``True`` and the RESERVED lock
+        stranded, blocking every other writer on the connection until
+        something else eventually committed, rolled back, or closed it.
+
+        Driven by an ``asyncio.Event`` handshake rather than a sleep: the
+        window signals once its own row is written and it is parked, so the
+        cancellation lands deterministically mid-window instead of hoping a
+        delay was long enough.
+        """
+        window_started = asyncio.Event()
+
+        async def _window() -> None:
+            async with store.suspend_auto_commit():
+                await store.create_thought(_thought("t-cancelled", content="never durable"))
+                window_started.set()
+                await asyncio.Event().wait()  # never set; only cancellation ends this
+
+        task = asyncio.create_task(_window())
+        await window_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert not db.in_transaction, (
+            "the RESERVED lock was left stranded after cancellation inside suspend_auto_commit"
+        )
+        # Rolled back, not merely abandoned: the window's own row must not
+        # have survived the cancellation either.
+        assert await _thought_ids(db) == []
+
+        # The store must still be usable -- a stranded lock would make this
+        # hang (waiting on itself) or raise "cannot start a transaction
+        # within a transaction".
+        created = await store.create_thought(
+            _thought("t-after", content="proves the store still works"),
+        )
+        assert created.thought_id == "t-after"
+        assert await _thought_ids(db) == ["t-after"]
 
 
 # ---------------------------------------------------------------------------
@@ -608,19 +1582,27 @@ class TestSuspendAutoCommitIsStoreWide:
 
 
 class TestTwoStoresOneFile:
-    """Nothing that orders operations inside one store reaches a second store."""
+    """The ``revision`` guard orders guarded updates across stores.
 
-    async def test_an_edit_from_a_second_store_is_discarded_without_raising(
+    The ``revision`` guard lives in the database rather than in any
+    in-process lock, so it reaches across connections for the ordinary
+    read-modify-write paths. The dedup probe window (the two tests further
+    down) orders stores through the database's own write lock instead.
+    """
+
+    async def test_an_edit_from_a_second_store_is_now_caught_not_discarded(
         self,
         two_stores: tuple[SqliteEngravaCore, SqliteEngravaCore, aiosqlite.Connection],
     ) -> None:
-        """The lost update crosses the connection boundary unchanged.
+        """A lost update across the connection boundary raises an error.
 
-        Same window as the single-store case, but now the competing write comes
-        from a different connection — the shape a second process has. Between two
-        processes no in-process lock could close it even in principle, which is
-        why multiple stores writing one file is unsupported rather than merely
-        discouraged.
+        Same window as the single-store case, but the competing write comes
+        from a different connection — the shape a second process has. No
+        in-process lock could close this even in principle; the guard closes
+        it because it lives in the database itself: store A's guarded write
+        reads ``revision`` fresh at write time and finds store B's committed
+        bump, so it matches no row and raises ``StaleDataError`` instead of
+        silently overwriting.
         """
         store_a, store_b, conn_a = two_stores
         await store_a.create_thought(_thought())
@@ -632,26 +1614,37 @@ class TestTwoStoresOneFile:
 
         _interleave_once(store_a, "_get_thought_row", _edit_from_the_second_store)
 
-        await store_a.update_thought("t-1", essence="from the first store")
+        with pytest.raises(StaleDataError):
+            await store_a.update_thought("t-1", essence="from the first store")
 
         # Precondition: the second store's edit really committed, and the first
         # store's connection could see it.
         assert landed == ["from the second store"]
         row = await _row(conn_a, "t-1")
-        assert row["essence"] == "from the first store"
+        assert row["essence"] == "from the second store"
 
-    async def test_deduplication_still_inserts_a_duplicate_across_stores(
+    async def test_deduplication_across_stores_raises_instead_of_duplicating(
         self,
         two_stores: tuple[SqliteEngravaCore, SqliteEngravaCore, aiosqlite.Connection],
     ) -> None:
-        """``deduplicate=True`` is enforced by a lock that stops at the store.
+        """``deduplicate=True`` serialises across stores instead of racing.
 
-        Both stores probe the content hash, both miss, and both insert — so the
-        database ends up holding two rows for byte-identical content, neither
-        of them confirmation-counted, which is exactly what the flag was asked
-        to prevent.
+        The first store's probe-and-insert window holds the write lock
+        (``BEGIN IMMEDIATE``) for its duration; a second store reaching the
+        same window while it is open cannot even start its own transaction.
+        Forced — by this test's interleave — to stay open for the whole
+        nested call, the first store's window outlasts every retry the second
+        store makes, so the second store raises ``WriteContentionError``. That
+        exception then unwinds out of the interleaved call and rolls the first
+        store's own attempt back too: neither row lands, rather than one
+        succeeding partially.
         """
         store_a, store_b, conn_a = two_stores
+        # A short busy_timeout on the second store: its every attempt is
+        # doomed for as long as the first store's window stays open, which by
+        # construction is the whole interleaved call, so a longer timeout
+        # would only slow the test down, not change the outcome.
+        await store_b._db.execute("PRAGMA busy_timeout = 20")
 
         async def _insert_from_the_second_store() -> None:
             await store_b.create_thought(
@@ -661,30 +1654,32 @@ class TestTwoStoresOneFile:
 
         _interleave_once(store_a, "_get_thought_by_content_hash", _insert_from_the_second_store)
 
-        await store_a.create_thought(
-            _thought("t-a", content="identical content"),
-            deduplicate=True,
-        )
+        with pytest.raises(WriteContentionError):
+            await store_a.create_thought(
+                _thought("t-a", content="identical content"),
+                deduplicate=True,
+            )
 
-        assert await _thought_ids(conn_a) == ["t-a", "t-b"]
-        for thought_id in ("t-a", "t-b"):
-            row = await _row(conn_a, thought_id)
-            assert row["content"] == "identical content"
-            assert row["confirmation_count"] == 0
+        # Neither insert landed: the second store never got past
+        # ``BEGIN IMMEDIATE``, and the first store's own transaction was
+        # rolled back once the interleaved call raised into it.
+        assert await _thought_ids(conn_a) == []
 
-    async def test_confirmation_counting_survives_a_second_store(
+    async def test_confirmation_counting_across_stores_now_raises_instead_of_racing(
         self,
         two_stores: tuple[SqliteEngravaCore, SqliteEngravaCore, aiosqlite.Connection],
     ) -> None:
-        """A dedup hit counts relative to storage, so neither sighting is lost.
+        """A confirmation racing a second store's open window fails loudly.
 
-        The guarantee that does cross the connection boundary: the bump is
-        ``confirmation_count = confirmation_count + 1`` evaluated by SQLite, not
-        an absolute value derived from a read. Two stores confirming the same
-        content therefore both count.
+        The first store's window holds the write lock for its duration, so
+        the second store cannot even start counting while it is open; it
+        raises ``WriteContentionError``, which unwinds the first store's own
+        attempt too rather than leaving it half-applied.
         """
         store_a, store_b, conn_a = two_stores
         await store_a.create_thought(_thought(content="identical content"))
+        # See the previous test for why this needs a short busy_timeout.
+        await store_b._db.execute("PRAGMA busy_timeout = 20")
 
         async def _confirm_from_the_second_store() -> None:
             await store_b.create_thought(
@@ -694,11 +1689,63 @@ class TestTwoStoresOneFile:
 
         _interleave_once(store_a, "_get_thought_by_content_hash", _confirm_from_the_second_store)
 
-        await store_a.create_thought(
-            _thought("t-a", content="identical content"),
-            deduplicate=True,
-        )
+        with pytest.raises(WriteContentionError):
+            await store_a.create_thought(
+                _thought("t-a", content="identical content"),
+                deduplicate=True,
+            )
 
+        # Neither confirmation landed: the only row is the original insert,
+        # untouched.
         assert await _thought_ids(conn_a) == ["t-1"]
         row = await _row(conn_a, "t-1")
-        assert row["confirmation_count"] == 2
+        assert row["confirmation_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# The production default of the write lock's acquire bound
+# ---------------------------------------------------------------------------
+
+
+class TestWriteLockAcquireBoundDefault:
+    """The write lock's acquire bound defaults to 600 seconds, however the store is built.
+
+    The slow-embedding test and the deadlock test above override this bound so
+    that they finish quickly, so neither would notice the default drifting.
+    ``docs/api-reference.md`` states the figure: ``600.0`` in the
+    ``write_lock_acquire_timeout_seconds`` row of the constructor table and in
+    the ``from_config`` signature. It is sized to clear a slow but legitimate
+    hold -- ``bulk_store``'s batch embedding call runs inside
+    ``suspend_auto_commit``'s window with the lock held.
+
+    The two store tests read the bound off the lock the built store actually
+    holds, not off a declared default: a signature can keep ``600.0`` while
+    forwarding something else to the constructor.
+    """
+
+    def test_the_documented_default_is_600_seconds(self) -> None:
+        """The constant the constructor and ``from_config`` default to is ``600.0``."""
+        assert _WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS == 600.0
+
+    async def test_a_store_built_with_no_override_holds_the_default_bound(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """``SqliteEngravaCore(conn)`` gives its write lock the default bound."""
+        store = SqliteEngravaCore(db)
+
+        assert store._write_lock._acquire_timeout_seconds == _WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS
+
+    async def test_from_config_with_no_override_holds_the_default_bound(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """``from_config`` with no override gives the store's own write lock the default bound."""
+        config_path = tmp_path / "engrava.yaml"
+        config_path.write_text(f"database:\n  path: {tmp_path / 'store.db'}\n", encoding="utf-8")
+
+        store = await SqliteEngravaCore.from_config(config_path)
+        try:
+            assert store._write_lock._acquire_timeout_seconds == _WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS
+        finally:
+            await store.close()

@@ -1,0 +1,46 @@
+# engrava — "local" quick-start profile (sentence-transformers)
+#
+# Offline semantic search, entirely in-process — after a one-time download.
+# Needs the `engrava[embeddings-local]` extra, which pulls
+# `sentence-transformers` and `torch`. `torch` alone is the large part: its
+# current PyPI Linux/x86_64 wheel for Python 3.11
+# (torch-2.14.0-cp311-cp311-manylinux_2_28_x86_64.whl) measured 554.6 MB on
+# 2026-09-16; `sentence-transformers` itself is a <1 MB wheel but brings in
+# `transformers`, `tokenizers`, and `huggingface_hub` on top, so the extra's
+# total download exceeds `torch` alone. The model named below
+# (`all-MiniLM-L6-v2`) is a further, separate download — measured 88 MB on
+# disk under `~/.cache/huggingface/hub` after the first call that uses it —
+# and is cached there afterwards.
+#
+# Once both the dependency install and that first model load are done, later
+# `embed()` calls run in-process with no network call — BUT only once two
+# environment variables are set: `HF_HUB_OFFLINE=1` and
+# `TRANSFORMERS_OFFLINE=1`. Verified against this exact profile with the
+# network unreachable: with an already-warm cache and those two variables
+# unset, loading the model still raises (the underlying `transformers`
+# library issues a HEAD request checking for a PEFT adapter config on every
+# load, cache or not, and does not fall back to the cache silently when that
+# request fails). With both variables set, the same load and query succeed
+# with no network reachable at all. Set them before your process starts.
+#
+# Trade-off versus `network`: this profile pays a large one-time cost
+# (dependency install + first model load) and needs the two offline
+# environment variables above, in exchange for never needing a reachable
+# service again. `network` (Ollama) pays no local download but needs that
+# service reachable at query time.
+#
+# See docs/configuration.md#quick-start-profiles.
+
+database:
+  path: "./engrava.db"
+  wal_mode: true
+
+embeddings:
+  provider: sentence-transformer
+  model: all-MiniLM-L6-v2
+  auto_embed: true
+
+extensions:
+  vector:
+    backend: numpy
+    dimension: 384

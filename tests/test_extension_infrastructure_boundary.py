@@ -28,10 +28,13 @@ contract.
 from __future__ import annotations
 
 import ast
+import importlib
 import inspect
+import sys
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
 
@@ -70,6 +73,7 @@ _DREAMING_STORE_CAPABILITIES = {
     "count_thoughts",
     "create_edge",
     "create_thought",
+    "delete_thought",
     "get_edges",
     "get_embedding",
     "get_thought",
@@ -203,18 +207,18 @@ _SANCTIONED_DREAMING_PATH = (
     "engrava.extensions.dreaming",
 )
 
-#: Crossings that predate the Dreaming inversion and are unrelated to it: the
-#: optional sqlite-vec vector backend, and configuration's optional extension
-#: manifest discovery helper.  They are enumerated so the walk below can be an
-#: exact allow-list instead of a "known-bad prefix" filter -- extending this
-#: tuple is an architecture decision, not a test fix.
-_PRE_EXISTING_EXTENSION_CROSSINGS = (
-    ("engrava.config", "engrava.extensions.discovery"),
-    (
-        "engrava.infrastructure.sqlite.engrava_core",
-        "engrava.extensions.vector_sqlite_vec",
-    ),
-)
+#: Crossings that predate the Dreaming inversion and are unrelated to it:
+#: configuration's optional extension manifest discovery helper.  It is
+#: enumerated so the walk below can be an exact allow-list instead of a
+#: "known-bad prefix" filter -- extending this tuple is an architecture
+#: decision, not a test fix.
+#:
+#: The sqlite-vec vector backend is not an entry here: it is a SQLite adapter,
+#: not an extension, and lives in ``engrava.infrastructure.sqlite``. Importing
+#: it as ``engrava.extensions.vector_sqlite_vec`` resolves through a
+#: ``sys.modules`` alias to that module -- see that module and
+#: ``test_vector_sqlite_vec_alias_is_the_same_module_object`` below.
+_PRE_EXISTING_EXTENSION_CROSSINGS = (("engrava.config", "engrava.extensions.discovery"),)
 
 #: Every edge from a module reachable out of ``engrava.infrastructure`` into
 #: ``engrava.extensions``.  Any other such edge -- direct or transitive, new or
@@ -391,6 +395,56 @@ def test_sanctioned_dreaming_path_is_the_only_bridge_to_the_extension() -> None:
 
 
 # ------------------------------------------------------------------
+# Alias identity: the relocated SQLite vector-search backend
+# ------------------------------------------------------------------
+
+_OLD_VECTOR_MODULE_NAME = "engrava.extensions.vector_sqlite_vec"
+_NEW_VECTOR_MODULE_NAME = "engrava.infrastructure.sqlite.vector_sqlite_vec"
+
+
+def test_vector_sqlite_vec_alias_is_the_same_module_object() -> None:
+    """The old import path must resolve to the *same* module object as the new one.
+
+    This is what makes ``engrava.extensions.vector_sqlite_vec`` an alias rather
+    than a re-export -- see that module's docstring for what the distinction
+    protects against.
+    """
+    old = importlib.import_module(_OLD_VECTOR_MODULE_NAME)
+    new = importlib.import_module(_NEW_VECTOR_MODULE_NAME)
+    assert old is new
+    assert sys.modules[_OLD_VECTOR_MODULE_NAME] is sys.modules[_NEW_VECTOR_MODULE_NAME]
+
+    # The "from <old path> import <symbol>" form resolves to the same object
+    # a caller gets from the new path.
+    from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend as OldBackend
+    from engrava.infrastructure.sqlite.vector_sqlite_vec import (
+        SqliteVecSearchBackend as NewBackend,
+    )
+
+    assert OldBackend is NewBackend
+
+
+def test_vector_sqlite_vec_monkeypatch_via_old_path_is_observed_through_new_path() -> None:
+    """A patch applied through the old path must be visible through the new one.
+
+    This is the test a name-based re-export would fail: a re-export would
+    leave a second module-like object under the old name, so a patch on its
+    attribute would never be seen by code that imports and calls through the
+    new path -- exactly the failure a consumer (a test, or a downstream
+    package built on this one) would hit if it monkeypatches through the
+    old path and expects the effect to be observed wherever the module is
+    actually used.
+    """
+    new = importlib.import_module(_NEW_VECTOR_MODULE_NAME)
+    original = new.purge_orphan_vectors
+    sentinel = object()
+    with patch(f"{_OLD_VECTOR_MODULE_NAME}.purge_orphan_vectors", sentinel):
+        assert new.purge_orphan_vectors is sentinel
+        assert importlib.import_module(_NEW_VECTOR_MODULE_NAME).purge_orphan_vectors is sentinel
+    assert new.purge_orphan_vectors is original
+
+
+# ------------------------------------------------------------------
 # Protocol signature compatibility
 # ------------------------------------------------------------------
 
@@ -479,8 +533,10 @@ def _return_annotation_mismatches(
     if exception is not None:
         if (str(expected), str(actual)) != exception:
             return [
-                f"documented return-annotation exception is stale:"
-                f" got ({str(expected)!r}, {str(actual)!r}), expected {exception!r}"
+                (
+                    f"documented return-annotation exception is stale:"
+                    f" got ({str(expected)!r}, {str(actual)!r}), expected {exception!r}"
+                )
             ]
         return []
     if expected is inspect.Signature.empty:
