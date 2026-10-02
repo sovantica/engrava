@@ -146,9 +146,10 @@ replacement. The old, stale index entry survived, pointing at a rowid the
 `--clear` restore, for instance) — at which point a keyword search for the
 original word resolved to that unrelated thought instead.
 
-**Fix.** `restore` now rebuilds the full-text index unconditionally, inside
-its own transaction, after every merge or `--clear`, so `0.7.0` cannot leave a
-stale entry behind this way.
+**Fix.** `restore` can still resolve a collision with `INSERT OR REPLACE`,
+but it now rebuilds the full-text index unconditionally, inside its own
+transaction, after every merge or `--clear`, so `0.7.0` cannot leave a stale
+entry behind this way.
 
 **Repair a database an older build already restored into.** Rebuild its
 index directly with the SQLite CLI:

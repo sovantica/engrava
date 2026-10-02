@@ -5,14 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "engrava"
 version = "0.6.0"
-description = "The memory database for AI agents — graph memory, hybrid search, tamper-evident thought/edge journal."
+description = "A queryable memory graph with bi-temporal valid-time predicates - in an in-process Python library over one SQLite file, with no generative-model call in the core write path."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.11"
 authors = [{name = "Sovantica", email = "hello@sovantica.ai"}]
 keywords = [
     "ai-agents", "agent-memory", "graph-memory", "hybrid-search",
-    "memory-consolidation", "audit-trail", "sqlite", "llm",
+    "memory-consolidation", "sqlite", "llm",
     "autonomous-agents", "python",
 ]
 classifiers = [
