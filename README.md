@@ -2,14 +2,14 @@
 
 > The memory database for AI agents.
 >
-> Graph memory, hybrid search, and a tamper-evident thought/edge journal — one `pip install`, no server, no LLM required.
+> A queryable memory graph with bi-temporal valid-time predicates — in an in-process Python library over one SQLite file, with no generative-model call in the core write path.
 
 [![CI](https://github.com/sovantica/engrava/actions/workflows/ci.yml/badge.svg)](https://github.com/sovantica/engrava/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/engrava.svg)](https://pypi.org/project/engrava/)
 [![Python](https://img.shields.io/pypi/pyversions/engrava.svg)](https://pypi.org/project/engrava/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Engrava** is a standalone embedded database for AI agent memory. Built on
+**Engrava** is a standalone, in-process database for AI agent memory. Built on
 SQLite, it provides thought CRUD, edge-based knowledge graphs, embedding-based
 similarity search, full-text search (FTS5/BM25), and a declarative extension
 system — all in a single package with zero external service dependencies.

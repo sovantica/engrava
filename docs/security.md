@@ -1,6 +1,6 @@
 # Security and Trust Boundaries
 
-Engrava is an embedded memory database, not an authentication gateway. It runs
+Engrava is an in-process memory database, not an authentication gateway. It runs
 inside the caller's Python process and stores data in SQLite. This page defines
 Engrava's security boundary and the controls an application or operator must
 provide around it.
@@ -9,7 +9,7 @@ For vulnerability reporting and disclosure timelines, see the repository
 [Security Policy](../SECURITY.md). This guide covers deployment and data trust;
 it does not replace that reporting policy.
 
-## Default posture: local and embedded
+## Default posture: local and in-process
 
 The core library opens a local SQLite database and exposes an in-process Python
 API. It does not start a network listener or require an external service. With
@@ -25,7 +25,7 @@ the caller:
 - dependency or model acquisition performed by an optional provider.
 
 Treat those components as separate trust decisions. The fact that Engrava core
-is embedded does not make arbitrary extensions or provider endpoints local.
+runs in-process does not make arbitrary extensions or provider endpoints local.
 
 ## Data at rest
 

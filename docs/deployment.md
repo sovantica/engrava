@@ -1,9 +1,8 @@
 # Deployment
 
 How to run Engrava in production: opening the store, the database files on disk,
-multi-worker setups, and shutting down cleanly. Engrava is an embedded library —
-there is no server to deploy; "deployment" means how your process opens and owns
-the database.
+multi-worker setups, and shutting down cleanly. Engrava is an in-process library;
+"deployment" means how your process opens and owns the database.
 
 For the concurrency model behind these recommendations, see
 [Concurrency](concurrency.md). For backups, see

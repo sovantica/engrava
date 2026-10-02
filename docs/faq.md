@@ -22,9 +22,9 @@ Engrava-side reasoning. See the [Embeddings guide](guides/embeddings.md).
 
 ## Does it need network access or any running service?
 
-No. Engrava is an embedded library built on SQLite — one `pip install`, runs
-in-process, no server, no network. The only time network is involved is if you
-configure a remote embedding provider yourself.
+No. Engrava is an in-process library built on SQLite. An embedding provider you
+configure can use the network: a remote provider, or a local model that is
+downloaded on first use.
 
 ## Does Engrava encrypt the database file?
 
