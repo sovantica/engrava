@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import re
 import subprocess
 from pathlib import Path
 
@@ -53,6 +54,27 @@ def _ref_exists(ref: str) -> bool:
         text=True,
     )
     return completed.returncode == 0
+
+
+def _newest_release_tag_in_this_repo() -> tuple[str, tuple[int, int, int]]:
+    """Return the highest ``vMAJOR.MINOR.PATCH`` tag here, read without the gate's helpers."""
+    listed = subprocess.run(
+        # Plumbing, not `git tag --list`: column.tag/column.ui can pack several
+        # names onto one line of the porcelain listing. Bytes, decoded per name
+        # with replacement, so a tag name that is not UTF-8 cannot raise here.
+        ["git", "for-each-ref", "--format=%(refname:lstrip=2)", "refs/tags/v*"],  # noqa: S607
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+    ).stdout.split(b"\n")
+    versions = {}
+    for raw in listed:
+        tag = raw.decode("utf-8", errors="replace")
+        match = re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag)
+        if match:
+            versions[tag] = (int(match[1]), int(match[2]), int(match[3]))
+    newest = max(versions, key=versions.__getitem__)
+    return newest, versions[newest]
 
 
 def _init_disposable_repo(path: Path) -> None:
@@ -151,6 +173,12 @@ class TestNewestVersionTag:
         # slot must decide first.
         tags = ["v0.10.0", "v1.0.0"]
         assert gate_module.newest_version_tag(tags) == "v1.0.0"  # type: ignore[attr-defined]
+
+    def test_patch_version_decides_when_major_and_minor_are_equal(
+        self, gate_module: object
+    ) -> None:
+        tags = ["v0.7.0", "v0.7.1", "v0.6.9"]
+        assert gate_module.newest_version_tag(tags) == "v0.7.1"  # type: ignore[attr-defined]
 
     def test_raises_when_nothing_matches(self, gate_module: object) -> None:
         with pytest.raises(gate_module.GateInputError):  # type: ignore[attr-defined]
@@ -1530,5 +1558,9 @@ class TestFailabilityOnRealHistory:
         assert passed is False, messages
         fail_lines = [line for line in messages if line.startswith("FAIL")]
         assert fail_lines, messages
-        assert "v0.6.0" in fail_lines[0]
+        # The gate names the newest version tag. That was v0.6.0 until a later
+        # release was tagged; the commit contains neither v0.6.0 nor any later tag.
+        newest, version = _newest_release_tag_in_this_repo()
+        assert version >= (0, 6, 0)
+        assert fail_lines[0].startswith(f"FAIL: {newest!r} is not reachable from ")
         assert PRE_FORWARD_MERGE_COMMIT in fail_lines[0]
