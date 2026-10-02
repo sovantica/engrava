@@ -5,9 +5,8 @@ The test runs ``examples/quickstart.py`` as the user would, via
 the markers documented in the script docstring. It requires the
 ``embeddings-local`` extra: when ``sentence_transformers`` is missing
 the test skips cleanly rather than failing the suite. Two defensive
-guards pin the dreaming demonstration policy: the fresh-store
-walkthrough script that promised a REFLECTION is no longer shipped,
-and ``quickstart.py`` must not promise one either.
+guards pin the dreaming demonstration policy: ``examples/dreaming_benefit.py``
+is not shipped, and ``quickstart.py`` must not promise a REFLECTION either.
 """
 
 from __future__ import annotations
@@ -115,13 +114,29 @@ def test_notes_memory_runs_to_completion() -> None:
     assert "Stored 4 notes." in result.stdout
 
 
+def test_simple_agent_runs_to_completion() -> None:
+    """``simple_agent.py`` runs the lower-level, no-encoder walkthrough to a clean exit.
+
+    Uses ``numpy``-seeded pseudo-embeddings from a plain ``embed()`` helper — a
+    core dependency, not the local-embeddings extra — so it always runs. The
+    similarity-search ranking is randomized per process (the helper seeds from
+    the builtin ``hash()``, which is salted per interpreter run), so the
+    assertions below stick to what stays constant across every run: the fixed
+    query text, the fixed count of stored thoughts, and the closing marker.
+    """
+    result = _run_example("simple_agent.py")
+    assert result.returncode == 0, f"non-zero exit; stderr=\n{result.stderr}"
+    assert "Query: 'wet cats and rain'" in result.stdout
+    assert result.stdout.count("[+] thought") == 5
+    assert "Done." in result.stdout
+
+
 def test_dreaming_benefit_script_not_shipped() -> None:
     """The fresh-store dreaming walkthrough script is not part of the public surface.
 
-    A previous iteration shipped a script that promised a REFLECTION
-    on a fresh in-memory store, which the default consolidation
-    configuration cannot deliver. The script was dropped; this guard
-    keeps it gone so the dropped artifact cannot silently reappear.
+    This guard keeps ``examples/dreaming_benefit.py`` absent from the
+    shipped examples, in line with the honesty contract pinned by
+    ``test_quickstart_does_not_promise_a_reflection``.
     """
     assert not (EXAMPLES_DIR / "dreaming_benefit.py").exists(), (
         "examples/dreaming_benefit.py must not be shipped — "

@@ -19,6 +19,7 @@ from sqlite3 import IntegrityError
 from typing import TYPE_CHECKING, ClassVar
 from weakref import WeakKeyDictionary
 
+from engrava.domain.models._temporal import canonical_timestamp
 from engrava.domain.models.journal import JournalEntry, JournalIntegrityResult
 
 if TYPE_CHECKING:
@@ -39,11 +40,11 @@ class JournalWriter:
         db: An open aiosqlite connection with the ``journal_entry``
             table already created.
         revocation: Optional shared revocation token. When the owning store
-            quarantines the connection it revokes this token, and every
-            connection-touching method here then fails hard with
-            :class:`~engrava.domain.exceptions.ConnectionQuarantinedError` —
-            so this holder of the real connection cannot bypass the store's
-            terminal quarantine. ``None`` (standalone use) disables the check.
+            quarantines the connection it revokes this token, and
+            :meth:`append`, :meth:`verify_integrity` and :meth:`get_entries`
+            then raise
+            :class:`~engrava.domain.exceptions.ConnectionQuarantinedError`.
+            ``None`` (standalone use) disables the check.
 
     Examples:
         >>> writer = JournalWriter(db)  # doctest: +SKIP
@@ -332,7 +333,8 @@ class JournalWriter:
             target_id: Filter by target entity ID.
             mutation_type: Filter by mutation type string.
             since: ISO-8601 timestamp lower bound (inclusive) on the
-                chain-uncovered ``created_at`` column.
+                chain-uncovered ``created_at`` column, compared by instant; a
+                value without an offset is read as UTC.
             limit: Maximum number of entries to return.
 
         Returns:
@@ -342,6 +344,8 @@ class JournalWriter:
         Raises:
             ConnectionQuarantinedError: When the shared connection has been
                 revoked (the owning store quarantined it).
+            ValueError: If ``since`` is not a valid ISO-8601 timestamp, or has
+                no UTC form within the supported ``datetime`` range.
 
         """
         self._check_revoked()
@@ -355,8 +359,10 @@ class JournalWriter:
             clauses.append("mutation_type = ?")
             params.append(mutation_type)
         if since is not None:
+            # Compared as TEXT against engrava's own canonical ``created_at``
+            # stamps, so the caller's value is put into the same form first.
             clauses.append("created_at >= ?")
-            params.append(since)
+            params.append(canonical_timestamp(since))
 
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         sql = (

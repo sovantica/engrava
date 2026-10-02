@@ -67,20 +67,24 @@ class StaleDataError(EngravaError):
     """Raised when a guarded write matches no row.
 
     Two situations produce that, and this error does not tell them apart:
-    another writer stamped a new ``updated_cycle`` between this operation's read
-    and its write, or the row was deleted in that window. Either way nothing of
-    the operation was applied.
+    another guarded write landed on this row (bumping its ``revision``)
+    between this operation's read and its write, or the row was deleted in
+    that window. Either way nothing of the operation was applied.
 
-    It is narrower than "the row changed" — nothing in engrava advances
-    ``updated_cycle`` on its own, so an ordinary competing edit passes the guard
-    and overwrites rather than raising — and also broader, because a delete
-    raises it too. Recover by re-reading the record (which may now be gone) and
-    recomputing the change.
+    Unlike the ``updated_cycle`` guard this replaced — which nothing in
+    engrava advanced on its own, so an ordinary competing edit passed it
+    silently — the engine bumps ``revision`` by one on *every* guarded write
+    to a row, automatically. So this error now means what its name says: the
+    row really did move since this call read it (or it is gone). It is still
+    broader than "the row changed" in one direction — a delete raises it too,
+    since there is no longer a row to distinguish "moved" from "gone" against.
+    Recover by re-reading the record (which may now be gone) and recomputing
+    the change.
 
     Args:
         entity_type: Type of entity (e.g., 'ThoughtRecord').
         entity_id: Identifier of the entity.
-        expected_version: The ``updated_cycle`` the caller expected.
+        expected_version: The ``revision`` the caller's guarded write expected.
 
     """
 
@@ -266,16 +270,58 @@ class EmbeddingQueryPrefixMismatchError(EngravaError):
 class EmbeddingGenerationError(EngravaError):
     """Raised when auto-embedding a thought fails under strict mode.
 
-    Auto-embed runs *after* ``create_thought`` (and the batch path)
-    has already committed the thought, so a provider failure would
-    otherwise leave the thought persisted without an embedding — a
-    silent, torn write invisible to vector search. By default the store
-    logs a ``WARNING`` naming the thought and re-raises the provider's
-    own exception (behaviour is unchanged for existing callers). When
-    the operator opts in via ``embeddings.require_embedding = true`` (or
-    ``require_embedding=True`` on the store), that failure is instead
-    normalised into this typed error — an explicit fail-fast signal that
-    the thought is persisted but unembedded.
+    What is certain regardless of call path: the embedding was not
+    produced, for the reason carried in the message. What happens to the
+    *thought row* itself is two independent questions.
+
+    **Is the row durable yet?** If this call does not own the outermost
+    transaction — nested inside the caller's own
+    ``suspend_auto_commit()`` window — nothing is durable yet, on any
+    path: the outermost window's exit decides — caught and that window
+    exits cleanly, the rows commit; uncaught, they roll back. This holds
+    for every path, single-item and batch alike.
+
+    If this call does own the outermost transaction, the path decides:
+
+    * ``create_thought`` and ``update_thought`` have already committed by
+      the time this can be raised, so the failure cannot undo them.
+    * A **standalone** ``bulk_store`` has not: its inserts and the single
+      trailing embed call share one transaction, so this failure rolls
+      the whole batch back regardless — every row in it, not just this
+      one — and none of them persist.
+
+    **What is left behind?** Determined by the path, and only meaningful
+    for whatever actually committed: ``create_thought`` leaves no
+    embedding row at all. ``update_thought`` (only reached here when
+    ``essence``/``content`` changed) leaves any embedding the row already
+    had in place — if the update committed, that embedding is now stale
+    against the new content, and the row is still findable by vector
+    search against that outdated vector; if the row had no embedding
+    before, it still has none, and remains unfindable by vector search.
+    If the update instead rolled back — only possible when this call is
+    nested inside a caller's own window and the caller lets the failure
+    escape it — the durable state reverts to whatever existed when that
+    *outermost* window opened, not merely to what this call itself started
+    from: an earlier write to the same thought inside the same window is
+    undone right along with it. If the thought was created inside that
+    same window, it no longer exists at all afterward — there is nothing
+    to be "left behind". If it already existed before the window opened,
+    it reverts to that pre-window state, and the retained embedding
+    matches it only if it already did: an earlier update on the same
+    thought, before this window ever opened, whose own re-embed failed can
+    already have left that pre-window state stale, and this rollback
+    neither detects nor repairs that. A standalone ``bulk_store``'s
+    rollback leaves nothing behind at all.
+
+    See ``docs/api-reference.md``'s ``bulk_store`` and
+    ``EmbeddingGenerationError`` entries for the fuller treatment. By
+    default the store logs a ``WARNING`` naming the thought and re-raises
+    the provider's own exception (behaviour is unchanged for existing
+    callers). When the operator opts in via
+    ``embeddings.require_embedding = true`` (or ``require_embedding=True``
+    on the store), that failure is instead normalised into this typed
+    error — an explicit fail-fast signal whose durability outcome depends
+    on transaction ownership and, when owned, on call path, per above.
 
     Args:
         thought_id: UUID of the thought whose embedding failed.
@@ -287,9 +333,11 @@ class EmbeddingGenerationError(EngravaError):
     def __init__(self, thought_id: str, message: str) -> None:
         self.thought_id = thought_id
         super().__init__(
-            f"Failed to auto-embed thought {thought_id}: {message}. "
-            f"The thought is persisted but has no embedding and is not "
-            f"reachable by vector search."
+            f"Failed to auto-embed thought {thought_id}: {message}. The "
+            f"embedding was not produced. Whether the thought row itself "
+            f"survives depends on the call that raised this and its "
+            f"surrounding transaction — see this exception's docstring for "
+            f"the specific outcomes."
         )
 
 
@@ -499,6 +547,126 @@ class CoreMigrationError(EngravaError):
         super().__init__(f"[core schema v{target_version}] {message}")
 
 
+class SchemaVersionError(EngravaError):
+    """Raised when ``ensure_schema`` refuses to open a database as-is.
+
+    Three distinct refusals share this type, all because the engine has been
+    handed a database it cannot safely bring to a known state on its own:
+
+    * ``"populated_sub_floor"`` — the stamped ``user_version`` is below the
+      version the bootstrap script assumes (empty), but the file already
+      carries a core table with at least one row. Stamping it current with a
+      script of ``CREATE ... IF NOT EXISTS`` statements would leave whatever
+      the file actually contains silently mislabelled as a fresh,
+      fully-migrated schema.
+    * ``"stale_shape_sub_floor"`` — the stamped ``user_version`` is below the
+      bootstrap floor and the file's core tables held zero rows (so
+      ``"populated_sub_floor"`` did not fire), but they already existed
+      under an older shape the bootstrap script's
+      ``CREATE ... IF NOT EXISTS`` statements left untouched. Left alone,
+      the database would end up stamped current without the columns that
+      older shape is missing.
+    * ``"newer_than_head"`` — the stamped ``user_version`` is higher than
+      this build's head version. The migration registry has no step to run
+      and nothing tells the caller that the file was written by a newer
+      engrava.
+
+    Constructed via :meth:`populated_sub_floor`, :meth:`stale_shape_sub_floor`
+    or :meth:`newer_than_head` rather than directly, so the message is always
+    built from the same version numbers the caller already has.
+
+    Args:
+        current_version: The database's stamped ``user_version``.
+        reason: Which refusal this is — ``"populated_sub_floor"``,
+            ``"stale_shape_sub_floor"`` or ``"newer_than_head"``.
+        message: Human-readable description, built by the named constructor.
+
+    """
+
+    def __init__(self, current_version: int, reason: str, message: str) -> None:
+        self.current_version = current_version
+        self.reason = reason
+        super().__init__(message)
+
+    @classmethod
+    def populated_sub_floor(cls, current_version: int, floor_version: int) -> SchemaVersionError:
+        """Build the refusal for a populated database below the bootstrap floor.
+
+        Args:
+            current_version: The database's stamped ``user_version``.
+            floor_version: The lowest version the bootstrap script may assume
+                is an empty file.
+
+        Returns:
+            A :class:`SchemaVersionError` describing the refusal.
+
+        """
+        message = (
+            f"Database is stamped user_version={current_version}, below the "
+            f"bootstrap floor (v{floor_version}), but already carries a core "
+            "table. Refusing to treat it as an empty database — this build "
+            "does not know how to bring a database this old to a known "
+            "schema state."
+        )
+        return cls(current_version, "populated_sub_floor", message)
+
+    @classmethod
+    def stale_shape_sub_floor(cls, current_version: int, floor_version: int) -> SchemaVersionError:
+        """Build the refusal for a sub-floor database bootstrapped over an older shape.
+
+        The message states only what the branch that raises this actually
+        established: :meth:`SqliteEngravaCore._has_any_core_table` already
+        found zero rows in every core table. It does not follow that the
+        file is otherwise empty or safe to discard — a sub-floor database
+        can still carry data in a non-core (e.g. extension) table that this
+        check never inspects — so the message says that too, and does not
+        suggest removing the file.
+
+        Args:
+            current_version: The database's stamped ``user_version``. Never
+                touched by this refusal: it fires before the bootstrap
+                script — and its trailing stamp — ever runs, so there is
+                nothing here to undo.
+            floor_version: The lowest version the bootstrap script may assume
+                is an empty file.
+
+        Returns:
+            A :class:`SchemaVersionError` describing the refusal.
+
+        """
+        message = (
+            f"Database is stamped user_version={current_version}, below the "
+            f"bootstrap floor (v{floor_version}); its core tables already "
+            "exist under an older shape that the bootstrap script's "
+            "`CREATE ... IF NOT EXISTS` statements would leave untouched. "
+            "Refusing to stamp it current — this build cannot tell which "
+            "older version produced these tables and will not guess. No "
+            "core table holds a row, but the file may still carry data "
+            "this check does not examine (e.g. in a non-core or extension "
+            "table)."
+        )
+        return cls(current_version, "stale_shape_sub_floor", message)
+
+    @classmethod
+    def newer_than_head(cls, current_version: int, head_version: int) -> SchemaVersionError:
+        """Build the refusal for a database newer than this build's head.
+
+        Args:
+            current_version: The database's stamped ``user_version``.
+            head_version: This build's head core schema version.
+
+        Returns:
+            A :class:`SchemaVersionError` describing the refusal.
+
+        """
+        message = (
+            f"Database is stamped user_version={current_version}, newer than "
+            f"this engrava build's head version (v{head_version}). Refusing "
+            "to open it — upgrade engrava before opening this database."
+        )
+        return cls(current_version, "newer_than_head", message)
+
+
 class DerivedRecordError(EngravaError):
     """Raised when the derived-records extension seam rejects a producer result.
 
@@ -622,8 +790,9 @@ class RecencyModeConflictError(EngravaError):
 class InvalidRecencyArgumentError(EngravaError):
     """Raised when a transaction-time recency argument is malformed.
 
-    Covers a ``recency_now`` that is not a valid ISO-8601 timestamp and a
-    non-positive ``recency_now_half_life``. It is raised at the ``search_hybrid``
+    Covers a ``recency_now`` that is not a valid ISO-8601 timestamp or has no
+    UTC form within the supported ``datetime`` range, and a non-positive
+    ``recency_now_half_life``. It is raised at the ``search_hybrid``
     / ``recall`` call boundary (never mid-ranking), a typed sibling of
     :class:`RecencyModeConflictError` so callers can catch a specific engrava
     error rather than a bare ``ValueError``. For a malformed timestamp the
@@ -648,15 +817,16 @@ recency_now must be ISO-8601
 class ConnectionQuarantinedError(EngravaError):
     """Raised when the store's connection has been quarantined and is unusable.
 
-    A long-lived SQLite connection is quarantined when a compensating rollback
-    could not be guaranteed to complete — most critically when a cancellation
-    interrupted a per-child rollback in the derived-records seam and the
-    rollback ultimately failed, so the connection may still hold an open
-    transaction. Continuing to use such a connection could flush an orphaned
-    partial write or run later operations on an indeterminate transaction, so
-    every public operation fails fast with this error instead. The condition is
-    terminal for the store instance: a new store over a fresh connection must
-    be constructed to recover.
+    A long-lived SQLite connection is quarantined when a guarded write's own
+    savepoint could not be unwound after it failed — most critically when a
+    cancellation interrupted the unwind (``ROLLBACK TO`` + ``RELEASE``) of an
+    insert/update/delete unit, including a derived child's row or edge insert
+    in the derived-records seam, and the unwind ultimately failed, so the
+    connection may still hold an open transaction. Continuing to use such a
+    connection could flush an orphaned partial write or run later operations on
+    an indeterminate transaction, so every public operation fails fast with
+    this error instead. The condition is terminal for the store instance: a new
+    store over a fresh connection must be constructed to recover.
 
     Scope: quarantine revokes *admission* — every NEW operation on the store or
     its journal fails fast with this error, so no write/commit can flush an
@@ -677,3 +847,183 @@ class ConnectionQuarantinedError(EngravaError):
     def __init__(self, reason: str) -> None:
         self.reason = reason
         super().__init__(f"connection quarantined: {reason}")
+
+
+class WriteContentionError(EngravaError):
+    """Raised when a guarded write cannot get past lock contention.
+
+    Two distinct mechanisms raise this, both converting a raw
+    :class:`sqlite3.OperationalError` (``database is locked``) into a typed,
+    catchable failure:
+
+    * The dedup probe-and-insert window. ``create_thought(deduplicate=True)``,
+      ``get_or_create`` and ``upsert_by_hash`` open their "check existing,
+      then insert or bump" window with ``BEGIN IMMEDIATE`` so a second
+      connection — a second process, or a second store on the same database
+      file — reaching the same window is turned away at transaction *start*
+      rather than mid-transaction, which is the classic embedded-SQLite
+      deadlock shape a deferred ``BEGIN`` invites. SQLite's own busy handler
+      (``PRAGMA busy_timeout``) already waits for the lock before giving up,
+      and the store retries the whole ``BEGIN IMMEDIATE`` a bounded number of
+      times with backoff on top of that; this error is raised only once both
+      are exhausted (``attempts`` reflects that count).
+    * The ``revision``-guarded update paths. ``update_thought``,
+      ``restore_thought``, ``update_edge`` and ``update_action`` each execute
+      at most one guarded ``UPDATE`` per call — ``update_edge`` executes none
+      when the merged change leaves every column equal to its current value,
+      since there is then nothing to write; if that single ``execute()`` does
+      run and reports lock contention (after SQLite's own busy-timeout wait),
+      it is converted here too, rather than left to leak as a raw driver
+      error — this is not retried at the application level (``attempts`` is
+      always ``1``), since a caller is already free to retry the whole
+      operation.
+
+    Retrying the call outright is safe in both cases: whichever transaction
+    would have done the work never started (the dedup case) or made no
+    change (a contended ``UPDATE`` affects zero rows when it fails to
+    execute at all), so nothing was read or written under it — there is no
+    partial state to reconcile, only contention to wait out.
+
+    Args:
+        operation: Name of the guarded method that could not get the lock
+            (e.g. ``"create_thought"``, ``"update_thought"``).
+        attempts: Number of attempts made before giving up — the number of
+            ``BEGIN IMMEDIATE`` attempts for the dedup window, always ``1``
+            for a guarded update's single ``execute()``.
+
+    Examples:
+        >>> raise WriteContentionError(operation="create_thought", attempts=3)
+        Traceback (most recent call last):
+            ...
+        engrava.domain.exceptions.WriteContentionError: \
+could not acquire the write lock for 'create_thought' after 3 attempt(s) \
+(the database is busy) — retry the call
+
+    """
+
+    def __init__(self, *, operation: str, attempts: int) -> None:
+        self.operation = operation
+        self.attempts = attempts
+        super().__init__(
+            f"could not acquire the write lock for {operation!r} after "
+            f"{attempts} attempt(s) (the database is busy) — retry the call"
+        )
+
+
+class WriteLockTimeoutError(EngravaError):
+    """Raised when a task cannot get the in-process write lock within the bound.
+
+    The store's guarded write paths share one task-reentrant lock per
+    instance: the task that opened it may re-enter freely, and any other task
+    waits for it to be released. **This is not exclusively a contract-violation
+    signal** — a guarded critical section is not always short and network-free:
+    ``bulk_store``'s batch embedding call runs inside the same
+    ``suspend_auto_commit`` window that holds this lock, and that call reaches
+    a real embedding provider over the network, which can legitimately take
+    minutes for a large batch. The bound is sized with margin over that
+    provider's own worst-case retry-exhaustion time (see
+    ``_WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS`` in ``engrava_core.py`` for the
+    derivation), so ordinarily this fires only on the deadlock below — but a
+    bound configured too small for your own provider or batch sizes, or a
+    provider genuinely slower than the default covers, can trip this on
+    entirely correct, documented usage too. If that is what happened, raise
+    ``write_lock_acquire_timeout_seconds`` (a constructor / ``from_config``
+    parameter) to match your provider's real worst case; this exception alone
+    does not tell the two causes apart.
+
+    The other cause — the one this bound exists to convert from a hang into an
+    attributable error — is breaking the documented contract for the
+    transaction-deferral window: opening it, then spawning and awaiting
+    (directly, or transitively through ``gather``/``wait_for``/an ``on_store``
+    hook/embedding provider callback) a *different* task that itself tries to
+    write on this store before the window closes. That other task can never
+    get the lock the window's own task is holding, and the window's task can
+    never finish — and release it — while it is still awaiting that other
+    task. Nothing about re-entrancy helps here: it is keyed on the task
+    actually holding the lock, and the spawned task is a different one. This
+    is a real, unrecoverable deadlock the store cannot resolve on its own —
+    the alternative to raising this is hanging forever with nothing in any log
+    to point at why. Raising it here also ends the deadlock itself: once this
+    task's wait fails, whatever awaited it (directly or not) can observe the
+    failure and unwind, which lets the window's own task resume and close its
+    transaction. Fix that caller by driving every write on a given store
+    instance that is inside an open transaction-deferral window from the one
+    task that opened it (nested calls on that same task are always safe) —
+    never from a task spawned and joined inside the window. See the
+    concurrency documentation.
+
+    Args:
+        timeout_seconds: The bound that was exceeded.
+
+    Examples:
+        >>> raise WriteLockTimeoutError(timeout_seconds=30.0)
+        Traceback (most recent call last):
+            ...
+        engrava.domain.exceptions.WriteLockTimeoutError: \
+a guarded write could not acquire this store's write lock within 30.0s — \
+likely a task spawned and awaited from inside another task's open \
+suspend_auto_commit() window; drive writes on one store instance from one \
+task at a time
+
+    """
+
+    def __init__(self, *, timeout_seconds: float) -> None:
+        self.timeout_seconds = timeout_seconds
+        super().__init__(
+            "a guarded write could not acquire this store's write lock within "
+            f"{timeout_seconds}s — likely a task spawned and awaited from inside "
+            "another task's open suspend_auto_commit() window; drive writes on "
+            "one store instance from one task at a time"
+        )
+
+
+class DedupLockReentryError(EngravaError):
+    """Raised when the current task tries to re-enter the store's dedup lock.
+
+    The dedup probe-and-insert window (``create_thought(deduplicate=True)``,
+    ``get_or_create``, ``upsert_by_hash``) is guarded by an in-process lock
+    with no legitimate reentrant use — unlike the task-reentrant write lock
+    (see ``WriteLockTimeoutError``), which exists precisely so a write nested
+    inside the caller's own ``suspend_auto_commit()`` window can proceed, a
+    *second* acquisition of the dedup lock by the same task is a bug.
+    The concrete shape: ``upsert_by_hash``'s hit branch calls the separately
+    overridable ``update_thought``, when a mutable field differs, while still
+    holding this lock (see ``docs/extension-hooks.md``, "§1B.3 A pre-existing restriction:
+    ``update_thought`` on ``upsert_by_hash``'s hit branch", for the full
+    contract) — an ``update_thought`` override that calls back
+    into ``create_thought(deduplicate=True)``, ``get_or_create``,
+    ``upsert_by_hash``, or ``bulk_store(deduplicate=True)`` on that same
+    task tries to acquire this lock a second time. A plain, non-reentrant
+    lock would block that second acquisition on itself, forever, with
+    nothing in any log to point at why — exactly the
+    silent, unattributable hang ``docs/concurrency.md`` ("A deadlock this
+    store cannot resolve raises, it does not hang") forbids. This is
+    detected synchronously (whether the current task already owns the lock
+    is known immediately, with no race to bound) and raised instead of
+    blocked on, the same "raise, don't hang" policy already applied to a
+    *different* task's wait on the write lock.
+
+    Reachable on both of ``upsert_by_hash``'s hit routes — the exploratory
+    probe's hit and the decisive probe's hit (including its own
+    miss-turned-hit race, where a second writer wins between the two
+    probes) -- whenever the hit calls ``update_thought``. ``get_or_create``'s
+    hit branch calls the private
+    ``_increment_confirmation`` instead of ``update_thought``. Both of
+    ``upsert_by_hash``'s hit routes hold
+    ``_write_lock`` and ``_dedup_lock`` while ``update_thought`` runs. This
+    store does not track which of ``create_thought`` / ``get_or_create`` /
+    ``upsert_by_hash`` opened the window still held on this task — only
+    that one already has.
+
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "this task already holds this store's dedup lock -- acquiring it "
+            "again would block on itself forever. This is almost always an "
+            "update_thought() override (or something it calls) recursing back "
+            "into create_thought(deduplicate=True) / get_or_create() / "
+            "upsert_by_hash() / bulk_store(deduplicate=True) on the same task "
+            "while a dedup hit's update is still under _write_lock and "
+            "_dedup_lock; see docs/extension-hooks.md §1B.3."
+        )

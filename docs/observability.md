@@ -10,6 +10,10 @@ storage footprint, and a rolling-window search-latency histogram.
 - `edges` — counts by edge type
 - `storage` — on-disk footprint for the main SQLite database and WAL
 - `search_latency` — rolling-window p50/p95/p99 search latency
+- `measured` — `True` only when this snapshot came from actually querying the
+  store; `False` for the zero-filled placeholder returned when `metrics.enabled`
+  is `False`. Check this before trusting a zero — an unmeasured snapshot and an
+  honestly empty store both read `thoughts.total == 0`.
 
 ## Quick Example
 
@@ -40,11 +44,26 @@ metrics:
 ```
 
 When `enabled: false`, `store.metrics()` returns a zero-filled snapshot and does
-not issue SQL queries.
+not issue SQL queries. That snapshot has `measured=False`. Nothing else in the
+snapshot states whether a measurement happened. Every field a caller might read
+instead is a proxy that fails in at least one direction — `storage.db_bytes`
+reads `0` for a disabled store and for a measured in-memory one (a freshly
+created, empty file-backed store instead measures a real, nonzero
+`storage.db_bytes` of `180224` bytes as soon as `ensure_schema()` has run, but
+that same field reads `0` again on a measured store whose file later goes
+missing under an open connection); `search_latency.sample_count` reads `0` for
+a disabled store and for a measured store that has served no searches.
+`measured` states it directly.
 
 ## CLI
 
-`engrava info` now renders the same snapshot contract used by the Python API.
+`engrava info` renders the same snapshot the Python API returns, with one
+deliberate difference: its own `schema_version` is exposed as
+`metrics_schema_version`, alongside a `database_schema_version` field the
+Python snapshot does not carry (the database's `PRAGMA user_version`, read
+separately) — see [Upgrade Guide → 0.6 -> 0.7](upgrade.md#06---07) for why the
+CLI output and the `EngravaMetrics` object are no longer key-for-key
+identical.
 
 ```bash
 engrava --db mydata.db info
@@ -95,32 +114,92 @@ your metrics system (Prometheus, OpenTelemetry, StatsD, …).
 ### Exporting the snapshot
 
 The snapshot is a plain dataclass, so mapping it to any client is
-straightforward. A Prometheus example:
+straightforward — but a plain `Gauge` is the wrong tool: it exposes a sample
+(`0.0` by default) from the moment it is *registered*, regardless of whether
+it has ever been `.set()`, so any "register once, update on each scrape"
+scheme has a window where a scrape reads a value nobody measured. Use a
+[custom collector](https://prometheus.github.io/client_python/collector/custom/)
+instead — it queries the store fresh on every scrape and yields nothing at
+all when `measured` is false, so there is no registration window, no stale
+value between ticks, and no separate setup step to get wrong.
+
+**The pattern below is written for a WSGI-style exposition**
+(`start_http_server()`), where `collect()` runs on a thread with no event loop
+of its own. It is the wrong shape for an ASGI application (e.g. one mounting
+`prometheus_client.make_asgi_app()`): there, `collect()` runs on the app's own
+running loop, and this pattern's internal `asyncio.run()` call raises. For an
+ASGI deployment, do the async store read once in your own request handler and
+register a collector over the already-computed metric families instead — its
+`collect()` then returns that precomputed list synchronously, with nothing
+left for it to await. We do not carry a tested ASGI example here; see the
+comment inside `collect()` below for exactly where and why this shape fails
+under one.
 
 ```python
-from prometheus_client import Gauge
+import asyncio
 
-THOUGHTS = Gauge("engrava_thoughts_total", "Total thoughts")
-DB_BYTES = Gauge("engrava_db_bytes", "Main database size in bytes")
-WAL_BYTES = Gauge("engrava_wal_bytes", "WAL size in bytes")
-SEARCH_P95 = Gauge("engrava_search_p95_ms", "Search p95 latency (ms)")
-SEARCH_P99 = Gauge("engrava_search_p99_ms", "Search p99 latency (ms)")
+from prometheus_client import REGISTRY
+from prometheus_client.core import GaugeMetricFamily
+
+_METRICS = (
+    ("engrava_thoughts_total", "Total thoughts"),
+    ("engrava_db_bytes", "Main database size in bytes"),
+    ("engrava_wal_bytes", "WAL size in bytes"),
+    ("engrava_search_p95_ms", "Search p95 latency (ms)"),
+    ("engrava_search_p99_ms", "Search p99 latency (ms)"),
+)
 
 
-async def collect(store) -> None:
-    m = await store.metrics()
-    THOUGHTS.set(m.thoughts.total)
-    DB_BYTES.set(m.storage.db_bytes)
-    WAL_BYTES.set(m.storage.wal_bytes)
-    SEARCH_P95.set(m.search_latency.p95_ms)
-    SEARCH_P99.set(m.search_latency.p99_ms)
+class EngravaCollector:
+    """Queries the store fresh on every scrape; yields nothing when unmeasured."""
+
+    def __init__(self, store):
+        self._store = store
+
+    def describe(self):
+        # Sample-free descriptors, so the registry learns these names and
+        # help text at registration time -- without this, `register()` calls
+        # `collect()` itself to learn them, which would need to query the
+        # store from the registering thread. Returning `[]` here instead
+        # would also work for the running-loop problem, but it disables the
+        # registry's own collision detection and `restricted_registry()`
+        # support along with it, so return the (sampleless) families instead.
+        return [GaugeMetricFamily(name, help_text) for name, help_text in _METRICS]
+
+    def collect(self):
+        # `asyncio.run()` requires no event loop already running on this
+        # thread -- true for a WSGI worker (`start_http_server()`), which is
+        # what this example is written for, but not for an ASGI exposition
+        # app (e.g. `prometheus_client.make_asgi_app()`): there, `collect()`
+        # itself runs on the app's own running loop regardless of which
+        # thread or loop the store's connection was created on, and this
+        # raises "asyncio.run() cannot be called from a running event loop".
+        # This example does not support that shape; the alternative for it is
+        # a periodic background task that refreshes a plain value collect()
+        # reads, rather than querying the store here.
+        m = asyncio.run(self._store.metrics())
+        if not m.measured:
+            return
+        values = (m.thoughts.total, m.storage.db_bytes, m.storage.wal_bytes,
+                  m.search_latency.p95_ms, m.search_latency.p99_ms)
+        for (name, help_text), value in zip(_METRICS, values, strict=True):
+            yield GaugeMetricFamily(name, help_text, value=value)
+
+
+REGISTRY.register(EngravaCollector(store))
 ```
+
+`collect()` runs synchronously on the scrape thread, hence `asyncio.run(...)`;
+if your process already runs its own event loop, drive the same coroutine
+through that loop instead (e.g. a thread-safe future) rather than nesting
+`asyncio.run()` inside a running one.
 
 The main metric groups on `EngravaMetrics` are `thoughts` (`total`, `by_type`,
 `by_status`), `edges` (`total`, `by_type`), `storage` (`db_bytes`, `wal_bytes`,
 `vec_index_bytes`, `total_bytes`), and `search_latency` (`sample_count`,
 `p50_ms`, `p95_ms`, `p99_ms`, `min_ms`, `max_ms`, `mean_ms`). The snapshot also
-carries `schema_version` and `snapshot_timestamp` for the snapshot itself.
+carries `schema_version`, `snapshot_timestamp`, and `measured` for the
+snapshot itself — always check `measured` before trusting the rest.
 
 ### Scrape cadence
 
@@ -184,12 +263,24 @@ works too and additionally returns the live counts.)
 
 The library logs through the standard `logging` module under the **`engrava.*`**
 namespace (each module uses `logging.getLogger(__name__)`, e.g.
-`engrava.extensions.dreaming`, `engrava.extensions.vector_sqlite_vec`,
-`engrava.config`). It logs at **`WARNING`** (degraded conditions, e.g. sqlite-vec
-unavailable → numpy fallback), **`INFO`** (dreaming progress), and **`DEBUG`**
-(detailed internals) — it does **not** log at `ERROR`/`CRITICAL`; failures are
-raised as typed exceptions for the caller to handle. Configure it like any
-library logger:
+`engrava.extensions.dreaming`, `engrava.infrastructure.sqlite.vector_sqlite_vec`,
+`engrava.config`). As a general rule it logs at **`WARNING`** (degraded
+conditions, e.g. sqlite-vec unavailable → numpy fallback), **`INFO`**
+(dreaming progress), and **`DEBUG`** (detailed internals), and raises failures
+as typed exceptions for the caller to handle rather than logging them.
+`CRITICAL` is never used.
+
+The one departure: when the derived-records extension is enabled
+(`derive.enabled=True`, off by default, and only reachable with a producer
+capability configured) and a derived child's own failed write cannot be
+unwound — quarantining the connection — after its source has already
+committed, that failure logs at `ERROR` (`derive.on_error="log"`, the default
+for that setting) and then still propagates: a quarantined connection can no
+longer be trusted for the remaining children, so even under the default
+policy this is not swallowed. An ordinary per-child failure that unwinds
+cleanly stays at the usual `WARNING` level and does not raise under `"log"`.
+This is the library's only `ERROR` call site. Configure it like any library
+logger:
 
 ```python
 import logging

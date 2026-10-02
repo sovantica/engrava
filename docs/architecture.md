@@ -59,9 +59,10 @@ The primary store implementation.  Provides:
   thoughts after a source is durable; core owns child identity, persistence,
   and optional `DERIVED_FROM` provenance edges. Existing stores can be
   backfilled explicitly with `derive_existing()`.
-- **Memory Hygiene** — an opt-in, no-LLM forgetting pass that reversibly
-  archives cold records and can separately garbage-collect hygiene archives
-  after both configured restore windows.
+- **Memory Hygiene** — an opt-in forgetting pass, built-in scoring makes no LLM
+  calls, that reversibly archives cold records and can separately
+  garbage-collect hygiene archives after both configured restore windows.
+  Configured custom hooks are not covered by that "no LLM" property.
 - **Bi-temporal valid time** — optional `valid_from` / `valid_until` bounds on
   thoughts *and* edges (a second time axis: *when a fact is true*, distinct from
   when it was recorded), queried via the four valid-time MindQL predicates, with
@@ -90,7 +91,9 @@ See [search.md](../docs/search.md) for details.
 
 ### Dreaming Extension
 
-Periodic memory consolidation that:
+Periodic memory consolidation. A run evaluates eligible candidates and,
+conditional on the corresponding gates, thresholds, caps, embeddings, and
+feature settings, may perform any of:
 
 1. **Scores** active thoughts via configurable signals.
 2. **Promotes** qualifying thoughts to P1 priority.

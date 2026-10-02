@@ -1,8 +1,10 @@
-"""Tests for engrava.extensions.vector_sqlite_vec."""
+"""Tests for engrava.infrastructure.sqlite.vector_sqlite_vec."""
 
 from __future__ import annotations
 
+import base64
 import importlib.util
+import json
 import sqlite3
 import struct
 from pathlib import Path
@@ -12,16 +14,17 @@ import aiosqlite
 import pytest
 
 from engrava import EmbeddingProviderContractError
+from engrava.cli.main import _import_records_to_db
 from engrava.config import ConfigError, EngravaConfig
 from engrava.domain.enums import LifecycleStatus, Priority, ThoughtType
 from engrava.domain.models.thought import ThoughtRecord
-from engrava.extensions.vector_sqlite_vec import (
+from engrava.infrastructure.service_manager import EngravaManager
+from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
+from engrava.infrastructure.sqlite.vector_sqlite_vec import (
     SqliteVecSearchBackend,
     _load_sqlite_vec_sync,
     load_sqlite_vec,
 )
-from engrava.infrastructure.service_manager import EngravaManager
-from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
 
 # Skip the real-extension integration tests when sqlite-vec is absent, but
 # never let them silently pass when it is installed and broken.
@@ -423,8 +426,9 @@ class TestSqliteVecRealConnection:
     async def test_sqlite_vec_backend_constructs_and_searches(self, tmp_path: Path) -> None:
         """A real sqlite-vec backend loads, indexes, and returns ranked results.
 
-        This is the regression guard for the worker-thread load: on the
-        pre-fix code construction raised ``sqlite3.ProgrammingError`` here.
+        This guards the worker-thread load: the extension is loaded on
+        aiosqlite's worker thread, the thread the queries run on, so
+        construction yields a live backend.
         """
         store = await self._build_store(tmp_path, backend="sqlite-vec", dimension=3)
         try:
@@ -659,7 +663,7 @@ class TestVec0DimensionTakesPrecedenceOverTheProvider(TestSqliteVecRealConnectio
         dimension unresolved, would make the guarantee those tests establish a
         statement about a store no user has.
         """
-        from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
+        from engrava.infrastructure.sqlite.vector_sqlite_vec import SqliteVecSearchBackend
 
         db_path = tmp_path / "from_config_vec.db"
         cfg_file = tmp_path / "engrava.yaml"
@@ -709,9 +713,10 @@ class TestVec0DeleteRemovesVector(TestSqliteVecRealConnection):
     async def test_delete_thought_removes_vec_row(self, tmp_path: Path) -> None:
         """delete_thought purges the vec0 vector; a later search never sees it.
 
-        On the pre-fix code the ``embedding`` row is FK-cascaded away but the
-        vec0 vector lingers, so the rowid stays in ``embedding_vec`` and can
-        still occupy a KNN slot.
+        The ``embedding`` row is removed with the thought, but that removal
+        does not reach the vec0 table; the vector has to be purged as
+        well, or its rowid would stay in ``embedding_vec`` and could still
+        occupy a KNN slot.
         """
         store = await self._build_store(tmp_path, backend="sqlite-vec", dimension=3)
         try:
@@ -891,6 +896,142 @@ class TestVec0DeleteRemovesVector(TestSqliteVecRealConnection):
             await store.close()
 
 
+@sqlite_vec_required
+class TestVectorOwnershipIsTheThoughtNotTheEmbeddingRow(TestSqliteVecRealConnection):
+    """A vector is owned by a live thought — one test per enforcement place.
+
+    Each test manufactures the same underlying shape — an ``embedding`` row
+    whose owning ``thought`` row is gone, but which itself was never
+    removed — directly via SQL, bypassing ``delete_thought`` entirely. That
+    shape is what a pre-core-12 delete leaves behind (see
+    ``test_referential_integrity.py``'s ``TestDeletionOnAPreCascadeSchema``
+    for the real-schema reproduction); constructing it directly here isolates
+    each of the three places the ownership rule must hold — reconciliation,
+    purge, and search — independent of which delete path or schema version
+    produced it.
+    """
+
+    async def test_reconciliation_does_not_backfill_a_vector_whose_thought_is_gone(
+        self, tmp_path: Path
+    ) -> None:
+        """``sync_embeddings`` must not treat a dangling ``embedding`` row as live."""
+        store = await self._build_store(tmp_path, backend="sqlite-vec", dimension=3)
+        try:
+            await _make_thought(store, "t-live")
+            await _make_thought(store, "t-orphaned")
+            await store.store_embedding(
+                thought_id="t-live", vector=[1.0, 0.0, 0.0], model_name=_PARITY_MODEL
+            )
+            await store.store_embedding(
+                thought_id="t-orphaned", vector=[0.0, 1.0, 0.0], model_name=_PARITY_MODEL
+            )
+            orphaned_rowid = await _embedding_rowid(store, "t-orphaned")
+            assert orphaned_rowid is not None
+
+            # Remove the vec0 row and the thought row, but deliberately leave
+            # the embedding row behind -- exactly what a pre-core-12 parent
+            # delete does when nothing cascades it away. This store is on a
+            # head schema, whose FK *would* cascade the embedding row too, so
+            # the cascade is disabled for this one manual delete to
+            # manufacture that pre-cascade shape directly.
+            await store._db.execute("PRAGMA foreign_keys=OFF")
+            await store._db.execute("DELETE FROM embedding_vec WHERE rowid = ?", (orphaned_rowid,))
+            await store._db.execute("DELETE FROM thought WHERE thought_id = ?", ("t-orphaned",))
+            await store._db.commit()
+            await store._db.execute("PRAGMA foreign_keys=ON")
+            assert orphaned_rowid not in await _vec_rowids(store)
+            embedding_still_present = await store._db.execute(
+                "SELECT 1 FROM embedding WHERE rowid = ?", (orphaned_rowid,)
+            )
+            assert (await embedding_still_present.fetchone()) is not None, (
+                "fixture precondition failed: the embedding row must survive"
+            )
+
+            assert store._vector_backend is not None
+            backfilled = await store._vector_backend.sync_embeddings(store._db)
+
+            assert orphaned_rowid not in await _vec_rowids(store)
+            assert backfilled == 0
+        finally:
+            await store.close()
+
+    async def test_purge_removes_a_vector_whose_thought_is_gone_even_though_the_embedding_row_survives(  # noqa: E501
+        self, tmp_path: Path
+    ) -> None:
+        """``purge_orphan_vectors`` must key off the thought, not just the embedding row."""
+        from engrava.infrastructure.sqlite.vector_sqlite_vec import purge_orphan_vectors
+
+        store = await self._build_store(tmp_path, backend="sqlite-vec", dimension=3)
+        try:
+            await _make_thought(store, "t-live")
+            await _make_thought(store, "t-orphaned")
+            await store.store_embedding(
+                thought_id="t-live", vector=[1.0, 0.0, 0.0], model_name=_PARITY_MODEL
+            )
+            await store.store_embedding(
+                thought_id="t-orphaned", vector=[0.0, 1.0, 0.0], model_name=_PARITY_MODEL
+            )
+            orphaned_rowid = await _embedding_rowid(store, "t-orphaned")
+            assert orphaned_rowid is not None
+
+            # The embedding row is left in place; only its owning thought is
+            # removed. The old, embedding-row-only orphan predicate would see
+            # nothing wrong here at all. This store is on a head schema, whose
+            # FK would otherwise cascade the embedding row away too, so the
+            # cascade is disabled for this one manual delete.
+            await store._db.execute("PRAGMA foreign_keys=OFF")
+            await store._db.execute("DELETE FROM thought WHERE thought_id = ?", ("t-orphaned",))
+            await store._db.commit()
+            await store._db.execute("PRAGMA foreign_keys=ON")
+            assert orphaned_rowid in await _vec_rowids(store)
+
+            removed = await purge_orphan_vectors(store._db)
+            await store._db.commit()
+
+            assert orphaned_rowid not in await _vec_rowids(store)
+            assert removed == 1
+            live_rowid = await _embedding_rowid(store, "t-live")
+            assert live_rowid in await _vec_rowids(store)
+        finally:
+            await store.close()
+
+    async def test_search_does_not_resolve_a_vector_whose_thought_is_gone(
+        self, tmp_path: Path
+    ) -> None:
+        """The vec0 search arm must not resolve a rowid back to a deleted thought's id."""
+        store = await self._build_store(tmp_path, backend="sqlite-vec", dimension=3)
+        try:
+            await _make_thought(store, "t-live")
+            await _make_thought(store, "t-orphaned")
+            await store.store_embedding(
+                thought_id="t-live", vector=[1.0, 0.0, 0.0], model_name=_PARITY_MODEL
+            )
+            await store.store_embedding(
+                thought_id="t-orphaned", vector=[0.9, 0.1, 0.0], model_name=_PARITY_MODEL
+            )
+
+            # Leave the vec0 row and the embedding row both in place -- only
+            # the thought is gone -- so a hit for "t-orphaned" is exactly as
+            # findable by MATCH as it was before the delete, and only the
+            # ownership join stands between it and the returned id. This
+            # store is on a head schema, whose FK would otherwise cascade the
+            # embedding row away too, so the cascade is disabled for this one
+            # manual delete.
+            await store._db.execute("PRAGMA foreign_keys=OFF")
+            await store._db.execute("DELETE FROM thought WHERE thought_id = ?", ("t-orphaned",))
+            await store._db.commit()
+            await store._db.execute("PRAGMA foreign_keys=ON")
+
+            assert isinstance(store._vector_backend, SqliteVecSearchBackend)
+            results = await store._vector_backend.search(store._db, [0.9, 0.1, 0.0], top_k=5)
+
+            ids = [r[0] for r in results]
+            assert "t-orphaned" not in ids
+            assert "t-live" in ids
+        finally:
+            await store.close()
+
+
 # ------------------------------------------------------------------
 # R3 — vec0 over-fetch fills the top-k live window
 # ------------------------------------------------------------------
@@ -943,9 +1084,9 @@ class TestVec0OverfetchFillsTopK(TestSqliteVecRealConnection):
     async def test_search_similar_fills_topk_despite_expired(self, tmp_path: Path) -> None:
         """search_similar returns top_k live rows even when nearer rows are dead.
 
-        On the pre-fix code only ``top_k`` neighbours are fetched; the closest
-        ``top_k`` are the non-live rows, which the post-filter removes, leaving
-        fewer than ``top_k`` (often zero) results.
+        The nearest neighbours are non-live rows that the live-row post-filter
+        drops; the arm over-fetches past them, so the result is still filled
+        to ``top_k`` live rows.
         """
         store = await self._build_store(tmp_path, backend="sqlite-vec", dimension=2)
         try:
@@ -1003,10 +1144,10 @@ class TestVec0OverfetchFillsTopK(TestSqliteVecRealConnection):
         """search_hybrid's vector arm yields the expected fused top-k live pool.
 
         Weighted purely on the vector arm (``fts_weight=0``) so the fused
-        result depends on the vec pool alone: the deeper live pool now feeds
+        result depends on the vec pool alone: the deeper live pool feeds
         hybrid fusion, and the fused top-k fills with live rows while non-live
         rows never appear. (Positive integration check of the fused path;
-        the strict under-fill regressions live in the ``search_similar`` tests
+        the strict under-fill checks live in the ``search_similar`` tests
         above, where ``top_k`` is the binding fetch bound.)
         """
         store = await self._build_store(tmp_path, backend="sqlite-vec", dimension=2)
@@ -1024,7 +1165,7 @@ class TestVec0OverfetchFillsTopK(TestSqliteVecRealConnection):
             )
             ids = [tid for tid, _ in result.results]
             assert "vector" in result.backends_used
-            # Fused top-k fills entirely from the (now-complete) live vec pool.
+            # Fused top-k fills entirely from the live vec pool.
             assert len(result.results) == 3
             assert all(tid.startswith("t-live-") for tid in ids)
         finally:
@@ -1288,3 +1429,216 @@ class TestVectorBackendSelectionUsesTheValidatedName:
                 await manager.get_store("svc")
         finally:
             await manager.close_all()
+
+
+# ------------------------------------------------------------------
+# Merge restore must not leave a stale vec0 vector under a reused rowid.
+# ------------------------------------------------------------------
+
+
+def _thought_replace_line(thought_id: str, *, essence: str) -> str:
+    """Serialise a ``thought`` snapshot line that replaces an existing row."""
+    return json.dumps(
+        {
+            "_type": "thought",
+            "data": {
+                "thought_id": thought_id,
+                "thought_type": "OBSERVATION",
+                "essence": essence,
+                "content": f"content {thought_id}",
+                "priority": "P3",
+            },
+        }
+    )
+
+
+def _embedding_snapshot_line(
+    embedding_id: str,
+    owner_id: str,
+    model_name: str,
+    vector: list[float],
+) -> str:
+    """Serialise an ``embedding`` snapshot line carrying an explicit vector."""
+    blob = struct.pack(f"{len(vector)}f", *vector)
+    return json.dumps(
+        {
+            "_type": "embedding",
+            "data": {
+                "embedding_id": embedding_id,
+                "owner_type": "THOUGHT",
+                "owner_id": owner_id,
+                "model_name": model_name,
+                "dimension": len(vector),
+                "vector_blob": base64.b64encode(blob).decode("ascii"),
+                "created_at": "2026-01-01T00:00:00+00:00",
+            },
+        }
+    )
+
+
+@sqlite_vec_required
+class TestMergeRestoreDoesNotLeaveAStaleVectorUnderAReusedRowid:
+    """A restored row's vector must be its own.
+
+    Ordinary merge restore (no ``--clear``/``--re-embed``) never resets the
+    vec0 index -- only those two flags route through
+    ``_reset_sqlite_vec_index_for_restore``. In an unjournalled target,
+    replacing an embedded thought cascade-deletes its old ``embedding`` row,
+    freeing its rowid; the incoming replacement embedding can land on that
+    same freed rowid. The old vec0 entry at that rowid has to be invalidated,
+    or it would keep winning search under the new row's identity. This builds
+    that exact scenario against a real sqlite-vec backend and shows which
+    vector wins after a reopen.
+    """
+
+    async def _build_target_with_one_embedded_thought(
+        self,
+        tmp_path: Path,
+        *,
+        model_name: str,
+        vector: list[float],
+    ) -> Path:
+        """Build a target db with one thought and its vec0-indexed embedding."""
+        db_path = tmp_path / "target.db"
+        db = await aiosqlite.connect(str(db_path))
+        db.row_factory = aiosqlite.Row
+        try:
+            await db.execute("PRAGMA foreign_keys = ON")
+            store = SqliteEngravaCore(db)
+            store._owns_connection = True
+            await store.ensure_schema()
+            await store._configure_vector_backend(
+                backend_name="sqlite-vec", embedding_dimension=len(vector)
+            )
+            assert isinstance(store._vector_backend, SqliteVecSearchBackend)
+            await _make_thought(store, "t-x")
+            await store.store_embedding(thought_id="t-x", vector=vector, model_name=model_name)
+        finally:
+            await store.close()
+        return db_path
+
+    async def _embedding_rowid_for_owner(self, db_path: Path, *, owner_id: str) -> int:
+        """Return the (sole) ``embedding`` rowid owned by a thought.
+
+        Looked up by ``owner_id`` rather than ``embedding_id``: the point of
+        this whole scenario is that the *embedding_id changes* across the
+        replace while the underlying rowid is what may (or may not) get
+        reused, so asserting on rowid-by-owner is what actually exercises
+        the rowid reuse.
+        """
+        conn = await aiosqlite.connect(str(db_path))
+        try:
+            cursor = await conn.execute(
+                "SELECT rowid FROM embedding WHERE owner_type = 'THOUGHT' AND owner_id = ?",
+                (owner_id,),
+            )
+            row = await cursor.fetchone()
+        finally:
+            await conn.close()
+        assert row is not None
+        return int(row[0])
+
+    async def test_restored_rows_own_vector_wins_after_reopen(self, tmp_path: Path) -> None:
+        """The exact scenario: forced rowid reuse via a merge restore.
+
+        After the replace, a search for ``new_vector`` finds the thought as a
+        perfect match, and the best score for a search for ``old_vector`` is
+        0.0.
+        """
+        model_name = _PARITY_MODEL
+        old_vector = [1.0, 0.0, 0.0]
+        new_vector = [0.0, 1.0, 0.0]
+
+        target = await self._build_target_with_one_embedded_thought(
+            tmp_path, model_name=model_name, vector=old_vector
+        )
+        old_rowid = await self._embedding_rowid_for_owner(target, owner_id="t-x")
+
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_replace_line("t-x", essence="replaced")
+            + "\n"
+            + _embedding_snapshot_line("e-new", "t-x", model_name, new_vector)
+            + "\n",
+            encoding="utf-8",
+        )
+
+        conn = await aiosqlite.connect(str(target))
+        conn.row_factory = aiosqlite.Row
+        try:
+            await conn.execute("PRAGMA foreign_keys = ON")
+            await _import_records_to_db(conn, snap)
+        finally:
+            await conn.close()
+
+        # Confirm the mechanism actually fired: the replacement embedding
+        # landed on the exact rowid the old one held. If this assertion ever
+        # fails, SQLite's rowid-reuse behaviour changed and the rest of this
+        # test no longer exercises rowid reuse.
+        new_rowid = await self._embedding_rowid_for_owner(target, owner_id="t-x")
+        assert new_rowid == old_rowid
+
+        # Reopen -- this is where the sqlite-vec reconciliation pass runs.
+        db = await aiosqlite.connect(str(target))
+        db.row_factory = aiosqlite.Row
+        try:
+            await db.execute("PRAGMA foreign_keys = ON")
+            store = SqliteEngravaCore(db)
+            store._owns_connection = True
+            await store._configure_vector_backend(backend_name="sqlite-vec", embedding_dimension=3)
+            old_query_hit = await store.search_similar(old_vector, top_k=1)
+            new_query_hit = await store.search_similar(new_vector, top_k=1)
+        finally:
+            await store.close()
+
+        # The restored row's own vector must win: a query for the new vector
+        # is a perfect match, a query for the vector it replaced is not.
+        assert new_query_hit, "search for the replacement vector returned nothing"
+        assert new_query_hit[0][0] == "t-x"
+        assert new_query_hit[0][1] == pytest.approx(1.0, abs=1e-6)
+        assert old_query_hit, "search for the old vector returned nothing"
+        assert old_query_hit[0][1] == pytest.approx(0.0, abs=1e-6)
+
+    async def test_unrelated_merge_leaves_an_untouched_vector_alone(self, tmp_path: Path) -> None:
+        """A merge that replaces nothing must not purge any existing vector.
+
+        Only rowids this restore actually replaced should ever be touched.
+        """
+        model_name = _PARITY_MODEL
+        vector = [1.0, 0.0, 0.0]
+
+        target = await self._build_target_with_one_embedded_thought(
+            tmp_path, model_name=model_name, vector=vector
+        )
+
+        snap = tmp_path / "snap.jsonl"
+        snap.write_text(
+            _thought_replace_line("t-y", essence="unrelated")
+            + "\n"
+            + _embedding_snapshot_line("e-y", "t-y", model_name, [0.0, 0.0, 1.0])
+            + "\n",
+            encoding="utf-8",
+        )
+
+        conn = await aiosqlite.connect(str(target))
+        conn.row_factory = aiosqlite.Row
+        try:
+            await conn.execute("PRAGMA foreign_keys = ON")
+            await _import_records_to_db(conn, snap)
+        finally:
+            await conn.close()
+
+        db = await aiosqlite.connect(str(target))
+        db.row_factory = aiosqlite.Row
+        try:
+            await db.execute("PRAGMA foreign_keys = ON")
+            store = SqliteEngravaCore(db)
+            store._owns_connection = True
+            await store._configure_vector_backend(backend_name="sqlite-vec", embedding_dimension=3)
+            hit = await store.search_similar(vector, top_k=1)
+        finally:
+            await store.close()
+
+        assert hit
+        assert hit[0][0] == "t-x"
+        assert hit[0][1] == pytest.approx(1.0, abs=1e-6)

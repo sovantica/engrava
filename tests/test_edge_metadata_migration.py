@@ -29,7 +29,7 @@ from engrava import SqliteEngravaCore
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
-_HEAD_VERSION = 20
+_HEAD_VERSION = 21
 
 
 # ---------------------------------------------------------------------------

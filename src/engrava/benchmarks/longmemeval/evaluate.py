@@ -109,8 +109,7 @@ async def evaluate_cosine(
             answer and each retrieved chunk. The same provider that
             powers the engrava store should be used so the embedding
             space matches.
-        threshold: Cosine-similarity floor for a hit. Defaults to 0.7
-            per WS spec §2.3.
+        threshold: Cosine-similarity floor for a hit. Defaults to 0.7.
 
     Returns:
         :class:`EvaluationOutcome` whose ``score`` is ``1.0`` when the

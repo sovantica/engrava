@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from importlib import resources
 from itertools import islice
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, NoReturn, Self
+from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn, Self
 
 import aiosqlite
 import numpy as np
@@ -64,6 +64,7 @@ from engrava.domain.exceptions import (
     ConnectionQuarantinedError,
     CoreMigrationError,
     CycleProviderError,
+    DedupLockReentryError,
     DerivedRecordError,
     DuplicateEdgeError,
     EmbeddingGenerationError,
@@ -75,12 +76,17 @@ from engrava.domain.exceptions import (
     JournalIntegrityError,
     RecencyModeConflictError,
     ReferentialIntegrityError,
+    SchemaVersionError,
     SourceThoughtNotFoundError,
     StaleDataError,
     ThoughtNotFoundError,
     VectorDimensionMismatchError,
+    WriteContentionError,
+    WriteLockTimeoutError,
 )
 from engrava.domain.models._temporal import (
+    canonical_timestamp,
+    canonical_timestamp_or_none,
     parse_iso8601_to_utc,
     validate_interval_ordering,
     validate_iso8601_nullable,
@@ -100,8 +106,10 @@ from engrava.domain.protocols.derived_records import (
     DeriveGates,
     DeriveResult,
 )
+from engrava.domain.protocols.dreaming import DreamingConsolidatorProtocol
 from engrava.domain.protocols.embedding_provider import RoleAwareEmbeddingProvider
 from engrava.domain.protocols.hooks import DefaultEngravaHooks, EngravaHooksProtocol
+from engrava.infrastructure.sqlite.aiosqlite_connect import connect
 from engrava.infrastructure.sqlite.connection_revocation import ConnectionRevocationToken
 from engrava.infrastructure.sqlite.hygiene import (
     EvictionReason,
@@ -113,7 +121,7 @@ from engrava.infrastructure.sqlite.hygiene import (
 from engrava.infrastructure.sqlite.journal_writer import JournalWriter
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Sequence
 
     from engrava.config import HygienePolicyConfig, MetricsConfig, SearchConfig
     from engrava.domain.manifest import ExtensionManifest
@@ -121,10 +129,9 @@ if TYPE_CHECKING:
     from engrava.domain.models.metrics import EngravaMetrics, LatencyHistogram
     from engrava.domain.models.search import HybridSearchResult
     from engrava.domain.protocols.cycle_provider import CycleProvider
-    from engrava.domain.protocols.dreaming import DreamingConsolidatorProtocol
     from engrava.domain.protocols.embedding_provider import EmbeddingProviderProtocol
     from engrava.domain.protocols.hooks import MindQLExtension
-    from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
+    from engrava.infrastructure.sqlite.vector_sqlite_vec import SqliteVecSearchBackend
     from engrava.mindql.executor import MindQLResult
     from engrava.mindql.parser import MindQLQuery
 
@@ -161,6 +168,81 @@ _ORIGIN_DERIVE_EXISTING = "derive_existing"
 #: upgraded through the ordered core-migration registry.
 _CORE_SCHEMA_BOOTSTRAP_FLOOR = 2
 
+#: The core schema version ``ensure_schema`` upgrades a database to. Must
+#: equal the target of the last entry in :meth:`SqliteEngravaCore._core_migration_steps`
+#: — kept as its own constant (rather than read off the registry, which needs
+#: an instance) so a caller that has not opened a store yet — the CLI's
+#: schema-state gate, in particular — can compare a database's stamped
+#: ``user_version`` against head without one.
+CORE_SCHEMA_HEAD_VERSION = 21
+
+#: Target version of the one core-migration step that manages its own
+#: transaction boundaries rather than running inside the single explicit
+#: transaction :meth:`SqliteEngravaCore._run_pending_core_migrations` opens for
+#: every other step (see :meth:`SqliteEngravaCore._migrate_core_v11_to_v12` and
+#: :meth:`SqliteEngravaCore._recreate_child_tables_with_fk_atomically`).
+#: ``PRAGMA foreign_keys`` is a documented no-op while a transaction is open —
+#: this step must toggle it to rebuild ``edge`` / ``embedding`` / ``action``
+#: with their foreign keys — and that no-op behaviour was verified empirically
+#: against SQLite 3.31.1 (2020, compiled from the upstream amalgamation) and
+#: 3.53.1 (current) before writing this constant: it is a stable, long-standing
+#: engine constraint, not a stale assumption inherited without checking.
+_FK_RECREATE_TARGET_VERSION: Final = 12
+
+#: Core tables whose presence on a sub-floor database means it is a real,
+#: populated store rather than an empty file — see
+#: :meth:`SqliteEngravaCore._has_any_core_table`.
+_CORE_TABLE_NAMES = (
+    "thought",
+    "edge",
+    "embedding",
+    "action",
+    "_metadata",
+    "journal_entry",
+    "extension_schema_versions",
+)
+
+#: The columns :func:`~engrava.domain.models._temporal.validate_iso8601_nullable`
+#: covers, per table, as they stand at core-21: the ones the ``v20 -> v21`` step
+#: rewrites once into the canonical UTC form (see
+#: :meth:`SqliteEngravaCore._normalise_stored_timestamps`). Pinned to that
+#: schema version on purpose — a migration must keep doing what it did when it
+#: shipped, so a column validated in some later version is not added here.
+_CANONICAL_TIMESTAMP_COLUMNS: Final = (
+    (
+        "thought",
+        (
+            "created_at",
+            "updated_at",
+            "last_accessed_at",
+            "expires_at",
+            "valid_from",
+            "valid_until",
+            "archived_at",
+        ),
+    ),
+    ("edge", ("valid_from", "valid_until")),
+)
+
+#: SQLite ``GLOB`` patterns for the canonical UTC form: what
+#: ``datetime.isoformat()`` writes for an aware UTC instant — a whole second, or
+#: a six-digit fraction that is never ``.000000`` (``isoformat`` omits a zero
+#: fraction). A stored value matching them already has the canonical shape and is
+#: not read back, even if it names an impossible date; everything else in a
+#: migrated column is.
+_CANONICAL_WHOLE_SECOND_GLOB: Final = (
+    "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]+00:00"
+)
+_CANONICAL_FRACTION_GLOB: Final = (
+    "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]"
+    ".[0-9][0-9][0-9][0-9][0-9][0-9]+00:00"
+)
+_ZERO_FRACTION_GLOB: Final = "*.000000+00:00"
+
+#: Rows read per page while the ``v20 -> v21`` step rewrites values without the
+#: canonical shape, so a large store is never held in memory at once.
+_TIMESTAMP_NORMALISATION_BATCH_SIZE: Final = 500
+
 
 @dataclass(frozen=True)
 class _DerivationOutcome:
@@ -183,6 +265,67 @@ class _DerivationOutcome:
     created: int = 0
     reused: int = 0
     skipped: int = 0
+
+
+@dataclass(frozen=True)
+class _DeleteAtomicResult:
+    """Outcome of :meth:`SqliteEngravaCore._delete_thought_atomic`.
+
+    Two independent questions, not one: whether the *parent* thought was
+    removed, and whether the call wrote *anything at all*. They can diverge —
+    a ``thought_id`` that never matched a row still triggers an unconditional
+    orphan sweep of any child rows a schema without FK enforcement is
+    carrying, which is a real write even though ``deleted`` is ``False``.
+    ``delete_thought`` / ``cleanup_expired`` need ``wrote_anything`` to decide
+    whether they have anything of their own to commit; a per-branch boolean
+    that only tracked ``deleted`` would silently roll back that sweep instead.
+
+    Attributes:
+        deleted: Whether the parent thought row was actually removed.
+        wrote_anything: Whether the connection's ``total_changes`` rose across
+            the parent delete and the child sweep. A vetoed parent delete,
+            whose savepoint this call rolls back (see
+            :meth:`SqliteEngravaCore._delete_thought_atomic`), reports
+            ``False``, even though a trigger may have written a row for part
+            of the call's execution.
+
+    """
+
+    deleted: bool
+    wrote_anything: bool
+
+
+@dataclass(frozen=True)
+class _HygieneGcOutcome:
+    """Outcome of :meth:`SqliteEngravaCore._hygiene_gc`, for ``run_hygiene``'s finalization.
+
+    ``run_hygiene`` decides whether its archive+GC unit has a surviving write
+    to commit from signals the stages report themselves — never from
+    ``self._db.total_changes``, which is monotonic and still counts a write a
+    savepoint later undid (see ``run_hygiene``'s own docstring). This carries
+    the two signals :meth:`_hygiene_gc` alone can report, beyond the plain
+    count already in :class:`~engrava.infrastructure.sqlite.hygiene.HygieneResult`.
+
+    Attributes:
+        gc_count: The number of thoughts physically deleted this stage —
+            identical to the value ``run_hygiene`` puts on the public
+            ``HygieneResult``.
+        retired_count: How many orphan REFLECTIONs
+            ``retire_orphan_reflections`` retired before any delete ran. A
+            retirement is its own surviving write even when every GC
+            candidate that follows it is vetoed or absent (``gc_count == 0``).
+        wrote_anything: Whether any GC candidate's own
+            :meth:`SqliteEngravaCore._delete_thought_atomic` call reported
+            ``wrote_anything`` — its orphan-sweep case, which can be ``True``
+            even for a candidate this stage does not count in ``gc_count``
+            (``deleted`` is ``False``). Tracked the same way
+            ``cleanup_expired`` already tracks it across its own delete loop.
+
+    """
+
+    gc_count: int
+    retired_count: int
+    wrote_anything: bool
 
 
 #: Fixed namespaces for the deterministic identities the derived-records seam
@@ -348,24 +491,63 @@ def _is_foreign_key_violation(exc: aiosqlite.IntegrityError) -> bool:
     return errorcode == _FOREIGN_KEY_CONSTRAINT_ERRORCODE
 
 
-class _DerivationRollbackError(Exception):
-    """Internal: a per-child rollback itself failed during derivation.
+#: SQLite result codes that identify lock contention: the primary ``SQLITE_BUSY``
+#: (5) plus its extended forms — a busy signal raised specifically during hot
+#: journal recovery (261) or when a snapshot cannot be maintained (517), and
+#: the equivalent of the primary code once extended result codes are in force
+#: (773). Classified structurally via :attr:`sqlite3.Error.sqlite_errorcode`,
+#: matching :data:`_UNIQUE_CONSTRAINT_ERRORCODES` above, so contention is never
+#: confused with an unrelated ``OperationalError`` (a locked schema, a missing
+#: table) that happens to share the generic "database is locked" wording.
+_BUSY_ERRORCODES: frozenset[int] = frozenset(
+    {
+        getattr(sqlite3, "SQLITE_BUSY", 5),
+        getattr(sqlite3, "SQLITE_BUSY_RECOVERY", 261),
+        getattr(sqlite3, "SQLITE_BUSY_SNAPSHOT", 517),
+        getattr(sqlite3, "SQLITE_BUSY_TIMEOUT", 773),
+    },
+)
 
-    Signals that after a child persistence failure the compensating
-    ``rollback()`` also raised, leaving the transaction state indeterminate (the
-    failed child's pending insert/edge may still be open and could be flushed by
-    a later child's commit). The derivation dispatch must therefore abort
-    immediately — this exception is **non-continuable** and is never swallowed by
-    the ``on_error="log"`` continue branch. The original child failure is chained
-    as ``__cause__``. Private to this module; not part of the public API.
+
+def _is_busy_error(exc: sqlite3.OperationalError) -> bool:
+    """Return ``True`` when *exc* is ``SQLITE_BUSY`` (or an extended busy code).
+
+    Used to decide whether a failed ``BEGIN IMMEDIATE`` is lock contention —
+    worth retrying — or some other ``OperationalError`` that retrying cannot
+    fix. Classification uses the extended result code rather than matching the
+    message text, which is locale/driver-fragile.
 
     Args:
-        rollback_error: The exception raised by the failed ``rollback()``.
+        exc: The raised SQLite operational error.
+
+    Returns:
+        ``True`` for a busy/lock-contention error, ``False`` otherwise.
 
     """
+    errorcode = getattr(exc, "sqlite_errorcode", None)
+    if not isinstance(errorcode, int):
+        # Unreachable on the supported floor (Python >= 3.11 always exposes
+        # ``sqlite_errorcode``). Fail safe rather than guessing from fragile
+        # message text: "not a recognised busy error" lets the caller
+        # propagate the original error instead of misclassifying it.
+        return False  # pragma: no cover
+    return errorcode in _BUSY_ERRORCODES
 
-    def __init__(self, rollback_error: BaseException) -> None:
-        super().__init__(f"rollback failed after a derived-child error: {rollback_error}")
+
+#: Maximum number of ``BEGIN IMMEDIATE`` attempts the dedup probe-and-insert
+#: window makes before giving up and raising :class:`WriteContentionError`.
+#: ``PRAGMA busy_timeout`` already makes each individual attempt wait for the
+#: lock; this bounds how many times the store tries again *after* an attempt
+#: has exhausted that wait, for the case where contention outlasts it.
+_DEDUP_BEGIN_MAX_ATTEMPTS: Final = 3
+
+#: Delay, in seconds, before each retry of a busy ``BEGIN IMMEDIATE``, doubling
+#: per attempt (0.05s before the 2nd attempt, 0.1s before the 3rd). Kept short
+#: relative to the default 5s ``busy_timeout``: each attempt has already waited
+#: out normal contention by the time it fails, so the retry delay only needs to
+#: let a sibling transaction that is *between* statements finish, not to
+#: substitute for the busy wait itself.
+_DEDUP_BEGIN_RETRY_BASE_SECONDS: Final = 0.05
 
 
 class _QuarantinedConnection:
@@ -377,8 +559,7 @@ class _QuarantinedConnection:
     fails hard on **any** core-initiated DB operation — ``commit``, ``execute``,
     ``cursor``, a read, or one of the direct-commit sites that bypass the
     :meth:`SqliteEngravaCore._maybe_commit` flag guard — **independent of whether
-    the physical connection actually closed**. This is what makes quarantine
-    terminal by construction rather than by a best-effort ``close()`` succeeding.
+    the physical connection actually closed**.
 
     ``close`` is a no-op so store shutdown stays graceful after quarantine.
     Private to this module; never part of the public API.
@@ -675,7 +856,7 @@ def _provider_dimension(provider: EmbeddingProviderProtocol) -> int:
     message that says the attribute is a required protocol member and what to
     add.
 
-    A conformant provider is read **exactly once**, as before — the member is
+    A conformant provider is read **exactly once** — the member is
     accessed in the ``try`` and everything else lives in the ``except``.
     ``hasattr(provider, ...)`` would be the shorter spelling and is deliberately
     not used: it evaluates the property to answer, so the read would happen twice
@@ -836,6 +1017,19 @@ _SUPPRESS_SEARCH_METRICS: contextvars.ContextVar[bool] = contextvars.ContextVar(
     default=False,
 )
 
+#: Task-local suppression for a nested write's own auto-commit, read only by
+#: :meth:`SqliteEngravaCore._maybe_commit`. ``run_hygiene`` sets this for the
+#: duration of its archive+GC unit so a nested public write it makes itself
+#: (``retire_orphan_reflections`` -> ``update_thought``) does not end that
+#: unit early with its own commit. Deliberately **not** the instance-wide
+#: ``_skip_auto_commit_depth``: that counter is shared by every task on the
+#: store, so raising it for the length of a hygiene pass would make an
+#: unrelated task's guarded write see a foreign window as its own.
+_SUPPRESS_NESTED_AUTO_COMMIT: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "engrava_suppress_nested_auto_commit",
+    default=False,
+)
+
 
 class _LatencyRingBuffer:
     """Fixed-size async-safe ring buffer of recent search latencies."""
@@ -963,6 +1157,146 @@ class _AccessBuffer:
         return drained
 
 
+async def _close_quietly(conn: aiosqlite.Connection) -> None:
+    """Close *conn*, logging rather than raising if the close itself fails.
+
+    Cleanup code that closes a connection while another exception -- or a
+    cancellation -- is already propagating must not let a failure in the
+    close itself replace what the caller actually needs to see: a bare
+    ``raise`` after an unconditional ``await conn.close()`` only re-raises
+    the original error when that close *succeeds*. If the close itself
+    raises, its exception becomes the one that propagates and the original
+    -- a ``ConfigError``, a ``JournalIntegrityError``, an
+    ``asyncio.CancelledError`` -- is lost. A close failure is real
+    information, but it belongs logged underneath the original error, not
+    raised in front of it. **Use this for cleanup that closes a connection
+    while another exception -- or a cancellation -- is already
+    propagating.** A close on the ordinary success path, where a close
+    failure is the only thing there is to report, should propagate
+    normally instead of coming through here -- routing it through this
+    helper would silently turn a genuine close failure into a
+    successful-looking outcome. ``service_manager.py`` imports this same
+    function rather than defining its own. The CLI layer has the same rule
+    under the same name in :mod:`engrava.cli.main` -- not shared as one
+    function across the CLI/infrastructure boundary, but copied rather
+    than re-derived.
+
+    ``await conn.close()`` is itself a suspension point, so a bare
+    ``try/except Exception`` around it has the identical gap this whole
+    helper exists to close: a cancellation arriving while the close is
+    in flight is a ``BaseException``, skips that handler, and can leave
+    the close abandoned mid-way with aiosqlite's non-daemon worker thread
+    still alive. The close is run as its own task and shielded so that
+    cancelling *this* coroutine does not also cancel the close itself;
+    the shield alone would not be enough, though, since it only stops the
+    cancellation from reaching the close, not from being re-thrown into
+    this coroutine before the close finishes running. So on cancellation
+    this explicitly awaits the same task again -- now cancellation-proof,
+    since a second throw only happens on an explicit second
+    ``cancel()`` -- to hold this coroutine (and so whatever awaits it,
+    keeping the event loop alive) open until the real close has actually
+    completed, before letting the cancellation propagate.
+
+    Args:
+        conn: The aiosqlite connection to close.
+
+    """
+    try:
+        close_task = asyncio.ensure_future(conn.close())
+        await asyncio.shield(close_task)
+    except asyncio.CancelledError:
+        try:
+            await close_task
+        except Exception:
+            logger.warning("Error closing connection during cleanup", exc_info=True)
+        raise
+    except Exception:
+        logger.warning("Error closing connection during cleanup", exc_info=True)
+
+
+async def _run_cleanup_step_quietly(
+    step: Callable[[], Coroutine[Any, Any, object]],
+    description: str,
+    *,
+    log_failure: Callable[[Exception], None] | None = None,
+) -> asyncio.CancelledError | None:
+    """Run one cleanup statement, logging rather than raising an ordinary failure.
+
+    Generalises :func:`_close_quietly`'s shield-then-redraw technique (see
+    that function's docstring for the full rationale) to an arbitrary
+    cleanup statement -- a transaction rollback, a pragma restore -- rather
+    than specifically a connection close. A migration cleanup that must run
+    more than one such step in sequence (rollback, then restore a pragma)
+    needs the same "log a failure here, don't let it replace what is already
+    propagating" treatment for each step, and this is that treatment,
+    written once -- shared across the infrastructure and CLI layers rather
+    than copied, unlike :func:`_close_quietly` and its CLI counterpart
+    (:mod:`engrava.cli.main`'s own ``_close_quietly``), which are separate
+    copies. ``step`` is a zero-argument callable rather than an
+    already-created coroutine so that a synchronous failure -- raised by
+    calling it, before anything is scheduled -- is also caught here rather
+    than escaping before the shield is even in place.
+
+    An ordinary failure (not a cancellation) is logged and swallowed: the
+    caller already knows an exception is propagating through it, and this
+    step's own failure is secondary information, not the error to report. A
+    cancellation delivered to *this* call while the step is in flight is
+    different -- a control-flow signal, not an ordinary error -- so it is
+    never swallowed. It is returned rather than raised so a caller running
+    several steps in sequence can still finish the remaining ones before
+    deciding which exception ultimately propagates.
+
+    The default log line is a plain ``exc_info=True`` warning, matching this
+    module's own ``_close_quietly``. A caller whose logging needs to differ
+    -- a different logger, or a message shape like the CLI's own
+    ``_close_quietly``/``_rollback_quietly``, which reads the cleanup
+    exception once through a guarded, non-absorbing description instead of
+    letting the standard traceback formatter render it a second, unguarded
+    way -- passes ``log_failure`` rather than this being forked into a
+    second copy of the whole function.
+
+    Args:
+        step: Zero-argument callable returning the awaitable to run, e.g.
+            ``self._db.rollback`` or ``lambda: self._db.execute("PRAGMA ...")``.
+        description: Human-readable description of the step, used only in
+            the default warning logged on an ordinary failure (ignored when
+            ``log_failure`` is given).
+        log_failure: Called with the cleanup step's own exception instead of
+            the default warning, when the step fails with an ordinary
+            (non-cancellation) exception. Never called for a cancellation.
+
+    Returns:
+        The ``CancelledError`` delivered to this call, if any. ``None`` when
+        the step ran to completion -- successfully or not -- without this
+        call itself being cancelled.
+
+    """
+    try:
+        task = asyncio.ensure_future(step())
+        await asyncio.shield(task)
+    except asyncio.CancelledError as exc:
+        try:
+            await task
+        except Exception as cleanup_exc:
+            if log_failure is not None:
+                log_failure(cleanup_exc)
+            else:
+                logger.warning("Error %s during cleanup", description, exc_info=True)
+        return exc
+    except Exception as cleanup_exc:
+        if log_failure is not None:
+            log_failure(cleanup_exc)
+        else:
+            logger.warning("Error %s during cleanup", description, exc_info=True)
+        # See ``_close_quietly`` for why this matters: without a real
+        # suspension point after the synchronous logging above, a
+        # cancellation or SIGINT requested while this coroutine was running
+        # synchronously would be silently dropped instead of reaching the
+        # caller.
+        await asyncio.sleep(0)
+    return None
+
+
 def _validate_provider_cycle(value: object) -> int:
     """Validate a value pulled from a ``CycleProvider`` at the trust boundary.
 
@@ -995,6 +1329,262 @@ def _validate_provider_cycle(value: object) -> int:
     return value
 
 
+#: Bound on how long a task waits to acquire an in-process write lock before
+#: :class:`~engrava.domain.exceptions.WriteLockTimeoutError` is raised (see
+#: :class:`_TaskReentrantLock`). **Not** a claim that nothing under the lock
+#: does network I/O — ``bulk_store``'s batch embedding call runs inside
+#: :meth:`SqliteEngravaCore.suspend_auto_commit`, which holds this lock for
+#: its whole duration, and that call reaches a real embedding provider over
+#: the network. A legitimate hold can genuinely take minutes, so this bound
+#: is a backstop that converts an *unrecoverable* deadlock (a task spawned
+#: and awaited from inside another task's own window — see the class
+#: docstring) into an attributable, catchable error — not a policy against
+#: slow legitimate work, though it **can** still misfire on one if this
+#: value is too small for your own provider or batch sizes, which is exactly
+#: why it is a per-instance parameter rather than a hardcoded constant. Must
+#: never be tightened without re-deriving this number.
+#:
+#: Derived, not guessed, from the shipped default provider
+#: (:class:`~engrava.embeddings.openai_compatible.OpenAICompatibleProvider`):
+#: one ``embed_batch``/``embed_document_batch`` call is one HTTP round trip
+#: for the *whole* batch (no internal chunking), made with a 60s client
+#: timeout, up to 3 attempts total, with backoff of ``1 * attempt`` seconds
+#: between them. Worst case before that provider itself gives up:
+#: ``3 * 60 + (1 + 2) = 183`` seconds — and that is only the shipped
+#: default's own retry-exhaustion ceiling, not an upper bound on every
+#: provider a caller can configure (a self-hosted or custom provider may
+#: have its own, larger timeout and retry budget the lock cannot see) or on
+#: how long a large batch can legitimately take to process even on a single
+#: successful attempt. The default below is a small integer multiple of that
+#: 183s figure for headroom, not a round number picked for the sake of
+#: looking generous — tune it via ``SqliteEngravaCore(...,
+#: write_lock_acquire_timeout_seconds=...)`` for a slower configured
+#: provider or a larger batch ceiling than this covers.
+_WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS = 600.0
+
+#: How long :meth:`SqliteEngravaCore.close` waits for the aiosqlite worker
+#: thread to answer the physical close before giving up on it. Unbounded
+#: before this: a worker that never answers — busy with something
+#: legitimately slow, or genuinely wedged inside a call nothing can
+#: interrupt — left ``close()`` queued behind it forever. See ``close``'s own
+#: docstring for what happens once this bound expires.
+#:
+#: **Not a per-call budget.** ``close()`` applies this same value a second
+#: time, independently, to the access-buffer flush it runs before the
+#: physical close — so one call can wait up to *twice* this figure (60s at
+#: the default) when the worker never answers at all, not this figure as a
+#: ceiling on the whole call. See :meth:`SqliteEngravaCore.close` for why
+#: the flush needs its own bound rather than sharing one with the close.
+#:
+#: Derived from a number already in this file, not an unrelated one:
+#: :meth:`SqliteEngravaCore.from_config` sets ``PRAGMA busy_timeout=5000`` on
+#: every connection it opens — five seconds is already this product's own
+#: line between "the database is legitimately busy" and "something is
+#: wrong", at the level SQLite itself can see. ``close()`` is waiting on the
+#: same worker thread from one layer above that PRAGMA, so its bound uses a
+#: small integer multiple of that figure for headroom (the close's own WAL
+#: bookkeeping, plus whatever the worker was already doing when the stop
+#: request was queued behind it) rather than inventing an unrelated number:
+#: **30 seconds, six times the busy-timeout floor.**
+#:
+#: This is deliberately much shorter than
+#: :data:`_WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS` (600s) — that bound covers a
+#: *different* task waiting through a legitimate, network-bound embedding
+#: round trip that never touches the worker thread at all (the wait happens
+#: on the Python/asyncio side, while the connection itself is idle). This
+#: bound covers a caller waiting on the worker thread itself, where
+#: measurement behind this bound found only two shapes: a slow statement
+#: that finishes in seconds, or a worker that will never answer at any
+#: bound, however large — so a large default buys nothing for the first
+#: case and only makes the second case's caller wait longer than it has to.
+#: That caller is plausibly a short-lived command-line invocation through
+#: the ``--config`` tier (``SqliteEngravaCore.from_config`` — the case that
+#: motivated this): the CLI's other, bare-connection tier calls
+#: ``aiosqlite.Connection.close()`` directly and does not go through this
+#: method at all, so it does not inherit this bound regardless of the
+#: default chosen here.
+#: Tune it via ``SqliteEngravaCore(..., close_timeout_seconds=...)`` /
+#: ``from_config(..., close_timeout_seconds=...)`` for a deployment whose
+#: legitimate closes run slower than this covers.
+_CLOSE_TIMEOUT_SECONDS: Final = 30.0
+
+
+class _TaskReentrantLock:
+    """An ``asyncio``-compatible lock that the *same task* may re-acquire freely.
+
+    A plain :class:`asyncio.Lock` is not reentrant: a task that calls
+    ``acquire`` twice — e.g. a write issued from inside its own
+    :meth:`SqliteEngravaCore.suspend_auto_commit` window — blocks on itself and
+    hangs forever. This wrapper tracks the *owning task* and a nesting depth so
+    the owning task's own nested acquisitions are free, while every other task
+    blocks on the underlying lock. Getting this wrong
+    turns a silent data loss into a hang, which is not an improvement — so the
+    identity check is on the task object itself (``asyncio.current_task()``),
+    never on anything the caller could pass or forge.
+
+    Deliberately task-scoped, not store-scoped: two genuinely concurrent tasks
+    still serialise against each other (the second call to ``acquire`` blocks
+    until the first task's matching, outermost ``release``), which is exactly
+    what makes a read-modify-write critical section atomic across tasks. This
+    mirrors the shape of :attr:`SqliteEngravaCore._dedup_lock` (:class:`_DedupLock`,
+    itself wrapping an ``asyncio.Lock`` to guard one instance-wide critical
+    section — see that class for why a *same-task* second acquisition raises
+    there instead of blocking, unlike this lock's free same-task recursion)
+    plus the
+    task-local ``ContextVar``s already in this file
+    (:attr:`SqliteEngravaCore._suppress_access_tracking`) rather than inventing
+    a new primitive: an ``asyncio.Lock`` for the store-wide serialisation, task
+    identity for the reentrancy.
+
+    **Re-entrancy is keyed on the task, and a task boundary is a hard edge.**
+    A task spawned from inside a :meth:`SqliteEngravaCore.suspend_auto_commit`
+    window — via ``asyncio.create_task``, ``gather``, ``wait_for``, or one
+    spawned inside an ``on_store`` hook or embedding provider callback — is a
+    *different* task, however it was created. If the window's own task then
+    awaits that spawned task (directly, or transitively) before its window
+    closes, the spawned task can never get the lock the window's task is
+    holding, and the window's task can never release it while still awaiting
+    the spawned task: an unrecoverable deadlock this store cannot resolve.
+    This is already out of the documented contract — every guarded write on a
+    given store instance while a ``suspend_auto_commit`` window is open must
+    come from the one task that opened it — so ``acquire`` bounds a
+    *different* task's wait at :data:`_WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS` and
+    raises :class:`~engrava.domain.exceptions.WriteLockTimeoutError` past it,
+    trading a silent, unattributable hang for a typed, catchable failure that
+    also ends the deadlock (the spawned task's failure lets whatever awaited
+    it unwind, freeing the window's task to finish and release the lock).
+
+    **That bound is not "ordinary contention never gets close to it" —
+    ``bulk_store``'s batch embedding call runs inside its own
+    ``suspend_auto_commit`` window, holding this lock for the whole,
+    genuinely network-bound embedding round trip**, which can legitimately
+    take minutes for a large batch. The bound has to clear that legitimate
+    case with real margin, not merely clear "ordinary" contention — see
+    :data:`_WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS` for how its default is
+    derived and why a caller with a slower provider or larger batches should
+    raise it via ``SqliteEngravaCore(...,
+    write_lock_acquire_timeout_seconds=...)`` rather than accept a false
+    timeout on correct usage.
+    """
+
+    def __init__(
+        self, *, acquire_timeout_seconds: float = _WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS
+    ) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: asyncio.Task[object] | None = None
+        self._depth = 0
+        self._acquire_timeout_seconds = acquire_timeout_seconds
+
+    async def acquire(self) -> None:
+        """Acquire the lock, or recurse for free if this task already holds it.
+
+        Raises:
+            WriteLockTimeoutError: When a *different* task cannot acquire the
+                lock within :attr:`_acquire_timeout_seconds` — see the class
+                docstring for why this bound exists and what tripping it means.
+
+        """
+        current = asyncio.current_task()
+        if current is not None and current is self._owner:
+            self._depth += 1
+            return
+        try:
+            await asyncio.wait_for(self._lock.acquire(), timeout=self._acquire_timeout_seconds)
+        except TimeoutError:
+            raise WriteLockTimeoutError(timeout_seconds=self._acquire_timeout_seconds) from None
+        self._owner = current
+        self._depth = 1
+
+    def release(self) -> None:
+        """Release one level of nesting; only the outermost release unblocks others.
+
+        Raises:
+            RuntimeError: When called by a task that is not the current holder
+                (including a task that never acquired it).
+
+        """
+        if self._depth <= 0 or asyncio.current_task() is not self._owner:
+            msg = "_TaskReentrantLock.release() called by a task that does not hold it"
+            raise RuntimeError(msg)
+        self._depth -= 1
+        if self._depth == 0:
+            self._owner = None
+            self._lock.release()
+
+    async def __aenter__(self) -> None:
+        """Support ``async with self._write_lock:``, matching ``asyncio.Lock``."""
+        await self.acquire()
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        """Release on block exit, including on exception."""
+        self.release()
+
+
+class _DedupLock:
+    """A dedup-window lock that raises on same-task re-entry instead of hanging.
+
+    ``_dedup_lock`` guards the dedup probe-and-insert window
+    (``create_thought(deduplicate=True)``, ``get_or_create``,
+    ``upsert_by_hash``) and, unlike :class:`_TaskReentrantLock`, has no
+    legitimate reentrant use: nothing this store does needs the *same* task
+    to hold it twice. A second acquisition by the same task is always a bug
+    — the concrete shape is ``upsert_by_hash``'s hit branch, when it updates
+    the row, calling the overridable ``update_thought`` while still holding
+    this lock (see ``docs/extension-hooks.md`` §1B.3); an ``update_thought``
+    override that calls back into ``create_thought(deduplicate=True)`` /
+    ``get_or_create`` / ``upsert_by_hash`` / ``bulk_store(deduplicate=True)``
+    on that same task tries to acquire this lock again while its own outer acquisition
+    has not yet released it.
+
+    A plain :class:`asyncio.Lock` blocks that second acquisition on itself
+    forever, with nothing in any log to point at why — exactly the silent,
+    unattributable hang ``docs/concurrency.md`` ("A deadlock this store
+    cannot resolve raises, it does not hang") forbids for the write lock's
+    own different-task case. This wrapper extends that same policy here:
+    whether the current task already owns the lock is known synchronously,
+    with no race to bound, so the second acquisition raises
+    :class:`~engrava.domain.exceptions.DedupLockReentryError` immediately
+    instead of awaiting the underlying lock at all.
+
+    A *different* task still waits on the underlying :class:`asyncio.Lock`
+    exactly as it would with no wrapper at all — only a same-task second
+    acquisition changes behaviour.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: asyncio.Task[object] | None = None
+
+    async def acquire(self) -> None:
+        """Acquire the lock, or raise if this task already holds it.
+
+        Raises:
+            DedupLockReentryError: When the current task already holds this
+                lock — waiting for the underlying :class:`asyncio.Lock` would
+                block on itself forever, since only this same task's own
+                matching :meth:`release` can ever free it.
+
+        """
+        current = asyncio.current_task()
+        if current is not None and current is self._owner:
+            raise DedupLockReentryError
+        await self._lock.acquire()
+        self._owner = current
+
+    def release(self) -> None:
+        """Release the lock so a waiting task (or a later call) can acquire it."""
+        self._owner = None
+        self._lock.release()
+
+    async def __aenter__(self) -> None:
+        """Support ``async with self._dedup_lock:``, matching ``asyncio.Lock``."""
+        await self.acquire()
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        """Release on block exit, including on exception."""
+        self.release()
+
+
 class SqliteEngravaCore:
     """Core SQLite persistence backend for thought-graph CRUD.
 
@@ -1005,7 +1595,16 @@ class SqliteEngravaCore:
     skip ``db.commit()`` so the caller manages the commit boundary.
 
     Subclasses can override ``_row_to_thought`` to produce extended model
-    types (template method pattern).
+    types (template method pattern), and ``prepare_thought_for_insert`` to
+    validate or enrich a candidate thought before the decisive probe for a
+    duplicate, or — when ``deduplicate=False`` skips that probe — before the
+    unconditional write instead; that choice hinges on ``deduplicate``, not on
+    which entry point was called, since ``create_thought``, ``bulk_store``,
+    and ``remember`` each default to ``deduplicate=False`` — the pre-insert
+    seam that ``create_thought``, ``get_or_create``, ``upsert_by_hash``,
+    ``bulk_store`` and ``remember`` call, when it runs at all (two of those
+    skip it entirely on a stable hit); see that method's docstring for its
+    exact invocation-count and locking contract per entry point.
 
     Args:
         db: An open aiosqlite connection (WAL mode, FK enabled).
@@ -1017,9 +1616,30 @@ class SqliteEngravaCore:
             provider's own exception (byte-identical to prior behaviour). When
             ``True``, that failure is normalised into a typed
             :class:`~engrava.domain.exceptions.EmbeddingGenerationError` — the
-            opt-in fail-fast. The thought is already committed either way, so
-            this governs how loudly the missing embedding is surfaced, not
-            whether the row is persisted. No effect unless ``auto_embed`` is on.
+            opt-in fail-fast. This flag decides the exception *type*, not
+            whether the call that raised it already committed its own row.
+            When a single-item call (``create_thought``/``update_thought``)
+            owns its own transaction, that row is already durable by the
+            time auto-embed runs regardless of this flag, and a standalone
+            :meth:`bulk_store` rolls its whole batch back regardless of this
+            flag too (see that exception's docstring for the full per-path
+            outcome, including the nested case, where nothing is durable
+            yet on either flag setting until the caller's own outermost
+            window exits). But the exception type this flag picks *can*
+            affect durability when the failure happens nested inside a
+            caller's own ``suspend_auto_commit()`` window — only when the
+            caller's own exception handling distinguishes the two types: an
+            ``except EmbeddingGenerationError`` clause around the failing
+            call catches the strict-mode error and lets that outer window
+            exit cleanly (so it commits), while the same clause does not
+            catch the untyped provider exception this flag raises by
+            default, which escapes the window and rolls it back — same
+            provider failure, same caller code, opposite durable outcome. A
+            caller whose ``except`` clause instead catches both types (a
+            bare ``except Exception``) or neither sees the same outcome
+            regardless of this flag; only type-discriminating handling makes
+            the flag's choice of exception type observable in durability. No
+            effect unless ``auto_embed`` is on.
         search_config: Optional default hybrid-search weights from config.
         journal_enabled: Whether to record mutations in the hash-chain
             journal.  Defaults to ``False``.
@@ -1043,6 +1663,41 @@ class SqliteEngravaCore:
             recency / age-gating stay off unless a cycle is passed per call. The
             provider is **read-time only** — it never stamps ``created_cycle`` /
             ``updated_cycle`` on writes.
+        write_lock_acquire_timeout_seconds: How long a *different* task may
+            wait to acquire this instance's in-process write lock before
+            :class:`~engrava.domain.exceptions.WriteLockTimeoutError` is
+            raised. A backstop that converts an unrecoverable deadlock (a
+            task spawned and awaited from inside another task's own
+            ``suspend_auto_commit`` window — see
+            :class:`_TaskReentrantLock`) into an attributable, catchable
+            error — not a policy against ordinary contention or slow
+            legitimate work, though it **can** still fire on a legitimate
+            hold longer than this value, which is exactly why it is
+            configurable rather than fixed. The default covers
+            ``bulk_store``'s batch-embedding call through the shipped
+            default provider with margin (see
+            :data:`_WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS` for the derivation).
+            Raise this if your embedding provider's own worst-case latency
+            for the batches you actually send is close to or above the
+            default; lower it only for a deployment that never runs
+            ``bulk_store`` with network-bound embedding under load, since a
+            legitimate hold longer than this value now fails loudly instead
+            of completing.
+        close_timeout_seconds: How long :meth:`close` waits for the aiosqlite
+            worker thread to answer the physical close before giving up on
+            it and quarantining the store — see :meth:`close` and
+            :data:`_CLOSE_TIMEOUT_SECONDS` for what expiry does and how the
+            default is derived. Raise this for a deployment whose legitimate
+            closes (a large WAL checkpoint, a busy worker finishing real
+            work) routinely run slower than the default covers; lower it to
+            get control back sooner when the worker is wedged and will
+            never answer. The same shorter bound is all a merely-slow close
+            gets to prove itself in, though:
+            :meth:`_finish_close_wait` cannot tell a slow worker from a wedged
+            one, so a lower value also raises the odds of quarantining a store
+            whose close was healthy and would have finished. The close itself
+            runs to completion either way — the bound stops this call's
+            observation of it, never the close.
 
     """
 
@@ -1065,29 +1720,71 @@ class SqliteEngravaCore:
         hygiene_policy: HygienePolicyConfig | None = None,
         derive_gates: DeriveGates | None = None,
         cycle_provider: CycleProvider | None = None,
+        write_lock_acquire_timeout_seconds: float = _WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS,
+        close_timeout_seconds: float = _CLOSE_TIMEOUT_SECONDS,
     ) -> None:
         self._db = db
         self._hooks: EngravaHooksProtocol = hooks or DefaultEngravaHooks()
-        self._skip_auto_commit: bool = False
-        # Terminal quarantine state. Set only when a per-child compensating
-        # rollback in the derived-records seam did not cleanly complete (raised
-        # or was cancelled), so the long-lived connection may still hold an open
-        # transaction. Quarantine is terminal by construction:
+        # Nesting depth of open `suspend_auto_commit` windows on this task's
+        # current critical section — an ``int``, not a ``bool``, precisely so a
+        # *nested* window cannot commit the *outer* one early or clear the flag
+        # out from under it (see `suspend_auto_commit` and `_skip_auto_commit`
+        # below). Only the outermost `suspend_auto_commit` call ever commits,
+        # rolls back, or brings this back to 0.
+        self._skip_auto_commit_depth: int = 0
+        # Every open `suspend_auto_commit` window (nested or not) registers a
+        # fresh identity here for its duration — see `suspend_auto_commit` and
+        # `_dispatch_derivation`. Paired with `_current_auto_commit_window`
+        # below, this lets the derivation gate ask "is *this task's own*
+        # window still open?" instead of "is *some* window open on this
+        # store?", which `_skip_auto_commit_depth` alone cannot answer: that
+        # counter is instance-wide, so a task with no window of its own would
+        # otherwise read another task's open window as if it were its own.
+        self._open_auto_commit_windows: set[object] = set()
+        # Task-local marker naming the innermost `suspend_auto_commit` window
+        # THIS task currently has open on THIS store, or `None` if it has none
+        # open. A `contextvars.ContextVar`, created per-instance rather than
+        # at module level — the same choice already made for
+        # `_suppress_access_tracking` below — so a task holding windows on two
+        # different store instances at once keeps each store's marker
+        # independent: opening a window on store B must not overwrite store
+        # A's own still-open window's identity for a task that holds both.
+        # Set with a token at each window's entry and reset in its `finally`,
+        # where the identity is also unregistered from
+        # `_open_auto_commit_windows` — see `suspend_auto_commit`.
+        self._current_auto_commit_window: contextvars.ContextVar[object | None] = (
+            contextvars.ContextVar("engrava_current_auto_commit_window", default=None)
+        )
+        # Terminal quarantine state. Set only when a guarded write's own unit
+        # (e.g. ``_write_readback_savepoint``, including a derived child's row
+        # or edge insert) could not unwind its savepoint after it failed
+        # (raised or was cancelled), so the long-lived connection may still
+        # hold an open transaction. Quarantine has three parts:
         #   * the flag makes guarded entry points + ``_maybe_commit`` fail fast;
         #   * ``_db`` is swapped for a ``_QuarantinedConnection`` proxy so every
         #     core-initiated op raises regardless of physical close; and
-        #   * the shared revocation token (below) makes every *other* holder of
-        #     the real connection (the JournalWriter) fail hard too.
+        #   * the shared revocation token (below) is revoked, so the
+        #     JournalWriter's methods that check it raise.
         # Never cleared — recovery requires a fresh connection + store.
         self._connection_quarantined: bool = False
         self._quarantine_reason: str | None = None
-        # Shared with the JournalWriter (and any future direct-connection holder)
-        # so quarantine revokes them all synchronously, independent of the
-        # best-effort physical close.
+        # Shared with the JournalWriter so quarantine can revoke the token
+        # synchronously, independent of the best-effort physical close.
         self._revocation = ConnectionRevocationToken()
-        # Retains the detached best-effort close task so it is neither GC'd while
-        # pending nor reported as an unretrieved-exception task.
+        # The task performing the real connection's *physical* close, however
+        # it started -- quarantine's own detached best-effort close, or an
+        # ordinary close() call that got there first. Doubles as the "a
+        # physical close is already in progress" marker close() and
+        # _quarantine_connection each check before starting a second,
+        # independent one on the same underlying connection (see close()).
+        # Also retains quarantine's own close task so it is neither GC'd
+        # while pending nor reported as an unretrieved-exception task.
         self._quarantine_close_task: asyncio.Task[None] | None = None
+        # Bound on how long close() waits for the worker to answer the
+        # physical close before quarantining the store instead -- see
+        # close() and _CLOSE_TIMEOUT_SECONDS for the derivation and what
+        # expiry does.
+        self._close_timeout_seconds: float = close_timeout_seconds
         self._fts_available: bool = False
         self._fts_probed: bool = False
         # Count of primary FTS5 ``MATCH`` executions that raised an
@@ -1115,7 +1812,6 @@ class SqliteEngravaCore:
         # per-thought auto-embed so the batch path can embed all rows in one
         # provider call after the insert loop. False for every other caller.
         self._suppress_auto_embed: bool = False
-        self._embedding_model_verified: bool = False
         # Configuration objects are required to be *exactly* their class, not
         # instances of it. A subclass passes ``isinstance`` and is still free to
         # report one set of settings while it is validated and another every
@@ -1174,7 +1870,36 @@ class SqliteEngravaCore:
         # converge on a single row even though aiosqlite does not expose
         # row-level locking.  Acquired only on the dedup branch — the
         # legacy ``deduplicate=False`` path stays lock-free.
-        self._dedup_lock: asyncio.Lock = asyncio.Lock()
+        self._dedup_lock: _DedupLock = _DedupLock()
+        # Task-reentrant lock around every write path on the instance. Held
+        # for the duration of each read-validate-write critical section —
+        # for a single-item call (create_thought, update_thought, ...) not
+        # nested in the same task's own suspend_auto_commit() window, never
+        # across a slow/arbitrary step such as an embedding provider
+        # request, an `on_store` hook, or a derived-records producer,
+        # matching the discipline `_serialize_dedup_probe` already
+        # established (see its own docstring). `bulk_store` is one
+        # exception, by design: its batch embedding call runs *inside*
+        # `suspend_auto_commit`'s window (the batch's atomicity spans
+        # insert + embed + commit as one unit), so this lock is held
+        # for that whole, genuinely network-bound round trip too. A
+        # single-item call nested in an outer, already-open
+        # suspend_auto_commit() window on the same task is a second
+        # exception, incidentally rather than by design: this lock is
+        # task-reentrant, so the outer window's hold never actually drops
+        # while this call's own follow-up work (auto-embed, on_store,
+        # derivation) runs — see `_finish_create_thought` — and a
+        # *different* task's write still waits behind it for the whole
+        # window, same as `bulk_store`'s case. See `_TaskReentrantLock` and
+        # `_WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS` for what that means for the
+        # acquisition bound. Blocks a *different*
+        # task's write for the duration; the *same* task re-enters for free
+        # (see `_TaskReentrantLock`), which is what lets a write issued from
+        # inside `suspend_auto_commit` complete instead of deadlocking on
+        # itself.
+        self._write_lock: _TaskReentrantLock = _TaskReentrantLock(
+            acquire_timeout_seconds=write_lock_acquire_timeout_seconds
+        )
         # Fires the recency-off nudge in ``recall`` at most once per instance.
         self._recency_nudge_emitted: bool = False
         # Live access substrate (feeds the dreaming ``frequency`` signal).
@@ -1199,7 +1924,10 @@ class SqliteEngravaCore:
         # The backend-independent dreaming consolidator, supplied by the
         # composition root when enabled. ``None`` for a manually built store or
         # dreaming-off configuration. The legacy private attribute name is kept
-        # to avoid disrupting existing diagnostic integrations.
+        # to avoid disrupting existing diagnostic integrations. This is the one
+        # slot both wiring routes target: ``from_config`` still writes it
+        # directly, and every other caller has ``attach_dreaming_extension``
+        # (below) as the supported door onto the same state.
         self._dreaming_extension: DreamingConsolidatorProtocol | None = None
         # Memory Hygiene (deterministic forgetting) policy. ``None`` (default)
         # or ``enabled=False`` ⇒ the forgetting loop never runs and no existing
@@ -1277,11 +2005,40 @@ class SqliteEngravaCore:
     def journal(self) -> JournalWriter | None:
         """Return the ``JournalWriter`` if journaling is enabled, else ``None``.
 
+        **A direct call to the returned writer's own ``append()`` is not a
+        guarded write path.** Every mutation this store itself journals runs
+        the append under the same in-process write lock as the write it
+        describes (see the concurrency documentation). ``JournalWriter`` does
+        not hold that lock itself — it only serialises its own
+        ``sequence_number`` allocation against other appends on the same
+        connection — so a caller appending directly through this property,
+        outside of any guarded write this store performs, can still land
+        inside another task's open transaction-deferral window and be rolled
+        back with it. Prefer letting the store journal its own mutations;
+        treat a direct ``append()`` call the same as any other unmediated use
+        of the underlying connection.
+
         Returns:
             The active journal writer, or ``None``.
 
         """
         return self._journal
+
+    @property
+    def _skip_auto_commit(self) -> bool:
+        """Return whether a ``suspend_auto_commit`` window is currently open.
+
+        Backed by :attr:`_skip_auto_commit_depth` rather than a bare ``bool`` so
+        a *nested* ``suspend_auto_commit`` call cannot make this ``False`` while
+        an enclosing one is still open — see that method's docstring for the two
+        failures a plain ``bool`` produced under nesting.
+
+        Returns:
+            ``True`` while at least one ``suspend_auto_commit`` window — nested
+            or not — is open on this task's current critical section.
+
+        """
+        return self._skip_auto_commit_depth > 0
 
     async def verify_journal(self) -> JournalIntegrityResult:
         """Verify the persisted hash-chain journal on disk.
@@ -1402,6 +2159,7 @@ class SqliteEngravaCore:
 
         return EngravaMetrics(
             snapshot_timestamp=snapshot_ts,
+            measured=True,
             thoughts=ThoughtCounts(
                 by_type=thought_by_type,
                 by_status=thought_by_status,
@@ -1525,6 +2283,8 @@ class SqliteEngravaCore:
         config_path: str | Path,
         *,
         cycle_provider: CycleProvider | None = None,
+        write_lock_acquire_timeout_seconds: float = _WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS,
+        close_timeout_seconds: float = _CLOSE_TIMEOUT_SECONDS,
     ) -> Self:
         """Create a fully configured instance from a YAML config file.
 
@@ -1545,6 +2305,14 @@ class SqliteEngravaCore:
                 config file — it is supplied here as a runtime keyword. ``None``
                 (default) preserves today's behaviour. See the constructor's
                 ``cycle_provider`` for the resolution and read-time-only rules.
+            write_lock_acquire_timeout_seconds: Forwarded verbatim to the
+                constructor — see its own docstring. Not read from the config
+                file (it is a runtime tuning knob, not corpus-affecting
+                configuration).
+            close_timeout_seconds: Forwarded verbatim to the constructor —
+                see its own and :meth:`close`'s docstrings. Not read from the
+                config file, for the same reason as
+                ``write_lock_acquire_timeout_seconds`` above.
 
         Returns:
             A configured ``SqliteEngravaCore`` with schema applied.
@@ -1558,7 +2326,7 @@ class SqliteEngravaCore:
         from engrava.config import load_config, resolve_hooks  # noqa: PLC0415
 
         config = load_config(config_path)
-        db = await aiosqlite.connect(str(config.database_path))
+        db = await connect(str(config.database_path))
         try:
             if config.wal_mode:
                 await db.execute("PRAGMA journal_mode=WAL")
@@ -1617,6 +2385,8 @@ class SqliteEngravaCore:
                 hygiene_policy=config.hygiene_policy,
                 derive_gates=config.derive,
                 cycle_provider=cycle_provider,
+                write_lock_acquire_timeout_seconds=write_lock_acquire_timeout_seconds,
+                close_timeout_seconds=close_timeout_seconds,
             )
             store._owns_connection = True
 
@@ -1652,8 +2422,16 @@ class SqliteEngravaCore:
                 backend_name=config.vector_backend,
                 embedding_dimension=config.embedding_dimension,
             )
-        except Exception:
-            await db.close()
+        except BaseException:
+            # Not ``except Exception``: ``asyncio.CancelledError`` derives
+            # from ``BaseException``, and a cancellation during any await
+            # above must close ``db`` exactly like an ordinary failure does
+            # — otherwise it leaks aiosqlite's non-daemon connection worker
+            # thread just as an uncaught error during open would. Routed
+            # through ``_close_quietly`` rather than a direct
+            # ``await db.close()`` so a failure in the close itself cannot
+            # replace this exception -- see that function's docstring.
+            await _close_quietly(db)
             raise
 
         return store
@@ -1662,17 +2440,305 @@ class SqliteEngravaCore:
         """Close the database connection if owned by this instance.
 
         Flushes any pending access-buffer events first (best-effort — a flush
-        failure never blocks the close), then closes the connection when this
-        instance owns it. No-op on the connection when it is caller-managed
-        (i.e. created via the manual constructor).
+        failure never blocks the close, and neither does a cancellation
+        arriving while the flush is in flight, nor does the flush's own
+        bound expiring — see the bounded-wait paragraph below), then closes
+        the connection when this instance owns it. No-op on the connection
+        when it is caller-managed (i.e. created via the manual constructor).
+
+        **Coordinates with a concurrent or prior quarantine.**
+        :meth:`_quarantine_connection` schedules its own physical close of
+        the real connection, detached and un-awaited, so that it can return
+        promptly even if that close hangs. If this call finds
+        :attr:`_quarantine_close_task` already set — quarantine got here
+        first, or does so while this call is in flight — it awaits that
+        same task instead of issuing a second, independent ``close()`` on
+        the same underlying connection: two concurrent closes on the pinned
+        aiosqlite version can each enqueue their own stop sentinel to the
+        worker thread, which exits on the first and can leave the other
+        caller's future unresolved forever. Only one physical close is ever
+        entered, whichever caller (this one, or quarantine) gets there
+        first.
+
+        **Both branches drain the task under :meth:`_drain_shielded`,
+        symmetrically** — the branch that creates the task is not exempt
+        just because it is the one that "owns" it. A bare ``await`` on the
+        task would propagate *this call's own* cancellation into the task
+        (unlike a shielded await), which can cancel the physical close
+        before ``_db.close()`` has meaningfully run at all — and that
+        half-run, cancelled task would still be ``done()``, so it would sit
+        in :attr:`_quarantine_close_task` looking exactly like a completed
+        close to every later caller that drains it, none of them any wiser
+        that the real connection was never actually closed. Draining under
+        ``_drain_shielded`` closes that off structurally rather than
+        detecting it afterwards: it re-shields on every repeated
+        cancellation of the awaiting coroutine, so this call's own
+        cancellation — however many times it happens — never reaches the
+        task itself. It returns once the task is genuinely ``done()``, or
+        once the bound below expires with the task still pending, whichever
+        comes first; either way, draining never cancels the task, so the
+        physical close keeps running toward real completion — success or a
+        real failure — in the background.
+
+        **What differs between the two branches is what happens next, not
+        how safely they wait.** When this call is the one that created the
+        task (the ordinary, non-quarantined close), its outcome is
+        actionable: a genuine close failure propagates via
+        :meth:`asyncio.Task.result`, exactly as an unshielded direct
+        ``await`` would have surfaced it. When this call is piggybacking on
+        a task quarantine already started, the outcome is discarded instead
+        — the connection is already terminally unusable via the quarantine
+        proxy, so nothing about how its close turned out is actionable to
+        this caller. Either way, a cancellation of *this specific await* —
+        whoever is awaiting ``close()`` being itself cancelled — is never
+        discarded and always propagates first, ahead of whatever the task
+        itself resolved to; the shared task keeps running to completion
+        regardless, so nothing is left half-closed by letting the
+        cancellation through.
+
+        **The wait on the worker is bounded, not indefinite -- applied
+        twice in sequence, once to the flush above and once to the physical
+        close below, not once as a shared budget for the whole call.** The
+        access-buffer flush awaits the same worker directly (through
+        ``_write_lock`` and a raw ``executemany``), so it is wrapped in its
+        own ``asyncio.wait_for(..., timeout=self._close_timeout_seconds)``
+        immediately above; an unresponsive worker would otherwise hang
+        there first, before the physical-close bound described next is
+        ever reached, silently defeating it for every store with access
+        tracking on. A flush timeout is just another flush failure to this
+        call -- caught the same way, for the same reason (the buffered
+        counts are documented best-effort telemetry, self-healing after a
+        lost flush). **Because each wait gets the full
+        :attr:`_close_timeout_seconds` independently, one call to this
+        method can take up to twice that value** (60s at the default) when
+        the worker never answers at all -- up to the full bound stuck in
+        the flush, then up to the full bound again stuck in the close --
+        not :attr:`_close_timeout_seconds` itself as a per-call ceiling.
+
+        The physical close is bounded the same way: both branches drain
+        the task under :attr:`_close_timeout_seconds` (default
+        :data:`_CLOSE_TIMEOUT_SECONDS`, configurable via the constructor /
+        :meth:`from_config`) rather than forever. A worker that is merely
+        slow still gets that whole window to answer — the task itself is
+        never cancelled by the bound, only *this call's observation of it*
+        stops, so a slow-but-finite close keeps running to completion behind
+        the scenes exactly as it would without a bound. A worker that never
+        answers at all leaves the task not ``done()`` when the bound
+        expires; this call then hands off to :meth:`_quarantine_connection`
+        with that same task already installed in
+        :attr:`_quarantine_close_task`, so quarantine's own coordination
+        (above) sees a physical close already in flight and defers to it
+        rather than starting a second one — an expired bound never causes a
+        second physical close, whether this is the first ``close()`` on this
+        store or a later one piggybacking on an earlier expiry. The store is
+        left terminally unusable either way (the same
+        :class:`~engrava.domain.exceptions.ConnectionQuarantinedError` every
+        other quarantine path raises, not a new sibling state), because the
+        worker's last operation never reported and the connection's true
+        state is unknown from here. This call itself raises that same error
+        once the hand-off completes — unless a cancellation of this call's
+        own await was already pending (from the flush above, or from
+        draining the task), which outranks a *discovered* expiry exactly as
+        it outranks a discovered close failure elsewhere in this method: the
+        expiry is logged instead, and the pending cancellation is what
+        propagates.
+
+        **Bounding this wait does not bound the ordinary ~20s residual delay
+        measured behind this bound, and for that delay the reason is not
+        the worker thread.** A daemon and a non-daemon worker took the same
+        ~20s to exit, and by the time that residual wait is even observed
+        the worker thread has already finished — that delay lives inside
+        the interpreter's own async-runtime shutdown sequence, which runs
+        *after* this method (and the rest of your code) has already
+        returned control, not in anything ``close()`` is waiting on. That
+        measurement did not test, and does not rule out, a worker that
+        never finishes at all: aiosqlite creates its connection's worker
+        thread non-daemon, so a genuinely wedged worker leaves that thread
+        running indefinitely even after this method has abandoned the wait
+        and raised :class:`ConnectionQuarantinedError` — and a live
+        non-daemon thread is what keeps a Python process from exiting,
+        regardless of the async-runtime delay above. Neither delay is
+        something this method — or any bound it applies — can fix; see
+        ``docs/deployment.md`` for what a caller can do about it.
+
+        Raises:
+            ConnectionQuarantinedError: When this call's own wait for the
+                worker exceeds :attr:`_close_timeout_seconds` before a
+                cancellation of this call does. The store is unusable from
+                this point on regardless of whether the worker eventually
+                does answer.
+
         """
+        # A cancellation during the flush must not skip the close below --
+        # that would strand the connection's non-daemon worker exactly like
+        # an uncaught error would, contradicting this method's own "a flush
+        # failure never blocks the close" promise (a cancellation is a kind
+        # of failure too). Caught here and re-raised only once the close
+        # below has actually run, mirroring
+        # :meth:`EngravaManager.close_all`: every required cleanup step
+        # still runs, and the cancellation is deferred, never discarded.
+        pending_cancellation: asyncio.CancelledError | None = None
         if self._access_tracking_enabled:
             try:
-                await self.flush_access_buffer()
+                # Bounded on the same budget as the physical close below --
+                # this also awaits the worker directly (via ``_write_lock``
+                # + ``self._db.executemany``), so an unresponsive worker
+                # would otherwise hang here before the close-task bound is
+                # ever reached, defeating it for every store with access
+                # tracking on. A timeout is just another flush failure to
+                # this call: caught by the same ``except Exception`` below,
+                # exactly as "a flush failure never blocks the close"
+                # already promises, since the buffered counts are
+                # documented best-effort telemetry a lost flush self-heals
+                # from -- there is nothing here worth preserving in the
+                # background the way the physical close is preserved.
+                await asyncio.wait_for(
+                    self.flush_access_buffer(), timeout=self._close_timeout_seconds
+                )
+            except asyncio.CancelledError as exc:
+                pending_cancellation = exc
             except Exception:  # noqa: BLE001
                 logger.debug("access-buffer flush on close failed; counts are best-effort")
         if self._owns_connection:
-            await self._db.close()
+            task, is_new_task = self._resolve_close_task()
+            cancel_error = await self._drain_shielded(
+                task, timeout_seconds=self._close_timeout_seconds
+            )
+            pending_cancellation = await self._finish_close_wait(
+                task,
+                is_new_task=is_new_task,
+                cancel_error=cancel_error,
+                pending_cancellation=pending_cancellation,
+            )
+        if pending_cancellation is not None:
+            raise pending_cancellation
+
+    def _resolve_close_task(self) -> tuple[asyncio.Task[None], bool]:
+        """Return the physical-close task for this call to drain.
+
+        Reuses :attr:`_quarantine_close_task` when a physical close is
+        already in flight -- started by a concurrent quarantine, or by a
+        prior ``close()`` call this one is piggybacking on -- rather than
+        ever starting a second, independent close on the same connection
+        (see :meth:`close` for why two concurrent closes on the pinned
+        aiosqlite version can leave a caller's future unresolved forever).
+        Only when nothing is in flight yet does this start the real,
+        non-quarantined close and install it.
+
+        Returns:
+            The task to drain, and whether this call is the one that just
+            created it (``True``) versus piggybacking on one that already
+            existed (``False``) -- :meth:`_finish_close_wait` uses this to
+            decide whether the task's outcome is actionable to this caller.
+
+        """
+        existing_task = self._quarantine_close_task
+        if existing_task is not None:
+            return existing_task, False
+        task = asyncio.ensure_future(self._db.close())
+        self._quarantine_close_task = task
+        return task, True
+
+    async def _finish_close_wait(
+        self,
+        task: asyncio.Task[None],
+        *,
+        is_new_task: bool,
+        cancel_error: asyncio.CancelledError | None,
+        pending_cancellation: asyncio.CancelledError | None,
+    ) -> asyncio.CancelledError | None:
+        """Interpret one drain of the physical-close task and act on it.
+
+        The state transition in outcome 1 always happens when the bound has
+        expired, regardless of any cancellation -- cancellation precedence
+        (outcomes 1 and 2) only decides which exception ultimately
+        propagates, never whether the store gets quarantined. Three
+        outcomes, most-authoritative first for that reason:
+
+        1. **The bound expired before the worker answered** (``task`` still
+           not ``done()``): quarantines via :meth:`_abandon_expired_close`
+           (never a second physical close -- see that method) unconditionally,
+           whether or not a cancellation is also pending -- including a
+           cancellation of *this call's own await while draining the task*
+           (``cancel_error``), which does not short-circuit the quarantine.
+           Then either raises
+           :class:`~engrava.domain.exceptions.ConnectionQuarantinedError`, or,
+           if a cancellation was already pending -- ``cancel_error`` from
+           draining just now, or ``pending_cancellation`` deferred earlier in
+           :meth:`close` (the access-buffer flush), ``cancel_error`` preferred
+           when both are set -- only logs the expiry and returns that
+           cancellation instead.
+        2. **The task finished within the bound, but this call's own await
+           was cancelled while draining it** (``cancel_error`` set): returned
+           as the new ``pending_cancellation`` -- it outranks whatever the
+           task itself resolved to.
+        3. **The task finished within the bound, with no cancellation of this
+           call's own drain**: a genuine outcome is surfaced only when this
+           call is the one that created the task (``is_new_task``) -- a
+           piggybacked task's outcome is never actionable to this caller.
+
+        Args:
+            task: The physical-close task that was just drained.
+            is_new_task: Whether this call created ``task`` itself, per
+                :meth:`_resolve_close_task`.
+            cancel_error: Whatever :meth:`_drain_shielded` returned for this
+                drain.
+            pending_cancellation: Any cancellation already deferred earlier
+                in :meth:`close` (the access-buffer flush).
+
+        Returns:
+            The cancellation that should ultimately propagate from
+            :meth:`close`, if any.
+
+        Raises:
+            ConnectionQuarantinedError: Per outcome 1 above.
+
+        """
+        if not task.done():
+            # The bound expired before the worker answered -- slow or
+            # genuinely wedged, this call cannot tell which and does not
+            # need to. See close()'s own docstring for why this always
+            # quarantines (never a second physical close) and raises the
+            # same error every other quarantined path already raises.
+            # This runs even when `cancel_error` is set: `_drain_shielded`
+            # re-shields and keeps waiting out its own bound on a
+            # cancellation of our await, so a cancelled drain and a genuine
+            # expiry can coincide -- cancellation only decides which
+            # exception propagates next, never whether this transition
+            # happens.
+            await self._abandon_expired_close(task)
+            propagating_cancellation = (
+                cancel_error if cancel_error is not None else pending_cancellation
+            )
+            if propagating_cancellation is None:
+                raise ConnectionQuarantinedError(
+                    self._quarantine_reason
+                    or f"close() did not complete within {self._close_timeout_seconds:.1f}s"
+                )
+            logger.warning(
+                "close() exceeded its %.1fs bound while a cancellation was "
+                "already pending; the store is now quarantined",
+                self._close_timeout_seconds,
+            )
+            return propagating_cancellation
+        if cancel_error is not None:
+            return cancel_error
+        if is_new_task:
+            # This is the real, non-quarantined close -- unlike the
+            # piggyback case, its own outcome is actionable, so it is
+            # surfaced (not discarded): a clean close returns None, an
+            # ordinary failure or an independent cancellation of the task
+            # itself both raise via result().
+            if pending_cancellation is None:
+                task.result()
+            else:
+                # A cancellation was already deferred above (from the
+                # flush) -- see :meth:`_log_close_failure_over_pending_cancellation`
+                # for the rule this follows.
+                self._log_close_failure_over_pending_cancellation(task)
+        # else: piggybacking on a task that finished within this call's own
+        # bound -- outcome discarded.
+        return pending_cancellation
 
     async def __aenter__(self) -> Self:
         """Enter the async context manager.
@@ -1686,11 +2752,35 @@ class SqliteEngravaCore:
     async def __aexit__(self, *exc: object) -> None:
         """Exit the async context manager and close if owned.
 
+        When the ``async with`` body already raised, that is what the
+        caller needs to see, so a failure from :meth:`close` here is
+        secondary: logged rather than allowed to replace it, the same rule
+        :func:`_close_quietly` applies to a bare ``await conn.close()``
+        during cleanup, applied here to :meth:`close` itself since this
+        call has no raw connection of its own to route through that
+        helper. A cancellation reaching this ``__aexit__`` call is a
+        distinct signal, not a mere close failure, and is never swallowed.
+        On a clean exit (no exception from the body), a close failure is
+        not secondary to anything -- it is the only error there is, so it
+        propagates normally.
+
         Args:
             *exc: Exception info (type, value, traceback).
 
         """
-        await self.close()
+        if exc[1] is None:
+            await self.close()
+            return
+        try:
+            await self.close()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "Error closing connection in __aexit__ while the context "
+                "body's exception was propagating",
+                exc_info=True,
+            )
 
     async def _configure_vector_backend(
         self,
@@ -1738,7 +2828,7 @@ class SqliteEngravaCore:
             embedding_dimension: Expected embedding vector dimension.
 
         """
-        from engrava.extensions.vector_sqlite_vec import (  # noqa: PLC0415
+        from engrava.infrastructure.sqlite.vector_sqlite_vec import (  # noqa: PLC0415
             SqliteVecSearchBackend,
             load_sqlite_vec,
         )
@@ -1761,21 +2851,79 @@ class SqliteEngravaCore:
     async def ensure_schema(self) -> None:
         """Create core tables if they don't already exist.
 
+        **Write-lock classification: deliberately outside `_write_lock`,
+        bucket 2 — schema bootstrap, not a guarded runtime write path.**
+        Every write this method performs directly, or reaches through
+        ``_run_pending_core_migrations`` / ``_core_migration_steps`` /
+        each ``_migrate_core_v*_to_v*`` step / ``_rebuild_fts_index`` /
+        ``_recreate_child_tables_with_fk_atomically`` and the three
+        ``_recreate_*_with_fk`` helpers it calls / ``_purge_orphan_children``
+        / the ``PRAGMA user_version`` stamps, is schema DDL (plus, in a
+        handful of migrations, a one-time data backfill tied to that DDL) run
+        while the store is being opened — before ``ensure_schema`` returns,
+        the schema this store depends on for every other guarded write does
+        not yet reliably exist, so no concurrent guarded write can be
+        meaningfully in flight yet. This is a property of *when* these calls
+        happen (once, at open, awaited to completion before the store is
+        handed to any other caller), not a habit — engrava does not support
+        calling ``ensure_schema`` concurrently with itself or with guarded
+        writes on the same instance, and nothing about ``_write_lock`` would
+        make that safe even if it held it (schema DDL under a data-row lock
+        is a different problem this lock does not solve). See
+        ``docs/deployment.md`` for the "open once, then share" contract this
+        relies on.
+
         Applies the full ``schema_core.sql`` (including the FTS5 virtual table
-        and sync triggers) only when the database predates the migration-ladder
-        floor. A database at or above the floor is upgraded incrementally
-        through the ordered core-migration registry (see
-        :meth:`_core_migration_steps`) up to the head version (20).
+        and sync triggers) only when the database predates the
+        migration-ladder floor **and no core table holds a row yet** (see
+        :meth:`_has_any_core_table` — this is row presence, not mere table
+        existence, so an empty table an interrupted bootstrap left behind
+        does not itself count as "populated") — a sub-floor database that
+        already has a populated core table refuses instead (see
+        :class:`SchemaVersionError`). Before that script runs, whichever core
+        tables already exist there (necessarily still empty, or the refusal
+        above already fired) are also checked against it (see
+        :meth:`_existing_core_tables_match_bootstrap_shape`): one already
+        carrying an older shape the script's ``CREATE ... IF NOT EXISTS``
+        statements would leave untouched is refused up front, before
+        anything is written, rather than only discovered after a stamp the
+        script's own last statement already committed. A database at or
+        above the floor is upgraded incrementally through the ordered
+        core-migration registry (see :meth:`_core_migration_steps`) up to the
+        head version (:data:`CORE_SCHEMA_HEAD_VERSION`). A database stamped
+        **above** head also refuses rather than silently skipping every
+        migration step and opening as though it were current.
 
         After core schema creation or upgrade, probes for the ``thought_fts``
         table and then runs any pending extension schema migrations for each
         manifest supplied via the ``manifests`` constructor parameter.
+
+        Raises:
+            SchemaVersionError: When the database is a sub-floor schema with
+                a populated core table this build cannot bootstrap, is a
+                sub-floor schema whose zero-row core tables already exist
+                under an older shape the bootstrap script would leave
+                untouched, or is stamped newer than this build's head
+                version.
+
         """
         cursor = await self._db.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         current_version = int(row[0]) if row else 0
 
         if current_version < _CORE_SCHEMA_BOOTSTRAP_FLOOR:
+            # A sub-floor database is only safe to bootstrap when it is truly
+            # empty. The bootstrap script is built entirely of
+            # ``CREATE ... IF NOT EXISTS`` statements ending in an
+            # unconditional ``PRAGMA user_version`` stamp — run against a file
+            # that already carries a core table (written by something older
+            # than this migration ladder's public history), it would leave
+            # whatever that file actually contains silently mislabelled as a
+            # fresh, fully-migrated schema.
+            if await self._has_any_core_table():
+                raise SchemaVersionError.populated_sub_floor(
+                    current_version, _CORE_SCHEMA_BOOTSTRAP_FLOOR
+                )
             # Fresh bootstrap: ``schema_core.sql`` already carries the head DDL
             # and stamps ``user_version`` itself, so no incremental step runs
             # for a brand-new database.
@@ -1784,7 +2932,23 @@ class SqliteEngravaCore:
                 .joinpath("schema_core.sql")
                 .read_text(encoding="utf-8")
             )
+            if not await self._existing_core_tables_match_bootstrap_shape(schema_sql):
+                # A core table already exists here (with zero rows, or
+                # ``_has_any_core_table`` above would already have refused),
+                # but not under this script's own shape -- it predates this
+                # build. Refusing *before* running anything means there is no
+                # stamp for a crash between the write and an undo to strand:
+                # nothing was written, so there is nothing to undo.
+                raise SchemaVersionError.stale_shape_sub_floor(
+                    current_version, _CORE_SCHEMA_BOOTSTRAP_FLOOR
+                )
             await self._db.executescript(schema_sql)
+        elif current_version > CORE_SCHEMA_HEAD_VERSION:
+            # The migration registry has no step targeting a version this high
+            # — the incremental loop would simply skip every entry and leave
+            # ``user_version`` untouched, opening a file written by a newer
+            # engrava as though it were current and understood.
+            raise SchemaVersionError.newer_than_head(current_version, CORE_SCHEMA_HEAD_VERSION)
         else:
             await self._run_pending_core_migrations(current_version)
 
@@ -1826,7 +2990,7 @@ class SqliteEngravaCore:
         Returns:
             Entries ordered by ascending target version, contiguous from the
             first post-bootstrap step (``v2 -> v3`` rebuilds the FTS index) up
-            to the head version (``v19 -> v20``).
+            to the head version (``v20 -> v21``).
 
         """
         return (
@@ -1848,21 +3012,90 @@ class SqliteEngravaCore:
             (18, self._migrate_core_v17_to_v18),
             (19, self._migrate_core_v18_to_v19),
             (20, self._migrate_core_v19_to_v20),
+            (21, self._migrate_core_v20_to_v21),
         )
 
     async def _run_pending_core_migrations(self, current_version: int) -> None:
+        # Write-lock classification: bucket 2 (schema bootstrap) -- see ensure_schema.
         """Apply every pending core migration in registry order.
 
         Walks the ordered registry from :meth:`_core_migration_steps` and runs
         only the steps whose target version exceeds ``current_version``. Each
         step is idempotent and **verifies its own postcondition**, raising
         :class:`CoreMigrationError` (or the underlying SQLite error) before it
-        returns if the migrated structure is absent. The ``user_version`` is
-        stamped and committed only *after* the step returns successfully, so a
-        failed or interrupted migration leaves the version at the last
-        fully-applied step and the next ``ensure_schema`` retries the remaining
-        tail — a failure can never mark the database current over a
-        partially-migrated schema.
+        returns if the migrated structure is absent.
+
+        **Atomicity.** Every step here except
+        :data:`_FK_RECREATE_TARGET_VERSION` runs its DDL/DML, the
+        ``PRAGMA user_version`` stamp, and the ``COMMIT`` itself all inside
+        one ``try``: SQLite's schema-modifying statements (``ALTER TABLE``,
+        ``CREATE TABLE|INDEX|TRIGGER``, ``DROP``, the FTS5 rebuild) are fully
+        transactional, so a step whose DDL/DML or version stamp raises
+        partway rolls back to exactly the database state before it began —
+        nothing it already executed survives the failure — and the version
+        is never stamped over a partial change. A failing ``COMMIT`` itself
+        (for example SQLite reporting the database locked because a
+        concurrent reader still holds a transaction) is covered the same
+        way: the rollback that follows returns the connection to that same
+        pre-step state, with no transaction left open on it and the durable
+        ``user_version`` unchanged, so a retry does not read back an
+        uncommitted stamp on this connection and mistake the step for
+        already applied. That guarantee holds when the compensating
+        rollback itself succeeds. If it instead raises an ``Exception``,
+        that failure is logged and the original migration failure is still
+        what propagates (see the ``except`` block below) — but if the
+        rollback, or the logging call right after it, raises something that
+        is not an ``Exception`` — a cancellation delivered while this
+        coroutine is suspended on that ``await`` is the case that matters
+        here, and a logging handler that itself raises from ``emit()``
+        behaves the same way — the inner ``except Exception`` does not
+        catch it: that exception propagates in the original failure's
+        place, with the original kept only as its ``__context__``. Either
+        way, once the
+        compensating rollback has failed, this connection's transaction
+        state is no longer known and it should not be reused. When the
+        rollback does succeed, a retry
+        re-enters the same step from that unchanged state, and because
+        every step is *also* independently idempotent (checks its own
+        postcondition, guards its own ``ADD COLUMN`` / uses
+        ``IF NOT EXISTS``), the retry converges whether or not this outer
+        transaction is what rolled the previous attempt back.
+
+        The one exception is the foreign-key recreate step
+        (``_FK_RECREATE_TARGET_VERSION`` / :meth:`_migrate_core_v11_to_v12`),
+        which is **not** wrapped here: it must toggle
+        ``PRAGMA foreign_keys`` off and back on around its own table swap, and
+        that pragma is a documented no-op while any transaction — including
+        the one this method would open — is already active. When the swap is
+        actually needed (some child table still lacks its FK),
+        :meth:`_migrate_core_v11_to_v12` calls
+        :meth:`_recreate_child_tables_with_fk_atomically`, whose own leading
+        ``commit()`` closes any transaction left open by an earlier step
+        before toggling the pragma — from that point this step runs in
+        autocommit and provides its own atomicity for the swap via an
+        internal ``SAVEPOINT`` (see that method's docstring for exactly what
+        it can leave behind and why re-running is still safe). When no
+        *existing* table needs the swap (each one either already carries
+        its FK or was never there to begin with — a partial database is
+        "nothing to migrate" here, same as the comment above this method's
+        ``migration_needed`` computation says), that call — and its leading
+        ``commit()`` — never happens: the trailing
+        ``CREATE INDEX`` and the ``PRAGMA user_version`` stamp this step
+        still issues then run in whatever transaction state the connection
+        was already in when this step started, not necessarily autocommit.
+
+        **Why the per-step transaction opens with ``BEGIN IMMEDIATE``.** Most
+        steps' first statement is a postcondition-style presence check
+        (:meth:`_table_exists`, :meth:`_column_exists` via
+        :meth:`_add_column_if_absent`, :meth:`_index_exists`) before their
+        first DDL/DML — a read, inside the transaction, ahead of the write.
+        Under a deferred ``BEGIN`` that read takes a WAL snapshot the later
+        write then has to upgrade; if another connection holds the write
+        lock, SQLite refuses the upgrade with ``SQLITE_BUSY`` and never
+        invokes the busy handler, so a contending migration would fail at
+        once instead of waiting out ``PRAGMA busy_timeout`` like every other
+        write unit in this module. ``BEGIN IMMEDIATE`` takes the write lock
+        up front, through the busy handler, before any step gets to read.
 
         Args:
             current_version: The database's current ``user_version``. It is at
@@ -1873,9 +3106,196 @@ class SqliteEngravaCore:
         for target_version, migrate in self._core_migration_steps():
             if target_version <= current_version:
                 continue
-            await migrate()
-            await self._db.execute(f"PRAGMA user_version = {target_version}")
-            await self._db.commit()
+            if target_version == _FK_RECREATE_TARGET_VERSION:
+                await migrate()
+                await self._db.execute(f"PRAGMA user_version = {target_version}")
+                await self._db.commit()
+                continue
+            await self._db.execute("BEGIN IMMEDIATE")
+            try:
+                await migrate()
+                await self._db.execute(f"PRAGMA user_version = {target_version}")
+                await self._db.commit()
+            except BaseException:
+                # ``BaseException``, not ``Exception``: a cancellation delivered
+                # mid-step must also roll back rather than leave a half-applied
+                # schema change committed by a later, unrelated statement.
+                # ``commit()`` is inside this ``try`` (not after it) for the
+                # same reason: a ``COMMIT`` that itself fails -- e.g. SQLite
+                # reporting the database locked because a concurrent reader
+                # still holds a transaction -- otherwise left the transaction
+                # open on this connection, which then reads back the
+                # *uncommitted* new ``user_version`` and can make a retried
+                # ``ensure_schema`` on this same connection believe the step
+                # already applied when nothing durable happened at all.
+                try:
+                    await self._db.rollback()
+                except Exception:
+                    # A rollback failure here does not change what needs to
+                    # propagate -- the migration failure above is still the
+                    # real error. Logged rather than raised, the same
+                    # convention ``_close_quietly`` uses for a cleanup
+                    # failure while another exception is already in flight
+                    # (see its docstring), applied here to a rollback
+                    # instead of a close.
+                    logger.warning("Error rolling back failed core migration step", exc_info=True)
+                raise
+
+    async def _has_any_core_table(self) -> bool:
+        """Return whether the database already carries user data in a core table.
+
+        Used by :meth:`ensure_schema` to tell a genuinely empty file (safe to
+        bootstrap) apart from a **populated** sub-floor database (refused —
+        see :class:`SchemaVersionError`). Checked as row presence, not mere
+        table existence: the bootstrap script (``schema_core.sql``) is pure
+        DDL, so a bootstrap interrupted partway through (a mid-script DDL
+        failure) can leave empty table / index / trigger definitions behind
+        without ever writing a row, and a retry has to be able to re-run the
+        same idempotent ``CREATE ... IF NOT EXISTS`` script against that
+        partial, data-free state rather than being told it looks like a real
+        legacy database (see the failure-injection coverage in
+        ``TestBootstrapAtomicity``). A database that was actually used, by
+        contrast, carries at least one row somewhere — that is what
+        "populated" means here.
+
+        The ``sqlite_master.name`` lookup is matched ``COLLATE NOCASE``:
+        SQLite itself resolves table identifiers case-insensitively (a
+        ``CREATE TABLE IF NOT EXISTS thought`` matches an existing ``THOUGHT``
+        just as ``SELECT ... FROM thought`` reads from it), so a plain
+        case-sensitive string comparison against the stored name could miss a
+        core table written under a different case and report an empty file
+        that is not one.
+
+        Returns:
+            ``True`` if any table in :data:`_CORE_TABLE_NAMES` exists **and**
+            holds at least one row.
+
+        """
+        for table in _CORE_TABLE_NAMES:
+            cursor = await self._db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? COLLATE NOCASE",
+                (table,),
+            )
+            if await cursor.fetchone() is None:
+                continue
+            # `table` is drawn only from the fixed _CORE_TABLE_NAMES tuple
+            # above, never from caller input, so this interpolation cannot
+            # carry anything the allow-list did not already name.
+            row_cursor = await self._db.execute(f"SELECT 1 FROM {table} LIMIT 1")  # noqa: S608
+            if await row_cursor.fetchone() is not None:
+                return True
+        return False
+
+    async def _existing_core_tables_match_bootstrap_shape(self, schema_sql: str) -> bool:
+        """Return whether every already-existing core table matches ``schema_sql``.
+
+        Checked **before** ``schema_sql`` is run, not after: the script is
+        pure ``CREATE ... IF NOT EXISTS``, so it can only skip an existing
+        table under an older shape, never fix it — while still stamping
+        ``user_version`` current at its own trailing statement regardless.
+        Checking first means a mismatch is refused with nothing yet written:
+        no stamp has landed, so there is nothing to undo and no window
+        between a stamp and an undo for a crash to split apart.
+
+        A table that does not exist yet is not a mismatch — it is exactly
+        what the script is about to create, whether this is a genuinely
+        fresh file or a retry of *this build's own* bootstrap interrupted
+        partway through. ``CREATE TABLE`` is atomic, so any table an earlier,
+        interrupted run of this exact script already finished already carries
+        the full head shape and matches; tables it had not reached yet are
+        simply absent here and the now-completing script creates them fresh.
+
+        A genuinely fresh file — no core table exists at all — skips the
+        comparison entirely rather than opening a disposable reference
+        connection it would never need: that keeps the common case (every
+        brand-new database) free of that extra connection.
+
+        When at least one core table does already exist, this bootstraps a
+        disposable, provably-fresh reference database from ``schema_sql``
+        itself — rather than naming one column the current head happens to
+        add last, which would stop being a witness the moment a *future*
+        migration adds another — and compares each such table's column set
+        against it. The comparison is self-updating: whatever the script
+        declares next release, the reference picks it up automatically, with
+        no separate constant for a future column to fall out of sync with.
+
+        **What this does not check.** The comparison is column *names* only —
+        it says nothing about types, defaults, constraints, collations,
+        column order, or generated/hidden columns (some of which
+        ``PRAGMA table_info`` does not even surface). A hand-built table
+        carrying the right column names under a different type or a hostile
+        constraint would pass. No build this project has ever shipped
+        produces such a table, which is why this is a documented limit of
+        the check rather than something it is fixed to catch — it
+        establishes equal column names across the core tables, nothing more.
+
+        **What this does not serialize.** This is a single connection's own
+        pre-check, not a cross-process lock. Two different engrava builds
+        bootstrapping the same fresh file at the same time can still
+        interleave: each can pass this check while no core table yet exists,
+        then each runs its own ``schema_core.sql`` and stamps its own head
+        version, and whichever runs last wins. Detecting or preventing that
+        race is outside what this method — or any check confined to a single
+        connection — can do.
+
+        Args:
+            schema_sql: The ``schema_core.sql`` text about to be run, if this
+                check passes.
+
+        Returns:
+            ``True`` if every core table already present on ``self._db`` has
+            exactly the column set a fresh bootstrap of ``schema_sql`` gives
+            it. Vacuously ``True`` when no core table exists yet.
+
+        """
+        existing_tables = [table for table in _CORE_TABLE_NAMES if await self._table_exists(table)]
+        if not existing_tables:
+            return True
+        # Not `async with`: the connection returned here is already awaited
+        # (connected), and `Connection.__aenter__` awaits it again, which tries
+        # to start its worker thread a second time and raises.
+        reference = await connect(":memory:")
+        try:
+            await reference.executescript(schema_sql)
+            for table in existing_tables:
+                actual = await self._table_column_names(self._db, table)
+                expected = await self._table_column_names(reference, table)
+                if actual != expected:
+                    return False
+        finally:
+            await reference.close()
+        return True
+
+    @staticmethod
+    async def _table_column_names(conn: aiosqlite.Connection, table: str) -> frozenset[str]:
+        """Return the set of column names ``table`` carries on ``conn``.
+
+        Reads each ``PRAGMA table_info`` row **by position**
+        (``cid, name, type, notnull, dflt_value, pk`` — ``name`` is index 1),
+        never by key. ``conn`` here is not always a connection this class
+        configured itself: the disposable reference database this is also
+        called against is plain ``aiosqlite.connect(...)`` with no
+        ``row_factory`` set, and a caller could hand this a connection with
+        any row factory at all. Indexing by key only works when the row
+        factory happens to be ``aiosqlite.Row`` (or another mapping); reading
+        by position works whether the row comes back as that or as a plain
+        tuple, so this makes no assumption about the connection it is given.
+
+        Args:
+            conn: Open connection to inspect.
+            table: The table name. Always drawn from the fixed
+                :data:`_CORE_TABLE_NAMES` tuple, never caller input, so the
+                f-string interpolation below cannot carry anything the
+                allow-list did not already name.
+
+        Returns:
+            The table's column names, order-independent. Empty if the table
+            does not exist on ``conn``.
+
+        """
+        cursor = await conn.execute(f"PRAGMA table_info({table})")
+        rows = await cursor.fetchall()
+        return frozenset(row[1] for row in rows)
 
     async def _probe_fts(self) -> None:
         """Detect whether the ``thought_fts`` FTS5 table exists.
@@ -1891,6 +3311,7 @@ class SqliteEngravaCore:
         self._fts_probed = True
 
     async def _rebuild_fts_index(self) -> None:
+        # Write-lock classification: bucket 2 (schema bootstrap) -- see ensure_schema.
         """Rebuild the FTS5 index with the hyphen-aware tokenizer.
 
         This upgrade path is used for existing core schema version 2
@@ -1947,6 +3368,7 @@ class SqliteEngravaCore:
             await self._require_trigger(3, trigger)
 
     async def _migrate_core_v3_to_v4(self) -> None:
+        # Write-lock classification: bucket 2 (schema bootstrap) -- see ensure_schema.
         """Add access tracking and datetime timestamp columns (core-4).
 
         Idempotent — safe to run on a database that already has the columns.
@@ -2055,7 +3477,7 @@ class SqliteEngravaCore:
         edge-touching migrations guard theirs — a thought-only database has no
         edge index to build, and the fresh DDL already carries it. Any *other*
         DDL failure propagates rather than being swallowed, so an isolated
-        index-creation error can no longer be recorded as a completed migration.
+        index-creation error cannot be recorded as a completed migration.
         A postcondition assertion confirms the index is present (when the
         ``edge`` table exists) before the loop bumps the version.
         """
@@ -2136,7 +3558,15 @@ class SqliteEngravaCore:
         embedding_needs: bool,
         action_needs: bool,
     ) -> None:
+        # Write-lock classification: bucket 2 (schema bootstrap) -- see ensure_schema.
         """Recreate the child tables that still lack their FK, atomically.
+
+        :meth:`_run_pending_core_migrations` wraps every other core-migration
+        step in one outer transaction but deliberately excludes this one's
+        target version (see ``_FK_RECREATE_TARGET_VERSION``): that pragma
+        toggle below is a no-op inside a transaction, so an outer ``BEGIN``
+        would silently defeat it. This method is where the atomicity for the
+        excluded step actually lives instead.
 
         All three recreations run inside ONE explicit SAVEPOINT so the whole
         swap is atomic. Under sqlite3 legacy isolation (aiosqlite's default) the
@@ -2160,11 +3590,35 @@ class SqliteEngravaCore:
         is silently ignored inside an open transaction, so a leaked "off" state
         would make the rest of the session accept orphans and skip
         ``ON DELETE CASCADE`` without ever raising. Both the disable and the
-        savepoint therefore live inside the outer ``try`` whose ``finally``
-        closes any still-open transaction and re-enables enforcement. That
-        covers every transaction-control statement except the leading
-        ``commit()``, which precedes the ``try`` and runs while enforcement is
-        still on.
+        savepoint therefore live inside the outer ``try``, whose ``except``
+        (failure or cancellation) and ``else`` (success) branches both close
+        any still-open transaction and re-enable enforcement — a plain
+        ``finally`` cannot draw that distinction, and the two branches need
+        different treatment of a cleanup failure (see below). That covers
+        every transaction-control statement except the leading ``commit()``,
+        which precedes the ``try`` and runs while enforcement is still on.
+
+        On the ``except`` path, a failure rolling back or restoring the
+        pragma must not replace the exception (or cancellation) already
+        propagating from the body above — an ordinary failure in either
+        step is logged underneath instead, via ``_run_cleanup_step_quietly``,
+        and both steps are attempted even if the first one fails; a
+        cancellation of the cleanup itself is the one thing that still
+        outranks the original exception's plain ``raise``. On the ``else``
+        path there is no original exception to protect, so an ordinary
+        cleanup failure is not merely logged there — it is the error, and
+        propagates. The rollback there is usually a no-op with nothing open
+        to undo, but a no-op rollback can still raise: not only an ordinary
+        ``Exception`` (e.g. against a connection that has already gone
+        away), but a ``CancelledError`` or other ``BaseException`` raised
+        directly by the rollback call, which ``_run_cleanup_step_quietly``'s
+        own shield-then-redraw does not catch and would otherwise let escape
+        before the pragma restore is even attempted — so that path wraps the
+        pragma restore in a plain ``finally`` rather than relying on the
+        helper alone. See :meth:`_restore_after_successful_recreate` for
+        exactly which of the two exceptions is the one actually raised in
+        each case, and which is instead only chained onto it as
+        ``__cause__``.
 
         This is a strong best effort, not an absolute postcondition: if the
         cleanup ``rollback()`` itself fails while leaving a transaction active,
@@ -2188,7 +3642,7 @@ class SqliteEngravaCore:
         try:
             # Inside the try: a failure (or cancellation) delivered on this await
             # may still leave the pragma applied on the connection, so the
-            # ``finally`` below must already cover it.
+            # ``except``/``else`` below must already cover it.
             await self._db.execute("PRAGMA foreign_keys=OFF")
             await self._db.execute("SAVEPOINT recreate_fk")
             try:
@@ -2207,8 +3661,8 @@ class SqliteEngravaCore:
                 # table) for the next attempt to inherit, then release it.
                 #
                 # If one of these control statements itself fails, it propagates
-                # and the outer ``finally`` discards the whole transaction — the
-                # safe outcome, and deliberately NOT a further ``RELEASE``:
+                # and the outer ``except`` below discards the whole transaction —
+                # the safe outcome, and deliberately NOT a further ``RELEASE``:
                 # releasing the OUTERMOST savepoint COMMITS, so a release after a
                 # failed ``ROLLBACK TO`` would durably commit the half-swap.
                 await self._db.execute("ROLLBACK TO recreate_fk")
@@ -2220,20 +3674,155 @@ class SqliteEngravaCore:
                 # no-op inside a transaction — actually takes effect.
                 await self._db.execute("RELEASE recreate_fk")
                 await self._db.commit()
+        except BaseException as exc:
+            # The recreate above (or its own unwind) raised, or was cancelled —
+            # that is what the caller needs to see. Rolling back and restoring
+            # the pragma are real cleanup, but a failure in either one must not
+            # replace it -- logged underneath instead, via
+            # ``_run_cleanup_step_quietly``, exactly as ``_close_quietly``'s
+            # docstring states for a connection close. Both steps are attempted
+            # even if the first one fails, since leaving the pragma unrestored
+            # would silently disable FK enforcement for the whole session --
+            # matching the previous nested-``finally`` shape's guarantee.
+            # ``PRAGMA foreign_keys`` is ignored inside a transaction, so the
+            # rollback runs first, exactly as it did before. A cancellation
+            # delivered to *this* cleanup, though, is a fresh control-flow
+            # signal, not an ordinary failure: it wins over whatever was
+            # propagating before it -- the same precedence ``_close_quietly``
+            # gives a cancellation over the error it is cleaning up after --
+            # but ``from exc`` still records what that error was, rather than
+            # discarding it, since it is exactly the information a caller who
+            # catches the cancellation would want to see.
+            rollback_cancelled = await _run_cleanup_step_quietly(
+                self._db.rollback,
+                "rolling back the migration transaction",
+            )
+            pragma_cancelled = await _run_cleanup_step_quietly(
+                lambda: self._db.execute("PRAGMA foreign_keys=ON"),
+                "restoring PRAGMA foreign_keys",
+            )
+            if pragma_cancelled is not None:
+                raise pragma_cancelled from exc
+            if rollback_cancelled is not None:
+                raise rollback_cancelled from exc
+            raise
+        else:
+            # Clean path: the rollback is usually a no-op (nothing is left
+            # open to undo), but it is still a real await against a real
+            # connection and can itself fail -- e.g. against a connection
+            # that has already gone away. There is no original exception to
+            # protect here, so unlike the ``except`` branch above, a failure
+            # in either cleanup step must reach the caller rather than being
+            # logged and swallowed -- see
+            # :meth:`_restore_after_successful_recreate` for the shape.
+            await self._restore_after_successful_recreate()
+
+    async def _restore_after_successful_recreate(self) -> None:
+        """Roll back the (normally no-op) transaction and restore the pragma.
+
+        The cleanup half of the ``else`` (success) branch of
+        :meth:`_recreate_child_tables_with_fk_atomically`, split out to keep
+        that method's branch count down. Issued UNCONDITIONALLY: the caller
+        does not gate this on ``in_transaction``, since that flag is read
+        straight off the connection and can be stale relative to a statement
+        still queued in aiosqlite's worker, which could skip a rollback that
+        is in fact still needed.
+
+        Unlike that method's ``except`` branch, there is no original
+        exception to protect here, so a failure in either step below is not
+        merely logged -- it IS an error and must reach the caller, exactly
+        as ``_close_quietly``'s docstring states for a close on the success
+        path. But losing the pragma restore because the rollback ahead of it
+        raised would silently leave FK enforcement off for the rest of the
+        connection's life, so the pragma restore is wrapped in a plain
+        ``finally`` under the rollback, rather than relying only on
+        ``_run_cleanup_step_quietly``'s own
+        return-a-``CancelledError``-instead-of-raising convention: that
+        helper's own shield-then-redraw re-awaits an already-finished task
+        through an ``except Exception``, so a rollback that raises a
+        ``BaseException`` directly -- a synchronous ``CancelledError`` not
+        delivered by the outer task's own ``cancel()``, a ``SystemExit``, a
+        ``KeyboardInterrupt``, or a custom ``BaseException`` -- escapes that
+        call uncaught instead of coming back as its documented return value.
+        The ``except BaseException`` below exists to catch exactly that
+        escape (as well as anything else that could in principle escape the
+        helper) so the ``finally`` beneath it still runs either way.
+
+        Both steps are attempted no matter what either one raises -- that
+        much holds unconditionally, guaranteed by the ``finally`` above, not
+        merely by ``_run_cleanup_step_quietly``'s own convention. What
+        happens to the two exceptions differs by case, and not every case
+        gets the same treatment:
+
+        * Neither step fails: nothing is raised.
+        * Exactly one step fails: that exception is re-raised bare, with no
+          ``from`` -- genuinely unchanged, including its own
+          ``__cause__``/``__context__``, whatever they already were.
+        * Both fail: the pragma restore's exception is the one actually
+          raised (its loss is the silent, lasting one -- FK enforcement left
+          off) -- via ``raise ... from`` the rollback's, so the rollback's is
+          not discarded, but it is then visible only as that exception's
+          ``__cause__`` in the traceback, not as the exception a caller's
+          ``except SomeType:`` would itself catch.
+
+        A cancellation is not special-cased against an ordinary exception in
+        the "both fail" case above: whichever of the two steps failed
+        *last* (the pragma restore, always, since it runs second) is the one
+        raised, cancellation or not. That differs from the ``except``
+        branch's own cleanup, where an ordinary cleanup-step failure is
+        always only logged and never propagates at all, and the one thing
+        that can still outrank the original body exception's plain ``raise``
+        is a cancellation of the cleanup itself. There is no original body
+        exception here for a cancellation to need to outrank, and an
+        ordinary cleanup failure is not merely logged here -- it is the
+        error, so it propagates rather than being swallowed.
+        """
+        rollback_error: BaseException | None = None
+        pragma_error: BaseException | None = None
+
+        def _capture_rollback_exc(exc: Exception) -> None:
+            nonlocal rollback_error
+            rollback_error = exc
+
+        def _capture_pragma_exc(exc: Exception) -> None:
+            nonlocal pragma_error
+            pragma_error = exc
+
+        try:
+            rollback_cancelled = await _run_cleanup_step_quietly(
+                self._db.rollback,
+                "rolling back the (normally no-op) migration transaction",
+                log_failure=_capture_rollback_exc,
+            )
+            if rollback_cancelled is not None:
+                rollback_error = rollback_cancelled
+        except BaseException as exc:  # noqa: BLE001 -- see docstring above
+            rollback_error = exc
         finally:
+            # Attempted no matter what happened above -- an ordinary
+            # exception captured into ``rollback_error``, a cancellation
+            # returned as one, or a raw ``BaseException`` caught just above.
             try:
-                # ``PRAGMA foreign_keys`` is ignored inside a transaction, so
-                # close any that is still open first. Issued UNCONDITIONALLY:
-                # ``in_transaction`` is read straight off the connection and can
-                # be stale relative to a statement still queued in aiosqlite's
-                # worker, so gating on it could skip a rollback that is in fact
-                # needed. On the committed success path this is a no-op.
-                await self._db.rollback()
-            finally:
-                # Nested so the restore is still attempted even if the rollback
-                # above fails — the pragma is per-connection, and leaving it OFF
-                # would silently disable FK enforcement for the whole session.
-                await self._db.execute("PRAGMA foreign_keys=ON")
+                pragma_cancelled = await _run_cleanup_step_quietly(
+                    lambda: self._db.execute("PRAGMA foreign_keys=ON"),
+                    "restoring PRAGMA foreign_keys",
+                    log_failure=_capture_pragma_exc,
+                )
+                if pragma_cancelled is not None:
+                    pragma_error = pragma_cancelled
+            except BaseException as exc:  # noqa: BLE001 -- see docstring above
+                pragma_error = exc
+
+        # Both steps have now been attempted, whatever either one raised.
+        # Exactly which of the two propagates, and how, differs by case --
+        # see the docstring above for the three cases this covers and the
+        # two it does not.
+        if pragma_error is not None:
+            if rollback_error is not None:
+                raise pragma_error from rollback_error
+            raise pragma_error
+        if rollback_error is not None:
+            raise rollback_error
 
     async def _migrate_core_v11_to_v12(self) -> None:
         """Add referential integrity (FK + ON DELETE CASCADE) to child tables.
@@ -2331,14 +3920,14 @@ class SqliteEngravaCore:
             await self._require_index(12, "idx_edge_type_from")
 
         # Retry model: the per-step registry resumes a failed upgrade at the
-        # failed step (an improvement over the old bump-once-at-the-end ladder,
-        # which re-ran the whole tail). The table swaps are atomic within the
+        # failed step. The table swaps are atomic within the
         # SAVEPOINT above and rolled back to it on failure, so a mid-recreate
         # drop never persists; a legacy state that already carries the exact FK
         # is skipped and the required edge index is recreated independently, so
         # a resumed upgrade is convergent.
 
     async def _migrate_core_v12_to_v13(self) -> None:
+        # Write-lock classification: bucket 2 (schema bootstrap) -- see ensure_schema.
         """Add nullable valid-time columns + indexes to thought and edge (core-13).
 
         Introduces a second time axis ("valid time") alongside the
@@ -2675,11 +4264,10 @@ class SqliteEngravaCore:
         UTC-normalised ISO-8601 instant at which the Memory Hygiene loop archived
         a thought, or ``NULL`` when it was not archived by hygiene (a restore
         clears it back to ``NULL``, exactly like ``archived_at_cycle``). It backs
-        the wall-clock restore window: the irreversible GC stage may reap a
-        hygiene-archived thought only once **both** the cycle window
-        (``archived_at_cycle``) and this real-time window have elapsed, so a
-        fast-cycling store can no longer permanently delete a just-archived
-        thought before any real-time chance to restore it.
+        the wall-clock restore window: while ``gc_restore_window_seconds`` is
+        greater than zero, the irreversible GC stage also requires
+        ``archived_at`` to be at least that many seconds old, in addition to
+        the cycle window (``archived_at_cycle``).
 
         The add is guarded against the duplicate-column error exactly as
         ``_migrate_core_v17_to_v18`` guards its own ``ADD COLUMN``, so a database
@@ -2703,6 +4291,205 @@ class SqliteEngravaCore:
         # Postcondition: the column must exist before the loop bumps the
         # version, closing the "version bumped without the column" hole.
         await self._require_column(20, "thought", "archived_at")
+
+    async def _migrate_core_v20_to_v21(self) -> None:
+        """Add the row-version guard column and canonicalise stored timestamps (core-21).
+
+        Two parts, run in the one transaction the migration loop opens for the
+        step. First, ``thought``, ``edge`` and ``action`` each gain
+        ``revision INTEGER NOT NULL DEFAULT 0``. Not ``embedding`` — it is a
+        carrier owned by its thought, not an independently updatable entity.
+        Second, the stored values in the timestamp columns the shared validator
+        covers that are not already in the canonical shape are read once, and
+        each one that can be read as an instant is rewritten into the canonical
+        UTC form that validator now returns — see
+        :meth:`_normalise_stored_timestamps`. That second part
+        changes row values only, never a table's shape, so it does not need a
+        schema version of its own.
+
+        ``NOT NULL DEFAULT 0`` makes a separate backfill step unnecessary: every
+        pre-existing row reads back ``revision = 0`` the instant the column
+        exists, identically to a freshly bootstrapped row that has never been
+        written. There is no NULL state for a write-time guard to special-case.
+
+        This column is the enforcement primitive the guarded ``UPDATE``
+        statements on ``update_thought`` / ``restore_thought`` / ``update_edge``
+        / ``update_action`` compare and increment atomically (``revision =
+        revision + 1 WHERE id = ? AND revision = ?``) — it replaces
+        ``updated_cycle`` as the guard column, since ``updated_cycle`` is a
+        cognitive-recency signal nothing in this store advances on its own and
+        is not safe to overload as a write counter.
+
+        The add is guarded against the duplicate-column error exactly as every
+        earlier ``ADD COLUMN`` rung guards its own, so a database already
+        carrying the column (a partial or re-run migration) is left unchanged.
+        A postcondition assertion per table confirms each added column is
+        present before the migration loop bumps ``user_version``, closing the
+        "version bumped without the column" hole an interrupt could otherwise
+        open — the same pattern every prior rung in this ladder uses.
+
+        ``thought`` is always present by this point (the first table created
+        by the fresh DDL and by every earlier migration path), so its
+        ``ALTER`` needs no table-existence guard, exactly as
+        ``_migrate_core_v19_to_v20`` reasons about the same table. ``edge``
+        and ``action`` may each be absent in a partial bootstrap (a
+        thought-only database) — guarded by ``_table_exists`` exactly as
+        ``_migrate_core_v18_to_v19`` guards its own ``edge`` work and
+        ``_migrate_core_v15_to_v16`` guards its own ``action`` work. Either
+        table is only ever created from nothing by the base DDL, which at v21
+        already carries ``revision``, so a table that later comes into
+        existence is self-healing — no database can reach a state with an
+        ``edge`` or ``action`` table that lacks ``revision``.
+        """
+        await self._add_column_if_absent("thought", "revision", "INTEGER NOT NULL DEFAULT 0")
+        # Postcondition: the column must exist before the loop bumps the
+        # version, closing the "version bumped without the column" hole.
+        await self._require_column(21, "thought", "revision")
+
+        if await self._table_exists("edge"):
+            await self._add_column_if_absent("edge", "revision", "INTEGER NOT NULL DEFAULT 0")
+            await self._require_column(21, "edge", "revision")
+
+        if await self._table_exists("action"):
+            await self._add_column_if_absent("action", "revision", "INTEGER NOT NULL DEFAULT 0")
+            await self._require_column(21, "action", "revision")
+
+        await self._normalise_stored_timestamps()
+
+    async def _normalise_stored_timestamps(self) -> None:
+        # Write-lock classification: bucket 2 (schema bootstrap) -- see ensure_schema.
+        """Rewrite stored timestamps without the canonical shape into the canonical UTC form.
+
+        Before core-21 the shared validator returned a naive timestamp exactly
+        as the caller wrote it, so a v20 database can hold values such as
+        ``2026-01-02 03:04:05``, ``20260102T030405`` or ``2026-W01-5`` in a
+        column the store compares as TEXT — against
+        ``datetime.now(UTC).isoformat()`` for expiry, against MindQL literals for
+        valid time. Such a value sorts in the wrong place: a space separator
+        makes a still-live row read as expired, basic format or a week date
+        makes an expired one read as live. This rewrites each of them that can
+        be read as an instant into the form the validator returns now (a naive
+        value is read as UTC), so it orders by its instant.
+
+        Covers the columns in :data:`_CANONICAL_TIMESTAMP_COLUMNS`. Only rows
+        whose value does not already have the canonical shape are read back
+        (selected in SQL with ``GLOB``), a page at a time, so a large store that
+        is already canonical is scanned but not rewritten. A value that already
+        has the canonical shape is not re-read, even if it names an impossible
+        date. The rewrite changes no instant and is not an edit: ``revision`` is
+        not bumped, ``updated_at`` is not re-stamped (its own value is only put
+        into canonical form, like every covered column), and no journal entry is
+        written — the journal keeps its own copies of what was written, so its
+        hash chain still verifies. Of the values read back, one that cannot be
+        read as an ISO-8601 instant is left untouched; the count of such values
+        is logged, never the values themselves.
+
+        An ``edge`` table absent in a partial bootstrap (a thought-only
+        database) is skipped, as the ``revision`` part of this step skips it.
+
+        Raises:
+            CoreMigrationError: If a rewritten column still holds a value
+                without the canonical shape that is not one of the values left
+                untouched.
+
+        """
+        left_untouched: dict[str, int] = {}
+        for table, columns in _CANONICAL_TIMESTAMP_COLUMNS:
+            if not await self._table_exists(table):
+                continue
+            for column in columns:
+                untouched = await self._normalise_timestamp_column(table, column)
+                if untouched:
+                    left_untouched[f"{table}.{column}"] = untouched
+        if left_untouched:
+            logger.warning(
+                "Upgrading the core schema to version 21 left %d stored timestamp "
+                "value(s) unchanged because they cannot be read as an ISO-8601 "
+                "instant (%s)",
+                sum(left_untouched.values()),
+                ", ".join(f"{name}: {count}" for name, count in left_untouched.items()),
+            )
+
+    async def _normalise_timestamp_column(self, table: str, column: str) -> int:
+        # Write-lock classification: bucket 2 (schema bootstrap) -- see ensure_schema.
+        """Rewrite one column's values that lack the canonical shape.
+
+        See :meth:`_normalise_stored_timestamps` for what is rewritten and why.
+
+        Pages through the rows whose value lacks the canonical shape by
+        ``rowid`` (keyset pagination), so a value left untouched is never read
+        twice and a rewritten one never comes back: after its rewrite it matches
+        the canonical ``GLOB`` and is no longer selected. The ``SELECT`` of each
+        page is fully read before that page's ``UPDATE`` runs, so no statement
+        reads a table another one on this connection is changing. Then checks
+        its own postcondition.
+
+        Args:
+            table: A table from :data:`_CANONICAL_TIMESTAMP_COLUMNS`.
+            column: One of that table's columns there. Both are drawn from that
+                fixed constant, never caller input, so the f-string
+                interpolation below cannot carry anything it did not name.
+
+        Returns:
+            How many of the values read back (those without the canonical
+            shape) were left untouched because they cannot be read as an
+            ISO-8601 instant. A value with the canonical shape is never read, so
+            it is never counted.
+
+        Raises:
+            CoreMigrationError: If, after the rewrite, the number of values
+                without the canonical shape is not exactly the number left
+                untouched.
+
+        """
+        not_canonical = (
+            f"{column} IS NOT NULL AND NOT ({column} GLOB ? "
+            f"OR ({column} GLOB ? AND {column} NOT GLOB ?))"
+        )
+        globs = (_CANONICAL_WHOLE_SECOND_GLOB, _CANONICAL_FRACTION_GLOB, _ZERO_FRACTION_GLOB)
+        first_page = (
+            f"SELECT rowid, {column} FROM {table} "  # noqa: S608 - fixed identifiers, see Args
+            f"WHERE {not_canonical} ORDER BY rowid LIMIT ?"
+        )
+        next_page = (
+            f"SELECT rowid, {column} FROM {table} "  # noqa: S608 - fixed identifiers, see Args
+            f"WHERE rowid > ? AND {not_canonical} ORDER BY rowid LIMIT ?"
+        )
+        rewrite = f"UPDATE {table} SET {column} = ? WHERE rowid = ?"  # noqa: S608 - fixed identifiers
+
+        untouched = 0
+        cursor = await self._db.execute(first_page, (*globs, _TIMESTAMP_NORMALISATION_BATCH_SIZE))
+        while True:
+            rows = list(await cursor.fetchall())
+            rewrites: list[tuple[str, int]] = []
+            for row in rows:
+                canonical = canonical_timestamp_or_none(row[1])
+                if canonical is None:
+                    untouched += 1
+                else:
+                    rewrites.append((canonical, int(row[0])))
+            if rewrites:
+                await self._db.executemany(rewrite, rewrites)
+            if len(rows) < _TIMESTAMP_NORMALISATION_BATCH_SIZE:
+                break
+            cursor = await self._db.execute(
+                next_page, (int(rows[-1][0]), *globs, _TIMESTAMP_NORMALISATION_BATCH_SIZE)
+            )
+
+        # Postcondition: only the values left untouched may still lack the
+        # canonical shape.
+        cursor = await self._db.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE {not_canonical}",  # noqa: S608 - fixed identifiers
+            globs,
+        )
+        remaining = await cursor.fetchone()
+        if remaining is None or int(remaining[0]) != untouched:
+            raise CoreMigrationError(
+                21,
+                f"{table}.{column} still holds values without the canonical shape "
+                "after the rewrite",
+            )
+        return untouched
 
     async def _fk_present(self, table: str, column: str) -> bool:
         """Return whether ``column`` has the required thought-cascade foreign key.
@@ -2746,9 +4533,16 @@ class SqliteEngravaCore:
             )
 
     async def _table_exists(self, table: str) -> bool:
-        """Return ``True`` when ``table`` is registered in ``sqlite_master``."""
+        """Return ``True`` when ``table`` is registered in ``sqlite_master``.
+
+        Matched ``COLLATE NOCASE``, the same as :meth:`_has_any_core_table`:
+        SQLite resolves table identifiers case-insensitively, so a
+        case-sensitive comparison here could report a table absent when it
+        exists under a different case and every real DDL/DML statement
+        against it already resolves fine.
+        """
         cursor = await self._db.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? COLLATE NOCASE",
             (table,),
         )
         return await cursor.fetchone() is not None
@@ -2923,6 +4717,7 @@ class SqliteEngravaCore:
                 raise
 
     async def _purge_orphan_children(self) -> None:
+        # Write-lock classification: bucket 2 (schema bootstrap) -- see ensure_schema.
         """Delete orphan rows whose parent thought no longer exists.
 
         Runs before FK enablement so the constraint can be added
@@ -2952,6 +4747,7 @@ class SqliteEngravaCore:
             )
 
     async def _recreate_edge_with_fk(self) -> None:
+        # Write-lock classification: bucket 2 (schema bootstrap) -- see ensure_schema.
         """Recreate ``edge`` with FK + CASCADE on both endpoints."""
         await self._db.execute(
             "CREATE TABLE edge_new ("
@@ -2981,6 +4777,7 @@ class SqliteEngravaCore:
         )
 
     async def _recreate_embedding_with_fk(self) -> None:
+        # Write-lock classification: bucket 2 (schema bootstrap) -- see ensure_schema.
         """Recreate ``embedding`` with FK + CASCADE on ``owner_id``.
 
         The polymorphic ``owner_type`` column is preserved for forward
@@ -3026,6 +4823,7 @@ class SqliteEngravaCore:
         return await cursor.fetchone() is not None
 
     async def _recreate_action_with_fk(self) -> None:
+        # Write-lock classification: bucket 2 (schema bootstrap) -- see ensure_schema.
         """Recreate ``action`` with FK + CASCADE on ``source_thought_id``."""
         await self._db.execute(
             "CREATE TABLE action_new ("
@@ -3047,15 +4845,21 @@ class SqliteEngravaCore:
     # Embedding model immutability
     # ------------------------------------------------------------------
 
-    async def _ensure_embedding_model_lock(self, model_name: str, dimension: int) -> None:
-        """Lazy-lock the embedding model on first ``store_embedding()``.
+    async def _ensure_embedding_model_lock(
+        self, model_name: str, dimension: int, *, commit: bool = True
+    ) -> None:
+        """Lock the embedding model on first ``store_embedding()``, verify on every call.
 
         On first call (no ``embedding_model_name`` in ``_metadata``), writes
         the model name, dimension, and — only when the active provider
         applies a non-empty ``document_prefix`` — the deterministic
         fingerprint of that prefix and the ``query_prefix`` the corpus is
-        built to pair with. On subsequent calls, verifies the provider
-        matches the stored values.
+        built to pair with. On this and every later call, the stored values
+        are read back and compared against the arguments — there is no
+        instance-level cache that lets a later call skip the comparison, so a
+        store instance that is handed a different model, dimension, or
+        document prefix on a later call is refused just as reliably as one
+        constructed fresh with the mismatched provider.
 
         The document-prefix fingerprint is part of the *corpus identity*:
         changing the ``document_prefix`` changes what every stored vector
@@ -3069,9 +4873,46 @@ class SqliteEngravaCore:
         ``_metadata`` shape is byte-identical to the legacy one and a
         pre-existing unprefixed store never false-trips the lock.
 
+        ``model_name == CENTROID_MODEL_NAME`` is exempt from all of the
+        above: a REFLECTION centroid is a computed mean of member vectors,
+        not something a configured embedding provider produced, so its
+        sentinel tag is bookkeeping rather than a corpus identity. It must
+        never be compared against the locked identity, and it must never
+        itself lock the corpus identity either — including the edge case
+        where a centroid write happens to be the very first
+        ``store_embedding()`` call ever made on a store.
+
+        **The first-call identity write is committed here only when
+        ``commit`` is true.** ``verify_embedding_model`` wants exactly that:
+        it establishes identity on an empty corpus on its own account,
+        independent of any write, so its call keeps the default and this
+        method ends with :meth:`_maybe_commit`. That call commits
+        immediately unless the caller already has a
+        :meth:`suspend_auto_commit` window open on this task, in which case
+        the write joins that window's transaction and only becomes durable
+        when the outer window's own exit commits it. ``store_embedding``
+        wants the opposite — its call passes
+        ``commit=False`` and makes the identity write itself, from inside
+        the same :meth:`_write_readback_savepoint` span as the base/vec0
+        write it exists to gate: a rejected first vector (wrong dimension,
+        an invalid owner) then unwinds the identity write along with it,
+        instead of leaving a wrongly-locked identity behind for a corrected
+        retry to fail against.
+
         Args:
             model_name: Model identifier from the current provider.
             dimension: Vector dimensionality from the current provider.
+            commit: Whether the first-call identity write commits on its own
+                account. ``True`` (the default, used by
+                ``verify_embedding_model``) calls :meth:`_maybe_commit`,
+                which commits immediately unless a caller's own
+                :meth:`suspend_auto_commit` window is already open, in
+                which case the commit is deferred to that window's exit.
+                ``False`` (used by
+                ``store_embedding``) leaves the write pending for the
+                caller's own enclosing savepoint/commit to resolve, so it
+                rolls back together with a failed write it was meant to
+                gate rather than surviving it.
 
         Raises:
             EmbeddingModelMismatchError: When the configured model, its
@@ -3079,71 +4920,81 @@ class SqliteEngravaCore:
                 from the one stored in ``_metadata``.
 
         """
-        if self._embedding_model_verified:
+        if model_name == CENTROID_MODEL_NAME:
+            # Bookkeeping tag, not a provider identity: skip the comparison
+            # and the metadata write in both directions.
             return
 
-        # Ensure _metadata table exists (idempotent).
-        await self._migrate_core_v4_to_v5()
+        # Held for this whole method, not just by callers that happen to
+        # already have it: ``store_embedding`` holds it for its entire body
+        # (a free re-entrant no-op here), but ``verify_embedding_model`` — a
+        # public entry point — does not, and without the lock two concurrent
+        # first-callers could both see no stored model and both write the lock
+        # row.
+        async with self._write_lock:
+            # Ensure _metadata table exists (idempotent).
+            await self._migrate_core_v4_to_v5()
 
-        _query_prefix, document_prefix = _role_prefixes(self._embedding_provider)
-        active_fingerprint = _document_prefix_fingerprint(document_prefix)
+            _query_prefix, document_prefix = _role_prefixes(self._embedding_provider)
+            active_fingerprint = _document_prefix_fingerprint(document_prefix)
 
-        cursor = await self._db.execute(
-            "SELECT value FROM _metadata WHERE key = 'embedding_model_name'"
-        )
-        row = await cursor.fetchone()
-
-        if row is None:
-            # First embedding — lock the model.
-            await self._db.execute(
-                "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
-                ("embedding_model_name", model_name),
+            cursor = await self._db.execute(
+                "SELECT value FROM _metadata WHERE key = 'embedding_model_name'"
             )
-            await self._db.execute(
-                "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
-                ("embedding_dimension", str(dimension)),
-            )
-            # Only a non-empty document prefix records a fingerprint — an
-            # unprefixed corpus keeps the legacy _metadata shape untouched.
-            if active_fingerprint is not None:
+            row = await cursor.fetchone()
+
+            if row is None:
+                # First embedding — lock the model.
                 await self._db.execute(
                     "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
-                    (_METADATA_DOCUMENT_PREFIX_FINGERPRINT, active_fingerprint),
+                    ("embedding_model_name", model_name),
                 )
-            if _query_prefix:
                 await self._db.execute(
                     "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
-                    (_METADATA_QUERY_PREFIX, _query_prefix),
+                    ("embedding_dimension", str(dimension)),
                 )
-            await self._maybe_commit()
-        else:
-            stored_model = row["value"]
-            dim_cursor = await self._db.execute(
-                "SELECT value FROM _metadata WHERE key = 'embedding_dimension'"
-            )
-            dim_row = await dim_cursor.fetchone()
-            stored_dimension = int(dim_row["value"]) if dim_row else 0
-
-            fp_cursor = await self._db.execute(
-                "SELECT value FROM _metadata WHERE key = ?",
-                (_METADATA_DOCUMENT_PREFIX_FINGERPRINT,),
-            )
-            fp_row = await fp_cursor.fetchone()
-            stored_fingerprint = fp_row["value"] if fp_row else None
-
-            if (
-                stored_model != model_name
-                or stored_dimension != dimension
-                or stored_fingerprint != active_fingerprint
-            ):
-                raise EmbeddingModelMismatchError(
-                    stored_model=self._describe_corpus_model(stored_model, stored_fingerprint),
-                    configured_model=self._describe_corpus_model(model_name, active_fingerprint),
-                    stored_dimension=stored_dimension,
-                    configured_dimension=dimension,
+                # Only a non-empty document prefix records a fingerprint — an
+                # unprefixed corpus keeps the legacy _metadata shape untouched.
+                if active_fingerprint is not None:
+                    await self._db.execute(
+                        "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
+                        (_METADATA_DOCUMENT_PREFIX_FINGERPRINT, active_fingerprint),
+                    )
+                if _query_prefix:
+                    await self._db.execute(
+                        "INSERT OR REPLACE INTO _metadata (key, value) VALUES (?, ?)",
+                        (_METADATA_QUERY_PREFIX, _query_prefix),
+                    )
+                if commit:
+                    await self._maybe_commit()
+            else:
+                stored_model = row["value"]
+                dim_cursor = await self._db.execute(
+                    "SELECT value FROM _metadata WHERE key = 'embedding_dimension'"
                 )
+                dim_row = await dim_cursor.fetchone()
+                stored_dimension = int(dim_row["value"]) if dim_row else 0
 
-        self._embedding_model_verified = True
+                fp_cursor = await self._db.execute(
+                    "SELECT value FROM _metadata WHERE key = ?",
+                    (_METADATA_DOCUMENT_PREFIX_FINGERPRINT,),
+                )
+                fp_row = await fp_cursor.fetchone()
+                stored_fingerprint = fp_row["value"] if fp_row else None
+
+                if (
+                    stored_model != model_name
+                    or stored_dimension != dimension
+                    or stored_fingerprint != active_fingerprint
+                ):
+                    raise EmbeddingModelMismatchError(
+                        stored_model=self._describe_corpus_model(stored_model, stored_fingerprint),
+                        configured_model=self._describe_corpus_model(
+                            model_name, active_fingerprint
+                        ),
+                        stored_dimension=stored_dimension,
+                        configured_dimension=dimension,
+                    )
 
     @staticmethod
     def _describe_corpus_model(model_name: str, fingerprint: str | None) -> str:
@@ -3229,13 +5080,11 @@ class SqliteEngravaCore:
         """
         if self._embedding_provider is None:
             return
-        # Read in the order this method has always read: ``model_name`` first,
-        # then the dimension. Only ``dimension`` is translated into a typed
-        # error, so a provider missing ``model_name`` as well still fails on that
-        # member — as it did before — rather than being told about a different
+        # Read ``model_name`` first, then the dimension. Only ``dimension`` is
+        # translated into a typed error, so a provider missing ``model_name``
+        # as well fails on that member rather than being told about a different
         # one. Reversing the order to catch that case would change what a
-        # conformant provider with stateful properties observes, which this
-        # change is required not to do.
+        # conformant provider with stateful properties observes.
         model_name = self._embedding_provider.model_name
         await self._ensure_embedding_model_lock(
             model_name,
@@ -3279,19 +5128,27 @@ class SqliteEngravaCore:
         Batches every write in the block into one transaction: the block
         commits once on clean exit and rolls back entirely on any exception.
 
-        **One writer for the duration of the window** — a restriction on this
-        block, not on the store in general. The window belongs to the store
-        instance, not to the task that opened it: the deferred-commit state lives
-        on the instance, so a write issued by *any* task while the window is open
-        joins this block's transaction (and, under auto-embed, is affected by the
-        batch's embedding deferral). A rollback then discards that write too,
-        and the task that issued it is never told. Drive writes on a given store
-        instance from one task at a time *while a window is open* — this is the
-        established contract that ``bulk_store`` and every deferred-commit caller
-        rely on. Note that
-        opening a *second* store on the same database file is not the way out:
-        only one store may write a given file (see the concurrency
-        documentation).
+        **One writer for the duration of the window.** This method takes
+        :attr:`_write_lock` for its entire duration, so a *different* task
+        calling any guarded write path on this instance blocks until the
+        window closes instead of joining its transaction. The *same* task may
+        still write freely inside its own window — the lock is task-reentrant
+        (see :class:`_TaskReentrantLock`) — which is what lets ``bulk_store``'s
+        insert loop, and a caller's own writes issued inside its own
+        ``suspend_auto_commit`` block, complete rather than deadlock on
+        themselves. Note that opening a *second* store on the same database
+        file is not the way out: only one store may write a given file (see
+        the concurrency documentation) — the lock is per-instance, not
+        cross-connection.
+
+        **Reentrant nesting is supported and safe.** A nested
+        ``suspend_auto_commit`` call — on the same task, which is the only way
+        to reach one, since the lock above blocks any other task before it
+        could nest — shares the *same* transaction as the outermost call:
+        :attr:`_skip_auto_commit_depth` counts the nesting, and only the
+        **outermost** call's clean exit commits or its exception rolls back;
+        an inner call's own exit does neither, and its ``finally`` only
+        decrements the depth rather than clearing it outright.
 
         Note on the derived-records seam: a create issued inside this block does
         **not** auto-derive (the source is not yet durable and this block owns
@@ -3300,20 +5157,508 @@ class SqliteEngravaCore:
         ``suspend_auto_commit`` window triggers derivation via an explicit
         re-run/backfill (see :meth:`_dispatch_derivation`).
 
+        **Cancellation is caught alongside every other exception**
+        (``except BaseException``, not ``except Exception``):
+        :class:`asyncio.CancelledError` derives from ``BaseException``, and this
+        block is the *only* thing that can close the transaction while
+        ``_skip_auto_commit`` is set — a nested guard such as
+        :meth:`_serialize_dedup_probe` deliberately declines to commit or roll
+        back anything itself here, leaving that decision to this method (see its
+        own docstring). If this method only caught ``Exception``, a
+        cancellation landing inside a ``bulk_store`` batch (or any other
+        ``suspend_auto_commit`` caller) would skip the rollback entirely, the
+        ``finally`` below would still clear ``_skip_auto_commit`` (at the
+        outermost level), and the RESERVED lock would be left stranded on the
+        connection — ``in_transaction`` stuck ``True`` — blocking every other
+        writer on the file until something else eventually commits, rolls
+        back, or closes it.
+
+        Both the commit and the rollback are also guarded on
+        ``self._db.in_transaction`` — read fresh at that point rather than
+        assumed — so a window that happened to do no writes at all (or one
+        cancelled before its first write) does not issue a pointless commit or
+        rollback call on a connection with nothing open. That guard is skipped
+        entirely when :attr:`_connection_quarantined` is already set: a guarded
+        write inside the window (e.g. :meth:`_write_readback_savepoint`) can
+        itself quarantine the connection while unwinding its own unit, and
+        `self._db` is by then a terminal proxy on which even reading
+        ``.in_transaction`` raises — checking the flag first, before touching
+        `self._db` again, is what keeps that from replacing the original error
+        or cancellation with :class:`ConnectionQuarantinedError`.
+
+        **A failed commit ends its own transaction, one way or another.** The
+        clean-exit commit above goes through :meth:`_commit_or_recover`, not a
+        bare ``self._db.commit()``: a ``COMMIT`` can itself fail (e.g. a
+        concurrent reader still holding a lock when ``busy_timeout`` expires)
+        while leaving the write transaction open on the connection. Left
+        alone, that open transaction would sit there until some later,
+        unrelated write on the same connection committed it too — publishing
+        this window's work despite the reported failure. See
+        :meth:`_commit_or_recover` for the recovery this now performs.
+
         Yields:
             None — the store operates in deferred-commit mode.
 
         """
-        self._skip_auto_commit = True
+        async with self._write_lock:
+            self._skip_auto_commit_depth += 1
+            is_outermost = self._skip_auto_commit_depth == 1
+            # Fresh identity for THIS window (nested or not) — see
+            # `_open_auto_commit_windows` / `_current_auto_commit_window` for
+            # why this is separate from `_skip_auto_commit_depth`.
+            window_id = object()
+            self._open_auto_commit_windows.add(window_id)
+            window_token = self._current_auto_commit_window.set(window_id)
+            try:
+                yield
+            except BaseException:
+                if self._connection_quarantined:
+                    # A guarded write inside this window already quarantined
+                    # the connection while unwinding its own unit and left
+                    # `self._db` a terminal proxy — touching it again here
+                    # (even just reading `.in_transaction`) would replace the
+                    # in-flight exception or cancellation with
+                    # ConnectionQuarantinedError instead of letting it
+                    # propagate. See _write_readback_savepoint for the same
+                    # guard.
+                    raise
+                if is_outermost and self._db.in_transaction:
+                    await self._db.rollback()
+                raise
+            else:
+                if is_outermost and self._db.in_transaction:
+                    await self._commit_or_recover()
+            finally:
+                self._skip_auto_commit_depth -= 1
+                # Unregister this window's identity and restore the marker
+                # this task had before this window opened (the enclosing
+                # window's identity, if nested, else `None`) — on every exit
+                # path, including cancellation: see `_dispatch_derivation`.
+                self._open_auto_commit_windows.discard(window_id)
+                self._current_auto_commit_window.reset(window_token)
+
+    async def _open_write_unit(
+        self, name: str, *, begin: Literal["DEFERRED", "IMMEDIATE"], opened_transaction: bool
+    ) -> None:
+        """Open :meth:`_write_readback_savepoint`'s own transaction and ``SAVEPOINT``.
+
+        Split out of that method purely to keep its own cyclomatic
+        complexity in check — no behavior lives here that method's callers
+        need to know about separately.
+
+        **What this recovers from, precisely.** ``BEGIN`` and ``SAVEPOINT``
+        are each awaited separately. This recovers from a cancellation that
+        surfaces *after* SQLite has already executed one of those two
+        statements for real — on a worker thread this coroutine's own
+        cancellation cannot reach — but *before* this call's own ``await``
+        returns control here, and only when this call is also the one that
+        opened the transaction (``opened_transaction`` is ``True``). In
+        that case, on any failure, this checks live connection state
+        (``self._db.in_transaction``), never whether the awaited call was
+        observed to complete: only a plain ``rollback()`` — never
+        ``ROLLBACK TO {name}``, since this call cannot prove the
+        ``SAVEPOINT`` itself was ever created, whichever of the two
+        statements actually failed. Already-quarantined is a no-op here,
+        the same guard :meth:`_write_readback_savepoint`'s own unwind
+        applies to itself: touching ``self._db`` again would replace the
+        original exception with :class:`ConnectionQuarantinedError` instead
+        of letting it propagate. A failed rollback quarantines the
+        connection, mirroring every other compensating-rollback failure in
+        this class.
+
+        **Two related gaps exist and are deliberately not covered here.**
+        Both belong to aiosqlite's own execution model — the same class of
+        gap exists at every other call site in this class that awaits a
+        single ``self._db.execute(...)`` and predates this method — so
+        neither is patched locally; both are tracked as a separate,
+        codebase-wide backlog item instead of being half-fixed in one call
+        site:
+
+        (a) If the statement is still *queued* on aiosqlite's worker thread
+            — not yet actually executed — when the cancellation lands,
+            ``self._db.in_transaction`` can read ``False`` at the moment
+            this checks it, correctly reflecting that nothing has run yet.
+            But the worker thread does not know its queued job was
+            cancelled at the Python level, and executes it anyway once it
+            gets to it — opening a real transaction on the connection after
+            this method has already concluded there was nothing to roll
+            back, and returned. Nothing here can observe that after the
+            fact.
+        (b) If this call enters with a transaction *already* open
+            (``opened_transaction`` is ``False``) and the ``SAVEPOINT``
+            itself executes before the cancellation surfaces, that
+            savepoint is never released: the rollback above is gated on
+            ``opened_transaction`` precisely because a caller-held
+            transaction must not be ended by this call's own failure, so
+            nothing here ends it, or the savepoint nested inside it,
+            either. A transaction a caller already held is **not**
+            guaranteed to be left exactly as it was in this case — only
+            that this call never ends it and never touches any write the
+            caller made before or after this call's own attempt.
+
+        A compensating ``RELEASE {name}`` for (b) — issued only when the
+        ``SAVEPOINT`` is known to have executed before a later failure —
+        was considered and left out: the exception raised from
+        ``await self._db.execute(f"SAVEPOINT {name}")`` looks identical
+        whether that statement genuinely created the savepoint and then
+        raced with a cancellation, or never created anything because the
+        statement itself failed outright, and nothing observable here
+        distinguishes the two. Issuing ``RELEASE {name}`` on the strength
+        of a guess is not the trivially-safe addition it would need to be:
+        ``RELEASE`` targets the innermost, most-recently-created savepoint
+        with that literal name, so if this call's own ``SAVEPOINT`` never
+        actually existed, that statement would instead release some
+        unrelated, older, still-legitimate savepoint the caller's own
+        transaction happens to carry under the same name — a worse outcome
+        than the leak it would be trying to close. Left undone; this is
+        that "otherwise leave it and say so".
+
+        Args:
+            name: Savepoint name — see :meth:`_write_readback_savepoint`.
+            begin: ``"IMMEDIATE"`` or ``"DEFERRED"`` — see
+                :meth:`_write_readback_savepoint`.
+            opened_transaction: Whether this call is the one opening the
+                transaction, sampled by the caller before either statement
+                below ran.
+
+        Raises:
+            BaseException: The original failure (``asyncio.CancelledError``
+                included), or a cancellation raised by the rollback itself,
+                which always outranks it.
+
+        """
+        try:
+            if opened_transaction:
+                await self._db.execute(f"BEGIN {begin}")
+            await self._db.execute(f"SAVEPOINT {name}")
+        except BaseException as exc:
+            if self._connection_quarantined:
+                raise
+            if opened_transaction and self._db.in_transaction:
+                try:
+                    await self._db.rollback()
+                except BaseException as unwind_exc:
+                    await self._quarantine_connection(
+                        f"{name} could not roll back after failing to open its own "
+                        f"unit: {exc!r}: {unwind_exc!r}"
+                    )
+                    if isinstance(unwind_exc, asyncio.CancelledError):
+                        raise
+                    raise exc from unwind_exc
+            raise
+
+    @contextlib.asynccontextmanager
+    async def _write_readback_savepoint(
+        self, name: str, *, begin: Literal["DEFERRED", "IMMEDIATE"]
+    ) -> AsyncIterator[None]:
+        """Make a journaled write one failure-atomic unit, with its journal entry.
+
+        The store's journaled insert, update and delete paths use this to
+        make their own row write(s) and their own journal append recover
+        together. ``update_thought``, ``restore_thought``, ``update_edge``
+        and ``update_action`` additionally re-read the row to report and
+        journal the state actually stored, so for those the unit also covers
+        that read-back. Without this wrapper, a failure inside the unit (a
+        vanished row, a driver error, the row mapper rejecting a stored
+        value, a failed or cancelled journal append) propagated while the
+        write itself stayed pending in the connection's transaction — a
+        later, unrelated commit on the same connection would then publish a
+        mutation whose own operation had reported failure.
+
+        The journal append runs inside this same block, not after it, for
+        the identical reason: ``JournalWriter.append`` awaits a chain-tail
+        read before its own ``INSERT``, and a failure or cancellation in
+        that await must unwind the row write too — a mutation the journal
+        never recorded must never be the one thing that survives. Releasing
+        the savepoint before the append ran (the original shape of every
+        call site above) left that same failure window with no savepoint
+        protecting the row write any more, guarded only by
+        :attr:`_write_lock` — a lock, not a transaction guard — so a later,
+        unrelated commit on the same connection could publish the row write
+        with no matching journal entry.
+
+        A bare ``self._db.rollback()`` on that failure is the wrong
+        instrument: a caller may already hold this connection's transaction
+        open (see :meth:`suspend_auto_commit`), with its own writes pending
+        that must not be discarded by a sibling call's unrelated failure.
+        This uses a ``SAVEPOINT`` instead, mirroring the established pattern
+        in :meth:`_delete_thought_children_explicit` /
+        :meth:`_delete_thought_atomic`: a transaction is opened first only
+        when :attr:`self._db.in_transaction <aiosqlite.Connection.in_transaction>`
+        is not already ``True`` (tracked as ``opened_transaction``).
+
+        **``begin`` is required, with no default, precisely because the two
+        modes serve different, incompatible contracts, and a call site must
+        say which one it means rather than inherit a silent house default:**
+
+        * ``"IMMEDIATE"`` — for a body that reads before it writes (an FTS5
+          trigger reading its own config on insert, an existence check
+          before a delete, a before-image or a vector rowid a caller
+          deliberately reads after taking this lock). A deferred
+          transaction's read takes a WAL snapshot that the later write must
+          then upgrade; SQLite refuses that upgrade while another connection
+          holds the write lock and returns ``SQLITE_BUSY`` *without ever
+          invoking the busy handler*, so the unit would fail at once under
+          contention instead of waiting out ``PRAGMA busy_timeout`` like an
+          ordinary write. ``BEGIN IMMEDIATE`` takes the write lock up front,
+          through the busy handler, before anything in the body gets to
+          read — correctness, not a documented retry contract, is what this
+          buys. Used by every create and delete path, and by the two delete
+          paths that read their before-image / vector rowid after taking
+          this same lock.
+        * ``"DEFERRED"`` — for the four ``revision``-guarded update paths
+          (:meth:`update_thought`, :meth:`restore_thought`,
+          :meth:`update_edge`, :meth:`update_action`), which read *before*
+          opening this unit. Their guarded ``UPDATE`` is always typed via
+          :meth:`_execute_revision_guarded_write`, but **not all four settle
+          the same way, and neither settles literally "at once" in
+          general** — that shape is narrower than it looks:
+
+          * :meth:`update_thought` alone can fail within milliseconds,
+            without the busy handler ever running: a content-changing
+            update fires the FTS5 sync trigger, which reads its own config
+            as part of the *same* ``UPDATE`` statement, so the write-lock
+            upgrade that read forces is refused at once
+            (``SQLITE_BUSY``, no wait) while another connection holds the
+            lock.
+          * :meth:`restore_thought`, :meth:`update_edge` and
+            :meth:`update_action` carry no such trigger. Their guarded
+            ``UPDATE`` contends through the *ordinary* busy handler and
+            waits up to ``PRAGMA busy_timeout`` like any other write. If the
+            other writer is still holding the lock once that wait is
+            exhausted, this surfaces as typed
+            :class:`WriteContentionError`, same as the first case. But if
+            the other writer instead commits *while this call is still
+            waiting*, the guarded ``UPDATE`` proceeds once the lock frees
+            and raises ``StaleDataError`` if this row's ``revision`` no
+            longer matches.
+
+          What ``DEFERRED`` actually buys, for all four uniformly, is
+          narrower and does not depend on which of the two shapes above
+          applies: the read that determines ``expected_revision`` happens
+          *before* this unit ever competes for the write lock, never after
+          waiting for it. Reading only after such a wait — which an
+          ``IMMEDIATE`` unit here would do — lets a write guard a revision
+          it read *after* another process's edit had already landed,
+          rejecting a disjoint-column edit as falsely stale instead of the
+          lost update the guard exists to catch.
+
+        The body then runs inside a named ``SAVEPOINT``, and on any failure
+        it is unwound with ``ROLLBACK TO`` + ``RELEASE`` — undoing only what
+        this call itself wrote — before the original exception propagates.
+        Only when this call is also the one that opened the transaction does
+        it end that transaction (with a rollback, never a commit); a
+        transaction a caller already held stays open, with only this call's
+        own write undone.
+
+        Cancellation is handled the same way: caught alongside every other
+        exception (``except BaseException``, not ``except Exception``) so a
+        cancellation delivered mid-body still unwinds the savepoint rather
+        than leaving it — and the write it guards — dangling on the
+        connection.
+
+        **Entry itself is guarded too, not just the body — within limits.**
+        ``BEGIN`` and ``SAVEPOINT`` are each awaited separately by
+        :meth:`_open_write_unit`, and a cancellation can be delivered after
+        SQLite has already executed one of them but before that ``await``
+        returns control here — the statement still ran, on a worker thread
+        this coroutine's own cancellation cannot reach. When this call is
+        the one that opened the transaction, a failure at either point
+        rolls that transaction back (checked via live connection state,
+        never via whether the awaited call was seen to complete) with a
+        plain ``rollback()`` — never ``ROLLBACK TO`` a savepoint this call
+        cannot prove was ever created, whichever of the two statements
+        actually failed — and the original exception always propagates
+        unchanged. When a caller already held the transaction, this never
+        ends it or touches the caller's own writes either way, but a
+        ``SAVEPOINT`` that raced a cancellation right after really
+        executing can be left behind, unreleased, on that caller's
+        transaction: see :meth:`_open_write_unit`'s own docstring for
+        exactly which two gaps entry does not close, and why.
+
+        **When the unwind itself cannot be trusted, this refuses rather than
+        guesses.** If a ``RAISE(ROLLBACK)`` trigger already ended the whole
+        transaction (``self._db.in_transaction`` is already ``False`` on the
+        failure path), there is nothing left to unwind and the original
+        exception propagates unchanged. If the unwind's own statements raise,
+        recovery cannot be proven, so the connection is quarantined via
+        :meth:`_quarantine_connection` — every later write then fails fast
+        with :class:`ConnectionQuarantinedError` instead of ever reaching a
+        commit that could make the dangling write durable. A cancellation
+        raised by the unwind itself always wins over the error the unwind was
+        trying to recover from.
+
+        Args:
+            name: Savepoint name, unique among the guarded update paths (a
+                fixed literal at every call site, never caller-controlled —
+                interpolated directly into the SQL since SQLite does not
+                accept savepoint names as bound parameters).
+            begin: ``"IMMEDIATE"`` or ``"DEFERRED"`` — see above. Required,
+                with no default, so every call site states its own contract
+                rather than inheriting one.
+
+        Yields:
+            None. The caller performs its write, read-back, and journal
+            append inside the block; a failure raised anywhere in it is
+            unwound as described above and then re-raised unchanged.
+
+        Raises:
+            ConnectionQuarantinedError: When an unwind attempt itself fails
+                and a consistent state could not be proven.
+
+        """
+        opened_transaction = not self._db.in_transaction
+        await self._open_write_unit(name, begin=begin, opened_transaction=opened_transaction)
         try:
             yield
-        except Exception:
-            await self._db.rollback()
+            # The release lives inside this guarded region, deliberately —
+            # so that a failure or cancellation delivered while awaiting it
+            # reaches the unwind below.
+            await self._db.execute(f"RELEASE {name}")
+        except BaseException as exc:
+            if self._connection_quarantined:
+                # A unit this block wraps (e.g. _delete_thought_atomic) already
+                # quarantined the connection while unwinding its own nested
+                # savepoint and left `self._db` a terminal proxy — see that
+                # method's docstring. Touching `self._db` again here — even
+                # just reading `.in_transaction` — would replace `exc` with
+                # ConnectionQuarantinedError instead of letting it propagate.
+                raise
+            if not self._db.in_transaction:
+                # A RAISE(ROLLBACK) trigger already ended the whole
+                # transaction (savepoint included). Nothing is left open to
+                # unwind, and nothing this call wrote can outlive it.
+                raise
+            try:
+                await self._db.execute(f"ROLLBACK TO {name}")
+                await self._db.execute(f"RELEASE {name}")
+                if opened_transaction:
+                    await self._db.rollback()
+            except BaseException as unwind_exc:
+                await self._quarantine_connection(
+                    f"{name} could not unwind its savepoint after {exc!r}: {unwind_exc!r}"
+                )
+                if isinstance(unwind_exc, asyncio.CancelledError):
+                    raise
+                raise exc from unwind_exc
             raise
-        else:
-            await self._db.commit()
-        finally:
-            self._skip_auto_commit = False
+
+    async def _execute_revision_guarded_write(
+        self,
+        sql: str,
+        params: tuple[object, ...],
+        *,
+        operation: str,
+    ) -> aiosqlite.Cursor:
+        """Execute a ``revision``-guarded ``UPDATE``, typing lock contention.
+
+        ``update_thought``, ``restore_thought``, ``update_edge`` and
+        ``update_action`` all execute their guarded write through this, so a
+        lock timeout on any of them surfaces as :class:`WriteContentionError`
+        rather than a raw :class:`sqlite3.OperationalError` — the same
+        conversion :meth:`_begin_dedup_write_lock` already performs for the
+        dedup window's own ``BEGIN IMMEDIATE``. An ordinary ``UPDATE`` from a
+        second connection or process has always been able to hit the write
+        lock and time out — a ``revision`` predicate in the ``WHERE`` clause
+        does not, by itself, introduce SQL-level contention that was not
+        already there. What changed is how often that contention now surfaces
+        as a *typed* error: before these four paths ran through this method, a
+        lock timeout on any of them propagated as a raw
+        :class:`sqlite3.OperationalError`, and only
+        ``_begin_dedup_write_lock``'s cross-connection window converted its
+        own — leaving these four untyped would now be a gap this method
+        exists to close, not a property they merely inherit.
+
+        No application-level retry is added: ``PRAGMA busy_timeout`` already
+        makes SQLite wait out ordinary contention inside this single
+        ``execute()`` call, and a caller is free to retry the whole operation
+        (a safe thing to do, since nothing was written before this call
+        raised). Only a busy/lock error converts; any other
+        :class:`sqlite3.OperationalError` (a genuine I/O failure, a schema
+        problem) is never mistaken for contention and propagates unchanged.
+
+        Args:
+            sql: The guarded ``UPDATE`` statement, as built by
+                :func:`_build_update_sql`.
+            params: The statement's bound parameters, in order.
+            operation: Name of the calling public method, carried onto
+                :class:`WriteContentionError` for a caller that logs or
+                branches on it.
+
+        Returns:
+            The cursor from the executed statement.
+
+        Raises:
+            WriteContentionError: The write could not proceed because the
+                connection reported lock contention.
+            sqlite3.OperationalError: Some other, non-busy failure.
+
+        """
+        try:
+            return await self._db.execute(sql, params)
+        except sqlite3.OperationalError as exc:
+            if not _is_busy_error(exc):
+                raise
+            raise WriteContentionError(operation=operation, attempts=1) from exc
+
+    async def _rollback_self_opened_transaction(
+        self, *, opened_transaction: bool, exc: BaseException
+    ) -> None:
+        """Undo a transaction this call itself opened, on a failure before any write.
+
+        ``delete_thought`` and ``delete_edge`` each open their own ``BEGIN
+        IMMEDIATE`` *before* reading their journal before-image (and, for
+        ``delete_thought``, the embedding rowid the vector purge needs) — see
+        those methods' docstrings for why the write lock is taken before that
+        read. A failure raised while performing that read strikes before
+        :meth:`_write_readback_savepoint`'s own ``SAVEPOINT`` is ever
+        created, so there is nothing to unwind with ``ROLLBACK TO`` — only
+        the transaction itself, and only when this call is the one that
+        opened it. A transaction a caller already held when this call
+        started (``opened_transaction`` is ``False``) is left exactly as it
+        was.
+
+        Deliberately a plain ``rollback()``, not the savepoint-aware unwind
+        :meth:`_write_readback_savepoint` uses: at this point nothing has
+        been written, so undoing the whole transaction and undoing "only
+        this call's own write" are the same thing. Mirrors that method's own
+        compensating-rollback failure handling: when the rollback itself
+        fails, the connection's state cannot be trusted, so it is
+        quarantined via :meth:`_quarantine_connection` instead of leaving an
+        indeterminate transaction for a later, unrelated commit to publish.
+        Already-quarantined is also a no-op here — :meth:`_write_readback_savepoint`
+        may have quarantined the connection on its own unwind failure before
+        this ever runs, and touching ``self._db`` again would replace ``exc``
+        with :class:`ConnectionQuarantinedError` instead of letting it
+        propagate, the same guard that method's own handler applies to
+        itself.
+
+        Args:
+            opened_transaction: Whether this call is the one that opened the
+                active transaction, sampled before this call touched the
+                connection.
+            exc: The exception that triggered this cleanup — chained onto a
+                rollback failure, or left untouched when the rollback
+                succeeds (the caller re-raises it unchanged either way).
+
+        Raises:
+            BaseException: A cancellation raised by the rollback itself,
+                which always outranks ``exc``.
+
+        """
+        if self._connection_quarantined:
+            return
+        if not opened_transaction or not self._db.in_transaction:
+            return
+        try:
+            await self._db.rollback()
+        except BaseException as rollback_exc:
+            await self._quarantine_connection(
+                f"rollback after {exc!r} also failed: {rollback_exc!r}"
+            )
+            if isinstance(rollback_exc, asyncio.CancelledError):
+                raise
+            raise exc from rollback_exc
 
     def _ensure_connection_usable(self) -> None:
         """Fail fast when the connection has been quarantined.
@@ -3333,8 +5678,10 @@ class SqliteEngravaCore:
             raise ConnectionQuarantinedError(self._quarantine_reason or "connection unusable")
 
     @staticmethod
-    async def _drain_shielded(task: asyncio.Task[None]) -> asyncio.CancelledError | None:
-        """Await a shielded task to completion, returning any cancellation of us.
+    async def _drain_shielded(
+        task: asyncio.Task[None], *, timeout_seconds: float | None = None
+    ) -> asyncio.CancelledError | None:
+        """Await a shielded task, up to an optional bound, returning any cancellation of us.
 
         The task is observed via a **single** :func:`asyncio.wait` waiter that is
         awaited under :func:`asyncio.shield` and reused across every cancellation
@@ -3345,14 +5692,30 @@ class SqliteEngravaCore:
         swallowed) so the caller can honor it once the task is safely complete;
         the task's own success/failure is left on the task for the caller.
 
+        ``timeout_seconds`` bounds *our own observation*, never the task: it is
+        forwarded straight to the single ``asyncio.wait`` call above, so the
+        deadline is set once, when this is first called, and does not restart on
+        a repeated cancellation of our await (the same "one waiter, reused"
+        property the unbounded case already relies on). ``task`` is never
+        cancelled by a timeout — the caller decides what an unanswered task means
+        by checking ``task.done()`` once this returns; a task that has not
+        answered keeps running afterwards exactly as it would have without a
+        bound, which is what lets a later drain (a piggybacking ``close()``, or
+        :meth:`_quarantine_connection`) keep observing the very same task rather
+        than a cancelled one.
+
         Args:
-            task: The already-scheduled task to drain to completion.
+            task: The already-scheduled task to drain.
+            timeout_seconds: Maximum time to wait for ``task``. ``None`` (the
+                default) waits without a bound.
 
         Returns:
-            The last ``CancelledError`` raised into our await, or ``None``.
+            The last ``CancelledError`` raised into our await, or ``None``. Check
+            ``task.done()`` after this returns to tell a real bound expiry
+            (``False``) apart from the task actually finishing (``True``).
 
         """
-        waiter = asyncio.ensure_future(asyncio.wait({task}))
+        waiter = asyncio.ensure_future(asyncio.wait({task}, timeout=timeout_seconds))
         cancelled: asyncio.CancelledError | None = None
         while not waiter.done():
             try:
@@ -3365,14 +5728,85 @@ class SqliteEngravaCore:
         return cancelled
 
     @staticmethod
+    def _log_close_failure_over_pending_cancellation(task: asyncio.Task[None]) -> None:
+        """Consume a close task's result when a cancellation already outranks it.
+
+        The rule, stated generally so the next cleanup path here can reuse
+        it rather than re-derive it: **the caller's own cancellation
+        outranks anything the cleanup discovers about itself.** When
+        something earlier in ``close()`` (the access-buffer flush) has
+        already deferred a cancellation, the connection's physical close
+        still runs to completion -- but its own outcome must not replace
+        the cancellation the caller actually needs to see. ``task.result()``
+        is still called so a close failure is never an unretrieved task
+        exception, and a genuine failure is logged with the exception
+        itself -- the only trace of it that will exist -- rather than
+        raised in front of the cancellation.
+
+        Args:
+            task: The completed close task.
+
+        """
+        try:
+            task.result()
+        except BaseException:
+            logger.warning(
+                "close() failed while a cancellation was already pending",
+                exc_info=True,
+            )
+
+    async def _abandon_expired_close(self, task: asyncio.Task[None]) -> None:
+        """Quarantine the store after :meth:`close`'s own bound expires unanswered.
+
+        Called only when a caller of :meth:`close` stops waiting on the
+        physical close task because :attr:`_close_timeout_seconds` elapsed
+        with the task still not ``done()``. The task itself is never
+        cancelled here or anywhere upstream — it keeps running (or not) in
+        the background exactly as :meth:`_quarantine_connection`'s own
+        detached close already does; this only stops *this call* from
+        waiting on it any longer.
+
+        Delegates to :meth:`_quarantine_connection`, which is idempotent, so
+        a concurrent quarantine (a prior compensating-rollback failure, a
+        different caller's own ``close()`` also timing out on this same
+        task, or a second ``close()`` after this one already gave up)
+        collapses onto whichever caller gets there first. Because ``task``
+        is already installed in :attr:`_quarantine_close_task` by the time
+        this runs, :meth:`_quarantine_connection`'s own physical-close step
+        finds it non-``None`` and defers to it rather than starting a second
+        one — the same coordination :meth:`close` already relies on for a
+        concurrent quarantine, reused here so an expired bound can never
+        cause a second physical close on the pinned connection.
+
+        That deferral also means :meth:`_quarantine_connection` will *not*
+        attach its own done-callback to ``task`` (it only does that for a
+        task it creates itself), so this method attaches
+        :meth:`_consume_quarantine_close` directly — otherwise the task's
+        eventual outcome, whenever the worker finally answers, if ever,
+        would be reported as an unretrieved task exception instead of
+        quietly discarded. Attaching it more than once (a second caller
+        hitting this same path for the same task) is harmless: the callback
+        only reads the outcome, which is safe to read repeatedly.
+
+        Args:
+            task: The in-flight physical-close task this call gave up
+                waiting on.
+
+        """
+        task.add_done_callback(self._consume_quarantine_close)
+        await self._quarantine_connection(
+            f"close() did not complete within {self._close_timeout_seconds:.1f}s "
+            "-- the connection worker has not answered"
+        )
+
+    @staticmethod
     def _consume_quarantine_close(task: asyncio.Task[None]) -> None:
         """Done-callback that consumes the detached best-effort close outcome.
 
         Retrieves any exception so the task is never reported as an
         unretrieved-exception; a *cancelled* close task carries no exception to
         retrieve and is left alone (``exception()`` would raise on it). The
-        outcome is irrelevant to correctness — the proxy + token already
-        guarantee terminality — so it is never re-raised.
+        outcome is not re-raised.
 
         Args:
             task: The completed detached close task.
@@ -3384,38 +5818,43 @@ class SqliteEngravaCore:
             task.exception()
 
     async def _quarantine_connection(self, reason: str) -> None:
-        """Make the store terminally unusable, by construction and independent of close.
+        """Quarantine the store's connection without waiting for its physical close.
 
         Kept ``async`` for call-site symmetry with the compensating-rollback flow
         and so the "returns promptly even if close hangs" liveness contract is
         awaitable in tests; it intentionally **awaits nothing** — every step is
         synchronous and the physical close is *detached*.
 
-        Terminal-by-construction, in three synchronous steps (nothing here can be
+        Three synchronous steps (nothing here can be
         cancelled or blocked, so a caller-frame cancellation is never swallowed —
         it is simply delivered at the caller's next await and propagates):
 
         1. Set the flag — guarded entry points and :meth:`_maybe_commit` fail fast
            with a typed :class:`ConnectionQuarantinedError`.
-        2. Revoke the shared :class:`ConnectionRevocationToken` — every *other*
-           holder of the real connection (the :class:`JournalWriter`) fails hard
-           on its next connection-touching method, so it cannot bypass the proxy.
+        2. Revoke the shared :class:`ConnectionRevocationToken` — the
+           :class:`JournalWriter`'s ``append``, ``verify_integrity`` and
+           ``get_entries`` check it and raise :class:`ConnectionQuarantinedError`.
         3. Detach the real connection, swap in a :class:`_QuarantinedConnection`
            proxy (so every core-initiated op raises), and schedule a **bounded,
-           detached** best-effort close for resource cleanup. Quarantine returns
-           promptly even if that close hangs forever — safety never depends on it.
-           A done-callback consumes the close outcome so a failure/cancellation
-           is never an unretrieved-task warning, and the task is retained so it is
-           not GC'd while pending.
+           detached** best-effort close for resource cleanup — unless
+           :meth:`close` already started (or is starting) that same physical
+           close, in which case this step defers to it entirely rather than
+           entering ``real_conn.close()`` a second time (see :meth:`close`
+           for the race two concurrent closes on the same connection can
+           hit). Quarantine returns promptly even if that close hangs
+           forever. A done-callback consumes
+           the close outcome so a failure/cancellation is never an
+           unretrieved-task warning, and the task is retained so it is not
+           GC'd while pending.
 
         Idempotent: a second call is a no-op (already quarantined).
 
         Guarantee / limitation: quarantine synchronously revokes *admission* —
-        every NEW operation on the store or its journal fails fast with
-        :class:`ConnectionQuarantinedError`, and direct core connection access is
-        terminal via the proxy — so no write/commit can flush an orphaned
-        transaction, regardless of whether the physical close succeeds. It does
-        NOT retract an operation already admitted before revocation: a reader
+        the core's connection access raises :class:`ConnectionQuarantinedError`
+        through the proxy, and so do the :class:`JournalWriter`'s ``append``,
+        ``verify_integrity`` and ``get_entries`` — so a write or commit does not
+        flush an orphaned transaction whether or not the physical close
+        succeeds. It does NOT retract an operation already admitted before revocation: a reader
         admitted just before revocation may complete its in-flight read on the
         pre-revocation connection — a possibly-stale read, never a commit.
 
@@ -3431,11 +5870,81 @@ class SqliteEngravaCore:
         real_conn = self._db
         self._db = _QuarantinedConnection(reason)  # type: ignore[assignment]  # terminal proxy: every later use must fail
         # Detached best-effort close: schedule and return; do NOT await it, so a
-        # hung close can never block quarantine (safety is already guaranteed by
-        # the proxy + token). Retain the task and consume its result via callback.
-        close_task = asyncio.get_running_loop().create_task(real_conn.close())
-        self._quarantine_close_task = close_task
-        close_task.add_done_callback(self._consume_quarantine_close)
+        # hung close does not block quarantine. Retain the task and consume its
+        # result via callback.
+        # But only schedule it if nothing has already initiated the physical
+        # close of this same real connection -- self._quarantine_close_task
+        # doubles as that shared "already in progress" marker, checked and set
+        # here with no await in between, which is what makes this race-free
+        # against a concurrent close() under cooperative scheduling: only one
+        # of the two ever wins the check.
+        if self._quarantine_close_task is None:
+            close_task = asyncio.get_running_loop().create_task(real_conn.close())
+            self._quarantine_close_task = close_task
+            close_task.add_done_callback(self._consume_quarantine_close)
+
+    async def _commit_or_recover(self) -> None:
+        """Commit the current transaction; unwind or quarantine when the commit itself fails.
+
+        Both runtime commit call sites — this one (via :meth:`_maybe_commit`)
+        and :meth:`suspend_auto_commit`'s own clean-exit commit — go through
+        this method rather than a bare ``self._db.commit()``. A ``COMMIT`` can
+        fail on its own account (most concretely: a concurrent connection
+        still holding a read lock when ``busy_timeout`` expires, reported as
+        ``SQLITE_BUSY``) while the write transaction stays open on the
+        connection — SQLite does not roll a transaction back just because its
+        ``COMMIT`` failed. Left alone, that open transaction would sit there
+        until some later, unrelated write on the *same* connection committed
+        it too, silently publishing the failed operation's changes alongside
+        its own.
+
+        On a commit failure, a rollback of the now-known-bad transaction is
+        attempted:
+
+        * If the transaction already closed on its own (``self._db.in_transaction``
+          is already ``False`` — some commit failures do end it, e.g. a
+          trigger-raised ``RAISE(ROLLBACK)`` surfacing at commit time), there is
+          nothing left to unwind and the commit failure propagates unchanged.
+        * If the rollback succeeds, the transaction is gone and the commit
+          failure propagates — nothing from this window can become durable via
+          a later commit.
+        * If the rollback *also* fails, the connection's state cannot be
+          trusted, so it is quarantined via :meth:`_quarantine_connection` —
+          mirroring :meth:`_write_readback_savepoint`'s own unwind-failure
+          handling — so every later write fails fast with
+          :class:`ConnectionQuarantinedError` instead of ever reaching a
+          commit that could flush the orphaned transaction. A cancellation
+          raised by the rollback itself always outranks the commit failure it
+          was trying to recover from, exactly as in
+          :meth:`_write_readback_savepoint`.
+
+        Not weakened, and deliberately not retried: no application-level retry
+        is added here, so a caller sees the real failure instead of it being
+        silently absorbed — ``PRAGMA busy_timeout`` has already given SQLite
+        every chance to succeed before this runs at all.
+
+        Raises:
+            BaseException: The original commit failure (chained to the
+                rollback failure, via ``__cause__``, when the rollback also
+                fails), or a cancellation raised by the rollback itself.
+
+        """
+        try:
+            await self._db.commit()
+        except BaseException as exc:
+            if not self._db.in_transaction:
+                raise
+            try:
+                await self._db.rollback()
+            except BaseException as rollback_exc:
+                await self._quarantine_connection(
+                    f"commit failed and the compensating rollback also failed: "
+                    f"{exc!r}; rollback error: {rollback_exc!r}"
+                )
+                if isinstance(rollback_exc, asyncio.CancelledError):
+                    raise
+                raise exc from rollback_exc
+            raise
 
     async def _maybe_commit(self) -> None:
         """Commit if auto-commit is not suspended.
@@ -3445,13 +5954,44 @@ class SqliteEngravaCore:
         ``_QuarantinedConnection`` proxy on ``self._db`` — even a commit that
         skipped this check would raise on ``self._db.commit()``.
 
+        The commit itself goes through :meth:`_commit_or_recover`, so a commit
+        that fails on its own account (rather than the transaction body having
+        already raised) is unwound — rolled back, or the connection quarantined
+        if the rollback also fails — instead of leaving an open transaction for
+        a later, unrelated commit on this connection to publish by accident.
+
+        **Write-lock classification: relies on every caller, not on its own
+        body.** Every one of this method's call sites is the last step of a
+        guarded write already running under ``_write_lock`` — its own
+        acquisition (``_insert_new_thought_row``, ``update_thought``,
+        ``restore_thought``, ``delete_thought``, ``create_edge``,
+        ``update_edge``, ``delete_edge``, ``store_embedding``,
+        ``record_access``, ``flush_access_buffer``, ``create_action``,
+        ``update_action``, ``cleanup_expired``, ``_insert_derived_row``,
+        ``_insert_derived_edge``, ``_ensure_embedding_model_lock``) or a named
+        caller's (``_increment_confirmation`` via ``_create_thought_with_dedup``
+        / ``get_or_create``; ``run_hygiene`` holds it directly). ``upsert_by_hash``
+        reaches this method only via ``update_thought``'s own call on its
+        matched-and-changed branch — its unchanged-match branch writes nothing
+        and does not call this method at all. This method never acquires the
+        write lock itself.
+
+        **Nested-commit suppression, task-local.** ``run_hygiene`` sets
+        :data:`_SUPPRESS_NESTED_AUTO_COMMIT` for the duration of its
+        archive+GC unit so a nested public write it makes itself
+        (``retire_orphan_reflections`` -> ``update_thought``) does not end
+        that unit early with its own commit here — see that ContextVar's
+        module-level docstring for why it is task-local rather than the
+        instance-wide :attr:`_skip_auto_commit_depth`.
+
         Raises:
-            ConnectionQuarantinedError: When the connection has been quarantined.
+            ConnectionQuarantinedError: When the connection has been quarantined
+                (already, or by this call's own failed-commit recovery).
 
         """
         self._ensure_connection_usable()
-        if not self._skip_auto_commit:
-            await self._db.commit()
+        if not self._skip_auto_commit and not _SUPPRESS_NESTED_AUTO_COMMIT.get():
+            await self._commit_or_recover()
 
     # ------------------------------------------------------------------
     # Row -> Domain mappers (template methods — override in subclasses)
@@ -3543,6 +6083,7 @@ class SqliteEngravaCore:
         return await cursor.fetchone()
 
     async def _get_edge_row(self, edge_id: str) -> aiosqlite.Row | None:
+        # Write-lock classification: not a write path at all -- a plain SELECT.
         """Fetch a raw edge row without applying transformations.
 
         Args:
@@ -3628,13 +6169,18 @@ class SqliteEngravaCore:
         )
 
     #: Guard clause every core thought UPDATE carries: the row identity plus the
-    #: ``updated_cycle`` the caller read. Nothing in the store advances that
-    #: column, so a write is rejected only when a *caller* stamped a new cycle in
-    #: between, or the row was deleted — the two cases ``rowcount == 0`` cannot
-    #: tell apart. Being on *every* update, it also rejects an edit that shares
-    #: no column with the cycle-stamping one; the public docstrings say both
-    #: rather than implying a general staleness check.
-    _CORE_UPDATE_GUARD = "thought_id = ? AND updated_cycle = ?"
+    #: ``revision`` this call read. The engine itself increments ``revision`` by
+    #: one on every guarded write (``revision = revision + 1`` in the same
+    #: statement that checks it — see :func:`_build_update_sql`'s
+    #: ``bump_column``), so a write is rejected whenever *any* other guarded
+    #: write landed since this call's own read, or the row was deleted — the two
+    #: cases ``rowcount == 0`` cannot tell apart. Being on *every* update, it
+    #: also rejects an edit that shares no column with the row-version-moving
+    #: one; the public docstrings say both rather than implying a general
+    #: staleness check. ``updated_cycle`` is not this guard's column: it is a
+    #: cognitive-recency signal nothing in this store advances on its own, and
+    #: is not safe to overload as a write counter.
+    _CORE_UPDATE_GUARD = "thought_id = ? AND revision = ?"
 
     def _thought_to_core_columns(self, thought: ThoughtRecord) -> dict[str, object]:
         """Map a ThoughtRecord to the column values an UPDATE may write.
@@ -3649,13 +6195,10 @@ class SqliteEngravaCore:
 
         Two columns are absent, for different reasons. ``thought_id``
         identifies the row being updated, so it is correctly not assignable
-        here. ``content_hash`` is a **known defect being preserved, not a
-        design choice**: no update has ever written it, so editing ``content``
-        leaves the stored hash pointing at the superseded text and content-hash
-        deduplication then matches the row on content it no longer holds.
-        Repairing it changes deduplication behaviour and belongs to a change of
-        its own; it is carried unchanged here so this rewrite stays
-        behaviour-preserving.
+        here. ``content_hash`` is not written by any update, so editing
+        ``content`` leaves the stored hash pointing at the superseded text and
+        content-hash deduplication then matches the row on content it no
+        longer holds.
 
         Args:
             thought: The thought record to encode.
@@ -3761,9 +6304,8 @@ class SqliteEngravaCore:
 
         Returns:
             The matching ``ThoughtRecord`` or ``None`` if no row
-            matches.  When more than one row shares the hash (only
-            possible for older data ingested before this fix
-            was deployed) the first match in B-tree order is returned.
+            matches.  When more than one row shares the hash the first
+            match in B-tree order is returned.
 
         """
         cursor = await self._db.execute(
@@ -3781,6 +6323,11 @@ class SqliteEngravaCore:
     ) -> ThoughtRecord:
         """Bump ``confirmation_count`` + ``updated_at`` for an existing thought.
 
+        **Write-lock classification: under the lock via callers, not its own
+        body.** Called only from ``_create_thought_with_dedup`` and
+        ``get_or_create``, both of which hold ``_write_lock`` for their whole
+        dedup window.
+
         Implements the dedup-hit branch of ``create_thought``.  The bump is
         **relative** — ``confirmation_count = confirmation_count + 1``
         evaluated by SQLite against the stored row — so a confirmation
@@ -3789,6 +6336,24 @@ class SqliteEngravaCore:
         a stale read.  ``updated_at`` is refreshed to the current UTC time.
         The row is read back so the returned record and the journal ``after``
         image carry the count that is actually stored.
+
+        **Commits once, after the journal append, not before it.**
+        ``self._journal.append()`` does not commit on its own (see its
+        docstring: the caller is responsible, via ``_maybe_commit``) — writing
+        the UPDATE, committing, and only then appending to the journal would
+        leave that append's own INSERT permanently uncommitted whenever this
+        call runs inside :meth:`_serialize_dedup_probe`'s window, since that
+        guard takes no commit responsibility of its own (see its docstring).
+        Ordering the write, the read-back and the journal append *before* the
+        single ``_maybe_commit()`` call makes this method — the thing actually
+        doing the writing — responsible for making all of it durable in one
+        step, rather than depending on a caller several frames up to notice a
+        write it cannot see.
+
+        **The write, its confirming read-back, and its journal entry are one
+        failure-atomic unit**, via :meth:`_write_readback_savepoint` — see
+        :meth:`update_thought` for what that protects against. A failed or
+        cancelled journal append here unwinds this call's own ``UPDATE`` too.
 
         Args:
             existing: The thought already in the database.
@@ -3805,28 +6370,390 @@ class SqliteEngravaCore:
         """
         now_iso = datetime.datetime.now(datetime.UTC).isoformat()
 
-        cursor = await self._db.execute(
-            "UPDATE thought SET confirmation_count = confirmation_count + 1, "
-            "updated_at = ? WHERE thought_id = ?",
-            (now_iso, existing.thought_id),
-        )
-        if cursor.rowcount == 0:
-            raise ThoughtNotFoundError(existing.thought_id)
-        await self._maybe_commit()
-
-        after = await self._read_back_thought(existing.thought_id)
-
-        if self._journal is not None:
-            await self._journal.append(
-                mutation_type="UPDATE_THOUGHT",
-                target_id=existing.thought_id,
-                delta={
-                    "before": existing.model_dump(mode="json"),
-                    "after": after.model_dump(mode="json"),
-                },
+        async with self._write_readback_savepoint("increment_confirmation", begin="IMMEDIATE"):
+            cursor = await self._db.execute(
+                "UPDATE thought SET confirmation_count = confirmation_count + 1, "
+                "updated_at = ? WHERE thought_id = ?",
+                (now_iso, existing.thought_id),
             )
+            if cursor.rowcount == 0:
+                raise ThoughtNotFoundError(existing.thought_id)
 
+            after = await self._read_back_thought(existing.thought_id)
+
+            if self._journal is not None:
+                await self._journal.append(
+                    mutation_type="UPDATE_THOUGHT",
+                    target_id=existing.thought_id,
+                    delta={
+                        "before": existing.model_dump(mode="json"),
+                        "after": after.model_dump(mode="json"),
+                    },
+                )
+
+        await self._maybe_commit()
         return after
+
+    async def _begin_dedup_write_lock(self, *, operation: str) -> None:
+        # Write-lock classification: under _write_lock via callers, not its
+        # own body -- reached only from _serialize_dedup_probe, itself only
+        # called from _create_thought_with_dedup / get_or_create /
+        # upsert_by_hash, all three of which hold _write_lock for their whole
+        # dedup window. (This method's own name coincidentally contains the
+        # substring "_write_lock" -- it does not touch that attribute; it
+        # implements the *separate*, cross-connection BEGIN IMMEDIATE lock.)
+        """Open the dedup probe-and-insert window with ``BEGIN IMMEDIATE``.
+
+        Issued in place of letting the probe's ``SELECT`` open an implicit
+        *deferred* transaction, so the write lock is acquired **before** the
+        probe runs rather than only when the eventual ``INSERT``/``UPDATE``
+        needs it. A deferred transaction lets two connections both pass the
+        probe unlocked and then discover the conflict only at the write —
+        ``SQLITE_BUSY`` mid-transaction, the classic embedded-SQLite deadlock
+        shape. Immediate mode surfaces contention at the boundary a caller can
+        actually act on: before anything has been read for this call.
+
+        ``PRAGMA busy_timeout`` already makes SQLite wait for the lock inside
+        a single ``BEGIN IMMEDIATE`` call. This adds a bounded number of
+        further attempts, with a short backoff between them, for contention
+        that outlasts that wait — and converts the final failure into
+        :class:`WriteContentionError` instead of leaking the raw
+        :class:`sqlite3.OperationalError`. An ``OperationalError`` that is
+        *not* busy/lock contention (e.g. a genuine I/O failure) is never
+        retried and propagates unchanged — retrying could not fix it, and
+        mislabelling it as contention would hide the real cause.
+
+        Args:
+            operation: Name of the calling public method, carried onto
+                :class:`WriteContentionError` for a caller that logs or
+                branches on it.
+
+        Raises:
+            WriteContentionError: The write lock could not be acquired after
+                :data:`_DEDUP_BEGIN_MAX_ATTEMPTS` attempts.
+            sqlite3.OperationalError: Some other, non-busy failure opening the
+                transaction.
+
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                await self._db.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                if not _is_busy_error(exc):
+                    raise
+                if attempt >= _DEDUP_BEGIN_MAX_ATTEMPTS:
+                    raise WriteContentionError(operation=operation, attempts=attempt) from exc
+                await asyncio.sleep(_DEDUP_BEGIN_RETRY_BASE_SECONDS * (2 ** (attempt - 1)))
+            else:
+                return
+
+    @contextlib.asynccontextmanager
+    async def _serialize_dedup_probe(self, *, operation: str) -> AsyncIterator[None]:
+        # Write-lock classification: under _write_lock via callers, not its
+        # own body -- see _begin_dedup_write_lock's note; the same three
+        # callers hold _write_lock around this method's whole window too.
+        """Take the cross-connection write lock for a probe-and-row window.
+
+        Opens ``BEGIN IMMEDIATE`` (via :meth:`_begin_dedup_write_lock`) when
+        ``not self._db.in_transaction`` — and *only* that; ``self._skip_auto_commit``
+        (set by :meth:`suspend_auto_commit`) is not consulted here. This is
+        what protects :meth:`bulk_store` too: its insert loop runs entirely
+        inside one ``suspend_auto_commit`` window, so ``_skip_auto_commit`` is
+        ``True`` for every row, but only the *first* row that reaches this
+        method finds ``in_transaction`` still ``False`` — that row opens the
+        lock up front, before its own hash probe runs, closing the same
+        probe-then-insert race on the bulk path. Every later row in the same
+        batch sees ``in_transaction`` already ``True`` and correctly takes no
+        further lock of its own — it is already covered by the one still open.
+
+        **This method commits nothing, on any path.** Whoever
+        actually does the write — :meth:`_insert_new_thought_row`,
+        :meth:`_increment_confirmation`, :meth:`update_thought` (via
+        ``upsert_by_hash``'s matched-row path) — commits its own work, in the
+        same call, after everything that call itself needs durable (including
+        its own journal append — see each of those methods for why the
+        ordering matters there). This method never decides that on their
+        behalf. The no-op branch of ``upsert_by_hash`` writes nothing despite
+        having opened this lock, and correspondingly commits nothing — but it
+        does not leave the window open either: see
+        :meth:`_end_exploratory_probe`, which that branch calls to roll back
+        its own, still-empty transaction (never a caller's) before returning.
+
+        **A rollback is kept, for the exception path only**, gated on having
+        taken the lock, on ``self._db.in_transaction`` being ``True`` at that
+        point, and on ``self._skip_auto_commit`` being ``False`` (inside a
+        ``suspend_auto_commit`` window, that caller's own block owns the
+        rollback decision, exactly as it owns the commit decision on the
+        normal path). Cancellation is caught alongside every other exception
+        (``except BaseException``, not ``except Exception``):
+        :class:`asyncio.CancelledError` derives from ``BaseException``, and
+        without catching it here a cancellation landing while this call still
+        holds an open transaction would strand the RESERVED lock —
+        ``in_transaction`` stuck ``True`` — blocking every other writer on the
+        connection until something else eventually commits, rolls back, or
+        closes it.
+
+        **This rollback does not discard another task's guarded write.** A
+        connection has exactly one transaction, so a rollback here would take
+        down any other task's write that had joined it. Every caller of this
+        method (:meth:`_create_thought_with_dedup`, :meth:`get_or_create`,
+        :meth:`upsert_by_hash`) holds :attr:`_write_lock` — the same
+        task-reentrant lock every other guarded write path on this instance
+        holds — for the whole probe-and-row window, so a different task cannot
+        take that lock until this window has closed. See
+        ``docs/concurrency.md`` ("What is guaranteed" under "Many async
+        tasks, one store") for the caller-facing statement.
+
+        **Known residual gap.** If a caller already holds an open transaction
+        on this connection through means this store does not control — a raw
+        ``BEGIN`` issued directly against it, with nothing written yet —
+        ``self._db.in_transaction`` is already
+        ``True`` when this method is entered, so no ``BEGIN IMMEDIATE`` is
+        taken: SQLite refuses a ``BEGIN`` inside an already-open transaction,
+        so there is no way to acquire the *cross-connection* write lock up
+        front in that case. The window then falls back to whatever atomicity
+        the caller's own transaction provides — it still gets the in-process
+        :attr:`_write_lock` and ``_dedup_lock`` (the caller of this method
+        holds both already), so a *different task on this instance* still
+        cannot land inside the window; only the cross-connection ordering is
+        unavailable here. This is not something ``bulk_store`` or
+        ``suspend_auto_commit`` trigger (neither issues a bare ``BEGIN`` with
+        no write): it can only happen through direct, unmediated use of the
+        underlying connection, which is outside what this store manages.
+
+        Args:
+            operation: Forwarded to :meth:`_begin_dedup_write_lock` for
+                :class:`WriteContentionError`.
+
+        Yields:
+            None — the probe-and-row body runs inside the method and is
+            responsible for committing its own write, if any.
+
+        """
+        took_lock = not self._db.in_transaction
+        try:
+            if took_lock:
+                await self._begin_dedup_write_lock(operation=operation)
+            yield
+        except BaseException:
+            if self._connection_quarantined:
+                # The dedup write inside this window (e.g. _insert_new_thought_row,
+                # _increment_confirmation) already quarantined the connection
+                # while unwinding its own unit and left `self._db` a terminal
+                # proxy — touching it again here would replace the in-flight
+                # exception with ConnectionQuarantinedError instead of letting
+                # it propagate. See _write_readback_savepoint for the same guard.
+                raise
+            if took_lock and not self._skip_auto_commit and self._db.in_transaction:
+                await self._db.rollback()
+            raise
+
+    async def _end_exploratory_probe(self, *, opened_transaction: bool) -> None:
+        """Close a probe's own transaction without touching a caller's.
+
+        Two callers reach this, and both leave a read-only ``BEGIN IMMEDIATE``
+        that nothing else would close:
+
+        * the miss branch of :meth:`get_or_create` / :meth:`upsert_by_hash`'s
+          **exploratory** probe — the first of their two-phase miss path (see
+          either method's docstring) — before the preparation seam runs; and
+        * :meth:`upsert_by_hash`'s no-change branch, where a matched row whose
+          mutable fields already equal the incoming record's writes nothing at
+          all: no ``UPDATE``, no journal entry.
+
+        Both call it from *inside* the ``async with self._write_lock,
+        self._dedup_lock:`` block, so both locks are still held while this
+        runs; they release only afterward, when that block exits following
+        this call's return. What this closes is the cross-connection
+        ``BEGIN IMMEDIATE`` :meth:`_serialize_dedup_probe` may have opened,
+        which nothing else would ever close — those paths only read, so the
+        "whoever writes, commits" rule that normally ends this window (see
+        :meth:`_serialize_dedup_probe`) never fires on them.
+
+        **Ownership test: `opened_transaction` alone.** It is computed by the
+        caller as ``not self._db.in_transaction``, read *before* this probe's
+        own window began — so when it is ``True``, no transaction of any
+        kind, the caller's or anyone else's, was open at that point, and the
+        ``BEGIN IMMEDIATE`` that may now be open can only be the one this
+        probe itself opened. There is nothing ambiguous left to protect, so
+        no test on ``self._skip_auto_commit`` (whether this call happens to
+        be nested inside a caller's own :meth:`suspend_auto_commit` window)
+        is made: "nested" does not imply "someone else's transaction" — a
+        caller's window can be open with *nothing yet written to it* (e.g.
+        before its first guarded write), in which case ``opened_transaction``
+        is still ``True`` and the transaction is still this probe's own.
+        When ``opened_transaction`` is ``False`` instead
+        (a transaction was already open before this probe began — e.g. this
+        call is itself nested inside the *same* task's own
+        :meth:`suspend_auto_commit` window, where an earlier guarded write
+        already opened one), the still-open transaction is
+        unambiguously the *caller's*: rolling it back would discard writes
+        this call knows nothing about, and committing it early would end the
+        batch's atomicity mid-flight — that case is excluded by
+        ``opened_transaction`` on its own, with no need for a second test.
+
+        Always a rollback, never a commit, when it does act: the probe only
+        read, so there is nothing of its own to make durable — rollback is
+        also what :meth:`_serialize_dedup_probe`'s own exception path uses to
+        end an aborted probe.
+
+        Args:
+            opened_transaction: Whether *this* call's own window opened the
+                ``BEGIN IMMEDIATE`` that may still be open. Computed by the
+                caller as ``not self._db.in_transaction``, read at the same
+                point in the call — immediately after acquiring
+                ``_write_lock`` and ``_dedup_lock``, before entering
+                :meth:`_serialize_dedup_probe` — that method reads it for its
+                own ``took_lock``, so the two can never disagree.
+
+        """
+        if opened_transaction and self._db.in_transaction:
+            await self._db.rollback()
+
+    async def prepare_thought_for_insert(self, thought: ThoughtRecord) -> ThoughtRecord:
+        """Override point: prepare or validate a candidate before it is stored.
+
+        **The pre-insert seam**: override this in a subclass to run
+        validation or persisted enrichment on every candidate that might
+        become a new row, before this store commits to inserting it or treats
+        it as a duplicate sighting. The default implementation is a
+        pass-through that returns ``thought`` unchanged.
+
+        This exists because ``on_store`` cannot fill this role — it runs
+        *after* the row is written, so a rejection there does not stop the
+        write unless the exception leaves an enclosing ``suspend_auto_commit()``
+        window and rolls it back, and an enrichment there reaches the caller's
+        returned record but never the stored one. Overriding
+        ``create_thought`` itself does not cover ``get_or_create`` /
+        ``upsert_by_hash``, whose miss branch calls the internal insertion
+        step directly instead of the public, overridable method. This seam is
+        the uniform override point for all of them.
+
+        **Invocation count — pinned per entry point, not "once per row":**
+
+        * :meth:`create_thought` — once per call that passes its initial
+          metadata and provenance validation, *before* the dedup branch:
+          whether the call goes on to insert, to bump
+          an existing row's ``confirmation_count`` (``deduplicate=True`` hit),
+          or (``deduplicate=False``) always inserts. A direct call has no way
+          to know in advance which of those it will be, so it runs once
+          either way.
+        * :meth:`get_or_create` / :meth:`upsert_by_hash` — **zero** times on a
+          stable, pre-existing hit (their exploratory probe resolves the call
+          before this method is ever reached — an idempotent "ensure it
+          exists" call that turns out to be a hit costs nothing extra), and
+          **once** when the call reaches this method after a miss. That
+          includes the race where a second writer wins between the
+          exploratory probe and the mandatory decisive re-probe, turning the
+          miss into a hit: the seam already ran once for this call and does
+          not run again just because the outcome changed underneath it.
+        * :meth:`bulk_store` — once per item, in input order until one call
+          raises, run for the *whole batch*, holding no lock this call itself
+          acquires, before ``bulk_store`` takes any lock for its insert
+          transaction — not "through" a per-item :meth:`create_thought` call
+          the way the other counts might suggest. A dedup hit inside the
+          batch still costs one seam call, the same "still runs once" rule
+          a direct call follows.
+        * :meth:`remember` — through its own :meth:`create_thought` call, so the
+          :meth:`create_thought` count above applies.
+
+        **Never one this call itself acquires — on any entry point — but not
+        "never any lock at all".** Neither ``_dedup_lock`` nor ``_write_lock``
+        nor a ``BEGIN IMMEDIATE`` this call's own dedup machinery opened is
+        held while this method is awaited. :meth:`create_thought` calls this
+        before taking any lock at all; :meth:`get_or_create` /
+        :meth:`upsert_by_hash` release ``_write_lock``, ``_dedup_lock``, and
+        (via :meth:`_end_exploratory_probe`) their own ``BEGIN IMMEDIATE``
+        *before* calling this, and only reacquire everything afterward, from
+        scratch, for the decisive probe. This is deliberate: a call to the
+        public ``create_thought()`` from *inside* an already-locked dedup
+        window would run auto-embed, cleanup, ``on_store`` and derivation
+        while still holding ``_dedup_lock`` — a plain lock with no
+        legitimate reentrant use — so a hook that calls back into a dedup
+        entry point on the *same task* would raise
+        :class:`~engrava.domain.exceptions.DedupLockReentryError` rather
+        than blocking on it. This call's own machinery does not hold
+        ``_dedup_lock`` while it awaits this seam, so a recursive call *from
+        inside this method* does not contend for a ``_dedup_lock`` this call
+        took. The same lock's reentry guard exists for a different call site:
+        ``upsert_by_hash``'s hit branch (see ``docs/extension-hooks.md`` §1B.3)
+        calls the separately overridable ``update_thought`` while still
+        holding ``_dedup_lock``,
+        and an override of that method which recurses into a dedup entry
+        point on the same task raises ``DedupLockReentryError``.
+
+        **That is a statement about locks this call itself takes, not about
+        every lock that can be held while it runs.** If you call
+        :meth:`create_thought` / :meth:`get_or_create` / :meth:`upsert_by_hash`
+        / :meth:`bulk_store` from *inside your own*
+        :meth:`suspend_auto_commit` window, that window's ``_write_lock`` is
+        still held while this seam runs underneath it — it is *your* lock,
+        acquired before you ever reached this call, not one this call took
+        for itself. A plain in-process ``asyncio.Lock`` cannot distinguish
+        "the caller's own reentrant hold" from "a lock this call should
+        release", so a pre-insert override cannot close this on its own; it
+        is not new either — it applies identically to a raw
+        :meth:`create_thought` call inside your own
+        :meth:`suspend_auto_commit` block, seam or no seam.
+
+        **One residual exposure this does not close, because it is out of
+        this seam's scope: a *different, spawned* task calling back in from
+        inside a caller's own** :meth:`suspend_auto_commit` **window** (for
+        example, from inside an override invoked by ``bulk_store``'s insert
+        loop). That window's pre-existing contract already requires every
+        guarded write on the instance to come from the one task that opened
+        it; a spawned task's write times out on ``_write_lock`` there exactly
+        as it would for any other code violating that same contract — not a
+        new gap this seam introduces, and not one a pre-insert hook could
+        close without breaking that contract's own atomicity guarantee.
+
+        **The returned record is revalidated, and its content is decisive.**
+        The caller re-runs metadata and provenance validation on whatever this
+        method returns (not just the original candidate) — so an override that
+        introduces invalid ``metadata`` or ``provenance`` makes the call raise
+        here, before the decisive probe or any row write (for
+        :meth:`get_or_create` / :meth:`upsert_by_hash`, this revalidation runs
+        *after* their own exploratory probe already came up empty, not before
+        any probe at all). For :meth:`get_or_create`
+        and :meth:`upsert_by_hash`, the *returned* record's ``content`` — not
+        the original candidate's — supplies the hash for the decisive probe
+        that follows, so an override that changes ``content`` changes what
+        counts as a duplicate for this call.
+
+        **Raising aborts the create.** This call inserts no row and appends no
+        journal entry: the seam runs before either.
+
+        **Out of the ``revision`` contract, on the path where it matters
+        most.** This seam postdates the revision guard's design and is not
+        part of it. On :meth:`bulk_store`'s path in particular, this call runs
+        for the whole batch *before* ``bulk_store`` takes its own write lock
+        (see the invocation-count note above) — so a subclass override that
+        persists a write of its own here does so before that lock is taken. A
+        write it makes straight on the connection is a mutation this store
+        neither guards nor bumps; treat it as unmediated use of the
+        connection, in the same sense the concurrency documentation uses that
+        phrase for a caller's own raw transaction.
+
+        Args:
+            thought: The candidate record, already validated (metadata,
+                provenance) in its pre-seam form — on every entry point
+                *except* :meth:`bulk_store`, which runs this call, batch-wide,
+                before its own per-item validation (see
+                :meth:`_bulk_store_inner`'s docstring for why); a
+                ``bulk_store`` override sees whatever was passed to it,
+                unvalidated. Its ``created_at`` / ``updated_at`` /
+                ``expires_at`` are not yet resolved — that happens
+                afterward, in :meth:`_insert_new_thought_row`, only if this
+                call ends up inserting.
+
+        Returns:
+            The record to use from here on for the probe and (on a miss) the
+            insert. The default implementation returns ``thought`` unchanged.
+
+        """
+        return thought
 
     async def _create_thought_with_dedup(
         self,
@@ -3836,29 +6763,85 @@ class SqliteEngravaCore:
     ) -> ThoughtRecord:
         """Lock-protected dedup branch of ``create_thought``.
 
+        Called only after the pre-insert seam has already run on ``thought``
+        — via :meth:`_prepare_for_create` for a direct :meth:`create_thought`
+        call, or via :meth:`_bulk_store_inner`'s own batch-wide phase 1 for a
+        ``bulk_store(deduplicate=True)`` item reaching this through
+        :meth:`_create_thought_from_prepared` — unlike :meth:`get_or_create` /
+        :meth:`upsert_by_hash`, this branch takes no two-phase detour of its
+        own: the seam already ran before this method was ever entered,
+        whichever of the hit/miss branches below it resolves to.
+
         Acquires ``self._dedup_lock`` for the entire ``check existing
         → INSERT or UPDATE`` window so concurrent calls **on this store
         instance** with identical ``content`` never race past the existence
-        probe.  The lock stops at that boundary: a second store on the same
-        database file can insert between this call's probe and its insert, so
-        deduplication is an in-instance guarantee only.  When the content has
-        not been seen the call delegates back to
-        ``create_thought(..., deduplicate=False)`` so the regular
-        insert / journal / auto-embed pipeline runs unchanged; when it
-        has been seen ``confirmation_count`` is bumped and the existing
-        record returned without any additional INSERT.
+        probe, and additionally serialises that same window across
+        *connections* with :meth:`_serialize_dedup_probe` (``BEGIN
+        IMMEDIATE``), so a second store on the same database file cannot
+        insert between this call's probe and its insert — see that
+        method's docstring for its one residual gap (a caller
+        holding a raw, unmediated transaction on the connection). The other
+        exposure that docstring describes — a different task's write joining
+        this call's transaction — is closed here by :attr:`_write_lock`
+        (below). On a miss, the row is inserted
+        directly via
+        :meth:`_insert_new_thought_row` (not by recursing into
+        ``create_thought``) so only the probe and the insert run inside the
+        window; when the content has been seen, ``confirmation_count`` is
+        bumped and the existing record returned without any additional
+        INSERT.
+
+        **The write lock is released, and the row made durable, before
+        auto-embed / ``on_store`` run — unless this call is itself nested in
+        the caller's own** :meth:`suspend_auto_commit` **window.** On a miss,
+        only the probe and the row insert happen inside
+        :meth:`_serialize_dedup_probe`'s window; :meth:`_insert_new_thought_row`
+        calls :meth:`_maybe_commit`, which — at the top level — ends the
+        ``BEGIN IMMEDIATE`` transaction there and then, so
+        :meth:`_finish_create_thought` (auto-embed, hygiene cleanup,
+        ``on_store``, derivation dispatch) runs *after* the ``async with``
+        block has already exited, with the row already durable and no
+        transaction or write lock left open — so a slow or hanging embedding
+        call cannot stall every other writer on the file. Nested inside the
+        caller's own :meth:`suspend_auto_commit` window, :meth:`_maybe_commit`
+        is a no-op by design (the caller owns the commit boundary), so the
+        row is *not yet durable* and :meth:`_finish_create_thought` runs
+        while the outer transaction — and, below, the outer ``_write_lock``
+        hold — are still open: an ``on_store`` override reached this way must
+        not assume the row survives a crash yet, and a slow follow-up step
+        can block other writers for that whole extra span (see
+        ``docs/concurrency.md``'s nesting note for the general rule this is
+        an instance of).
+
+        **Also under the in-process task-reentrant write lock, at the top
+        level:** the probe-then-insert/bump window is held under
+        :attr:`_write_lock` in
+        addition to ``_dedup_lock`` — the latter blocks a *second* call to one
+        of the three dedup methods, the former blocks *every* other guarded
+        write on this instance, closing the exposure
+        :meth:`_serialize_dedup_probe` describes (a different task's write
+        joining this call's transaction): that other task's write cannot even
+        start until this window's lock is released. Released before
+        :meth:`_finish_create_thought`, except when this call is nested in the
+        caller's own :meth:`suspend_auto_commit` window, where ``_write_lock``
+        is task-reentrant and the outer hold never actually drops, so it stays
+        held through :meth:`_finish_create_thought` too.
         """
-        async with self._dedup_lock:
+        async with (
+            self._write_lock,
+            self._dedup_lock,
+            self._serialize_dedup_probe(operation="create_thought"),
+        ):
             existing = await self._get_thought_by_content_hash(
                 _compute_content_hash(thought.content),
             )
             if existing is not None:
                 return await self._increment_confirmation(existing)
-            return await self.create_thought(
+            persisted = await self._insert_new_thought_row(
                 thought,
                 expires_after_seconds=expires_after_seconds,
-                deduplicate=False,
             )
+        return await self._finish_create_thought(persisted)
 
     async def create_thought(
         self,
@@ -3867,6 +6850,10 @@ class SqliteEngravaCore:
         expires_after_seconds: int | None = None,
         deduplicate: bool = False,
     ) -> ThoughtRecord:
+        # Write-lock classification: under _write_lock via callees, not its
+        # own body -- the dedup branch delegates to _create_thought_with_dedup
+        # (holds it) and the plain-insert branch to _insert_new_thought_row
+        # (holds it); this method does no SQL of its own.
         """Persist a new thought record.
 
         Automatically sets ``created_at`` and ``updated_at`` to the
@@ -3925,58 +6912,235 @@ class SqliteEngravaCore:
                 thought that was then deleted before its ``confirmation_count``
                 could be bumped — the sighting was not recorded, so no record
                 is returned for it.
+            WriteContentionError: When ``deduplicate=True`` and the
+                cross-connection write lock could not be acquired after
+                retrying (see :meth:`_begin_dedup_write_lock`).
             ConnectionQuarantinedError: When the connection has been quarantined.
+
+        """
+        # Pre-insert seam, then insert/dedup -- split into two helpers so
+        # bulk_store can run every item's seam call holding no lock this
+        # call itself acquires, for the whole batch, before taking
+        # _write_lock for its one insert transaction
+        # (see _prepare_for_create / _create_thought_from_prepared). A direct
+        # call here just runs both halves back to back.
+        thought = await self._prepare_for_create(thought)
+        return await self._create_thought_from_prepared(
+            thought,
+            expires_after_seconds=expires_after_seconds,
+            deduplicate=deduplicate,
+        )
+
+    async def _prepare_for_create(self, thought: ThoughtRecord) -> ThoughtRecord:
+        """Pre-seam validation, the seam itself, and its revalidation.
+
+        The first of :meth:`create_thought`'s two halves (see
+        :meth:`_create_thought_from_prepared` for the second): validates the
+        candidate, runs :meth:`prepare_thought_for_insert` on it — once,
+        after that validation and before the dedup branch, since a
+        direct call cannot know in advance whether it will hit or miss — and
+        revalidates whatever the seam returns. **Not called by**
+        :meth:`_bulk_store_inner`: that method calls
+        :meth:`prepare_thought_for_insert` directly, batch-wide, holding no
+        lock this call itself acquires, and runs ordinary validation
+        separately, per item, in its own insert phase — see its docstring for
+        why bundling this helper's validate-seam-revalidate sequence across
+        the whole batch would let a later item's validation failure pre-empt
+        an earlier item's own outcome. See
+        :meth:`prepare_thought_for_insert`'s docstring for the full
+        per-entry-point invocation-count contract.
+
+        Args:
+            thought: The candidate record to validate and run through the
+                seam.
+
+        Returns:
+            The prepared, revalidated record — ready for
+            :meth:`_create_thought_from_prepared`.
 
         """
         self._ensure_connection_usable()
         _validate_metadata(thought.metadata)
         _validate_provenance(thought.provenance)
 
+        thought = await self.prepare_thought_for_insert(thought)
+        _validate_metadata(thought.metadata)
+        _validate_provenance(thought.provenance)
+        return thought
+
+    async def _create_thought_from_prepared(
+        self,
+        thought: ThoughtRecord,
+        *,
+        expires_after_seconds: int | None,
+        deduplicate: bool,
+    ) -> ThoughtRecord:
+        """Insert (or dedup-resolve) a record the seam has already run on.
+
+        The second of :meth:`create_thought`'s two halves (see
+        :meth:`_prepare_for_create` for the first). Must never call
+        :meth:`prepare_thought_for_insert` itself: :meth:`_bulk_store_inner`
+        also calls this method directly, per item, once its own per-item
+        validation has run — not through :meth:`_prepare_for_create`, which
+        it never calls (see that method's docstring); the seam already ran,
+        holding no lock this call itself acquires, over the whole batch in
+        :meth:`_bulk_store_inner`'s own
+        phase 1. Either caller relies on this method not running the seam a
+        second time for an already-prepared item.
+
+        Args:
+            thought: An already-prepared, already-(re)validated record — for
+                a direct :meth:`create_thought` call, the value
+                :meth:`_prepare_for_create` returned; for a
+                :meth:`_bulk_store_inner` item, the seam's output, validated
+                inline by that method's own per-item loop instead.
+            expires_after_seconds: Forwarded to :meth:`_insert_new_thought_row`.
+            deduplicate: Forwarded to :meth:`_create_thought_with_dedup`.
+
+        Returns:
+            The persisted record, or the existing record on a dedup hit.
+
+        """
         if deduplicate:
             return await self._create_thought_with_dedup(
                 thought,
                 expires_after_seconds=expires_after_seconds,
             )
 
-        existing_row = await self._get_thought_row(thought.thought_id)
-        if existing_row is not None:
-            msg = f"Thought already exists: {thought.thought_id}"
-            raise ValueError(msg)
+        persisted = await self._insert_new_thought_row(
+            thought,
+            expires_after_seconds=expires_after_seconds,
+        )
+        return await self._finish_create_thought(persisted)
 
-        now = datetime.datetime.now(datetime.UTC)
-        now_iso = now.isoformat()
-        updates: dict[str, object] = {}
-        if thought.created_at is None:
-            updates["created_at"] = now_iso
-        if thought.updated_at is None:
-            updates["updated_at"] = now_iso
+    async def _insert_new_thought_row(
+        self,
+        thought: ThoughtRecord,
+        *,
+        expires_after_seconds: int | None,
+    ) -> ThoughtRecord:
+        """Insert-only half of ``create_thought``: row, journal, commit.
 
-        # Resolve expiry: explicit param > thought field > store default.
-        if expires_after_seconds is not None:
-            updates["expires_at"] = (
-                now + datetime.timedelta(seconds=expires_after_seconds)
-            ).isoformat()
-        elif thought.expires_at is None and self._ttl_default_seconds is not None:
-            updates["expires_at"] = (
-                now + datetime.timedelta(seconds=self._ttl_default_seconds)
-            ).isoformat()
+        Split out of ``create_thought`` so the dedup entry points
+        (:meth:`_create_thought_with_dedup`, :meth:`get_or_create`,
+        :meth:`upsert_by_hash`) can run **only this** inside
+        :meth:`_serialize_dedup_probe`'s ``BEGIN IMMEDIATE`` window, and run
+        :meth:`_finish_create_thought` (auto-embed, cleanup, ``on_store``,
+        derivation) afterwards, outside it. This method's own
+        :meth:`_maybe_commit` call is what ends that window on the normal
+        path — deliberately before any of the slower, I/O-bound follow-up work
+        the split keeps out of it. The journal append runs *before* that
+        commit, not after: :meth:`_serialize_dedup_probe` takes no commit
+        responsibility of its own, so whoever writes here is the one that
+        must make the journal entry durable too.
 
-        if updates:
-            thought = type(thought).model_validate(
-                {**thought.model_dump(), **updates},
-            )
+        The existence check, the insert, and the commit run under
+        :attr:`_write_lock`: a different task's guarded write
+        cannot land between the existence probe and the insert, or between the
+        insert and its commit.
 
-        await self._db.execute(self._CORE_INSERT_SQL, self._thought_to_core_params(thought))
+        **The insert and its journal entry are one failure-atomic unit**, via
+        :meth:`_write_readback_savepoint` — see :meth:`update_thought` for what
+        that protects against. A failed or cancelled journal append here
+        unwinds the insert too, rather than leaving it pending for a later,
+        unrelated commit to publish without the journal entry that documents
+        it.
 
-        if self._journal is not None:
-            await self._journal.append(
-                mutation_type="INSERT_THOUGHT",
-                target_id=thought.thought_id,
-                delta={"before": None, "after": thought.model_dump(mode="json")},
-            )
+        Args:
+            thought: The thought record to create.
+            expires_after_seconds: Optional relative TTL in seconds; overrides
+                the store-level default when given.
 
-        await self._maybe_commit()
+        Returns:
+            The persisted thought record, with timestamps and expiry resolved
+            — the value the create paths pass on to
+            :meth:`_finish_create_thought`.
 
+        Raises:
+            ValueError: If a thought with the same ID already exists.
+
+        """
+        self._ensure_connection_usable()
+        async with self._write_lock:
+            existing_row = await self._get_thought_row(thought.thought_id)
+            if existing_row is not None:
+                msg = f"Thought already exists: {thought.thought_id}"
+                raise ValueError(msg)
+
+            now = datetime.datetime.now(datetime.UTC)
+            now_iso = now.isoformat()
+            updates: dict[str, object] = {}
+            if thought.created_at is None:
+                updates["created_at"] = now_iso
+            if thought.updated_at is None:
+                updates["updated_at"] = now_iso
+
+            # Resolve expiry: explicit param > thought field > store default.
+            if expires_after_seconds is not None:
+                updates["expires_at"] = (
+                    now + datetime.timedelta(seconds=expires_after_seconds)
+                ).isoformat()
+            elif thought.expires_at is None and self._ttl_default_seconds is not None:
+                updates["expires_at"] = (
+                    now + datetime.timedelta(seconds=self._ttl_default_seconds)
+                ).isoformat()
+
+            if updates:
+                thought = type(thought).model_validate(
+                    {**thought.model_dump(), **updates},
+                )
+
+            async with self._write_readback_savepoint("insert_new_thought_row", begin="IMMEDIATE"):
+                await self._db.execute(self._CORE_INSERT_SQL, self._thought_to_core_params(thought))
+
+                if self._journal is not None:
+                    await self._journal.append(
+                        mutation_type="INSERT_THOUGHT",
+                        target_id=thought.thought_id,
+                        delta={"before": None, "after": thought.model_dump(mode="json")},
+                    )
+
+            await self._maybe_commit()
+        return thought
+
+    async def _finish_create_thought(self, thought: ThoughtRecord) -> ThoughtRecord:
+        """Follow-up half of ``create_thought``: auto-embed through derivation.
+
+        Runs everything ``create_thought`` does *after* the row is inserted:
+        auto-embed, hygiene cleanup, the ``on_store`` hook and derived-record
+        dispatch. Split out so the dedup entry points can call it once
+        :meth:`_serialize_dedup_probe`'s window has already closed — see
+        :meth:`_insert_new_thought_row`.
+
+        **"Post-commit" only at the top level.** :meth:`_insert_new_thought_row`
+        calls :meth:`_maybe_commit`, which actually commits — making
+        ``thought`` durable before this method ever runs — only when this
+        call is not itself nested inside the caller's own
+        :meth:`suspend_auto_commit` window. Nested, ``_maybe_commit`` is a
+        no-op by design (the caller owns the commit boundary), so this
+        method runs on a row that is inserted but not yet durable, inside
+        the outer transaction, and — because ``_write_lock`` is
+        task-reentrant — still under the outer window's hold of it too. Two
+        consequences follow for an override reached from here: an
+        ``on_store`` implementation must not assume the row survives a
+        crash yet in that case, and a slow or hanging step (an embedding
+        provider call, a derived-records producer) can block a *different*
+        task's guarded write for this whole extra span, not just for the
+        insert itself. :meth:`bulk_store` is a second, by-design instance of
+        the same shape: it calls this method from *inside* its own batch
+        transaction deliberately, so its auto-embed and derivation dispatch
+        also run before that batch commits (see its own docstring). See
+        ``docs/concurrency.md``'s nesting note for the general rule this is
+        one instance of.
+
+        Args:
+            thought: The just-inserted, but not necessarily yet durable,
+                thought record, as returned by :meth:`_insert_new_thought_row`.
+
+        Returns:
+            The enriched record returned by the ``on_store`` hook.
+
+        """
         # Auto-embed when a provider is configured and auto_embed is on.
         # ``_suppress_auto_embed`` lets ``bulk_store`` defer embedding to a
         # single batch call after the insert loop without changing this path
@@ -4015,20 +7179,48 @@ class SqliteEngravaCore:
         A thin convenience over the existing content-hash deduplication that
         removes the check-then-create round trip (and its TOCTOU window)
         callers otherwise write by hand. That window is closed against other
-        callers of **this store instance**, which is where the deduplication
-        lock lives; a second store on the same database file is outside it and
-        can still insert the same content. The content hash is the same
-        byte-exact SHA-256 of ``content`` used by
+        callers of **this store instance** by the in-process deduplication
+        lock, and additionally against a second store on the same database
+        file by ``BEGIN IMMEDIATE`` around the probe and the row insert (see
+        :meth:`_serialize_dedup_probe`) — see that method's docstring for its
+        one remaining residual gap (a caller holding a raw, unmediated
+        transaction on this connection). The other gap that docstring
+        documents — a genuinely concurrent, unrelated task's write riding
+        along with this call's own commit — cannot happen here either: this
+        call holds ``_write_lock`` for the same probe-and-row window (see
+        :meth:`_create_thought_with_dedup`'s docstring for why that closes
+        it). At the top level, the write lock is released as
+        soon as the row is written, before auto-embed or the ``on_store`` hook
+        run; nested in the caller's own :meth:`suspend_auto_commit` window,
+        that hold stays through the follow-up work instead — see
+        :meth:`_insert_new_thought_row` / :meth:`_finish_create_thought`'s
+        docstring for both cases.
+        The content hash is the same byte-exact SHA-256 of ``content`` used by
         ``create_thought(deduplicate=True)``:
 
         * **Hit** — a thought with that hash already exists: it is returned
           with ``created=False``. No new row is inserted; its
           ``confirmation_count`` is bumped and ``updated_at`` refreshed,
           identical to ``create_thought(deduplicate=True)`` so the two APIs
-          stay consistent.
-        * **Miss** — no such thought exists: it is inserted (running the
-          regular journal / auto-embed / cleanup pipeline) and returned with
-          ``created=True``.
+          stay consistent. **The pre-insert seam
+          (:meth:`prepare_thought_for_insert`) does not run on this branch**
+          — a stable hit costs zero seam calls.
+        * **Miss** — no such thought exists: a **two-phase** path runs from
+          here. The exploratory probe above found nothing, so this call
+          releases ``_write_lock``, ``_dedup_lock`` and any ``BEGIN IMMEDIATE``
+          it opened for that probe, then calls
+          :meth:`prepare_thought_for_insert` — holding no lock this call
+          itself acquires (a lock an *enclosing* caller took is a different
+          matter; see :meth:`prepare_thought_for_insert`'s own docstring) —
+          and
+          revalidates what it returns. It then **reacquires** everything for a
+          **decisive** probe keyed on the *prepared* record's content: if that
+          still misses, the row is inserted (running the regular journal /
+          auto-embed / cleanup pipeline) and returned with ``created=True``;
+          if a second writer won the race in between, this call takes the hit
+          branch instead — the seam already ran for this call. See
+          :meth:`prepare_thought_for_insert` for why the seam runs holding no
+          lock this call itself acquires, on either probe.
 
         The returned boolean is the value ``create_thought(deduplicate=True)``
         cannot give back: it tells the caller *whether it created*, so an
@@ -4040,9 +7232,10 @@ class SqliteEngravaCore:
         when a match should adopt the incoming record's fields.
 
         Args:
-            thought: The candidate thought. On a miss it is inserted verbatim
-                (with timestamps populated); on a hit only its ``content`` was
-                used, via the hash.
+            thought: The candidate thought. On a miss it is passed through
+                :meth:`prepare_thought_for_insert` and inserted verbatim (with
+                timestamps populated); on a hit only its ``content`` was used,
+                via the hash.
             expires_after_seconds: Optional relative TTL applied only when the
                 thought is created (a hit never re-arms TTL). Mirrors
                 ``create_thought``'s parameter.
@@ -4055,10 +7248,14 @@ class SqliteEngravaCore:
             ValueError: If ``thought.metadata`` violates the metadata-shape or
                 size invariants (validated up front on both the hit and miss
                 paths, matching ``create_thought(deduplicate=True)`` which
-                validates before it branches).
+                validates before it branches) — or if
+                :meth:`prepare_thought_for_insert` returns a record that
+                fails that same revalidation on a miss.
             ThoughtNotFoundError: If a matched thought was deleted before its
                 ``confirmation_count`` could be bumped — the sighting was not
                 recorded, so no record is returned for it.
+            WriteContentionError: The cross-connection write lock could not be
+                acquired after retrying (see :meth:`_begin_dedup_write_lock`).
             ConnectionQuarantinedError: When the connection has been quarantined.
 
         """
@@ -4069,22 +7266,57 @@ class SqliteEngravaCore:
         # re-validates on the miss/insert path; that is cheap and harmless.
         _validate_metadata(thought.metadata)
         _validate_provenance(thought.provenance)
-        async with self._dedup_lock:
+
+        # Phase 1 -- exploratory probe: a stable hit resolves right here, at
+        # zero seam calls, and never reaches phase 2 below.
+        async with self._write_lock, self._dedup_lock:
+            opened_transaction = not self._db.in_transaction
+            async with self._serialize_dedup_probe(operation="get_or_create"):
+                existing = await self._get_thought_by_content_hash(
+                    _compute_content_hash(thought.content),
+                )
+                if existing is not None:
+                    return await self._increment_confirmation(existing), False
+                await self._end_exploratory_probe(opened_transaction=opened_transaction)
+        # _write_lock, _dedup_lock and any BEGIN IMMEDIATE this call's own
+        # probe opened are all released above -- the seam below runs holding
+        # no lock this call itself acquires (an enclosing caller's own lock
+        # is a different matter -- see prepare_thought_for_insert's docstring).
+
+        thought = await self.prepare_thought_for_insert(thought)
+        _validate_metadata(thought.metadata)
+        _validate_provenance(thought.provenance)
+
+        # Phase 2 -- decisive probe: reacquired from scratch, keyed on the
+        # prepared record's content. Insert only if this still misses.
+        async with (
+            self._write_lock,
+            self._dedup_lock,
+            self._serialize_dedup_probe(operation="get_or_create"),
+        ):
             existing = await self._get_thought_by_content_hash(
                 _compute_content_hash(thought.content),
             )
             if existing is not None:
+                # Another writer won the race between the two probes -- the
+                # seam already ran once for this call; take the hit branch
+                # instead of inserting.
                 return await self._increment_confirmation(existing), False
-            origin_token = _DERIVATION_ORIGIN.set("get_or_create")
-            try:
-                created = await self.create_thought(
-                    thought,
-                    expires_after_seconds=expires_after_seconds,
-                    deduplicate=False,
-                )
-            finally:
-                _DERIVATION_ORIGIN.reset(origin_token)
-            return created, True
+            persisted = await self._insert_new_thought_row(
+                thought,
+                expires_after_seconds=expires_after_seconds,
+            )
+        # Write lock released above, at the top level; nested in the
+        # caller's own suspend_auto_commit() window, the outer hold stays
+        # through auto-embed / on_store / derivation below too -- see
+        # _finish_create_thought's docstring for the durability and
+        # lock-hold implications of that case.
+        origin_token = _DERIVATION_ORIGIN.set("get_or_create")
+        try:
+            created = await self._finish_create_thought(persisted)
+        finally:
+            _DERIVATION_ORIGIN.reset(origin_token)
+        return created, True
 
     #: Mutable ``ThoughtRecord`` fields a content-hash upsert copies from the
     #: incoming record onto a matched row. ``content`` is deliberately excluded
@@ -4137,8 +7369,25 @@ class SqliteEngravaCore:
         update reuses :meth:`update_thought`, so it carries the same
         ``updated_cycle`` guard — and the same limits on what that guard catches
         — and re-embeds when ``essence`` changed, exactly like any other edit.
-        A miss delegates to :meth:`create_thought` (regular insert / journal /
-        auto-embed pipeline).
+        A miss runs the same **two-phase** path as :meth:`get_or_create`: the
+        exploratory probe above found nothing, so this call releases
+        ``_write_lock``, ``_dedup_lock`` and any ``BEGIN IMMEDIATE`` it opened,
+        calls :meth:`prepare_thought_for_insert` holding no lock this call
+        itself acquires,
+        revalidates what it returns, then reacquires everything for a
+        decisive probe keyed on the *prepared* record's content. If that
+        still misses, the row is inserted (regular journal pipeline, via
+        :meth:`_insert_new_thought_row`) and auto-embed / ``on_store`` /
+        derivation run afterwards — at the top level, once the write lock is
+        released; nested in the caller's own :meth:`suspend_auto_commit`
+        window, while that outer hold stays in place instead (see
+        :meth:`_finish_create_thought`'s docstring for both cases); if a
+        second writer won the race in
+        between, this call takes the hit (update-on-match) branch instead —
+        the seam already ran for this call. **A stable hit costs zero seam
+        calls**, exactly like :meth:`get_or_create`. See
+        :meth:`prepare_thought_for_insert` for why the seam runs holding no
+        lock this call itself acquires, on either probe.
 
         Choose :meth:`get_or_create` for "ensure it exists, don't touch it if it
         does"; choose ``upsert_by_hash`` for "make the stored thought match this
@@ -4146,9 +7395,10 @@ class SqliteEngravaCore:
         confirmation-counting of repeated sightings.
 
         Args:
-            thought: The desired thought state. On a miss it is inserted
-                verbatim; on a hit its mutable fields are copied onto the
-                existing row (keyed by ``content``).
+            thought: The desired thought state. On a miss it is passed through
+                :meth:`prepare_thought_for_insert` and inserted verbatim; on a
+                hit its mutable fields are copied onto the existing row (keyed
+                by ``content``).
             expires_after_seconds: Optional relative TTL applied only when the
                 thought is created. A hit does not re-arm TTL (``expires_at`` is
                 a system-managed field left untouched), matching
@@ -4161,7 +7411,8 @@ class SqliteEngravaCore:
         Raises:
             ValueError: If ``thought.metadata`` violates the metadata-shape or
                 size invariants (validated up front on both the hit and miss
-                paths).
+                paths) — or if :meth:`prepare_thought_for_insert` returns a
+                record that fails that same revalidation on a miss.
             StaleDataError: If the matched row's guarded update writes no row —
                 another writer stamped a new ``updated_cycle`` between the hash
                 probe and the in-place update, or deleted the row. The probe and
@@ -4169,6 +7420,8 @@ class SqliteEngravaCore:
                 :meth:`update_thought`'s: an ordinary competing edit to a field
                 this upsert also writes is overwritten silently rather than
                 reported here.
+            WriteContentionError: The cross-connection write lock could not be
+                acquired after retrying (see :meth:`_begin_dedup_write_lock`).
             ConnectionQuarantinedError: When the connection has been quarantined.
 
         """
@@ -4177,34 +7430,128 @@ class SqliteEngravaCore:
         # on both the hit (update) and miss (insert) branches.
         _validate_metadata(thought.metadata)
         _validate_provenance(thought.provenance)
-        async with self._dedup_lock:
-            existing = await self._get_thought_by_content_hash(
-                _compute_content_hash(thought.content),
-            )
-            if existing is None:
-                origin_token = _DERIVATION_ORIGIN.set("upsert_by_hash")
-                try:
-                    return await self.create_thought(
+
+        # Phase 1 -- exploratory probe: a stable hit resolves right here, at
+        # zero seam calls, and never reaches phase 2 below.
+        async with self._write_lock, self._dedup_lock:
+            opened_transaction = not self._db.in_transaction
+            async with self._serialize_dedup_probe(operation="upsert_by_hash"):
+                existing = await self._get_thought_by_content_hash(
+                    _compute_content_hash(thought.content),
+                )
+                if existing is not None:
+                    return await self._upsert_matched_row(
+                        thought, existing, opened_transaction=opened_transaction
+                    )
+                await self._end_exploratory_probe(opened_transaction=opened_transaction)
+        # _write_lock, _dedup_lock and any BEGIN IMMEDIATE this call's own
+        # probe opened are all released above -- the seam below runs holding
+        # no lock this call itself acquires (an enclosing caller's own lock
+        # is a different matter -- see prepare_thought_for_insert's docstring).
+
+        thought = await self.prepare_thought_for_insert(thought)
+        _validate_metadata(thought.metadata)
+        _validate_provenance(thought.provenance)
+
+        # Phase 2 -- decisive probe: reacquired from scratch, keyed on the
+        # prepared record's content. Insert only if this still misses.
+        async with self._write_lock, self._dedup_lock:
+            # Sampled again, not carried over from phase 1: the seam (or
+            # anything else on this connection) may have left a transaction
+            # open in between, and this window opened nothing then.
+            opened_transaction = not self._db.in_transaction
+            async with self._serialize_dedup_probe(operation="upsert_by_hash"):
+                existing = await self._get_thought_by_content_hash(
+                    _compute_content_hash(thought.content),
+                )
+                if existing is None:
+                    # Insert-only, inside the window; auto-embed / on_store /
+                    # derivation run afterwards -- at the top level, once the
+                    # write lock is released; nested in the caller's own
+                    # suspend_auto_commit() window, while that outer hold stays
+                    # in place instead (see _insert_new_thought_row /
+                    # _finish_create_thought's docstring for both cases).
+                    persisted = await self._insert_new_thought_row(
                         thought,
                         expires_after_seconds=expires_after_seconds,
-                        deduplicate=False,
                     )
-                finally:
-                    _DERIVATION_ORIGIN.reset(origin_token)
-            # Only the fields that actually differ are forwarded to
-            # ``update_thought``. This keeps the update minimal (no spurious OCC
-            # churn or re-embed when a field is unchanged) and, critically,
-            # never re-asserts an identical ``lifecycle_status`` — ``evolve``
-            # rejects same-state lifecycle transitions, so passing the stored
-            # value back verbatim would raise ``InvalidTransitionError``.
-            changes = {
-                field: getattr(thought, field)
-                for field in self._UPSERT_MUTABLE_FIELDS
-                if getattr(thought, field) != getattr(existing, field)
-            }
-            if not changes:
-                return existing
-            return await self.update_thought(existing.thought_id, **changes)
+                else:
+                    # Another writer won the race between the two probes -- the
+                    # seam already ran once for this call; take the hit branch
+                    # instead of inserting.
+                    return await self._upsert_matched_row(
+                        thought, existing, opened_transaction=opened_transaction
+                    )
+        origin_token = _DERIVATION_ORIGIN.set("upsert_by_hash")
+        try:
+            return await self._finish_create_thought(persisted)
+        finally:
+            _DERIVATION_ORIGIN.reset(origin_token)
+
+    async def _upsert_matched_row(
+        self,
+        thought: ThoughtRecord,
+        existing: ThoughtRecord,
+        *,
+        opened_transaction: bool,
+    ) -> ThoughtRecord:
+        """Hit branch shared by both of ``upsert_by_hash``'s probes.
+
+        Applies whichever of ``thought``'s :attr:`_UPSERT_MUTABLE_FIELDS`
+        differ from ``existing`` onto the stored row, or leaves the row
+        untouched if none differ. Used identically whether the match was found
+        on the first (exploratory) probe or the second (decisive) probe of
+        :meth:`upsert_by_hash`'s two-phase miss path — the two probes share
+        this one implementation so they cannot drift.
+
+        Only the fields that actually differ are forwarded to
+        :meth:`update_thought`. This keeps the update minimal (no spurious OCC
+        churn or re-embed when a field is unchanged) and, critically, never
+        re-asserts an identical ``lifecycle_status`` — ``evolve`` rejects
+        same-state lifecycle transitions, so passing the stored value back
+        verbatim would raise ``InvalidTransitionError``. ``update_thought``
+        commits its own write (after its own journal append), the same
+        "whoever writes, commits" rule :meth:`_insert_new_thought_row` and
+        :meth:`_increment_confirmation` follow — this method needs no special
+        handling for that case.
+
+        Args:
+            thought: The candidate whose mutable fields may overwrite ``existing``.
+            existing: The stored row the content-hash probe matched.
+            opened_transaction: Whether *this* call's own window opened the
+                ``BEGIN IMMEDIATE`` that may still be open, forwarded from the
+                caller so the no-change branch can end its own transaction
+                without touching a caller's. See
+                :meth:`_end_exploratory_probe`.
+
+        Returns:
+            ``existing`` unchanged when no field differs, or the record
+            :meth:`update_thought` returns otherwise.
+
+        """
+        changes = {
+            field: getattr(thought, field)
+            for field in self._UPSERT_MUTABLE_FIELDS
+            if getattr(thought, field) != getattr(existing, field)
+        }
+        if not changes:
+            # No write happens on this branch at all, but the window that
+            # found this match still holds the transaction that was open
+            # before the probe ran -- its own `BEGIN IMMEDIATE` when this
+            # call opened one, or an already-open outer transaction when it
+            # reused one instead (it cannot know in advance that the match
+            # needs no change) -- and the guard itself does not commit on a
+            # clean exit. Closing
+            # what nothing else here will, *without committing*: a
+            # `_maybe_commit()` here would commit whatever the caller already
+            # had pending, so their own later `rollback()` would find nothing
+            # to undo -- a call that writes nothing must not commit somebody
+            # else's work. `_end_exploratory_probe` rolls back instead, and
+            # only the transaction this call itself opened, so the write
+            # reservation is released without touching a caller's.
+            await self._end_exploratory_probe(opened_transaction=opened_transaction)
+            return existing
+        return await self.update_thought(existing.thought_id, **changes)
 
     async def bulk_store(
         self,
@@ -4212,7 +7559,10 @@ class SqliteEngravaCore:
         *,
         deduplicate: bool = False,
     ) -> list[ThoughtRecord]:
-        """Persist many thoughts in a single all-or-nothing transaction.
+        # Write-lock classification: under _write_lock via _bulk_store_inner's
+        # own suspend_auto_commit() window, which holds the lock for its whole
+        # duration (own body has no direct SQL).
+        """Persist many thoughts in a single transaction, all-or-nothing when this call owns it.
 
         The batch analogue of :meth:`create_thought` for ingest paths that
         would otherwise loop ``create_thought`` (one commit — and, under
@@ -4221,10 +7571,18 @@ class SqliteEngravaCore:
 
         * **One commit** — every row commits together when the batch finishes,
           not once per row.
-        * **All-or-nothing** — if any row raises (duplicate id, metadata
-          violation, an embedding failure under ``require_embedding=True``, …)
-          the entire transaction is rolled back and *nothing* is persisted; the
-          exception propagates. Partial batches never land.
+        * **All-or-nothing when this call owns the transaction** — if any row
+          raises (duplicate id, metadata violation, an embedding failure under
+          ``require_embedding=True``, …) the entire transaction is rolled back
+          and *nothing* is persisted; the exception propagates. Partial
+          batches never land this way — **provided this call's own**
+          :meth:`suspend_auto_commit` **window is the outermost one.** Nested
+          inside a caller's own :meth:`suspend_auto_commit` window, only the
+          outermost window's exit decides commit or rollback (see that
+          method's docstring): this call's own raise does not roll anything
+          back at the inner level, so a caller that catches the error and lets
+          its own window exit cleanly commits the batch's successful prefix
+          along with the rest of its work.
         * **Order preserved** — the returned list is in input order, element
           *i* corresponding to ``thoughts[i]`` (or, under ``deduplicate=True``,
           the existing record that ``thoughts[i]`` collapsed onto).
@@ -4250,10 +7608,15 @@ class SqliteEngravaCore:
 
         Like :meth:`suspend_auto_commit`, this call briefly toggles
         store-instance state (the deferred-commit flag, and a flag that defers
-        per-thought embedding to the batch). The store owns a single connection
-        and is not built for a *second* writer to run on the same instance
-        concurrently with a batch; issue ``bulk_store`` from one task at a time
-        (matching the existing bulk-write contract).
+        per-thought embedding to the batch). The store owns a single
+        connection, but a *second* writer does not need to be kept off it
+        by convention: :attr:`_write_lock` covers this whole call the same
+        way it covers :meth:`suspend_auto_commit`, so a concurrent task's
+        guarded write on this instance simply waits for the batch to finish
+        (or times out, per :attr:`_WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS`)
+        instead of racing its toggled state. Submitting ``bulk_store`` from
+        one task at a time is still the simplest mental model, not a
+        requirement for correctness.
 
         Args:
             thoughts: The thoughts to persist, in order. An empty list is a
@@ -4268,9 +7631,14 @@ class SqliteEngravaCore:
 
         Raises:
             ValueError: If any thought has a duplicate id or metadata that
-                violates the shape/size invariants (whole batch rolled back).
+                violates the shape/size invariants. Rolls the whole batch
+                back when this call's own :meth:`suspend_auto_commit` window
+                is the outermost one; nested inside a caller's own window,
+                only that outermost window's exit decides commit or rollback
+                (see above).
             EmbeddingGenerationError: If batch auto-embed fails and
-                ``require_embedding`` is ``True`` (whole batch rolled back).
+                ``require_embedding`` is ``True``. Same outermost-window
+                caveat as above.
             ConnectionQuarantinedError: When the connection has been quarantined.
 
         """
@@ -4284,19 +7652,6 @@ class SqliteEngravaCore:
             DerivedRecordProducerProtocol,
         )
 
-        # Snapshot the ids that already exist so genuine inserts can be told
-        # apart from dedup hits deterministically — by *row existence*, never by
-        # instance identity. (Instance identity is unreliable: ``create_thought``
-        # rebuilds the record to populate timestamps, and a dedup hit can return
-        # a row whose id coincides with the submitted one.) Only rows whose id is
-        # absent here — and not yet inserted earlier in this same batch — are
-        # freshly inserted, and thus the ones that need embedding and are eligible
-        # for derivation. Taken whenever embedding OR the derived-records seam is
-        # active, so a dedup hit never derives even with auto-embed off (D5).
-        pre_existing_ids: set[str] = set()
-        if embed_active or derivation_active:
-            pre_existing_ids = await self._existing_thought_ids()
-
         origin_token = _DERIVATION_ORIGIN.set("bulk_store")
         try:
             return await self._bulk_store_inner(
@@ -4304,7 +7659,6 @@ class SqliteEngravaCore:
                 deduplicate=deduplicate,
                 embed_active=embed_active,
                 derivation_active=derivation_active,
-                pre_existing_ids=pre_existing_ids,
             )
         finally:
             _DERIVATION_ORIGIN.reset(origin_token)
@@ -4316,21 +7670,63 @@ class SqliteEngravaCore:
         deduplicate: bool,
         embed_active: bool,
         derivation_active: bool,
-        pre_existing_ids: set[str],
     ) -> list[ThoughtRecord]:
         """Run the ``bulk_store`` insert loop under the derivation-origin label.
 
         Extracted so the ``bulk_store`` public method stays a thin wrapper that
         sets the informational ``DeriveContext.origin`` for the batch.
 
-        The insert loop runs under ``suspend_auto_commit`` (one transaction). Only
-        genuinely-inserted records — those whose id was absent before the batch
-        and not inserted earlier in it, i.e. dedup / hash hits excluded (D5) — are
-        collected as ``newly_created``. **After** the batch commits and is durable
-        (the ``async with`` has exited), derivation is dispatched locally, per
-        newly-created record, off the batch transaction, each child its own
-        guarded durable unit; a producer/child failure there can never roll back a
-        committed source or child (D3/D10). There is no shared instance buffer —
+        **Two phases: only the seam runs holding no lock this call itself
+        acquires, and batch-wide; ordinary
+        validation stays per-item, in the insert phase.** A batch has every
+        one of its records up front, so phase 1 runs :meth:`prepare_thought_for_insert`
+        — the seam itself, nothing else — over the *whole* batch before
+        phase 2 ever takes ``_write_lock``. Phase 2 then runs under
+        ``suspend_auto_commit`` (one transaction) and, for each
+        already-seamed record in order, revalidates it (metadata,
+        provenance) and inserts it (or dedup-resolves it) via
+        :meth:`_create_thought_from_prepared`, which does not call the seam
+        again.
+
+        **Why the split is this narrow.** Running :meth:`_prepare_for_create`
+        — validate, seam, revalidate — for the whole batch in phase 1, the way
+        :meth:`create_thought` does it for one item, would keep the seam from
+        holding any lock this call itself acquires, but it would change the
+        caller-visible failure ordering: because *every* item's validation,
+        not only its seam call, would run before *any* item's insert, a later
+        item's ordinary (non-seam) validation error — invalid ``metadata`` or
+        ``provenance``, either on the original candidate or on what the seam
+        returned — could raise *before* an earlier item's own duplicate-id
+        failure or ``on_store`` call was ever reached, silently replacing that
+        earlier outcome and suppressing that earlier ``on_store``. A bare loop
+        of :meth:`create_thought` calls does not do this: item *n* is fully
+        finished — validated, seamed, inserted, ``on_store`` dispatched —
+        before item *n + 1* is even looked at. Moving *only* the seam call to
+        phase 1 and revalidating in phase 2, per item, immediately before
+        that item's own insert, gives that same ordering: item *n*'s
+        ordinary validation, insert, and ``on_store`` all happen within the
+        same iteration of phase 2's loop, before item *n + 1*'s iteration
+        begins, and a later item's validation failure cannot pre-empt an
+        earlier one's insert-time or ``on_store`` outcome.
+
+        **One difference from the other entry points: the seam itself, in
+        phase 1, does not receive pre-validated input for the bulk path.** The
+        other entry points (:meth:`create_thought`, :meth:`get_or_create`,
+        :meth:`upsert_by_hash`) validate the candidate's ``metadata`` /
+        ``provenance`` before calling the seam, so an override
+        can rely on that precondition — see :meth:`prepare_thought_for_insert`'s
+        ``Args`` — but here the seam call in phase 1 runs before phase 2's
+        revalidation, on whatever ``thoughts`` was given, unvalidated. A
+        seam call for item *m* raising anywhere in phase 1 (a validated
+        precondition or not) stops the whole batch there. Only
+        genuinely-inserted records — those whose id was absent before the
+        batch and not inserted earlier in it, i.e. dedup / hash hits excluded
+        — are collected as ``newly_created``. **After** the batch
+        commits and is durable (the ``async with`` has exited), derivation is
+        dispatched locally, per newly-created record, off the batch
+        transaction, each child its own guarded durable unit; a
+        producer/child failure there can never roll back a committed source
+        or child. There is no shared instance buffer —
         ``newly_created`` is a local variable of this call.
 
         Args:
@@ -4339,22 +7735,64 @@ class SqliteEngravaCore:
             embed_active: Whether auto-embed is active for this batch.
             derivation_active: Whether the derived-records seam is active (used to
                 collect the newly-created records for post-commit dispatch).
-            pre_existing_ids: Ids present before the batch (for embed / derivation
-                new-insert selection).
 
         Returns:
             The persisted records in input order.
 
         """
+        # Phase 1 -- *only* the pre-insert seam itself, over the whole batch,
+        # holding no lock this call itself acquires. Deliberately not
+        # _prepare_for_create: that helper
+        # also validates (before and after the seam), and running validation
+        # here, batched across the whole input ahead of phase 2, would let a
+        # later item's ordinary validation error pre-empt an earlier item's
+        # duplicate-id or on_store outcome (see this method's docstring). Only
+        # the seam -- the one piece of overridable code that must run without
+        # holding a lock this call itself acquires -- runs here; ordinary
+        # validation runs in phase 2, per item, at the point the base loop of
+        # create_thought() calls would have run it.
+        prepared_thoughts = [await self.prepare_thought_for_insert(thought) for thought in thoughts]
+
         newly_created: list[ThoughtRecord] = []
         async with self.suspend_auto_commit():
+            # Phase 2 -- ``_write_lock`` held for this whole window. Snapshot
+            # the ids that already exist so genuine inserts can be told apart
+            # from dedup hits deterministically — by *row existence*, never
+            # by instance identity. (Instance identity is unreliable:
+            # ``create_thought`` rebuilds the record to populate timestamps,
+            # and a dedup hit can return a row whose id coincides with the
+            # submitted one.) Taken here, inside this ``suspend_auto_commit``
+            # window — which holds ``_write_lock`` for its whole duration —
+            # so no concurrent task's insert can land between this read and
+            # the loop below that relies on it. Only rows whose id is absent
+            # here — and not yet inserted earlier in this same batch — are
+            # freshly inserted, and thus the ones that need embedding and are
+            # eligible for derivation. Taken whenever embedding OR the
+            # derived-records seam is active, so a dedup hit never derives
+            # even with auto-embed off.
+            pre_existing_ids: set[str] = set()
+            if embed_active or derivation_active:
+                pre_existing_ids = await self._existing_thought_ids()
             self._suppress_auto_embed = embed_active
             try:
                 persisted: list[ThoughtRecord] = []
                 inserted: list[ThoughtRecord] = []
                 seen_before: set[str] = set(pre_existing_ids)
-                for thought in thoughts:
-                    record = await self.create_thought(thought, deduplicate=deduplicate)
+                for thought in prepared_thoughts:
+                    # Ordinary validation, per item, at the point the base
+                    # per-item create_thought() loop would have run it --
+                    # right before *this* item's own insert, not batched
+                    # ahead of the whole loop (see this method's docstring).
+                    # Validates what the seam returned; the seam already ran,
+                    # holding no lock this call itself acquires, in phase 1
+                    # above.
+                    _validate_metadata(thought.metadata)
+                    _validate_provenance(thought.provenance)
+                    record = await self._create_thought_from_prepared(
+                        thought,
+                        expires_after_seconds=None,
+                        deduplicate=deduplicate,
+                    )
                     persisted.append(record)
                     if record.thought_id not in seen_before:
                         if embed_active:
@@ -4429,17 +7867,36 @@ class SqliteEngravaCore:
         ``DERIVED_FROM`` edge) is never re-derived.
 
         Unlike :meth:`_dispatch_derivation` it does **not** early-return inside a
-        caller-held ``suspend_auto_commit`` window: the source is already durable
-        (stored by a prior committed call), so there is no source-durability reason
-        to defer. If a caller wraps it in an open transaction, the children simply
-        join that transaction like any other write and the caller owns their
-        durability. Consequently, inside such a window with
-        ``DeriveGates.on_error="raise"`` a derived-child failure rolls back that
-        **whole** transaction — the caller's unrelated writes included — which is
-        simply ``suspend_auto_commit``'s normal atomicity (the caller who opens the
-        window owns its rollback semantics), not a behaviour unique to backfill;
-        the already-committed **source thought is unaffected**. Outside a suspend
-        window each child commits as its own durable unit (per-child isolation).
+        caller-held ``suspend_auto_commit`` window (or a caller-held raw
+        ``BEGIN``): the source is already durable (stored by a prior committed
+        call), so there is no source-durability reason to defer. If a caller
+        wraps it in an open transaction, the children simply join that
+        transaction like any other write — but who then decides *when* that
+        becomes durable depends on which kind of transaction it is. A
+        ``suspend_auto_commit`` window suppresses every write's own
+        auto-commit for its whole duration, so the caller genuinely owns the
+        children's durability: nothing commits until the window's own single,
+        final commit. A raw ``BEGIN`` does **not** suppress it: a child's own
+        successful step still calls its own ``_maybe_commit()``, which — since
+        nothing told it to defer — actually commits the shared transaction
+        (the caller's own pending write included) as soon as that step
+        succeeds, well before the caller's own explicit commit. See
+        :meth:`_insert_derived_row` and :meth:`_insert_derived_edge` for the
+        two steps that can trigger this.
+
+        **A failed child undoes only itself, in every transaction context** — see
+        :meth:`_persist_derived_child` for exactly what a failing step leaves
+        behind. Under ``DeriveGates.on_error="log"`` the dispatch logs the
+        failure and continues with the next child; the caller's other pending
+        writes in the same transaction are never touched. Under
+        ``on_error="raise"`` the error propagates after that per-step undo: if
+        the caller lets it escape an open ``suspend_auto_commit`` window
+        uncaught, the window rolls back everything it holds — its own normal
+        atomicity, not a behaviour unique to backfill — but if the caller
+        catches it inside the window, the window's other writes survive. The
+        already-committed **source thought is unaffected either way**. Outside a
+        suspend window each child commits as its own durable unit (per-child
+        isolation), unchanged from before.
 
         Args:
             thought_id: The already-stored source thought to derive from.
@@ -4468,7 +7925,7 @@ class SqliteEngravaCore:
         if _IN_DERIVATION.get():
             return DeriveResult(thought_id=thought_id)
         # Capability-present gate — deliberately independent of DeriveGates.enabled
-        # (that master switch governs only the automatic on-store trigger, D4).
+        # (that master switch governs only the automatic on-store trigger).
         if not isinstance(self._hooks, DerivedRecordProducerProtocol):
             return DeriveResult(thought_id=thought_id)
         producer: DerivedRecordProducerProtocol = self._hooks
@@ -4523,14 +7980,19 @@ class SqliteEngravaCore:
         journal) — it does at most a single cheap capability/enabled check before
         returning, not zero extra work.
 
-        When called while auto-commit is suspended it returns without dispatching:
-        the source is not yet durable and derivation must never run inside a
-        transaction. ``bulk_store`` instead dispatches derivation locally, per
-        newly-created record, *after* its batch commits; a caller writing inside
-        its own ``suspend_auto_commit`` window triggers derivation via an explicit
-        re-run/backfill (ADR D8 — recoverability, not automatic recovery). A
+        When called while **the current task's own** auto-commit window is still
+        open it returns without dispatching: that source is not yet durable and
+        derivation must never run inside a transaction. This is asked of the
+        current task only — via a task-local marker, not the instance-wide
+        ``_skip_auto_commit_depth`` — so a *different* task's open window (which
+        holds no transaction this source's insert belongs to) is invisible here;
+        see ``_current_auto_commit_window`` and ``_open_auto_commit_windows``.
+        ``bulk_store`` instead dispatches derivation locally, per newly-created
+        record, *after* its batch commits; a caller writing inside its own
+        ``suspend_auto_commit`` window triggers derivation via an explicit
+        re-run/backfill -- recoverability, not automatic recovery. A
         dedup / hash hit never reaches this method (those return before the
-        dispatch call in ``create_thought``), so only genuine inserts derive (D5).
+        dispatch call in ``create_thought``), so only genuine inserts derive.
 
         The recursion guard (:data:`_IN_DERIVATION`) is set for the whole
         dispatch — including any nested public write a (contract-violating)
@@ -4545,8 +8007,11 @@ class SqliteEngravaCore:
             return
         if _IN_DERIVATION.get():
             return
-        if self._skip_auto_commit:
-            # Not yet durable (inside a suspended-commit window). Do not dispatch
+        window_id = self._current_auto_commit_window.get()
+        if window_id is not None and window_id in self._open_auto_commit_windows:
+            # Not yet durable inside THIS TASK's own suspended-commit window —
+            # asked of the current task only (see `_current_auto_commit_window`),
+            # so another task's open window never trips this. Do not dispatch
             # and do not buffer — bulk_store dispatches locally post-commit, and
             # a caller-held transaction triggers derivation via explicit backfill.
             return
@@ -4620,6 +8085,16 @@ class SqliteEngravaCore:
         children continue; under ``on_error="raise"`` the error re-raises after
         the source is safe, aborting the remaining children.
 
+        **A quarantined connection is non-continuable under either policy.**
+        Persisting a child uses failure-atomic units (:meth:`_write_readback_savepoint`
+        via :meth:`_insert_derived_row`, :meth:`_insert_derived_edge` and
+        :meth:`store_embedding`); when a unit's own unwind cannot be trusted it
+        quarantines the connection and re-raises the child's original error. Seeing
+        the connection quarantined after a child failure means every later write
+        would fail fast anyway, so the remaining children are never attempted and
+        the original error always propagates — logged first under ``"log"``, since
+        that policy would otherwise swallow it.
+
         Args:
             producer: The derived-record producer capability.
             source: The committed source thought.
@@ -4644,24 +8119,22 @@ class SqliteEngravaCore:
                 inserted = await self._persist_derived_child(source, record, ctx)
             except asyncio.CancelledError:
                 raise
-            except _DerivationRollbackError:
-                # Non-continuable: a per-child rollback failed, so the
-                # transaction state is indeterminate. Aborting the remaining
-                # children is mandatory regardless of ``on_error`` — a later
-                # child's commit could flush the failed child's pending work.
-                # But the source is already durably committed, so this must not
-                # escape a ``"log"`` policy as a caller-visible raise (fail-open,
-                # ADR D10): under ``"raise"`` propagate; under ``"log"`` log at
-                # error level and stop without re-raising. ``CancelledError`` is
-                # handled by its own branch above and always propagates.
-                if on_error == "raise":
-                    raise
-                logger.exception(
-                    "derived-record rollback failed for source %s; aborting remaining children",
-                    ctx.source_thought_id,
-                )
-                return _DerivationOutcome(created=created, reused=reused, skipped=skipped)
             except Exception:
+                if self._connection_quarantined:
+                    # Non-continuable regardless of on_error: a unit's own
+                    # unwind failed while persisting this child (see
+                    # _write_readback_savepoint), so the connection can no
+                    # longer be trusted and every later write would fail fast
+                    # anyway. Abort the remaining children and let the
+                    # original error through -- logged first under "log",
+                    # which would otherwise swallow it.
+                    if on_error == "log":
+                        logger.exception(
+                            "derived-record persistence quarantined the connection "
+                            "for source %s; aborting remaining children",
+                            ctx.source_thought_id,
+                        )
+                    raise
                 if on_error == "raise":
                     raise
                 logger.warning(
@@ -4754,7 +8227,7 @@ class SqliteEngravaCore:
         the edge insert is conflict-safe. So a re-run over a child that committed
         but never got enriched — e.g. a crash or cancellation between the child's
         commit and its post-commit embedding/edge — completes the enrichment
-        idempotently (D8/D10 recoverability).
+        idempotently -- recoverability, not atomic enrichment.
 
         Enrichment always targets the **stored** row's own content, never the
         producer's content. On a conflict-as-reuse hit the stored row may differ
@@ -4766,14 +8239,17 @@ class SqliteEngravaCore:
         Per-child transaction isolation: a child's **row** commits as its own
         durable unit; its enrichment (embedding, ``DERIVED_FROM`` edge) completes
         afterward, so a child may be durably present yet not-yet-enriched — a
-        recoverable partial state (D10), not atomic enrichment. If any step
-        (insert, its journal append, embed, or edge insert) fails after writing
-        but before that step's own commit, the child's uncommitted mutations are
-        rolled back before the error propagates — so no half-written row/edge
-        (e.g. a row whose journal append failed) can be flushed by a later
-        child's commit, and the journal chain stays consistent. Earlier children
-        and the source are already committed, so the rollback discards only this
-        child's pending work.
+        recoverable partial state, not atomic enrichment. **A failed step
+        undoes only itself, in every transaction context — including inside a
+        caller's own ``suspend_auto_commit`` window or raw ``BEGIN``.** The row
+        insert and its journal append (:meth:`_insert_derived_row`) are one
+        :meth:`_write_readback_savepoint` unit; the ``DERIVED_FROM`` edge insert
+        and its append (:meth:`_insert_derived_edge`) are another. The embed step
+        needs no unit of its own: a provider failure writes nothing, and a failed
+        :meth:`store_embedding` unwinds through that method's own unit. Either
+        way, a failure there never touches the row step 1 already wrote. No step
+        ever rolls back more than its own pending write — never an earlier
+        child's work, and never a caller's other writes in the same transaction.
 
         Args:
             source: The committed source thought.
@@ -4792,6 +8268,9 @@ class SqliteEngravaCore:
                 pre-existing row whose stored content differs from the derived
                 record (a foreign-identity collision — no provenance edge is
                 attached and the collision is surfaced per ``on_error``).
+            ConnectionQuarantinedError: When a step's own unit could not unwind
+                its failure and quarantined the connection (see
+                :meth:`_write_readback_savepoint`).
 
         """
         child_id = _derived_thought_id(record.content)
@@ -4803,12 +8282,27 @@ class SqliteEngravaCore:
             )
         child = self._build_derived_thought(record, child_id, ctx, source)
         reused_foreign = False
-        try:
+        # Each step below undoes only itself on failure — no compensating
+        # rollback here at all. `_insert_derived_row` and `_insert_derived_edge`
+        # each wrap their own insert + journal append in their own
+        # `_write_readback_savepoint` unit (see their docstrings), so a failure
+        # unwinds exactly that step's pending write, in every transaction
+        # context, including inside a caller's own `suspend_auto_commit` window
+        # or raw `BEGIN`. The embed step below needs no unit of its own: a
+        # provider failure raises before writing anything, and a failed
+        # `store_embedding` unwinds through that method's own unit. Every
+        # `async with self._write_lock:` here is a re-entrant no-op once
+        # acquired (`_insert_derived_row` / `_insert_derived_edge` /
+        # `store_embedding` each take it themselves too), so a failing step's
+        # own unwind always runs under the same lock hold its write did.
+        async with self._write_lock:
             inserted = await self._insert_derived_row(child)
-            # Re-read the stored row once: it is both the enrichment target (its
-            # own content, never the producer's) and the basis for the provenance
-            # identity-collision check below. On a conflict-as-reuse hit it may be
-            # a foreign row a caller pre-created at this deterministic id.
+        async with self._write_lock:
+            # Re-read the stored row once: it is both the enrichment
+            # target (its own content, never the producer's) and the
+            # basis for the provenance identity-collision check below. On
+            # a conflict-as-reuse hit it may be a foreign row a caller
+            # pre-created at this deterministic id.
             stored_row = await self._get_thought_row(child_id)
             if (
                 self._auto_embed
@@ -4817,124 +8311,41 @@ class SqliteEngravaCore:
                 and stored_row is not None
                 and await self.get_embedding(child_id) is None
             ):
-                # Embed the persisted row's actual content — not the producer's —
-                # so a reused foreign row never receives a producer-content vector.
+                # Embed the persisted row's actual content — not the
+                # producer's — so a reused foreign row never receives a
+                # producer-content vector.
                 await self._auto_embed_thought(self._row_to_thought(stored_row))
-            if record.attach_provenance_edge:
-                # Provenance guard: only attach the ``DERIVED_FROM`` edge when the
-                # stored row's content actually matches the derived record. A
-                # caller can pre-create a thought whose id equals
-                # ``uuid5(record.content)`` but with DIFFERENT content; reusing
-                # that row and still attaching the edge would assert a false
-                # "derived from source" provenance. On a mismatch treat it as an
-                # identity collision: skip the edge and surface it per
-                # ``on_error`` (mirroring the source-id collision above).
-                if stored_row is None or stored_row["content"] != record.content:
-                    reused_foreign = True
-                else:
+        if record.attach_provenance_edge:
+            # Provenance guard: only attach the ``DERIVED_FROM`` edge when the
+            # stored row's content actually matches the derived record. A
+            # caller can pre-create a thought whose id equals
+            # ``uuid5(record.content)`` but with DIFFERENT content; reusing
+            # that row and still attaching the edge would assert a false
+            # "derived from source" provenance. On a mismatch treat it as an
+            # identity collision: skip the edge and surface it per
+            # ``on_error`` (mirroring the source-id collision above).
+            if stored_row is None or stored_row["content"] != record.content:
+                reused_foreign = True
+            else:
+                async with self._write_lock:
                     await self._insert_derived_edge(
                         child_id,
                         source.thought_id,
                         ctx.cycle_at_derivation,
                     )
-        except BaseException as original:
-            # Roll back this child's uncommitted partial (a written-but-not-yet-
-            # committed insert/edge, e.g. one whose journal append raised) so it
-            # cannot be flushed by a later child's commit. Earlier children and
-            # the source are committed, so a clean rollback discards only this
-            # child's pending work. On a clean rollback the helper returns and we
-            # re-raise the original so ``_run_derivation`` applies ``on_error``
-            # (log→continue / raise→abort); otherwise the helper raises.
-            await self._compensate_child_rollback(original)
-            raise
         if reused_foreign:
             # Foreign-identity collision: the conflict-as-reuse hit landed on a
             # pre-existing row whose content differs from this derived record, so
-            # no provenance edge was attached. Surface it outside the
-            # compensating-rollback path — no uncommitted mutation is pending (the
-            # reuse insert aborted cleanly and any stored-row embedding already
-            # committed) — so ``_run_derivation`` applies ``on_error``
-            # (log→skip this child / raise→abort remaining), exactly like the
-            # source-id collision.
+            # no provenance edge was attached. Surface it outside any unwind path
+            # — no uncommitted mutation is pending (the reuse insert aborted
+            # cleanly and any stored-row embedding already committed) — so
+            # ``_run_derivation`` applies ``on_error`` (log→skip this child /
+            # raise→abort remaining), exactly like the source-id collision.
             raise DerivedRecordError(
                 source.thought_id,
                 "derived record identity collides with an unrelated stored thought",
             )
         return inserted
-
-    async def _compensate_child_rollback(self, original: BaseException) -> None:
-        """Roll back a failed derived child's uncommitted partial, cancel-safely.
-
-        Runs the compensating ``rollback`` as an independent task and awaits it
-        under :func:`asyncio.shield`, so a cancellation of *our* awaiting frame
-        never aborts the rollback itself. A half-completed rollback would leave
-        the long-lived connection mid-transaction — an orphaned partial that a
-        later operation could flush, or run atop as indeterminate state. If the
-        caller is cancelled during it, the still-running shielded task is awaited
-        to completion before the cancellation is honored; the cancellation is
-        never swallowed and always wins over ``original``.
-
-        The task's outcome is inspected structurally — :meth:`asyncio.Task.cancelled`
-        is checked *before* :meth:`asyncio.Task.exception` (which raises on a
-        cancelled task) — so a rollback failure is always detected, never let to
-        throw and bypass the quarantine/precedence logic.
-
-        Quarantine on *any* non-clean rollback: whenever the compensating
-        rollback does not cleanly complete (raised **or** cancelled), the
-        transaction is indeterminate regardless of whether the caller was
-        cancelled, so the connection is quarantined and hard-invalidated
-        (:meth:`_quarantine_connection`) before anything is surfaced. A clean
-        rollback never quarantines. This closes the hole where a non-cancelled
-        rollback failure (esp. under ``on_error="log"``, which logs and aborts)
-        would otherwise leave the store usable for a later, orphan-flushing
-        commit.
-
-        Args:
-            original: The child failure that triggered the compensating rollback.
-
-        Raises:
-            asyncio.CancelledError: When a cancellation (the caller's, or the
-                rollback task's own) is the outcome. The connection is
-                quarantined first if the rollback did not cleanly complete.
-            _DerivationRollbackError: When, on the non-cancelled path, the
-                rollback itself failed and ``original`` was not a cancellation —
-                a non-continuable abort of the whole dispatch (post-quarantine).
-
-        """
-        # Run the rollback as an independent, shielded task and drain it to
-        # completion, capturing any cancellation of our await.
-        rollback_task: asyncio.Task[None] = asyncio.ensure_future(self._db.rollback())
-        cancel_error = await self._drain_shielded(rollback_task)
-        # (#2) A cancelled rollback task would make ``exception()`` raise, so
-        # check ``cancelled()`` first and treat it as non-clean completion.
-        rollback_cancelled = rollback_task.cancelled()
-        rollback_exc = None if rollback_cancelled else rollback_task.exception()
-
-        # (#1) Any non-clean rollback → the transaction is indeterminate →
-        # quarantine before surfacing, whether or not the caller was cancelled. A
-        # clean rollback never quarantines. ``_quarantine_connection`` is
-        # synchronous-effect (detached close) so it cannot swallow ``cancel_error``.
-        if rollback_cancelled or rollback_exc is not None:
-            await self._quarantine_connection(
-                f"compensating rollback did not cleanly complete: "
-                f"{rollback_exc if rollback_exc is not None else 'cancelled'}",
-            )
-
-        if cancel_error is not None:
-            # The caller's cancellation is the visible outcome and takes precedence.
-            raise cancel_error from original
-        if rollback_cancelled:
-            # The rollback task itself was cancelled (its coroutine raised
-            # ``CancelledError``) → propagate a cancellation, never a
-            # ``_DerivationRollbackError``; ``original`` is chained as context.
-            raise asyncio.CancelledError from original
-        if rollback_exc is not None:
-            # Non-cancelled path: the rollback itself failed → abort the dispatch
-            # non-continuably (F2). A CancelledError ``original`` still wins.
-            if isinstance(original, asyncio.CancelledError):
-                raise original from rollback_exc
-            raise _DerivationRollbackError(rollback_exc) from original
-        # Clean rollback, no cancellation → the caller re-raises ``original``.
 
     def _build_derived_thought(
         self,
@@ -4987,8 +8398,19 @@ class SqliteEngravaCore:
         ``UNIQUE`` / primary-key violation is caught and treated as reuse.
         Enrichment of a reused row is handled by the caller against the stored
         row's own content. The conflicting ``INSERT`` statement is aborted by
-        SQLite (its own changes rolled back, the transaction preserved), so the
-        reuse early-return leaves no pending uncommitted mutation behind.
+        SQLite itself (its own changes rolled back, the transaction preserved),
+        so the reuse early-return leaves no pending uncommitted mutation behind:
+        it still runs inside the savepoint unit below (the ``INSERT`` is what
+        raises), but exits that unit normally — a clean ``RELEASE``, never an
+        unwind — because nothing of this attempt is left for the unit to undo.
+
+        **The insert and its journal entry are one failure-atomic unit**, via
+        :meth:`_write_readback_savepoint` — see :meth:`update_thought` for what
+        that protects against. A failed or cancelled journal append here unwinds
+        the insert too, in every transaction context (including inside a
+        caller's ``suspend_auto_commit`` window or raw ``BEGIN``), instead of
+        leaving it pending for a later, unrelated commit to publish without the
+        journal entry that documents it.
 
         Args:
             child: The derived thought to persist.
@@ -4998,24 +8420,29 @@ class SqliteEngravaCore:
             with the same content-addressed identity was reused (conflict-as-
             reuse). The caller uses this to tally created vs reused children.
 
+        Raises:
+            ConnectionQuarantinedError: When the connection has been quarantined.
+
         """
-        try:
-            await self._db.execute(
-                self._CORE_INSERT_SQL,
-                self._thought_to_core_params(child),
-            )
-        except aiosqlite.IntegrityError as exc:
-            if not _is_unique_violation(exc):
-                raise
-            return False
-        if self._journal is not None:
-            await self._journal.append(
-                mutation_type="INSERT_THOUGHT",
-                target_id=child.thought_id,
-                delta={"before": None, "after": child.model_dump(mode="json")},
-            )
-        await self._maybe_commit()
-        return True
+        async with self._write_lock:
+            async with self._write_readback_savepoint("insert_derived_row", begin="IMMEDIATE"):
+                try:
+                    await self._db.execute(
+                        self._CORE_INSERT_SQL,
+                        self._thought_to_core_params(child),
+                    )
+                except aiosqlite.IntegrityError as exc:
+                    if not _is_unique_violation(exc):
+                        raise
+                    return False
+                if self._journal is not None:
+                    await self._journal.append(
+                        mutation_type="INSERT_THOUGHT",
+                        target_id=child.thought_id,
+                        delta={"before": None, "after": child.model_dump(mode="json")},
+                    )
+            await self._maybe_commit()
+            return True
 
     async def _insert_derived_edge(
         self,
@@ -5028,16 +8455,27 @@ class SqliteEngravaCore:
         Records content-level provenance (derived → source). The edge is
         conflict-safe on both its deterministic id and the ``(from, to, type)``
         unique constraint, so a re-run or a concurrent derivation reuses the
-        existing edge rather than failing; SQLite aborts the conflicting
+        existing edge rather than failing; SQLite itself aborts the conflicting
         ``INSERT`` (rolling back only its own changes), so the reuse early-return
-        leaves no pending uncommitted mutation. A failure of the journal append
-        after the edge insert propagates to the caller, which rolls back this
-        child's pending edge insert (per-child isolation).
+        leaves no pending uncommitted mutation: it still runs inside the
+        savepoint unit below (the ``INSERT`` is what raises), but exits that
+        unit normally — a clean ``RELEASE``, never an unwind — because nothing
+        of this attempt is left for the unit to undo.
+
+        **The insert and its journal entry are one failure-atomic unit**, via
+        :meth:`_write_readback_savepoint` — see :meth:`update_thought` for what
+        that protects against. A failed or cancelled journal append here unwinds
+        the edge insert too, in every transaction context (including inside a
+        caller's ``suspend_auto_commit`` window or raw ``BEGIN``): the child's
+        row (and any embedding) survives untouched, per-child isolation.
 
         Args:
             from_thought_id: The derived child id (edge origin).
             to_thought_id: The source thought id (edge target).
             cycle: The cycle to stamp on the edge.
+
+        Raises:
+            ConnectionQuarantinedError: When the connection has been quarantined.
 
         """
         edge = EdgeRecord(
@@ -5049,44 +8487,48 @@ class SqliteEngravaCore:
             created_cycle=cycle,
             source=KnowledgeSource.EXPERIENCE,
         )
-        try:
-            await self._db.execute(
-                "INSERT INTO edge "
-                "(edge_id, from_thought_id, to_thought_id, edge_type, weight, "
-                " created_cycle, source, decay_multiplier, valid_from, valid_until, "
-                " metadata_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    edge.edge_id,
-                    edge.from_thought_id,
-                    edge.to_thought_id,
-                    edge.edge_type.value,
-                    edge.weight,
-                    edge.created_cycle,
-                    edge.source.value,
-                    edge.decay_multiplier,
-                    edge.valid_from,
-                    edge.valid_until,
-                    # Derived edges never carry caller metadata, so bind the empty
-                    # ``'{}'`` object literal rather than serializing the in-memory
-                    # record. This provenance-only path therefore cannot smuggle
-                    # unvalidated (e.g. non-finite) metadata into the column — it
-                    # bypasses ``_validate_metadata`` by writing a trivially valid
-                    # empty object, matching the fresh-DDL / ALTER ``DEFAULT '{}'``.
-                    "{}",
-                ),
-            )
-        except aiosqlite.IntegrityError as exc:
-            if not _is_unique_violation(exc):
-                raise
-            return
-        if self._journal is not None:
-            await self._journal.append(
-                mutation_type="INSERT_EDGE",
-                target_id=edge.edge_id,
-                delta={"before": None, "after": edge.model_dump(mode="json")},
-            )
-        await self._maybe_commit()
+        async with self._write_lock:
+            async with self._write_readback_savepoint("insert_derived_edge", begin="IMMEDIATE"):
+                try:
+                    await self._db.execute(
+                        "INSERT INTO edge "
+                        "(edge_id, from_thought_id, to_thought_id, edge_type, weight, "
+                        " created_cycle, source, decay_multiplier, valid_from, valid_until, "
+                        " metadata_json) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            edge.edge_id,
+                            edge.from_thought_id,
+                            edge.to_thought_id,
+                            edge.edge_type.value,
+                            edge.weight,
+                            edge.created_cycle,
+                            edge.source.value,
+                            edge.decay_multiplier,
+                            edge.valid_from,
+                            edge.valid_until,
+                            # Derived edges never carry caller metadata, so bind the
+                            # empty ``'{}'`` object literal rather than serializing
+                            # the in-memory record. This provenance-only path
+                            # therefore cannot smuggle unvalidated (e.g. non-finite)
+                            # metadata into the column — it bypasses
+                            # ``_validate_metadata`` by writing a trivially valid
+                            # empty object, matching the fresh-DDL / ALTER
+                            # ``DEFAULT '{}'``.
+                            "{}",
+                        ),
+                    )
+                except aiosqlite.IntegrityError as exc:
+                    if not _is_unique_violation(exc):
+                        raise
+                    return
+                if self._journal is not None:
+                    await self._journal.append(
+                        mutation_type="INSERT_EDGE",
+                        target_id=edge.edge_id,
+                        delta={"before": None, "after": edge.model_dump(mode="json")},
+                    )
+            await self._maybe_commit()
 
     async def _batch_embed_thoughts(self, inserted: list[ThoughtRecord]) -> None:
         """Embed the freshly-inserted thoughts of a batch in one provider call.
@@ -5101,8 +8543,12 @@ class SqliteEngravaCore:
         (one round trip, role-aware when the provider supports it). A provider
         failure is routed through :meth:`_on_auto_embed_failure` so it is logged
         and either re-raised or converted to :class:`EmbeddingGenerationError`
-        under ``require_embedding=True`` — and, because this runs inside
-        ``suspend_auto_commit``, that raise rolls the whole batch back.
+        under ``require_embedding=True``. Because this runs inside
+        ``suspend_auto_commit``, that raise rolls the whole batch back
+        **provided this call's own window is the outermost one** — nested
+        inside a caller's own ``suspend_auto_commit()`` window, the raise
+        does not roll anything back at this level, and the outer window's
+        clean exit commits the batch's successful prefix instead.
 
         Args:
             inserted: The freshly-inserted records to embed, in input order.
@@ -5118,9 +8564,11 @@ class SqliteEngravaCore:
             vectors = await _embed_documents_batch(provider, texts)
         except Exception as exc:  # noqa: BLE001 -- provider may raise any type; re-raised in handler
             # Attribute the whole-batch failure to the first inserted id — a
-            # representative, valid lookup key (not a silent drop of the others).
-            # The raise rolls the entire batch back under suspend_auto_commit, so
-            # every inserted row is un-done regardless of which id is named.
+            # representative, valid lookup key, not a promise that the row
+            # is gone. The raise rolls the entire batch back only when this
+            # call's own suspend_auto_commit window is outermost; nested in
+            # a caller's own window, that window's clean exit can still
+            # commit every row named here.
             self._on_auto_embed_failure(inserted[0].thought_id, exc)
         for record, vector in zip(inserted, vectors, strict=True):
             await self.store_embedding(
@@ -5341,87 +8789,178 @@ class SqliteEngravaCore:
           out of hygiene GC and prevents a stale marker from an earlier hygiene
           episode (left behind by a low-level un-archive) from making a
           later TTL re-archival GC-eligible on the earlier, already-elapsed
-          restore windows.
+          restore windows. This write also bumps ``revision`` — unconditionally,
+          not enforced against a caller's read — for the same reason
+          :meth:`_hygiene_archive` does: the lifecycle just changed underneath
+          any caller-held token, so that token must not survive it.
         * **delete**: Physically deletes the expired thought rows (cascading
           to edges, embeddings, and actions via ON DELETE CASCADE).
 
         Mutations are recorded in the journal when journaling is enabled.
 
         Args:
-            now: Optional ISO-8601 UTC timestamp to use as "current time".
-                Defaults to ``datetime.now(UTC).isoformat()`` when omitted.
-                Useful for deterministic testing.
+            now: Optional ISO-8601 timestamp to use as "current time", in any
+                form the timestamp validator accepts; a value without an offset
+                is read as UTC. It is compared in the canonical UTC form, so a
+                row is taken exactly when its ``expires_at`` instant is at or
+                before this one. Defaults to ``datetime.now(UTC).isoformat()``
+                when omitted. Useful for deterministic testing.
             exclude_id: Optional thought ID to skip during cleanup.
                 Used by auto-cleanup to protect a just-written thought.
 
         Returns:
             A ``CleanupResult`` with the count of processed thoughts, the
-            strategy that was applied, and a UTC timestamp.
+            strategy that was applied, and the canonical UTC form of the
+            instant it cleaned up to.
+
+        Raises:
+            ValueError: If ``now`` is not a valid ISO-8601 timestamp, or has no
+                UTC form within the supported ``datetime`` range. Nothing is
+                read or written in that case.
 
         """
-        if now is None:
-            now = datetime.datetime.now(datetime.UTC).isoformat()
-
-        cursor = await self._db.execute(
-            "SELECT thought_id FROM thought WHERE expires_at IS NOT NULL AND expires_at <= ?",
-            (now,),
+        # A caller's ``now`` is compared as TEXT against canonical stored
+        # ``expires_at`` values, so it is put into the same canonical UTC form
+        # first -- otherwise a space separator, basic format, a week date or an
+        # offset would select rows by string order instead of by instant.
+        now = (
+            datetime.datetime.now(datetime.UTC).isoformat()
+            if now is None
+            else canonical_timestamp(now)
         )
-        expired_rows = await cursor.fetchall()
-        expired_ids = [row["thought_id"] for row in expired_rows if row["thought_id"] != exclude_id]
 
         strategy = CleanupStrategy(self._ttl_strategy)
 
-        for tid in expired_ids:
-            if strategy is CleanupStrategy.ARCHIVE:
-                before_row = await self._get_thought_row(tid) if self._journal is not None else None
-                await self._db.execute(
-                    "UPDATE thought SET lifecycle_status = ?, expires_at = NULL, "
-                    "archived_at_cycle = NULL, archived_at = NULL "
-                    "WHERE thought_id = ?",
-                    (LifecycleStatus.ARCHIVED.value, tid),
-                )
-                if self._journal is not None and before_row is not None:
-                    before = self._row_to_thought(before_row)
-                    after = before.evolve(
-                        lifecycle_status=LifecycleStatus.ARCHIVED.value,
-                        expires_at=None,
-                        archived_at_cycle=None,
-                        archived_at=None,
-                    )
-                    await self._journal.append(
-                        mutation_type="UPDATE_THOUGHT",
-                        target_id=tid,
-                        delta={
-                            "before": before.model_dump(mode="json"),
-                            "after": after.model_dump(mode="json"),
-                        },
-                    )
-            else:
-                # DELETE strategy.
-                before_row = await self._get_thought_row(tid) if self._journal is not None else None
-                # Capture the embedding rowid before the cascade drops the
-                # embedding row; the vec0 vector is not FK-reachable and would
-                # otherwise linger as a ghost.
-                vec_rowid = await self._embedding_rowid_for_thought(tid)
-                await self._db.execute(
-                    "DELETE FROM thought WHERE thought_id = ?",
-                    (tid,),
-                )
-                await self._purge_orphan_vector(vec_rowid)
-                if self._journal is not None and before_row is not None:
-                    await self._journal.append(
-                        mutation_type="DELETE_THOUGHT",
-                        target_id=tid,
-                        delta={
-                            "before": self._row_to_thought(before_row).model_dump(
-                                mode="json",
-                            ),
-                            "after": None,
-                        },
-                    )
+        async with self._write_lock:
+            # Sampled before anything below touches the connection, mirroring
+            # delete_thought / _delete_thought_atomic: whether this call is the
+            # one that opened the transaction it may need to close below.
+            opened_transaction = not self._db.in_transaction
+            # Whether *anything* in this batch actually wrote — not merely
+            # whether a candidate existed, and not just whether
+            # ``_delete_thought_atomic`` reported ``deleted``: its "id never
+            # existed" branch can still sweep real orphaned children (see
+            # _DeleteAtomicResult), which is a write this batch must still
+            # commit even though that one candidate reports ``deleted=False``.
+            wrote_anything = False
 
-        if expired_ids:
-            await self._maybe_commit()
+            # The candidate read is inside the same critical section as the
+            # writes below: a concurrent task extending a thought's
+            # `expires_at`, or a suspended transaction exposing a value it then
+            # rolls back, could otherwise land between this read and the write
+            # that acts on it, and this call would archive or delete a row that
+            # is no longer actually expired -- caller data loss, not merely a
+            # stale read.
+            cursor = await self._db.execute(
+                "SELECT thought_id FROM thought WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                (now,),
+            )
+            expired_rows = await cursor.fetchall()
+            expired_ids = [
+                row["thought_id"] for row in expired_rows if row["thought_id"] != exclude_id
+            ]
+
+            # The whole batch is one failure-atomic unit, via
+            # _write_readback_savepoint (see update_thought for what that
+            # protects against): a failed or cancelled journal append on any
+            # one candidate unwinds every write this call has made so far in
+            # the batch, not just that candidate's own -- a partial batch
+            # commit on a later, unrelated write would otherwise publish some
+            # candidates' mutations without the journal entries that document
+            # them. This loop makes no nested public write of its own (each
+            # candidate's own commit is deferred to the single
+            # ``wrote_anything`` / ``opened_transaction`` finalization below,
+            # unchanged), so nothing inside it can end the unit early.
+            # ``_delete_thought_atomic`` nests inside this unit unchanged: this
+            # block already opens the transaction (when one is not already
+            # open) before the first candidate runs, so that call's own
+            # `opened_transaction` sample sees one already open and never ends
+            # it on the veto path itself.
+            async with self._write_readback_savepoint("cleanup_expired", begin="IMMEDIATE"):
+                for tid in expired_ids:
+                    if strategy is CleanupStrategy.ARCHIVE:
+                        before_row = (
+                            await self._get_thought_row(tid) if self._journal is not None else None
+                        )
+                        changes_before = self._db.total_changes
+                        await self._db.execute(
+                            "UPDATE thought SET lifecycle_status = ?, expires_at = NULL, "
+                            "archived_at_cycle = NULL, archived_at = NULL, "
+                            "revision = revision + 1 "
+                            "WHERE thought_id = ?",
+                            (LifecycleStatus.ARCHIVED.value, tid),
+                        )
+                        if self._journal is not None and before_row is not None:
+                            before = self._row_to_thought(before_row)
+                            after = before.evolve(
+                                lifecycle_status=LifecycleStatus.ARCHIVED.value,
+                                expires_at=None,
+                                archived_at_cycle=None,
+                                archived_at=None,
+                            )
+                            await self._journal.append(
+                                mutation_type="UPDATE_THOUGHT",
+                                target_id=tid,
+                                delta={
+                                    "before": before.model_dump(mode="json"),
+                                    "after": after.model_dump(mode="json"),
+                                },
+                            )
+                        # Sampled last, after the journal append -- not right
+                        # after the UPDATE. Not unconditionally ``True`` either:
+                        # a ``BEFORE UPDATE`` trigger can veto the archive with
+                        # ``RAISE(IGNORE)``, which leaves its own rowcount (and
+                        # any naive "the UPDATE ran" assumption) saying a write
+                        # happened when the row was left untouched -- and a
+                        # comparison taken right there would also miss that the
+                        # journal append below it is a real row insert of its
+                        # own, on a genuinely vetoed archive, that a comparison
+                        # taken before it can never see. Reading `total_changes`
+                        # only now, after everything this iteration could have
+                        # written, is what closes both gaps at once.
+                        wrote_anything = (self._db.total_changes > changes_before) or wrote_anything
+                    else:
+                        # DELETE strategy.
+                        before_row = (
+                            await self._get_thought_row(tid) if self._journal is not None else None
+                        )
+                        # Capture the embedding rowid before the delete drops the
+                        # embedding row; the vec0 vector is not FK-reachable and
+                        # would otherwise linger as a ghost.
+                        vec_rowid = await self._embedding_rowid_for_thought(tid)
+                        # Parent delete and explicit child deletes under one
+                        # savepoint — see _delete_thought_atomic for why. Its return
+                        # value must be honoured, not ignored: a RAISE(IGNORE)
+                        # trigger (or any future silent veto) reports False, and
+                        # a purge or journal append for a parent that still
+                        # exists would purge a live vector and record false
+                        # history.
+                        result = await self._delete_thought_atomic(tid)
+                        wrote_anything = result.wrote_anything or wrote_anything
+                        if not result.deleted:
+                            continue
+                        await self._purge_orphan_vector(vec_rowid)
+                        if self._journal is not None and before_row is not None:
+                            await self._journal.append(
+                                mutation_type="DELETE_THOUGHT",
+                                target_id=tid,
+                                delta={
+                                    "before": self._row_to_thought(before_row).model_dump(
+                                        mode="json",
+                                    ),
+                                    "after": None,
+                                },
+                            )
+
+            if wrote_anything:
+                await self._maybe_commit()
+            elif opened_transaction and self._db.in_transaction:
+                # Every DELETE-strategy candidate was vetoed (or there simply
+                # were none) — nothing in this batch was actually written, so
+                # there is nothing of this call's own to commit. Close only a
+                # transaction this call itself opened, never one a caller
+                # already held — see delete_thought for the same reasoning.
+                await self._db.rollback()
 
         return CleanupResult(
             expired_count=len(expired_ids),
@@ -5479,21 +9018,43 @@ class SqliteEngravaCore:
         journal ``after`` image is the same read-back.
 
         **What the version guard does and does not catch.** The write carries a
-        guard on ``updated_cycle`` as read at the start of the call, and nothing
-        in engrava advances that column on its own — only a caller passing
-        ``updated_cycle=`` here, or ``current_cycle=`` to
-        :meth:`restore_thought`, moves it. ``StaleDataError`` therefore does not
-        mean *the row changed*: it means the guarded ``UPDATE`` matched no row,
-        which happens when a competing writer stamped a cycle **or deleted the
-        row**. This call is a read-modify-write and is **not** atomic: another
-        writer's whole update can land between the read and the write, and if
-        both name the same field the later write wins silently. Two edits to
-        *different* fields survive each other — but only while neither stamps a
-        cycle: the guard is part of every update, so a competing cycle stamp
-        rejects this call in full even when the two edits share no column. A
-        ``lifecycle_status`` change is validated against the record *this* call
-        read, so a competing move in that window can leave the row in a state
-        the machine would not have allowed as a single step.
+        guard on ``revision`` as read at the start of the call, and the engine
+        itself increments ``revision`` by one on every guarded write to this
+        row — atomically, in the same ``UPDATE`` that checks it — so no caller
+        action is needed to arm it. ``StaleDataError`` therefore means the
+        guarded ``UPDATE`` matched no row, which happens when **any** other
+        guarded write landed on this row since it was read here **or the row
+        was deleted**; it does not distinguish the two.
+
+        **The read, the validation, and the write are now one critical section
+        with respect to every other task on this instance:** the whole span
+        from the initial read to the commit runs
+        under :attr:`_write_lock`, a task-reentrant lock, so a second task
+        calling any guarded write path on this store blocks until this call's
+        own write has committed — it cannot land *between* this call's
+        read and its write. Concretely: a competing edit to the **same** field
+        cannot be silently discarded by an interleaved write racing this
+        one (each such call runs to completion before the next one's own
+        read), a competing cycle stamp cannot spuriously reject an
+        unrelated edit that merely happened to straddle it, and a
+        ``lifecycle_status`` transition is validated against a row that no
+        concurrent call on this instance can move out from under it mid-check.
+        This governs concurrent calls **on this store instance** only — a
+        second store on the same database file, or a caller mutating the row
+        through a raw connection this store does not mediate, is outside what
+        any in-process lock can reach (see the concurrency documentation).
+
+        **The write, its confirming read-back, and its journal entry are one
+        failure-atomic unit.** All three run inside
+        :meth:`_write_readback_savepoint`: if the read-back raises — the row
+        vanished, or the mapper rejects a stored value — or the journal
+        append itself fails or is cancelled, this call's own ``UPDATE`` is
+        unwound before the exception propagates, so it can never be
+        published by a later, unrelated commit on this connection without
+        the journal entry that documents it. A caller-owned transaction (a
+        :meth:`suspend_auto_commit` window already in progress) is
+        unaffected: only this call's write is undone, not the caller's
+        earlier ones.
 
         Args:
             thought_id: UUID of the thought to update.
@@ -5506,9 +9067,9 @@ class SqliteEngravaCore:
             ThoughtNotFoundError: If the thought does not exist when the call
                 starts, or if the row was deleted before the write could be read
                 back.
-            StaleDataError: If the guarded write matches no row — another writer
-                stamped a new ``updated_cycle`` since the row was read, or
-                deleted the row. Nothing of this update is written when it is
+            StaleDataError: If the guarded write matches no row — another
+                guarded write landed on this row since it was read here, or it
+                was deleted. Nothing of this update is written when it is
                 raised.
             ValueError: If the post-``evolve`` metadata violates the
                 metadata-shape or size invariants enforced by
@@ -5516,49 +9077,61 @@ class SqliteEngravaCore:
                 provenance is not a
                 :class:`~engrava.domain.models.provenance.ProvenanceContext`
                 (per :func:`_validate_provenance`).
+            WriteContentionError: The guarded write could not proceed because
+                the connection reported lock contention.
             ConnectionQuarantinedError: When the connection has been quarantined.
 
         """
         self._ensure_connection_usable()
-        current_row = await self._get_thought_row(thought_id)
-        if current_row is None:
-            raise ThoughtNotFoundError(thought_id)
+        async with self._write_lock:
+            current_row = await self._get_thought_row(thought_id)
+            if current_row is None:
+                raise ThoughtNotFoundError(thought_id)
 
-        current = self._row_to_thought(current_row)
+            current = self._row_to_thought(current_row)
 
-        expected_cycle = current.updated_cycle
-        updated = current.evolve(**changes)
+            expected_revision = int(current_row["revision"])
+            updated = current.evolve(**changes)
 
-        _validate_metadata(updated.metadata)
-        _validate_provenance(updated.provenance)
+            _validate_metadata(updated.metadata)
+            _validate_provenance(updated.provenance)
 
-        columns = self._thought_update_columns(current, updated)
-        cursor = await self._db.execute(
-            _build_update_sql("thought", columns, self._CORE_UPDATE_GUARD),
-            (*columns.values(), thought_id, expected_cycle),
-        )
-        if cursor.rowcount == 0:
-            raise StaleDataError(
-                entity_type="ThoughtRecord",
-                entity_id=thought_id,
-                expected_version=expected_cycle,
-            )
+            columns = self._thought_update_columns(current, updated)
+            async with self._write_readback_savepoint("update_thought_readback", begin="DEFERRED"):
+                cursor = await self._execute_revision_guarded_write(
+                    _build_update_sql(
+                        "thought", columns, self._CORE_UPDATE_GUARD, bump_column="revision"
+                    ),
+                    (*columns.values(), thought_id, expected_revision),
+                    operation="update_thought",
+                )
+                if cursor.rowcount == 0:
+                    raise StaleDataError(
+                        entity_type="ThoughtRecord",
+                        entity_id=thought_id,
+                        expected_version=expected_revision,
+                    )
 
-        persisted = await self._read_back_thought(thought_id)
+                persisted = await self._read_back_thought(thought_id)
 
-        if self._journal is not None:
-            await self._journal.append(
-                mutation_type="UPDATE_THOUGHT",
-                target_id=thought_id,
-                delta={
-                    "before": current.model_dump(mode="json"),
-                    "after": persisted.model_dump(mode="json"),
-                },
-            )
+                if self._journal is not None:
+                    await self._journal.append(
+                        mutation_type="UPDATE_THOUGHT",
+                        target_id=thought_id,
+                        delta={
+                            "before": current.model_dump(mode="json"),
+                            "after": persisted.model_dump(mode="json"),
+                        },
+                    )
 
-        await self._maybe_commit()
+            await self._maybe_commit()
 
-        # Re-embed when essence or content changed.
+        # Re-embed when essence or content changed. Deliberately outside the
+        # write lock (released above): auto-embed is a slow, arbitrary provider
+        # call, and holding a per-instance lock across it would turn every
+        # other task's unrelated write into a bottleneck on this one's network
+        # round trip — exactly what this section rules out (the lock protects a
+        # critical section, not this call's entire lifetime).
         if (
             self._auto_embed
             and self._embedding_provider is not None
@@ -5600,7 +9173,16 @@ class SqliteEngravaCore:
         low-level lifecycle writes.
 
         Like :meth:`update_thought`, this writes only the columns the restore
-        owns and returns the row read back from storage after the write.
+        owns and returns the row read back from storage after the write. It
+        shares the same task-reentrant :attr:`_write_lock` critical section,
+        so the read, the transition check, and the write are atomic with
+        respect to every other guarded write on this instance. It also shares
+        :meth:`update_thought`'s :meth:`_write_readback_savepoint` protection:
+        a read-back failure, or a failed or cancelled journal append, unwinds
+        this call's own write instead of leaving it pending for a later,
+        unrelated commit to publish without the journal entry that documents
+        it, without disturbing a caller-owned transaction already in
+        progress.
 
         Args:
             thought_id: UUID of the archived thought to restore.
@@ -5614,62 +9196,69 @@ class SqliteEngravaCore:
             ThoughtNotFoundError: If the thought does not exist, or if the row
                 was deleted before the write could be read back.
             InvalidTransitionError: If the thought is not currently ``ARCHIVED``.
-            StaleDataError: If the guarded write matches no row — another writer
-                stamped a new ``updated_cycle`` since the row was read, or
-                deleted the row (see :meth:`update_thought` for what that guard
-                does and does not catch). Nothing of the restore is written when
-                it is raised.
+            StaleDataError: If the guarded write matches no row — another
+                guarded write landed on this row since it was read here, or it
+                was deleted (see :meth:`update_thought` for what that guard
+                does and does not catch). Nothing of the restore is written
+                when it is raised.
+            WriteContentionError: The guarded write could not proceed because
+                the connection reported lock contention.
 
         """
-        current_row = await self._get_thought_row(thought_id)
-        if current_row is None:
-            raise ThoughtNotFoundError(thought_id)
-        current = self._row_to_thought(current_row)
+        async with self._write_lock:
+            current_row = await self._get_thought_row(thought_id)
+            if current_row is None:
+                raise ThoughtNotFoundError(thought_id)
+            current = self._row_to_thought(current_row)
 
-        if current.lifecycle_status is not LifecycleStatus.ARCHIVED:
-            raise InvalidTransitionError(
-                entity_type="LifecycleStatus",
-                current_state=current.lifecycle_status.value,
-                target_state=LifecycleStatus.ACTIVE.value,
-            )
+            if current.lifecycle_status is not LifecycleStatus.ARCHIVED:
+                raise InvalidTransitionError(
+                    entity_type="LifecycleStatus",
+                    current_state=current.lifecycle_status.value,
+                    target_state=LifecycleStatus.ACTIVE.value,
+                )
 
-        expected_cycle = current.updated_cycle
-        # Pass the enum (not its value) so ``evolve`` runs the state-machine
-        # transition check — the ARCHIVED -> ACTIVE edge is what makes the
-        # archive reversible.
-        changes: dict[str, object] = {
-            "lifecycle_status": LifecycleStatus.ACTIVE,
-            "archived_at_cycle": None,
-            "archived_at": None,
-        }
-        if current_cycle is not None:
-            changes["updated_cycle"] = current_cycle
-        updated = current.evolve(**changes)
+            expected_revision = int(current_row["revision"])
+            # Pass the enum (not its value) so ``evolve`` runs the state-machine
+            # transition check — the ARCHIVED -> ACTIVE edge is what makes the
+            # archive reversible.
+            changes: dict[str, object] = {
+                "lifecycle_status": LifecycleStatus.ACTIVE,
+                "archived_at_cycle": None,
+                "archived_at": None,
+            }
+            if current_cycle is not None:
+                changes["updated_cycle"] = current_cycle
+            updated = current.evolve(**changes)
 
-        columns = self._thought_update_columns(current, updated)
-        cursor = await self._db.execute(
-            _build_update_sql("thought", columns, self._CORE_UPDATE_GUARD),
-            (*columns.values(), thought_id, expected_cycle),
-        )
-        if cursor.rowcount == 0:
-            raise StaleDataError(
-                entity_type="ThoughtRecord",
-                entity_id=thought_id,
-                expected_version=expected_cycle,
-            )
+            columns = self._thought_update_columns(current, updated)
+            async with self._write_readback_savepoint("restore_thought_readback", begin="DEFERRED"):
+                cursor = await self._execute_revision_guarded_write(
+                    _build_update_sql(
+                        "thought", columns, self._CORE_UPDATE_GUARD, bump_column="revision"
+                    ),
+                    (*columns.values(), thought_id, expected_revision),
+                    operation="restore_thought",
+                )
+                if cursor.rowcount == 0:
+                    raise StaleDataError(
+                        entity_type="ThoughtRecord",
+                        entity_id=thought_id,
+                        expected_version=expected_revision,
+                    )
 
-        persisted = await self._read_back_thought(thought_id)
+                persisted = await self._read_back_thought(thought_id)
 
-        if self._journal is not None:
-            await self._journal.append(
-                mutation_type="UPDATE_THOUGHT",
-                target_id=thought_id,
-                delta={
-                    "before": current.model_dump(mode="json"),
-                    "after": persisted.model_dump(mode="json"),
-                },
-            )
-        await self._maybe_commit()
+                if self._journal is not None:
+                    await self._journal.append(
+                        mutation_type="UPDATE_THOUGHT",
+                        target_id=thought_id,
+                        delta={
+                            "before": current.model_dump(mode="json"),
+                            "after": persisted.model_dump(mode="json"),
+                        },
+                    )
+            await self._maybe_commit()
         return persisted
 
     async def invalidate_thought(
@@ -5707,7 +9296,8 @@ class SqliteEngravaCore:
                 cycle stamp or a delete (see :meth:`update_thought`).
             ValueError: If ``valid_until`` is not a valid ISO-8601 timestamp,
                 or is earlier than the thought's existing ``valid_from`` (an
-                inverted validity interval).
+                inverted validity interval), or either bound has no UTC form
+                within the supported ``datetime`` range.
 
         """
         normalized = validate_iso8601_nullable(valid_until)
@@ -5878,41 +9468,134 @@ class SqliteEngravaCore:
     async def delete_thought(self, thought_id: str) -> bool:
         """Delete a thought by its ID.
 
+        **The write lock is taken before the journal before-image and the
+        embedding rowid are read, not after.** This call opens its own
+        ``BEGIN IMMEDIATE`` first (unless a transaction is already open — a
+        caller's :meth:`suspend_auto_commit` window, or a raw ``BEGIN``), so
+        a concurrent holder of the write lock is waited out first, and only
+        then does this call read the before-image and the rowid the delete
+        depends on — instead of a snapshot taken before that wait, which
+        could carry a since-superseded before-image or target a since-freed
+        rowid. There is no ``revision`` guard here to preserve either way: a
+        delete has nothing to compare a stale read against, only a row to
+        remove, so reading fresh is a pure correctness improvement, not a
+        contract change. A failure while reading either value rolls back a
+        transaction this call itself opened, never a caller's, via
+        :meth:`_rollback_self_opened_transaction`.
+
         Args:
             thought_id: UUID of the thought to delete.
 
         Returns:
-            True if the thought was deleted, False if not found.
+            True if the thought row was deleted. False if it was not found,
+            or if it was found but the delete removed nothing (a
+            ``RAISE(IGNORE)`` trigger, for one) — this call reports
+            both cases identically, since either way there is nothing to
+            purge or journal.
 
         Raises:
             ConnectionQuarantinedError: When the connection has been quarantined.
 
         """
         self._ensure_connection_usable()
-        before_row = await self._get_thought_row(thought_id) if self._journal is not None else None
+        async with self._write_lock:
+            # Sampled before anything below touches the connection — see
+            # _delete_thought_atomic's docstring for the ownership test this
+            # mirrors. Nothing between this line and the BEGIN IMMEDIATE
+            # right after it is anything but a read, so this and that
+            # method's own sample cannot disagree.
+            opened_transaction = not self._db.in_transaction
+            try:
+                # Taken before either read below, not after — see this
+                # method's docstring. "Already open" also covers a
+                # same-task call already inside its own unit (the
+                # task-reentrant write lock allows that) — this never
+                # begins a second transaction there. Inside the try, not
+                # before it: a cancellation delivered after SQLite has
+                # executed this BEGIN but before the ``await`` itself
+                # returns must still reach the ``except`` below and roll
+                # this transaction back, not leave it open.
+                if opened_transaction:
+                    await self._db.execute("BEGIN IMMEDIATE")
 
-        # Capture the embedding rowid *before* the cascade removes the row: the
-        # vec0 vector table is not reachable by the embedding FK's ON DELETE
-        # CASCADE, so the vector must be deleted explicitly to avoid a ghost.
-        vec_rowid = await self._embedding_rowid_for_thought(thought_id)
+                before_row = (
+                    await self._get_thought_row(thought_id) if self._journal is not None else None
+                )
 
-        cursor = await self._db.execute("DELETE FROM thought WHERE thought_id = ?", (thought_id,))
-        deleted = cursor.rowcount > 0
+                # Capture the embedding rowid *before* the delete removes the
+                # row: the vec0 vector table is not reachable by the
+                # embedding FK's ON DELETE CASCADE, so the vector must be
+                # purged explicitly to avoid a ghost.
+                vec_rowid = await self._embedding_rowid_for_thought(thought_id)
 
-        if deleted:
-            await self._purge_orphan_vector(vec_rowid)
+                # Parent delete and explicit child deletes under one
+                # savepoint — see _delete_thought_atomic for why the parent goes
+                # first (a BEFORE DELETE trigger on thought runs before this
+                # code has deleted any child) and why the child
+                # deletes still run explicitly rather than trusting ON
+                # DELETE CASCADE (a store on a pre-core-12 schema, or a
+                # connection with enforcement off, has no cascade to trust).
+                #
+                # The delete, the vector purge and the journal entry are one
+                # further failure-atomic unit on top of the reads above, via
+                # _write_readback_savepoint (see update_thought for what
+                # that protects against): a failed or cancelled journal
+                # append here unwinds the delete too, rather than leaving it
+                # pending in the open transaction with no savepoint left to
+                # protect it — _delete_thought_atomic's own savepoint has
+                # already released by the time this call reaches its
+                # append. _delete_thought_atomic nests inside this unit
+                # unchanged: since this block already opened the
+                # transaction (when one was not already open) before that
+                # call runs, its own `opened_transaction` sample sees one
+                # already open and never ends it on the veto path itself,
+                # leaving that to this call's own cleanup below as usual.
+                # A failure here — including inside the savepoint unit —
+                # is caught below, which is why that unit's own unwind does
+                # not also need to close this call's outer transaction: it
+                # sees one already open (`opened_transaction` is `False`
+                # there) and correctly leaves that to this `except`.
+                async with self._write_readback_savepoint("delete_thought", begin="IMMEDIATE"):
+                    result = await self._delete_thought_atomic(thought_id)
+                    deleted = result.deleted
 
-        if deleted and self._journal is not None and before_row is not None:
-            await self._journal.append(
-                mutation_type="DELETE_THOUGHT",
-                target_id=thought_id,
-                delta={
-                    "before": self._row_to_thought(before_row).model_dump(mode="json"),
-                    "after": None,
-                },
-            )
+                    if deleted:
+                        await self._purge_orphan_vector(vec_rowid)
 
-        await self._maybe_commit()
+                    if deleted and self._journal is not None and before_row is not None:
+                        await self._journal.append(
+                            mutation_type="DELETE_THOUGHT",
+                            target_id=thought_id,
+                            delta={
+                                "before": self._row_to_thought(before_row).model_dump(mode="json"),
+                                "after": None,
+                            },
+                        )
+            except BaseException as exc:
+                await self._rollback_self_opened_transaction(
+                    opened_transaction=opened_transaction, exc=exc
+                )
+                raise
+
+            if result.wrote_anything:
+                # A real write happened, so commit it. ``deleted`` alone would
+                # miss the orphan-sweep-only case (see _DeleteAtomicResult).
+                await self._maybe_commit()
+            elif opened_transaction and self._db.in_transaction:
+                # Nothing was written at all — the id never matched a row and
+                # there was nothing orphaned to sweep, or a trigger vetoed the
+                # delete — so this call has nothing of its own to make
+                # durable. `_delete_thought_atomic` already ends a transaction
+                # *it* opened on the veto path; this closes the "never
+                # existed, nothing to sweep" path, where that method leaves
+                # its own self-opened, still-empty transaction open for this
+                # call to close. Either way, only a transaction this call
+                # itself opened is ended here, and always with a rollback — a
+                # transaction the caller already held when this call started
+                # (``opened_transaction`` is ``False``) is never touched: a
+                # commit would durably apply the caller's own unrelated
+                # pending work, which this call was never asked to do.
+                await self._db.rollback()
         return deleted
 
     # ------------------------------------------------------------------
@@ -5945,69 +9628,78 @@ class SqliteEngravaCore:
 
         """
         _validate_metadata(edge.metadata)
-        try:
-            await self._db.execute(
-                "INSERT INTO edge "
-                "(edge_id, from_thought_id, to_thought_id, edge_type, weight, "
-                " created_cycle, source, decay_multiplier, valid_from, valid_until, "
-                " metadata_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    edge.edge_id,
-                    edge.from_thought_id,
-                    edge.to_thought_id,
-                    edge.edge_type.value,
-                    edge.weight,
-                    edge.created_cycle,
-                    edge.source.value,
-                    edge.decay_multiplier,
-                    edge.valid_from,
-                    edge.valid_until,
-                    json.dumps(edge.metadata, ensure_ascii=False),
-                ),
-            )
-        except aiosqlite.IntegrityError as exc:
-            # Classify structurally by the extended result code BEFORE any
-            # existence probe: a FOREIGN KEY failure maps to the domain wrapper,
-            # and only a UNIQUE / PRIMARY KEY failure is a candidate duplicate.
-            # A CHECK / NOT NULL / trigger abort (even one whose message mentions
-            # "foreign key") is neither and propagates unchanged.
-            if _is_foreign_key_violation(exc):
-                column, referenced = await self._identify_orphan_endpoint(edge)
-                raise ReferentialIntegrityError(
-                    entity_type="edge",
-                    column=column,
-                    referenced_id=referenced,
-                ) from exc
-            if _is_unique_violation(exc):
-                # Confirm the collision is the directed-endpoint + type identity
-                # (the conflict-as-reuse case) rather than another UNIQUE
-                # constraint, such as a caller-supplied duplicate ``edge_id``,
-                # which keeps its own contract and propagates.
-                duplicate_cursor = await self._db.execute(
-                    "SELECT 1 FROM edge "
-                    "WHERE from_thought_id = ? AND to_thought_id = ? AND edge_type = ? "
-                    "LIMIT 1",
-                    (edge.from_thought_id, edge.to_thought_id, edge.edge_type.value),
-                )
-                if await duplicate_cursor.fetchone() is not None:
-                    raise DuplicateEdgeError(
-                        edge.from_thought_id,
-                        edge.to_thought_id,
-                        edge.edge_type.value,
-                    ) from exc
-            # Preserve every other integrity failure (a non-duplicate UNIQUE, a
-            # CHECK, NOT NULL, or trigger abort) for its own contract.
-            raise
+        async with self._write_lock:
+            # The insert and its journal entry are one failure-atomic unit,
+            # via _write_readback_savepoint (see update_thought for what that
+            # protects against): a failed or cancelled journal append here
+            # unwinds the insert too, instead of leaving it pending with no
+            # savepoint of its own protecting it.
+            async with self._write_readback_savepoint("create_edge", begin="IMMEDIATE"):
+                try:
+                    await self._db.execute(
+                        "INSERT INTO edge "
+                        "(edge_id, from_thought_id, to_thought_id, edge_type, weight, "
+                        " created_cycle, source, decay_multiplier, valid_from, valid_until, "
+                        " metadata_json) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            edge.edge_id,
+                            edge.from_thought_id,
+                            edge.to_thought_id,
+                            edge.edge_type.value,
+                            edge.weight,
+                            edge.created_cycle,
+                            edge.source.value,
+                            edge.decay_multiplier,
+                            edge.valid_from,
+                            edge.valid_until,
+                            json.dumps(edge.metadata, ensure_ascii=False),
+                        ),
+                    )
+                except aiosqlite.IntegrityError as exc:
+                    # Classify structurally by the extended result code BEFORE any
+                    # existence probe: a FOREIGN KEY failure maps to the domain
+                    # wrapper, and only a UNIQUE / PRIMARY KEY failure is a
+                    # candidate duplicate. A CHECK / NOT NULL / trigger abort (even
+                    # one whose message mentions "foreign key") is neither and
+                    # propagates unchanged.
+                    if _is_foreign_key_violation(exc):
+                        column, referenced = await self._identify_orphan_endpoint(edge)
+                        raise ReferentialIntegrityError(
+                            entity_type="edge",
+                            column=column,
+                            referenced_id=referenced,
+                        ) from exc
+                    if _is_unique_violation(exc):
+                        # Confirm the collision is the directed-endpoint + type
+                        # identity (the conflict-as-reuse case) rather than another
+                        # UNIQUE constraint, such as a caller-supplied duplicate
+                        # ``edge_id``, which keeps its own contract and propagates.
+                        duplicate_cursor = await self._db.execute(
+                            "SELECT 1 FROM edge "
+                            "WHERE from_thought_id = ? AND to_thought_id = ? AND edge_type = ? "
+                            "LIMIT 1",
+                            (edge.from_thought_id, edge.to_thought_id, edge.edge_type.value),
+                        )
+                        if await duplicate_cursor.fetchone() is not None:
+                            raise DuplicateEdgeError(
+                                edge.from_thought_id,
+                                edge.to_thought_id,
+                                edge.edge_type.value,
+                            ) from exc
+                    # Preserve every other integrity failure (a non-duplicate
+                    # UNIQUE, a CHECK, NOT NULL, or trigger abort) for its own
+                    # contract.
+                    raise
 
-        if self._journal is not None:
-            await self._journal.append(
-                mutation_type="INSERT_EDGE",
-                target_id=edge.edge_id,
-                delta={"before": None, "after": edge.model_dump(mode="json")},
-            )
+                if self._journal is not None:
+                    await self._journal.append(
+                        mutation_type="INSERT_EDGE",
+                        target_id=edge.edge_id,
+                        delta={"before": None, "after": edge.model_dump(mode="json")},
+                    )
 
-        await self._maybe_commit()
+            await self._maybe_commit()
         return edge
 
     async def update_edge(self, edge_id: str, **changes: object) -> EdgeRecord:
@@ -6015,15 +9707,47 @@ class SqliteEngravaCore:
 
         Writes **only the columns whose value this edit changes**, so a field
         another writer set since the row was read is not rolled back. An edit
-        that changes nothing writes nothing at all. The record returned is read
-        back from storage after the write — the row that exists, not the one
-        the call intended to write — and the journal ``after`` image is the
+        that changes nothing writes no column of its own — though an attempt
+        is still made to journal it (as a before == after entry) when
+        journaling is enabled, since journaling is not conditioned on there
+        being a column change; like the column write above, a trigger on the
+        journal table can silently veto that insert too (``RAISE(IGNORE)``),
+        in which case nothing was journaled either. Either way, this call
+        commits only when the connection's own change counter shows
+        something of its own actually landed — a column, a journal entry, or
+        both, not merely attempted — and otherwise leaves a caller's own
+        open transaction exactly as it found it; see :meth:`delete_thought`
+        for the same rule applied to a write-free outcome. The record
+        returned is read back from storage after the write — the row that exists, not the
+        one the call intended to write — and the journal ``after`` image is the
         same read-back.
 
-        The write is keyed on ``edge_id`` alone — there is no version guard on
-        this path, so it never raises ``StaleDataError``. It is a
-        read-modify-write like :meth:`update_thought`, so a competing edit to a
-        field this call also writes is overwritten silently.
+        **The write (when there is one) carries a ``revision`` guard**, exactly
+        like :meth:`update_thought`'s: the row's ``revision`` at the start of
+        this call is checked and incremented atomically by the same ``UPDATE``,
+        so any other guarded write that landed on this row since it was read
+        here — or a delete — makes the ``UPDATE`` match no row, and this call
+        raises ``StaleDataError`` rather than silently overwriting. An edit
+        that changes nothing issues no ``UPDATE`` at all (see below), so it
+        cannot go stale — there is nothing for it to be stale against. It is a
+        read-modify-write like :meth:`update_thought`, and shares the same
+        task-reentrant :attr:`_write_lock` critical section: the
+        read, the merge, and the write are atomic with respect to every other
+        guarded write on this instance, so a competing edit to a field this
+        call also writes cannot land between this call's own read and
+        write.
+
+        **The write (when there is one), its confirming read-back, and its
+        journal entry are one failure-atomic unit**, via
+        :meth:`_write_readback_savepoint` — see :meth:`update_thought` for
+        what that protects against and how it treats a caller-owned
+        transaction. The ``UPDATE`` also now captures
+        its cursor and rejects a zero-row match immediately, rather than
+        trusting the read-back alone: without that check, a row deleted
+        after the initial read (so the ``UPDATE`` matches nothing) and
+        re-created under the same ``edge_id`` before the read-back runs would
+        be reported as though this call had updated it, when it had written
+        nothing at all.
 
         Args:
             edge_id: UUID of the edge to update.
@@ -6033,47 +9757,107 @@ class SqliteEngravaCore:
             The stored edge record, as persisted by this update.
 
         Raises:
-            ValueError: If the edge does not exist (including when it was
-                deleted before the write could be read back), or if the merged
-                ``metadata`` violates the shared metadata contract (a
-                non-scalar / list value, a non-finite float, or a serialized
-                size over the 64 KiB hard limit).
+            ValueError: If the edge does not exist at the initial read, or if
+                the merged ``metadata`` violates the shared metadata contract
+                (a non-scalar / list value, a non-finite float, or a
+                serialized size over the 64 KiB hard limit).
+            StaleDataError: If a real change's guarded ``UPDATE`` matches no
+                row — another guarded write landed on this row since it was
+                read here (including a delete, and including a delete
+                followed by a different row recreated under the same
+                ``edge_id`` before the read-back could run). Nothing of this
+                update is written when it is raised.
+            WriteContentionError: The guarded write could not proceed because
+                the connection reported lock contention.
 
         """
-        current_row = await self._get_edge_row(edge_id)
-        if current_row is None:
-            msg = f"Edge not found: {edge_id}"
-            raise ValueError(msg)
+        async with self._write_lock:
+            # Sampled before anything below touches the connection — same
+            # ownership test as delete_thought / cleanup_expired.
+            opened_transaction = not self._db.in_transaction
 
-        current = _row_to_edge(current_row)
-        updated = type(current).model_validate({**current.model_dump(mode="json"), **changes})
-        _validate_metadata(updated.metadata)
+            current_row = await self._get_edge_row(edge_id)
+            if current_row is None:
+                msg = f"Edge not found: {edge_id}"
+                raise ValueError(msg)
 
-        before = _edge_to_core_columns(current)
-        columns = {
-            name: value
-            for name, value in _edge_to_core_columns(updated).items()
-            if before[name] != value
-        }
-        if columns:
-            await self._db.execute(
-                _build_update_sql("edge", columns, "edge_id = ?"),
-                (*columns.values(), edge_id),
-            )
+            current = _row_to_edge(current_row)
+            expected_revision = int(current_row["revision"])
+            updated = type(current).model_validate({**current.model_dump(mode="json"), **changes})
+            _validate_metadata(updated.metadata)
 
-        persisted = await self._read_back_edge(edge_id)
+            before = _edge_to_core_columns(current)
+            columns = {
+                name: value
+                for name, value in _edge_to_core_columns(updated).items()
+                if before[name] != value
+            }
+            async with self._write_readback_savepoint("update_edge_readback", begin="DEFERRED"):
+                # Sampled *inside* the savepoint, immediately after its own
+                # ``SAVEPOINT`` statement -- not before it. A caller-owned
+                # transaction with its own pending write to an FTS-indexed
+                # column (``thought.essence`` / ``thought.content``) can
+                # leave some of that write's own accounting against
+                # ``total_changes`` until the next SAVEPOINT/BEGIN executes
+                # on this connection (an FTS5 shadow-table quirk, not
+                # anything this call did); sampling after this savepoint's
+                # own ``SAVEPOINT`` lets that settle on the caller's side of
+                # the line instead of being folded into this call's delta.
+                changes_before = self._db.total_changes
+                if columns:
+                    cursor = await self._execute_revision_guarded_write(
+                        _build_update_sql(
+                            "edge",
+                            columns,
+                            "edge_id = ? AND revision = ?",
+                            bump_column="revision",
+                        ),
+                        (*columns.values(), edge_id, expected_revision),
+                        operation="update_edge",
+                    )
+                    if cursor.rowcount == 0:
+                        raise StaleDataError(
+                            entity_type="EdgeRecord",
+                            entity_id=edge_id,
+                            expected_version=expected_revision,
+                        )
 
-        if self._journal is not None:
-            await self._journal.append(
-                mutation_type="UPDATE_EDGE",
-                target_id=edge_id,
-                delta={
-                    "before": current.model_dump(mode="json"),
-                    "after": persisted.model_dump(mode="json"),
-                },
-            )
+                persisted = await self._read_back_edge(edge_id)
 
-        await self._maybe_commit()
+                if self._journal is not None:
+                    await self._journal.append(
+                        mutation_type="UPDATE_EDGE",
+                        target_id=edge_id,
+                        delta={
+                            "before": current.model_dump(mode="json"),
+                            "after": persisted.model_dump(mode="json"),
+                        },
+                    )
+            # An edit that changes nothing (``columns`` empty) writes no
+            # column of its own *unless* journaling is enabled: the journal
+            # entry above is itself a real row insert (JournalWriter.append
+            # docstring: "The caller is responsible for committing... or
+            # relying on the store's _maybe_commit") that needs the same
+            # commit a real column change would need. So this tracks whether
+            # *anything* this call did needs to be made durable, not just
+            # whether ``columns`` was non-empty. It is not simply "``columns``
+            # was non-empty, or the journal was called" either: ``append``
+            # does not check whether its own INSERT actually inserted, so a
+            # trigger on the journal table can veto it with ``RAISE(IGNORE)``
+            # while the call still happened. ``total_changes`` reflects
+            # whether the column write and/or the journal insert actually
+            # landed, not merely whether either was attempted.
+            wrote_anything = self._db.total_changes > changes_before
+
+            if wrote_anything:
+                await self._maybe_commit()
+            elif opened_transaction and self._db.in_transaction:
+                # Truly nothing was written (no column changed, no journal
+                # entry) — the read-back savepoint above may still have opened
+                # an otherwise-empty transaction. Close only that one, and
+                # only with a rollback: a transaction the caller already held
+                # is left exactly as it was.
+                await self._db.rollback()
         return persisted
 
     async def _read_back_edge(self, edge_id: str) -> EdgeRecord:
@@ -6130,7 +9914,13 @@ class SqliteEngravaCore:
         Raises:
             ValueError: If the edge does not exist, ``valid_until`` is not a
                 valid ISO-8601 timestamp, or ``valid_until`` is earlier than the
-                edge's existing ``valid_from`` (an inverted validity interval).
+                edge's existing ``valid_from`` (an inverted validity interval),
+                or either bound has no UTC form within the supported
+                ``datetime`` range.
+            StaleDataError: If the guarded write matches no row — see
+                :meth:`update_edge`, which this delegates to.
+            WriteContentionError: The guarded write could not proceed because
+                the connection reported lock contention.
 
         """
         normalized = validate_iso8601_nullable(valid_until)
@@ -6150,26 +9940,52 @@ class SqliteEngravaCore:
         thought_id: str,
         *,
         direction: str = "BOTH",
+        limit: int | None = None,
     ) -> list[EdgeRecord]:
         """Retrieve edges connected to a thought.
 
         Args:
             thought_id: UUID of the thought.
             direction: 'IN', 'OUT', or 'BOTH'.
+            limit: If given, bound the result to this many edges at the SQL
+                layer, keeping the highest-``weight`` ones first. Must be
+                ``0`` or a positive integer; ``0`` returns an empty list.
+                ``None`` (the default) returns every matching edge, unordered,
+                exactly as before this parameter existed — callers that need
+                the complete adjacency (e.g. checking every existing
+                connection before creating a new one) must keep passing
+                ``None``; only pass a bound where the caller's own contract is
+                already "the top-N most relevant neighbours", not "all of
+                them".
 
         Returns:
-            List of matching edge records.
+            List of matching edge records. Ordered by ``weight`` descending
+            when ``limit`` is given, otherwise in storage order.
+
+        Raises:
+            ValueError: If ``limit`` is a ``bool`` or is negative. ``bool``
+                is rejected even though it subclasses ``int``: it is never a
+                meaningful edge count, only a type mismatch a type checker
+                would miss.
 
         """
+        if limit is not None and (isinstance(limit, bool) or limit < 0):
+            msg = f"limit must be a non-negative integer, got {limit!r}"
+            raise ValueError(msg)
+
         if direction == "OUT":
             sql = "SELECT * FROM edge WHERE from_thought_id = ?"
-            params: tuple[str, ...] = (thought_id,)
+            params: list[object] = [thought_id]
         elif direction == "IN":
             sql = "SELECT * FROM edge WHERE to_thought_id = ?"
-            params = (thought_id,)
+            params = [thought_id]
         else:
             sql = "SELECT * FROM edge WHERE from_thought_id = ? OR to_thought_id = ?"
-            params = (thought_id, thought_id)
+            params = [thought_id, thought_id]
+
+        if limit is not None:
+            sql += " ORDER BY weight DESC LIMIT ?"
+            params.append(limit)
 
         cursor = await self._db.execute(sql, params)
         rows = await cursor.fetchall()
@@ -6178,6 +9994,27 @@ class SqliteEngravaCore:
     async def delete_edge(self, edge_id: str) -> bool:
         """Delete an edge by its ID.
 
+        **The write lock is taken before the before-image is read, not
+        after.** This call opens its own ``BEGIN IMMEDIATE`` first (unless a
+        transaction is already open), so a concurrent holder of the write
+        lock is waited out first, and only then does this call read the
+        before-image the journal records — instead of a snapshot taken
+        before that wait, which could carry a since-superseded before-image.
+        There is no ``revision`` guard here to preserve: a delete has
+        nothing to compare a stale read against, only a row to remove, so
+        reading fresh is a pure correctness improvement. A failure while
+        reading the before-image rolls back a transaction this call itself
+        opened, never a caller's, via
+        :meth:`_rollback_self_opened_transaction`.
+
+        **The delete and its journal entry are then a further failure-atomic
+        unit**, via :meth:`_write_readback_savepoint`. This call commits
+        only when its own ``DELETE`` actually removed a row; on a missing
+        id, or on a failure reading the before-image, it rolls back only a
+        transaction it opened itself, exactly like :meth:`delete_thought` —
+        it never commits a caller's already-open transaction for a call that
+        deleted nothing.
+
         Args:
             edge_id: UUID of the edge to delete.
 
@@ -6185,22 +10022,53 @@ class SqliteEngravaCore:
             True if the edge was deleted, False if not found.
 
         """
-        before_row = await self._get_edge_row(edge_id) if self._journal is not None else None
+        async with self._write_lock:
+            # Sampled before anything below touches the connection — same
+            # ownership test as delete_thought.
+            opened_transaction = not self._db.in_transaction
+            try:
+                # Taken before the read, not after it — see this method's
+                # docstring. Inside the try, not before it: a cancellation
+                # delivered after SQLite has executed this BEGIN but before
+                # the ``await`` itself returns must still reach the
+                # ``except`` below and roll this transaction back, not
+                # leave it open.
+                if opened_transaction:
+                    await self._db.execute("BEGIN IMMEDIATE")
 
-        cursor = await self._db.execute("DELETE FROM edge WHERE edge_id = ?", (edge_id,))
-        deleted = cursor.rowcount > 0
+                before_row = (
+                    await self._get_edge_row(edge_id) if self._journal is not None else None
+                )
 
-        if deleted and self._journal is not None and before_row is not None:
-            await self._journal.append(
-                mutation_type="DELETE_EDGE",
-                target_id=edge_id,
-                delta={
-                    "before": dict(before_row),
-                    "after": None,
-                },
-            )
+                async with self._write_readback_savepoint("delete_edge", begin="IMMEDIATE"):
+                    cursor = await self._db.execute(
+                        "DELETE FROM edge WHERE edge_id = ?", (edge_id,)
+                    )
+                    deleted = cursor.rowcount > 0
 
-        await self._maybe_commit()
+                    if deleted and self._journal is not None and before_row is not None:
+                        await self._journal.append(
+                            mutation_type="DELETE_EDGE",
+                            target_id=edge_id,
+                            delta={
+                                "before": dict(before_row),
+                                "after": None,
+                            },
+                        )
+            except BaseException as exc:
+                await self._rollback_self_opened_transaction(
+                    opened_transaction=opened_transaction, exc=exc
+                )
+                raise
+
+            if deleted:
+                await self._maybe_commit()
+            elif opened_transaction and self._db.in_transaction:
+                # Nothing was written — the id never matched a row — so this
+                # call has nothing of its own to make durable. Close only a
+                # transaction this call itself opened, never one a caller
+                # already held: see delete_thought for the same reasoning.
+                await self._db.rollback()
         return deleted
 
     async def list_edges(
@@ -6275,8 +10143,12 @@ class SqliteEngravaCore:
     ) -> bool:
         """Check whether any thought with an exact source and thought_type exists.
 
-        Performs a single O(1) index lookup — safe to call per cluster in
-        ``_create_reflections`` regardless of store size.
+        Not an O(1) index lookup: the schema indexes ``thought(thought_type)``
+        but not ``thought(source)``, so this scans every row of the matched
+        ``thought_type`` for the ``source`` filter — O(number of rows of that
+        type), not O(1). Called per cluster in ``_create_reflections``, so
+        the cost scales with the REFLECTION count on a store with many of
+        them.
 
         Args:
             source: Exact ``source`` field value to match.
@@ -6381,13 +10253,64 @@ class SqliteEngravaCore:
     def _on_auto_embed_failure(self, thought_id: str, exc: Exception) -> NoReturn:
         """Surface an auto-embed provider failure, never silently.
 
-        Auto-embed runs *after* the thought (or batch) has already committed,
-        so a provider failure leaves the thought persisted but unembedded and
-        invisible to vector search. This handler makes that torn write visible:
-        it always emits a ``WARNING`` naming the thought id and the provider
-        error, then either re-raises the provider's own exception (default,
-        byte-identical to prior behaviour) or, under ``require_embedding=True``,
-        raises a typed :class:`EmbeddingGenerationError` — the opt-in fail-fast.
+        What is certain regardless of caller: the embedding was not
+        produced. What happens to the thought row itself is two
+        independent questions.
+
+        **Is the row durable yet?** If this call does not own the
+        outermost transaction — nested inside a caller's own
+        ``suspend_auto_commit()`` window — nothing is durable yet, on any
+        path. The outermost window's exit decides — if the caller catches
+        this and that outer window exits cleanly, the rows commit (for a
+        batch, every row it inserted, see :meth:`bulk_store`); uncaught,
+        they roll back. This holds for every path, single-item and batch
+        alike.
+
+        If this call does own the outermost transaction, the path
+        decides:
+
+        * ``create_thought`` and ``update_thought`` have already
+          committed by the time this runs, so the failure cannot undo
+          them.
+        * Called from :meth:`_batch_embed_thoughts` on its own (a
+          standalone ``bulk_store``), the insert loop has already
+          finished, but the whole batch (inserts plus the trailing embed
+          call) shares one transaction, so this failure rolls the
+          *entire* batch back instead — every row in it, this one
+          included — and none of them persist.
+
+        **What is left behind?** Determined by the path, and only
+        meaningful for whatever actually committed: ``create_thought``
+        leaves no embedding row at all. ``update_thought`` (only reached
+        here when ``essence``/``content`` changed) leaves any embedding
+        the row already had in place — if the update committed, that
+        embedding is now stale against the new content, and the row is
+        still findable by vector search against that outdated vector; if
+        the row had no embedding before, it still has none, and remains
+        unfindable by vector search. If the update instead rolled back —
+        only possible when this call is nested inside a caller's own window
+        and the caller lets the failure escape it — the durable state
+        reverts to whatever existed when that *outermost* window opened,
+        not merely to what this call itself started from: an earlier write
+        to the same thought inside the same window is undone right along
+        with it. If the thought was created inside that same window, it no
+        longer exists at all afterward — there is nothing to be "left
+        behind". If it already existed before the window opened, it
+        reverts to that pre-window state, and the retained embedding
+        matches it only if it already did: an earlier update on the same
+        thought, before this window ever opened, whose own re-embed failed
+        can already have left that pre-window state stale, and this
+        rollback neither detects nor repairs that. A standalone
+        ``bulk_store``'s rollback leaves nothing behind at all.
+
+        See ``docs/api-reference.md``'s ``bulk_store`` and
+        ``EmbeddingGenerationError`` entries for the fuller treatment. This
+        handler makes the certain half of that outcome visible either way:
+        it always emits a ``WARNING`` naming the thought id and the
+        provider error's type — never its message — then either re-raises
+        the provider's own exception (default, byte-identical to prior
+        behaviour) or, under ``require_embedding=True``, raises a typed
+        :class:`EmbeddingGenerationError` — the opt-in fail-fast.
 
         Args:
             thought_id: UUID of the thought whose embedding failed.
@@ -6399,10 +10322,13 @@ class SqliteEngravaCore:
 
         """
         logger.warning(
-            "Auto-embed failed for thought %s: %s. The thought is persisted "
-            "but has no embedding and is not reachable by vector search.",
+            "Auto-embed failed for thought %s: %s. The embedding was not "
+            "produced. Whether the thought row survives, and in what "
+            "state, depends on the call that raised this and its "
+            "surrounding transaction — see docs/api-reference.md for the "
+            "specific outcomes.",
             thought_id,
-            exc,
+            type(exc).__name__,
         )
         if self._require_embedding:
             raise EmbeddingGenerationError(thought_id, str(exc)) from exc
@@ -6413,15 +10339,67 @@ class SqliteEngravaCore:
 
         Builds the embed payload via :func:`_build_embed_input` (which drops a
         prefix-redundant ``essence`` to avoid double-counting the opening),
-        embeds it via the configured provider, and persists the vector.
+        embeds it via the configured provider, and persists the vector —
+        but only if the thought's stored ``essence``/``content`` still match
+        what was just embedded (see "Staleness" below).
 
-        A provider failure is never silent: it is routed through
+        An ``Exception`` that escapes the guarded call to
+        :func:`_embed_document` below is never silent: it is routed through
         :meth:`_on_auto_embed_failure`, which logs a ``WARNING`` naming the
-        thought and then re-raises the provider error (default) or a typed
-        :class:`EmbeddingGenerationError` (when ``require_embedding=True``).
-        The commit ordering of the caller is unchanged — the thought is already
-        persisted when this runs, so on failure it remains stored but
-        unembedded.
+        thought and the provider error's type, then re-raises the provider
+        error (default) or a typed :class:`EmbeddingGenerationError` (when
+        ``require_embedding=True``).
+        That guarantee is scoped to this one call, not to provider failures
+        in general: ``provider.model_name`` is read afterward, outside the
+        ``try``/``except``, to pass to :meth:`store_embedding`, so a
+        provider whose ``model_name`` property raises skips the routing
+        entirely regardless of ``require_embedding`` or exception type — no
+        ``WARNING``, no :class:`EmbeddingGenerationError`. A
+        ``BaseException`` that is not an ``Exception`` raised *from inside*
+        the guarded call — :class:`asyncio.CancelledError` is the one that
+        matters in practice — is also not caught by the ``except Exception``
+        here, so it skips the routing too: no ``WARNING`` is logged and it
+        is never normalised into :class:`EmbeddingGenerationError`. Either
+        way it still propagates, so it is not swallowed, only unlogged and
+        untyped.
+        Whether the thought row is durable yet depends on whether this
+        call owns the outermost transaction: on its own, the insert or
+        update has already committed by the time this runs, so the
+        failure cannot undo it; nested inside the caller's own
+        ``suspend_auto_commit()`` window, nothing is durable yet — that
+        window's exit decides. What is left behind is path-specific: a
+        fresh ``create_thought`` leaves no embedding row at all, so the
+        row stays unfindable by vector search; an ``update_thought``
+        leaves any embedding the row already had in place — stale and
+        still findable by vector search only if the row had one before
+        and the update committed.
+
+        **Staleness.** The provider call above is a slow, arbitrary network
+        round trip made *outside* :attr:`_write_lock` (see the call sites in
+        :meth:`update_thought` and :meth:`_finish_create_thought`), so by the
+        time it returns, an unrelated later write may already have changed
+        this same thought's ``essence``/``content`` — or deleted the row
+        outright — and installed its own, newer vector. Installing this
+        call's vector unconditionally would silently overwrite that newer
+        vector with one computed from now-superseded content, even though
+        the durable text and FTS index already reflect the later write.
+        Guarded against here, atomically with the install: immediately
+        before calling :meth:`store_embedding`, the thought's *current*
+        stored ``essence``/``content`` are re-read under :attr:`_write_lock`
+        and compared against what was actually embedded above. A mismatch —
+        including the row no longer existing — means this completion is
+        stale: it is dropped silently rather than installed, on the
+        assumption that either the later write already triggered its own,
+        current auto-embed, or (if it did not, e.g. a metadata-only write)
+        the vector already in place is the one that write left there, which
+        is correct for its content. Comparing content rather than a revision
+        counter also covers thought-id reuse after a delete: a revision
+        counter restarts at zero on the recreated row, which could
+        coincidentally equal a revision captured before the deletion, but
+        the *content* only matches when it is genuinely the same content —
+        installing in that case is correct, not stale, because the vector
+        this call computed is valid for whatever row currently holds that
+        content.
 
         Args:
             thought: The thought to embed.
@@ -6441,11 +10419,25 @@ class SqliteEngravaCore:
         except Exception as exc:  # noqa: BLE001 -- provider may raise any type; re-raised in handler
             self._on_auto_embed_failure(thought.thought_id, exc)
 
-        await self.store_embedding(
-            thought.thought_id,
-            vector,
-            model_name=provider.model_name,
-        )
+        model_name = provider.model_name
+        async with self._write_lock:
+            current_row = await self._get_thought_row(thought.thought_id)
+            if (
+                current_row is None
+                or current_row["essence"] != thought.essence
+                or current_row["content"] != thought.content
+            ):
+                logger.debug(
+                    "Dropping stale auto-embed completion for %s: essence/content "
+                    "changed (or the row was deleted) since this embed was scheduled.",
+                    thought.thought_id,
+                )
+                return
+            await self.store_embedding(
+                thought.thought_id,
+                vector,
+                model_name=model_name,
+            )
 
     async def _rebind_consolidated_reflections(self, source_id: str) -> int:
         """Recompute the centroids of REFLECTIONs that summarize a source.
@@ -6464,6 +10456,23 @@ class SqliteEngravaCore:
         :meth:`update_thought`, so metadata/priority churn leaves dependent
         REFLECTION centroids untouched.
 
+        **Same asynchronous-completion shape as the auto-embed above, closed
+        differently.** Like :meth:`_auto_embed_thought`, this runs outside
+        :attr:`_write_lock` (:meth:`update_thought` releases it before
+        either call), so two members of the same REFLECTION updated close
+        together can each trigger a rebind of that one REFLECTION
+        concurrently. Unlike the provider call above, though, nothing here
+        is slow, arbitrary network I/O — every step reading a member vector
+        is a local, in-process database read — so each reflection's whole
+        read-recompute-store span is wrapped in one :attr:`_write_lock`
+        acquisition instead of using a captured-then-compared identity. That
+        makes the span atomic with respect to every other guarded write,
+        including a concurrent rebind of the same REFLECTION: whichever
+        rebind actually runs always reads the member vectors as they stand
+        at that moment, not a snapshot captured earlier, so there is no
+        window in which an earlier-read, now-superseded centroid can land
+        after a later one already installed a fresher vector.
+
         Args:
             source_id: UUID of the source thought that was just re-embedded.
 
@@ -6477,24 +10486,25 @@ class SqliteEngravaCore:
 
         rebound = 0
         for reflection_id in reflection_ids:
-            member_ids = await self.consolidated_member_ids(reflection_id)
-            member_vectors: list[list[float]] = []
-            for member_id in member_ids:
-                embedding = await self.get_embedding(member_id)
-                if embedding is None:
+            async with self._write_lock:
+                member_ids = await self.consolidated_member_ids(reflection_id)
+                member_vectors: list[list[float]] = []
+                for member_id in member_ids:
+                    embedding = await self.get_embedding(member_id)
+                    if embedding is None:
+                        continue
+                    member_vectors.append(
+                        list(struct.unpack(f"{embedding.dimension}f", embedding.vector_blob)),
+                    )
+                if not member_vectors:
                     continue
-                member_vectors.append(
-                    list(struct.unpack(f"{embedding.dimension}f", embedding.vector_blob)),
+                centroid = compute_centroid(member_vectors)
+                await self.store_embedding(
+                    reflection_id,
+                    centroid,
+                    model_name=CENTROID_MODEL_NAME,
                 )
-            if not member_vectors:
-                continue
-            centroid = compute_centroid(member_vectors)
-            await self.store_embedding(
-                reflection_id,
-                centroid,
-                model_name=CENTROID_MODEL_NAME,
-            )
-            rebound += 1
+                rebound += 1
         return rebound
 
     # ------------------------------------------------------------------
@@ -6511,8 +10521,10 @@ class SqliteEngravaCore:
     ) -> EmbeddingRecord:
         """Persist an embedding vector for a thought.
 
-        On first call, locks the embedding model in ``_metadata``.
-        Subsequent calls verify the model matches the stored one.
+        On first call, locks the embedding model in ``_metadata`` — atomically
+        with this call's own write, so a first call that fails (wrong
+        dimension, an invalid ``thought_id``) locks nothing. Subsequent calls
+        verify the model matches the stored one.
 
         Args:
             thought_id: UUID of the thought that owns this embedding.
@@ -6524,59 +10536,84 @@ class SqliteEngravaCore:
             The persisted EmbeddingRecord.
 
         Raises:
-            EmbeddingModelMismatchError: When model_name does not match
-                the model already stored in ``_metadata``.
+            EmbeddingModelMismatchError: When model_name, its dimension, or
+                its document-prefix fingerprint does not match the one
+                already stored in ``_metadata`` — checked on every call, not
+                only the first.
+            ConnectionQuarantinedError: When the base row write succeeds but
+                the vec0 upsert fails and the resulting unwind cannot itself
+                be trusted to have undone it cleanly (see
+                :meth:`_write_readback_savepoint`).
 
         """
-        await self._ensure_embedding_model_lock(model_name, len(vector))
-        eid = embedding_id or f"emb-{_uuid.uuid5(_uuid.NAMESPACE_URL, thought_id)}"
-        dimension = len(vector)
-        blob = struct.pack(f"{dimension}f", *vector)
-        created_at = datetime.datetime.now(datetime.UTC).isoformat()
+        async with self._write_lock:
+            eid = embedding_id or f"emb-{_uuid.uuid5(_uuid.NAMESPACE_URL, thought_id)}"
+            dimension = len(vector)
+            blob = struct.pack(f"{dimension}f", *vector)
+            created_at = datetime.datetime.now(datetime.UTC).isoformat()
 
-        cursor = await self._db.execute(
-            "SELECT rowid FROM embedding WHERE embedding_id = ?",
-            (eid,),
-        )
-        existing_row = await cursor.fetchone()
+            # The identity lock, the base ``embedding`` row and the ``vec0``
+            # upsert are one failure-atomic unit: without this, a first call
+            # on an empty corpus that locked the model identity but then
+            # failed its own base/vec0 write (a wrong-dimension vector, an
+            # invalid owner) left that identity committed regardless — a
+            # corrected retry would then fail verification against a corpus
+            # identity no write had actually survived to justify. Passing
+            # ``commit=False`` keeps the identity write itself inside this
+            # same savepoint span, so it unwinds together with a rejected
+            # base/vec0 write instead of outliving it; a wrong-dimension
+            # vector or vec0 rejection after the base row already succeeded
+            # unwinds the same way, leaving nothing pending in the
+            # connection's open transaction for a later, unrelated commit to
+            # publish. See :meth:`_write_readback_savepoint`.
+            async with self._write_readback_savepoint("store_embedding", begin="IMMEDIATE"):
+                await self._ensure_embedding_model_lock(model_name, dimension, commit=False)
+                cursor = await self._db.execute(
+                    "SELECT rowid FROM embedding WHERE embedding_id = ?",
+                    (eid,),
+                )
+                existing_row = await cursor.fetchone()
 
-        rowid: int
-        if existing_row is None:
-            await self._db.execute(
-                "INSERT INTO embedding "
-                "(embedding_id, owner_type, owner_id, model_name, "
-                "dimension, vector_blob, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (eid, "THOUGHT", thought_id, model_name, dimension, blob, created_at),
-            )
-            cursor = await self._db.execute(
-                "SELECT rowid FROM embedding WHERE embedding_id = ?",
-                (eid,),
-            )
-            inserted_row = await cursor.fetchone()
-            if inserted_row is None:
-                msg = f"Embedding row missing after insert: {eid}"
-                raise RuntimeError(msg)
-            rowid = int(inserted_row["rowid"])
-        else:
-            rowid = int(existing_row["rowid"])
-            await self._db.execute(
-                "UPDATE embedding SET "
-                "owner_type = ?, owner_id = ?, model_name = ?, dimension = ?, "
-                "vector_blob = ?, created_at = ? "
-                "WHERE embedding_id = ?",
-                ("THOUGHT", thought_id, model_name, dimension, blob, created_at, eid),
-            )
+                rowid: int
+                if existing_row is None:
+                    await self._db.execute(
+                        "INSERT INTO embedding "
+                        "(embedding_id, owner_type, owner_id, model_name, "
+                        "dimension, vector_blob, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (eid, "THOUGHT", thought_id, model_name, dimension, blob, created_at),
+                    )
+                    cursor = await self._db.execute(
+                        "SELECT rowid FROM embedding WHERE embedding_id = ?",
+                        (eid,),
+                    )
+                    inserted_row = await cursor.fetchone()
+                    if inserted_row is None:
+                        msg = f"Embedding row missing after insert: {eid}"
+                        raise RuntimeError(msg)
+                    rowid = int(inserted_row["rowid"])
+                else:
+                    rowid = int(existing_row["rowid"])
+                    await self._db.execute(
+                        "UPDATE embedding SET "
+                        "owner_type = ?, owner_id = ?, model_name = ?, dimension = ?, "
+                        "vector_blob = ?, created_at = ? "
+                        "WHERE embedding_id = ?",
+                        ("THOUGHT", thought_id, model_name, dimension, blob, created_at, eid),
+                    )
 
-        # Keep the vec0 vector table in sync when a vector backend is active.
-        if self._vector_backend is not None:
-            await self._vector_backend.upsert_embedding(
-                self._db,
-                rowid=rowid,
-                vector=vector,
-            )
+                # Keep the vec0 vector table in sync when a vector backend is
+                # active. A rejection here (e.g. a wrong-dimension vector) is
+                # unwound together with the base row write above, by the
+                # savepoint this block is nested in.
+                if self._vector_backend is not None:
+                    await self._vector_backend.upsert_embedding(
+                        self._db,
+                        rowid=rowid,
+                        vector=vector,
+                    )
 
-        await self._maybe_commit()
+            await self._maybe_commit()
         return EmbeddingRecord(
             embedding_id=eid,
             owner_type="THOUGHT",
@@ -6586,6 +10623,335 @@ class SqliteEngravaCore:
             vector_blob=blob,
             created_at=created_at,
         )
+
+    async def _delete_thought_children_explicit(self, thought_id: str) -> bool:
+        """Delete a thought's edge / embedding / action rows without a cascade.
+
+        ``ON DELETE CASCADE`` on these three tables only exists from the
+        core-12 schema onward (``_migrate_core_v11_to_v12``); on an older
+        schema a plain ``DELETE FROM thought`` leaves them behind, orphaned
+        but intact. A dangling ``embedding`` row in particular is what let a
+        later reconciliation pass (``sync_embeddings``) treat the thought as
+        still live and restore its vector — the resurrection this deletion
+        rule exists to close off. Every physical thought-delete path in the
+        core (``delete_thought``, the TTL ``delete`` strategy, and hygiene GC)
+        reaches this only through :meth:`_delete_thought_atomic`, which calls
+        it right after the parent delete, so none of them
+        depends on a cascade the database it is running against may not
+        have.
+
+        **The three deletes share one savepoint, not three independent
+        statements.** A failure of any of them is handled as described under
+        **Failure** below, instead of leaving the earlier deletes in an open
+        transaction for a later write on this connection to commit. The
+        savepoint's ``RELEASE`` runs inside the same guarded region as the
+        deletes.
+
+        The savepoint never starts the transaction: releasing a savepoint that
+        started one commits it, which would commit ahead of
+        :meth:`_delete_thought_atomic`'s own ``RELEASE``, the vector purge and
+        the journal entry. So a transaction is opened first when
+        :attr:`self._db.in_transaction <aiosqlite.Connection.in_transaction>`
+        is not already ``True`` — the same check
+        :meth:`_serialize_dedup_probe` uses — with ``BEGIN IMMEDIATE`` rather
+        than a deferred ``BEGIN``, mirroring :meth:`_write_readback_savepoint`
+        and :meth:`_delete_thought_atomic`, so the write lock is taken up
+        front, through the busy handler. This method never commits.
+
+        **Failure.** When a delete or the release raises and
+        ``self._db.in_transaction`` is still true, the unwind issues
+        ``ROLLBACK TO`` and ``RELEASE`` for the savepoint, and rolls back the
+        transaction as well if this call opened it; a transaction the caller
+        already held is left open. When it is no longer true — a trigger using
+        ``RAISE(ROLLBACK, ...)`` ends the whole transaction, the savepoint and
+        any earlier work of the caller's in it included — the exception is
+        re-raised with nothing to unwind. If the unwind itself raises, this
+        method calls :meth:`_quarantine_connection` instead of guessing at a
+        consistent state.
+
+        Args:
+            thought_id: UUID of the thought whose children are being removed.
+
+        Returns:
+            ``True`` if the connection's own change counter is higher after
+            the three deletes than it was before them, ``False`` otherwise.
+            This is not the same as "one of the three rowcounts is nonzero":
+            a ``BEFORE DELETE`` trigger on any of the three tables can insert
+            a row of its own (an audit entry, say) and then veto its own
+            statement with ``RAISE(IGNORE)``, leaving every rowcount at zero
+            while that insert is still applied. It is also independent of
+            whether the *parent* thought existed — a schema (or connection)
+            without FK enforcement can carry an orphaned child for a
+            ``thought_id`` that was never a live thought at all, and sweeping
+            that orphan is itself a real write :meth:`_delete_thought_atomic`
+            must account for even when it reports the parent as not deleted.
+
+        Raises:
+            aiosqlite.Error: Propagated from any of the three deletes (e.g. a
+                trigger that raises).
+            asyncio.CancelledError: Propagated when this call is cancelled,
+                including a cancellation that lands during the unwind, which
+                is raised in preference to the error being unwound.
+            ConnectionQuarantinedError: From this store's next guarded call
+                after the connection was quarantined. This call itself
+                raises the original failure (or the cancellation).
+
+        """
+        opened_transaction = not self._db.in_transaction
+        if opened_transaction:
+            await self._db.execute("BEGIN IMMEDIATE")
+        await self._db.execute("SAVEPOINT delete_thought_children")
+        try:
+            # `total_changes` (not each cursor's own `rowcount`) is what
+            # actually answers "did this write anything": a `BEFORE DELETE`
+            # trigger on any of these three tables can insert an audit row
+            # of its own and then veto its own statement with
+            # `RAISE(IGNORE)`, which leaves that insert applied while the
+            # vetoed delete's rowcount is zero. `rowcount` cannot see the
+            # trigger's write; `total_changes` counts it.
+            changes_before = self._db.total_changes
+            await self._db.execute(
+                "DELETE FROM edge WHERE from_thought_id = ? OR to_thought_id = ?",
+                (thought_id, thought_id),
+            )
+            await self._db.execute(
+                "DELETE FROM embedding WHERE owner_id = ?",
+                (thought_id,),
+            )
+            await self._db.execute(
+                "DELETE FROM action WHERE source_thought_id = ?",
+                (thought_id,),
+            )
+            wrote_anything = self._db.total_changes > changes_before
+            # The release lives INSIDE this guarded region, deliberately —
+            # not after it — so that a failure or cancellation delivered
+            # while awaiting it reaches the unwind below.
+            await self._db.execute("RELEASE delete_thought_children")
+        # ``except BaseException`` (not ``Exception``) so a cancellation
+        # landing anywhere in the block above — mid-delete or during the
+        # release itself — also reaches the unwind below before it
+        # propagates.
+        except BaseException as exc:
+            if not self._db.in_transaction:
+                # A RAISE(ROLLBACK) trigger already ended the whole
+                # transaction (savepoint included) — see the docstring.
+                # Nothing is left open for a later write to inherit, so
+                # there is nothing to unwind and nothing to quarantine.
+                raise
+            try:
+                await self._db.execute("ROLLBACK TO delete_thought_children")
+                await self._db.execute("RELEASE delete_thought_children")
+                if opened_transaction:
+                    await self._db.rollback()
+            except BaseException as unwind_exc:
+                # The unwind itself failed: recovery cannot be proven, so
+                # this connection is no longer trusted to decide anything
+                # about the transaction it might still be holding open —
+                # quarantine it rather than guess. `_quarantine_connection`
+                # awaits nothing internally (every step is synchronous), so
+                # this call itself cannot be interrupted partway.
+                await self._quarantine_connection(
+                    f"delete_thought_children could not unwind its savepoint "
+                    f"after {exc!r}: {unwind_exc!r}"
+                )
+                if isinstance(unwind_exc, asyncio.CancelledError):
+                    # A cancellation arriving during the unwind always wins
+                    # over the error the unwind was trying to recover from —
+                    # never swallowed, or shutdown/timeout stop working.
+                    raise
+                # Any other unwind failure: the caller still sees the
+                # original error, not this one. `unwind_exc` is chained as
+                # the cause for diagnosis, never as the raised type.
+                raise exc from unwind_exc
+            raise
+        # No ``else`` branch: the release is the last statement inside the
+        # ``try`` above, and reaching here means it already succeeded. Never
+        # a commit on any path — the parent delete has already run by the time
+        # this runs (see ``_delete_thought_atomic``), which still has its own
+        # ``RELEASE`` to issue, and the original caller (``delete_thought`` /
+        # ``cleanup_expired`` / hygiene GC) still has the vector purge and
+        # the journal entry to write before its own ``_maybe_commit()``
+        # decides when any of it becomes durable.
+        return wrote_anything
+
+    async def _delete_thought_atomic(self, thought_id: str) -> _DeleteAtomicResult:
+        """Delete a thought and its children inside one savepoint.
+
+        The parent delete comes first, inside the savepoint that also covers
+        :meth:`_delete_thought_children_explicit`'s deletes of the edge,
+        embedding and action rows. The parent goes first so that a
+        ``BEFORE DELETE`` trigger on ``thought`` runs before this method has
+        deleted any child.
+        The child deletes are explicit, not left to ``ON DELETE CASCADE``,
+        because a schema older than core 12 has no cascade and a connection
+        with ``PRAGMA foreign_keys`` off does not apply one.
+
+        A ``DELETE`` that reports no row deleted cannot say why, so the method
+        first reads, inside the savepoint, whether the row exists. When this call
+        opens the transaction it uses ``BEGIN IMMEDIATE``, so the write lock is
+        taken up front, before that read.
+
+        When nothing raises there are three outcomes:
+
+        * The row existed and the parent ``DELETE`` reported a row deleted: the
+          child deletes run and the savepoint is released.
+        * The row did not exist: the child deletes run anyway, and
+          ``deleted`` is ``False``.
+        * The row existed and the parent ``DELETE`` reported no row deleted:
+          the savepoint is rolled back and the child deletes do not run, so
+          the row and its children are as they were, and ``deleted`` is
+          ``False``. A transaction this call opened is rolled back as well.
+
+        Quarantine and cancellation handling wrap
+        :meth:`_delete_thought_children_explicit`'s rather than duplicating
+        it: if that call already quarantined the connection while unwinding
+        its own (nested) savepoint, ``self._db`` is now the terminal
+        ``_QuarantinedConnection`` proxy, and touching it again — even just
+        reading ``.in_transaction`` — raises
+        :class:`ConnectionQuarantinedError`, which would silently replace the
+        real error (an ``asyncio.CancelledError``, in the race that provokes
+        this) with that one. So ``self._connection_quarantined`` — a plain
+        flag on ``self``, never proxied — is checked *first*, before
+        ``self._db`` is touched at all, and the original error is left to
+        propagate unchanged when it is already set.
+
+        Args:
+            thought_id: UUID of the thought to delete, along with its
+                edge / embedding / action rows.
+
+        Returns:
+            A :class:`_DeleteAtomicResult`. Its ``deleted`` is ``True`` if a
+            thought row was deleted, ``False`` if no row matched
+            ``thought_id`` **or** a row matched but the delete removed
+            nothing (a ``RAISE(IGNORE)`` trigger, for one) — in both cases the
+            caller must treat this exactly like "nothing was deleted": no
+            vector purge, no journal append. Its ``wrote_anything`` is
+            ``True`` if ``total_changes`` rose across the parent delete and
+            the child sweep. Callers use it to decide whether they have
+            anything of their own left to commit; ``deleted`` alone is not
+            that signal (see the class docstring). A parent delete that matches
+            no row although the row existed rolls its own savepoint all the
+            way back, so a write a trigger made along the way does not make
+            this ``True``.
+
+        Raises:
+            aiosqlite.Error: Propagated from the parent delete or any of the
+                three child deletes (e.g. a trigger that raises), once this
+                savepoint's own unwind (if one was needed) has completed.
+            asyncio.CancelledError: Propagated on cancellation, in
+                preference to any error an unwind it interrupted was trying
+                to recover from.
+            ConnectionQuarantinedError: On this store's *next* guarded call,
+                after an unwind attempt (here, or inside
+                :meth:`_delete_thought_children_explicit`) itself failed and
+                a consistent state could not be proven.
+
+        """
+        opened_transaction = not self._db.in_transaction
+        if opened_transaction:
+            await self._db.execute("BEGIN IMMEDIATE")
+        await self._db.execute("SAVEPOINT delete_thought_atomic")
+        try:
+            # Read inside this savepoint, immediately before the parent
+            # DELETE, so a DELETE that matches no row can be told apart from
+            # a ``thought_id`` that does not exist — see the docstring.
+            existence_cursor = await self._db.execute(
+                "SELECT 1 FROM thought WHERE thought_id = ?", (thought_id,)
+            )
+            existed_before = await existence_cursor.fetchone() is not None
+
+            changes_before = self._db.total_changes
+            cursor = await self._db.execute(
+                "DELETE FROM thought WHERE thought_id = ?", (thought_id,)
+            )
+            deleted = cursor.rowcount > 0
+
+            if deleted or not existed_before:
+                # Either the parent delete actually succeeded, or
+                # ``thought_id`` never matched a row at all: sweep any
+                # orphaned edge / embedding / action rows a schema without a
+                # cascade could still be carrying. That sweep can itself
+                # write real rows even when ``deleted`` is ``False`` — see
+                # _DeleteAtomicResult — so its own report is folded in here
+                # rather than assumed away. Folded in via ``total_changes``
+                # over both statements together, not the child call's return
+                # OR'd onto ``deleted``: a trigger anywhere in this span
+                # (the parent delete or any of the three child deletes) can
+                # write a real row and still veto its own statement with
+                # ``RAISE(IGNORE)``, which leaves every rowcount involved at
+                # zero. ``total_changes`` counts that write; rowcount cannot.
+                await self._delete_thought_children_explicit(thought_id)
+                await self._db.execute("RELEASE delete_thought_atomic")
+                # Sampled last, after the ``RELEASE`` -- not before it. See
+                # ``update_edge`` for why: this connection's own
+                # ``total_changes`` can lag a write by one further
+                # SAVEPOINT-class statement on an FTS-backed table, and
+                # ``RELEASE`` is one such statement. Reading it only now
+                # means nothing this branch did (the parent delete, the
+                # child sweep, and this release) can land uncounted.
+                wrote_anything = self._db.total_changes > changes_before
+            else:
+                # existed_before and not deleted: the row was there and the
+                # DELETE still matched zero rows. Roll the savepoint back
+                # instead of sweeping the children: this discards the DELETE
+                # and any write made inside this savepoint since it began
+                # (e.g. an audit insert by a trigger), so ``wrote_anything``
+                # is ``False`` here, and skipping the sweep is what keeps the
+                # parent's children attached to it.
+                wrote_anything = False
+                await self._db.execute("ROLLBACK TO delete_thought_atomic")
+                await self._db.execute("RELEASE delete_thought_atomic")
+                if opened_transaction:
+                    # This call opened the outer transaction (sampled via
+                    # ``opened_transaction`` before anything below it ran),
+                    # and nothing durable happened inside it
+                    # — the parent row is unchanged and the children were
+                    # never swept. Ending it here — rather than trusting a
+                    # caller to do it — is what keeps a delete that removed nothing from
+                    # being indistinguishable, to a second connection, from a
+                    # still-open write reservation. This call must not depend
+                    # on which caller it came from to end a transaction it
+                    # opened itself. A rollback, not a commit — there is
+                    # nothing of ours to preserve, and a transaction we opened
+                    # ourselves cannot be carrying a caller's pending work for
+                    # a commit to risk instead.
+                    await self._db.rollback()
+        # ``except BaseException`` for the same reason
+        # ``_delete_thought_children_explicit`` uses it: a cancellation must
+        # reach the unwind below too, not just an ordinary ``Exception``.
+        except BaseException as exc:
+            if self._connection_quarantined:
+                # The nested call already quarantined the connection and
+                # left `self._db` a terminal proxy — see the docstring.
+                # Nothing here can be trusted to roll back or release
+                # anything, and touching `self._db` would replace `exc`
+                # with ConnectionQuarantinedError instead of propagating it.
+                raise
+            if not self._db.in_transaction:
+                # A RAISE(ROLLBACK) trigger — on `thought` itself, or
+                # propagated up from the nested savepoint — already ended
+                # the whole transaction. Nothing is left open to unwind.
+                raise
+            try:
+                await self._db.execute("ROLLBACK TO delete_thought_atomic")
+                await self._db.execute("RELEASE delete_thought_atomic")
+                if opened_transaction:
+                    await self._db.rollback()
+            except BaseException as unwind_exc:
+                # The unwind itself failed: recovery cannot be proven, so
+                # this connection is no longer trusted to decide anything
+                # about the transaction it might still be holding open —
+                # quarantine it rather than guess, mirroring
+                # _delete_thought_children_explicit's own handling.
+                await self._quarantine_connection(
+                    f"delete_thought_atomic could not unwind its savepoint "
+                    f"after {exc!r}: {unwind_exc!r}"
+                )
+                if isinstance(unwind_exc, asyncio.CancelledError):
+                    raise
+                raise exc from unwind_exc
+            raise
+        return _DeleteAtomicResult(deleted=deleted, wrote_anything=wrote_anything)
 
     async def _embedding_rowid_for_thought(self, thought_id: str) -> int | None:
         """Resolve the ``embedding`` rowid backing a thought's vector, if any.
@@ -6617,9 +10983,8 @@ class SqliteEngravaCore:
         """Remove a now-orphaned vec0 vector left behind by a thought delete.
 
         Paired with :meth:`_embedding_rowid_for_thought`: the numpy backend
-        yields ``None`` (nothing to do — byte-identical to the pre-fix path),
-        while an active sqlite-vec backend deletes the vector whose FK-cascaded
-        ``embedding`` row has just been removed.
+        yields ``None`` (nothing to do), while an active sqlite-vec backend
+        deletes the vec0 vector at ``rowid``.
 
         Args:
             rowid: The vec0 rowid to delete, or ``None`` to no-op.
@@ -6777,9 +11142,9 @@ class SqliteEngravaCore:
             # nearest ``top_k`` neighbours turn out to be non-live. Fetch a
             # bounded multiple instead, filter, sort, then trim to ``top_k`` so
             # the trim keeps the highest-similarity *live* rows. The deeper live
-            # pool also now feeds the hybrid-fusion vector arm more completely
-            # (previously under-fed); for stores containing expired/retired rows
-            # this can shift the fused order — a more-correct pool, disclosed.
+            # pool feeds the hybrid-fusion vector arm more completely; for
+            # stores containing expired/retired rows this can shift the fused
+            # order.
             overfetch_factor = (
                 self._search_config.vec0_overfetch_factor if self._search_config is not None else 4
             )
@@ -6813,26 +11178,32 @@ class SqliteEngravaCore:
         *,
         include_archived: bool = False,
     ) -> list[tuple[str, float]]:
-        """Remove expired thoughts, retired REFLECTIONs, and archived rows.
+        """Keep only results that positively resolve to a live, eligible thought.
 
-        Used as a post-filter for search backends (e.g. sqlite-vec)
-        that cannot natively exclude expired rows in their queries. It also
-        applies the REFLECTION freshness floor: a retired REFLECTION (an
-        orphan archived once its cluster left the active set) must not
-        over-recall on its now-stale centroid, so any REFLECTION whose
-        ``lifecycle_status`` is not ``ACTIVE`` is dropped. Other thought
-        types are gated on expiry — and, unless ``include_archived`` is set,
-        on the archived-exclusion rule.
+        Used as a post-filter for search backends (e.g. sqlite-vec) that
+        cannot natively exclude ineligible rows in their queries. Under the
+        rule that a vector is owned by a live thought, a vec0 hit is only
+        ever as trustworthy as the ``embedding`` row it was resolved through,
+        and that row can outlive its thought on a schema predating the
+        core-12 cascade — so this filter does not compute what to *remove*
+        from an otherwise-trusted list. It computes what it can **positively
+        confirm** — a ``thought`` row that exists, is not expired, is not a
+        retired REFLECTION, and (unless ``include_archived``) is not
+        archived — and keeps only that. An id absent from ``thought``
+        entirely, including a deleted thought whose ``embedding`` row was
+        never cleaned up, resolves no confirming row and is dropped by
+        construction rather than by a case this filter has to remember to
+        add: **absence is a positive exclusion, not an incidental miss.**
 
         Args:
             results: List of ``(thought_id, similarity_score)`` pairs.
-            include_archived: When ``False`` (the default) archived thoughts are
-                added to the excluded set; when ``True`` they are retained (the
-                retired-REFLECTION and expiry gates still apply).
+            include_archived: When ``False`` (the default) archived thoughts
+                are never confirmed eligible; when ``True`` they may be (the
+                retired-REFLECTION, expiry, and existence gates still apply).
 
         Returns:
-            Filtered list with expired thoughts, retired REFLECTIONs, and — when
-            ``include_archived`` is ``False`` — archived rows removed.
+            The subset of ``results`` whose thought positively confirms as
+            live and eligible under the current gates.
 
         """
         if not results:
@@ -6840,24 +11211,25 @@ class SqliteEngravaCore:
         now = datetime.datetime.now(datetime.UTC).isoformat()
         ids = [r[0] for r in results]
         placeholders = ",".join("?" * len(ids))
-        # Inverted form: this SELECT collects the rows to *exclude*, so the
-        # archived rule is an ``OR`` here (drop where status IS archived), not
-        # the ``!= 'ARCHIVED'`` keep-form used in the arm WHERE clauses.
-        archived_exclusion = (
-            "" if include_archived else f" OR lifecycle_status = '{LifecycleStatus.ARCHIVED.value}'"
+        # Positive form: keep-form archived gate (``!= 'ARCHIVED'``), matching
+        # the arm WHERE clauses.
+        archived_clause = (
+            ""
+            if include_archived
+            else f" AND lifecycle_status != '{LifecycleStatus.ARCHIVED.value}'"
         )
         cursor = await self._db.execute(
             f"SELECT thought_id FROM thought "  # noqa: S608
             f"WHERE thought_id IN ({placeholders}) "
-            f"AND ((expires_at IS NOT NULL AND expires_at <= ?) "
-            f"OR (thought_type = 'REFLECTION' AND lifecycle_status != 'ACTIVE')"
-            f"{archived_exclusion})",
+            f"AND (expires_at IS NULL OR expires_at > ?) "
+            f"AND NOT (thought_type = 'REFLECTION' AND lifecycle_status != 'ACTIVE')"
+            f"{archived_clause}",
             [*ids, now],
         )
-        excluded_ids = {row["thought_id"] for row in await cursor.fetchall()}
-        if not excluded_ids:
-            return results
-        return [(tid, score) for tid, score in results if tid not in excluded_ids]
+        eligible_ids = {row["thought_id"] for row in await cursor.fetchall()}
+        if not eligible_ids:
+            return []
+        return [(tid, score) for tid, score in results if tid in eligible_ids]
 
     async def _search_similar_numpy(
         self,
@@ -6937,20 +11309,25 @@ class SqliteEngravaCore:
         # per-row ``struct.unpack`` + ``list()``. The dtype is **native-endian**
         # ``np.float32`` — the exact byte layout ``store_embedding`` writes with
         # native ``struct.pack(f"{dim}f", …)`` — so the decode is bit-identical
-        # to the old ``struct.unpack(f"{dim}f", …)`` on every platform (both use
-        # the host byte order). Every embedding in a store shares one
-        # ``dimension`` (enforced by the model lock), so the blobs are joined and
-        # viewed as one ``(n, dimension)`` matrix in a single decode. If any blob
-        # is missing/short (a corrupt or truncated row), the fast path is
-        # abandoned for the original per-row decode so the exact prior
-        # skip/error behaviour is preserved.
+        # to the per-row ``struct.unpack(f"{dim}f", …)`` decode below on every
+        # platform (both use the host byte order). When the rows agree on
+        # ``dimension``, the blobs are joined and viewed as one
+        # ``(n, dimension)`` matrix in a single decode. If a blob is
+        # missing/short (a corrupt or truncated row), the fast path is
+        # abandoned for that per-row decode.
         first_dimension = int(rows[0]["dimension"])
         if len(query_vector) != first_dimension:
             # Typed rejection instead of an opaque numpy ``matmul`` ValueError.
-            # Reached only when the store declares no dimension at the boundary
-            # (no vector backend and no embedding provider), so ``search_similar``
-            # cannot check the length up front and the mismatch would otherwise
-            # surface as an untyped shape error from the dot product below.
+            # Reached whenever no vector backend is configured, whether or not
+            # an embedding provider is: ``search_similar``'s boundary guard
+            # compares ``query_vector`` against ``_declared_embedding_dimension()``
+            # — the provider's *current* dimension, not what a corpus's rows
+            # actually stored — so it lets a query through here whenever it
+            # matches the provider's current setting even if the stored rows
+            # were embedded at a different dimension. This check compares
+            # against the *stored* dimension instead, so it is what actually
+            # catches a corpus written under one dimension being queried after
+            # the provider's own has since changed.
             raise VectorDimensionMismatchError(expected=first_dimension, actual=len(query_vector))
         expected_bytes = first_dimension * 4
         blobs = [row["vector_blob"] for row in rows]
@@ -6962,7 +11339,7 @@ class SqliteEngravaCore:
         if uniform:
             # Decode as native float32 (bit-identical to the stored bytes), then
             # widen to float64 so the norm/dot arithmetic below runs at exactly
-            # the same precision as the original per-row path (which built a
+            # the same precision as the per-row path below (which builds a
             # float64 matrix). ``frombuffer`` returns a read-only view;
             # ``astype`` produces the writable float64 copy the reduction expects.
             matrix = (
@@ -7101,7 +11478,7 @@ class SqliteEngravaCore:
                 (normalized_query, now_iso, *filter_params, top_k),
             )
             rows = await cursor.fetchall()
-        except OperationalError:
+        except OperationalError as exc:
             # The primary MATCH is invalid FTS5. This branch is REACHABLE by
             # real input, by design: a *balanced* quoted phrase carrying
             # adjacent hazardous punctuation (e.g. ``"forum"?``) classifies as
@@ -7116,11 +11493,22 @@ class SqliteEngravaCore:
             # AND/OR/NOT phrase-quoted so FTS5 cannot read it as an operator) —
             # and retry the MATCH once with it.
             self._fts_match_failure_count += 1
+            # No query text and no ``exc_info``: SQLite's own FTS5 syntax error
+            # names the offending token (e.g. ``fts5: syntax error near
+            # "AND"``), which can quote content straight out of the query. A
+            # digest was considered and rejected: an unsalted hash of a short,
+            # low-entropy search query (often one or two words) is a
+            # dictionary lookup away from the plaintext, not a one-way
+            # fingerprint. Log only non-content facts -- length, the
+            # exception's type, and SQLite's own error name -- so an operator
+            # still sees that a fallback happened, how often, and what kind of
+            # error caused it.
             logger.warning(
-                "FTS MATCH failed for normalized query %r; retrying via "
-                "sanitized bare-mode fallback",
-                normalized_query,
-                exc_info=True,
+                "FTS MATCH failed for a query of length %d; retrying via "
+                "sanitized bare-mode fallback [error type=%s, sqlite error=%s]",
+                len(normalized_query),
+                type(exc).__name__,
+                getattr(exc, "sqlite_errorname", None),
             )
             fallback_query = _normalize_fts_query_bare(query)
             if not fallback_query:
@@ -7132,7 +11520,7 @@ class SqliteEngravaCore:
                     (fallback_query, now_iso, *filter_params, top_k),
                 )
                 rows = await cursor.fetchall()
-            except OperationalError:  # pragma: no cover - unreachable for real input
+            except OperationalError as exc:  # pragma: no cover - unreachable for real input
                 # Effectively unreachable for real input — unlike the primary
                 # failure above, which is a designed, counted recovery. The bare
                 # path emits only sanitized, wildcard-collapsed, operator-quoted
@@ -7141,10 +11529,18 @@ class SqliteEngravaCore:
                 # that reaches here). This is defense-in-depth against an
                 # unforeseen residual only: degrade to no FTS hits rather than
                 # propagate.
+                #
+                # Same content discipline as the primary failure above: no
+                # query text, no ``exc_info`` (SQLite's own error message can
+                # quote the offending token), and no digest either -- an
+                # unsalted hash of a short query is reversible by dictionary
+                # lookup. Length, exception type and SQLite's error name only.
                 logger.warning(
-                    "FTS bare-mode fallback also failed for %r; returning no FTS results",
-                    fallback_query,
-                    exc_info=True,
+                    "FTS bare-mode fallback also failed for a query of length %d; "
+                    "returning no FTS results [error type=%s, sqlite error=%s]",
+                    len(fallback_query),
+                    type(exc).__name__,
+                    getattr(exc, "sqlite_errorname", None),
                 )
                 await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
                 return []
@@ -7461,6 +11857,84 @@ class SqliteEngravaCore:
             scores[thought_id] = boost_map.get(priority_val, 0.0)
         return scores
 
+    async def _fetch_candidate_adjacency(
+        self,
+        all_ids: list[str],
+        *,
+        max_neighbors: int,
+    ) -> dict[str, list[tuple[str, float]]]:
+        """Fetch each candidate's top-``max_neighbors`` 1-hop neighbours, bounded in SQL.
+
+        The candidate-ID list is queried in 450-wide chunks (SQLite's bound
+        parameter ceiling makes one query per chunk necessary once the
+        candidate pool is large). Each chunk's query:
+
+        1. Builds every ``(candidate, neighbour, weight)`` triple touching a
+           candidate in that chunk, from either edge direction.
+        2. Ranks each candidate's triples by ``weight`` descending (ties
+           broken by ``edge_id`` for a deterministic order) with a single
+           ``ROW_NUMBER() OVER (PARTITION BY candidate_id ...)`` — one window
+           per candidate across *both* directions combined, not one per
+           direction, so a candidate with strong edges on both sides isn't
+           handed up to ``2 * max_neighbors`` rows.
+        3. Keeps only rows within the per-candidate rank cutoff, so no more
+           than ``max_neighbors`` rows per candidate ever cross back into
+           Python — the SQL layer enforces the bound, not a Python-side
+           ``sorted(...)[:max_neighbors]`` slice applied after everything
+           was already fetched.
+
+        Chunking also fixes cross-chunk double-counting as a structural
+        property rather than a post-hoc deduplication step: a candidate ID
+        belongs to exactly one chunk (the chunks are a strict partition of
+        ``all_ids``), and each chunk's query only ranks/returns rows for
+        *its own* candidates — a candidate's neighbour list is therefore
+        computed by exactly one chunk's query, however many other chunks'
+        `IN` predicates an edge touching it also happens to satisfy.
+
+        Args:
+            all_ids: Candidate thought IDs to fetch adjacent edges for.
+            max_neighbors: Maximum neighbours kept per candidate, combined
+                across both edge directions.
+
+        Returns:
+            Mapping of candidate thought_id to its bounded, weight-ordered
+            ``(neighbour_id, edge_weight)`` list.
+
+        """
+        chunk_size = 450
+        adjacency: dict[str, list[tuple[str, float]]] = {}
+        for i in range(0, len(all_ids), chunk_size):
+            chunk = all_ids[i : i + chunk_size]
+            placeholders = ", ".join("?" for _ in chunk)
+            sql = (
+                "WITH matched AS ("  # noqa: S608
+                "  SELECT from_thought_id AS candidate_id, to_thought_id AS neighbour_id, "
+                "         weight, edge_id "
+                f"  FROM edge WHERE from_thought_id IN ({placeholders}) "
+                "  UNION ALL "
+                "  SELECT to_thought_id AS candidate_id, from_thought_id AS neighbour_id, "
+                "         weight, edge_id "
+                f"  FROM edge WHERE to_thought_id IN ({placeholders}) "
+                ") "
+                "SELECT candidate_id, neighbour_id, weight FROM ("
+                "  SELECT candidate_id, neighbour_id, weight, "
+                "         ROW_NUMBER() OVER ("
+                "             PARTITION BY candidate_id ORDER BY weight DESC, edge_id"
+                "         ) AS rn "
+                "  FROM matched "
+                ") WHERE rn <= ? "
+                "ORDER BY candidate_id, weight DESC"
+            )
+            params: list[object] = [*chunk, *chunk, max_neighbors]
+            cursor = await self._db.execute(sql, params)
+            rows = await cursor.fetchall()
+            for r in rows:
+                candidate_id = str(r["candidate_id"])
+                neighbour_id = str(r["neighbour_id"])
+                weight = float(r["weight"])
+                adjacency.setdefault(candidate_id, []).append((neighbour_id, weight))
+        return adjacency
+
     async def _load_graph_signal(
         self,
         *,
@@ -7493,48 +11967,15 @@ class SqliteEngravaCore:
             return {}
 
         all_ids = list(candidate_scores.keys())
-        # Batch query — fetch all edges touching any candidate
-        chunk_size = 450
-        edge_rows: list[dict[str, object]] = []
-        for i in range(0, len(all_ids), chunk_size):
-            chunk = all_ids[i : i + chunk_size]
-            placeholders = ", ".join("?" for _ in chunk)
-            sql = (
-                f"SELECT from_thought_id, to_thought_id, weight "  # noqa: S608
-                f"FROM edge WHERE from_thought_id IN ({placeholders}) "
-                f"OR to_thought_id IN ({placeholders}) "
-                f"ORDER BY weight DESC"
-            )
-            params = [*chunk, *chunk]
-            cursor = await self._db.execute(sql, params)
-            rows = await cursor.fetchall()
-            edge_rows.extend(
-                {"from": r["from_thought_id"], "to": r["to_thought_id"], "weight": r["weight"]}
-                for r in rows
-            )
+        adjacency = await self._fetch_candidate_adjacency(all_ids, max_neighbors=max_neighbors)
 
-        # Build adjacency: candidate → list of (neighbour_id, edge_weight)
-        adjacency: dict[str, list[tuple[str, float]]] = {}
-        candidate_set = set(all_ids)
-        for edge in edge_rows:
-            from_id = str(edge["from"])
-            to_id = str(edge["to"])
-            w = float(edge["weight"])  # type: ignore[arg-type]  # the row's weight column is numeric
-            if from_id in candidate_set:
-                adjacency.setdefault(from_id, []).append((to_id, w))
-            if to_id in candidate_set:
-                adjacency.setdefault(to_id, []).append((from_id, w))
-
-        # Compute boost per candidate (prefer highest-weight neighbours)
+        # Compute boost per candidate — the adjacency fetched above is
+        # already bounded to `max_neighbors` per candidate and ordered by
+        # weight, so no further Python-side sorting or slicing is needed.
         boosts: dict[str, float] = {}
         for cid in all_ids:
-            neighbors = sorted(
-                adjacency.get(cid, []),
-                key=lambda x: x[1],
-                reverse=True,
-            )[:max_neighbors]
             boost = 0.0
-            for neighbour_id, edge_weight in neighbors:
+            for neighbour_id, edge_weight in adjacency.get(cid, []):
                 neighbour_base = candidate_scores.get(neighbour_id, 0.0)
                 boost += edge_weight * neighbour_base * graph_edge_decay
             if boost > 0.0:
@@ -7986,6 +12427,176 @@ class SqliteEngravaCore:
             unit_keys[thought_id] = None if any(c is None for c in components) else components
         return unit_keys
 
+    async def _apply_reflection_filter_boost(
+        self,
+        *,
+        combined: dict[str, float],
+        include_reflections: bool,
+        resolved_reflection_boost: float,
+        needs_reflection_ids: bool,
+    ) -> set[str]:
+        """Resolve REFLECTION ids for ``combined`` and apply filter/boost.
+
+        Shared by the FTS/vector-active fusion path and the query-less
+        fallback: both need the same REFLECTION id lookup, the same
+        ``include_reflections=False`` hard filter, and the same
+        ``reflection_boost`` scaling before either path computes its own
+        (path-specific) ranked order.
+
+        Args:
+            combined: Candidate ``thought_id -> score`` map, mutated in
+                place — REFLECTION ids are popped (``include_reflections``
+                ``False``) or score-scaled (``resolved_reflection_boost !=
+                1.0``).
+            include_reflections: When ``False``, REFLECTION ids are removed
+                from ``combined``.
+            resolved_reflection_boost: The already-resolved boost factor
+                (see ``search_hybrid``'s ``reflection_boost`` argument).
+            needs_reflection_ids: Whether a REFLECTION id lookup is needed
+                at all (``False`` short-circuits the query — neither the
+                filter, the boost, nor the caller's ``reflection_topk_cap``
+                check requires it).
+
+        Returns:
+            The resolved REFLECTION id set (empty when none matched or
+            ``needs_reflection_ids`` was ``False``).
+
+        """
+        reflection_ids: set[str] = set()
+        if needs_reflection_ids and combined:
+            candidate_ids = list(combined)
+            placeholders = ", ".join("?" for _ in candidate_ids)
+            cursor = await self._db.execute(
+                f"SELECT thought_id FROM thought"  # noqa: S608
+                f" WHERE thought_type = 'REFLECTION'"
+                f" AND thought_id IN ({placeholders})",
+                candidate_ids,
+            )
+            rows = await cursor.fetchall()
+            reflection_ids = {str(r["thought_id"]) for r in rows}
+
+        if not include_reflections:
+            for rid in reflection_ids:
+                combined.pop(rid, None)
+        elif resolved_reflection_boost != 1.0 and reflection_ids:
+            for rid in reflection_ids:
+                if rid in combined:
+                    combined[rid] = combined[rid] * resolved_reflection_boost
+        return reflection_ids
+
+    async def _apply_collapse_and_topk_cap(
+        self,
+        *,
+        ranked: list[tuple[str, float]],
+        collapse_paths: tuple[str, ...] | None,
+        collapse_max_per_unit: int | None,
+        reflection_ids: set[str],
+        resolved_reflection_topk_cap: float,
+        include_reflections: bool,
+        top_k: int,
+    ) -> tuple[list[tuple[str, float]], int]:
+        """Apply collapse-by-unit retention, then ``reflection_topk_cap``.
+
+        ``ranked`` must already be in the caller's deterministic total
+        order (score descending, under whatever tie-break rule that path
+        uses). Shared by the FTS/vector-active fusion path and the
+        query-less fallback, so a caller-requested ``collapse_key`` /
+        ``reflection_topk_cap`` is honoured identically regardless of which
+        arms produced the candidates.
+
+        Args:
+            ranked: Candidates already sorted into the caller's total
+                order.
+            collapse_paths: Validated de-fragmentation unit-key paths, or
+                ``None`` to leave ``ranked`` unchanged.
+            collapse_max_per_unit: Intra-unit retention depth (see
+                ``search_hybrid``'s docstring); inert unless
+                ``collapse_paths`` is also set.
+            reflection_ids: REFLECTION ids among ``ranked`` (from
+                :meth:`_apply_reflection_filter_boost`).
+            resolved_reflection_topk_cap: The already-resolved cap fraction.
+            include_reflections: When ``False`` the cap step is skipped —
+                REFLECTIONs were already removed upstream.
+            top_k: Maximum number of final results.
+
+        Returns:
+            The ``(final_results, reflections_evicted)`` pair.
+
+        """
+        # --- De-fragmentation retention-by-unit + backfill ---
+        # Runs AFTER fusion/ranking and REFLECTION boost, BEFORE the
+        # ``[:top_k]`` truncation and BEFORE reflection_topk_cap — the same
+        # locus and shape as the cap's evict-and-backfill. It touches no
+        # score and no candidate set: it only removes surplus lower-ranked
+        # members of the same caller-defined unit so deeper distinct units
+        # in ``ranked[top_k:]`` flow up into the window. ``collapse_max_per_unit``
+        # sets how many members of a unit are kept: ``None`` => 1
+        # (single-keeper collapse), an integer keeps that many.
+        if collapse_paths is not None and ranked:
+            unit_keys = await self._fetch_collapse_unit_keys(
+                thought_ids=[tid for tid, _ in ranked],
+                paths=collapse_paths,
+            )
+            ranked = _retain_ranked_by_unit(
+                ranked,
+                unit_keys,
+                max_per_unit=1 if collapse_max_per_unit is None else collapse_max_per_unit,
+            )
+        final = ranked[:top_k]
+
+        # --- reflection_topk_cap enforcement ---
+        # Runs on the (possibly collapsed) ``ranked`` so the single backfill
+        # source is the collapsed off-list pool — no unit is double-counted.
+        reflections_evicted = 0
+        if include_reflections and resolved_reflection_topk_cap < 1.0 and reflection_ids:
+            _max_ref_slots = max(0, int(top_k * resolved_reflection_topk_cap))
+            _ref_in_final = [
+                (i, tid, s) for i, (tid, s) in enumerate(final) if tid in reflection_ids
+            ]
+            if len(_ref_in_final) > _max_ref_slots:
+                _excess = len(_ref_in_final) - _max_ref_slots
+                _to_evict = {
+                    tid for _, tid, _ in sorted(_ref_in_final, key=lambda x: x[2])[:_excess]
+                }
+                _off_list_obs = [(tid, s) for tid, s in ranked[top_k:] if tid not in reflection_ids]
+                if len(_off_list_obs) < _excess:
+                    logger.warning(
+                        "reflection_topk_cap: %d excess REFLECTION(s) to evict but only %d "
+                        "off-list non-REFLECTION candidates available — partial enforcement",
+                        _excess,
+                        len(_off_list_obs),
+                    )
+                _fill = _off_list_obs[:_excess]
+                _survivor_ids = {tid for tid, _ in final if tid not in _to_evict}
+                _survivor_ids.update(tid for tid, _ in _fill)
+                # Rebuild from ``ranked`` — the caller's own total order,
+                # already collapse-retained above — instead of re-sorting the
+                # survivors by ``(score, id)``. For the FTS/vector arms
+                # ``ranked`` already *is* that ``(score desc, id asc)`` order
+                # (built by ``_sort_scored_descending`` at the call site
+                # below), so filtering it reproduces exactly what the re-sort
+                # produced. The query-less fallback's ``ranked`` carries a
+                # different order — recency- or priority-ranked, ties broken
+                # by the DB's own pre-order — which a ``(score, id)`` re-sort
+                # would silently discard in favour of id order. Filtering
+                # ``ranked`` in place keeps whichever order it already
+                # carries, for either caller.
+                final = [item for item in ranked if item[0] in _survivor_ids][:top_k]
+                # ``_to_evict`` REFLECTIONs are removed from the window
+                # unconditionally (independent of how many backfill candidates
+                # were available), so the evicted count is the excess.
+                reflections_evicted = len(_to_evict)
+                logger.info(
+                    "reflection_topk_cap: evicted %d REFLECTION(s) from the top-%d window "
+                    "(cap=%.3f, max reflection slots=%d)",
+                    reflections_evicted,
+                    top_k,
+                    resolved_reflection_topk_cap,
+                    _max_ref_slots,
+                )
+
+        return final, reflections_evicted
+
     async def search_hybrid(  # noqa: C901, PLR0912, PLR0915
         self,
         query_text: str,
@@ -8048,7 +12659,9 @@ class SqliteEngravaCore:
             - If ``priority_weight`` is ``0.0`` → priority skipped.
             - If ``graph_weight`` is ``0.0`` → graph skipped.
             - Disabled weights redistributed proportionally to active signals.
-            - If all signals disabled → fallback to ``list_thoughts(LIMIT top_k)``.
+            - If all signals disabled → fallback to its own query over
+              ``thought`` (see :meth:`_fallback_hybrid_results`), not a call
+              to ``list_thoughts``.
 
         Args:
             query_text: Text query for FTS5 keyword search.
@@ -8267,17 +12880,47 @@ class SqliteEngravaCore:
         # never mid-query (reuses the shared metadata path grammar). ``None``
         # keeps the entire candidate/score/order path byte-identical to today's.
         collapse_paths: tuple[str, ...] | None = None
+        collapse_pool_factor = (
+            self._search_config.collapse_pool_factor if self._search_config is not None else 4
+        )
         if collapse_key is not None:
             collapse_paths = _normalize_collapse_key(collapse_key)
             # Bounded candidate-pool widening: when collapsing, fragments of
             # few units can dominate the per-arm budgets, so widen each arm by
             # a small, config-backed factor to give backfill a deeper distinct
             # -unit pool. Bounded (small int) — never unbounded over-fetch.
-            collapse_pool_factor = (
-                self._search_config.collapse_pool_factor if self._search_config is not None else 4
-            )
             fts_top_k = fts_top_k * collapse_pool_factor
             vector_top_k = vector_top_k * collapse_pool_factor
+
+        # Resolve the REFLECTION cap/boost once, up front, so the query-less
+        # fallback below can size its own row window with the same backfill
+        # headroom the FTS/vector arms already get for free from their much
+        # larger ``fts_top_k`` / ``vector_top_k`` defaults.
+        resolved_reflection_boost = (
+            reflection_boost
+            if reflection_boost is not None
+            else (self._search_config.reflection_boost if self._search_config is not None else 1.0)
+        )
+        resolved_reflection_topk_cap = (
+            self._search_config.reflection_topk_cap if self._search_config is not None else 0.3
+        )
+        needs_reflection_ids = (
+            not include_reflections
+            or resolved_reflection_boost != 1.0
+            or resolved_reflection_topk_cap < 1.0
+        )
+
+        # The query-less fallback has no arm to over-fetch from, so give its
+        # own row window the same bounded, config-backed headroom that
+        # collapse-by-unit backfill and reflection_topk_cap eviction-backfill
+        # both need — both draw replacement candidates from beyond ``top_k``.
+        # Only widen when finalization can actually use the extra depth: with
+        # ``collapse_key=None`` and the cap disabled (``>= 1.0``) the fallback
+        # still fetches exactly ``top_k`` rows, byte-identical to before this
+        # widening existed.
+        fallback_fetch_top_k = top_k
+        if collapse_paths is not None or resolved_reflection_topk_cap < 1.0:
+            fallback_fetch_top_k = top_k * collapse_pool_factor
 
         backends_used: set[str] = set()
         (
@@ -8341,14 +12984,15 @@ class SqliteEngravaCore:
         if not fts_active and not vector_active:
             if recency_active:
                 backends_used.add("recency")
-            # Gate the transaction axis on ``recency_active`` so a weight-0
-            # ``recency_now`` stays inert on this query-less path too: passing
-            # ``transaction_now=None`` when recency is inactive falls the fallback
-            # through to its neutral (flat-score, updated_cycle-ordered) branch,
-            # byte-identical to a query with no recency reference.
+            # Gate BOTH recency references on ``recency_active`` so a weight-0
+            # reference stays inert on this query-less path too, on either
+            # axis: passing ``current_cycle=None`` / ``transaction_now=None``
+            # when recency is inactive falls the fallback through to its
+            # neutral (flat-score, updated_cycle-ordered) branch, byte-identical
+            # to a query with no recency reference.
             fallback = await self._fallback_hybrid_results(
-                top_k=top_k,
-                current_cycle=current_cycle,
+                top_k=fallback_fetch_top_k,
+                current_cycle=current_cycle if recency_active else None,
                 recency_half_life=resolved_recency_half_life,
                 transaction_now=transaction_now if recency_active else None,
                 transaction_half_life_seconds=resolved_recency_now_half_life,
@@ -8365,26 +13009,46 @@ class SqliteEngravaCore:
                     for tid, score in fallback
                 ]
                 fallback.sort(key=lambda x: x[1], reverse=True)
-            # --- REFLECTION filter in fallback path ---
-            if not include_reflections and fallback:
-                fb_ids = [tid for tid, _ in fallback]
-                placeholders = ", ".join("?" for _ in fb_ids)
-                cursor = await self._db.execute(
-                    f"SELECT thought_id FROM thought"  # noqa: S608
-                    f" WHERE thought_type = 'REFLECTION'"
-                    f" AND thought_id IN ({placeholders})",
-                    fb_ids,
-                )
-                rows = await cursor.fetchall()
-                ref_set = {str(r["thought_id"]) for r in rows}
-                fallback = [(tid, s) for tid, s in fallback if tid not in ref_set]
+
+            # Route the fallback's raw (tid, score) pairs through the same
+            # REFLECTION filter/boost, collapse-by-unit, and
+            # reflection_topk_cap finalization the FTS/vector-active path
+            # applies below — a fallback result is still a result, and this
+            # path enforces the same per-call limits.
+            fallback_combined = dict(fallback)
+            reflection_ids = await self._apply_reflection_filter_boost(
+                combined=fallback_combined,
+                include_reflections=include_reflections,
+                resolved_reflection_boost=resolved_reflection_boost,
+                needs_reflection_ids=needs_reflection_ids,
+            )
+            # Preserve the fallback's own deterministic order (recency- and
+            # priority-scored, DB pre-order on ties) instead of re-deriving
+            # one from dict/scan order — only the filter/boost step above
+            # needed dict semantics. A stable sort by score alone keeps that
+            # relative order for every tie the boost left untouched, and only
+            # re-positions ids whose score the boost actually changed.
+            ranked = sorted(
+                ((tid, fallback_combined[tid]) for tid, _ in fallback if tid in fallback_combined),
+                key=lambda item: -item[1],
+            )
+            final, reflections_evicted = await self._apply_collapse_and_topk_cap(
+                ranked=ranked,
+                collapse_paths=collapse_paths,
+                collapse_max_per_unit=collapse_max_per_unit,
+                reflection_ids=reflection_ids,
+                resolved_reflection_topk_cap=resolved_reflection_topk_cap,
+                include_reflections=include_reflections,
+                top_k=top_k,
+            )
 
             await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
 
-            self._buffer_accesses([tid for tid, _ in fallback])
+            self._buffer_accesses([tid for tid, _ in final])
             return HybridSearchResult(
-                results=fallback,
+                results=final,
                 backends_used=frozenset(backends_used),
+                reflections_evicted=reflections_evicted,
             )
 
         token = _SUPPRESS_SEARCH_METRICS.set(True)
@@ -8512,106 +13176,28 @@ class SqliteEngravaCore:
             if _added > 0:
                 backends_used.add("graph_expansion")
 
-        # --- REFLECTION filter + boost + top-K cap ---
-        resolved_reflection_boost = (
-            reflection_boost
-            if reflection_boost is not None
-            else (self._search_config.reflection_boost if self._search_config is not None else 1.0)
+        # --- REFLECTION filter + boost + collapse-by-unit + top-K cap ---
+        # Shared with the query-less fallback path above, so both paths
+        # enforce the same per-call limits regardless of which arms produced
+        # ``combined``.
+        reflection_ids = await self._apply_reflection_filter_boost(
+            combined=combined,
+            include_reflections=include_reflections,
+            resolved_reflection_boost=resolved_reflection_boost,
+            needs_reflection_ids=needs_reflection_ids,
         )
-        resolved_reflection_topk_cap = (
-            self._search_config.reflection_topk_cap if self._search_config is not None else 0.3
-        )
-        _needs_reflection_ids = (
-            not include_reflections
-            or resolved_reflection_boost != 1.0
-            or resolved_reflection_topk_cap < 1.0
-        )
-        reflection_ids: set[str] = set()
-        if _needs_reflection_ids and combined:
-            candidate_ids = list(combined)
-            placeholders = ", ".join("?" for _ in candidate_ids)
-            cursor = await self._db.execute(
-                f"SELECT thought_id FROM thought"  # noqa: S608
-                f" WHERE thought_type = 'REFLECTION'"
-                f" AND thought_id IN ({placeholders})",
-                candidate_ids,
-            )
-            rows = await cursor.fetchall()
-            reflection_ids = {str(r["thought_id"]) for r in rows}
-
-        if not include_reflections:
-            for rid in reflection_ids:
-                combined.pop(rid, None)
-        elif resolved_reflection_boost != 1.0 and reflection_ids:
-            for rid in reflection_ids:
-                if rid in combined:
-                    combined[rid] = combined[rid] * resolved_reflection_boost
-
         # Deterministic total order: score descending, canonical thought_id
         # ascending — invariant to dict/scan order.
         ranked = _sort_scored_descending(list(combined.items()))
-
-        # --- De-fragmentation retention-by-unit + backfill ---
-        # Runs AFTER fusion + recency/priority/graph scoring + the
-        # CONSOLIDATED_FROM expansion and reflection boost, BEFORE the
-        # ``[:top_k]`` truncation and BEFORE reflection_topk_cap — the same
-        # locus and shape as the cap's evict-and-backfill. It touches neither
-        # arm's WHERE, no score, and no candidate set: it only removes surplus
-        # lower-ranked members of the same caller-defined unit so deeper
-        # distinct units in ``ranked[top_k:]`` flow up into the window.
-        # ``collapse_max_per_unit`` sets how many members of a unit are kept:
-        # ``None`` => 1 (single-keeper collapse, byte-identical to before), an
-        # integer keeps that many (deeper same-unit rows survive while the freed
-        # slots still backfill distinct units).
-        if collapse_paths is not None and combined:
-            unit_keys = await self._fetch_collapse_unit_keys(
-                thought_ids=list(combined),
-                paths=collapse_paths,
-            )
-            ranked = _retain_ranked_by_unit(
-                ranked,
-                unit_keys,
-                max_per_unit=1 if collapse_max_per_unit is None else collapse_max_per_unit,
-            )
-        final = ranked[:top_k]
-
-        # --- reflection_topk_cap enforcement ---
-        # Runs on the (possibly collapsed) ``ranked`` so the single backfill
-        # source is the collapsed off-list pool — no unit is double-counted.
-        reflections_evicted = 0
-        if include_reflections and resolved_reflection_topk_cap < 1.0 and reflection_ids:
-            _max_ref_slots = max(0, int(top_k * resolved_reflection_topk_cap))
-            _ref_in_final = [
-                (i, tid, s) for i, (tid, s) in enumerate(final) if tid in reflection_ids
-            ]
-            if len(_ref_in_final) > _max_ref_slots:
-                _excess = len(_ref_in_final) - _max_ref_slots
-                _to_evict = {
-                    tid for _, tid, _ in sorted(_ref_in_final, key=lambda x: x[2])[:_excess]
-                }
-                _off_list_obs = [(tid, s) for tid, s in ranked[top_k:] if tid not in reflection_ids]
-                if len(_off_list_obs) < _excess:
-                    logger.warning(
-                        "reflection_topk_cap: %d excess REFLECTION(s) to evict but only %d "
-                        "off-list non-REFLECTION candidates available — partial enforcement",
-                        _excess,
-                        len(_off_list_obs),
-                    )
-                _fill = _off_list_obs[:_excess]
-                _kept = [(tid, s) for tid, s in final if tid not in _to_evict]
-                final = _sort_scored_descending(_kept + _fill)[:top_k]
-                # ``_to_evict`` REFLECTIONs are removed from the window
-                # unconditionally (independent of how many backfill candidates
-                # were available), so the evicted count is the excess.
-                reflections_evicted = len(_to_evict)
-                logger.info(
-                    "reflection_topk_cap: evicted %d REFLECTION(s) from the top-%d window "
-                    "(cap=%.3f, max reflection slots=%d)",
-                    reflections_evicted,
-                    top_k,
-                    resolved_reflection_topk_cap,
-                    _max_ref_slots,
-                )
+        final, reflections_evicted = await self._apply_collapse_and_topk_cap(
+            ranked=ranked,
+            collapse_paths=collapse_paths,
+            collapse_max_per_unit=collapse_max_per_unit,
+            reflection_ids=reflection_ids,
+            resolved_reflection_topk_cap=resolved_reflection_topk_cap,
+            include_reflections=include_reflections,
+            top_k=top_k,
+        )
 
         await self._record_search_latency((_time.perf_counter() - _t_start) * 1000)
 
@@ -8855,15 +13441,16 @@ class SqliteEngravaCore:
             ThoughtNotFoundError: If the thought does not exist.
 
         """
-        now = datetime.datetime.now(datetime.UTC).isoformat()
-        cursor = await self._db.execute(
-            "UPDATE thought SET access_count = access_count + 1, "
-            "last_accessed_at = ? WHERE thought_id = ?",
-            (now, thought_id),
-        )
-        if cursor.rowcount == 0:
-            raise ThoughtNotFoundError(thought_id)
-        await self._maybe_commit()
+        async with self._write_lock:
+            now = datetime.datetime.now(datetime.UTC).isoformat()
+            cursor = await self._db.execute(
+                "UPDATE thought SET access_count = access_count + 1, "
+                "last_accessed_at = ? WHERE thought_id = ?",
+                (now, thought_id),
+            )
+            if cursor.rowcount == 0:
+                raise ThoughtNotFoundError(thought_id)
+            await self._maybe_commit()
 
     def _buffer_accesses(self, thought_ids: list[str]) -> None:
         """Buffer access events for retrieved thoughts (no DB write).
@@ -8911,30 +13498,63 @@ class SqliteEngravaCore:
         explicitly. A no-op returning ``0`` when tracking is disabled or the
         buffer is empty.
 
+        The buffer is drained only once the store's write lock is held. When
+        the call cannot take the lock within its bound it raises
+        :class:`~engrava.domain.exceptions.WriteLockTimeoutError` and has
+        taken nothing out of the buffer.
+
         Returns:
             The number of buffered access **entries flushed** — the distinct
             thought ids drained from the buffer. This counts entries submitted
             to the batched ``UPDATE``, which is not necessarily the number of
             rows actually updated: an id whose thought was deleted since it was
             buffered matches no row, so it is flushed but updates nothing (the
-            counts are best-effort telemetry, so this is not reconciled).
+            counts are best-effort telemetry, so this is not reconciled). If
+            *none* of the batch matched a row, this call wrote nothing at all,
+            and — like :meth:`delete_thought` — does not commit a caller's own
+            open transaction on the strength of that empty batch.
+
+        Raises:
+            WriteLockTimeoutError: If this call cannot take the store's write
+                lock within ``write_lock_acquire_timeout_seconds``. It has
+                drained nothing.
 
         """
-        if not self._access_tracking_enabled:
+        if not self._access_tracking_enabled or len(self._access_buffer) == 0:
             return 0
-        pending = self._access_buffer.drain()
-        if not pending:
-            return 0
-        # (delta, last_seen, thought_id) — matches the UPDATE parameter order.
-        params = [(delta, ts, tid) for tid, delta, ts in pending]
-        await self._db.executemany(
-            "UPDATE thought SET access_count = access_count + ?, "
-            "last_accessed_at = ? WHERE thought_id = ?",
-            params,
-        )
-        await self._maybe_commit()
+        async with self._write_lock:
+            # Drain only now that the lock is held, so a flush that cannot
+            # take it has drained nothing.
+            pending = self._access_buffer.drain()
+            if not pending:
+                # Another flush took the events while this one waited.
+                return 0
+            # (delta, last_seen, thought_id) — matches the UPDATE parameter order.
+            params = [(delta, ts, tid) for tid, delta, ts in pending]
+            # Sampled before anything below touches the connection — same
+            # ownership test as delete_thought.
+            opened_transaction = not self._db.in_transaction
+            cursor = await self._db.executemany(
+                "UPDATE thought SET access_count = access_count + ?, "
+                "last_accessed_at = ? WHERE thought_id = ?",
+                params,
+            )
+            # sqlite3 (and aiosqlite atop it) sums per-statement row counts
+            # into a single ``executemany`` rowcount, so this is exact, not an
+            # approximation: 0 here means not one entry in the batch matched a
+            # still-existing thought, i.e. this call wrote nothing.
+            if cursor.rowcount > 0:
+                await self._maybe_commit()
+            elif opened_transaction and self._db.in_transaction:
+                # Every id in the batch was stale — nothing was written, so
+                # there is nothing of this call's own to commit. Close only a
+                # transaction this call itself opened; a caller's own open
+                # transaction is left untouched.
+                await self._db.rollback()
         logger.debug(
-            "flushed access buffer: %d thought(s) updated in one batch",
+            "flushed access buffer: %d entries drained in one batch "
+            "(not necessarily the number of rows updated — a deleted "
+            "thought's entry still counts here)",
             len(params),
         )
         return len(params)
@@ -8987,9 +13607,7 @@ class SqliteEngravaCore:
           store, where cycle-recency degenerates into ingest order, from
           archiving its earliest-ingested rows.
         * **Decay clamp.** The ``decay_function`` return is clamped to
-          ``[0.0, 1.0]`` and a non-finite value is treated as ``1.0`` (no decay)
-          — decay can only lower a score toward archive, never resurrect one, and
-          a misbehaving custom hook can never cause a spurious eviction.
+          ``[0.0, 1.0]`` and a non-finite value is treated as ``1.0`` (no decay).
         * **Deterministic capped selection.** Same store + config + cycle ⇒ the
           identical eviction set; archive orders by ``eviction_score ASC,
           updated_cycle ASC, thought_id ASC`` and GC by ``archived_at_cycle ASC,
@@ -8998,17 +13616,16 @@ class SqliteEngravaCore:
           non-NULL ``archived_at_cycle`` (i.e. archived *by hygiene*) are ever
           auto-GC'd — a TTL/manually-archived thought (``archived_at_cycle`` is
           ``None``) is left alone.
-        * **Two restore windows, both required.** GC reaps a hygiene-archived
-          thought only once it is old enough *cognitively* (the cycle window,
-          ``gc_min_archive_age_cycles``) **and** in *real time* (the wall-clock
-          window, ``gc_restore_window_seconds``, measured against ``now``), so a
-          fast-cycling store cannot permanently delete a just-archived thought
-          before a real-time chance to restore it. A hygiene-archived row that
-          predates the ``archived_at`` column (``archived_at`` is ``None``) has
-          no real-time stamp and is never auto-GC'd while the wall-clock window
-          is active — the irreversible stage fails closed. Setting
-          ``gc_restore_window_seconds = 0`` disables the wall-clock window
-          (cycle-only, backward-compatible).
+        * **Two restore windows.** GC requires a hygiene-archived thought to
+          be old enough *cognitively* (the cycle window,
+          ``gc_min_archive_age_cycles``) **and**, while
+          ``gc_restore_window_seconds`` is greater than zero, in *real time*
+          (the wall-clock window, measured against ``now``). A hygiene-archived
+          row that predates the ``archived_at`` column (``archived_at`` is
+          ``None``) has no real-time stamp and is never auto-GC'd while the
+          wall-clock window is active — the irreversible stage fails closed.
+          Setting ``gc_restore_window_seconds = 0`` disables the wall-clock
+          window (cycle-only, backward-compatible).
         * **Dry run.** When ``dry_run`` is set nothing is mutated and nothing is
           journaled; the would-evict set is returned for preview.
 
@@ -9050,6 +13667,9 @@ class SqliteEngravaCore:
                 explicit ``current_cycle`` nor a configured ``cycle_provider``.
             CycleProviderError: When a configured provider returns an invalid
                 value (not an ``int``, a ``bool``, or negative).
+            ConnectionQuarantinedError: When the connection has been
+                quarantined (already, or by this call's own failed-unwind
+                recovery inside its archive+GC unit).
 
         """
         policy = self._hygiene_policy
@@ -9127,16 +13747,71 @@ class SqliteEngravaCore:
                 flat_signals=flat_signals,
             )
 
-        archived_count = await self._hygiene_archive(
-            would_evict, policy=policy, current_cycle=current_cycle, now=now
-        )
+        # Archive + GC share one failure-atomic unit, not just one critical
+        # section: both stages' guarded writes run under `_write_lock` (so a
+        # different task's guarded write cannot land between the archive
+        # stage's last write and the GC stage's first), and both run inside
+        # one `_write_readback_savepoint` unit, so a failed or cancelled
+        # journal append anywhere in either stage unwinds every write the
+        # pass has made so far -- not just the write it failed on. A nested
+        # public write inside that unit -- `retire_orphan_reflections` writes
+        # through `update_thought`, whose own `_maybe_commit()` commits --
+        # would otherwise release the unit's savepoint right along with it;
+        # suppressing nested commits for the unit's duration (task-locally,
+        # via `_SUPPRESS_NESTED_AUTO_COMMIT` -- see that ContextVar's
+        # docstring for why not the instance-wide `_skip_auto_commit_depth`)
+        # keeps the whole pass inside the one savepoint instead.
+        async with self._write_lock:
+            # Sampled before the unit below touches the connection, mirroring
+            # delete_thought / cleanup_expired / delete_edge: whether this
+            # call is the one that opened the transaction it may need to
+            # close once the unit exits cleanly with nothing to commit.
+            opened_transaction = not self._db.in_transaction
 
-        gc_count = 0
-        if policy.auto_gc_enabled:
-            gc_count = await self._hygiene_gc(policy=policy, current_cycle=current_cycle, now=now)
+            gc_count = 0
+            retired_count = 0
+            gc_wrote_anything = False
+            async with self._write_readback_savepoint("run_hygiene", begin="IMMEDIATE"):
+                suppress_token = _SUPPRESS_NESTED_AUTO_COMMIT.set(True)
+                try:
+                    archived_count = await self._hygiene_archive(
+                        would_evict, policy=policy, current_cycle=current_cycle, now=now
+                    )
 
-        if archived_count or gc_count:
-            await self._maybe_commit()
+                    if policy.auto_gc_enabled:
+                        gc_outcome = await self._hygiene_gc(
+                            policy=policy, current_cycle=current_cycle, now=now
+                        )
+                        gc_count = gc_outcome.gc_count
+                        retired_count = gc_outcome.retired_count
+                        gc_wrote_anything = gc_outcome.wrote_anything
+                finally:
+                    # Reset before the exception (if any) leaves this block,
+                    # so a nested write made by the *unwind* itself (there is
+                    # none today, but the invariant is the unit's, not this
+                    # call's) never sees a stale suppression left behind.
+                    _SUPPRESS_NESTED_AUTO_COMMIT.reset(suppress_token)
+
+            # Finalization is decided by what survived, reported by the
+            # stages themselves -- never by `self._db.total_changes`, which
+            # is monotonic and still counts a write a savepoint later undid.
+            # Concretely: a GC candidate silently vetoed by a `BEFORE DELETE`
+            # trigger that writes an audit row and then `RAISE(IGNORE)`s
+            # advances `total_changes` for that audit insert even though
+            # `_delete_thought_atomic` rolls it back and reports
+            # `wrote_anything=False` -- a `total_changes`-keyed finalization
+            # would misread that as a surviving write and commit a caller's
+            # unrelated pending work along with it.
+            wrote_anything = (
+                archived_count > 0 or gc_count > 0 or retired_count > 0 or gc_wrote_anything
+            )
+            if wrote_anything:
+                await self._maybe_commit()
+            elif opened_transaction and self._db.in_transaction:
+                # Nothing this pass made survived -- close only a transaction
+                # this call itself opened, never one a caller already held:
+                # see delete_thought for the same reasoning.
+                await self._db.rollback()
 
         return HygieneResult(
             archived_count=archived_count,
@@ -9151,9 +13826,9 @@ class SqliteEngravaCore:
         """Collect the eviction candidate pool: every ACTIVE and CREATED thought.
 
         Already-ARCHIVED and DONE thoughts are outside the candidate set (they
-        are not re-processed). The **whole** eligible pool must be scored — the
-        per-run cap bounds the *archived* set, not the *considered* set, so that
-        the coldest thoughts (not an arbitrary page) are the ones selected.
+        are not re-processed). The per-run cap bounds the *archived* set, not
+        the *considered* set, so that the coldest thoughts (not an arbitrary
+        page) are the ones selected.
         Both eligible lifecycles are walked one page at a time (mirroring the
         orphan-reflection sweep) so no candidate is missed regardless of store
         size. The frequency signal is not fed by these internal scans (access
@@ -9188,12 +13863,10 @@ class SqliteEngravaCore:
     ) -> dict[str, float]:
         """Resolve the clamped decay multiplier for each candidate.
 
-        The ``decay_function`` hook is the third otherwise-dead hook; the hygiene
-        eviction score is its **only** call-site (it is never wired into search /
-        ranking / promotion). Its return is clamped to ``[0.0, 1.0]`` and a
-        non-finite value (``NaN`` / ``±inf``) is treated as ``1.0`` — the
-        fail-safe direction, since decay can then only lower a score toward
-        archive, never resurrect one above threshold or over-evict.
+        The hygiene eviction score is ``decay_function``'s **only** call-site
+        (it is never wired into search / ranking / promotion). Its return is
+        clamped to ``[0.0, 1.0]`` and a non-finite value (``NaN`` / ``±inf``)
+        is treated as ``1.0`` (no decay).
 
         Args:
             candidates: The candidate pool.
@@ -9223,9 +13896,9 @@ class SqliteEngravaCore:
     ) -> list[EvictionReason]:
         """Score candidates and pick the deterministic, capped archive set.
 
-        For each unprotected candidate, computes ``keep_score`` (weighted average
-        over the active signals) and ``eviction_score = keep_score * decay``, and
-        keeps those strictly below ``eviction_threshold``. The survivors are
+        For each candidate not excluded below, computes ``keep_score`` (weighted
+        sum over the active signals) and ``eviction_score = keep_score * decay``,
+        and keeps those strictly below ``eviction_threshold``. The survivors are
         ordered ``eviction_score ASC, updated_cycle ASC, thought_id ASC``
         (lowest-value, oldest, id tiebreak) and truncated to
         ``max_evictions_per_run`` — a stable set for a given store + config +
@@ -9286,13 +13959,17 @@ class SqliteEngravaCore:
     ) -> int:
         """Archive the selected thoughts (Stage 1 — reversible, journaled).
 
+        **Write-lock classification: under the lock via its caller.** Called
+        only from ``run_hygiene``, which holds ``_write_lock`` around both
+        this call and ``_hygiene_gc``'s.
+
         Flips each thought ``* -> ARCHIVED`` via the existing archive mechanism
         — a **direct lifecycle write**, exactly as TTL archival does in
         :meth:`cleanup_expired` (an ``UPDATE`` of ``lifecycle_status`` /
         ``expires_at``, not an ``evolve`` transition). Using the direct write is
         deliberate: it lets a ``CREATED`` thought be archived even though the
-        lifecycle state machine only permits ``CREATED -> ACTIVE`` (the ADR's
-        candidate set is ACTIVE **and** CREATED), matching how TTL archival flips
+        lifecycle state machine only permits ``CREATED -> ACTIVE`` (hygiene's
+        eligible candidate set is ACTIVE **and** CREATED), matching how TTL archival flips
         any expired row regardless of its current state. The write also stamps
         ``archived_at_cycle = current_cycle`` and the wall-clock
         ``archived_at = now`` (the two hygiene-archival markers, cleared together
@@ -9305,6 +13982,14 @@ class SqliteEngravaCore:
         hygiene. Like every model field, both markers are still writable through a
         raw :meth:`update_thought`; that low-level path does not manage them, so
         prefer :meth:`restore_thought` / the hygiene and TTL flows.
+
+        **The write also bumps ``revision``, but does not enforce it.** Hygiene
+        must not be defeated by a caller holding a stale read — it archives
+        unconditionally (subject only to the predicate guard above, which is
+        about *protection*, not staleness) — but a caller's own token for this
+        row must not survive an archival it did not cause, since the row's
+        lifecycle just changed underneath it. Bumping (without checking)
+        ``revision`` achieves both at once.
 
         The mutation is recorded as an ordinary ``UPDATE_THOUGHT`` journal entry
         — **no new mutation type** — with the forgetting rationale nested in the
@@ -9396,7 +14081,8 @@ class SqliteEngravaCore:
                 update_params.append(inactivity_cutoff_iso)
             cursor = await self._db.execute(
                 "UPDATE thought SET lifecycle_status = ?, "  # noqa: S608 - interpolation is only ``?`` placeholders
-                "expires_at = NULL, archived_at_cycle = ?, archived_at = ? "
+                "expires_at = NULL, archived_at_cycle = ?, archived_at = ?, "
+                "revision = revision + 1 "
                 "WHERE thought_id = ? AND lifecycle_status IN (?, ?) AND pinned = 0"
                 + priority_guard
                 + inactivity_guard,
@@ -9429,8 +14115,25 @@ class SqliteEngravaCore:
         policy: HygienePolicyConfig,
         current_cycle: int,
         now: datetime.datetime,
-    ) -> int:
+    ) -> _HygieneGcOutcome:
         """Physically delete hygiene-archived thoughts past both restore windows.
+
+        **Write-lock classification: under the lock via its caller.** Called
+        only from ``run_hygiene``, which holds ``_write_lock`` around both
+        ``_hygiene_archive``'s call and this one. Its own call to
+        ``retire_orphan_reflections`` (which writes via ``update_thought``)
+        is reentrant-safe on the same task for the same reason.
+
+        **Reports what it did, not just the delete count.** ``run_hygiene``
+        decides whether its unit has anything to commit from what actually
+        survived, not from a per-call count alone — a retirement can be the
+        only surviving write in an otherwise-empty pass, and a vetoed
+        delete's own trigger-driven write must not count even though
+        ``self._db.total_changes`` would still show it. The returned
+        :class:`_HygieneGcOutcome` carries the retirement count and the
+        per-candidate ``wrote_anything`` signal alongside the delete count for
+        exactly that decision; ``run_hygiene`` still reports only the delete
+        count on the public :class:`~engrava.infrastructure.sqlite.hygiene.HygieneResult`.
 
         Stage 2 — runs only when ``auto_gc_enabled``. A thought is GC-eligible
         only when it was archived **by hygiene** (``archived_at_cycle IS NOT
@@ -9459,30 +14162,41 @@ class SqliteEngravaCore:
                 deterministic.
 
         Returns:
-            The number of thoughts physically deleted.
+            A :class:`_HygieneGcOutcome` with the number of thoughts
+            physically deleted, the number of orphan REFLECTIONs retired, and
+            whether any candidate's own delete wrote something even where it
+            did not count toward the delete total.
 
         """
         eligible = await self._hygiene_gc_eligible(
             policy=policy, current_cycle=current_cycle, now=now
         )
         if not eligible:
-            return 0
+            return _HygieneGcOutcome(gc_count=0, retired_count=0, wrote_anything=False)
 
         # Retire orphan REFLECTIONs *before* any delete so a synthesis never
         # outlives its whole source cluster with a dangling edge.
-        await self.retire_orphan_reflections()
+        retired_count = await self.retire_orphan_reflections()
 
         gc_count = 0
+        wrote_anything = False
         for thought in eligible:
             before_row = await self._get_thought_row(thought.thought_id)
             if before_row is None:
                 continue
             vec_rowid = await self._embedding_rowid_for_thought(thought.thought_id)
-            cursor = await self._db.execute(
-                "DELETE FROM thought WHERE thought_id = ?",
-                (thought.thought_id,),
-            )
-            if cursor.rowcount <= 0:
+            # Parent delete and explicit child deletes under one savepoint —
+            # see _delete_thought_atomic for why. Its own ``wrote_anything``
+            # is folded in unconditionally (mirroring cleanup_expired's
+            # DELETE-strategy loop), not gated on ``deleted``: a candidate a
+            # trigger silently vetoes reports ``wrote_anything=False`` here
+            # (its own savepoint rolled the veto's own writes back too), but
+            # a future orphan-sweep-only case reporting ``True`` here must
+            # still count as a surviving write for run_hygiene's own
+            # finalization, even though it does not advance ``gc_count``.
+            result = await self._delete_thought_atomic(thought.thought_id)
+            wrote_anything = result.wrote_anything or wrote_anything
+            if not result.deleted:
                 continue
             await self._purge_orphan_vector(vec_rowid)
             gc_count += 1
@@ -9503,7 +14217,9 @@ class SqliteEngravaCore:
                         },
                     },
                 )
-        return gc_count
+        return _HygieneGcOutcome(
+            gc_count=gc_count, retired_count=retired_count, wrote_anything=wrote_anything
+        )
 
     async def _hygiene_gc_eligible(
         self,
@@ -9562,6 +14278,14 @@ class SqliteEngravaCore:
         # cap slot and starve younger eligible rows. The Python re-check below
         # stays as defence-in-depth.
         params: list[object] = [LifecycleStatus.ARCHIVED.value, max_archived_cycle]
+        # Cycle-axis restore window. ``archived_at_cycle`` is set by the hygiene
+        # archive stage only, so ``archived_at_cycle IS NOT NULL`` is redundant
+        # against ordinary data — the comparison beside it already rejects a
+        # NULL row. It stays explicit because it is what keeps a TTL- or
+        # manually-archived row (``archived_at_cycle IS NULL``) excluded if the
+        # comparison is ever rewritten into a NULL-tolerant form (e.g.
+        # ``COALESCE(archived_at_cycle, 0) <= ?``), which the method's contract
+        # forbids reaping.
         # Wall-clock restore window (in addition to the cycle window). When
         # disabled (``gc_restore_window_seconds == 0``) the predicate is omitted,
         # so a hygiene-archived row with ``archived_at IS NULL`` stays cycle-only
@@ -9687,6 +14411,52 @@ class SqliteEngravaCore:
 
         return retired
 
+    def attach_dreaming_extension(self, extension: DreamingConsolidatorProtocol) -> None:
+        """Wire a Dreaming consolidator onto this store.
+
+        This is the supported alternative to writing the private
+        ``_dreaming_extension`` attribute directly — the two are the same
+        underlying slot, so whichever one last ran wins and :meth:`consolidate`
+        cannot tell them apart. :meth:`from_config` itself still uses the
+        private write internally; this method exists for every other caller
+        (a hand-built store, a downstream integration, third-party code) that
+        today has no supported way to do what it is already doing.
+
+        Calling this again **replaces** whatever was attached before,
+        including one installed by :meth:`from_config` — the same behaviour
+        as re-assigning the private attribute. There is no
+        separate "already attached" error: a second call is a deliberate
+        re-wiring, not a mistake this method can distinguish from one.
+
+        Detaching is deliberately **not** part of this seam. There is no
+        supported way to remove an attached extension.
+
+        Args:
+            extension: A consolidator satisfying
+                :class:`~engrava.domain.protocols.dreaming.DreamingConsolidatorProtocol`.
+                This method checks ``extension`` against that
+                ``runtime_checkable`` protocol (which looks for a
+                ``run_consolidation`` member) and raises below if that check
+                fails. The check does not verify the method's parameters or
+                that it is a coroutine function, so a same-named but
+                wrong-shaped ``run_consolidation`` — sync instead of async, or
+                a different signature — passes this check and only fails
+                once :meth:`consolidate` actually calls it.
+
+        Raises:
+            TypeError: When ``extension`` fails the ``runtime_checkable``
+                protocol check above.
+
+        """
+        if not isinstance(extension, DreamingConsolidatorProtocol):
+            msg = (
+                "attach_dreaming_extension() requires a DreamingConsolidatorProtocol "
+                f"implementation (an async run_consolidation(store, current_cycle) "
+                f"method); got {type(extension).__name__!r}"
+            )
+            raise TypeError(msg)
+        self._dreaming_extension = extension
+
     async def consolidate(self, *, current_cycle: int | None = None) -> ConsolidationResult:
         """Run one dreaming consolidation cycle on this store.
 
@@ -9782,6 +14552,13 @@ class SqliteEngravaCore:
         only-in-flight — store never writes an outcome score and stays
         byte-identical to one built before this feature.
 
+        **The action write and the recompute's write + journal entry are one
+        failure-atomic unit**, via :meth:`_write_readback_savepoint` — see
+        :meth:`update_thought` for what that protects against. The action's
+        own ``INSERT`` is not itself journaled (a separate, tracked gap), but
+        a failed or cancelled recompute append still unwinds it: wrapping only
+        the recompute would leave the action row pending after a failed call.
+
         Args:
             action: The action record to create.
 
@@ -9789,24 +14566,26 @@ class SqliteEngravaCore:
             The persisted action record.
 
         """
-        await self._db.execute(
-            "INSERT INTO action "
-            "(action_id, source_thought_id, action_type, intent, "
-            " status, verification_status, raw_metrics_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                action.action_id,
-                action.source_thought_id,
-                action.action_type.value,
-                action.intent,
-                action.status.value,
-                action.verification_status.value,
-                action.raw_metrics_json,
-            ),
-        )
-        if action.status in _TERMINAL_ACTION_STATUSES:
-            await self._recompute_action_outcome(action.source_thought_id)
-        await self._maybe_commit()
+        async with self._write_lock:
+            async with self._write_readback_savepoint("create_action", begin="IMMEDIATE"):
+                await self._db.execute(
+                    "INSERT INTO action "
+                    "(action_id, source_thought_id, action_type, intent, "
+                    " status, verification_status, raw_metrics_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        action.action_id,
+                        action.source_thought_id,
+                        action.action_type.value,
+                        action.intent,
+                        action.status.value,
+                        action.verification_status.value,
+                        action.raw_metrics_json,
+                    ),
+                )
+                if action.status in _TERMINAL_ACTION_STATUSES:
+                    await self._recompute_action_outcome(action.source_thought_id)
+            await self._maybe_commit()
         return action
 
     async def update_action(
@@ -9827,10 +14606,17 @@ class SqliteEngravaCore:
         therefore permitted in **any** status, including a terminal
         ``CONFIRMED`` / ``FAILED`` action (verification legitimately advances
         while the status stays terminal). The transition is validated against the
-        record *this* call read, and the write carries no version guard, so a
-        competing move landing in between is neither rejected nor detected: two
-        individually-legal transitions can leave the action in a state the
-        machine would not have allowed as a single step. ``verification_status``
+        record *this* call read. On a real change the write carries a
+        ``revision`` guard exactly like :meth:`update_thought`'s: the row's
+        ``revision`` at the start of this call is checked and incremented
+        atomically by the same ``UPDATE``. A no-op (below) issues no ``UPDATE``
+        at all, so it cannot go stale. The
+        read, the transition check, and the write share the same
+        task-reentrant :attr:`_write_lock` critical section every other guarded
+        write on this instance uses, so a competing move issued by
+        a *different task on this instance* cannot land in that window —
+        it is delayed until this call's write has committed, and then it
+        validates against the state this call actually left. ``verification_status``
         is not gated
         by the lifecycle state: it may be set on a non-terminal action too, but
         such an action contributes nothing to ``action_outcome_score`` (the
@@ -9855,6 +14641,16 @@ class SqliteEngravaCore:
         triggers no recompute. The record returned is read back from storage
         after the write, and the journal ``after`` image is the same read-back.
 
+        **The write, its confirming read-back, and its journal entry are one
+        failure-atomic unit**, via :meth:`_write_readback_savepoint` — see
+        :meth:`update_thought` for what that protects against and how it
+        treats a caller-owned transaction. The ``UPDATE`` also captures its
+        cursor and rejects a zero-row match immediately: without that check,
+        a row deleted after the initial read (so the ``UPDATE`` matches
+        nothing) and re-created under the same ``action_id`` before the
+        read-back runs would be reported as though this call had updated it,
+        when it had written nothing at all.
+
         Args:
             action_id: UUID of the action to update.
             status: New status, or ``None`` to leave the status unchanged.
@@ -9865,75 +14661,109 @@ class SqliteEngravaCore:
             The stored action record (or, for a no-op, the unchanged record).
 
         Raises:
-            ActionNotFoundError: If the action does not exist, or if the row
-                was deleted before the write could be read back.
+            ActionNotFoundError: If the action does not exist at the initial
+                read.
+            StaleDataError: If a real change's guarded ``UPDATE`` matches no
+                row — another guarded write landed on this row since it was
+                read here (including a delete, and including a delete
+                followed by a different row recreated under the same
+                ``action_id`` before the read-back could run). Nothing of
+                this update is written when it is raised.
             InvalidTransitionError: If a real ``status`` change is illegal
                 per the action state machine.
+            WriteContentionError: The guarded write could not proceed because
+                the connection reported lock contention.
 
         """
-        current = await self._get_action(action_id)
-        if current is None:
-            raise ActionNotFoundError(action_id)
+        async with self._write_lock:
+            action_row = await self._get_action_row(action_id)
+            if action_row is None:
+                raise ActionNotFoundError(action_id)
+            current = _row_to_action(action_row)
+            expected_revision = int(action_row["revision"])
 
-        status_changes = status is not None and status != current.status
-        verification_changes = (
-            verification_status is not None and verification_status != current.verification_status
-        )
-        if not status_changes and not verification_changes:
-            # No-op: nothing to persist, journal, or recompute.
-            return current
-
-        changes: dict[str, object] = {}
-        if status_changes:
-            changes["status"] = status
-        if verification_changes:
-            changes["verification_status"] = verification_status
-        # ``evolve`` validates the status transition when ``status`` changes and
-        # is a no-op validation-wise for a verification-only change.
-        updated = current.evolve(**changes)
-
-        # Write only the column(s) this call moves: a status-only update must
-        # not re-assert the verification column it read a moment ago, which
-        # would roll back a verification recorded by another writer meanwhile.
-        columns: dict[str, object] = {}
-        if status_changes:
-            columns["status"] = updated.status.value
-        if verification_changes:
-            columns["verification_status"] = updated.verification_status.value
-
-        await self._db.execute(
-            _build_update_sql("action", columns, "action_id = ?"),
-            (*columns.values(), action_id),
-        )
-
-        persisted = await self._read_back_action(action_id)
-
-        if self._journal is not None:
-            await self._journal.append(
-                mutation_type="UPDATE_ACTION",
-                target_id=action_id,
-                delta={
-                    "before": {
-                        "status": current.status.value,
-                        "verification_status": current.verification_status.value,
-                    },
-                    "after": {
-                        "status": persisted.status.value,
-                        "verification_status": persisted.verification_status.value,
-                    },
-                },
+            status_changes = status is not None and status != current.status
+            verification_changes = (
+                verification_status is not None
+                and verification_status != current.verification_status
             )
+            if not status_changes and not verification_changes:
+                # No-op: nothing to persist, journal, or recompute.
+                return current
 
-        # Outcome-affecting iff the change lands a terminal status, or changes
-        # verification on an already-terminal action. Because the aggregate
-        # reads both status and verification, a verification change on a
-        # terminal action IS outcome-affecting.
-        lands_terminal = status_changes and persisted.status in _TERMINAL_ACTION_STATUSES
-        verifies_terminal = verification_changes and persisted.status in _TERMINAL_ACTION_STATUSES
-        if lands_terminal or verifies_terminal:
-            await self._recompute_action_outcome(persisted.source_thought_id)
+            changes: dict[str, object] = {}
+            if status_changes:
+                changes["status"] = status
+            if verification_changes:
+                changes["verification_status"] = verification_status
+            # ``evolve`` validates the status transition when ``status``
+            # changes and is a no-op validation-wise for a verification-only
+            # change.
+            updated = current.evolve(**changes)
 
-        await self._maybe_commit()
+            # Write only the column(s) this call moves: a status-only update
+            # must not re-assert the verification column it read a moment
+            # ago, which would roll back a verification recorded by another
+            # writer meanwhile.
+            columns: dict[str, object] = {}
+            if status_changes:
+                columns["status"] = updated.status.value
+            if verification_changes:
+                columns["verification_status"] = updated.verification_status.value
+
+            async with self._write_readback_savepoint("update_action_readback", begin="DEFERRED"):
+                cursor = await self._execute_revision_guarded_write(
+                    _build_update_sql(
+                        "action",
+                        columns,
+                        "action_id = ? AND revision = ?",
+                        bump_column="revision",
+                    ),
+                    (*columns.values(), action_id, expected_revision),
+                    operation="update_action",
+                )
+                if cursor.rowcount == 0:
+                    raise StaleDataError(
+                        entity_type="ActionRecord",
+                        entity_id=action_id,
+                        expected_version=expected_revision,
+                    )
+
+                persisted = await self._read_back_action(action_id)
+
+                if self._journal is not None:
+                    await self._journal.append(
+                        mutation_type="UPDATE_ACTION",
+                        target_id=action_id,
+                        delta={
+                            "before": {
+                                "status": current.status.value,
+                                "verification_status": current.verification_status.value,
+                            },
+                            "after": {
+                                "status": persisted.status.value,
+                                "verification_status": persisted.verification_status.value,
+                            },
+                        },
+                    )
+
+                # Outcome-affecting iff the change lands a terminal status, or
+                # changes verification on an already-terminal action. Because
+                # the aggregate reads both status and verification, a
+                # verification change on a terminal action IS
+                # outcome-affecting. Run inside the same unit as the action's
+                # own write and journal entry above: a failed or cancelled
+                # recompute append must unwind the action write too, not just
+                # its own score write, so wrapping only the recompute is not
+                # enough on its own.
+                lands_terminal = status_changes and persisted.status in _TERMINAL_ACTION_STATUSES
+                verifies_terminal = (
+                    verification_changes and persisted.status in _TERMINAL_ACTION_STATUSES
+                )
+                if lands_terminal or verifies_terminal:
+                    await self._recompute_action_outcome(persisted.source_thought_id)
+
+            await self._maybe_commit()
         return persisted
 
     async def _read_back_action(self, action_id: str) -> ActionRecord:
@@ -9967,12 +14797,34 @@ class SqliteEngravaCore:
             The action record, or ``None`` if not found.
 
         """
-        cursor = await self._db.execute("SELECT * FROM action WHERE action_id = ?", (action_id,))
-        row = await cursor.fetchone()
+        row = await self._get_action_row(action_id)
         return _row_to_action(row) if row is not None else None
+
+    async def _get_action_row(self, action_id: str) -> aiosqlite.Row | None:
+        """Fetch the raw ``action`` row by id, or ``None`` when absent.
+
+        The counterpart of :py:meth:`_get_thought_row` / :py:meth:`_get_edge_row`
+        for actions: :meth:`update_action` needs the raw ``revision`` column
+        for its guard, which :meth:`_get_action`'s mapped
+        :class:`~engrava.domain.models.action.ActionRecord` does not carry (it
+        is not a domain-model field — see :meth:`update_thought` for why).
+
+        Args:
+            action_id: UUID of the action.
+
+        Returns:
+            The raw row, or ``None`` if not found.
+
+        """
+        cursor = await self._db.execute("SELECT * FROM action WHERE action_id = ?", (action_id,))
+        return await cursor.fetchone()
 
     async def _recompute_action_outcome(self, thought_id: str) -> None:
         """Recompute and persist a thought's denormalised ``action_outcome_score``.
+
+        **Write-lock classification: under the lock via callers.** Called
+        only from ``create_action`` and ``update_action``, both of which hold
+        ``_write_lock`` around their entire body, including this call.
 
         Full, idempotent recompute: reads **all** of the thought's actions
         via :meth:`get_actions` (a seek on ``idx_action_source_thought``),
@@ -10111,8 +14963,14 @@ def _edge_to_core_columns(edge: EdgeRecord) -> dict[str, object]:
     }
 
 
-def _build_update_sql(table: str, columns: Iterable[str], guard: str) -> str:
-    """Compose an UPDATE that assigns exactly ``columns``.
+def _build_update_sql(
+    table: str,
+    columns: Iterable[str],
+    guard: str,
+    *,
+    bump_column: str | None = None,
+) -> str:
+    """Compose an UPDATE that assigns exactly ``columns``, optionally bumping a counter.
 
     Every update in the store writes a subset of its table's columns — the ones
     the operation owns — so the statement is shaped per call instead of being a
@@ -10124,12 +14982,22 @@ def _build_update_sql(table: str, columns: Iterable[str], guard: str) -> str:
         columns: Column names to assign, each bound to a ``?`` placeholder, in
             the order their values are passed.
         guard: The WHERE clause, its own placeholders included.
+        bump_column: When given, an additional ``{bump_column} = {bump_column}
+            + 1`` assignment is appended — a self-referential increment, not a
+            bound value, which is why it is a separate parameter rather than
+            one more entry in ``columns`` (which always binds a caller-supplied
+            value). Used for the ``revision`` guard: the row's own current
+            value is incremented in the same atomic statement that checks it,
+            never read-then-written as two steps.
 
     Returns:
         The composed UPDATE statement.
 
     """
     assignments = ", ".join(f"{name} = ?" for name in columns)
+    if bump_column is not None:
+        bump_assignment = f"{bump_column} = {bump_column} + 1"
+        assignments = f"{assignments}, {bump_assignment}" if assignments else bump_assignment
     return f"UPDATE {table} SET {assignments} WHERE {guard}"  # noqa: S608 -- table/columns/guard are internal literals; all values are bound
 
 
@@ -10527,12 +15395,10 @@ def _decode_consolidated(raw: str | None) -> list[str] | None:
 
 
 def _clamp_decay(raw: float) -> float:
-    """Clamp a ``decay_function`` return into the fail-safe ``[0.0, 1.0]`` range.
+    """Clamp a ``decay_function`` return into the ``[0.0, 1.0]`` range.
 
-    A non-finite value (``NaN`` / ``±inf``) maps to ``1.0`` (no decay) — the
-    fail-safe direction, since decay can then only lower an eviction-score toward
-    archive, never resurrect one above threshold or cause a spurious eviction. A
-    finite value is clamped into ``[0.0, 1.0]``.
+    A non-finite value (``NaN`` / ``±inf``) maps to ``1.0`` (no decay). A finite
+    value is clamped into ``[0.0, 1.0]``.
 
     Args:
         raw: The raw ``decay_function`` hook result.
@@ -10885,7 +15751,10 @@ def _parse_recency_now(value: str) -> datetime.datetime:
 
     Raises:
         InvalidRecencyArgumentError: If ``value`` is not a valid ISO-8601
-            timestamp (the underlying parser error is chained as ``__cause__``).
+            timestamp, or is one whose instant has no UTC form within the
+            supported ``datetime`` range (an aware value at the range limits,
+            such as ``0001-01-01T00:00:00+01:00``). The underlying error is
+            chained as ``__cause__``.
 
     """
     try:
@@ -10893,29 +15762,35 @@ def _parse_recency_now(value: str) -> datetime.datetime:
     except (ValueError, TypeError) as exc:
         msg = f"recency_now must be an ISO-8601 timestamp, got {value!r}"
         raise InvalidRecencyArgumentError(msg) from exc
+    except OverflowError as exc:
+        msg = f"recency_now {value!r} has no UTC form within the supported datetime range"
+        raise InvalidRecencyArgumentError(msg) from exc
 
 
 def _parse_row_timestamp(value: object) -> datetime.datetime | None:
     """Parse a stored transaction-time row timestamp, tolerating bad data.
 
     Returns the UTC-normalised instant, or ``None`` when the stored value is
-    missing (SQL ``NULL``) or malformed (a legacy / imported row). Callers map a
-    ``None`` result to the deterministic minimum recency score — the row is
-    treated as maximally old — so bad row data never crashes the ranking path
-    and never triggers a host-clock read.
+    missing (SQL ``NULL``), malformed (a legacy / imported row), or valid
+    ISO-8601 with no UTC form within the supported ``datetime`` range — a value
+    the core-21 upgrade leaves untouched because it cannot put it into the
+    canonical UTC form. Callers map a ``None`` result to the deterministic
+    minimum recency score — the row is treated as maximally old — so bad row
+    data never crashes the ranking path and never triggers a host-clock read.
 
     Args:
         value: The raw ``updated_at`` / ``created_at`` column value.
 
     Returns:
-        The parsed instant, or ``None`` when the value is missing or malformed.
+        The parsed instant, or ``None`` when the value is missing, malformed or
+        has no UTC form.
 
     """
     if not isinstance(value, str):
         return None
     try:
         return parse_iso8601_to_utc(value)
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
 
 
@@ -10982,10 +15857,11 @@ def _retain_ranked_by_unit(
     unit_keys: dict[str, tuple[object, ...] | None],
     max_per_unit: int,
 ) -> list[tuple[str, float]]:
-    """Retain up to ``max_per_unit`` best rows per unit on a D8-ranked list.
+    """Retain up to ``max_per_unit`` best rows per unit on an already-ranked list.
 
-    Walks ``ranked`` top-down (it is already in the D8 total order, so the
-    members of each unit are visited highest-ranked first). A row is admitted
+    Walks ``ranked`` top-down (it is already in the caller's deterministic
+    ranking order, so the members of each unit are visited highest-ranked
+    first). A row is admitted
     unless its unit key has already reached ``max_per_unit`` admitted members,
     in which case the surplus lower-ranked member is dropped. A row whose unit
     key is ``None`` (missing / malformed metadata, or a composite with any-NULL
@@ -10997,17 +15873,20 @@ def _retain_ranked_by_unit(
     relaxation that keeps a unit's deeper members too — the intra-unit
     retention count is the only thing that changes, never which distinct units
     are eligible. The relative order of the surviving rows is preserved from
-    ``ranked`` (already the D8 order), so no re-sort with a new rule is
-    introduced; retention and final order both derive from the single D8 order.
+    ``ranked`` (already in that order), so no re-sort with a new rule is
+    introduced; retention and final order both derive from that single
+    ranking order.
 
     Args:
-        ranked: ``(thought_id, score)`` pairs in D8 total order.
+        ranked: ``(thought_id, score)`` pairs already in the caller's
+            deterministic ranking order.
         unit_keys: Map from ``thought_id`` to its unit-key tuple, or ``None``
             for a key-less row. Missing ids are treated as ``None``.
         max_per_unit: Maximum admitted members per non-None unit (``>= 1``).
 
     Returns:
-        The retained ``(thought_id, score)`` list, D8 order preserved.
+        The retained ``(thought_id, score)`` list, with that ranking order
+        preserved.
 
     """
     unit_counts: dict[tuple[object, ...], int] = {}
@@ -11031,7 +15910,7 @@ def _collapse_ranked_by_unit(
     ranked: list[tuple[str, float]],
     unit_keys: dict[str, tuple[object, ...] | None],
 ) -> list[tuple[str, float]]:
-    """Collapse a D8-ranked candidate list to one best row per unit.
+    """Collapse an already-ranked candidate list to one best row per unit.
 
     The single-keeper special case of :func:`_retain_ranked_by_unit`
     (``max_per_unit=1``): the first (highest-ranked) member of each **non-None**
@@ -11039,12 +15918,14 @@ def _collapse_ranked_by_unit(
     Key-less rows (``None`` unit key) always pass through as their own unit.
 
     Args:
-        ranked: ``(thought_id, score)`` pairs in D8 total order.
+        ranked: ``(thought_id, score)`` pairs already in the caller's
+            deterministic ranking order.
         unit_keys: Map from ``thought_id`` to its unit-key tuple, or ``None``
             for a key-less row. Missing ids are treated as ``None``.
 
     Returns:
-        The collapsed ``(thought_id, score)`` list, D8 order preserved.
+        The collapsed ``(thought_id, score)`` list, with that ranking order
+        preserved.
 
     """
     return _retain_ranked_by_unit(ranked, unit_keys, max_per_unit=1)

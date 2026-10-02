@@ -35,6 +35,10 @@ from typing import TYPE_CHECKING, TypeAlias, cast
 
 import click
 
+from engrava.domain.models._temporal import canonical_timestamp_or_none
+from engrava.domain.models.edge import EDGE_TIMESTAMP_FIELDS
+from engrava.domain.models.thought import THOUGHT_TIMESTAMP_FIELDS
+
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
@@ -253,6 +257,10 @@ class TableSpec:
             only identifiers ever emitted into restore SQL.
         required: The subset of :attr:`columns` a record must supply (the
             primary key plus every ``NOT NULL`` column without a default).
+        column_types: Each column's storage kind.
+        timestamp_columns: The columns the domain model keeps in the canonical
+            UTC timestamp form; restore writes that form too (see
+            :meth:`canonicalise_timestamps`). Empty for a table with none.
 
     """
 
@@ -260,6 +268,7 @@ class TableSpec:
     columns: tuple[str, ...]
     required: frozenset[str]
     column_types: Mapping[str, ColumnKind]
+    timestamp_columns: tuple[str, ...] = ()
 
     def validate(self, data: Mapping[str, object], *, line_number: int) -> None:
         """Validate a record's columns and values against this spec.
@@ -294,8 +303,36 @@ class TableSpec:
             if value is not None and not _value_matches_kind(value, self.column_types[column]):
                 raise InvalidColumnValueError(self.table, column, line_number)
 
+    def canonicalise_timestamps(
+        self, data: Mapping[str, SnapshotScalar]
+    ) -> Mapping[str, SnapshotScalar]:
+        """Return ``data`` with its timestamp columns in the canonical UTC form.
+
+        A snapshot can carry a timestamp in any form an older release stored —
+        naive, space-separated, basic format, a week date. Written as it is, it
+        would compare wrongly against every canonical value, so each value in
+        :attr:`timestamp_columns` that names an ISO-8601 instant is rewritten
+        into the form the domain validator stores (a value without an offset is
+        read as UTC). A value that does not is left exactly as the snapshot has
+        it, the same rule the schema upgrade applies to stored rows.
+
+        Args:
+            data: A record mapping already accepted by :meth:`validate`.
+
+        Returns:
+            ``data`` itself when nothing changes, otherwise a new mapping.
+
+        """
+        rewrites: dict[str, SnapshotScalar] = {}
+        for column in self.timestamp_columns:
+            value = data.get(column)
+            canonical = canonical_timestamp_or_none(value)
+            if canonical is not None and canonical != value:
+                rewrites[column] = canonical
+        return {**data, **rewrites} if rewrites else data
+
     def build_insert(
-        self, data: Mapping[str, SnapshotBindValue]
+        self, data: Mapping[str, SnapshotBindValue], *, plain_insert: bool = False
     ) -> tuple[str, tuple[SnapshotBindValue, ...]]:
         """Build a fixed ``INSERT`` statement and its aligned value tuple.
 
@@ -306,6 +343,11 @@ class TableSpec:
         Args:
             data: A validated, bind-ready record mapping (columns are a subset of
                 :attr:`columns`).
+            plain_insert: When ``True``, emit an ordinary ``INSERT`` that lets
+                SQLite refuse a colliding primary key or ``UNIQUE`` constraint,
+                instead of the default ``INSERT OR REPLACE`` that silently
+                overwrites (or, through a cascading foreign key, deletes) the
+                colliding row.
 
         Returns:
             A ``(sql, values)`` pair ready for ``execute``.
@@ -314,13 +356,11 @@ class TableSpec:
         present = tuple(column for column in self.columns if column in data)
         columns_sql = ", ".join(present)
         placeholders = ", ".join("?" for _ in present)
+        verb = "INSERT" if plain_insert else "INSERT OR REPLACE"
         # Only the table name and allow-listed column constants reach the SQL
         # text; every value travels as a bound parameter, so this is not an
         # injection surface despite the f-string.
-        sql = (
-            f"INSERT OR REPLACE INTO {self.table.value} "  # noqa: S608
-            f"({columns_sql}) VALUES ({placeholders})"
-        )
+        sql = f"{verb} INTO {self.table.value} ({columns_sql}) VALUES ({placeholders})"
         values = tuple(data[column] for column in present)
         return sql, values
 
@@ -336,6 +376,7 @@ def _make_spec(
     table: CoreTable,
     columns: tuple[tuple[str, ColumnKind], ...],
     required: frozenset[str],
+    timestamp_columns: tuple[str, ...] = (),
 ) -> TableSpec:
     """Build a :class:`TableSpec` from ``(column, kind)`` pairs.
 
@@ -344,6 +385,8 @@ def _make_spec(
         columns: The allowed columns with their storage kinds, in schema order.
         required: The required column names (primary key plus non-defaulted
             ``NOT NULL`` columns).
+        timestamp_columns: The columns kept in the canonical UTC timestamp
+            form, taken from the domain model.
 
     Returns:
         The immutable spec, with the column name tuple and type map derived from
@@ -355,6 +398,7 @@ def _make_spec(
         columns=tuple(name for name, _ in columns),
         required=required,
         column_types=dict(columns),
+        timestamp_columns=timestamp_columns,
     )
 
 
@@ -394,8 +438,10 @@ _TABLE_SPECS: dict[CoreTable, TableSpec] = {
             ("pinned", _INT),
             ("archived_at_cycle", _INT),
             ("archived_at", _TEXT),
+            ("revision", _INT),
         ),
         frozenset({"thought_id", "thought_type", "essence", "content", "priority"}),
+        THOUGHT_TIMESTAMP_FIELDS,
     ),
     CoreTable.EDGE: _make_spec(
         CoreTable.EDGE,
@@ -411,8 +457,10 @@ _TABLE_SPECS: dict[CoreTable, TableSpec] = {
             ("valid_from", _TEXT),
             ("valid_until", _TEXT),
             ("metadata_json", _TEXT),
+            ("revision", _INT),
         ),
         frozenset({"edge_id", "from_thought_id", "to_thought_id", "edge_type"}),
+        EDGE_TIMESTAMP_FIELDS,
     ),
     CoreTable.EMBEDDING: _make_spec(
         CoreTable.EMBEDDING,
@@ -447,6 +495,7 @@ _TABLE_SPECS: dict[CoreTable, TableSpec] = {
             ("status", _TEXT),
             ("verification_status", _TEXT),
             ("raw_metrics_json", _TEXT),
+            ("revision", _INT),
         ),
         frozenset({"action_id", "source_thought_id", "action_type", "intent"}),
     ),
@@ -497,13 +546,17 @@ class TableRecord:
     data: Mapping[str, SnapshotScalar]
     line_number: int
 
-    def to_insert(self) -> tuple[str, tuple[SnapshotBindValue, ...]]:
+    def to_insert(self, *, plain_insert: bool = False) -> tuple[str, tuple[SnapshotBindValue, ...]]:
         """Return fixed SQL and bind values, decoding any transport encoding.
 
         The base64 ``vector_blob`` of an ``embedding`` record is decoded to bytes
         here -- at insert time -- so a record that is skipped (``--skip-embeddings``
         or ``--re-embed``) never pays the decode and a corrupt blob does not fail
         an import that would not have stored it.
+
+        Args:
+            plain_insert: Forwarded to :meth:`TableSpec.build_insert` -- see
+                there for what it selects.
 
         Returns:
             A ``(sql, values)`` pair ready for ``execute``.
@@ -516,7 +569,7 @@ class TableRecord:
         values: Mapping[str, SnapshotBindValue] = self.data
         if self.spec.table is CoreTable.EMBEDDING:
             values = _decode_embedding_blob(self.data, line_number=self.line_number)
-        return self.spec.build_insert(values)
+        return self.spec.build_insert(values, plain_insert=plain_insert)
 
 
 @dataclass(frozen=True, slots=True)
@@ -574,7 +627,8 @@ def parse_snapshot_record(raw_line: str, *, line_number: int) -> SnapshotRecord:
     Supports both the current ``{_type, data}`` form and the legacy
     ``{table, data}`` form. A core-table record is validated against its
     :class:`TableSpec` before it is returned, so a returned :class:`TableRecord`
-    is always safe to insert via fixed SQL. A metadata header and a
+    is always safe to insert via fixed SQL, and its timestamp columns are put
+    into the canonical UTC form (:meth:`TableSpec.canonicalise_timestamps`). A metadata header and a
     non-core-table record are returned as their own typed variants and are never
     inserted.
 
@@ -626,4 +680,6 @@ def parse_snapshot_record(raw_line: str, *, line_number: int) -> SnapshotRecord:
     spec.validate(data_map, line_number=line_number)
     # ``validate`` proved every value is a scalar, so this view is sound.
     scalar_data = cast("Mapping[str, SnapshotScalar]", data_map)
-    return TableRecord(spec=spec, data=scalar_data, line_number=line_number)
+    return TableRecord(
+        spec=spec, data=spec.canonicalise_timestamps(scalar_data), line_number=line_number
+    )

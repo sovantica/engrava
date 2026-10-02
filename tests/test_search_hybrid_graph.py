@@ -432,14 +432,14 @@ class TestParseSearchGraphExpansion:
 
 
 # ---------------------------------------------------------------------------
-# Regression tests for the 4 gaps found in review (2026-04-23)
+# Graph expansion: seed ranking, target types, backends_used, edge index
 # ---------------------------------------------------------------------------
 
 
 class TestExpansionGapFixes:
-    """Tests that validate each of the 4 review gaps are now correctly fixed."""
+    """Seed ranking, target filtering, ``backends_used`` and the edge index of graph expansion."""
 
-    # --- Gap 1: top-N REFLECTION ranking must respect combined score ---
+    # --- 1: top-N REFLECTION ranking must respect combined score ---
 
     async def test_top_n_respects_score_order(self, store: SqliteEngravaCore) -> None:
         """The expansion seeds must be the highest-scored REFLECTIONs, not SQL-order ones.
@@ -479,7 +479,7 @@ class TestExpansionGapFixes:
             "Low-scored REFLECTION should NOT have been seeded"
         )
 
-    # --- Gap 2: only OBSERVATION targets must be pulled into combined ---
+    # --- 2: only OBSERVATION targets must be pulled into combined ---
 
     async def test_non_observation_targets_not_expanded(self, store: SqliteEngravaCore) -> None:
         """CONSOLIDATED_FROM targets that are not OBSERVATION are skipped.
@@ -522,7 +522,7 @@ class TestExpansionGapFixes:
         assert task_child.thought_id not in combined, "TASK child must NOT be expanded"
         assert refl_child.thought_id not in combined, "REFLECTION child must NOT be expanded"
 
-    # --- Gap 3: backends_used is false-positive when no expansion occurs ---
+    # --- 3: backends_used must not report expansion when none occurs ---
 
     async def test_backends_used_absent_when_no_obs_expanded(self, tmp_path: Path) -> None:
         """'graph_expansion' must NOT appear in backends_used when no OBS was added.
@@ -573,7 +573,7 @@ class TestExpansionGapFixes:
         )
         assert added > 0
 
-    # --- Gap 4: schema migration v7 → v8 creates the edge index ---
+    # --- 4: schema migration v7 → v8 creates the edge index ---
 
     async def test_schema_v8_creates_edge_index(self, tmp_path: Path) -> None:
         """ensure_schema on a fresh DB produces idx_edge_type_from in sqlite_master."""
@@ -616,4 +616,4 @@ class TestExpansionGapFixes:
         await conn.close()
 
         assert row is not None, "idx_edge_type_from missing after v7->head migration"
-        assert int(version_row[0]) == 20
+        assert int(version_row[0]) == 21

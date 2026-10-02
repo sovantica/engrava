@@ -38,9 +38,9 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
 
-# Public floors. Mirror the frozen acceptance criteria committed to
-# ``engrava/benchmarks/synthetic/runner.py`` — a deliberate redundancy so
-# the gate fails if either side drifts. The four labels exactly match
+# Public floors. They duplicate the thresholds in
+# ``engrava/benchmarks/synthetic/runner.py`` (``_AC9A_FLOOR``,
+# ``_AC9B_CEILING``, ``_AC8_CEILING``). The four labels exactly match
 # the benchmark's ``_BindingResult.label`` strings.
 SYNTHETIC_FLOORS: Mapping[str, dict[str, float | str]] = {
     "AC-9a synthesis coverage": {"comparator": ">=", "floor": 0.80},
@@ -67,11 +67,7 @@ LONGMEMEVAL_RECALL_AT_5_FLOOR: float | None = 0.30
 # Questions that the upstream LongMemEval oracle variant ships with text
 # that the engrava-core FTS5 query normaliser cannot serialise into a
 # valid ``MATCH`` expression. The harness crashes mid-sweep when it
-# reaches one of them, so the probe filters them out by id. Each entry
-# corresponds to a tracked follow-up against the FTS normaliser; the set
-# shrinks to empty once the normaliser handles single-quoted phrases
-# plus a bare ``Not`` token in the same query without producing invalid
-# FTS5 syntax.
+# reaches one of them, so the probe filters them out by id.
 LONGMEMEVAL_EXCLUDED_QUESTION_IDS: frozenset[str] = frozenset(
     {
         "352ab8bd",
@@ -224,9 +220,11 @@ def evaluate_longmemeval_recall(
     """
     if floor is None:
         return False, [
-            "LongMemEval was requested but the recall@5 floor is not yet "
-            "calibrated; commit the empirical value before enabling the "
-            "probe in CI",
+            (
+                "LongMemEval was requested but the recall@5 floor is not yet "
+                "calibrated; commit the empirical value before enabling the "
+                "probe in CI"
+            ),
         ]
 
     try:
@@ -255,9 +253,11 @@ def evaluate_longmemeval_recall(
     ]
     if not questions:
         return False, [
-            "LongMemEval dataset filtered to zero questions — every entry "
-            "matched the excluded id list, which should never happen on the "
-            "upstream oracle variant",
+            (
+                "LongMemEval dataset filtered to zero questions — every entry "
+                "matched the excluded id list, which should never happen on the "
+                "upstream oracle variant"
+            ),
         ]
 
     provider = resolve_embedding_provider_or_exit()

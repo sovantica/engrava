@@ -14,10 +14,10 @@ The scenario library MUST contain at least two scenarios
 where dreaming is *not* expected to help.  Those scenarios are
 marked ``expected_dreaming_effect="neutral"`` in this file and that
 flag is committed to git history **before** any calibration run.
-The runtime evaluator then enforces a tight |ON - OFF| <= 0.02 band
-on the sanity subset (see :mod:`engrava.benchmarks.synthetic.evaluate`
-and ``tests/benchmarks/test_synthetic_e2e.py``); silently lowering
-that band would invalidate the whole benchmark.
+The binding section of :mod:`engrava.benchmarks.synthetic.runner`
+(``_AC8_CEILING``) and ``tests/benchmarks/test_synthetic_e2e.py`` cap
+|ON - OFF| on the sanity subset at 0.05; silently raising that
+ceiling would invalidate the whole benchmark.
 
 The non-neutral scenarios are intentionally biased toward the
 recall pathologies dreaming targets — long-distance recall,
@@ -61,15 +61,17 @@ def _freeze_vocab(
 ScenarioDifficulty = Literal["easy", "medium", "hard"]
 # Three categories aligned with the AC-9a / AC-9b / AC-8 grouping:
 #
-# * ``"gain"`` — synthesis-requiring; AC-9a binding ≥5pp ON-vs-OFF gain.
+# * ``"gain"`` — synthesis-requiring; AC-9a binding: a REFLECTION must cover
+#   at least 80 % of the synthesis questions (``_AC9A_FLOOR`` in ``runner.py``).
 #   The answer to the recall question exists in a REFLECTION cluster
 #   summary (consolidated_from semantics), not in any single planted
 #   OBSERVATION.  Dreaming is the mechanism under test.
 # * ``"neutral_or_minor"`` — direct-retrieval scenarios; AC-9b binding
-#   ±2pp neutrality.  FTS / vector retrieval finds the planted facts on
-#   its own; dreaming must not degrade direct lookup.
-# * ``"neutral"`` — anti-cherry-pick sanity subset; AC-8 binding ±2pp.
-#   Pre-registered scenarios where dreaming should not help at all.
+#   |ON - OFF| <= 0.05 (``_AC9B_CEILING``).  FTS / vector retrieval finds
+#   the planted facts on its own; dreaming must not degrade direct lookup.
+# * ``"neutral"`` — anti-cherry-pick sanity subset; AC-8 binding
+#   |ON - OFF| <= 0.05 (``_AC8_CEILING``).  Pre-registered scenarios where
+#   dreaming should not help at all.
 ScenarioDreamingEffect = Literal["gain", "neutral_or_minor", "neutral"]
 
 
@@ -151,11 +153,11 @@ class Scenario:
         difficulty: Coarse difficulty tag for the summary table.
         expected_dreaming_effect: Pre-registered expectation:
             ``"gain"`` for synthesis-requiring scenarios (AC-9a
-            ≥5pp ON-vs-OFF gain MUST materialise),
+            coverage of at least 0.80 MUST materialise),
             ``"neutral_or_minor"`` for direct-retrieval scenarios
-            (AC-9b ±2pp neutrality MUST hold), ``"neutral"`` for
-            anti-cherry-pick sanity scenarios (AC-8 ±2pp).  Never
-            flip a flag to chase a target metric.
+            (AC-9b |ON - OFF| <= 0.05 MUST hold), ``"neutral"`` for
+            anti-cherry-pick sanity scenarios (AC-8 |ON - OFF| <= 0.05).
+            Never flip a flag to chase a target metric.
         memorable_templates: Sentence templates for the memorable
             fact(s) on the direct path.  Slots are simple
             ``{name}``-style placeholders that the generator fills
@@ -402,9 +404,9 @@ SCENARIO_LIBRARY: tuple[Scenario, ...] = (
     ),
     # -----------------------------------------------------------------
     # Anti-cherry-pick scenarios — pre-registered as DREAMING-NEUTRAL.
-    # The evaluator enforces |ON - OFF| <= 0.02 on the subset built
-    # from these two scenarios; the assertion lives in
-    # ``tests/benchmarks/test_synthetic_e2e.py``.
+    # The binding measurements hold |ON - OFF| <= 0.05 on the subset built
+    # from these two scenarios (``_AC8_CEILING`` in ``runner.py``); the
+    # assertion lives in ``tests/benchmarks/test_synthetic_e2e.py``.
     # -----------------------------------------------------------------
     Scenario(
         name="single_unique_fact",
@@ -465,7 +467,7 @@ SCENARIO_LIBRARY: tuple[Scenario, ...] = (
         question_offset_max_turns=6,
     ),
     # -----------------------------------------------------------------
-    # Synthesis-requiring scenarios (AC-9a binding ≥5pp gain).  The
+    # Synthesis-requiring scenarios (AC-9a binding: coverage >= 0.80).  The
     # answer to the recall question exists in the REFLECTION cluster
     # summary, not in any single planted observation — so dreaming is
     # mechanically required to score.

@@ -1,12 +1,10 @@
 """Update paths write only the fields they own, and report what actually landed.
 
-Every update in the store used to be derived from a whole-record snapshot read
-at the top of the call: the record was read, evolved in memory, and written back
-column by column — including columns the caller never mentioned. A telemetry
-write (``record_access``) or a confirmation bump landing between that read and
-that write was silently overwritten.
+An update writes only the columns the operation owns, so a telemetry write
+(``record_access``) or a confirmation bump landing between the operation's read
+and its write is not overwritten.
 
-These tests pin the two halves of the fix:
+These tests pin two properties:
 
 * **Blast radius** — an update writes the columns the operation owns and leaves
   every other column exactly as it stands in storage, verified by reading the
@@ -39,6 +37,7 @@ from engrava import (
     LifecycleStatus,
     Priority,
     SqliteEngravaCore,
+    StaleDataError,
     ThoughtNotFoundError,
     ThoughtRecord,
     ThoughtType,
@@ -48,6 +47,7 @@ from engrava.domain.models import MetadataValue
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
+    from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Fixtures + helpers
@@ -243,7 +243,7 @@ class TestUpdateThoughtBlastRadius:
 
         await store.update_thought("t-1", essence="new essence")
 
-        assert _set_columns(statements, "thought") == {"essence", "updated_at"}
+        assert _set_columns(statements, "thought") == {"essence", "updated_at", "revision"}
 
     async def test_concurrent_access_telemetry_survives_an_update(
         self,
@@ -318,7 +318,13 @@ class TestUpdateThoughtBlastRadius:
 
         after = dict(await _row(db, "thought", "thought_id", "t-1"))
         changed = {key for key in before if before[key] != after[key]}
-        assert changed == {"essence", "updated_at", "access_count", "last_accessed_at"}
+        assert changed == {
+            "essence",
+            "updated_at",
+            "access_count",
+            "last_accessed_at",
+            "revision",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +653,7 @@ class TestUpdateEdge:
 
         await store.update_edge("e-1", weight=0.9)
 
-        assert _set_columns(statements, "edge") == {"weight"}
+        assert _set_columns(statements, "edge") == {"weight", "revision"}
 
     async def test_concurrent_weight_change_survives_an_update(
         self,
@@ -688,7 +694,7 @@ class TestUpdateEdge:
 
         after = dict(await _row(db, "edge", "edge_id", "e-1"))
         changed = {key for key in before if before[key] != after[key]}
-        assert changed == {"decay_multiplier", "weight"}
+        assert changed == {"decay_multiplier", "weight", "revision"}
 
     async def test_journal_after_image_reflects_the_concurrent_write(
         self,
@@ -771,11 +777,80 @@ class TestUpdateEdge:
         assert not [s for s in statements if s.lstrip().upper().startswith("UPDATE EDGE SET")]
         assert returned.weight == 0.5
 
+    async def test_no_op_update_does_not_commit_the_callers_pending_edit(
+        self,
+        store: SqliteEngravaCore,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """A no-op ``update_edge`` (no journal) has nothing of its own to commit.
+
+        Mirrors the ``delete_thought`` defect this pins in
+        ``tests/test_referential_integrity.py``: the caller opens a
+        transaction, makes its own pending edit, then calls a store method
+        that — on this branch — writes nothing at all. That method must not
+        reach out and commit the caller's unrelated pending work.
+        """
+        await self._seed(store)
+
+        await db.execute("BEGIN")
+        await db.execute(
+            "UPDATE thought SET essence = ? WHERE thought_id = ?",
+            ("edited-by-caller", "t-1"),
+        )
+
+        returned = await store.update_edge("e-1")
+
+        assert returned.weight == 0.5
+        assert db.in_transaction is True, (
+            "the caller's own transaction, with their pending edit still "
+            "inside it, must still be open after a no-op update_edge() call"
+        )
+        await db.rollback()
+
+        row = await _row(db, "thought", "thought_id", "t-1")
+        assert row["essence"] == "essence", (
+            "the caller's rollback must undo their own edit -- a no-op "
+            "update_edge() must not have committed it on their behalf"
+        )
+
+    async def test_no_op_update_still_commits_when_journaled(
+        self,
+        journaling_store: SqliteEngravaCore,
+        db: aiosqlite.Connection,
+    ) -> None:
+        """A no-op ``update_edge`` still journals (before == after) when enabled.
+
+        That journal entry is itself a real row insert on this connection, so
+        unlike the un-journaled no-op above, this call *does* have something
+        of its own to make durable — the call must still commit here.
+        """
+        await self._seed(journaling_store)
+
+        returned = await journaling_store.update_edge("e-1")
+
+        assert returned.weight == 0.5
+        assert db.in_transaction is False, (
+            "a no-op update_edge() that journaled a before==after entry must "
+            "still commit that entry"
+        )
+        assert journaling_store._journal is not None
+        entries = await journaling_store._journal.get_entries(
+            target_id="e-1",
+            mutation_type="UPDATE_EDGE",
+        )
+        assert len(entries) == 1
+
     async def test_update_of_an_edge_deleted_before_the_write_raises(
         self,
         store: SqliteEngravaCore,
     ) -> None:
-        """An edge deleted between the read and the write is not reported as updated."""
+        """An edge deleted between the read and the write is not reported as updated.
+
+        The guarded ``UPDATE`` matches no row (the row is gone), which is
+        exactly what ``StaleDataError`` means now that the write carries a
+        ``revision`` guard — see ``update_thought`` for why this error does
+        not distinguish "moved" from "gone".
+        """
         await self._seed(store)
 
         async def _delete() -> None:
@@ -783,7 +858,7 @@ class TestUpdateEdge:
 
         _interleave_once(store, "_get_edge_row", _delete)
 
-        with pytest.raises(ValueError, match="Edge not found"):
+        with pytest.raises(StaleDataError):
             await store.update_edge("e-1", weight=0.9)
 
     async def test_update_of_an_edge_deleted_after_the_write_raises(
@@ -802,6 +877,117 @@ class TestUpdateEdge:
         with pytest.raises(ValueError, match="Edge not found"):
             await store.update_edge("e-1", weight=0.9)
         assert any(s.lstrip().upper().startswith("UPDATE EDGE SET") for s in statements)
+
+
+class TestUpdateEdgeWroteAnythingDiscrimination:
+    """``wrote_anything`` must reflect ``total_changes``, not "``append`` was called".
+
+    ``update_edge`` derives ``wrote_anything`` from ``total_changes``, not from
+    whether the journal's ``append`` was invoked -- ``append`` does not check
+    whether its own ``INSERT`` actually landed, so a trigger on
+    ``journal_entry`` can veto it with ``RAISE(IGNORE)`` while a flag set on
+    invocation would still claim a write happened.
+    """
+
+    async def _open(self, tmp_path: Path, name: str) -> tuple[aiosqlite.Connection, Path]:
+        db_path = tmp_path / name
+        db = await aiosqlite.connect(str(db_path))
+        db.row_factory = aiosqlite.Row
+        bootstrap = SqliteEngravaCore(db, journal_enabled=True)
+        await bootstrap.ensure_schema()
+        return db, db_path
+
+    async def test_trigger_write_before_the_journal_veto_is_durable(self, tmp_path: Path) -> None:
+        """The trigger's own write survives even though the journal insert was vetoed."""
+        db, db_path = await self._open(tmp_path, "update-edge-journal-veto-durable.sqlite")
+        try:
+            store = SqliteEngravaCore(db, journal_enabled=True)
+            await store.create_thought(_thought("t-1"))
+            await store.create_thought(_thought("t-2"))
+            await store.create_edge(_edge())
+            await db.execute("CREATE TABLE audit(note TEXT)")
+            await db.execute(
+                "CREATE TRIGGER journal_insert_audit BEFORE INSERT ON journal_entry "
+                "BEGIN INSERT INTO audit VALUES ('attempted'); SELECT RAISE(IGNORE); END"
+            )
+            await db.commit()
+            journal_rows_before = (
+                await (await db.execute("SELECT COUNT(*) FROM journal_entry")).fetchone()
+            )[0]
+
+            returned = await store.update_edge("e-1")
+
+            assert returned.weight == 0.5
+
+            other = await aiosqlite.connect(str(db_path))
+            try:
+                cursor = await other.execute("SELECT COUNT(*) FROM audit")
+                row = await cursor.fetchone()
+                assert row is not None
+                assert row[0] == 1, (
+                    "the trigger's own audit insert ran before it vetoed the "
+                    "journal entry, and must be committed even though "
+                    "journal_entry itself gained no row"
+                )
+                cursor = await other.execute("SELECT COUNT(*) FROM journal_entry")
+                row = await cursor.fetchone()
+                assert row is not None
+                assert row[0] == journal_rows_before, (
+                    "the journal insert itself was genuinely vetoed -- "
+                    "no new row, only the two thought/edge creations already there"
+                )
+            finally:
+                await other.close()
+        finally:
+            await db.close()
+
+    async def test_a_journal_veto_that_writes_nothing_commits_nothing(self, tmp_path: Path) -> None:
+        """A pure veto (no trigger side effect at all) must not commit a caller's own edit.
+
+        Enabling journaling does not by itself make a call a write: when the
+        journal insert is vetoed and the edit changes no column, this call has
+        written nothing, so it commits nothing.
+        """
+        db, _ = await self._open(tmp_path, "update-edge-journal-veto-write-free.sqlite")
+        try:
+            store = SqliteEngravaCore(db, journal_enabled=True)
+            await store.create_thought(_thought("t-1"))
+            await store.create_thought(_thought("t-2"))
+            await store.create_thought(_thought("t-3", essence="essence-unrelated"))
+            await store.create_edge(_edge())
+            await db.execute(
+                "CREATE TRIGGER journal_insert_ignore BEFORE INSERT ON journal_entry "
+                "BEGIN SELECT RAISE(IGNORE); END"
+            )
+            await db.commit()
+
+            await db.execute("BEGIN")
+            await db.execute(
+                "UPDATE thought SET essence = ? WHERE thought_id = ?",
+                ("edited-by-caller", "t-3"),
+            )
+
+            returned = await store.update_edge("e-1")
+
+            assert returned.weight == 0.5
+            assert db.in_transaction is True, (
+                "the caller's own transaction, with their pending edit still "
+                "inside it, must still be open after a call whose only "
+                "attempted write (the journal insert) was silently vetoed "
+                "and left nothing behind"
+            )
+            await db.rollback()
+
+            cursor = await db.execute("SELECT essence FROM thought WHERE thought_id = ?", ("t-3",))
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row["essence"] == "essence-unrelated", (
+                "the caller's rollback must undo their own edit -- a "
+                "genuinely write-free update_edge() must not have committed "
+                "it on their behalf"
+            )
+        finally:
+            await db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -826,7 +1012,7 @@ class TestUpdateAction:
 
         await store.update_action("a-1", status=ActionStatus.EXECUTING)
 
-        assert _set_columns(statements, "action") == {"status"}
+        assert _set_columns(statements, "action") == {"status", "revision"}
 
     async def test_concurrent_verification_change_survives_a_status_update(
         self,
@@ -842,7 +1028,7 @@ class TestUpdateAction:
                 (VerificationStatus.PARTIAL.value, "a-1"),
             )
 
-        _interleave_once(store, "_get_action", _verify)
+        _interleave_once(store, "_get_action_row", _verify)
 
         returned = await store.update_action("a-1", status=ActionStatus.EXECUTING)
 
@@ -867,13 +1053,13 @@ class TestUpdateAction:
                 (VerificationStatus.PARTIAL.value, "a-1"),
             )
 
-        _interleave_once(store, "_get_action", _verify)
+        _interleave_once(store, "_get_action_row", _verify)
 
         await store.update_action("a-1", status=ActionStatus.EXECUTING)
 
         after = dict(await _row(db, "action", "action_id", "a-1"))
         changed = {key for key in before if before[key] != after[key]}
-        assert changed == {"status", "verification_status"}
+        assert changed == {"status", "verification_status", "revision"}
 
     async def test_journal_after_image_reflects_the_concurrent_write(
         self,
@@ -889,7 +1075,7 @@ class TestUpdateAction:
                 (VerificationStatus.PARTIAL.value, "a-1"),
             )
 
-        _interleave_once(journaling_store, "_get_action", _verify)
+        _interleave_once(journaling_store, "_get_action_row", _verify)
 
         await journaling_store.update_action("a-1", status=ActionStatus.EXECUTING)
 
@@ -909,15 +1095,22 @@ class TestUpdateAction:
         self,
         store: SqliteEngravaCore,
     ) -> None:
-        """An action deleted between the read and the write is not reported as updated."""
+        """An action deleted between the read and the write is not reported as updated.
+
+        The guarded ``UPDATE`` matches no row (the row is gone), which is
+        exactly what ``StaleDataError`` means now that the write carries a
+        ``revision`` guard — see ``update_thought`` for why this error does
+        not distinguish "moved" from "gone". ``ActionNotFoundError`` remains
+        what the *initial* read raises, before any guarded write is attempted.
+        """
         await self._seed(store)
 
         async def _delete() -> None:
             await store._db.execute("DELETE FROM action WHERE action_id = ?", ("a-1",))
 
-        _interleave_once(store, "_get_action", _delete)
+        _interleave_once(store, "_get_action_row", _delete)
 
-        with pytest.raises(ActionNotFoundError):
+        with pytest.raises(StaleDataError):
             await store.update_action("a-1", status=ActionStatus.EXECUTING)
 
     async def test_update_of_an_action_deleted_after_the_write_raises(
@@ -958,11 +1151,11 @@ class TestColumnMapsMatchTheSchema:
         """Every thought column is either updatable or explicitly excluded."""
         mapped = set(store._thought_to_core_columns(_thought()))
         # ``thought_id`` identifies the row being updated. ``content_hash`` is
-        # excluded because no update has ever written it — a known defect (an
-        # edit to ``content`` leaves the stored hash pointing at the old text),
-        # preserved here deliberately rather than sanctioned: changing it moves
-        # deduplication behaviour and belongs to its own change.
-        excluded = {"thought_id", "content_hash"}
+        # excluded because no update writes it, so an edit to ``content``
+        # leaves the stored hash unchanged. ``revision`` is excluded because
+        # it is engine-bumped (``revision = revision + 1`` in the guarded
+        # ``UPDATE`` itself), never a caller-supplied value.
+        excluded = {"thought_id", "content_hash", "revision"}
         assert mapped | excluded == await self._table_columns(db, "thought")
         assert not mapped & excluded
 
@@ -974,8 +1167,9 @@ class TestColumnMapsMatchTheSchema:
         from engrava.infrastructure.sqlite.engrava_core import _edge_to_core_columns
 
         mapped = set(_edge_to_core_columns(_edge()))
-        # ``edge_id`` identifies the row being updated.
-        excluded = {"edge_id"}
+        # ``edge_id`` identifies the row being updated. ``revision`` is
+        # excluded because it is engine-bumped, never a caller-supplied value.
+        excluded = {"edge_id", "revision"}
         assert mapped | excluded == await self._table_columns(db, "edge")
         assert not mapped & excluded
 

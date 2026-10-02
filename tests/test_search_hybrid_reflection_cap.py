@@ -8,6 +8,10 @@ Covers:
 - Warning emitted when off-list non-REFLECTIONs are insufficient to fill evicted slots
 - _parse_search wires reflection_topk_cap from YAML
 - Zero REFLECTION-only top-K: OBSERVATIONs always present when cap < 1.0 and sources exist
+- Query-less fallback: the survivors' relative order is the fallback's own
+  order, not a fresh ``(score, id)`` or ``updated_cycle`` re-sort, across
+  every fallback ranking mode (cycle recency, transaction-time recency,
+  priority-adjusted) and composed with collapse-by-unit
 """
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ from engrava.domain.enums import (
     ThoughtType,
 )
 from engrava.domain.models.edge import EdgeRecord
-from engrava.domain.models.thought import ThoughtRecord
+from engrava.domain.models.thought import MetadataValue, ThoughtRecord
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -47,18 +51,28 @@ def _obs(
     essence: str = "obs",
     content: str = "content",
     created_cycle: int = 0,
+    priority: Priority = Priority.P3,
+    updated_at: str | None = None,
+    metadata: dict[str, MetadataValue] | None = None,
 ) -> ThoughtRecord:
-    """Minimal OBSERVATION thought."""
+    """Minimal OBSERVATION thought.
+
+    ``updated_at`` is only auto-stamped by ``create_thought`` when left
+    ``None``, so passing it explicitly gives a test byte-exact control of the
+    transaction-time axis.
+    """
     return ThoughtRecord(
         thought_id=thought_id,
         thought_type=ThoughtType.OBSERVATION,
         essence=essence,
         content=content,
-        priority=Priority.P3,
+        priority=priority,
         lifecycle_status=LifecycleStatus.ACTIVE,
         created_cycle=created_cycle,
         updated_cycle=created_cycle,
         source="test",
+        updated_at=updated_at,
+        metadata=metadata or {},
     )
 
 
@@ -68,6 +82,9 @@ def _reflection(
     essence: str = "reflection",
     content: str = "summary",
     created_cycle: int = 0,
+    priority: Priority = Priority.P2,
+    updated_at: str | None = None,
+    metadata: dict[str, MetadataValue] | None = None,
 ) -> ThoughtRecord:
     """Minimal REFLECTION thought."""
     return ThoughtRecord(
@@ -75,11 +92,13 @@ def _reflection(
         thought_type=ThoughtType.REFLECTION,
         essence=essence,
         content=content,
-        priority=Priority.P2,
+        priority=priority,
         lifecycle_status=LifecycleStatus.ACTIVE,
         created_cycle=created_cycle,
         updated_cycle=created_cycle,
         source="test",
+        updated_at=updated_at,
+        metadata=metadata or {},
     )
 
 
@@ -373,11 +392,7 @@ class TestReflectionCapInvariant:
         self,
         store: SqliteEngravaCore,
     ) -> None:
-        """With cap=0.3, at least one OBS appears in top-5 result when OBSs exist.
-
-        This validates the 'zero REFLECTION-only top-20' acceptance criterion
-        when scaled down to top-5.
-        """
+        """With cap=0.3, at least one OBS appears in top-5 result when OBSs exist."""
         _, obs_ids = await self._populate_flood(
             store,
             n_reflections=8,
@@ -509,3 +524,164 @@ class TestReflectionsEvictedField:
         result = await store_cap1.search_hybrid(query_text="zephyr", top_k=10)
 
         assert result.reflections_evicted == 0
+
+
+class TestFallbackReflectionCap:
+    """The all-signals-off fallback must enforce ``reflection_topk_cap``
+    exactly like an ordinary FTS/vector-active search — a fallback result is
+    still a result.
+    """
+
+    async def test_fallback_enforces_cap(self, store: SqliteEngravaCore) -> None:
+        """No query text, no vector: REFLECTIONs still capped at cap * top_k.
+
+        8 REFLECTIONs (ranked first via a higher ``updated_cycle``) and 12
+        OBSERVATIONs (ranked after, with enough depth to fully backfill the
+        evicted slots). With ``top_k=10`` and the fixture's
+        ``reflection_topk_cap=0.3``, at most 3 REFLECTION slots are allowed,
+        where an uncapped top-10 would hold 8 of them.
+        """
+        for i in range(8):
+            await store.create_thought(
+                _reflection(f"refl-{i}", essence="reflection flood", created_cycle=10)
+            )
+        for i in range(12):
+            await store.create_thought(_obs(f"obs-{i}", essence="obs flood", created_cycle=0))
+
+        result = await store.search_hybrid("", top_k=10, priority_weight=0.0)
+
+        assert "fts5" not in result.backends_used
+        assert "vector" not in result.backends_used
+        refl_in_result = [tid for tid, _ in result.results if tid.startswith("refl-")]
+        obs_in_result = [tid for tid, _ in result.results if tid.startswith("obs-")]
+        # cap=0.3 * top_k=10 -> at most 3 reflection slots.
+        assert len(refl_in_result) <= 3
+        # The freed slots are backfilled from off-list OBSERVATIONs, filling
+        # the window back up to top_k.
+        assert len(refl_in_result) + len(obs_in_result) == 10
+        assert len(result.results) == 10
+
+    async def test_fallback_keeps_recency_order_after_eviction_and_backfill(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """Eviction + backfill must keep the fallback's own recency order.
+
+        One REFLECTION outranks three OBSERVATIONs by cycle and is evicted (cap
+        below 1.0 allows zero REFLECTION slots at top_k=3); the backfilled
+        OBSERVATION takes the evicted slot without disturbing the other two
+        survivors' relative order. Every fallback score here is the same flat
+        value, so a re-sort using ``thought_id`` as its tie-break (rather than
+        keeping the fallback's own order) would silently turn "most-recent
+        first" into alphabetical.
+        """
+        await store.create_thought(_reflection("r", created_cycle=50))
+        await store.create_thought(_obs("z", created_cycle=40))
+        await store.create_thought(_obs("y", created_cycle=30))
+        await store.create_thought(_obs("x", created_cycle=20))
+        await store.create_thought(_obs("w", created_cycle=10))
+
+        result = await store.search_hybrid("", top_k=3, priority_weight=0.0)
+
+        assert "fts5" not in result.backends_used
+        assert "vector" not in result.backends_used
+        assert result.reflections_evicted == 1
+        assert [tid for tid, _ in result.results] == ["z", "y", "x"]
+
+    async def test_fallback_keeps_priority_adjusted_order_after_eviction(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """Same eviction/backfill shape, ranked by priority instead of cycle.
+
+        ``priority_weight=1.0`` with recency off makes the priority-adjusted
+        score the fallback's only signal, so its order has no relation to
+        ``updated_cycle`` (the OBSERVATION cycles are deliberately scrambled
+        relative to priority). Two survivors share a priority tier (P3), and
+        their thought_ids are chosen so alphabetical order is the reverse of
+        the fallback's own order — a ``(score, id)`` re-sort after eviction
+        would swap them.
+        """
+        await store.create_thought(_reflection("prio-refl", priority=Priority.P2, created_cycle=5))
+        await store.create_thought(_obs("prio-c", priority=Priority.P1, created_cycle=10))
+        await store.create_thought(_obs("prio-zulu", priority=Priority.P3, created_cycle=40))
+        await store.create_thought(_obs("prio-alpha", priority=Priority.P3, created_cycle=30))
+
+        result = await store.search_hybrid("", top_k=3, priority_weight=1.0)
+
+        assert "fts5" not in result.backends_used
+        assert "vector" not in result.backends_used
+        assert result.reflections_evicted == 1
+        assert [tid for tid, _ in result.results] == ["prio-c", "prio-zulu", "prio-alpha"]
+
+    async def test_fallback_keeps_transaction_time_order_after_eviction(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """Same eviction/backfill shape, ranked by transaction time.
+
+        ``recency_now`` with ``priority_weight=0.0`` makes write-time recency
+        the fallback's only signal; the OBSERVATION cycles are again scrambled
+        relative to it, so a re-sort that substitutes ``updated_cycle`` for the
+        fallback's own order would also fail this one.
+        """
+        await store.create_thought(
+            _reflection("txn-refl", created_cycle=999, updated_at="2026-01-05T00:00:00+00:00")
+        )
+        await store.create_thought(
+            _obs("txn-a", created_cycle=1, updated_at="2026-01-10T00:00:00+00:00")
+        )
+        await store.create_thought(
+            _obs("txn-b", created_cycle=50, updated_at="2026-01-08T00:00:00+00:00")
+        )
+        await store.create_thought(
+            _obs("txn-c", created_cycle=25, updated_at="2026-01-01T00:00:00+00:00")
+        )
+
+        result = await store.search_hybrid(
+            "",
+            top_k=3,
+            priority_weight=0.0,
+            recency_weight=1.0,
+            recency_now="2026-01-11T00:00:00+00:00",
+            recency_now_half_life=2_592_000,
+        )
+
+        assert "fts5" not in result.backends_used
+        assert "vector" not in result.backends_used
+        assert "recency" in result.backends_used
+        assert result.reflections_evicted == 1
+        assert [tid for tid, _ in result.results] == ["txn-a", "txn-b", "txn-c"]
+
+    async def test_fallback_keeps_order_with_collapse_and_cap_both_acting(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """Collapse-by-unit and the REFLECTION cap can both evict in one call.
+
+        ``cc-dup-lo`` is dropped first (collapse retention keeps only the
+        higher-ranked member of its unit); the freed slot lets ``cc-deep-a``
+        advance into the pre-cap top-3 window. The REFLECTION (already
+        ranked first by cycle, ahead of any collapse) is then evicted by the
+        cap and backfilled from ``cc-deep-b``, the next survivor beyond the
+        window. The two backfilled OBSERVATIONs land in the surviving order
+        the fallback itself produced — not the alphabetical order their
+        thought_ids would give a ``(score, id)`` re-sort.
+        """
+        await store.create_thought(_reflection("cc-refl", created_cycle=100))
+        await store.create_thought(_obs("cc-dup-hi", created_cycle=90, metadata={"unit": "dup"}))
+        await store.create_thought(_obs("cc-dup-lo", created_cycle=80, metadata={"unit": "dup"}))
+        await store.create_thought(_obs("cc-deep-a", created_cycle=70))
+        await store.create_thought(_obs("cc-deep-b", created_cycle=10))
+
+        result = await store.search_hybrid(
+            "",
+            top_k=3,
+            priority_weight=0.0,
+            collapse_key="$.unit",
+        )
+
+        assert "fts5" not in result.backends_used
+        assert "vector" not in result.backends_used
+        assert result.reflections_evicted == 1
+        assert [tid for tid, _ in result.results] == ["cc-dup-hi", "cc-deep-a", "cc-deep-b"]

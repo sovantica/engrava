@@ -1,8 +1,9 @@
 # Dreaming — Memory Consolidation
 
 Engrava's **dreaming** extension provides periodic memory consolidation:
-it evaluates stored thoughts, scores them against configurable signals,
-and promotes the most important ones by setting their priority to **P1**.
+it evaluates eligible candidate thoughts, scores them against configurable
+signals, and — when the corresponding gates, thresholds, and caps permit —
+may promote qualifying ones by setting their priority to **P1**.
 
 Dreaming runs **outside** the normal CRUD path — the consumer decides
 when to invoke `run_consolidation()` (after N cycles, in a cron job,
@@ -100,6 +101,29 @@ result = await ext.run_consolidation(store, current_cycle=1)
 print(f"Promoted {result.promoted_count} thoughts")
 ```
 
+### Attaching a hand-built extension to a store
+
+Calling `run_consolidation()` on the extension directly (above) never needs
+the store to know about it. If you instead want `store.consolidate()` to run
+your hand-built extension — the same call site used by an `from_config`-built
+store — wire it on with `attach_dreaming_extension()`:
+
+```python
+store.attach_dreaming_extension(ext)
+result = await store.consolidate(current_cycle=2)
+```
+
+This is the supported way to wire an extension onto a manually built store; it
+does not itself construct or configure a `DreamingExtension`. Calling it again
+replaces whatever was attached before — there is no separate error for a
+second call, and no way to detach through this method. `attach_dreaming_extension()`
+checks the argument against the `runtime_checkable` `DreamingConsolidatorProtocol`
+(which looks for a `run_consolidation` member) and raises `TypeError` if that
+check fails. It does not check the method's signature or that it is a
+coroutine function, so a same-named but wrong-shaped `run_consolidation`
+(sync instead of async, or a different signature) passes this check and
+fails only once `consolidate()` actually calls it.
+
 ### From YAML config
 
 If you enable dreaming in `engrava.yaml`
@@ -131,9 +155,10 @@ unconditional.
 
 ## Gates
 
-Before a thought is scored against the promotion threshold, it must
-pass all active **gates**.  Gates are cheap boolean checks that filter
-out clearly ineligible candidates.
+A thought is scored against the promotion threshold regardless; it must pass
+all active **gates** to be **promoted**. Gates are cheap boolean checks that
+filter out clearly ineligible candidates before a passing score can result in
+a promotion.
 
 | Gate | Field | Default | Description |
 |------|-------|---------|-------------|
@@ -181,7 +206,11 @@ The remaining caps operate at different stages:
 - `max_promoted_per_run` (default `20`) limits writes in one promotion phase;
 - `max_p1_fraction` (default `0.05`) limits the corpus-wide P1 population;
 - `min_cluster_size` / `max_cluster_size` (defaults `3` / `200`) reject clusters
-  that are too small or too broad after eligibility filtering;
+  that are too small or too broad — but not symmetrically: `max_cluster_size`
+  is applied once, to the **raw** cluster, before eligibility filtering; only
+  `min_cluster_size` is re-checked afterward, against the eligible member
+  count. A raw cluster over `max_cluster_size` is rejected even if filtering
+  would have brought it back under the cap;
 - `clustering_min_new_candidates` (default `50`) skips repeat clustering when
   the eligible ACTIVE population has not grown enough. It does not skip signal
   scoring, promotion, or edge creation.
@@ -189,7 +218,9 @@ The remaining caps operate at different stages:
 ## Signals
 
 Signals compute a score in `[0.0, 1.0]` for each candidate thought.
-The weighted sum of all signal scores is compared against
+The candidate's promotion score is a weighted sum over the signals
+**active for this run** — an inactive signal's weight is set to zero (see
+below) — and that score is compared against
 `promote_threshold`.
 
 | Signal | Weight | Description |
@@ -201,22 +232,43 @@ The weighted sum of all signal scores is compared against
 | `frequency` | 0.20 | Ratio of `access_count` to max (10). |
 | `action_outcome` | 0.15 | Thought's `action_outcome_score` — the mean outcome value over its terminal linked actions (`None` ⇒ contributes `0.0`). |
 
-A signal whose data source is flat across the whole candidate pool carries no
-ranking information, so it is dropped and its weight is redistributed over the
-active signals. `action_outcome` is therefore **inactive** — and its weight
-falls out of the denominator — in any store where no candidate has a recorded
-action outcome, so it never perturbs consolidation until actions are used. The
-default weights sum to more than 1.0 for this reason: they are relative
-priorities renormalised over the active set, not a probability distribution.
+Which signals are active is decided once per run, over the whole candidate
+pool:
 
-Custom signals can be provided via `DreamingSignalProtocol`:
+- `recency` and `staleness` are always active: a consolidation run always has
+  a cycle.
+- `confirmation` is active when some candidate has `confirmation_count > 0`.
+- `confidence` is active when some candidate has a `confidence` value.
+- `action_outcome` is active when some candidate has an `action_outcome_score`.
+- `frequency` is active when `access_tracking_enabled` is `true` and some
+  candidate has `access_count > 0` (see
+  [Access tracking](#access-tracking-the-frequency-substrate) below).
+- A custom signal registered via `custom_signals` under a new name is always
+  active. One that reuses a default name follows that name's rule.
+
+An inactive signal's weight is set to `0.0`, and each active signal's weight
+is divided by the sum of the active weights. If no signal is active, or that
+sum is zero, every weight is `0.0` and nothing is promoted. The default
+weights sum to more than 1.0: they are relative priorities, not a probability
+distribution.
+
+Custom signals can be provided via `DreamingSignalProtocol`. `custom_signals` only
+supplies the *callable* for a name — the name itself must also carry a weight in
+`config.signals`, or it is never resolved:
 
 ```python
+from engrava import ThoughtRecord, DreamingContext
+from engrava.config import DreamingConfig
+from engrava.extensions.dreaming import DreamingExtension
+
+
 class MySignal:
     def __call__(self, thought: ThoughtRecord, ctx: DreamingContext) -> float:
         return 0.42
 
 
+config = DreamingConfig(enabled=True)
+config.signals["my_signal"] = 0.30  # required: registers the name and its weight
 ext = DreamingExtension(
     config=config,
     custom_signals={"my_signal": MySignal()},
@@ -238,9 +290,12 @@ before scoring so the current cycle sees up-to-date counts. Access tracking is
 deliberately **not** journaled — the counts are regenerable telemetry, not part
 of the tamper-evident chain (see [Audit Trail](audit-trail.md)).
 
-Set `access_tracking_enabled: false` to leave `access_count` untouched (the
-`frequency` signal then stays inactive and its weight is redistributed over the
-remaining active signals, exactly as with any other inactive signal).
+Set `access_tracking_enabled: false` to stop counting new accesses. With it
+`false`, the `frequency` signal is always dropped and its weight redistributed
+over the remaining active signals — even on a store where candidates already
+carry a non-zero `access_count` from before tracking was turned off, since
+`access_tracking_enabled` gates the signal on its own, independent of any
+stored value.
 
 ## Priority signal in search
 
@@ -320,13 +375,17 @@ proportional to the neighbour's score and the connecting edge weight.
 ### Algorithm
 
 ```
+candidate_scores = { C: max(fts[C], vector[C]) for C in fusion pool }  # pool members only
 For each candidate C in the fusion pool:
   neighbours = get_edges(C, direction="BOTH", limit=max_neighbors)
   For each (edge, neighbour):
-    neighbour_base = max(fts[neighbour], vector[neighbour])
+    neighbour_base = candidate_scores.get(neighbour, 0.0)  # 0 if neighbour is off-pool
     boost[C] += edge.weight × neighbour_base × graph_edge_decay
 final_score[C] += graph_weight × boost[C]
 ```
+
+A neighbour outside the fusion pool contributes `0`, not its own fts/vector
+score — only pool members' base scores propagate.
 
 ### Configuration
 
@@ -348,8 +407,10 @@ result = await store.search_hybrid(
 ```
 
 The graph signal is **opt-in** in v0.3.0 (`default_graph_weight=0.0`).
-When the weight is `0.0`, no graph queries are made and there is zero
-performance impact.
+When the weight is `0.0`, the graph ranking signal is off and costs nothing.
+Candidate-pool expansion over `CONSOLIDATED_FROM` edges is controlled
+separately by `graph_expansion_enabled` (default `true`) and reads those edges only
+when a reflection ranks among the top candidates.
 
 ## Complete YAML surface
 
@@ -526,12 +587,38 @@ clusters (and REFLECTIONs) before any dream edges exist.
 ### Idempotence
 
 Before creating a REFLECTION, the extension derives a 16-hex content-hash
-from the sorted member IDs and checks whether any REFLECTION with
-`source = "dreaming:<hash>"` already exists (exact SQL index lookup,
-O(1), scales to any store size).  If found, the cluster is skipped.
+from the sorted, **eligibility-filtered** member IDs — the same subset the
+metadata-aware eligibility filter above narrows the raw cluster down to, not
+the raw cluster itself — and checks whether any REFLECTION with
+`source = "dreaming:<hash>"` already exists via
+`SELECT ... WHERE thought_type = ? AND source = ? LIMIT 1`. **This is not an
+O(1) index lookup**: the schema indexes `thought(thought_type)` but not
+`thought(source)`, so `EXPLAIN QUERY PLAN` shows the query using
+`idx_thought_type` and then scanning every matching row for the `source`
+filter — O(number of REFLECTIONs) per cluster per run, not O(1). If found, the
+cluster is skipped. Because
+the hash is over the filtered subset, the same raw cluster scanned under a
+different eligibility configuration can legitimately hash differently and
+yield a new REFLECTION.
 
 Re-running `run_consolidation()` on unchanged data creates zero
 duplicate REFLECTIONs.
+
+### Recovery from a failed embedding
+
+REFLECTION creation embeds the synthesis text itself (when the store has
+auto-embed configured) before the extension stores its own centroid vector.
+If that embedding attempt fails — a transient provider timeout, a rate
+limit — the extension attempts to delete the reflection thought it had
+already inserted, rather than rolling the transaction back; no centroid and
+no `CONSOLIDATED_FROM` edges are created for that cluster, because those
+steps only run after the reflection thought is created successfully. If the
+deletion attempt itself fails, or finds nothing to remove, the reflection
+thought remains with its content-hash recorded, and the next consolidation
+pass skips the cluster instead of retrying it. When the deletion succeeds,
+no thought carrying the cluster's hash remains, so the next pass processes
+the cluster as new; with journaling enabled, the journal still holds both
+the insert and the deletion.
 
 ### Configuration
 
@@ -554,7 +641,10 @@ extensions:
 
 After clustering, metadata eligibility is applied again to the resolved
 members. The cluster must still contain at least `min_cluster_size` eligible
-members and must not exceed `max_cluster_size`.
+members. `max_cluster_size` is **not** re-checked here — it was already
+enforced once, against the raw (pre-filtering) cluster in `_build_clusters` —
+so an eligible-member count under the cap does not rescue a raw cluster that
+exceeded it, and no upper bound applies to the eligible subset itself.
 
 With `cluster_quality_gating_enabled: true` (default), a cluster is rejected on
 the first failed content-quality check:
@@ -583,14 +673,14 @@ The cross-cluster boilerplate filter is controlled separately by
 | `candidates_evaluated` | Number of ACTIVE candidates in the bounded promotion pool |
 | `promoted_count` / `promoted_ids` | Promotions written and their thought IDs |
 | `skipped_gate_count` | Candidates rejected by age/confirmation gates |
-| `scores` | Computed score for every promotion candidate |
+| `scores` | Computed score for each candidate the loop scores. Every candidate is scored before its gate, metadata and threshold checks run, so scoring continues past the `max_promoted_per_run` cap; once the cap is reached, the loop stops at the next candidate that passes the gates, the metadata filter and the threshold, after scoring it, and candidates after that one are absent from the map |
 | `edges_created` | New dream-created ASSOCIATED edges |
 | `reflections_created` | New REFLECTION thoughts |
 | `promotion_capped` | Whether the corpus-wide P1 fraction prevented a promotion |
 | `p1_fraction_after` | P1 share after the run |
 | `orphans_retired` | ACTIVE REFLECTIONs archived because all sources left the active set |
 | `active_signal_weights` | Effective weights after flat-signal redistribution |
-| `flat_signals` | Configured signal names that carried no ranking information this run |
+| `flat_signals` | Configured signals dropped as inactive for this run (see [Signals](#signals)) |
 
 ### Querying reflections
 

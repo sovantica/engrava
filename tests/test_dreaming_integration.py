@@ -810,7 +810,7 @@ class TestReflectionV2CorpusPassthrough:
 
         # The contract: at least one positive score.  Without the corpus
         # passthrough every score collapses to 0.0 (log((1+0)/(1+0)) = 0),
-        # so this assertion is the regression guard for that bug class.
+        # so this assertion fails whenever the corpus does not reach the builder.
         scores = [entry["score"] for entry in top_keyphrases]
         assert any(score > 0.0 for score in scores), (
             f"all top_keyphrases scores are zero — corpus is not reaching the builder.  "

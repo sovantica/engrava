@@ -458,6 +458,185 @@ class TestModelImmutability:
 
 
 # ---------------------------------------------------------------------------
+# Model identity is re-checked on every call, not only the first
+# ---------------------------------------------------------------------------
+
+
+class TestModelReCheckOnEveryCall:
+    """A single long-lived store instance re-verifies model identity on later calls.
+
+    A *later* call on the same instance is compared against the model
+    identity already stored. These tests pin a differently sized (or
+    differently named, or differently prefixed) vector raising
+    ``EmbeddingModelMismatchError`` instead of being accepted silently. Uses a real
+    temporary file database (not ``:memory:``) so these tests exercise the
+    same on-disk ``_metadata`` round trip production code does.
+    """
+
+    async def _file_store(self, tmp_path: Path) -> SqliteEngravaCore:
+        conn = await aiosqlite.connect(str(tmp_path / "recheck.db"))
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA foreign_keys = ON")
+        store = SqliteEngravaCore(conn)
+        store._owns_connection = True
+        await store.ensure_schema()
+        return store
+
+    async def test_dimension_mismatch_raises_on_a_later_call(self, tmp_path: Path) -> None:
+        store = await self._file_store(tmp_path)
+        try:
+            await store.create_thought(_make_thought("t-1"))
+            await store.create_thought(_make_thought("t-2"))
+
+            await store.store_embedding(
+                thought_id="t-1", vector=[0.1, 0.2, 0.3], model_name="same-model"
+            )
+            with pytest.raises(EmbeddingModelMismatchError, match="dim=3"):
+                await store.store_embedding(
+                    thought_id="t-2",
+                    vector=[0.1, 0.2, 0.3, 0.4],
+                    model_name="same-model",
+                )
+        finally:
+            await store.close()
+
+    async def test_model_name_mismatch_raises_on_a_later_call(self, tmp_path: Path) -> None:
+        store = await self._file_store(tmp_path)
+        try:
+            await store.create_thought(_make_thought("t-1"))
+            await store.create_thought(_make_thought("t-2"))
+
+            await store.store_embedding(
+                thought_id="t-1", vector=[0.1, 0.2, 0.3], model_name="model-A"
+            )
+            with pytest.raises(EmbeddingModelMismatchError, match="model-A"):
+                await store.store_embedding(
+                    thought_id="t-2",
+                    vector=[0.1, 0.2, 0.3],
+                    model_name="model-B",
+                )
+        finally:
+            await store.close()
+
+    async def test_document_prefix_mismatch_raises_on_a_later_call(self, tmp_path: Path) -> None:
+        provider_a = _RolePrefixSpy(document_prefix="passage: ", model_name="prefix-model")
+        conn = await aiosqlite.connect(str(tmp_path / "recheck_prefix.db"))
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA foreign_keys = ON")
+        store = SqliteEngravaCore(conn, embedding_provider=provider_a, auto_embed=True)
+        store._owns_connection = True
+        await store.ensure_schema()
+        try:
+            await store.create_thought(_make_thought("t-1"))
+
+            # Same store instance, same model_name/dimension — only the
+            # provider's document_prefix changes, as it would if a caller
+            # swapped configuration on a long-lived instance without
+            # rebuilding the store.
+            store._embedding_provider = _RolePrefixSpy(
+                document_prefix="different: ", model_name="prefix-model"
+            )
+            with pytest.raises(EmbeddingModelMismatchError):
+                await store.create_thought(_make_thought("t-2"))
+        finally:
+            await store.close()
+
+    async def test_verify_embedding_model_rechecks_on_every_call(self, tmp_path: Path) -> None:
+        """``verify_embedding_model()`` also loses its own eager-check cache."""
+        provider_a = CallbackProvider(_dummy_embed, dimension=4, model_name="verify-A")
+        conn = await aiosqlite.connect(str(tmp_path / "recheck_verify.db"))
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA foreign_keys = ON")
+        store = SqliteEngravaCore(conn, embedding_provider=provider_a)
+        store._owns_connection = True
+        await store.ensure_schema()
+        try:
+            await store.create_thought(_make_thought("t-verify"))
+            await store.store_embedding(
+                thought_id="t-verify", vector=[0.1, 0.2, 0.3, 0.4], model_name="verify-A"
+            )
+            # First eager check succeeds (matches what was just locked).
+            await store.verify_embedding_model()
+
+            # Swap the provider on the same instance and verify again — a
+            # cached "already verified" flag would let this pass silently.
+            store._embedding_provider = CallbackProvider(
+                _dummy_embed, dimension=4, model_name="verify-B"
+            )
+            with pytest.raises(EmbeddingModelMismatchError, match="verify-A"):
+                await store.verify_embedding_model()
+        finally:
+            await store.close()
+
+
+class TestCentroidModelNameExemptFromLock:
+    """A REFLECTION centroid's sentinel ``model_name`` never touches the lock.
+
+    ``CENTROID_MODEL_NAME`` tags a computed centroid vector, not a provider
+    identity, so it must be exempt from ``_ensure_embedding_model_lock`` in
+    both directions: it must not be checked against an already-locked
+    identity, and it must not itself lock the corpus identity when it
+    happens to be the first ``store_embedding()`` call ever made.
+    """
+
+    async def _file_store(self, tmp_path: Path, name: str) -> SqliteEngravaCore:
+        conn = await aiosqlite.connect(str(tmp_path / name))
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA foreign_keys = ON")
+        store = SqliteEngravaCore(conn)
+        store._owns_connection = True
+        await store.ensure_schema()
+        return store
+
+    async def test_centroid_write_does_not_raise_against_a_locked_real_model(
+        self, tmp_path: Path
+    ) -> None:
+        from engrava.domain.dreaming import CENTROID_MODEL_NAME
+
+        store = await self._file_store(tmp_path, "centroid_exempt.db")
+        try:
+            await store.create_thought(_make_thought("t-1"))
+            await store.create_thought(_make_thought("t-2"))
+
+            # Locks the corpus identity to a real provider model.
+            await store.store_embedding(
+                thought_id="t-1", vector=[0.1, 0.2, 0.3], model_name="real-model"
+            )
+            # A centroid write, tagged with the sentinel, must not be
+            # compared against the locked identity.
+            await store.store_embedding(
+                thought_id="t-2", vector=[0.4, 0.5, 0.6], model_name=CENTROID_MODEL_NAME
+            )
+        finally:
+            await store.close()
+
+    async def test_centroid_write_as_first_call_does_not_lock_corpus_identity(
+        self, tmp_path: Path
+    ) -> None:
+        from engrava.domain.dreaming import CENTROID_MODEL_NAME
+
+        store = await self._file_store(tmp_path, "centroid_first_call.db")
+        try:
+            await store.create_thought(_make_thought("t-1"))
+            await store.create_thought(_make_thought("t-2"))
+
+            # The very first store_embedding() call ever made on this store
+            # is a centroid write — it must not lock the corpus identity to
+            # the sentinel name.
+            await store.store_embedding(
+                thought_id="t-1", vector=[0.1, 0.2, 0.3], model_name=CENTROID_MODEL_NAME
+            )
+            # A genuinely different, real model name must still succeed —
+            # it would have raised EmbeddingModelMismatchError here if the
+            # centroid write had wrongly locked the identity first.
+            await store.store_embedding(
+                thought_id="t-2", vector=[0.4, 0.5, 0.6], model_name="real-model"
+            )
+        finally:
+            await store.close()
+
+
+# ---------------------------------------------------------------------------
 # Schema migration core-4 → core-5
 # ---------------------------------------------------------------------------
 
@@ -499,7 +678,7 @@ class TestSchemaMigration:
             cursor = await conn.execute("PRAGMA user_version")
             row = await cursor.fetchone()
             assert row is not None
-            assert int(row[0]) == 20
+            assert int(row[0]) == 21
 
             # _metadata table should exist.
             cursor = await conn.execute(
@@ -1674,7 +1853,7 @@ class TestPartialRoleCapabilityFallsBack:
 
 
 class TestDocumentPrefixModelLock:
-    """D3: document-prefix identity and query-prefix pairing in the lock."""
+    """Document-prefix identity and query-prefix pairing in the lock."""
 
     async def test_enabling_document_prefix_on_unprefixed_corpus_raises(
         self,
@@ -1839,7 +2018,7 @@ class TestDocumentPrefixModelLock:
 
 
 class TestPrefixConfigParsing:
-    """D6: config parses the two prefixes and forwards them correctly."""
+    """Config parses the two prefixes and forwards them correctly."""
 
     def test_parse_prefixes(self) -> None:
         cfg = _parse_embeddings(
@@ -2083,11 +2262,10 @@ class TestProviderMissingRequiredMember:
         """A provider missing ``model_name`` too still fails on that member.
 
         The guard translates one member. ``verify_embedding_model`` reads
-        ``model_name`` first, as it always has — reversing that to reach the
-        typed check would change the order a conformant provider's properties are
-        evaluated in, which this change is required not to do. So a provider
-        exposing neither member is told about ``model_name``, exactly as before,
-        and nothing is written on the way out.
+        ``model_name`` first — reversing that to reach the typed check would
+        change the order a conformant provider's properties are evaluated in. So
+        a provider exposing neither member is told about ``model_name``, and
+        nothing is written on the way out.
         """
         store = SqliteEngravaCore(db, embedding_provider=_NoPublicMembersProvider())  # type: ignore[arg-type]
 
@@ -2118,18 +2296,13 @@ class TestProviderMissingRequiredMember:
         self,
         db: aiosqlite.Connection,
     ) -> None:
-        """A conformant provider's ranked output is unchanged, order and scores.
+        """A conformant provider's ranked output is frozen, order and scores.
 
         The discriminating half of the pair above: a multi-candidate corpus with
         a provider whose vectors actually differ, frozen as an ordered
         ``(thought_id, score)`` expectation. A guard that changed the resolved
         dimension, the candidate set, or the cosine inputs would move one of
-        these values.
-
-        The frozen values were produced by this same scenario with the guard
-        removed — i.e. reading ``provider.dimension`` directly, as the code did
-        before this change — and are unchanged with it in place, to the six
-        decimal places asserted here.
+        these values, which are asserted to six decimal places.
         """
         provider = CallbackProvider(
             callback=lambda text: [float(len(text) % 7) / 7.0, 0.5, 0.25, 0.125],
@@ -2156,9 +2329,8 @@ class TestProviderMissingRequiredMember:
         """The guard adds no extra read of a conformant provider's ``dimension``.
 
         ``dimension`` is a property, so a presence check that evaluates it (say
-        ``hasattr``) would double the reads on every vector search. A provider
-        whose property is stateful or expensive would then behave differently
-        than it does today, which the change is required not to do.
+        ``hasattr``) would double the reads of ``dimension`` in the single
+        ``search_similar`` call below.
         """
         provider = _CountingDimensionProvider()
         store = SqliteEngravaCore(db, embedding_provider=provider)  # type: ignore[arg-type]

@@ -1,8 +1,7 @@
 # Positioning — what Engrava is (and isn't)
 
-Engrava is a **standalone embedded database for AI-agent memory**. It is built on
-SQLite and runs in-process: one `pip install`, no server, no LLM, no external
-services. It gives an agent a durable thought-graph with hybrid retrieval
+Engrava is a **standalone, in-process database for AI-agent memory**. It is built on
+SQLite and needs no external services. It gives an agent a durable thought-graph with hybrid retrieval
 (full-text + vector + recency + priority + graph) and an optional tamper-evident
 hash-chain journal.
 
@@ -20,7 +19,7 @@ relates to the other memory options you might be choosing between.
   result. See [Search](search.md).
 - **You want a graph, not a flat list.** Thoughts are connected by typed,
   weighted [edges](concepts.md), and the graph itself contributes to ranking.
-- **You want it embedded.** No network hop, no service to operate, no separate
+- **You want it in-process.** No network hop, no service to operate, no separate
   process. It runs anywhere Python and SQLite run.
 - **You want embeddings to be optional and pluggable.** Bring a local model, an
   OpenAI-compatible endpoint, Ollama, HuggingFace, or your own callback — or run
@@ -28,26 +27,30 @@ relates to the other memory options you might be choosing between.
   [Embeddings guide](guides/embeddings.md).
 - **You want memory that maintains itself.** Engrava models both halves of memory
   maintenance: [Dreaming](dreaming.md) (consolidation) keeps and strengthens what
-  matters, and [Forgetting](memory-hygiene.md) (opt-in, reversible memory hygiene)
-  lets cold, low-signal memories fade rather than being kept indefinitely. The
+  matters, and [Forgetting](memory-hygiene.md) (opt-in memory hygiene, whose
+  default archive action is reversible; its separately opt-in garbage
+  collection is not) lets cold, low-signal memories fade rather than being
+  kept indefinitely. The
   built-in mechanisms use no LLM; reproducibility requires fixed inputs and
   deterministic custom hooks/signals, and Forgetting additionally requires a
   fixed wall-clock `now`.
-- **Small-to-medium corpora.** The default backend brute-forces vector search in
-  Python and works well up to roughly 100k embeddings; beyond that, switch to
-  the `sqlite-vec` backend. See
+- **Small-to-medium corpora.** The default backend is a brute-force cosine
+  scan done with NumPy; cost grows with the eligible embedding population.
+  For larger corpora, switch to the `sqlite-vec` backend and measure your own
+  latency. See
   [Known Limitations](known-limitations.md#sqlite-vec-pre-v1-status).
 
 ## When Engrava is *not* a good fit
 
-- **You need a managed, horizontally-scaled vector service.** Engrava is a local
-  embedded library, not a clustered database. One store is one SQLite file
+- **You need a managed, horizontally-scaled vector service.** Engrava is a local,
+  in-process library, not a clustered database. One store is one SQLite file
   written by one process. If you need sharding, replication, or a multi-writer
   service across many machines, use a dedicated vector database.
 - **You need more than one process writing the same store.** Only one store may
   write a database file; any number may read it. WAL lets readers and that one
-  writer coexist, and one process can drive many async tasks against the store —
-  but two writers on one file is unsupported, not merely contended. See
+  writer coexist, and one process can share a store across the async tasks of
+  one event loop — but two writers on one file is unsupported, not merely
+  contended. See
   [Concurrency](concurrency.md#multiple-stores-one-database-file).
 - **You want the library to call an LLM for you.** Engrava does no LLM-side fact
   extraction, summarisation, or entity resolution (see [Non-goals](#non-goals)).
@@ -90,7 +93,7 @@ your own workload.
 
 | | Engrava | Hosted agent-memory services (e.g. mem0, Zep) | Framework memory (e.g. LangChain memory) | Standalone vector DBs (e.g. Chroma, Qdrant, pgvector) |
 |---|---|---|---|---|
-| **Deployment** | Embedded library, one SQLite file, in-process | Typically a hosted/managed service or self-hosted server | In-process, tied to the framework | Separate database/service (some have embedded modes) |
+| **Deployment** | In-process library, one SQLite file | Typically a hosted/managed service or self-hosted server | In-process, tied to the framework | Separate database/service (some have embedded modes) |
 | **Retrieval model** | Hybrid: FTS + vector + recency + priority + graph, fused | Varies; often vector + recency with managed pipelines | Usually buffer/window or a vector-store wrapper | Primarily vector similarity (some add keyword/hybrid) |
 | **Graph** | First-class typed/weighted edges that feed ranking | Some offer entity/graph memory | Generally no | Generally no |
 | **LLM-side extraction** | None — you decide what to store | Often built in (auto fact-extraction/summarisation) | Sometimes, via chains | None |

@@ -122,13 +122,14 @@ def _thought(
     updated_cycle: int = 0,
     lifecycle_status: LifecycleStatus = LifecycleStatus.ACTIVE,
     action_outcome_score: float | None = None,
+    priority: Priority = Priority.P3,
 ) -> ThoughtRecord:
     return ThoughtRecord(
         thought_id=thought_id,
         thought_type=ThoughtType.OBSERVATION,
         essence=essence,
         content=content,
-        priority=Priority.P3,
+        priority=priority,
         lifecycle_status=lifecycle_status,
         created_cycle=created_cycle,
         updated_cycle=updated_cycle,
@@ -284,7 +285,7 @@ class TestResolveCurrentCycle:
 
 
 # ---------------------------------------------------------------------------
-# max_cycle() high-water accessor (D3)
+# max_cycle() high-water accessor
 # ---------------------------------------------------------------------------
 
 
@@ -345,7 +346,7 @@ class TestMaxCycle:
 
 
 # ---------------------------------------------------------------------------
-# Provider is READ-TIME only — it never stamps writes (D2)
+# Provider is READ-TIME only — it never stamps writes
 # ---------------------------------------------------------------------------
 
 
@@ -507,6 +508,46 @@ class TestSearchHybridResolution:
                 await s.search_hybrid("alpha", current_cycle=None)
         finally:
             await s._db.close()
+
+
+class TestFallbackPathCycleRecencyGating:
+    """A zero cognitive-cycle recency weight must be inert on the query-less
+    FALLBACK path (no FTS, no vector) too: a supplied reference at weight 0 is
+    accepted but inert -- the weight gates recency, not merely its label.
+    """
+
+    async def test_zero_weight_cycle_inert_on_fallback_path(self, store: SqliteEngravaCore) -> None:
+        # Weight-0 cycle recency must be byte-identical to a
+        # fallback with no recency reference at all, never scored by cognitive
+        # cycle. ``old``/``new`` differ enough in ``updated_cycle`` that cycle
+        # decay (half-life 50) would separate their scores if it leaked through.
+        await store.create_thought(_thought("old", updated_cycle=0))
+        await store.create_thought(_thought("new", updated_cycle=100))
+        baseline = await store.search_hybrid("", priority_weight=0.0)
+        weight0 = await store.search_hybrid(
+            "", recency_weight=0.0, current_cycle=100, priority_weight=0.0
+        )
+        assert weight0 == baseline
+        assert "recency" not in weight0.backends_used
+        assert all(score == 0.0 for _, score in weight0.results)
+
+    async def test_zero_weight_cycle_flips_order_with_heterogeneous_priority(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        # Headline shape: the fallback path adds the priority contribution to
+        # the recency score and re-sorts, so zeroing the recency weight changes
+        # which term dominates -- it can flip the winner, not just shrink the
+        # scores. On defaults (current_cycle=100, half-life 50, priority_weight
+        # 0.05): a fresh/low-priority row and a stale/high-priority row swap
+        # first place once the cycle axis is genuinely inert.
+        await store.create_thought(_thought("fresh", updated_cycle=100, priority=Priority.P4))
+        await store.create_thought(_thought("stale", updated_cycle=0, priority=Priority.P2))
+        result = await store.search_hybrid("", recency_weight=0.0, current_cycle=100)
+        assert "recency" not in result.backends_used
+        assert [tid for tid, _ in result.results] == ["stale", "fresh"]
+        scores = dict(result.results)
+        assert scores["stale"] == pytest.approx(0.6)
+        assert scores["fresh"] == 0.0
 
 
 class TestRecallResolution:
@@ -705,16 +746,16 @@ class TestMaxCycleProvider:
 
 
 # ---------------------------------------------------------------------------
-# Golden regressions: NO provider + explicit cycle == the pre-seam path
+# Golden outputs: NO provider + explicit cycle
 # ---------------------------------------------------------------------------
 
 
 class TestGoldenDefaultUnchanged:
-    """Exact/golden regressions on the default (no-provider) path.
+    """Exact/golden outputs on the default (no-provider) path.
 
     With no ``cycle_provider`` configured and an explicit ``current_cycle``, the
-    resolution is a pure no-op, so each cycle-consuming path must produce output
-    byte-for-byte identical to the pre-seam implementation. These freeze the
+    resolution is a pure no-op, so the default path must produce exactly
+    the golden outputs below. These freeze the
     exact fused order + scores (and the exact eligibility outcome) so a future
     change to the resolution/fusion that perturbs the default path fails loudly.
     """

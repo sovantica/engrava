@@ -12,6 +12,14 @@ Rationale: core infrastructure must not import or call LLM APIs; REFLECTION
 content is *structural* (centroid + keyword union + n-gram TF-IDF + regex
 entities) — no LLM prose.  Any LLM summary capability would live in a separate
 opt-in extension, never in this package.
+
+A module can also leave ``extensions/`` for the opposite reason: it turns out
+to be core infrastructure, not an extension, and gets re-homed with a
+``sys.modules`` alias left at the old name. The directory walk cannot see
+that coming — the file it discovers there is the thin alias, not the logic
+that moved — so such a module is named explicitly in
+``TestNoLLMInMigratedCoreModules`` below rather than silently losing the
+coverage the walk gives a module that lives under ``extensions/``.
 """
 
 from __future__ import annotations
@@ -23,7 +31,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import pytest
 
@@ -31,6 +39,28 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
 _EXTENSIONS_DIR = Path(__file__).parent.parent / "src" / "engrava" / "extensions"
+
+#: Dotted names under ``extensions/`` that are intentionally a ``sys.modules``
+#: alias to a module living elsewhere: importing the old name transparently
+#: hands back the relocated implementation, which is the whole point of the
+#: alias (see ``engrava.extensions.vector_sqlite_vec``). The by-directory
+#: origin check below cannot know that on its own — it would otherwise read a
+#: genuine, intentional alias as "this name resolved to some other copy of
+#: the package", which is exactly the failure that check exists to catch —
+#: so the mapping is spelled out here, by name, rather than guessed at. The
+#: aliased module's own content is not scanned by walking this
+#: directory; its coverage lives in ``TestNoLLMInMigratedCoreModules`` below,
+#: pointed at the real file directly.
+_KNOWN_MODULE_ALIASES: dict[str, Path] = {
+    "engrava.extensions.vector_sqlite_vec": (
+        Path(__file__).parent.parent
+        / "src"
+        / "engrava"
+        / "infrastructure"
+        / "sqlite"
+        / "vector_sqlite_vec.py"
+    ),
+}
 
 # This is a memory database — it does not import LLM-framework runtimes.
 # The extension surface stays free of any LLM SDK or framework.  This is the one
@@ -383,9 +413,9 @@ class TestGuardDetectors:
     def test_the_text_scan_covers_the_whole_forbidden_set(self) -> None:
         """Every forbidden runtime is scanned for as text, not a chosen subset.
 
-        The text scan used to look for three of the ten names, which is the same
-        defect as a hand-listed file set: adding a runtime to the import guard
-        left the dynamic-import path uncovered for it.
+        The text scan looks for every name in ``_FORBIDDEN_IMPORT_PREFIXES``, so
+        adding a runtime to the import guard covers the dynamic-import path for it
+        too.
         """
         for runtime in sorted(_FORBIDDEN_IMPORT_PREFIXES):
             assert runtime in _named_runtimes(f'__import__("{runtime}")\n')
@@ -439,7 +469,11 @@ class TestNoLLMInFreeExtensions:
         a runtime some start-up hook had already loaded cannot be subtracted
         away; and each target's reported origin is checked against this
         checkout, so the guard cannot pass by importing some other installed
-        copy of the package.
+        copy of the package. A name in ``_KNOWN_MODULE_ALIASES`` is accepted at
+        its documented alias target too — that is a deliberate ``sys.modules``
+        swap, not an unrelated copy of the package — so this probe still
+        exercises the alias's real, transitive import closure rather than
+        skipping it.
         """
         expected_origin = {
             _module_name(path, package_root=_EXTENSIONS_DIR, package="engrava.extensions"): path
@@ -447,12 +481,20 @@ class TestNoLLMInFreeExtensions:
         }
         loaded = _modules_loaded_by(list(expected_origin))
 
-        # Precondition: the probe executed exactly *these* files, resolved, and
-        # not a same-named module from some other copy of the package.
+        def _acceptable_origins(target: str, path: Path) -> set[Path]:
+            origins = {path.resolve()}
+            alias_target = _KNOWN_MODULE_ALIASES.get(target)
+            if alias_target is not None:
+                origins.add(alias_target.resolve())
+            return origins
+
+        # Precondition: the probe executed exactly *these* files, resolved —
+        # to the file itself, or to its documented alias target — and not a
+        # same-named module from some other copy of the package.
         elsewhere = {
             target: loaded.get(target, "<never loaded>")
             for target, path in expected_origin.items()
-            if Path(loaded.get(target, "")).resolve() != path.resolve()
+            if Path(loaded.get(target, "")).resolve() not in _acceptable_origins(target, path)
         }
         assert not elsewhere, f"import probe resolved targets outside this checkout: {elsewhere}"
 
@@ -484,6 +526,94 @@ class TestNoLLMInFreeExtensions:
             "langchain",
             "openai.types",
         ]
+
+
+class TestNoLLMInMigratedCoreModules:
+    """The same cognitive-boundary guarantee, for modules that left ``extensions/``.
+
+    ``_GUARDED_FILES`` is discovered by walking ``extensions/``, so a module
+    that moves out of that directory — because it turns out to be core
+    infrastructure rather than an optional extension, and is re-homed with a
+    ``sys.modules`` alias left at the old name — stops being found by that
+    walk. Two of the three checks above would then silently start reading the
+    thin alias left behind instead of the logic that moved: the alias file
+    has almost nothing in it, so the AST-import scan and the source-text scan
+    would both read as clean regardless of what the relocated module actually
+    does. The import-closure probe stays honest on its own, because the alias
+    still executes the real module's code — that one is patched only for the
+    origin precondition, in ``test_importing_the_extensions_does_not_pull_llm_sdks``
+    above.
+
+    A directory walk cannot discover a module once it has left the directory,
+    so — unlike the guard above — this one is a short, explicit, by-name list.
+    That is the same shape of risk a hand-listed extension set would have
+    carried (silently stops covering a module nobody remembers to add), just
+    on a list expected to almost never grow: it is exactly as long as the
+    number of modules this package has ever decided were miscategorised as
+    extensions.
+    """
+
+    #: Every entry needs its own reason it still belongs on the Free side of
+    #: the cognitive boundary despite not living under ``extensions/``.
+    #:
+    #: ``vector_sqlite_vec.py`` — a SQLite adapter for KNN vector search, not
+    #: an extension. Re-homed to ``infrastructure/sqlite/``; the alias left at
+    #: ``engrava.extensions.vector_sqlite_vec`` keeps the old import path (and
+    #: a monkeypatch through it) working, but this is where its content is
+    #: actually checked.
+    _MIGRATED_MODULES: ClassVar[dict[str, Path]] = {
+        "engrava.infrastructure.sqlite.vector_sqlite_vec": (
+            Path(__file__).parent.parent
+            / "src"
+            / "engrava"
+            / "infrastructure"
+            / "sqlite"
+            / "vector_sqlite_vec.py"
+        ),
+    }
+
+    @pytest.mark.parametrize(
+        ("dotted", "path"),
+        sorted(_MIGRATED_MODULES.items()),
+        ids=list(_MIGRATED_MODULES),
+    )
+    def test_no_forbidden_imports_anywhere(self, dotted: str, path: Path) -> None:
+        """Same AST-import check the extension surface gets, aimed at the real file."""
+        violations = _forbidden_imports(path.read_text(encoding="utf-8"))
+        assert not violations, (
+            f"{dotted} has {violations} — violates the cognitive-boundary "
+            f"contract (LLM dependency in core infrastructure)"
+        )
+
+    @pytest.mark.parametrize(
+        ("dotted", "path"),
+        sorted(_MIGRATED_MODULES.items()),
+        ids=list(_MIGRATED_MODULES),
+    )
+    def test_no_forbidden_runtime_named_in_the_source(self, dotted: str, path: Path) -> None:
+        """Same source-text check the extension surface gets, aimed at the real file."""
+        named = _named_runtimes(path.read_text(encoding="utf-8"))
+        assert not named, (
+            f"{dotted} references the {named} LLM runtime(s) — this is a "
+            f"memory database and does not depend on LLM runtimes"
+        )
+
+    def test_importing_the_migrated_modules_does_not_pull_llm_sdks(self) -> None:
+        """Same import-closure probe the extension surface gets, aimed at the real file."""
+        loaded = _modules_loaded_by(list(self._MIGRATED_MODULES))
+
+        elsewhere = {
+            target: loaded.get(target, "<never loaded>")
+            for target, path in self._MIGRATED_MODULES.items()
+            if Path(loaded.get(target, "")).resolve() != path.resolve()
+        }
+        assert not elsewhere, f"import probe resolved targets outside this checkout: {elsewhere}"
+
+        pulled_in = _forbidden_among(loaded)
+        assert not pulled_in, (
+            f"Importing a migrated core module pulled in LLM modules: {pulled_in} — "
+            f"violates the cognitive-boundary contract"
+        )
 
 
 class TestTheProbeAndTheFilterJoinUp:

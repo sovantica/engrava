@@ -1,7 +1,7 @@
 """Dreaming activation correctness — reachable scoring + live access substrate.
 
-Covers the activation fixes: active-signal weight redistribution (promotion is
-arithmetically reachable under defaults again), the batched access substrate
+Covers active-signal weight redistribution (promotion is arithmetically
+reachable under defaults), the batched access substrate
 (feeds the ``frequency`` signal without per-read writes), config wiring
 (``from_config`` builds + runs dreaming, partial ``signals`` merges), and the
 default-off byte-identity guarantee.
@@ -9,6 +9,8 @@ default-off byte-identity guarantee.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from typing import TYPE_CHECKING
 
@@ -18,12 +20,13 @@ import pytest
 from engrava import SqliteEngravaCore
 from engrava.config import DreamingConfig, DreamingGates, _parse_dreaming
 from engrava.domain.enums import LifecycleStatus, Priority, ThoughtType
+from engrava.domain.exceptions import WriteLockTimeoutError
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.extensions.dreaming import DreamingExtension
 from engrava.infrastructure.sqlite.engrava_core import _AccessBuffer
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable
     from pathlib import Path
 
 # Cycle at which recency == staleness == 1.0: a thought created at cycle 0 and
@@ -138,7 +141,7 @@ class TestActiveWeightRedistribution:
 
 
 # ---------------------------------------------------------------------------
-# Reachability — promotion is possible under defaults again (the core fix)
+# Reachability — promotion is possible under the default threshold
 # ---------------------------------------------------------------------------
 
 
@@ -148,9 +151,9 @@ class TestPromotionReachable:
     ) -> None:
         """A recent + mature OBSERVATION promotes at the shipped 0.7 threshold.
 
-        On the pre-fix score (dead frequency + confirmation dragging the max to
-        0.525) this promotes zero; after active-signal redistribution recency +
-        staleness alone reach 1.0 > 0.7.
+        With frequency and confirmation flat (no data in the pool), the
+        active-signal weights are redistributed onto the remaining signals, so
+        recency + staleness alone clear the 0.7 threshold.
         """
         ext = DreamingExtension(config=_activation_cfg())
         for i in range(4):
@@ -268,6 +271,61 @@ class TestAccessSubstrate:
         assert row is not None
         assert row.access_count == 0
 
+    async def test_flush_of_all_stale_entries_does_not_commit_the_callers_pending_edit(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        """A flush whose whole batch is stale writes nothing and commits nothing.
+
+        Mirrors the ``delete_thought`` case pinned in
+        ``tests/test_referential_integrity.py``: every buffered id's thought
+        was deleted before the flush runs, so the batched ``UPDATE`` matches
+        zero rows across the board — this call has nothing of its own to make
+        durable, and must not commit a caller's own pending transaction.
+        """
+        store._access_tracking_enabled = True
+        await store.create_thought(_obs("stale"))
+        await store.create_thought(_obs("unrelated"))
+        await store.get_thought("stale")  # buffers one access
+        assert len(store._access_buffer) == 1
+
+        await store.delete_thought("stale")  # the buffered id no longer exists
+
+        await store._db.execute("BEGIN")
+        await store._db.execute(
+            "UPDATE thought SET essence = ? WHERE thought_id = ?",
+            ("edited-by-caller", "unrelated"),
+        )
+
+        flushed = await store.flush_access_buffer()
+
+        assert flushed == 1  # the stale entry is still drained from the buffer
+        assert store._db.in_transaction is True, (
+            "the caller's own transaction, with their pending edit still "
+            "inside it, must still be open after an all-stale flush"
+        )
+        await store._db.rollback()
+
+        row = await store.get_thought("unrelated")
+        assert row is not None
+        assert row.essence == "Essence unrelated", (
+            "the caller's rollback must undo their own edit -- an all-stale "
+            "flush_access_buffer() must not have committed it on their behalf"
+        )
+
+    async def test_ordinary_flush_still_commits(self, store: SqliteEngravaCore) -> None:
+        """Control: a flush with at least one live match commits as before."""
+        store._access_tracking_enabled = True
+        await store.create_thought(_obs("t"))
+        await store.get_thought("t")
+
+        flushed = await store.flush_access_buffer()
+
+        assert flushed == 1
+        assert store._db.in_transaction is False, "a real access-count write must still commit"
+        after = await store.get_thought("t")
+        assert after is not None
+        assert after.access_count == 1
+
     async def test_access_flush_is_not_journaled(self) -> None:
         """The batched access flush writes no journal entry and keeps the chain valid.
 
@@ -300,6 +358,224 @@ class TestAccessSubstrate:
         result = await store.verify_journal()
         assert result.valid is True
         await db.close()
+
+
+class TestFlushOnAContendedWriteLock:
+    """A flush that cannot take the write lock does not drain the buffer.
+
+    The flush needs the store's write lock to apply the buffered events, and
+    taking that lock is bounded (``WriteLockTimeoutError``). Losing events
+    because the database write failed is the documented best-effort behaviour
+    of this telemetry; losing them because the lock could not be *taken* is
+    not a database failure, so a flush that times out on the lock must not
+    drain the buffer.
+    """
+
+    @staticmethod
+    @contextlib.asynccontextmanager
+    async def _tracking_store(
+        tmp_path: Path, *, lock_timeout_seconds: float
+    ) -> AsyncIterator[SqliteEngravaCore]:
+        db = await aiosqlite.connect(str(tmp_path / "contended.db"))
+        db.row_factory = aiosqlite.Row
+        try:
+            s = SqliteEngravaCore(
+                db=db,
+                access_tracking_enabled=True,
+                write_lock_acquire_timeout_seconds=lock_timeout_seconds,
+            )
+            await s.ensure_schema()
+            yield s
+        finally:
+            await db.close()
+
+    @staticmethod
+    @contextlib.asynccontextmanager
+    async def _write_lock_held_by_another_task(
+        store: SqliteEngravaCore,
+    ) -> AsyncIterator[Callable[[], None]]:
+        """Hold the write lock in a separate task; yield the callable that frees it."""
+        held = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _holder() -> None:
+            async with store._write_lock:
+                held.set()
+                await release.wait()
+
+        task = asyncio.create_task(_holder())
+        try:
+            await held.wait()
+            yield release.set
+        finally:
+            release.set()
+            await task
+
+    @staticmethod
+    def _record_connection_calls(
+        monkeypatch: pytest.MonkeyPatch, store: SqliteEngravaCore
+    ) -> list[str]:
+        """Return a list that gains the name of every statement or transaction call made."""
+        calls: list[str] = []
+
+        def recorder(name: str, real: Callable[..., object]) -> Callable[..., object]:
+            def _record(*args: object, **kwargs: object) -> object:
+                calls.append(name)
+                return real(*args, **kwargs)
+
+            return _record
+
+        for name in (
+            "execute",
+            "executemany",
+            "executescript",
+            "execute_insert",
+            "execute_fetchall",
+            "commit",
+            "rollback",
+        ):
+            monkeypatch.setattr(store._db, name, recorder(name, getattr(store._db, name)))
+        return calls
+
+    @staticmethod
+    def _signal_when_lock_requested(
+        monkeypatch: pytest.MonkeyPatch, store: SqliteEngravaCore, *, times: int
+    ) -> asyncio.Event:
+        """Return an event set once the write lock has been requested ``times`` times."""
+        requested = asyncio.Event()
+        calls = 0
+        real_acquire = store._write_lock.acquire
+
+        async def _acquire() -> None:
+            nonlocal calls
+            calls += 1
+            if calls >= times:
+                requested.set()
+            await real_acquire()
+
+        monkeypatch.setattr(store._write_lock, "acquire", _acquire)
+        return requested
+
+    @staticmethod
+    async def _access_count(store: SqliteEngravaCore, thought_id: str) -> int:
+        cursor = await store._db.execute(
+            "SELECT access_count FROM thought WHERE thought_id = ?", (thought_id,)
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        return int(row[0])
+
+    async def test_a_timeout_on_the_write_lock_keeps_the_buffered_events(
+        self, tmp_path: Path
+    ) -> None:
+        async with self._tracking_store(tmp_path, lock_timeout_seconds=0.05) as store:
+            await store.create_thought(_obs("t"))
+            await store.get_thought("t")
+            assert len(store._access_buffer) == 1
+
+            async with self._write_lock_held_by_another_task(store) as release:
+                with pytest.raises(WriteLockTimeoutError):
+                    await store.flush_access_buffer()
+                assert len(store._access_buffer) == 1, (
+                    "a flush that could not take the write lock must not have emptied the buffer"
+                )
+                release()
+
+            assert await store.flush_access_buffer() == 1
+            assert len(store._access_buffer) == 0
+            assert await self._access_count(store, "t") == 1
+
+    async def test_a_flush_cancelled_while_it_waits_keeps_the_buffered_events(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with self._tracking_store(tmp_path, lock_timeout_seconds=30.0) as store:
+            await store.create_thought(_obs("t"))
+            await store.get_thought("t")
+
+            async with self._write_lock_held_by_another_task(store) as release:
+                waiting = self._signal_when_lock_requested(monkeypatch, store, times=1)
+                flush = asyncio.create_task(store.flush_access_buffer())
+                try:
+                    await waiting.wait()  # the flush has started and is waiting for the lock
+
+                    flush.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await flush
+                    assert len(store._access_buffer) == 1, (
+                        "a flush cancelled while it waited for the write lock must not "
+                        "have emptied the buffer"
+                    )
+                finally:
+                    release()
+                    await asyncio.gather(flush, return_exceptions=True)
+
+            assert await store.flush_access_buffer() == 1
+            assert await self._access_count(store, "t") == 1
+
+    async def test_an_access_recorded_while_the_flush_waits_is_included(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with self._tracking_store(tmp_path, lock_timeout_seconds=30.0) as store:
+            await store.create_thought(_obs("t"))
+            await store.get_thought("t")
+
+            async with self._write_lock_held_by_another_task(store) as release:
+                waiting = self._signal_when_lock_requested(monkeypatch, store, times=1)
+                flush = asyncio.create_task(store.flush_access_buffer())
+                try:
+                    await waiting.wait()  # the flush has started and is waiting for the lock
+
+                    await store.get_thought("t")  # a second access of the same id while it waits
+                    release()
+                    flushed = await flush
+                finally:
+                    release()
+                    await asyncio.gather(flush, return_exceptions=True)
+
+            assert flushed == 1  # one distinct id
+            assert len(store._access_buffer) == 0
+            assert await self._access_count(store, "t") == 2
+
+    async def test_an_empty_flush_does_not_wait_for_the_write_lock(self, tmp_path: Path) -> None:
+        async with self._tracking_store(tmp_path, lock_timeout_seconds=0.05) as store:
+            assert len(store._access_buffer) == 0
+
+            async with self._write_lock_held_by_another_task(store):
+                assert await store.flush_access_buffer() == 0
+
+    async def test_the_flush_that_lost_the_race_does_not_touch_the_database(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with self._tracking_store(tmp_path, lock_timeout_seconds=30.0) as store:
+            await store.create_thought(_obs("t"))
+            await store.get_thought("t")
+            calls = self._record_connection_calls(monkeypatch, store)
+            calls.clear()
+
+            assert await store.flush_access_buffer() == 1
+            a_lone_flush = list(calls)
+            assert "executemany" in a_lone_flush
+
+            await store.get_thought("t")
+            calls.clear()
+
+            async with self._write_lock_held_by_another_task(store) as release:
+                both_waiting = self._signal_when_lock_requested(monkeypatch, store, times=2)
+                first = asyncio.create_task(store.flush_access_buffer())
+                second = asyncio.create_task(store.flush_access_buffer())
+                try:
+                    await asyncio.wait_for(both_waiting.wait(), timeout=5)
+                    release()
+                    results = await asyncio.gather(first, second)
+                finally:
+                    release()
+                    await asyncio.gather(first, second, return_exceptions=True)
+
+            assert sorted(results) == [0, 1]
+            assert calls == a_lone_flush, (
+                "the flush that found nothing to write must not call the connection at all"
+            )
+            assert await self._access_count(store, "t") == 2
 
 
 class TestAccessBuffer:
@@ -451,3 +727,118 @@ class TestConfigActivation:
         """A manually-built store has no wired extension → consolidate() raises."""
         with pytest.raises(RuntimeError, match="dreaming"):
             await store.consolidate(current_cycle=1)
+
+
+# ---------------------------------------------------------------------------
+# attach_dreaming_extension — the public seam beside the private write
+# ---------------------------------------------------------------------------
+
+
+async def _seeded_store(
+    tmp_path: Path, name: str
+) -> tuple[aiosqlite.Connection, SqliteEngravaCore]:
+    """A manually-constructed store seeded with promotable candidates.
+
+    Returns the raw connection alongside the store: a manual constructor
+    never owns its connection (see ``SqliteEngravaCore.close``), so the
+    caller — not ``store.close()`` — is responsible for closing it, exactly
+    as the module-level ``store`` fixture above does.
+    """
+    db = await aiosqlite.connect(str(tmp_path / name))
+    db.row_factory = aiosqlite.Row
+    s = SqliteEngravaCore(db=db)
+    await s.ensure_schema()
+    for i in range(4):
+        await s.create_thought(_obs(f"obs-{i}"))
+    return db, s
+
+
+class TestAttachDreamingExtension:
+    """The public seam for wiring a consolidator, beside the private write."""
+
+    async def test_attach_matches_private_write_behaviour(self, tmp_path: Path) -> None:
+        """Attaching through the seam runs identically to the private write.
+
+        Two identically-seeded stores, one wired through
+        ``attach_dreaming_extension`` and one through the private attribute
+        write, must produce the same ``ConsolidationResult`` for the same
+        input — proving the seam does not just set a flag but drives the same
+        code path that ``consolidate()`` reads.
+        """
+        cfg = _activation_cfg()
+        seam_db, via_seam = await _seeded_store(tmp_path, "via_seam.db")
+        private_db, via_private = await _seeded_store(tmp_path, "via_private.db")
+        try:
+            via_seam.attach_dreaming_extension(DreamingExtension(config=cfg))
+            via_private._dreaming_extension = DreamingExtension(config=cfg)
+
+            seam_result = await via_seam.consolidate(current_cycle=_CYCLE)
+            private_result = await via_private.consolidate(current_cycle=_CYCLE)
+
+            assert seam_result == private_result
+            assert seam_result.promoted_count >= 1
+        finally:
+            await seam_db.close()
+            await private_db.close()
+
+    async def test_second_attach_replaces_the_first(self, store: SqliteEngravaCore) -> None:
+        """Attaching again replaces whatever was attached before.
+
+        There is no "already attached" refusal: the second call simply wins,
+        exactly as a second private-attribute write would. This is
+        demonstrated by identity (the store now points at the second
+        extension), not merely by the absence of an exception.
+        """
+        first = DreamingExtension(config=_activation_cfg())
+        second = DreamingExtension(config=_activation_cfg())
+
+        store.attach_dreaming_extension(first)
+        assert store._dreaming_extension is first
+
+        store.attach_dreaming_extension(second)
+        assert store._dreaming_extension is second
+        assert store._dreaming_extension is not first
+
+    async def test_private_write_still_works_and_agrees_with_the_seam(self, tmp_path: Path) -> None:
+        """The private path is untouched: it still wires and runs dreaming.
+
+        Both doors set the same single attribute, so a store wired through
+        one and then re-wired through the other ends up in exactly the state
+        the second call describes — they cannot disagree about what is
+        attached because there is only one slot.
+        """
+        db, s = await _seeded_store(tmp_path, "private_then_seam.db")
+        try:
+            ext_a = DreamingExtension(config=_activation_cfg())
+            s._dreaming_extension = ext_a
+            assert s._dreaming_extension is ext_a
+
+            ext_b = DreamingExtension(config=_activation_cfg())
+            s.attach_dreaming_extension(ext_b)
+            assert s._dreaming_extension is ext_b
+
+            result = await s.consolidate(current_cycle=_CYCLE)
+            assert result.promoted_count >= 1
+        finally:
+            await db.close()
+
+    async def test_attach_accepts_a_conforming_extension(self, store: SqliteEngravaCore) -> None:
+        """An object implementing ``run_consolidation`` is accepted."""
+        ext = DreamingExtension(config=_activation_cfg())
+        store.attach_dreaming_extension(ext)
+        assert store._dreaming_extension is ext
+
+    async def test_attach_rejects_a_non_conforming_object(self, store: SqliteEngravaCore) -> None:
+        """An object without ``run_consolidation`` is refused at the door.
+
+        A seam that accepted anything here would only fail later, deep inside
+        a consolidation cycle; this proves it refuses immediately instead.
+        """
+
+        class NotAnExtension:
+            pass
+
+        with pytest.raises(TypeError, match="DreamingConsolidatorProtocol"):
+            store.attach_dreaming_extension(NotAnExtension())  # type: ignore[arg-type]
+
+        assert store._dreaming_extension is None

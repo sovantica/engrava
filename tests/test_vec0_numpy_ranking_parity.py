@@ -36,8 +36,8 @@ import pytest
 
 from engrava.domain.enums import LifecycleStatus, Priority, ThoughtType
 from engrava.domain.models.thought import ThoughtRecord
-from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
 from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
+from engrava.infrastructure.sqlite.vector_sqlite_vec import SqliteVecSearchBackend
 
 if TYPE_CHECKING:
     from pathlib import Path

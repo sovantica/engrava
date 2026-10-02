@@ -61,8 +61,8 @@ class TestValidateIso8601Nullable:
     def test_none_passes_through(self) -> None:
         assert validate_iso8601_nullable(None) is None
 
-    def test_naive_returned_unchanged(self) -> None:
-        assert validate_iso8601_nullable("2026-01-01T00:00:00") == "2026-01-01T00:00:00"
+    def test_naive_read_as_utc(self) -> None:
+        assert validate_iso8601_nullable("2026-01-01T00:00:00") == "2026-01-01T00:00:00+00:00"
 
     def test_positive_offset_normalised_to_utc(self) -> None:
         assert validate_iso8601_nullable("2026-04-12T15:00:00+02:00") == "2026-04-12T13:00:00+00:00"
@@ -152,8 +152,8 @@ class TestThoughtValidTime:
             valid_from="2026-01-01T00:00:00",
             valid_until="2026-12-31T00:00:00",
         )
-        assert thought.valid_from == "2026-01-01T00:00:00"
-        assert thought.valid_until == "2026-12-31T00:00:00"
+        assert thought.valid_from == "2026-01-01T00:00:00+00:00"
+        assert thought.valid_until == "2026-12-31T00:00:00+00:00"
 
     def test_tz_aware_normalised_to_utc(self) -> None:
         thought = _make_thought(
@@ -169,7 +169,7 @@ class TestThoughtValidTime:
             _make_thought(**{field: "garbage"})
 
     def test_inverted_interval_rejected(self) -> None:
-        # AC-1: valid_from strictly after valid_until is rejected.
+        # valid_from strictly after valid_until is rejected.
         with pytest.raises(ValidationError, match="inverted validity interval"):
             _make_thought(
                 valid_from="2026-06-01T00:00:00",
@@ -177,15 +177,15 @@ class TestThoughtValidTime:
             )
 
     def test_equal_instant_accepted(self) -> None:
-        # AC-2: a zero-length interval is a legitimate instantaneous fact.
+        # A zero-length interval is a legitimate instantaneous fact.
         thought = _make_thought(
             valid_from="2026-01-01T00:00:00",
             valid_until="2026-01-01T00:00:00",
         )
-        assert thought.valid_from == thought.valid_until == "2026-01-01T00:00:00"
+        assert thought.valid_from == thought.valid_until == "2026-01-01T00:00:00+00:00"
 
     def test_equal_across_offsets_accepted(self) -> None:
-        # AC-2: equal instants expressed with differing offsets normalise equal.
+        # Equal instants expressed with differing offsets normalise equal.
         thought = _make_thought(
             valid_from="2026-06-01T12:00:00+02:00",
             valid_until="2026-06-01T05:00:00-05:00",
@@ -193,24 +193,24 @@ class TestThoughtValidTime:
         assert thought.valid_from == thought.valid_until == "2026-06-01T10:00:00+00:00"
 
     def test_naive_equals_aware_accepted(self) -> None:
-        # AC-2: same instant, one naive and one UTC-aware. Instant comparison
+        # Same instant, one naive and one UTC-aware. Instant comparison
         # accepts it; a raw-string comparison would wrongly reject it.
         thought = _make_thought(
             valid_from="2026-06-01T10:00:00+00:00",
             valid_until="2026-06-01T10:00:00",
         )
-        assert thought.valid_until == "2026-06-01T10:00:00"
+        assert thought.valid_from == thought.valid_until == "2026-06-01T10:00:00+00:00"
 
     @pytest.mark.parametrize(
         ("valid_from", "valid_until"),
         [
-            ("2026-01-01T00:00:00", None),
-            (None, "2026-01-01T00:00:00"),
+            ("2026-01-01T00:00:00+00:00", None),
+            (None, "2026-01-01T00:00:00+00:00"),
             (None, None),
         ],
     )
     def test_open_bounds_accepted(self, valid_from: str | None, valid_until: str | None) -> None:
-        # AC-3: a NULL on either bound preserves the open interval.
+        # A NULL on either bound preserves the open interval.
         thought = _make_thought(valid_from=valid_from, valid_until=valid_until)
         assert thought.valid_from == valid_from
         assert thought.valid_until == valid_until
@@ -232,8 +232,8 @@ class TestEdgeValidTime:
             valid_from="2026-01-01T00:00:00",
             valid_until="2026-12-31T00:00:00",
         )
-        assert edge.valid_from == "2026-01-01T00:00:00"
-        assert edge.valid_until == "2026-12-31T00:00:00"
+        assert edge.valid_from == "2026-01-01T00:00:00+00:00"
+        assert edge.valid_until == "2026-12-31T00:00:00+00:00"
 
     def test_tz_aware_normalised_to_utc(self) -> None:
         edge = _make_edge(
@@ -249,7 +249,7 @@ class TestEdgeValidTime:
             _make_edge(**{field: "garbage"})
 
     def test_inverted_interval_rejected(self) -> None:
-        # AC-1: valid_from strictly after valid_until is rejected.
+        # valid_from strictly after valid_until is rejected.
         with pytest.raises(ValidationError, match="inverted validity interval"):
             _make_edge(
                 valid_from="2026-06-01T00:00:00",
@@ -257,15 +257,15 @@ class TestEdgeValidTime:
             )
 
     def test_equal_instant_accepted(self) -> None:
-        # AC-2: a zero-length interval is a legitimate instantaneous relation.
+        # A zero-length interval is a legitimate instantaneous relation.
         edge = _make_edge(
             valid_from="2026-01-01T00:00:00",
             valid_until="2026-01-01T00:00:00",
         )
-        assert edge.valid_from == edge.valid_until == "2026-01-01T00:00:00"
+        assert edge.valid_from == edge.valid_until == "2026-01-01T00:00:00+00:00"
 
     def test_equal_across_offsets_accepted(self) -> None:
-        # AC-2: equal instants expressed with differing offsets normalise equal.
+        # Equal instants expressed with differing offsets normalise equal.
         edge = _make_edge(
             valid_from="2026-06-01T12:00:00+02:00",
             valid_until="2026-06-01T05:00:00-05:00",
@@ -273,24 +273,24 @@ class TestEdgeValidTime:
         assert edge.valid_from == edge.valid_until == "2026-06-01T10:00:00+00:00"
 
     def test_naive_equals_aware_accepted(self) -> None:
-        # AC-2: same instant, one naive and one UTC-aware. Instant comparison
+        # Same instant, one naive and one UTC-aware. Instant comparison
         # accepts it; a raw-string comparison would wrongly reject it.
         edge = _make_edge(
             valid_from="2026-06-01T10:00:00+00:00",
             valid_until="2026-06-01T10:00:00",
         )
-        assert edge.valid_until == "2026-06-01T10:00:00"
+        assert edge.valid_from == edge.valid_until == "2026-06-01T10:00:00+00:00"
 
     @pytest.mark.parametrize(
         ("valid_from", "valid_until"),
         [
-            ("2026-01-01T00:00:00", None),
-            (None, "2026-01-01T00:00:00"),
+            ("2026-01-01T00:00:00+00:00", None),
+            (None, "2026-01-01T00:00:00+00:00"),
             (None, None),
         ],
     )
     def test_open_bounds_accepted(self, valid_from: str | None, valid_until: str | None) -> None:
-        # AC-3: a NULL on either bound preserves the open interval.
+        # A NULL on either bound preserves the open interval.
         edge = _make_edge(valid_from=valid_from, valid_until=valid_until)
         assert edge.valid_from == valid_from
         assert edge.valid_until == valid_until

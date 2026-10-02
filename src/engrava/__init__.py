@@ -48,8 +48,11 @@ from engrava.domain.enums import (
 from engrava.domain.exceptions import (
     ActionNotFoundError,
     ConnectionQuarantinedError,
+    CoreMigrationError,
     CycleProviderError,
+    DedupLockReentryError,
     DerivedRecordError,
+    DuplicateEdgeError,
     EmbeddingGenerationError,
     EmbeddingModelMismatchError,
     EmbeddingProviderContractError,
@@ -63,10 +66,14 @@ from engrava.domain.exceptions import (
     JournalIntegrityError,
     ReadOnlyViolationError,
     RecencyModeConflictError,
+    ReferentialIntegrityError,
+    SchemaVersionError,
     SourceThoughtNotFoundError,
     StaleDataError,
     ThoughtNotFoundError,
     VectorDimensionMismatchError,
+    WriteContentionError,
+    WriteLockTimeoutError,
 )
 from engrava.domain.manifest import ExtensionManifest
 from engrava.domain.models.action import ActionRecord
@@ -120,12 +127,12 @@ from engrava.embeddings.sentence_transformer import SentenceTransformerProvider
 from engrava.extensions.discovery import discover_manifests
 from engrava.extensions.dreaming import DreamingExtension
 from engrava.extensions.structural_split import SplitMode, StructuralSplitProducer
-from engrava.extensions.vector_sqlite_vec import SqliteVecSearchBackend
 from engrava.infrastructure.read_only_store import ReadOnlyEngrava
 from engrava.infrastructure.service_manager import EngravaManager
 from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
 from engrava.infrastructure.sqlite.hygiene import EvictionReason, HygieneResult
 from engrava.infrastructure.sqlite.journal_writer import JournalWriter
+from engrava.infrastructure.sqlite.vector_sqlite_vec import SqliteVecSearchBackend
 from engrava.metadata import percept, thought, utterance
 from engrava.mindql.executor import MindQLExecutor, MindQLResult
 from engrava.mindql.parser import MindQLCommand, MindQLParseError, MindQLQuery, parse
@@ -145,9 +152,11 @@ __all__ = [
     "ConfirmationSignal",
     "ConnectionQuarantinedError",
     "ConsolidationResult",
+    "CoreMigrationError",
     "CoreThoughtRecord",
     "CycleProvider",
     "CycleProviderError",
+    "DedupLockReentryError",
     "DefaultEngravaHooks",
     "DefaultMindStoreHooks",
     "DeriveContext",
@@ -161,6 +170,7 @@ __all__ = [
     "DreamingExtension",
     "DreamingGates",
     "DreamingSignalProtocol",
+    "DuplicateEdgeError",
     "EdgeCounts",
     "EdgeRecord",
     "EdgeType",
@@ -224,7 +234,9 @@ __all__ = [
     "ReadOnlyViolationError",
     "RecencyModeConflictError",
     "RecencySignal",
+    "ReferentialIntegrityError",
     "RoleAwareEmbeddingProvider",
+    "SchemaVersionError",
     "ScoringContext",
     "SearchConfig",
     "SentenceTransformerProvider",
@@ -249,6 +261,8 @@ __all__ = [
     "VectorDimensionMismatchError",
     "VerificationStatus",
     "VisibilityQueryFilter",
+    "WriteContentionError",
+    "WriteLockTimeoutError",
     "discover_manifests",
     "load_config",
     "parse",
@@ -262,25 +276,40 @@ __all__ = [
 
 
 # ------------------------------------------------------------------
-# Backward-compatibility aliases — deprecated, remove in v0.4
+# Backward-compatibility aliases for the pre-rename (MindStore-era) names.
+#
+# Policy: kept, not scheduled for removal. A caller may keep using these
+# names — removing them would be a breaking change, and under this
+# project's versioning that computes a major release, which is not a
+# price this surface is worth paying on its own. Keeping them costs one
+# attribute lookup (the __getattr__ below) and no ongoing maintenance.
+# This is not a promise they live forever; it is the current position,
+# to be revisited deliberately rather than left to expire silently. New
+# code should use the current names, which is what the DeprecationWarning
+# on access points at.
 # ------------------------------------------------------------------
 import warnings as _warnings
+
+# The source of truth for every pre-rename alias this module still serves.
+# Tests reach into this constant (rather than hand-copying it) so that an
+# alias added here without test coverage fails loudly instead of shipping
+# silently.
+_DEPRECATED_ALIASES: dict[str, object] = {
+    "SqliteMindStoreCore": SqliteEngravaCore,
+    "MindStoreManager": EngravaManager,
+    "MindStoreConfig": EngravaConfig,
+    "MindStoreError": EngravaError,
+    "MindStoreCoreProtocol": EngravaCoreProtocol,
+    "MindStoreHooksProtocol": EngravaHooksProtocol,
+    "DefaultMindStoreHooks": DefaultEngravaHooks,
+    "ReadOnlyMindStore": ReadOnlyEngrava,
+}
 
 
 def __getattr__(name: str) -> object:
     """Lazy deprecation aliases for renamed symbols."""
-    _aliases: dict[str, object] = {
-        "SqliteMindStoreCore": SqliteEngravaCore,
-        "MindStoreManager": EngravaManager,
-        "MindStoreConfig": EngravaConfig,
-        "MindStoreError": EngravaError,
-        "MindStoreCoreProtocol": EngravaCoreProtocol,
-        "MindStoreHooksProtocol": EngravaHooksProtocol,
-        "DefaultMindStoreHooks": DefaultEngravaHooks,
-        "ReadOnlyMindStore": ReadOnlyEngrava,
-    }
-    if name in _aliases:
-        target = _aliases[name]
+    if name in _DEPRECATED_ALIASES:
+        target = _DEPRECATED_ALIASES[name]
         target_name = getattr(target, "__name__", str(target))
         _warnings.warn(
             f"{name} is deprecated, use {target_name} instead",

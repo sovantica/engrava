@@ -34,6 +34,8 @@ def test_upgrade_preserves_data_and_core_commands(tmp_path: Path) -> None:
 
     db_path = tmp_path / "upgrade.db"
     snapshot_path = tmp_path / "upgrade.snapshot.jsonl"
+    pre_snapshot_path = tmp_path / "upgrade.pre.snapshot.jsonl"
+    pre_journal_state_path = tmp_path / "upgrade.pre.journal-state.json"
 
     run_upgrade_path(
         from_spec=from_spec,
@@ -43,6 +45,8 @@ def test_upgrade_preserves_data_and_core_commands(tmp_path: Path) -> None:
         to_editable=to_editable,
         db_path=db_path,
         snapshot_path=snapshot_path,
+        pre_snapshot_path=pre_snapshot_path,
+        pre_journal_state_path=pre_journal_state_path,
     )
 
     assert db_path.exists()

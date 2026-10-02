@@ -7,6 +7,7 @@ These tests use only engrava types and SqliteEngravaCore.
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -66,6 +67,7 @@ async def store(db: aiosqlite.Connection) -> SqliteEngravaCore:
 
 def _make_thought(
     thought_id: str = "t-001",
+    *,
     thought_type: ThoughtType = ThoughtType.TASK,
     essence: str = "Test thought",
     content: str = "Test thought content",
@@ -309,6 +311,211 @@ class TestSqliteEngravaCoreEdge:
         edges = await store.get_edges("t-a", direction="OUT")
         assert len(edges) == 1
         assert edges[0].edge_type == EdgeType.ASSOCIATED
+
+    async def test_get_edges_limit_none_preserves_unbounded_behaviour(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """``limit=None`` (the default) is unchanged: every matching edge is returned."""
+        await store.create_thought(_make_thought("t-a"))
+        async with store.suspend_auto_commit():
+            for i in range(5):
+                await store.create_thought(_make_thought(f"t-n-{i}"))
+                await store.create_edge(
+                    EdgeRecord(
+                        edge_id=f"e-{i}",
+                        from_thought_id="t-a",
+                        to_thought_id=f"t-n-{i}",
+                        edge_type=EdgeType.ASSOCIATED,
+                        weight=(i + 1) / 10,
+                        created_cycle=0,
+                    ),
+                )
+
+        edges = await store.get_edges("t-a", direction="OUT")
+        assert len(edges) == 5
+
+    async def test_get_edges_limit_bounds_result_to_highest_weight(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """A ``limit`` keeps the highest-``weight`` edges, not an arbitrary subset."""
+        await store.create_thought(_make_thought("t-hub"))
+        weights = [0.1, 0.9, 0.5, 0.7, 0.3]
+        async with store.suspend_auto_commit():
+            for i, w in enumerate(weights):
+                await store.create_thought(_make_thought(f"t-hub-n-{i}"))
+                await store.create_edge(
+                    EdgeRecord(
+                        edge_id=f"e-hub-{i}",
+                        from_thought_id="t-hub",
+                        to_thought_id=f"t-hub-n-{i}",
+                        edge_type=EdgeType.ASSOCIATED,
+                        weight=w,
+                        created_cycle=0,
+                    ),
+                )
+
+        edges = await store.get_edges("t-hub", direction="OUT", limit=2)
+        assert len(edges) == 2
+        assert [e.weight for e in edges] == sorted(weights, reverse=True)[:2]
+
+    async def test_get_edges_limit_bounds_rows_read_at_sql_layer(
+        self,
+        store: SqliteEngravaCore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A large adjacency proves the bound is enforced in SQL, not after ``fetchall()``.
+
+        Instruments the actual number of rows the SQLite cursor hands back to
+        Python for the ``get_edges`` call — not just the length of the final
+        returned list — so a regression that reintroduces "fetch everything,
+        then slice in Python" would still fail this even though its *final*
+        result would look identical.
+        """
+        await store.create_thought(_make_thought("t-hub-large"))
+        hub_edge_count = 600
+        async with store.suspend_auto_commit():
+            for i in range(hub_edge_count):
+                await store.create_thought(_make_thought(f"t-hub-large-n-{i}"))
+                await store.create_edge(
+                    EdgeRecord(
+                        edge_id=f"e-hub-large-{i}",
+                        from_thought_id="t-hub-large",
+                        to_thought_id=f"t-hub-large-n-{i}",
+                        edge_type=EdgeType.ASSOCIATED,
+                        weight=(i + 1) / (hub_edge_count + 1),
+                        created_cycle=0,
+                    ),
+                )
+
+        rows_read: list[int] = []
+        real_fetchall = aiosqlite.Cursor.fetchall
+
+        async def _counting_fetchall(self: aiosqlite.Cursor) -> list[aiosqlite.Row]:
+            result = list(await real_fetchall(self))
+            rows_read.append(len(result))
+            return result
+
+        monkeypatch.setattr(aiosqlite.Cursor, "fetchall", _counting_fetchall)
+
+        bound = 10
+        edges = await store.get_edges("t-hub-large", direction="OUT", limit=bound)
+
+        assert len(edges) == bound
+        # Every row the cursor ever handed back across this call sums to
+        # exactly the bound, not the underlying 600-edge adjacency — proving
+        # the LIMIT is enforced in SQL, not by truncating an already-fetched
+        # Python list.
+        assert sum(rows_read) == bound
+
+    async def test_get_edges_rejects_negative_limit(
+        self,
+        store: SqliteEngravaCore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A negative ``limit`` is rejected before it reaches SQL.
+
+        SQLite reads a negative ``LIMIT`` as "no limit", so an unvalidated
+        negative value would silently return every edge instead of raising.
+        The message must name both the argument and the offending value — an
+        unanchored search for the value's ``repr`` is not enough: ``-1`` is a
+        substring of ``-1000000``, so a fix that always reported
+        ``-1000000`` would still satisfy a bare ``match`` on ``-1``'s
+        ``repr``. Anchoring the pattern at the end of the message (the value
+        is always the last thing in it) rules that out.
+
+        "Before it reaches SQL" is checked, not just claimed: the
+        connection's own ``execute`` is replaced with a function that fails
+        the test if it is ever invoked, so a fix that ran the query and only
+        then raised the same ``ValueError`` would still be caught, not just
+        one that never runs the query at all.
+        """
+        await store.create_thought(_make_thought("t-hub-neg"))
+        async with store.suspend_auto_commit():
+            for i in range(3):
+                await store.create_thought(_make_thought(f"t-hub-neg-n-{i}"))
+                await store.create_edge(
+                    EdgeRecord(
+                        edge_id=f"e-hub-neg-{i}",
+                        from_thought_id="t-hub-neg",
+                        to_thought_id=f"t-hub-neg-n-{i}",
+                        edge_type=EdgeType.ASSOCIATED,
+                        weight=(i + 1) / 10,
+                        created_cycle=0,
+                    ),
+                )
+
+        execute_called = False
+
+        async def _fail_if_executed(*_args: object, **_kwargs: object) -> object:
+            nonlocal execute_called
+            execute_called = True
+            msg = "get_edges ran a query before validating a negative limit"
+            raise AssertionError(msg)
+
+        monkeypatch.setattr(store._db, "execute", _fail_if_executed)
+
+        for bad_limit in (-1, -1_000_000):
+            with pytest.raises(
+                ValueError,
+                match=rf"limit.*{re.escape(repr(bad_limit))}$",
+            ):
+                await store.get_edges("t-hub-neg", direction="OUT", limit=bad_limit)
+            assert not execute_called
+
+    async def test_get_edges_limit_zero_returns_empty_list(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """``limit=0`` is a valid bound: it returns no edges, not every edge."""
+        await store.create_thought(_make_thought("t-hub-zero"))
+        await store.create_thought(_make_thought("t-hub-zero-n"))
+        await store.create_edge(
+            EdgeRecord(
+                edge_id="e-hub-zero",
+                from_thought_id="t-hub-zero",
+                to_thought_id="t-hub-zero-n",
+                edge_type=EdgeType.ASSOCIATED,
+                weight=0.5,
+                created_cycle=0,
+            ),
+        )
+
+        edges = await store.get_edges("t-hub-zero", direction="OUT", limit=0)
+        assert edges == []
+
+    async def test_get_edges_rejects_bool_limit(
+        self,
+        store: SqliteEngravaCore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``bool`` is an ``int`` subclass but never a meaningful edge count.
+
+        As in :meth:`test_get_edges_rejects_negative_limit`, the message must
+        name the offending value, anchored at the end, not just the
+        argument, and the rejection must happen before any query runs —
+        checked the same way, by failing the test if ``execute`` is called.
+        """
+        await store.create_thought(_make_thought("t-hub-bool"))
+
+        execute_called = False
+
+        async def _fail_if_executed(*_args: object, **_kwargs: object) -> object:
+            nonlocal execute_called
+            execute_called = True
+            msg = "get_edges ran a query before validating a boolean limit"
+            raise AssertionError(msg)
+
+        monkeypatch.setattr(store._db, "execute", _fail_if_executed)
+
+        for bad_limit in (True, False):
+            with pytest.raises(
+                ValueError,
+                match=rf"limit.*{re.escape(repr(bad_limit))}$",
+            ):
+                await store.get_edges("t-hub-bool", direction="OUT", limit=bad_limit)
+            assert not execute_called
 
     async def test_delete_edge(self, store: SqliteEngravaCore) -> None:
         await store.create_thought(_make_thought("t-a"))
@@ -582,7 +789,7 @@ class TestFTS5Schema:
         cursor = await db.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert int(row[0]) == 20
+        assert int(row[0]) == 21
 
     async def test_search_fts_lazy_probes_index(self, db: aiosqlite.Connection) -> None:
         """search_fts should work without an explicit _probe_fts call."""

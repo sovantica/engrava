@@ -70,7 +70,7 @@ def discover_manifests(group: str = _DEFAULT_GROUP) -> list[ExtensionManifest]:
                     group,
                     type(obj).__name__,
                 )
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning(
                 "Failed to load extension manifest %r from group %r.",
                 ep.name,

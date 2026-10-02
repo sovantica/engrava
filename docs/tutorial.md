@@ -25,6 +25,7 @@ the note above:
 ```python
 import asyncio
 import hashlib
+import sys
 import uuid
 
 import aiosqlite
@@ -120,9 +121,25 @@ async def search(store, query, cycle):
 Wire the pieces into a `main()` and run it:
 
 ```python
+async def _close_quietly(conn: aiosqlite.Connection) -> None:
+    """Close *conn*, reporting rather than raising if the close itself fails.
+
+    ``aiosqlite.Connection.__aexit__`` is an unconditional ``await
+    close()``, so a bare ``async with aiosqlite.connect(...)`` would let a
+    close failure here replace whatever the block above actually raised.
+    Used only from the exception path below -- the ordinary success-path
+    close still propagates a genuine failure normally.
+    """
+    try:
+        await conn.close()
+    except Exception as exc:  # noqa: BLE001 - deliberately broad: never replace the real error
+        print(f"warning: failed to close the database connection: {exc}", file=sys.stderr)
+
+
 async def main():
     provider = CallbackProvider(callback=embed, dimension=32, model_name="tutorial")
-    async with aiosqlite.connect(":memory:") as conn:
+    conn = await aiosqlite.connect(":memory:")
+    try:
         conn.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(conn, embedding_provider=provider, auto_embed=True)
         await store.ensure_schema()
@@ -136,6 +153,11 @@ async def main():
 
         total = await store.count_thoughts()
         print(f"\nStored {total} notes.")
+    except BaseException:
+        await _close_quietly(conn)
+        raise
+    else:
+        await conn.close()
 
 
 if __name__ == "__main__":

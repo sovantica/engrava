@@ -18,7 +18,10 @@ explicitly.
 
 from __future__ import annotations
 
+import contextlib
+import inspect
 import logging
+import struct
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -26,6 +29,7 @@ import pytest
 
 from engrava import (
     CoreThoughtRecord,
+    DefaultEngravaHooks,
     EmbeddingGenerationError,
     KnowledgeSource,
     LifecycleStatus,
@@ -37,6 +41,9 @@ from engrava import (
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+    from pathlib import Path
+
+    from engrava.domain.models.thought import ThoughtRecord
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +212,91 @@ async def _embedding_store(
     )
     await s._probe_fts()
     return s
+
+
+class _FlakyProvider:
+    """Succeeds only when the embed text contains a chosen marker, else raises.
+
+    Lets a test drive a sequence of embed attempts where some succeed (with a
+    fixed, recognisable vector) and later ones fail, to check what a real
+    on-disk connection reads back afterwards.
+    """
+
+    dimension = 4
+    model_name = "flaky-4"
+
+    def __init__(self, *, succeeds_on: str, vector: list[float]) -> None:
+        self._succeeds_on = succeeds_on
+        self._vector = vector
+
+    async def embed(self, text: str) -> list[float]:
+        if self._succeeds_on in text:
+            return self._vector
+        msg = f"provider exploded for: {text!r}"
+        raise RuntimeError(msg)
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        return [await self.embed(t) for t in texts]
+
+
+async def _open_file_store(
+    db_path: str,
+    provider: object,
+    *,
+    require_embedding: bool = False,
+) -> tuple[SqliteEngravaCore, aiosqlite.Connection]:
+    """Build an auto-embed store over a real on-disk file (not ``:memory:``).
+
+    A second, independent connection can then read this file back to confirm
+    what is actually durable, rather than trusting what the writer's own
+    connection sees before it has necessarily flushed a commit to disk.
+    """
+    conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(
+        conn,
+        embedding_provider=provider,  # type: ignore[arg-type]
+        auto_embed=True,
+        require_embedding=require_embedding,
+    )
+    await store.ensure_schema()
+    return store, conn
+
+
+async def _durable_thought_count(db_path: str, thought_id: str) -> int:
+    """Read the durable row count for ``thought_id`` from a fresh connection."""
+    conn = await aiosqlite.connect(db_path)
+    try:
+        return await _count(conn, "SELECT COUNT(*) FROM thought WHERE thought_id = ?", thought_id)
+    finally:
+        await conn.close()
+
+
+async def _durable_thought_content(db_path: str, thought_id: str) -> str | None:
+    """Read the durable ``content`` for ``thought_id`` from a fresh connection."""
+    conn = await aiosqlite.connect(db_path)
+    try:
+        cursor = await conn.execute(
+            "SELECT content FROM thought WHERE thought_id = ?", (thought_id,)
+        )
+        row = await cursor.fetchone()
+        return None if row is None else str(row[0])
+    finally:
+        await conn.close()
+
+
+async def _durable_embedding_vector(db_path: str, thought_id: str) -> list[float]:
+    """Read the durable embedding vector for ``thought_id`` from a fresh connection."""
+    conn = await aiosqlite.connect(db_path)
+    try:
+        cursor = await conn.execute(
+            "SELECT vector_blob, dimension FROM embedding WHERE owner_id = ?", (thought_id,)
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        return list(struct.unpack(f"{row[1]}f", row[0]))
+    finally:
+        await conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +564,228 @@ async def test_upsert_by_hash_applies_valid_lifecycle_transition(
     assert second.lifecycle_status is LifecycleStatus.ARCHIVED
 
 
+async def test_upsert_by_hash_noop_does_not_commit_callers_pending_work(
+    store: SqliteEngravaCore,
+    db: aiosqlite.Connection,
+) -> None:
+    """A no-op ``upsert_by_hash()`` must not commit the caller's own pending write.
+
+    The unchanged-record branch writes nothing of its own -- no
+    ``UPDATE``, no journal entry -- so it must not call ``_maybe_commit()``
+    either. A commit there would commit whatever *unrelated* work the caller
+    already had open on the same connection, leaving a later ``rollback()``
+    with nothing left to undo.
+
+    Here a raw pending ``INSERT`` left uncommitted on the shared connection
+    stands in for "the caller's pending work": a transaction already open
+    when this store's own guard is entered (see
+    :meth:`SqliteEngravaCore._serialize_dedup_probe`).
+    """
+    content = "Content re-upserted with byte-identical mutable fields."
+    seeded = await store.upsert_by_hash(_thought("t-rb-noop-1", content=content))
+
+    # The caller's own pending, uncommitted write on the same connection.
+    await db.execute(
+        "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+        "VALUES ('pending-row', 'OBSERVATION', 'e', 'pending content', 'P2')",
+    )
+    assert db.in_transaction
+
+    # A no-op hit: same mutable fields as the seeded row, so nothing to write.
+    result = await store.upsert_by_hash(_thought("t-rb-noop-2", content=content))
+    assert result.thought_id == seeded.thought_id
+
+    await db.rollback()
+
+    assert await _count(db, "SELECT COUNT(*) FROM thought WHERE thought_id = 'pending-row'") == 0
+
+
+async def test_upsert_by_hash_update_branch_still_commits_pending_work(
+    store: SqliteEngravaCore,
+    db: aiosqlite.Connection,
+) -> None:
+    """Control: the mutable-field-update branch keeps committing, unchanged.
+
+    Unlike the no-op branch (see the sibling test above), this branch does
+    write: it delegates to :meth:`SqliteEngravaCore.update_thought`, which
+    calls ``_maybe_commit()`` itself after its own journal append -- the
+    "whoever writes, commits" rule applied correctly. That commit is on the
+    one shared connection, so it also makes durable whatever unrelated
+    pending write the caller already had open; a later ``rollback()`` finds
+    nothing left to undo.
+    """
+    content = "Content that receives a genuine mutable-field update."
+    seeded = await store.upsert_by_hash(
+        _thought("t-rb-upd-1", content=content, priority=Priority.P3),
+    )
+
+    await db.execute(
+        "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+        "VALUES ('pending-row-ctrl', 'OBSERVATION', 'e', 'pending content 2', 'P2')",
+    )
+    assert db.in_transaction
+
+    updated = await store.upsert_by_hash(
+        _thought("t-rb-upd-2", content=content, priority=Priority.P1),
+    )
+    assert updated.thought_id == seeded.thought_id
+    assert updated.priority is Priority.P1
+
+    # update_thought already committed everything on this connection --
+    # rollback() has nothing left to discard.
+    await db.rollback()
+
+    assert (
+        await _count(db, "SELECT COUNT(*) FROM thought WHERE thought_id = 'pending-row-ctrl'") == 1
+    )
+
+
+async def test_upsert_by_hash_noop_inside_suspend_auto_commit_unaffected(
+    store: SqliteEngravaCore,
+    db: aiosqlite.Connection,
+) -> None:
+    """Inside ``suspend_auto_commit()``, a no-op ``upsert_by_hash()`` commits nothing.
+
+    The first upsert inserts a row and the second is a no-op hit on the same
+    content. When the window then raises, the outer rollback discards the
+    insert, so no row remains.
+    """
+    content = "Content re-upserted with byte-identical mutable fields, nested."
+
+    async def _run() -> None:
+        async with store.suspend_auto_commit():
+            await store.upsert_by_hash(_thought("t-nest-1", content=content))
+            # A no-op hit, still inside the same suspended window.
+            await store.upsert_by_hash(_thought("t-nest-2", content=content))
+            msg = "abort the whole window"
+            raise RuntimeError(msg)
+
+    with pytest.raises(RuntimeError, match="abort the whole window"):
+        await _run()
+
+    assert await _count(db, "SELECT COUNT(*) FROM thought") == 0
+
+
+async def test_upsert_by_hash_noop_leaves_an_explicit_begin_untouched(
+    store: SqliteEngravaCore,
+    db: aiosqlite.Connection,
+) -> None:
+    """A no-op match must not touch a transaction opened by a raw ``BEGIN``.
+
+    Distinct from the ``suspend_auto_commit()`` and ``bulk_store`` cases
+    (siblings of this test): here nothing in this store's own API opened the
+    transaction at all -- a caller issued ``BEGIN`` directly against the
+    shared connection, exactly the "residual gap" documented on
+    :meth:`SqliteEngravaCore._serialize_dedup_probe` ("a raw ``BEGIN`` issued
+    directly against it, with nothing written yet"). Because
+    ``self._db.in_transaction`` is already ``True`` when ``upsert_by_hash``
+    is entered, ``opened_transaction`` is computed ``False`` and
+    :meth:`SqliteEngravaCore._end_exploratory_probe` must take no action at
+    all: neither committing the caller's pending write nor rolling it back.
+    """
+    seeded = await store.upsert_by_hash(_thought("t-begin-seed", content="explicit begin case"))
+
+    await db.execute("BEGIN")
+    await db.execute(
+        "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+        "VALUES ('pending-explicit-begin', 'OBSERVATION', 'e', 'pending content', 'P2')",
+    )
+    assert db.in_transaction
+
+    result = await store.upsert_by_hash(_thought("t-begin-other", content="explicit begin case"))
+    assert result.thought_id == seeded.thought_id
+
+    # Still open -- neither committed nor rolled back by the no-op call.
+    assert db.in_transaction
+
+    await db.rollback()
+    assert (
+        await _count(
+            db,
+            "SELECT COUNT(*) FROM thought WHERE thought_id = 'pending-explicit-begin'",
+        )
+        == 0
+    )
+
+
+class _ReentrantUpsertHooks(DefaultEngravaHooks):
+    """``on_store`` hook that reenters ``upsert_by_hash`` with a no-op match.
+
+    Models a plugin's ``on_store`` callback calling back into the store on
+    the same task -- the reentrant shape ``_write_lock``/``_dedup_lock``'s
+    task-reentrant design exists to support. ``store`` is wired in after
+    construction since the hooks object must exist before the store that
+    takes it.
+    """
+
+    def __init__(self, *, trigger_id: str, noop_content: str) -> None:
+        super().__init__()
+        self.store: SqliteEngravaCore | None = None
+        self._trigger_id = trigger_id
+        self._noop_content = noop_content
+        self.reentrant_result: ThoughtRecord | None = None
+
+    async def on_store(self, thought: ThoughtRecord) -> ThoughtRecord:
+        """Reenter ``upsert_by_hash`` with a no-op match for the trigger row.
+
+        Args:
+            thought: The just-persisted thought passed to this hook.
+
+        Returns:
+            ``thought`` unchanged.
+
+        """
+        if thought.thought_id == self._trigger_id:
+            assert self.store is not None
+            self.reentrant_result = await self.store.upsert_by_hash(
+                _thought("reentrant-probe", content=self._noop_content),
+            )
+        return thought
+
+
+async def test_upsert_by_hash_noop_inside_bulk_store_batch_untouched(
+    db: aiosqlite.Connection,
+) -> None:
+    """A no-op match reentered from inside a ``bulk_store`` batch touches nothing.
+
+    ``bulk_store`` runs its whole insert loop -- including each row's
+    ``on_store`` dispatch -- under one ``suspend_auto_commit()`` window (see
+    :meth:`SqliteEngravaCore._bulk_store_inner`). If an ``on_store`` hook
+    calls back into ``upsert_by_hash`` on the same task and that call is a
+    no-op match, ``self._db.in_transaction`` is already ``True`` (the
+    batch's own transaction), so ``opened_transaction`` is ``False`` and
+    :meth:`SqliteEngravaCore._end_exploratory_probe` must leave the batch's
+    transaction completely alone. Decisive check: every row the batch
+    inserted -- including the one whose ``on_store`` triggered the reentrant
+    call -- is still present and committed once the batch returns; a wrong
+    implementation that rolled back on ``opened_transaction=False`` would
+    discard the whole in-flight batch instead.
+    """
+    seed_content = "Content the reentrant no-op call matches unchanged."
+    hooks = _ReentrantUpsertHooks(trigger_id="t-bulk-trigger", noop_content=seed_content)
+    store = SqliteEngravaCore(db, hooks)
+    hooks.store = store
+    await store._probe_fts()
+
+    seeded = await store.upsert_by_hash(_thought("t-bulk-seed", content=seed_content))
+
+    persisted = await store.bulk_store(
+        [
+            _thought("t-bulk-other", content="unrelated batch content"),
+            _thought("t-bulk-trigger", content="content distinct from the seed"),
+        ],
+    )
+
+    assert [record.thought_id for record in persisted] == ["t-bulk-other", "t-bulk-trigger"]
+    assert hooks.reentrant_result is not None
+    assert hooks.reentrant_result.thought_id == seeded.thought_id
+    assert not db.in_transaction
+
+    for thought_id in ("t-bulk-seed", "t-bulk-other", "t-bulk-trigger"):
+        count = await _count(db, "SELECT COUNT(*) FROM thought WHERE thought_id = ?", thought_id)
+        assert count == 1
+
+
 # ---------------------------------------------------------------------------
 # bulk_store — transactional insert
 # ---------------------------------------------------------------------------
@@ -535,6 +849,72 @@ async def test_bulk_store_rolls_back_on_mid_batch_failure(
         await store.bulk_store(thoughts)
 
     # All-or-nothing: not even the rows before the failure survive.
+    assert await _count(db, "SELECT COUNT(*) FROM thought") == 0
+
+
+async def test_bulk_store_earlier_duplicate_id_outranks_a_later_ordinary_validation_error(
+    store: SqliteEngravaCore,
+    db: aiosqlite.Connection,
+) -> None:
+    """A later item's ordinary validation error must not pre-empt an earlier
+    item's duplicate-id failure.
+
+    A bare loop of ``create_thought()`` calls finishes item *n* -- including
+    any insert-time failure -- before item *n + 1* is even looked at, so the
+    duplicate id here (item 3) must be what raises, never the oversized
+    metadata on item 4 that comes after it. This pins ``bulk_store``'s failure
+    ordering: validating every item, batch-wide, before any insert would let
+    a later item's ordinary (non-seam) validation error raise first instead.
+    """
+    oversized_metadata = {"blob": "x" * 70_000}  # exceeds the 64 KiB metadata cap
+    thoughts = [
+        _thought("t-rb-1", content="first"),
+        _thought("dup", content="second"),
+        _thought("dup", content="third"),  # duplicate id -> raises at insert time
+        _thought("t-rb-4", content="fourth", metadata=oversized_metadata),
+    ]
+
+    with pytest.raises(ValueError, match="already exists"):
+        await store.bulk_store(thoughts)
+
+    # All-or-nothing either way: not even the rows before the failure survive.
+    assert await _count(db, "SELECT COUNT(*) FROM thought") == 0
+
+
+async def test_bulk_store_on_store_ordering_survives_a_later_ordinary_validation_error(
+    db: aiosqlite.Connection,
+) -> None:
+    """A later item's ordinary validation error must not suppress an earlier
+    item's ``on_store`` call.
+
+    Matches the same base-ordering guarantee as the duplicate-id case above:
+    item *n*'s ``on_store`` already ran -- item *n* is fully finished -- by
+    the time item *n + 1* is even looked at, whether or not the whole batch
+    later rolls back for being all-or-nothing.
+    """
+    on_store_calls: list[str] = []
+
+    class _RecordingHooks(DefaultEngravaHooks):
+        async def on_store(self, thought: ThoughtRecord) -> ThoughtRecord:
+            on_store_calls.append(thought.thought_id)
+            return thought
+
+    store = SqliteEngravaCore(db, hooks=_RecordingHooks())
+    await store._probe_fts()
+
+    oversized_metadata = {"blob": "x" * 70_000}  # exceeds the 64 KiB metadata cap
+    thoughts = [
+        _thought("ok-1", content="first, valid"),
+        _thought("ok-2", content="second, valid"),
+        _thought("bad-3", content="third, invalid metadata", metadata=oversized_metadata),
+    ]
+
+    with pytest.raises(ValueError, match="metadata"):
+        await store.bulk_store(thoughts)
+
+    # ok-1 and ok-2's on_store already ran before bad-3's validation failed.
+    assert on_store_calls == ["ok-1", "ok-2"]
+    # All-or-nothing: the whole batch, including ok-1 / ok-2, still rolls back.
     assert await _count(db, "SELECT COUNT(*) FROM thought") == 0
 
 
@@ -713,10 +1093,9 @@ async def test_bulk_store_dedup_hit_reusing_existing_id_not_reembedded(
 ) -> None:
     """A dedup hit that reuses an existing row's id is classified by row existence.
 
-    Regression guard: dedup-hit detection must key off whether the row already
-    existed, not instance identity — otherwise a submitted thought whose id
-    coincides with the matched row's id would be misread as a fresh insert and
-    redundantly re-embedded.
+    Dedup-hit detection keys off whether the row already existed, not off
+    instance identity. A submitted thought whose id coincides with the matched
+    row's id is a hit, so it is not embedded again.
     """
     provider = _SpyProvider()
     store = await _embedding_store(db, provider)
@@ -763,6 +1142,149 @@ async def test_bulk_store_all_dedup_hits_issues_no_embed_call(
 # ---------------------------------------------------------------------------
 # No silent embedding skip (WARN + require_embedding)
 # ---------------------------------------------------------------------------
+
+
+def test_require_embedding_docstring_does_not_overclaim_top_level_durability() -> None:
+    """The constructor's ``require_embedding`` entry must not say "committed either way".
+
+    That phrase is only true for ``create_thought``/``update_thought``: a
+    standalone ``bulk_store`` shares one transaction between its insert loop
+    and the trailing batch-embed call, so a strict failure rolls the *whole
+    batch* back instead (see ``test_bulk_store_strict_embed_failure_rolls_back``
+    above) — the row this docstring tells an operator to repair may not exist.
+    The entry must call that exception out by name rather than claim every
+    top-level path commits regardless of which one raised.
+    """
+    doc = inspect.getdoc(SqliteEngravaCore) or ""
+    start = doc.index("require_embedding:")
+    end = doc.index("search_config:")
+    section = doc[start:end]
+
+    assert "committed either way" not in section
+    assert "bulk_store" in section
+    # A keyword check like this one can pass against a docstring that asserts
+    # the opposite of the truth, as long as it contains "bulk_store" and
+    # avoids one forbidden phrase — it does not verify behaviour. The
+    # behaviour is instead asserted directly by
+    # ``test_require_embedding_flag_flips_durability_through_a_typed_except``
+    # and ``test_nested_update_rollback_can_leave_a_stale_embedding`` below.
+    # This assertion only checks that one absolute phrase is absent from the
+    # section.
+    assert "it never decides whether the thought row survives" not in section
+
+
+async def test_require_embedding_flag_flips_durability_through_a_typed_except(
+    tmp_path: Path,
+) -> None:
+    """Same provider failure, same caller code, opposite durable outcome.
+
+    The constructor docstring must not claim ``require_embedding`` "never
+    decides whether the thought row survives": it does, indirectly, because
+    it decides the exception *type*, and an ordinary caller ``except
+    EmbeddingGenerationError`` clause only catches the strict-mode error.
+    Nested inside the caller's own ``suspend_auto_commit()`` window, that
+    difference decides whether the window exits cleanly (commits) or lets
+    the exception escape (rolls back). Verified from a second, independent
+    connection onto the same on-disk file, per ``require_embedding`` value.
+    """
+    for require_embedding, expect_durable in ((True, True), (False, False)):
+        db_path = str(tmp_path / f"flag-{require_embedding}.db")
+        store, conn = await _open_file_store(
+            db_path, _FailingProvider(), require_embedding=require_embedding
+        )
+        try:
+            with contextlib.suppress(RuntimeError):
+                # RuntimeError here is the default, untyped provider error
+                # escaping the window uncaught.
+                async with store.suspend_auto_commit():
+                    with contextlib.suppress(EmbeddingGenerationError):
+                        # Only the strict-mode error is caught here.
+                        await store.create_thought(_thought("t-flag"))
+        finally:
+            await conn.close()
+
+        durable = await _durable_thought_count(db_path, "t-flag")
+        expected = 1 if expect_durable else 0
+        assert durable == expected, (
+            f"require_embedding={require_embedding}: expected durable rows="
+            f"{expected}, got {durable}"
+        )
+
+
+async def test_nested_update_rollback_can_leave_a_stale_embedding(
+    tmp_path: Path,
+) -> None:
+    """A rolled-back nested update does not guarantee a consistent embedding.
+
+    Two-step sequence: a standalone update A -> B commits (the update commits
+    before re-embedding) while its own re-embed fails, leaving content B with
+    the embedding of A. A later nested update B -> C then also fails to
+    re-embed and escapes uncaught, rolling the outer window back to content
+    B — but the embedding was never touched by either failure, so it still
+    represents A, not B. Verified by reading both columns back from a second,
+    independent connection onto the same on-disk file.
+    """
+    vector_a = [1.0, 0.0, 0.0, 0.0]
+    db_path = str(tmp_path / "stale-embed.db")
+    store, conn = await _open_file_store(db_path, _FlakyProvider(succeeds_on="A", vector=vector_a))
+    try:
+        await store.create_thought(_thought("t-stale", essence="e", content="content-A"))
+
+        # Standalone update A -> B commits; re-embed of B fails and propagates.
+        with pytest.raises(RuntimeError):
+            await store.update_thought("t-stale", content="content-B")
+
+        # Nested update B -> C: re-embed of C also fails, escapes uncaught,
+        # and the outer window rolls the content change back to B.
+        with pytest.raises(RuntimeError):
+            async with store.suspend_auto_commit():
+                await store.update_thought("t-stale", content="content-C")
+    finally:
+        await conn.close()
+
+    content = await _durable_thought_content(db_path, "t-stale")
+    vector = await _durable_embedding_vector(db_path, "t-stale")
+    assert content == "content-B", "rollback should restore the pre-nested-update content"
+    assert vector == vector_a, (
+        "the embedding is still the one from the first failure and was never "
+        "repaired by the second rollback — content and embedding disagree"
+    )
+
+
+async def test_create_then_update_in_same_window_rollback_leaves_no_row(
+    tmp_path: Path,
+) -> None:
+    """A rolled-back window can erase a row, not just revert it.
+
+    Rollback does not unwind to "before this call" — it unwinds to whatever
+    existed when the *outermost* ``suspend_auto_commit()`` window opened. If
+    the thought was created earlier in that same window, a later update's
+    re-embed failure that escapes the window rolls the create back too: the
+    thought does not revert to some prior durable state, it stops existing
+    at all. Verified from a second, independent connection onto the same
+    on-disk file.
+    """
+    vector_a = [1.0, 0.0, 0.0, 0.0]
+    db_path = str(tmp_path / "create-then-update-rollback.db")
+    store, conn = await _open_file_store(db_path, _FlakyProvider(succeeds_on="A", vector=vector_a))
+
+    async def _create_then_update() -> None:
+        async with store.suspend_auto_commit():
+            await store.create_thought(_thought("t-window", essence="e", content="content-A"))
+            await store.update_thought("t-window", content="content-B")
+
+    try:
+        with pytest.raises(RuntimeError):
+            await _create_then_update()
+    finally:
+        await conn.close()
+
+    durable = await _durable_thought_count(db_path, "t-window")
+    assert durable == 0, (
+        "the create happened inside the same window as the failing update, "
+        "so the whole window's rollback erases it — it does not revert to "
+        "its pre-update state"
+    )
 
 
 async def test_auto_embed_failure_warns_and_propagates_by_default(
@@ -823,6 +1345,30 @@ async def test_bulk_store_strict_embed_failure_rolls_back(
     assert await _count(db, "SELECT COUNT(*) FROM embedding") == 0
 
 
+async def test_strict_embed_failure_nested_in_suspend_auto_commit_is_not_durable(
+    db: aiosqlite.Connection,
+) -> None:
+    """A single-item strict failure nested in the caller's own window is not durable.
+
+    ``create_thought`` does not own the outermost transaction here — the
+    caller's own ``suspend_auto_commit()`` window does — so raising
+    ``EmbeddingGenerationError`` does not commit the row on its own. If the
+    caller lets that outer window's exit see the exception (the case here),
+    the whole window rolls back and the thought never persists, contrary to
+    the single-item-is-always-committed intuition that holds only when this
+    call owns its own transaction.
+    """
+    store = await _embedding_store(db, _FailingProvider(), require_embedding=True)
+
+    with pytest.raises(EmbeddingGenerationError):
+        async with store.suspend_auto_commit():
+            await store.create_thought(_thought("t-nested-strict"))
+
+    # The outer window rolled back: the row was never made durable.
+    assert await _count(db, "SELECT COUNT(*) FROM thought") == 0
+    assert await _count(db, "SELECT COUNT(*) FROM embedding") == 0
+
+
 async def test_update_reembed_failure_warns_and_propagates_by_default(
     db: aiosqlite.Connection,
     caplog: pytest.LogCaptureFixture,
@@ -862,7 +1408,7 @@ async def test_update_reembed_failure_raises_typed_under_strict(
 
 
 # ---------------------------------------------------------------------------
-# Additive / no-regression: existing behaviour unchanged
+# Additive: existing behaviour unchanged
 # ---------------------------------------------------------------------------
 
 

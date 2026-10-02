@@ -1,0 +1,17 @@
+# Config asset for the "from_config" hybrid ranked golden.
+#
+# Deliberately minimal: only `default_graph_weight` is set explicitly (the
+# graph signal's own default is `0.0` — opt-in — on every construction path,
+# so it needs an explicit non-zero value to have any baseline at all). Every
+# other search weight is left unset, which routes through
+# `engrava.config._parse_search`'s own fallback constants — a code path the
+# directly-constructed golden never touches (it has no `SearchConfig` at all
+# and falls back through a separate set of hardcoded literals in
+# `SqliteEngravaCore._resolve_hybrid_defaults`). The two goldens therefore
+# exercise two independent "default weight" sources that happen to agree
+# today but could drift apart without either golden noticing on its own.
+database:
+  path: ":memory:"
+  wal_mode: false
+search:
+  default_graph_weight: 0.1

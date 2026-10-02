@@ -184,12 +184,9 @@ async def test_paragraph_custom_boundary_escape_hatch_still_works() -> None:
 
 
 async def test_paragraph_capturing_boundary_preserves_re_split_semantics() -> None:
-    """A custom boundary with a capturing group keeps ``re.split`` semantics.
+    """A custom boundary with a capturing group keeps its captured delimiter.
 
-    ``re.split`` keeps captured delimiters as segments, and the shipped producer
-    split on ``boundary.split``; this preserves that byte-identically — a captured
-    ``|`` stays a segment instead of being dropped (the interim finditer refactor
-    had dropped it, a delimiter-dropping regression).
+    The captured ``|`` stays a segment instead of being dropped.
     """
     producer = StructuralSplitProducer(boundary=re.compile(r"(\|)"))
     content = "a|b|c"

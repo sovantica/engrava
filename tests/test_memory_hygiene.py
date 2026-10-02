@@ -28,6 +28,7 @@ from __future__ import annotations
 import datetime
 import importlib.util
 import math
+import re
 from typing import TYPE_CHECKING
 from unittest import mock
 
@@ -476,7 +477,7 @@ class TestCore18Migration:
             s = SqliteEngravaCore(conn)
             await s.ensure_schema()
             cursor = await conn.execute("PRAGMA user_version")
-            assert (await cursor.fetchone())[0] == 20
+            assert (await cursor.fetchone())[0] == 21
             cursor = await conn.execute("PRAGMA table_info(thought)")
             cols = {row["name"] for row in await cursor.fetchall()}
             assert "pinned" in cols
@@ -536,7 +537,7 @@ class TestCore18Migration:
             s = SqliteEngravaCore(conn)
             await s.ensure_schema()
             cursor = await conn.execute("PRAGMA user_version")
-            assert (await cursor.fetchone())[0] == 20
+            assert (await cursor.fetchone())[0] == 21
 
             fetched = await s.get_thought("legacy")
             assert fetched is not None
@@ -593,7 +594,7 @@ class TestArchivedAtColumnMigration:
             s = SqliteEngravaCore(conn)
             await s.ensure_schema()
             cursor = await conn.execute("PRAGMA user_version")
-            assert (await cursor.fetchone())[0] == 20
+            assert (await cursor.fetchone())[0] == 21
             cursor = await conn.execute("PRAGMA table_info(thought)")
             cols = {row["name"] for row in await cursor.fetchall()}
             assert "archived_at" in cols
@@ -657,7 +658,7 @@ class TestArchivedAtColumnMigration:
             s = SqliteEngravaCore(conn)
             await s.ensure_schema()
             cursor = await conn.execute("PRAGMA user_version")
-            assert (await cursor.fetchone())[0] == 20
+            assert (await cursor.fetchone())[0] == 21
 
             fetched = await s.get_thought("legacy")
             assert fetched is not None
@@ -1165,10 +1166,8 @@ class TestArchiveReversible:
     async def test_archived_thought_transitions_to_active_via_state_machine(self) -> None:
         """The ARCHIVED -> ACTIVE edge exists, so restore is not a bypass.
 
-        Regression: ARCHIVED was terminal (zero outbound transitions), so the
-        'reversible archive' contract only held by writing the raw string value
-        and skipping the transition check. The edge now exists, so evolving with
-        the ACTIVE *enum* (which runs the state-machine check) no longer raises.
+        Evolving an archived thought with the ACTIVE *enum* (which runs the
+        state-machine check) does not raise.
         """
         assert LifecycleStatus.ARCHIVED.can_transition_to(LifecycleStatus.ACTIVE)
         policy = _forgetful_policy(eviction_threshold=1.0)
@@ -2450,7 +2449,7 @@ class TestMinimumInactivityAgeGate:
 
 
 class TestAccessGate:
-    """The run-level access-gate (D4): no usage signal ⇒ archive nothing."""
+    """The run-level access-gate: no usage signal ⇒ archive nothing."""
 
     async def test_aged_never_queried_store_archives_nothing(self) -> None:
         """An aged-but-never-used store archives nothing (recency-of-cycle alone
@@ -2910,7 +2909,7 @@ class TestGarbageCollectionWallClockWindow:
         assert "a_recent" not in wall_clock
 
     async def test_ttl_re_archival_clears_stale_hygiene_markers_end_to_end(self) -> None:
-        """End-to-end reproduction of the stale-marker GC-bypass the fix closes.
+        """TTL re-archival of an un-archived row clears the stale hygiene markers.
 
         Literally walks the reachable sequence rather than hand-assigning markers:
         hygiene archives a cold row (stamping both markers) -> a low-level
@@ -2919,7 +2918,6 @@ class TestGarbageCollectionWallClockWindow:
         archival is not a hygiene archival it clears both markers, so
         ``archived_at_cycle`` is NULL and the irreversible GC stage cannot reap the
         freshly re-archived row on the earlier, already-elapsed restore windows.
-        Without the fix the stale markers would make GC delete it immediately.
         """
         policy = _forgetful_policy(
             eviction_threshold=1.0,
@@ -2963,6 +2961,64 @@ class TestGarbageCollectionWallClockWindow:
             r2 = await s.run_hygiene(current_cycle=5000, now=_NOW + datetime.timedelta(days=90))
             assert r2.gc_count == 0
             assert await s.get_thought("t") is not None
+        finally:
+            await s._db.close()
+
+
+# ---------------------------------------------------------------------------
+# The two GC-eligibility guards are structurally pinned, not just behaviourally
+# ---------------------------------------------------------------------------
+
+
+class TestGcEligibilityGuardsAreStructurallyPinned:
+    """Both ``IS NOT NULL`` guards in the GC eligibility SQL are pinned by text.
+
+    Each guard is mechanically redundant against ordinary data: SQLite already
+    rejects a NULL row at the comparison beside it, so a behavioural test
+    cannot see the difference removing either one makes (that guarantee is
+    covered instead by ``test_gc_only_reaps_hygiene_archived_rows`` and
+    ``test_legacy_null_archived_at_never_gc``, both of which stay untouched).
+    Only a structural assertion on the generated SQL can see a guard being
+    deleted, or moved away from the comparison it protects — which is what
+    this test asserts.
+    """
+
+    async def test_both_guards_present_and_adjacent_to_their_comparison(self) -> None:
+        # Active wall-clock window, so its clause is actually emitted.
+        policy = HygienePolicyConfig(
+            enabled=True,
+            eviction_threshold=0.0,
+            auto_gc_enabled=True,
+            gc_min_archive_age_cycles=0,
+            gc_restore_window_seconds=1,
+        )
+        s = await _make_store(policy)
+        captured: list[str] = []
+        real_execute = s._db.execute
+
+        async def spy_execute(sql: str, *args: object, **kwargs: object) -> object:
+            captured.append(sql)
+            return await real_execute(sql, *args, **kwargs)
+
+        s._db.execute = spy_execute  # type: ignore[method-assign]
+        try:
+            await s._hygiene_gc_eligible(policy=policy, current_cycle=1000, now=_NOW)
+            gc_sql = next(sql for sql in captured if "archived_at_cycle" in sql)
+
+            # Cycle-axis guard: IS NOT NULL immediately precedes its comparison,
+            # with nothing (e.g. another clause) inserted between them.
+            assert re.search(
+                r"archived_at_cycle\s+IS\s+NOT\s+NULL\s+AND\s+archived_at_cycle\s*<=\s*\?",
+                gc_sql,
+            ), gc_sql
+            # Wall-clock-axis guard: same adjacency requirement. ``\b`` after
+            # ``archived_at`` does not match inside ``archived_at_cycle`` (both
+            # neighbouring characters are word characters there), so this
+            # pattern targets only the wall-clock column.
+            assert re.search(
+                r"archived_at\b\s+IS\s+NOT\s+NULL\s+AND\s+archived_at\b\s*<=\s*\?",
+                gc_sql,
+            ), gc_sql
         finally:
             await s._db.close()
 

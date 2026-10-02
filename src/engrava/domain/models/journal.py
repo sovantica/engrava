@@ -20,10 +20,14 @@ class JournalEntry:
     Attributes:
         entry_id: Stable UUID identity for this entry.
         sequence_number: Monotonic, gapless sequence (starts at 1).
-        mutation_type: One of INSERT_THOUGHT, UPDATE_THOUGHT,
-            DELETE_THOUGHT, INSERT_EDGE, UPDATE_EDGE, DELETE_EDGE.
-        target_id: The ``thought_id`` or ``edge_id`` affected (nullable
-            for bulk operations, but always set in current impl).
+        mutation_type: The kind of mutation recorded. The thought and edge
+            values are the :class:`~engrava.domain.models.mutation_type.MutationType`
+            members; the field is a plain ``str`` because not every value
+            written is one of them -- an action status change is journalled
+            as ``UPDATE_ACTION``, which that enum does not define.
+        target_id: The identity of the row affected -- a ``thought_id``,
+            an ``edge_id`` or an ``action_id``, depending on the mutation
+            (nullable for bulk operations, but always set in current impl).
         delta: JSON-serializable diff ``{"before": {...}, "after": {...}}``.
         parent_hash: SHA-256 hex digest of the previous entry, or ``None``
             for the very first entry in the chain.

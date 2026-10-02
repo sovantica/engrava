@@ -290,7 +290,7 @@ class TestReflectionDefaultPriority:
                 cluster_algorithm="agglomerative",
                 cluster_similarity_threshold=0.5,
                 clustering_min_new_candidates=0,
-                # Pre-WS content-quality gates: the synthetic test
+                # Content-quality gates off: the synthetic test
                 # thoughts use sparse content that the gates would
                 # legitimately reject; this suite tests priority
                 # behaviour, gates are exercised elsewhere.
@@ -332,7 +332,7 @@ class TestReflectionDefaultPriority:
                 cluster_algorithm="agglomerative",
                 cluster_similarity_threshold=0.5,
                 clustering_min_new_candidates=0,
-                # Pre-WS content-quality gates: the synthetic test
+                # Content-quality gates off: the synthetic test
                 # thoughts use sparse content that the gates would
                 # legitimately reject; this suite tests priority
                 # behaviour, gates are exercised elsewhere.

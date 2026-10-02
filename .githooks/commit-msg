@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# .githooks/commit-msg
+#
+# Lints the message of the commit being created -- including the one made
+# after `git merge --squash`, which did not exist when any status check
+# last ran.
+# See CONTRIBUTING.md for exactly what this hook covers and what it does not.
+#
+# Wired via `make install`, which points core.hooksPath at this directory
+# using an ABSOLUTE path. That means this exact file also runs on a commit
+# made from a linked worktree checked out on a different branch -- see
+# CONTRIBUTING.md for why a relative path would not.
+set -euo pipefail
+
+MSG_FILE="${1:-}"
+if [ -z "$MSG_FILE" ] || [ ! -f "$MSG_FILE" ] || [ ! -r "$MSG_FILE" ]; then
+  echo "commit-msg hook: invoked without a usable message-file argument" >&2
+  echo "  (got: '${1:-}'). git always supplies one; refusing rather than" >&2
+  echo "  treating this as an unwritten message to wave through." >&2
+  exit 1
+fi
+
+# The primary checkout's root -- NOT this worktree's own root. Derived from
+# --git-common-dir, which is the one shared git-dir every worktree of this
+# repository points at (a linked worktree's own --git-dir is a *different*,
+# per-worktree admin directory under it). Its parent is where the main
+# checkout lives, and therefore where `make install` put node_modules/: the
+# commitlint binary is installed once there and does not need to be
+# reinstalled in every worktree, unlike the config it enforces.
+#
+# Split into two commands rather than `dirname "$(git rev-parse ...)"` in
+# one line: dirname happily turns a failed substitution's empty output into
+# ".", so a rev-parse failure would otherwise be swallowed instead of
+# stopping the hook under `set -e`.
+GIT_COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
+PRIMARY_ROOT="$(dirname "$GIT_COMMON_DIR")"
+# Assumes the ordinary layout where --git-common-dir is <primary_root>/.git
+# (true for a normal clone/worktree set). --separate-git-dir, a submodule,
+# or a bare repository break that assumption; none of those are how
+# engrava is used, so this is stated rather than engineered around.
+COMMITLINT_BIN="$PRIMARY_ROOT/node_modules/.bin/commitlint"
+
+status=0
+
+# Chain to a locally installed hook FIRST, if present, and on EVERY path
+# this hook can take -- including a true merge, further down. Before this
+# hook existed, git called that installed hook directly on every commit,
+# merges included, and it made its own decision; wiring core.hooksPath must
+# not silently withdraw that layer from a case this hook itself decides not
+# to lint. That the installed guard also happens to skip merge commits is
+# not something this hook may rely on -- that file's own behaviour is not
+# ours to assume, and changes on its own schedule.
+# Resolved with --git-common-dir, never --git-path hooks: the latter
+# honours core.hooksPath and would point this hook at its own directory,
+# invoking itself forever. --git-common-dir also resolves correctly from a
+# linked worktree, where ".git" is a file rather than a directory.
+GUARD="$GIT_COMMON_DIR/hooks/commit-msg"
+if [ -x "$GUARD" ]; then
+  "$GUARD" "$MSG_FILE" || status=1
+fi
+
+# While a merge is in progress (MERGE_HEAD exists) the commit being created
+# is a merge commit, and this hook does not lint its message -- even when its
+# subject was written by hand with `git merge -m`.
+# This is this hook's OWN decision to skip the grammar check below -- it is
+# not a reason to skip the chain above, which already ran. MERGE_HEAD is
+# the correct test, not MERGE_MSG: a conflicted `git cherry-pick` or
+# `git revert` also writes MERGE_MSG while producing an ordinary
+# single-parent commit whose message IS hand-written and must still be
+# linted. Resolved via `git rev-parse --git-path`, never as the literal
+# ".git/MERGE_HEAD": in a linked worktree ".git" is a file, and merge state
+# resolves per-worktree even though core.hooksPath is shared.
+MERGE_HEAD="$(git rev-parse --git-path MERGE_HEAD 2>/dev/null || true)"
+if [ -n "$MERGE_HEAD" ] && [ -f "$MERGE_HEAD" ]; then
+  exit "$status"
+fi
+
+# Grammar check. commitlint resolves the scope enum from THIS worktree's
+# own commit-scopes.json (via .commitlintrc.js) because it is run with this
+# worktree's own directory as its working directory -- branch-local config
+# stays branch-local even though the binary is shared. If it cannot run at
+# all, that is a reason to REFUSE the commit, not to warn and let it
+# through: a gate that reports its health by existing is exactly the defect
+# this hook exists to close, and a missing linter is not an exception to
+# that.
+if [ -x "$COMMITLINT_BIN" ]; then
+  if ! NODE_PATH="$PRIMARY_ROOT/node_modules" "$COMMITLINT_BIN" --edit "$MSG_FILE"; then
+    status=1
+  fi
+else
+  echo "commit-msg hook: commitlint is not installed at $PRIMARY_ROOT." >&2
+  echo "commit-msg hook: run 'make install' from the primary checkout ($PRIMARY_ROOT)." >&2
+  echo "commit-msg hook: refusing the commit -- the commit grammar could not be checked." >&2
+  status=1
+fi
+
+exit "$status"

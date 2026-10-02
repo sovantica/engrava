@@ -3,8 +3,8 @@
 Covers two surfaces:
 
 * ``_extract_named_entities`` blocklist filter — common
-  sentence-openers and bare role-marker capitalisations no longer
-  pollute the ``named_entities`` field.
+  sentence-openers and bare role-marker capitalisations do not
+  appear in the ``named_entities`` field.
 * ``_build_member_excerpts`` honours ``max_length`` / the
   ``DreamingConfig.member_excerpt_max_chars`` knob.
 """
@@ -193,7 +193,7 @@ class TestMemberExcerptMaxChars:
         cfg = DreamingConfig(member_excerpt_max_chars=300)
         content = build_reflection_content_v2(cluster, algorithm="lpa", config=cfg, now=_FIXED_NOW)
         excerpt = content["member_excerpts"][0]["excerpt"]
-        # Up to 300 chars allowed now — 150-char truncation no longer fires.
+        # Up to 300 chars are allowed, beyond the 150-char default.
         assert len(excerpt) <= 300
         assert len(excerpt) > 150  # genuinely longer than the default
 

@@ -5,21 +5,38 @@ Tests all subcommands against an in-memory (temp file) SQLite database.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
+import os
 import sqlite3
-from typing import TYPE_CHECKING
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import TYPE_CHECKING, cast
+from unittest import mock
 
 import click
 import pytest
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-    from pathlib import Path
+    from collections.abc import Callable, Iterator
+    from typing import TextIO
 from click.testing import CliRunner
 
+import engrava.cli.main as cli_main
 from engrava.cli.config import EngravaCLIConfig
-from engrava.cli.main import cli
+from engrava.cli.main import (
+    _close_quietly,
+    _export_db_to_jsonl,
+    _import_records_to_db,
+    _read_thoughts_and_edges_in_one_transaction,
+    _rollback_quietly,
+    cli,
+)
+from engrava.infrastructure.sqlite.engrava_core import CORE_SCHEMA_HEAD_VERSION
 
 # Literal SQL, never interpolated: a read-back that assembles its own query
 # cannot be trusted to disagree with the schema the command wrote to.
@@ -81,6 +98,219 @@ def _stored_core_ids(db_path: Path) -> dict[str, set[str]]:
         }
     finally:
         conn.close()
+
+
+def _journal_entry_count(db_path: Path) -> int:
+    """Read the number of rows currently in ``journal_entry``.
+
+    A plain, independent connection, for the same reason as
+    :func:`_stored_core_ids`: the CLI owns and closes its own connection, so
+    what it actually left on disk is read back rather than inferred from the
+    command's own report.
+
+    Args:
+        db_path: Path to the database the CLI operated on.
+
+    Returns:
+        The row count of ``journal_entry``.
+
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM journal_entry").fetchone()
+        return int(row[0])
+    finally:
+        conn.close()
+
+
+def _journal_entry_deltas(db_path: Path, target_id: str) -> list[dict[str, object]]:
+    """Read every ``journal_entry.delta`` recorded for one ``target_id``, in order.
+
+    Same rationale as :func:`_journal_entry_count`: an independent connection
+    reads back what the CLI actually left on disk, rather than trusting the
+    command's own report.
+
+    Args:
+        db_path: Path to the database the CLI operated on.
+        target_id: The ``journal_entry.target_id`` to filter on.
+
+    Returns:
+        Each matching entry's ``delta``, parsed from JSON, oldest first.
+
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT delta FROM journal_entry WHERE target_id = ? ORDER BY sequence_number",
+            (target_id,),
+        ).fetchall()
+        return [cast("dict[str, object]", json.loads(row[0])) for row in rows]
+    finally:
+        conn.close()
+
+
+def _write_journalled_thoughts(db_path: Path, thought_ids: list[str]) -> None:
+    """Create a database whose thoughts were each recorded through the journal.
+
+    Unlike ``populated_db``, this builds the store with ``journal_enabled=True``
+    so ``create_thought`` writes one hash-linked ``journal_entry`` row per
+    thought -- the CLI itself never enables journaling (there is no CLI flag
+    for it), so a store that already carries journal history has to be built
+    directly against the domain API, exactly as it would be by an application
+    embedding engrava as a library.
+
+    Args:
+        db_path: Path to create the database at. Must not already exist.
+        thought_ids: The thought ids to create, in order.
+
+    """
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import (
+        LifecycleStatus,
+        Priority,
+        SqliteEngravaCore,
+        ThoughtRecord,
+        ThoughtType,
+    )
+
+    async def _setup() -> None:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = await aiosqlite.connect(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn, journal_enabled=True)
+        await store.ensure_schema()
+        for i, thought_id in enumerate(thought_ids):
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id=thought_id,
+                    essence=f"Essence for {thought_id}",
+                    content=f"Content for {thought_id}",
+                    thought_type=ThoughtType.OBSERVATION,
+                    source="test",
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    priority=Priority.P2,
+                    created_cycle=i + 1,
+                    updated_cycle=i + 1,
+                )
+            )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_setup())
+
+
+def _write_plain_thoughts(db_path: Path, thought_ids: list[str]) -> None:
+    """Create a database holding only plain (non-journalled) thoughts.
+
+    Distinct from both ``populated_db`` (whose thoughts carry embeddings and
+    one edge) and ``journalled_db``/``_write_journalled_thoughts`` (journal
+    enabled): no foreign key references these thoughts at all, so a raw
+    ``INSERT OR REPLACE`` collision against one of them (see
+    ``_corrupt_fts_with_raw_replace``) cascades onto nothing else, keeping the
+    reproduced corruption isolated to ``thought``/``thought_fts``.
+
+    Args:
+        db_path: Path to create the database at. Must not already exist.
+        thought_ids: The thought ids to create, in order.
+
+    """
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+
+    async def _setup() -> None:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = await aiosqlite.connect(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        await store.ensure_schema()
+        for i, thought_id in enumerate(thought_ids):
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id=thought_id,
+                    essence=f"Essence for {thought_id}",
+                    content=f"Content for {thought_id}",
+                    thought_type=ThoughtType.OBSERVATION,
+                    source="test",
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    priority=Priority.P2,
+                    created_cycle=i + 1,
+                    updated_cycle=i + 1,
+                )
+            )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_setup())
+
+
+def _write_journalled_thought_pair_with_edge(db_path: Path) -> None:
+    """Create two journalled thoughts (``t-old-0``, ``t-old-1``) joined by a journalled edge.
+
+    Same construction rationale as :func:`_write_journalled_thoughts`: the CLI
+    has no flag to enable journaling, so a store that already carries journal
+    history for both a thought mutation and an edge mutation has to be built
+    directly against the domain API. This backs the cascade-collision test,
+    where deleting one endpoint's thought row cascades an ``ON DELETE CASCADE``
+    foreign-key delete onto the edge.
+
+    Args:
+        db_path: Path to create the database at. Must not already exist.
+
+    """
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import (
+        EdgeRecord,
+        EdgeType,
+        LifecycleStatus,
+        Priority,
+        SqliteEngravaCore,
+        ThoughtRecord,
+        ThoughtType,
+    )
+
+    async def _setup() -> None:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = await aiosqlite.connect(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn, journal_enabled=True)
+        await store.ensure_schema()
+        for i, thought_id in enumerate(("t-old-0", "t-old-1")):
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id=thought_id,
+                    essence=f"Essence for {thought_id}",
+                    content=f"Content for {thought_id}",
+                    thought_type=ThoughtType.OBSERVATION,
+                    source="test",
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    priority=Priority.P2,
+                    created_cycle=i + 1,
+                    updated_cycle=i + 1,
+                )
+            )
+        await store.create_edge(
+            EdgeRecord(
+                edge_id="edge-001",
+                from_thought_id="t-old-0",
+                to_thought_id="t-old-1",
+                edge_type=EdgeType.ASSOCIATED,
+                weight=0.9,
+                created_cycle=1,
+            )
+        )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_setup())
 
 
 @pytest.fixture
@@ -147,6 +377,698 @@ def populated_db(db_path: Path) -> Path:
 
     asyncio.run(_setup())
     return db_path
+
+
+@pytest.fixture
+def journalled_db(tmp_path: Path) -> Path:
+    """A database with three thoughts, each recorded through the journal.
+
+    Distinct from ``populated_db``, whose store is built without
+    ``journal_enabled`` and so leaves ``journal_entry`` empty.
+    """
+    db_path = tmp_path / "journalled.db"
+    _write_journalled_thoughts(db_path, ["t-old-0", "t-old-1", "t-old-2"])
+    return db_path
+
+
+@pytest.fixture
+def journalled_db_with_edge(tmp_path: Path) -> Path:
+    """Two journalled thoughts (``t-old-0``, ``t-old-1``) joined by a journalled edge.
+
+    Distinct from ``journalled_db``, which has no edges. Backs the
+    cascade-collision test: ``edge`` carries an ``ON DELETE CASCADE`` foreign
+    key to ``thought`` on both endpoints, so replacing ``t-old-0`` would also
+    remove this edge.
+    """
+    db_path = tmp_path / "journalled_with_edge.db"
+    _write_journalled_thought_pair_with_edge(db_path)
+    return db_path
+
+
+@pytest.fixture
+def plain_thoughts_db(tmp_path: Path) -> Path:
+    """Two plain thoughts (``p-0``, ``p-1``), no journal, no edges, no embeddings.
+
+    Backs the cases where the store already carries a stale ``thought_fts``
+    entry before the restore runs: unlike ``populated_db``, nothing here
+    cascades when ``_corrupt_fts_with_raw_replace`` forces a raw primary-key
+    collision on one of these thoughts.
+    """
+    db_path = tmp_path / "plain.db"
+    _write_plain_thoughts(db_path, ["p-0", "p-1"])
+    return db_path
+
+
+@pytest.fixture
+def unrelated_snapshot(runner: CliRunner, tmp_path: Path) -> Path:
+    """A one-thought snapshot with no relation to ``journalled_db`` or ``populated_db``.
+
+    Built through the CLI (a fresh source database, then ``engrava
+    snapshot``) so the snapshot line format is exactly what real restores
+    consume, not a hand-assembled JSONL fixture.
+    """
+    source_db = tmp_path / "source.db"
+    result = runner.invoke(cli, ["--db", str(source_db), "migrate"])
+    assert result.exit_code == 0, result.output
+
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+
+    async def _seed() -> None:
+        conn = await aiosqlite.connect(str(source_db))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-src",
+                essence="Essence for t-src",
+                content="Content for t-src",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=1,
+                updated_cycle=1,
+            )
+        )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_seed())
+
+    snap = tmp_path / "unrelated-snapshot.jsonl"
+    result = runner.invoke(cli, ["--db", str(source_db), "snapshot", "-o", str(snap)])
+    assert result.exit_code == 0, result.output
+    return snap
+
+
+@pytest.fixture
+def colliding_snapshot(runner: CliRunner, tmp_path: Path) -> Path:
+    """A one-thought snapshot whose ID collides with ``t-old-0`` in ``journalled_db``
+    and ``journalled_db_with_edge``.
+
+    Built through the CLI, same rationale as ``unrelated_snapshot``: the
+    snapshot line format must be exactly what a real restore consumes, not a
+    hand-assembled JSONL fixture. The colliding thought's essence/content
+    differ from the original so a stored-content check can tell replacement
+    from a no-op.
+    """
+    source_db = tmp_path / "collide-source.db"
+    result = runner.invoke(cli, ["--db", str(source_db), "migrate"])
+    assert result.exit_code == 0, result.output
+
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+
+    async def _seed() -> None:
+        conn = await aiosqlite.connect(str(source_db))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-old-0",
+                essence="Replacement essence for t-old-0",
+                content="Replacement content for t-old-0",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=1,
+                updated_cycle=1,
+            )
+        )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_seed())
+
+    snap = tmp_path / "colliding-snapshot.jsonl"
+    result = runner.invoke(cli, ["--db", str(source_db), "snapshot", "-o", str(snap)])
+    assert result.exit_code == 0, result.output
+    return snap
+
+
+@pytest.fixture
+def colliding_snapshot_with_a_leading_new_record(runner: CliRunner, tmp_path: Path) -> Path:
+    """A two-thought snapshot: a brand-new record first, then one colliding with ``t-old-0``.
+
+    Backs the case that ``TestRestoreRefusesCollisionAgainstAJournalledStore``'s
+    own docstring describes -- the whole-transaction rollback discarding a
+    record inserted *before* the one that collides -- which none of that
+    class's other scenarios actually exercise: they each carry only the one
+    colliding record, with nothing successfully written ahead of it.
+    ``t-brand-new`` is created first in the source database, so
+    ``SELECT * FROM thought`` (no ``ORDER BY``, see the ``snapshot`` command)
+    returns it before ``t-old-0`` in the exported snapshot, and a plain
+    ``INSERT`` accepts it with no complaint before reaching the colliding
+    second record.
+    """
+    source_db = tmp_path / "collide-source-leading.db"
+    result = runner.invoke(cli, ["--db", str(source_db), "migrate"])
+    assert result.exit_code == 0, result.output
+
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+
+    async def _seed() -> None:
+        conn = await aiosqlite.connect(str(source_db))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-brand-new",
+                essence="Essence for t-brand-new",
+                content="Content for t-brand-new",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=1,
+                updated_cycle=1,
+            )
+        )
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-old-0",
+                essence="Replacement essence for t-old-0",
+                content="Replacement content for t-old-0",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=2,
+                updated_cycle=2,
+            )
+        )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_seed())
+
+    snap = tmp_path / "colliding-with-leading-snapshot.jsonl"
+    result = runner.invoke(cli, ["--db", str(source_db), "snapshot", "-o", str(snap)])
+    assert result.exit_code == 0, result.output
+    return snap
+
+
+@pytest.fixture
+def colliding_snapshot_for_populated_db(runner: CliRunner, tmp_path: Path) -> Path:
+    """A one-thought snapshot whose ID collides with ``thought-000`` in ``populated_db``.
+
+    Backs the negative control for the journalled-merge collision gate:
+    ``populated_db`` never enables journaling, so this collision must still
+    succeed and still replace, exactly as restore always behaved -- the gate
+    exists only once a journal has rows.
+    """
+    source_db = tmp_path / "collide-source-populated.db"
+    result = runner.invoke(cli, ["--db", str(source_db), "migrate"])
+    assert result.exit_code == 0, result.output
+
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+
+    async def _seed() -> None:
+        conn = await aiosqlite.connect(str(source_db))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="thought-000",
+                essence="Replacement essence for thought-000",
+                content="Replacement content for thought-000",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=1,
+                updated_cycle=1,
+            )
+        )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_seed())
+
+    snap = tmp_path / "colliding-populated-snapshot.jsonl"
+    result = runner.invoke(cli, ["--db", str(source_db), "snapshot", "-o", str(snap)])
+    assert result.exit_code == 0, result.output
+    return snap
+
+
+@pytest.fixture
+def custom_mutation_db(tmp_path: Path) -> Path:
+    """A store carrying one journal entry whose ``mutation_type`` is an arbitrary string.
+
+    ``JournalWriter.append()`` validates nothing about ``mutation_type`` -- it
+    is unconstrained ``TEXT`` -- so this writes ``CUSTOM_MUTATION``, a value no
+    other part of the codebase ever emits, directly through the writer
+    (bypassing ``create_thought``'s own journalling) to prove the gate keys
+    off "``journal_entry`` has rows", never off a specific recognised
+    ``mutation_type``.
+    """
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+    from engrava.infrastructure.sqlite.journal_writer import JournalWriter
+
+    db_path = tmp_path / "custom_mutation.db"
+
+    async def _setup() -> None:
+        conn = await aiosqlite.connect(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn, journal_enabled=False)
+        await store.ensure_schema()
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-cm-0",
+                essence="Essence for t-cm-0",
+                content="Content for t-cm-0",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=1,
+                updated_cycle=1,
+            )
+        )
+        writer = JournalWriter(conn)
+        await writer.append(
+            mutation_type="CUSTOM_MUTATION",
+            target_id="t-cm-0",
+            delta={"before": None, "after": {"content": "Content for t-cm-0"}},
+        )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_setup())
+    return db_path
+
+
+@pytest.fixture
+def colliding_snapshot_for_custom_mutation_db(runner: CliRunner, tmp_path: Path) -> Path:
+    """A one-thought snapshot whose ID collides with ``t-cm-0`` in ``custom_mutation_db``."""
+    source_db = tmp_path / "collide-source-cm.db"
+    result = runner.invoke(cli, ["--db", str(source_db), "migrate"])
+    assert result.exit_code == 0, result.output
+
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+
+    async def _seed() -> None:
+        conn = await aiosqlite.connect(str(source_db))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-cm-0",
+                essence="Replacement essence for t-cm-0",
+                content="Replacement content for t-cm-0",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=1,
+                updated_cycle=1,
+            )
+        )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_seed())
+
+    snap = tmp_path / "colliding-cm-snapshot.jsonl"
+    result = runner.invoke(cli, ["--db", str(source_db), "snapshot", "-o", str(snap)])
+    assert result.exit_code == 0, result.output
+    return snap
+
+
+@pytest.fixture
+def identical_snapshot_of_journalled_db(
+    runner: CliRunner, journalled_db: Path, tmp_path: Path
+) -> Path:
+    """A byte-for-byte snapshot of ``journalled_db`` itself, restorable back into it.
+
+    Restoring this into ``journalled_db`` collides every thought on its own
+    unchanged primary key and content. Used to show that even an identical
+    merge is refused: an ``INSERT OR REPLACE`` would silently change every
+    row's ``rowid`` (SQLite resolves the primary-key conflict by deleting
+    then re-inserting, even when column values match).
+    """
+    snap = tmp_path / "identical-snapshot.jsonl"
+    result = runner.invoke(cli, ["--db", str(journalled_db), "snapshot", "-o", str(snap)])
+    assert result.exit_code == 0, result.output
+    return snap
+
+
+def _thought_rowids(db_path: Path) -> dict[str, int]:
+    """Read each thought's implicit ``rowid``, keyed by ``thought_id``.
+
+    An ``INSERT OR REPLACE`` that resolves a primary-key collision by
+    deleting and re-inserting changes a row's ``rowid`` even when every
+    column value is unchanged -- a plain ``SELECT thought_id, essence, ...``
+    comparison would never see that.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute("SELECT thought_id, rowid FROM thought").fetchall()
+        return {str(row[0]): int(row[1]) for row in rows}
+    finally:
+        conn.close()
+
+
+def _thought_fts_match_count(db_path: Path, term: str) -> int:
+    """Count real ``thought_fts`` index entries matching ``term`` via a ``MATCH`` query.
+
+    ``SELECT COUNT(*) FROM thought_fts`` (no ``MATCH``) is USELESS here and
+    must not be used: ``thought_fts`` is an external-content FTS5 table
+    (``content='thought'``, ``content_rowid='rowid'``, schema_core.sql), and a
+    bare, unfiltered ``COUNT(*)`` over an external-content table is satisfied
+    by reading through to the row count of the backing ``thought`` table
+    itself. It reports the number of thoughts, by construction, no matter how
+    desynchronised the FTS shadow tables actually are.
+
+    A ``MATCH`` query, by contrast, scans the real inverted index and returns
+    one hit per indexed entry, including a stale entry whose rowid no longer
+    exists in ``thought`` at all. That is exactly the shape of the hazard this
+    probe exists to see: ``PRAGMA recursive_triggers`` defaults to ``0`` and
+    nothing under ``src/`` sets it, and SQLite only fires a table's ``DELETE``
+    trigger for the row an ``INSERT OR REPLACE`` conflict removes when
+    recursive triggers are enabled. So ``thought_fts_insert`` fires for the
+    new rowid while ``thought_fts_delete`` never fires for the old one, and
+    the stale entry for the removed rowid survives in the index, pointing at
+    a row that no longer exists.
+
+    Args:
+        db_path: Path to the database to inspect.
+        term: An FTS5 query term expected to match every thought under test
+            (e.g. a word common to every fixture's ``essence``/``content``).
+
+    Returns:
+        The number of ``thought_fts`` rows matching ``term`` -- real index
+        entries, not thoughts.
+
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM thought_fts WHERE thought_fts MATCH ?", (term,)
+        ).fetchone()
+        return int(row[0])
+    finally:
+        conn.close()
+
+
+def _fts_match_rowids(db_path: Path, term: str) -> set[int]:
+    """Return the real ``thought_fts`` rowids matching ``term`` via a ``MATCH`` query.
+
+    Companion to :func:`_thought_fts_match_count`: the count alone cannot say
+    *which* rowids a stale entry belongs to, which
+    :func:`_assert_fts_index_matches_live_thoughts` needs to compare against
+    the ``thought`` rows that currently, actually contain the term.
+
+    ``term`` is always sent as a quoted phrase, never a bare word: FTS5's
+    *query grammar* (not the configured tokenizer) treats an unquoted ``-``
+    as its own ``NOT``/column-filter syntax regardless of the table's
+    ``tokenchars '-_'`` setting -- a bare ``p-0`` raises ``OperationalError:
+    no such column: 0`` even though ``-`` is an ordinary token character to
+    the tokenizer once it is inside a quoted phrase. Callers that need to
+    identify one hyphenated id among several (e.g. ``t-old-0``) rely on this;
+    a plain word (``"alpha"``, ``"content"``) behaves identically quoted or
+    not, since a single-token phrase matches exactly like the bare term.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        quoted_term = '"' + term.replace('"', '""') + '"'
+        rows = conn.execute(
+            "SELECT rowid FROM thought_fts WHERE thought_fts MATCH ?", (quoted_term,)
+        ).fetchall()
+        return {int(row[0]) for row in rows}
+    finally:
+        conn.close()
+
+
+def _live_thought_rowids_containing(db_path: Path, term: str) -> set[int]:
+    """Return the rowids of ``thought`` rows whose essence or content literally contains ``term``.
+
+    Ground truth independent of FTS5 entirely -- "what a fresh re-index would
+    produce" restated as a plain substring check over the table restore is
+    supposed to be indexing right now. Every fixture used with this helper
+    picks terms (``"alpha"``, ``"zulu"``, an id like ``"t-old-0"``, ...) that
+    appear as whole, unambiguous substrings of exactly the rows they are meant
+    to describe, so a literal ``in`` check is exact here, not an approximation
+    -- except for case: the ``unicode61`` tokenizer folds case before indexing,
+    so ``thought_fts`` cannot distinguish ``"Content"`` from ``"content"`` and
+    this ground truth must not either, or a fixture whose column happens to
+    capitalize the term (``"Content for ..."``) would wrongly read as an entry
+    the index is missing.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute("SELECT rowid, essence, content FROM thought").fetchall()
+    finally:
+        conn.close()
+    term_lower = term.lower()
+    return {
+        int(rowid)
+        for rowid, essence, content in rows
+        if term_lower in essence.lower() or term_lower in content.lower()
+    }
+
+
+def _assert_fts_index_matches_live_thoughts(db_path: Path, term: str) -> None:
+    """Assert ``thought_fts``'s real ``MATCH`` rowids for ``term`` are exactly the live rows.
+
+    Per-term ``MATCH`` results must equal a fresh re-index of the thought
+    rows. A rowid ``MATCH`` returns that :func:`_live_thought_rowids_containing`
+    does not is a stale entry FTS5 never cleaned up; a rowid the other way
+    around is a row the index is missing entirely. Either is a failure.
+    """
+    actual = _fts_match_rowids(db_path, term)
+    expected = _live_thought_rowids_containing(db_path, term)
+    assert actual == expected, (
+        f"thought_fts MATCH {term!r} = {sorted(actual)}, but the thought rows that "
+        f"actually contain {term!r} right now are {sorted(expected)} "
+        f"(stale extra: {sorted(actual - expected)}, missing: {sorted(expected - actual)})"
+    )
+
+
+def _snapshot_line_types(snapshot_path: Path) -> set[str]:
+    """Return every distinct ``_type`` value present across a snapshot's lines.
+
+    Used to confirm a snapshot is genuinely metadata-only (``{"metadata"}``,
+    no ``thought``/``edge``/``embedding``/``action`` record at all) rather than
+    happening to contain zero of the one core-table type a test cares about.
+    """
+    lines = [json.loads(line) for line in snapshot_path.read_text(encoding="utf-8").splitlines()]
+    return {line.get("_type") for line in lines}
+
+
+def _corrupt_fts_with_raw_replace(db_path: Path, thought_id: str) -> None:
+    """Leave a stale ``thought_fts`` entry behind for one thought, at the raw-SQL level.
+
+    An ``INSERT OR REPLACE`` colliding on ``thought_id``'s primary key deletes
+    the existing row and re-inserts it, internally, as part of resolving the
+    conflict. Nothing under ``src/`` sets ``PRAGMA recursive_triggers`` (it
+    defaults to off), so SQLite fires ``thought_fts_insert`` for the freshly
+    assigned rowid but never fires ``thought_fts_delete`` for the rowid this
+    removed -- schema_core.sql's trigger only runs for a ``DELETE`` a caller
+    actually issues, not one SQLite performs to satisfy a conflicting
+    ``REPLACE``. The old entry survives, stale, pointing at a rowid ``thought``
+    no longer uses.
+
+    This calls no engrava code at all: it builds a database that already
+    carries stale FTS rows without going through ``restore``.
+
+    Args:
+        db_path: Path to a database already holding a thought with this id.
+        thought_id: The colliding primary key. Its own essence/content/etc.
+            are read back and reinserted unchanged, so the only effect is the
+            rowid churn described above -- no value actually changes.
+
+    Raises:
+        AssertionError: If no thought with this id exists yet.
+
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT thought_type, essence, content, priority, lifecycle_status, "
+            "created_cycle, updated_cycle, source FROM thought WHERE thought_id = ?",
+            (thought_id,),
+        ).fetchone()
+        assert row is not None, f"no thought {thought_id!r} to corrupt"
+        (
+            thought_type,
+            essence,
+            content,
+            priority,
+            lifecycle_status,
+            created_cycle,
+            updated_cycle,
+            source,
+        ) = row
+        conn.execute(
+            "INSERT OR REPLACE INTO thought "
+            "(thought_id, thought_type, essence, content, priority, lifecycle_status, "
+            "created_cycle, updated_cycle, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                thought_id,
+                thought_type,
+                essence,
+                content,
+                priority,
+                lifecycle_status,
+                created_cycle,
+                updated_cycle,
+                source,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _full_thought_table_snapshot(db_path: Path) -> list[tuple[object, ...]]:
+    """Read every column of every ``thought`` row, in a stable order.
+
+    Ground truth for "the repair command changes no thought row at all" --
+    stronger than comparing just the surviving id set (``_stored_core_ids``),
+    which cannot see a column that changed on an id that survives untouched.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM thought ORDER BY thought_id").fetchall()
+        return [tuple(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def _assert_recall_never_returns_a_mismatch(runner: CliRunner, db_path: Path, term: str) -> None:
+    """Assert every thought this ``recall(term)`` call returns contains ``term``.
+
+    Checked against each returned thought's *live* essence and content read directly from
+    the database -- not just ``recall --json``'s own payload, which surfaces
+    only ``essence`` -- and case-insensitively, matching the ``unicode61``
+    tokenizer's casefolding (the same reason :func:`_live_thought_rowids_containing`
+    lowercases both sides).
+    """
+    recall_result = runner.invoke(cli, ["--db", str(db_path), "recall", term, "--json"])
+    assert recall_result.exit_code == 0, recall_result.output
+    payload = json.loads(recall_result.output)
+    term_lower = term.lower()
+    conn = sqlite3.connect(db_path)
+    try:
+        for row in payload["results"]:
+            live_row = conn.execute(
+                "SELECT essence, content FROM thought WHERE thought_id = ?",
+                (row["thought_id"],),
+            ).fetchone()
+            assert live_row is not None, (
+                f"recall({term!r}) returned thought_id {row['thought_id']!r}, "
+                "which no longer exists in `thought` at all"
+            )
+            essence, content = live_row
+            assert term_lower in essence.lower() or term_lower in content.lower(), (
+                f"recall({term!r}) returned a thought that does not contain the word: {row}"
+            )
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def fresh_edge_id_duplicate_triple_snapshot(runner: CliRunner, tmp_path: Path) -> Path:
+    """A snapshot carrying only an edge record: a fresh ``edge_id``, ``edge-001``'s own triple.
+
+    Isolated to just the edge line -- the thought rows that satisfied this
+    edge's own foreign key when it was created in the source database are
+    stripped back out -- so restoring this into ``journalled_db_with_edge``
+    collides *only* on the edge table's composite
+    ``UNIQUE(from_thought_id, to_thought_id, edge_type)`` (schema_core.sql),
+    never on a thought primary key. A probe keyed on primary ids alone would
+    never see this collision at all, since ``edge_id`` itself (``edge-999``)
+    is brand new.
+    """
+    source_db = tmp_path / "edge-source.db"
+
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import (
+        EdgeRecord,
+        EdgeType,
+        LifecycleStatus,
+        Priority,
+        SqliteEngravaCore,
+        ThoughtRecord,
+        ThoughtType,
+    )
+
+    async def _seed() -> None:
+        conn = await aiosqlite.connect(str(source_db))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        await store.ensure_schema()
+        for i, tid in enumerate(("t-old-0", "t-old-1")):
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id=tid,
+                    essence=f"Essence for {tid}",
+                    content=f"Content for {tid}",
+                    thought_type=ThoughtType.OBSERVATION,
+                    source="test",
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    priority=Priority.P2,
+                    created_cycle=i + 1,
+                    updated_cycle=i + 1,
+                )
+            )
+        await store.create_edge(
+            EdgeRecord(
+                edge_id="edge-999",
+                from_thought_id="t-old-0",
+                to_thought_id="t-old-1",
+                edge_type=EdgeType.ASSOCIATED,
+                weight=0.5,
+                created_cycle=1,
+            )
+        )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_seed())
+
+    full_snap = tmp_path / "edge-source-full.jsonl"
+    result = runner.invoke(cli, ["--db", str(source_db), "snapshot", "-o", str(full_snap)])
+    assert result.exit_code == 0, result.output
+
+    edge_only_lines = [
+        line
+        for line in full_snap.read_text(encoding="utf-8").splitlines()
+        if json.loads(line).get("_type") == "edge"
+    ]
+    assert len(edge_only_lines) == 1
+    edge_only_snap = tmp_path / "edge-only.jsonl"
+    edge_only_snap.write_text("\n".join(edge_only_lines) + "\n", encoding="utf-8")
+    return edge_only_snap
 
 
 class TestGlobalControls:
@@ -260,14 +1182,79 @@ class TestInfo:
         assert "Thoughts: 3" in result.output
         assert "Edges: 1" in result.output
 
+    def test_info_table_format_names_both_schema_versions(
+        self, runner: CliRunner, populated_db: Path
+    ) -> None:
+        """The human line must name which number is which, and show both.
+
+        A fresh ``populated_db`` is stamped at ``CORE_SCHEMA_HEAD_VERSION`` by
+        ``ensure_schema()``, while the metrics snapshot's own shape version
+        (``EngravaMetrics.schema_version``) is a separate, much smaller
+        number — asserting they differ here is not incidental: equal values
+        would not show which label names which.
+        """
+        result = runner.invoke(cli, ["--db", str(populated_db), "info"])
+        assert result.exit_code == 0
+        expected_line = (
+            f"Metrics schema version: 2 (database schema version: {CORE_SCHEMA_HEAD_VERSION})"
+        )
+        assert expected_line in result.output
+        assert "Schema version:" not in result.output
+        assert CORE_SCHEMA_HEAD_VERSION != 2
+
     def test_info_json_format(self, runner: CliRunner, populated_db: Path) -> None:
         result = runner.invoke(cli, ["--db", str(populated_db), "--format", "json", "info"])
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["thoughts"]["total"] == 3
         assert data["edges"]["total"] == 1
-        assert data["schema_version"] == 1
+        assert data["metrics_schema_version"] == 2
+        assert data["database_schema_version"] == CORE_SCHEMA_HEAD_VERSION
+        assert "schema_version" not in data
         assert data["search_latency"]["sample_count"] == 0
+
+    @pytest.mark.parametrize(
+        "stamped_version",
+        [CORE_SCHEMA_HEAD_VERSION - 2, CORE_SCHEMA_HEAD_VERSION - 4],
+    )
+    def test_info_json_reports_a_non_head_database_schema_version(
+        self, runner: CliRunner, populated_db: Path, stamped_version: int
+    ) -> None:
+        """``database_schema_version`` must track the stamped ``PRAGMA
+        user_version``, not any hard-coded constant.
+
+        The database-backed ``info`` tests above build their database
+        through ``ensure_schema()``, which always lands on
+        ``CORE_SCHEMA_HEAD_VERSION`` -- on that fixture shape, an
+        implementation that reads ``PRAGMA user_version`` and one that just
+        returns ``CORE_SCHEMA_HEAD_VERSION`` report the same number and
+        those tests cannot tell them apart. Stamping to a single other
+        value would only rule out that one constant, so this is
+        parametrized over two different non-head values: no single
+        hard-coded return value, head or otherwise, can satisfy both.
+        Also confirm ``metrics_schema_version`` does not move with the
+        stamp -- the two numbers are unrelated -- and that the
+        behind-schema warning this stamp is expected to trigger (see
+        test_schema_version_gate.py) is actually emitted, so a build that
+        silently dropped that warning would not pass this test either.
+        """
+        conn = sqlite3.connect(str(populated_db))
+        try:
+            conn.execute(f"PRAGMA user_version = {stamped_version}")
+            conn.commit()
+        finally:
+            conn.close()
+
+        # The stamp is behind head, so this read command warns on stderr
+        # (see test_schema_version_gate.py) and still runs; read only
+        # stdout so that warning does not corrupt the JSON parse.
+        result = runner.invoke(cli, ["--db", str(populated_db), "--format", "json", "info"])
+        assert result.exit_code == 0, result.output
+        assert "behind" in result.stderr.lower()
+        data = json.loads(result.stdout)
+        assert data["database_schema_version"] == stamped_version
+        assert data["database_schema_version"] != CORE_SCHEMA_HEAD_VERSION
+        assert data["metrics_schema_version"] == 2
 
     def test_info_missing_db(self, runner: CliRunner, tmp_path: Path) -> None:
         missing = tmp_path / "nonexistent.db"
@@ -351,6 +1338,196 @@ class TestQuery:
         assert data[0]["count"] == 3
 
 
+# ------------------------------------------------------------------
+# Snapshot/export publish atomically
+# ------------------------------------------------------------------
+#
+# Both `snapshot` (`_export_db_to_jsonl`) and `export` (`export_cmd`) write
+# into a same-directory temporary file and publish it onto the real `-o`
+# path with `os.replace` only once every read they depend on has completed
+# successfully -- see `engrava.cli.main`'s own "Atomic output writing"
+# section. The helpers below give the acceptance tests for both writers
+# (`TestSnapshotAtomicReplace`, `TestExportAtomicReplace`) a uniform way to
+# inject a failure at each boundary of that mechanism and check what it
+# left on disk.
+
+
+def _atomic_temp_debris_in(directory: Path) -> list[Path]:
+    """List any leftover atomic-write temporary file in *directory*.
+
+    Matches `_open_same_directory_tempfile`'s naming (a leading dot and a
+    trailing ``.tmp``) broadly, rather than tying it to one particular
+    target name -- a guard-refusal test fails before any `out` is ever
+    settled, so it checks the whole directory rather than one file's name.
+    """
+    return [p for p in directory.glob(".*.tmp") if p.is_file()]
+
+
+@contextlib.contextmanager
+def _temporary_umask(mask: int) -> Iterator[None]:
+    """Set the process umask to *mask* for the block, then restore whatever it was.
+
+    The umask is process-global state, so this only works because the test
+    suite runs single-threaded; it still restores in a ``finally`` so a
+    failing assertion inside the block never leaks a changed umask into
+    later tests.
+    """
+    old_mask = os.umask(mask)
+    try:
+        yield
+    finally:
+        os.umask(old_mask)
+
+
+def _assert_fd_was_closed(fd: int, original_identity: os.stat_result) -> None:
+    """Assert *fd* no longer refers to the file whose identity was captured earlier.
+
+    A closed fd usually makes any further ``os.fstat`` raise ``OSError``
+    (``EBADF``) -- but the fd *number* can be reused by something else in
+    the same process before this check runs, which would make a bare "does
+    fstat still succeed" check a false negative. Comparing ``(st_dev,
+    st_ino)`` against the identity captured before the close is what closes
+    that gap: a reused fd number almost certainly names a different inode.
+
+    Args:
+        fd: The file descriptor that should have been closed.
+        original_identity: ``os.fstat(fd)``, captured while *fd* still named
+            the temporary file -- before the production code's own cleanup
+            could have closed it out from under a later check.
+
+    """
+    try:
+        current_identity = os.fstat(fd)
+    except OSError:
+        return
+    assert (current_identity.st_dev, current_identity.st_ino) != (
+        original_identity.st_dev,
+        original_identity.st_ino,
+    )
+
+
+class _FailAfterNWrites:
+    """A text-file stand-in whose ``write`` raises after *n* successful calls.
+
+    Wraps a real, already-open file handle so the bytes that do get through
+    before the injected failure land on the real temporary file on disk --
+    exactly what a genuine partial write (a full disk mid-stream) leaves
+    behind for the atomic-replace machinery to discard.
+    """
+
+    def __init__(self, real: TextIO, calls_before_failure: int, exc: OSError) -> None:
+        self._real = real
+        self._calls_before_failure = calls_before_failure
+        self._exc = exc
+        self._count = 0
+
+    def write(self, data: str) -> int:
+        if self._count >= self._calls_before_failure:
+            raise self._exc
+        self._count += 1
+        return self._real.write(data)
+
+    def flush(self) -> None:
+        self._real.flush()
+
+    def fileno(self) -> int:
+        return self._real.fileno()
+
+    def close(self) -> None:
+        self._real.close()
+
+
+def _fail_atomic_write_after(
+    monkeypatch: pytest.MonkeyPatch, calls_before_failure: int, exc: OSError
+) -> None:
+    """Make the next atomic write (snapshot or export) fail part-way through.
+
+    Wraps the real ``_open_same_directory_tempfile`` rather than replacing
+    it, so the temporary file it creates -- the one these tests check for
+    afterward -- is the genuine article the production code itself made,
+    not a stand-in this patch invents.
+    """
+    real_open = cli_main._open_same_directory_tempfile
+
+    def _wrapped(out: Path) -> tuple[Path, TextIO]:
+        tmp_path, f = real_open(out)
+        return tmp_path, cast("TextIO", _FailAfterNWrites(f, calls_before_failure, exc))
+
+    monkeypatch.setattr(cli_main, "_open_same_directory_tempfile", _wrapped)
+
+
+def _fail_publication(monkeypatch: pytest.MonkeyPatch, exc: OSError) -> None:
+    """Make the next ``os.replace`` publication call fail."""
+
+    def _raise(*_args: object, **_kwargs: object) -> None:
+        raise exc
+
+    monkeypatch.setattr(cli_main.os, "replace", _raise)
+
+
+def _spy_on_publication(monkeypatch: pytest.MonkeyPatch) -> mock.Mock:
+    """Wrap the real ``os.replace`` so a test can assert it was the publisher.
+
+    A copy-over-the-target implementation (read the temp file, write its
+    bytes into ``out``) would never call this -- the spy's call count is
+    what tells the two apart.
+    """
+    spy = mock.Mock(wraps=cli_main.os.replace)
+    monkeypatch.setattr(cli_main.os, "replace", spy)
+    return spy
+
+
+class _FailAfterNChars:
+    """A text-file stand-in whose ``write`` writes a prefix then raises.
+
+    ``export`` serializes its whole document with one ``f.write(big_string)``
+    call, so ``_FailAfterNWrites`` above (which fails whole calls) can only
+    ever fail that one call before anything lands on disk -- not a genuine
+    part-way failure. This instead lets the first *chars_before_failure*
+    characters of that one call reach the real file before raising, so the
+    temporary file the atomic-replace machinery has to discard is a real
+    partial write, the same shape a full disk mid-write would leave.
+    """
+
+    def __init__(self, real: TextIO, chars_before_failure: int, exc: OSError) -> None:
+        self._real = real
+        self._chars_before_failure = chars_before_failure
+        self._exc = exc
+
+    def write(self, data: str) -> int:
+        prefix = data[: self._chars_before_failure]
+        if prefix:
+            self._real.write(prefix)
+            self._real.flush()
+        raise self._exc
+
+    def flush(self) -> None:
+        self._real.flush()
+
+    def fileno(self) -> int:
+        return self._real.fileno()
+
+    def close(self) -> None:
+        self._real.close()
+
+
+def _fail_atomic_write_partway_through(
+    monkeypatch: pytest.MonkeyPatch, chars_before_failure: int, exc: OSError
+) -> None:
+    """Make the next atomic write fail after *chars_before_failure* characters land on disk.
+
+    See :class:`_FailAfterNChars`: for a writer with only one ``write()``
+    call (``export``), this is what a genuine part-way failure looks like.
+    """
+    real_open = cli_main._open_same_directory_tempfile
+
+    def _wrapped(out: Path) -> tuple[Path, TextIO]:
+        tmp_path, f = real_open(out)
+        return tmp_path, cast("TextIO", _FailAfterNChars(f, chars_before_failure, exc))
+
+    monkeypatch.setattr(cli_main, "_open_same_directory_tempfile", _wrapped)
+
+
 class TestSnapshot:
     """Tests for ``engrava snapshot``."""
 
@@ -416,6 +1593,780 @@ class TestSnapshot:
         assert isinstance(result.exception, SystemExit)
 
 
+async def _concurrent_writer_commit_after(
+    populated_db: Path, paused: asyncio.Event, resume: asyncio.Event
+) -> None:
+    """Commit a thought+edge pair through a second connection, once ``paused``.
+
+    Stands in for "the one supported concurrent writer" against ``engrava``'s
+    SQLite backend: a second ``SqliteEngravaCore`` on the same file, not a
+    mock. Waits for ``paused`` (set by the export side once it has scanned
+    `thought` and is about to scan `edge`), commits, then sets ``resume`` so
+    the paused export continues.
+
+    Args:
+        populated_db: Path to the database both connections share.
+        paused: Set by the caller once export has reached the point between
+            its thought-table and edge-table scans.
+        resume: Set here once the commit lands, to let export continue.
+
+    """
+    import aiosqlite
+
+    from engrava import (
+        EdgeRecord,
+        EdgeType,
+        LifecycleStatus,
+        Priority,
+        SqliteEngravaCore,
+        ThoughtRecord,
+        ThoughtType,
+    )
+
+    await paused.wait()
+    writer_conn = await aiosqlite.connect(str(populated_db))
+    writer_conn.row_factory = aiosqlite.Row
+    await writer_conn.execute("PRAGMA foreign_keys = ON")
+    writer_store = SqliteEngravaCore(writer_conn)
+    await writer_store.create_thought(
+        ThoughtRecord(
+            thought_id="thought-concurrent",
+            essence="written mid-export",
+            content="written mid-export",
+            thought_type=ThoughtType.OBSERVATION,
+            source="test",
+            lifecycle_status=LifecycleStatus.ACTIVE,
+            priority=Priority.P2,
+            created_cycle=99,
+            updated_cycle=99,
+        )
+    )
+    await writer_store.create_edge(
+        EdgeRecord(
+            edge_id="edge-concurrent",
+            from_thought_id="thought-concurrent",
+            to_thought_id="thought-000",
+            edge_type=EdgeType.ASSOCIATED,
+            weight=0.5,
+            created_cycle=99,
+        )
+    )
+    await writer_conn.commit()
+    await writer_conn.close()
+    resume.set()
+
+
+async def _export_with_commit_interleaved_before_edge_scan(populated_db: Path, out: Path) -> None:
+    """Run ``_export_db_to_jsonl`` while a concurrent writer commits mid-scan.
+
+    Pauses the export connection right before its ``SELECT * FROM edge`` --
+    after the thought-table scan, before the edge-table one -- starts the
+    concurrent writer (:func:`_concurrent_writer_commit_after`), and resumes
+    once it has committed. Uses the same technique
+    ``TestInProcessCriticalSection`` in ``test_concurrency_contract.py`` uses
+    for the store's own guards: a genuine ``asyncio.Task``, paused and
+    resumed via an ``asyncio.Event`` handshake, never a sleep or a mock.
+
+    Args:
+        populated_db: Path to the source database.
+        out: Where the snapshot is written.
+
+    """
+    import aiosqlite
+
+    export_conn = await aiosqlite.connect(str(populated_db))
+    export_conn.row_factory = aiosqlite.Row
+    # Matches how the real CLI opens a connection for `snapshot` (`_open_db`
+    # in `engrava.cli.main`) -- WAL mode is what makes a concurrent writer's
+    # commit non-blocking against an open reader, which is what lets this
+    # test observe the race rather than have the writer simply wait out the
+    # reader's lock.
+    await export_conn.execute("PRAGMA journal_mode = WAL")
+    await export_conn.execute("PRAGMA foreign_keys = ON")
+
+    paused = asyncio.Event()
+    resume = asyncio.Event()
+    original_execute = export_conn.execute
+    edge_scan_seen = False
+
+    async def _tracking_execute(sql: str, *args: object, **kwargs: object) -> object:
+        nonlocal edge_scan_seen
+        if sql == "SELECT * FROM edge" and not edge_scan_seen:
+            edge_scan_seen = True
+            paused.set()
+            await resume.wait()
+        return await original_execute(sql, *args, **kwargs)
+
+    setattr(export_conn, "execute", _tracking_execute)  # noqa: B010 -- see store patch above for why setattr, not a subclass
+
+    try:
+        _, (_total, tmp_path, real_out) = await asyncio.gather(
+            _concurrent_writer_commit_after(populated_db, paused, resume),
+            _export_db_to_jsonl(export_conn, out, db_path=populated_db),
+        )
+    finally:
+        await export_conn.close()
+    # `_export_db_to_jsonl` does not publish on its own -- it hands back
+    # the fully-written temporary file for the caller to publish once its
+    # own connection handling is done (`export_conn.close()` above). This
+    # test reads `out` afterward, so it publishes here the same way
+    # `snapshot` itself does.
+    cli_main._publish_atomic_replacement(tmp_path, real_out)
+
+
+class TestSnapshotObservesOneConsistentState:
+    """A snapshot must not stream a mix of before- and after-commit rows.
+
+    ``_export_db_to_jsonl`` scans the thought, edge, embedding, and action
+    tables one at a time. Without an enclosing read transaction, each scan is
+    its own independent read against whatever the database's current state
+    happens to be -- so a writer committing a new thought and its edge
+    between the thought scan and the edge scan leaves the edge in the
+    snapshot while the thought it references never made it in. This does not
+    need a mocked writer to show: it uses the one supported concurrent writer
+    (a second ``SqliteEngravaCore`` on the same file), paused and resumed
+    with a genuine ``asyncio.Task`` at the exact point between the two scans,
+    the same technique ``TestInProcessCriticalSection`` in
+    ``test_concurrency_contract.py`` uses for the store's own guards.
+    """
+
+    def test_export_survives_a_commit_between_the_thought_and_edge_scans(
+        self,
+        populated_db: Path,
+        tmp_path: Path,
+    ) -> None:
+        """A thought+edge pair committed mid-export must not appear split.
+
+        Either the pair is entirely absent from the snapshot (export's read
+        transaction opened before the commit) or entirely present (it opened
+        after) -- never an edge with no matching thought. The dangling-edge
+        shape is asserted directly against the snapshot file, and then again
+        by actually restoring it: a mixed snapshot fails restore's
+        foreign-key validation, a consistent one restores cleanly.
+
+        The interleaved export runs inside its own ``asyncio.run()`` (as
+        ``populated_db`` above already does for its setup), rather than this
+        test itself being ``async def``: ``restore`` below goes through the
+        real CLI, whose command bodies call ``asyncio.run()`` themselves,
+        which cannot nest inside a loop pytest-asyncio already has running.
+        """
+        out = tmp_path / "interleaved.snapshot.jsonl"
+        asyncio.run(_export_with_commit_interleaved_before_edge_scan(populated_db, out))
+
+        thought_ids: set[str] = set()
+        edge_referenced_ids: set[str] = set()
+        with out.open(encoding="utf-8") as f:
+            for line in f:
+                record = json.loads(line)
+                if record["_type"] == "thought":
+                    thought_ids.add(record["data"]["thought_id"])
+                elif record["_type"] == "edge":
+                    edge_referenced_ids.add(record["data"]["from_thought_id"])
+                    edge_referenced_ids.add(record["data"]["to_thought_id"])
+
+        dangling = edge_referenced_ids - thought_ids
+        assert not dangling, (
+            f"snapshot carries an edge referencing thought id(s) {dangling!r} that "
+            "never made it into the same snapshot -- a mixed before/after read"
+        )
+
+        # A consistent snapshot must also restore cleanly into a fresh target
+        # -- the dangling-edge shape above is exactly what fails restore's
+        # foreign-key validation.
+        target_db = tmp_path / "restored-from-interleaved.db"
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["--db", str(target_db), "restore", "-i", str(out)],
+            standalone_mode=False,
+        )
+        assert result.exit_code == 0, (
+            f"restore of a snapshot with no dangling edge must succeed cleanly, got: "
+            f"{result.output!r}"
+        )
+
+
+class TestSnapshotAtomicReplace:
+    """``snapshot`` must never destroy a good file at `-o` on a failed write.
+
+    `snapshot` writes the new snapshot to a same-directory temporary file and
+    publishes it onto `-o` only after the connection handling has finished,
+    so `-o` is never truncated before the new snapshot exists. These
+    tests show an existing target survives byte-identical whenever the
+    write, the read-transaction close, or the publish itself fails; that a
+    successful run still publishes the full snapshot; and that `-o` cannot
+    be pointed at the live database or its WAL/SHM companions.
+    """
+
+    def test_write_failure_leaves_existing_target_untouched(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        out = tmp_path / "existing.jsonl"
+        good_content = "a byte-identical earlier good backup\n"
+        out.write_text(good_content, encoding="utf-8")
+
+        _fail_atomic_write_after(monkeypatch, 2, OSError(27, "File too large"))
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(out)])
+
+        assert result.exit_code != 0
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_transaction_close_failure_leaves_existing_target_untouched(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failing `commit()` after every row was written must still discard the temp file.
+
+        An implementation that publishes *before* closing the read
+        transaction would still report failure here, but would have already
+        replaced the good content -- so this specifically checks the target
+        bytes, not just the exit code.
+        """
+        import aiosqlite
+
+        out = tmp_path / "existing.jsonl"
+        good_content = "a byte-identical earlier good backup\n"
+        out.write_text(good_content, encoding="utf-8")
+
+        async def _raise_on_commit(_self: aiosqlite.Connection) -> None:
+            msg = "simulated commit failure after every row was written"
+            raise OSError(28, msg)
+
+        monkeypatch.setattr(aiosqlite.Connection, "commit", _raise_on_commit)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(out)])
+
+        assert result.exit_code != 0
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_begin_failure_leaves_existing_target_untouched_and_no_leak(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failing `BEGIN` -- before any row is read -- must not leak the temp file or its handle.
+
+        `BEGIN` runs after the temporary file is already open. An
+        implementation that only starts discarding on failure *after*
+        `BEGIN` succeeds would leak both the file and its handle here.
+        """
+        import aiosqlite
+
+        out = tmp_path / "existing.jsonl"
+        good_content = "a byte-identical earlier good backup\n"
+        out.write_text(good_content, encoding="utf-8")
+
+        real_execute = aiosqlite.Connection.execute
+
+        async def _raise_on_begin(
+            self: aiosqlite.Connection, sql: str, *args: object, **kwargs: object
+        ) -> object:
+            if sql == "BEGIN":
+                msg = "simulated BEGIN failure"
+                raise OSError(5, msg)
+            return await real_execute(self, sql, *args, **kwargs)
+
+        monkeypatch.setattr(aiosqlite.Connection, "execute", _raise_on_begin)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(out)])
+
+        assert result.exit_code != 0
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    async def test_a_failing_begin_does_not_roll_back_the_callers_transaction(
+        self, populated_db: Path, tmp_path: Path
+    ) -> None:
+        """A `BEGIN` that fails because the caller already has one open must not roll it back.
+
+        `_export_db_to_jsonl` opens its own read transaction with `BEGIN`.
+        Calling it on a connection that already has an *uncommitted*
+        transaction open -- not one this function started -- makes SQLite
+        refuse with "cannot start a transaction within a transaction".
+        Rolling back unconditionally on any failure here would discard
+        writes this function never made and has no business undoing;
+        called directly (not through the CLI, which always closes its own
+        connection and so cannot tell a real rollback apart from the
+        implicit one that closing gives for free) on a connection kept open
+        across the call, so only an explicit, unconditional rollback could
+        account for the loss.
+        """
+        import aiosqlite
+
+        conn = await aiosqlite.connect(str(populated_db))
+        conn.row_factory = aiosqlite.Row
+        try:
+            # An explicit `BEGIN` plus a raw insert, not `create_thought` --
+            # the store's own write path commits internally, which would
+            # leave `conn.in_transaction` false again before this test ever
+            # gets to the scenario it means to set up.
+            await conn.execute("BEGIN")
+            await conn.execute(
+                "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    "t-uncommitted",
+                    "OBSERVATION",
+                    "uncommitted essence",
+                    "uncommitted content",
+                    "P2",
+                ),
+            )
+            assert conn.in_transaction
+
+            out = tmp_path / "out.jsonl"
+            with pytest.raises(sqlite3.OperationalError, match="transaction"):
+                await _export_db_to_jsonl(conn, out, db_path=populated_db)
+
+            assert conn.in_transaction
+            cursor = await conn.execute(
+                "SELECT COUNT(*) FROM thought WHERE thought_id = ?", ("t-uncommitted",)
+            )
+            row = await cursor.fetchone()
+            assert row[0] == 1
+            assert _atomic_temp_debris_in(out.parent) == []
+        finally:
+            await conn.rollback()
+            await conn.close()
+
+    async def test_a_cancellation_after_begin_executes_leaves_no_open_transaction(
+        self, populated_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cancellation arriving after `BEGIN` ran, before the `await` resumes, must not leak it.
+
+        aiosqlite runs `BEGIN` on its worker thread. If the awaiting task is
+        cancelled after that thread has already executed it but before the
+        `await` returns control here, a flag set only on a *successful
+        return* from that `await` would never see it -- leaving this
+        function's own transaction open forever, on a connection whose
+        caller had none before this call. Simulated by making
+        `execute("BEGIN")` run the real statement and then raise
+        `CancelledError`, which reproduces exactly that ordering without
+        needing a real scheduler race.
+        """
+        import aiosqlite
+
+        real_execute = aiosqlite.Connection.execute
+
+        async def _begin_then_cancel(
+            self: aiosqlite.Connection, sql: str, *args: object, **kwargs: object
+        ) -> object:
+            if sql == "BEGIN":
+                await real_execute(self, sql, *args, **kwargs)
+                raise asyncio.CancelledError
+            return await real_execute(self, sql, *args, **kwargs)
+
+        monkeypatch.setattr(aiosqlite.Connection, "execute", _begin_then_cancel)
+
+        conn = await aiosqlite.connect(str(populated_db))
+        conn.row_factory = aiosqlite.Row
+        try:
+            assert not conn.in_transaction
+
+            out = tmp_path / "out.jsonl"
+            with pytest.raises(asyncio.CancelledError):
+                await _export_db_to_jsonl(conn, out, db_path=populated_db)
+
+            assert not conn.in_transaction
+            assert _atomic_temp_debris_in(out.parent) == []
+        finally:
+            await conn.rollback()
+            await conn.close()
+
+    async def test_a_cancellation_while_begin_is_still_queued_leaves_no_open_transaction(
+        self, populated_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cancellation before `BEGIN`'s own call has even run must not leak a transaction either.
+
+        The complementary race to the sibling test above: here the
+        cancellation arrives *before* `BEGIN`'s underlying call has run at
+        all, not after. `execute("BEGIN")` fires the real call off as a
+        background task -- scheduled, not started -- and raises
+        `CancelledError` immediately, so this function's `except` block
+        reads `conn.in_transaction` while it is still `False`: the
+        transaction the pending `BEGIN` will eventually open does not exist
+        yet. The function does not depend on that read reflecting the future --
+        it decides from the state captured *before* `BEGIN` was ever
+        attempted, and issues the rollback unconditionally in that case.
+        That rollback is itself a queued call on the same
+        aiosqlite connection, so it lands on the same serial worker-thread
+        queue behind the still-pending `BEGIN` and -- per aiosqlite's own
+        FIFO ordering, which still runs a queued call even once the future
+        awaiting it has been cancelled -- always executes after it, closing
+        the transaction the pending `BEGIN` opens.
+
+        An implementation that instead reads `conn.in_transaction` *inside*
+        the `except` block would see the same `False` at that instant and
+        conclude there is nothing to roll back -- then the pending `BEGIN`
+        runs anyway, moments later, and nothing ever closes it.
+        """
+        import aiosqlite
+
+        real_execute = aiosqlite.Connection.execute
+        begin_task: list[asyncio.Task[object]] = []
+
+        async def _begin_queued_then_cancel(
+            self: aiosqlite.Connection, sql: str, *args: object, **kwargs: object
+        ) -> object:
+            if sql == "BEGIN":
+                begin_task.append(asyncio.ensure_future(real_execute(self, sql, *args, **kwargs)))
+                raise asyncio.CancelledError
+            return await real_execute(self, sql, *args, **kwargs)
+
+        monkeypatch.setattr(aiosqlite.Connection, "execute", _begin_queued_then_cancel)
+
+        conn = await aiosqlite.connect(str(populated_db))
+        conn.row_factory = aiosqlite.Row
+        try:
+            assert not conn.in_transaction
+
+            out = tmp_path / "out.jsonl"
+            with pytest.raises(asyncio.CancelledError):
+                await _export_db_to_jsonl(conn, out, db_path=populated_db)
+
+            # The queued BEGIN (and, on a correct implementation, the
+            # rollback queued behind it) may still be finishing on
+            # aiosqlite's worker thread -- let it actually complete before
+            # reading `conn.in_transaction`.
+            assert begin_task, "the patched execute('BEGIN') never ran -- test setup is broken"
+            await begin_task[0]
+
+            assert not conn.in_transaction
+            assert _atomic_temp_debris_in(out.parent) == []
+        finally:
+            await conn.rollback()
+            await conn.close()
+
+    def test_fdopen_failure_leaves_existing_target_untouched_and_no_leak(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failing `os.fdopen` must not leak the raw fd or the temp file it names.
+
+        `_open_same_directory_tempfile` creates the file and (when `-o`
+        already exists) `fchmod`s it before wrapping the raw fd with
+        `os.fdopen` -- a failure in that last step must still close the fd
+        and remove the file, the same as a failing `fchmod` already does.
+        """
+        out = tmp_path / "existing.jsonl"
+        good_content = "a byte-identical earlier good backup\n"
+        out.write_text(good_content, encoding="utf-8")
+
+        captured_fd: list[int] = []
+        captured_identity: list[os.stat_result] = []
+
+        def _raise_fdopen(fd: int, *_args: object, **_kwargs: object) -> TextIO:
+            # Captured before raising -- and before the production code's
+            # own cleanup can close `fd` out from under this test -- so the
+            # assertion below has the temp file's real identity to compare
+            # against, not just a bare "did fstat raise" check a reused fd
+            # number could pass by coincidence. Deliberately does not close
+            # `fd` itself: that is exactly what production is being tested
+            # for.
+            captured_fd.append(fd)
+            captured_identity.append(os.fstat(fd))
+            msg = "simulated fdopen failure"
+            raise OSError(msg)
+
+        monkeypatch.setattr(cli_main.os, "fdopen", _raise_fdopen)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(out)])
+
+        assert result.exit_code != 0
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+        _assert_fd_was_closed(captured_fd[0], captured_identity[0])
+
+    def test_connection_close_failure_leaves_existing_target_untouched(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A single-database close failure, after publish-eligible reads, must not publish.
+
+        `snapshot`'s single-database path publishes only after `_opened_db`
+        closes its connection. If that close fails, the export must not
+        have already replaced the target -- `_export_db_to_jsonl` itself
+        never publishes, only its caller does, once closing is done.
+        """
+        import aiosqlite
+
+        out = tmp_path / "existing.jsonl"
+        good_content = "a byte-identical earlier good backup\n"
+        out.write_text(good_content, encoding="utf-8")
+
+        real_close = aiosqlite.Connection.close
+
+        async def _raise_after_real_close(self: aiosqlite.Connection) -> None:
+            # Runs the real close first, so nothing outlives this test --
+            # same technique as `test_cli_memory_verbs_error_boundary.py`'s
+            # patched close.
+            await real_close(self)
+            msg = "simulated close failure once every read had completed"
+            raise OSError(5, msg)
+
+        monkeypatch.setattr(aiosqlite.Connection, "close", _raise_after_real_close)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(out)])
+
+        assert result.exit_code != 0
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_service_connection_close_failure_leaves_existing_target_untouched(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A `--service` close failure (`manager.close_all()`) must not publish either.
+
+        `close_all()` deliberately swallows an ordinary per-store close
+        failure (logged, not raised) so one bad store does not abort closing
+        the rest -- see its own docstring in `service_manager.py`. A
+        cancellation is the one failure it does not swallow: it finishes the
+        real close first (same contract `SqliteEngravaCore.close` documents,
+        and the same technique the pre-existing
+        `test_cli_memory_verbs_error_boundary.py` uses for a store's own
+        close), then re-raises once every store has had its close attempt.
+        That is the reachable "close_all() itself fails" case this tests.
+        """
+        import shutil
+
+        from engrava import SqliteEngravaCore
+
+        real_core_close = SqliteEngravaCore.close
+
+        async def _raise_after_real_core_close(self: SqliteEngravaCore) -> None:
+            await real_core_close(self)
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(SqliteEngravaCore, "close", _raise_after_real_core_close)
+
+        data_dir = tmp_path / "services"
+        data_dir.mkdir()
+        service_db_path = data_dir / "svc.db"
+        shutil.copy(populated_db, service_db_path)
+
+        out = data_dir / "existing.jsonl"
+        good_content = "a byte-identical earlier good backup\n"
+        out.write_text(good_content, encoding="utf-8")
+
+        # `CliRunner.invoke()` only converts `SystemExit`/`Exception` into a
+        # clean `Result` -- `asyncio.CancelledError` is a `BaseException` it
+        # does not catch, so it propagates out of `invoke()` itself here
+        # rather than showing up as a non-zero `result.exit_code`.
+        with pytest.raises(asyncio.CancelledError):
+            runner.invoke(
+                cli,
+                [
+                    "--db",
+                    str(data_dir / "unused.db"),
+                    "snapshot",
+                    "--service",
+                    "svc",
+                    "-o",
+                    str(out),
+                ],
+                catch_exceptions=False,
+            )
+
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_publication_failure_leaves_existing_target_untouched(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        out = tmp_path / "existing.jsonl"
+        good_content = "a byte-identical earlier good backup\n"
+        out.write_text(good_content, encoding="utf-8")
+
+        _fail_publication(monkeypatch, OSError(30, "simulated replace failure"))
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(out)])
+
+        assert result.exit_code != 0
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_publishes_with_os_replace(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A copy-over-the-target publication (never calling `os.replace`) must fail this test."""
+        out = tmp_path / "snap.jsonl"
+        spy = _spy_on_publication(monkeypatch)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(out)])
+
+        assert result.exit_code == 0
+        assert spy.call_count == 1
+        tmp_arg, out_arg = spy.call_args.args
+        assert Path(out_arg) == out
+        assert Path(tmp_arg).parent == out.parent
+        assert not Path(tmp_arg).exists()
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_success_holds_full_valid_output(
+        self, runner: CliRunner, populated_db: Path, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "snap.jsonl"
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(out)])
+
+        assert result.exit_code == 0
+        lines = out.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) >= 3
+        for line in lines:
+            record = json.loads(line)
+            assert "_type" in record
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_new_output_gets_the_umask_adjusted_default_mode(
+        self, runner: CliRunner, populated_db: Path, tmp_path: Path
+    ) -> None:
+        """A fresh `-o` comes out `open(path, "w")`-shaped, not `mkstemp`'s always-``0o600``.
+
+        ``0o027`` is deliberately unusual: neither a default mode nor a
+        stray ``0o600`` from an unpatched ``mkstemp`` could pass this by
+        coincidence the way a common umask like ``0o022`` might.
+        """
+        out = tmp_path / "fresh.jsonl"
+
+        with _temporary_umask(0o027):
+            result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(out)])
+
+        assert result.exit_code == 0
+        assert out.stat().st_mode & 0o777 == 0o640
+
+    def test_existing_output_mode_survives_a_successful_replace(
+        self, runner: CliRunner, populated_db: Path, tmp_path: Path
+    ) -> None:
+        """An existing `-o`'s permission bits are copied onto the replacement, not narrowed
+        to ``0o600``.
+
+        ``0o604`` is deliberately unusual for the same reason as the sibling
+        test above.
+        """
+        out = tmp_path / "existing.jsonl"
+        out.write_text("old content\n", encoding="utf-8")
+        out.chmod(0o604)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(out)])
+
+        assert result.exit_code == 0
+        assert out.stat().st_mode & 0o777 == 0o604
+
+    @pytest.mark.parametrize(
+        "output_for",
+        [
+            str,
+            lambda db_path: f"{db_path.parent}/../{db_path.parent.name}/{db_path.name}",
+        ],
+        ids=["same-path", "relative-spelling"],
+    )
+    def test_refuses_output_naming_the_live_database(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        output_for: Callable[[Path], str],
+    ) -> None:
+        before = populated_db.read_bytes()
+
+        result = runner.invoke(
+            cli, ["--db", str(populated_db), "snapshot", "-o", output_for(populated_db)]
+        )
+
+        assert result.exit_code != 0
+        assert "Refusing to write output" in result.stderr
+        assert populated_db.read_bytes() == before
+        assert _atomic_temp_debris_in(populated_db.parent) == []
+
+    def test_refuses_output_naming_a_symlink_to_the_live_database(
+        self, runner: CliRunner, populated_db: Path, tmp_path: Path
+    ) -> None:
+        link = tmp_path / "link-to-live.db"
+        link.symlink_to(populated_db)
+        before = populated_db.read_bytes()
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(link)])
+
+        assert result.exit_code != 0
+        assert "Refusing to write output" in result.stderr
+        assert populated_db.read_bytes() == before
+        assert _atomic_temp_debris_in(populated_db.parent) == []
+
+    @pytest.mark.parametrize("companion_suffix", ["-wal", "-shm"])
+    def test_refuses_output_naming_a_wal_or_shm_companion(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        companion_suffix: str,
+    ) -> None:
+        """A guard that checks only the database path (not -wal/-shm) must fail this test."""
+        companion = Path(f"{populated_db}{companion_suffix}")
+        before = populated_db.read_bytes()
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(companion)])
+
+        assert result.exit_code != 0
+        assert "Refusing to write output" in result.stderr
+        assert populated_db.read_bytes() == before
+        assert _atomic_temp_debris_in(populated_db.parent) == []
+
+    def test_output_symlink_is_followed_and_kept_pointing_at_new_content(
+        self, runner: CliRunner, populated_db: Path, tmp_path: Path
+    ) -> None:
+        """`-o` naming a symlink writes through it, and the symlink itself survives.
+
+        `os.replace` on a symlinked destination replaces the link's own
+        directory entry, not the file it points to -- publishing straight
+        onto the symlink would sever it. The real target is written and
+        replaced instead, so the link keeps resolving to the same file, now
+        holding the new snapshot.
+        """
+        real_target = tmp_path / "actual.jsonl"
+        real_target.write_text("old content\n", encoding="utf-8")
+        link = tmp_path / "link.jsonl"
+        link.symlink_to(real_target)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(link)])
+
+        assert result.exit_code == 0
+        assert link.is_symlink()
+        assert os.path.realpath(link) == os.path.realpath(real_target)
+        lines = real_target.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) >= 3
+        for line in lines:
+            record = json.loads(line)
+            assert "_type" in record
+        assert _atomic_temp_debris_in(real_target.parent) == []
+
+
 class TestRestore:
     """Tests for ``engrava restore``."""
 
@@ -453,6 +2404,244 @@ class TestRestore:
             ["--db", str(populated_db), "restore", "-i", str(snap), "--clear"],
         )
         assert result.exit_code == 0
+
+    def test_restore_with_clear_on_empty_journal_reports_zero_discarded(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+    ) -> None:
+        """``--clear`` on a store whose journal was never enabled discards nothing.
+
+        ``populated_db`` never enables journaling, so ``journal_entry`` starts
+        (and stays) empty. The count printed must say so honestly rather than
+        the CLI staying silent about a table ``--clear`` also clears.
+        """
+        assert _journal_entry_count(populated_db) == 0
+        snap = tmp_path / "snap.jsonl"
+        runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(snap)])
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(populated_db), "restore", "-i", str(snap), "--clear"],
+        )
+
+        assert result.exit_code == 0
+        assert _journal_entry_count(populated_db) == 0
+        assert "Discarded 0 journal entries" in result.output
+
+    def test_restore_with_clear_discards_the_journal(
+        self,
+        runner: CliRunner,
+        journalled_db: Path,
+        unrelated_snapshot: Path,
+    ) -> None:
+        """``--clear`` from an unrelated snapshot must not leave a journal that
+        describes thoughts the clear just removed.
+
+        ``journal_entry`` is not in the table list ``--clear`` iterates and no
+        foreign key reaches it, so ``--clear`` discards it with a statement of
+        its own. Afterwards ``thought`` holds only the restored ``t-src`` row,
+        all three ``t-old-*`` journal entries are gone, and ``verify_journal()``
+        reports the empty journal as ``valid``.
+        """
+        assert _journal_entry_count(journalled_db) == 3
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(journalled_db), "restore", "-i", str(unrelated_snapshot), "--clear"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert _stored_core_ids(journalled_db)["thought"] == {"t-src"}
+        assert _journal_entry_count(journalled_db) == 0
+        assert "Discarded 3 journal entries" in result.output
+
+        verify_result = runner.invoke(
+            cli,
+            ["--db", str(journalled_db), "--format", "json", "verify"],
+        )
+        assert verify_result.exit_code == 0, verify_result.output
+        verify_data = json.loads(verify_result.output)
+        assert verify_data["valid"] is True
+        assert verify_data["entries_checked"] == 0
+
+    def test_restore_without_clear_leaves_the_journal_untouched_for_disjoint_ids(
+        self,
+        runner: CliRunner,
+        journalled_db: Path,
+        unrelated_snapshot: Path,
+    ) -> None:
+        """A merge restore (no ``--clear``) leaves the journal alone when IDs don't collide.
+
+        ``unrelated_snapshot`` carries a single thought (``t-src``) whose ID is
+        disjoint from every ID already in ``journalled_db``, so this only
+        establishes that ``journal_entry`` survives untouched in that disjoint
+        case -- it keeps describing exactly the three pre-existing thoughts and
+        nothing about the merged-in ``t-src``. It says nothing about a
+        *colliding* ID: ``TestRestoreRefusesCollisionAgainstAJournalledStore``
+        below covers that case.
+        """
+        assert _journal_entry_count(journalled_db) == 3
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(journalled_db), "restore", "-i", str(unrelated_snapshot)],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Discarded" not in result.output
+        assert _journal_entry_count(journalled_db) == 3
+        assert _stored_core_ids(journalled_db)["thought"] == {
+            "t-old-0",
+            "t-old-1",
+            "t-old-2",
+            "t-src",
+        }
+
+        verify_result = runner.invoke(
+            cli,
+            ["--db", str(journalled_db), "--format", "json", "verify"],
+        )
+        assert verify_result.exit_code == 0, verify_result.output
+        verify_data = json.loads(verify_result.output)
+        assert verify_data["valid"] is True
+        assert verify_data["entries_checked"] == 3
+
+    def test_restore_service_with_clear_discards_the_journal(
+        self,
+        runner: CliRunner,
+        tmp_path: Path,
+        unrelated_snapshot: Path,
+    ) -> None:
+        """The ``--service`` restore path clears the journal exactly like the
+        single-database path.
+
+        Both branches route through the same ``_import_records_to_db``, but
+        that is an implementation detail this test does not assume -- it
+        drives the ``--service`` restore through the CLI and inspects the
+        resulting service database file directly.
+        """
+        services_dir = tmp_path / "services"
+        service_db = services_dir / "svc.db"
+        _write_journalled_thoughts(service_db, ["t-old-0", "t-old-1", "t-old-2"])
+        assert _journal_entry_count(service_db) == 3
+
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(services_dir / "ignored.db"),
+                "restore",
+                "-i",
+                str(unrelated_snapshot),
+                "--service",
+                "svc",
+                "--clear",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert _stored_core_ids(service_db)["thought"] == {"t-src"}
+        assert _journal_entry_count(service_db) == 0
+        assert "Discarded 3 journal entries" in result.output
+
+    def test_restore_service_refuses_collision_against_a_journalled_store(
+        self,
+        runner: CliRunner,
+        tmp_path: Path,
+        colliding_snapshot: Path,
+    ) -> None:
+        """The ``--service`` restore path is defended by the journalled-merge collision gate too.
+
+        Every collision and override test elsewhere in this module exercises
+        only the single-database restore path. ``_restore_service_snapshot``
+        forwards ``orphan_journal_entries`` to the same
+        ``_import_records_to_db`` the single-database path uses, but nothing
+        pinned that a default ``--service`` restore into a journalled target
+        is actually refused rather than merging silently.
+        ``colliding_snapshot`` carries a thought whose ID (``t-old-0``)
+        matches one already in the service database, with different
+        essence/content.
+        """
+        services_dir = tmp_path / "services"
+        service_db = services_dir / "svc.db"
+        _write_journalled_thoughts(service_db, ["t-old-0", "t-old-1", "t-old-2"])
+        assert _journal_entry_count(service_db) == 3
+
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(services_dir / "ignored.db"),
+                "restore",
+                "-i",
+                str(colliding_snapshot),
+                "--service",
+                "svc",
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "--orphan-journal-entries" in result.output
+        assert "journal_entry" in result.output
+
+        assert _stored_core_ids(service_db)["thought"] == {"t-old-0", "t-old-1", "t-old-2"}
+        conn = sqlite3.connect(service_db)
+        try:
+            live_content = conn.execute(
+                "SELECT content FROM thought WHERE thought_id = ?",
+                ("t-old-0",),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert live_content == "Content for t-old-0"
+        assert _journal_entry_count(service_db) == 3
+
+    def test_restore_service_orphan_journal_entries_overrides_the_gate(
+        self,
+        runner: CliRunner,
+        tmp_path: Path,
+        colliding_snapshot: Path,
+    ) -> None:
+        """``--orphan-journal-entries`` under ``--service`` restores the merge too.
+
+        Complements the refusal above: the same override flag
+        ``_restore_service_snapshot`` forwards must let this collision
+        through and replace in service mode -- the flag's entire purpose --
+        exactly as it does on the single-database path.
+        """
+        services_dir = tmp_path / "services"
+        service_db = services_dir / "svc.db"
+        _write_journalled_thoughts(service_db, ["t-old-0", "t-old-1", "t-old-2"])
+
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(services_dir / "ignored.db"),
+                "restore",
+                "-i",
+                str(colliding_snapshot),
+                "--service",
+                "svc",
+                "--orphan-journal-entries",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        conn = sqlite3.connect(service_db)
+        try:
+            live_content = conn.execute(
+                "SELECT content FROM thought WHERE thought_id = ?",
+                ("t-old-0",),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert live_content == "Replacement content for t-old-0"
+        # The journal is left exactly as before: the override does not touch
+        # journal_entry, it only changes which INSERT form is used.
+        assert _journal_entry_count(service_db) == 3
 
     def test_restore_invalid_service_name_is_distinct_clean_error(
         self,
@@ -654,6 +2843,1085 @@ class TestRestore:
         assert isinstance(result.exception, SystemExit)
 
 
+class TestRestoreRefusesCollisionAgainstAJournalledStore:
+    """A merge restore (no ``--clear``) refuses a collision once the target is journalled.
+
+    When the target's ``journal_entry`` table is non-empty and
+    ``--orphan-journal-entries`` is not given, the journalled-merge collision
+    gate in ``_import_records_to_db`` (``cli/main.py``) inserts incoming
+    records with a plain ``INSERT`` instead of ``INSERT OR REPLACE``, so
+    SQLite itself refuses the collision rather than replacing (or
+    cascade-deleting) a journalled row. These tests show the refusal and an
+    entirely untouched database, which is also the atomicity guarantee: the
+    rollback in ``_import_records_to_db`` discards the whole transaction,
+    including any record inserted before the one that collided.
+    """
+
+    def test_colliding_thought_id_is_refused_content_and_journal_untouched(
+        self,
+        runner: CliRunner,
+        journalled_db: Path,
+        colliding_snapshot: Path,
+    ) -> None:
+        """A colliding thought ID is refused; live content and the journal are both untouched.
+
+        ``colliding_snapshot`` carries a thought whose ID (``t-old-0``) matches
+        one already in ``journalled_db``, with different essence/content --
+        exactly the mismatch that was once silently accepted.
+        """
+        assert _journal_entry_count(journalled_db) == 3
+        before_deltas = _journal_entry_deltas(journalled_db, "t-old-0")
+        assert len(before_deltas) == 1
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(journalled_db), "restore", "-i", str(colliding_snapshot)],
+        )
+
+        assert result.exit_code != 0
+        assert "--orphan-journal-entries" in result.output
+        assert "journal_entry" in result.output
+
+        # Nothing was written: the live row keeps its original content ...
+        assert _stored_core_ids(journalled_db)["thought"] == {"t-old-0", "t-old-1", "t-old-2"}
+        conn = sqlite3.connect(journalled_db)
+        try:
+            live_content = conn.execute(
+                "SELECT content FROM thought WHERE thought_id = ?",
+                ("t-old-0",),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert live_content == "Content for t-old-0"
+
+        # ... and the journal is exactly as it was.
+        assert _journal_entry_count(journalled_db) == 3
+        assert _journal_entry_deltas(journalled_db, "t-old-0") == before_deltas
+
+        verify_result = runner.invoke(
+            cli,
+            ["--db", str(journalled_db), "--format", "json", "verify"],
+        )
+        assert verify_result.exit_code == 0, verify_result.output
+        verify_data = json.loads(verify_result.output)
+        assert verify_data["valid"] is True
+        assert verify_data["entries_checked"] == 3
+
+    def test_colliding_thought_id_is_refused_before_any_cascade_can_fire(
+        self,
+        runner: CliRunner,
+        journalled_db_with_edge: Path,
+        colliding_snapshot: Path,
+    ) -> None:
+        """A colliding thought ID is refused before its cascading edge delete can fire.
+
+        ``edge`` carries an ``ON DELETE CASCADE`` foreign key to ``thought`` on
+        both endpoints (schema_core.sql). An ``INSERT OR REPLACE`` resolving
+        the primary-key collision on ``t-old-0`` would delete the pre-existing
+        row first, and with ``PRAGMA foreign_keys = ON`` (always on for
+        restore, see ``_open_db``) that would cascade onto ``edge-001``. A
+        plain ``INSERT`` has no delete half, so that cascade path is
+        unreachable rather than merely mitigated: it never gets the chance to
+        fire.
+        """
+        assert _journal_entry_count(journalled_db_with_edge) == 3  # 2 thoughts + 1 edge
+
+        def _edge_count() -> int:
+            conn = sqlite3.connect(journalled_db_with_edge)
+            try:
+                row = conn.execute("SELECT COUNT(*) FROM edge").fetchone()
+                return int(row[0])
+            finally:
+                conn.close()
+
+        assert _edge_count() == 1
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(journalled_db_with_edge), "restore", "-i", str(colliding_snapshot)],
+        )
+
+        assert result.exit_code != 0
+        assert "--orphan-journal-entries" in result.output
+
+        assert _edge_count() == 1  # the cascade never fired: nothing was deleted
+        assert _journal_entry_count(journalled_db_with_edge) == 3
+        edge_deltas = _journal_entry_deltas(journalled_db_with_edge, "edge-001")
+        assert len(edge_deltas) == 1
+
+        verify_result = runner.invoke(
+            cli,
+            ["--db", str(journalled_db_with_edge), "--format", "json", "verify"],
+        )
+        assert verify_result.exit_code == 0, verify_result.output
+        verify_data = json.loads(verify_result.output)
+        assert verify_data["valid"] is True
+        assert verify_data["entries_checked"] == 3
+
+    def test_a_record_inserted_before_the_collision_is_also_rolled_back(
+        self,
+        runner: CliRunner,
+        journalled_db: Path,
+        colliding_snapshot_with_a_leading_new_record: Path,
+    ) -> None:
+        """The rollback discards a record inserted before the collision, too.
+
+        ``colliding_snapshot_with_a_leading_new_record`` carries
+        ``t-brand-new`` first, which the plain ``INSERT`` accepts with no
+        complaint, followed by ``t-old-0``, which collides with the
+        journalled target and aborts the whole restore. This is the class
+        docstring's own claim: the whole-transaction rollback in
+        ``_import_records_to_db`` must discard ``t-brand-new`` along with
+        refusing ``t-old-0``, not leave the earlier, otherwise-successful
+        insert sitting on disk.
+        """
+        # This test's whole premise is that ``t-brand-new`` precedes the
+        # colliding ``t-old-0`` in the snapshot below. The exporter's
+        # ``SELECT * FROM thought`` (cli/main.py) carries no ``ORDER BY``, so
+        # SQL does not guarantee that order -- it only happens to match
+        # creation order today. Pin the precondition here: if export order
+        # ever changes, this fails loudly instead of leaving the assertions
+        # below passing for the wrong reason (``t-brand-new`` absent because
+        # it was never attempted, not because the rollback discarded it).
+        snapshot_lines = [
+            json.loads(line)
+            for line in colliding_snapshot_with_a_leading_new_record.read_text(
+                encoding="utf-8"
+            ).splitlines()
+        ]
+        thought_ids_in_snapshot_order = [
+            line["data"]["thought_id"] for line in snapshot_lines if line.get("_type") == "thought"
+        ]
+        assert thought_ids_in_snapshot_order == ["t-brand-new", "t-old-0"]
+
+        assert _journal_entry_count(journalled_db) == 3
+
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(journalled_db),
+                "restore",
+                "-i",
+                str(colliding_snapshot_with_a_leading_new_record),
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "--orphan-journal-entries" in result.output
+
+        stored_ids = _stored_core_ids(journalled_db)["thought"]
+        assert "t-brand-new" not in stored_ids
+        assert stored_ids == {"t-old-0", "t-old-1", "t-old-2"}
+
+        conn = sqlite3.connect(journalled_db)
+        try:
+            live_content = conn.execute(
+                "SELECT content FROM thought WHERE thought_id = ?",
+                ("t-old-0",),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert live_content == "Content for t-old-0"
+        assert _journal_entry_count(journalled_db) == 3
+
+
+class TestJournalledMergeCollisionGate:
+    """The rest of the journalled-merge collision gate's required verification.
+
+    Complements ``TestRestoreRefusesCollisionAgainstAJournalledStore`` with the
+    cases that class does not cover: an identical-content restore (no value
+    differs, only the primary key collides), a journal entry recorded with an
+    unrecognised ``mutation_type``, the composite ``UNIQUE`` on ``edge`` that a
+    primary-id probe would miss, the negative control proving the gate is
+    scoped to a non-empty journal, and the ``--orphan-journal-entries``
+    override itself.
+    """
+
+    def test_identical_restore_is_refused_and_rowids_never_move(
+        self,
+        runner: CliRunner,
+        journalled_db: Path,
+        identical_snapshot_of_journalled_db: Path,
+    ) -> None:
+        """Restoring a store's own snapshot back into itself is refused.
+
+        Every value in the incoming record matches what is already stored --
+        only the primary key collides. An ``INSERT OR REPLACE`` would still
+        resolve that collision by deleting and re-inserting the row, which
+        silently changes its ``rowid`` (and, with it, desynchronises anything
+        keyed on ``rowid``, such as the ``thought_fts`` external-content index
+        or a persisted sqlite-vec table) even though no column value differs.
+        A plain ``INSERT`` never reaches that delete-and-recreate at all.
+        """
+        before_rowids = _thought_rowids(journalled_db)
+        # "content" matches every journalled thought's own content column
+        # (`_write_journalled_thoughts` writes "Content for {thought_id}"), so
+        # this is a real per-entry count of the FTS index, not of `thought`.
+        before_fts = _thought_fts_match_count(journalled_db, "content")
+        assert before_fts == 3
+        assert _journal_entry_count(journalled_db) == 3
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(journalled_db), "restore", "-i", str(identical_snapshot_of_journalled_db)],
+        )
+
+        assert result.exit_code != 0
+        assert "--orphan-journal-entries" in result.output
+
+        assert _thought_rowids(journalled_db) == before_rowids
+        # The refused restore never inserted anything, so the index carries
+        # exactly the entries it started with -- neither a stale leftover from
+        # a delete-and-recreate nor a duplicate.
+        assert _thought_fts_match_count(journalled_db, "content") == before_fts
+        assert _journal_entry_count(journalled_db) == 3
+
+    def test_unrecognised_mutation_type_does_not_bypass_the_gate(
+        self,
+        runner: CliRunner,
+        custom_mutation_db: Path,
+        colliding_snapshot_for_custom_mutation_db: Path,
+    ) -> None:
+        """A ``CUSTOM_MUTATION`` journal entry gates a collision exactly like any other.
+
+        The gate only asks whether ``journal_entry`` has rows; it never reads
+        ``mutation_type``. A detector that instead tried to interpret the
+        journal's content could be bypassed by a value it did not recognise;
+        that cannot happen here, because nothing about this record's insert
+        depends on what ``mutation_type`` says.
+        """
+        assert _journal_entry_count(custom_mutation_db) == 1
+        conn = sqlite3.connect(custom_mutation_db)
+        try:
+            before_content = conn.execute(
+                "SELECT content FROM thought WHERE thought_id = 't-cm-0'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert before_content == "Content for t-cm-0"
+
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(custom_mutation_db),
+                "restore",
+                "-i",
+                str(colliding_snapshot_for_custom_mutation_db),
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "--orphan-journal-entries" in result.output
+
+        conn = sqlite3.connect(custom_mutation_db)
+        try:
+            after_content = conn.execute(
+                "SELECT content FROM thought WHERE thought_id = 't-cm-0'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert after_content == before_content
+        assert _journal_entry_count(custom_mutation_db) == 1
+
+    def test_fresh_edge_id_with_duplicate_triple_is_refused(
+        self,
+        runner: CliRunner,
+        journalled_db_with_edge: Path,
+        fresh_edge_id_duplicate_triple_snapshot: Path,
+    ) -> None:
+        """A brand-new ``edge_id`` sharing an existing edge's triple is refused.
+
+        The incoming record does not collide with ``edge-001`` on
+        ``edge_id`` -- it has a different one (``edge-999``) -- so a probe
+        keyed on primary ids would see no collision at all. It collides on
+        ``edge``'s composite ``UNIQUE(from_thought_id, to_thought_id,
+        edge_type)`` (schema_core.sql), which the plain ``INSERT`` leaves to
+        SQLite itself to catch.
+        """
+        conn = sqlite3.connect(journalled_db_with_edge)
+        try:
+            before_edge_id = conn.execute(
+                "SELECT edge_id FROM edge WHERE from_thought_id = 't-old-0' "
+                "AND to_thought_id = 't-old-1'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert before_edge_id == "edge-001"
+
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(journalled_db_with_edge),
+                "restore",
+                "-i",
+                str(fresh_edge_id_duplicate_triple_snapshot),
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "--orphan-journal-entries" in result.output
+
+        conn = sqlite3.connect(journalled_db_with_edge)
+        try:
+            row = conn.execute("SELECT COUNT(*) FROM edge").fetchone()
+            edge_count = int(row[0])
+            surviving_edge_id = conn.execute(
+                "SELECT edge_id FROM edge WHERE from_thought_id = 't-old-0' "
+                "AND to_thought_id = 't-old-1'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert edge_count == 1
+        assert surviving_edge_id == "edge-001"  # the original edge, not edge-999
+
+    def test_colliding_restore_into_an_empty_journal_still_replaces(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        colliding_snapshot_for_populated_db: Path,
+    ) -> None:
+        """The negative control: an empty ``journal_entry`` keeps the original merge behavior.
+
+        ``populated_db`` is never journalled, which is also the overwhelmingly
+        common case in practice -- the CLI has no flag that enables
+        journaling. This restore must still succeed and still replace,
+        proving the gate is scoped to a non-empty journal rather than having
+        quietly changed the default merge behavior for everyone.
+        """
+        assert _journal_entry_count(populated_db) == 0
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(populated_db), "restore", "-i", str(colliding_snapshot_for_populated_db)],
+        )
+
+        assert result.exit_code == 0, result.output
+        conn = sqlite3.connect(populated_db)
+        try:
+            live_content = conn.execute(
+                "SELECT content FROM thought WHERE thought_id = 'thought-000'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert live_content == "Replacement content for thought-000"
+
+    def test_orphan_journal_entries_overrides_the_gate(
+        self,
+        runner: CliRunner,
+        journalled_db: Path,
+        colliding_snapshot: Path,
+    ) -> None:
+        """``--orphan-journal-entries`` restores the unconditional ``INSERT OR REPLACE`` merge.
+
+        The same collision ``TestRestoreRefusesCollisionAgainstAJournalledStore``
+        shows refused succeeds and replaces once the override is passed,
+        which is the flag's entire purpose: a caller who has weighed the gap
+        and wants the merge anyway.
+        """
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(journalled_db),
+                "restore",
+                "-i",
+                str(colliding_snapshot),
+                "--orphan-journal-entries",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        conn = sqlite3.connect(journalled_db)
+        try:
+            live_content = conn.execute(
+                "SELECT content FROM thought WHERE thought_id = 't-old-0'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert live_content == "Replacement content for t-old-0"
+        # The journal is left exactly as before: the override does not touch
+        # journal_entry, it only changes which INSERT form is used.
+        assert _journal_entry_count(journalled_db) == 3
+
+    def test_restore_help_names_the_override_flag(self, runner: CliRunner) -> None:
+        result = runner.invoke(cli, ["restore", "--help"])
+        assert result.exit_code == 0, result.output
+        assert "--orphan-journal-entries" in result.output
+
+    def test_foreign_key_violation_still_propagates_unchanged_under_the_gate(
+        self,
+        runner: CliRunner,
+        journalled_db: Path,
+    ) -> None:
+        """A foreign-key violation is a different, pre-existing error and keeps its own kind.
+
+        An incoming edge whose endpoints do not exist in the target violates
+        ``edge``'s foreign keys to ``thought`` -- a ``sqlite3.IntegrityError``
+        with ``sqlite_errorcode`` ``787`` (``SQLITE_CONSTRAINT_FOREIGNKEY``),
+        never ``1555`` or ``2067``. The gate must not catch this: it is not a
+        collision the gate is scoped to, so it never becomes the gate's own
+        ``click.ClickException`` (naming ``--orphan-journal-entries``)
+        regardless of whether the journalled-merge collision gate is active
+        for this restore.
+
+        It does not escape the CLI *uncaught*, though: ``_run_command``
+        (see ``engrava.cli.main``) converts it into exit ``1`` with a
+        message naming the resolved database and the exception's own type
+        and text -- not a raw traceback. That conversion is exactly why
+        ``sqlite3.IntegrityError`` / ``sqlite_errorcode`` are not observable
+        through ``result.exception`` or ``result.output``: the printed text is
+        ``"restore: <path>: unexpected IntegrityError: FOREIGN KEY
+        constraint failed"``, and nowhere in it -- not in the command name,
+        not in the path, not in the exception's own text -- does SQLite's
+        numeric error code ever appear. This test therefore
+        pins the type/code claim directly against ``_import_records_to_db``
+        -- the function ``restore`` calls, one layer below the boundary that
+        converts the exception -- and pins the CLI-visible behaviour (exit
+        code, database naming, no gate message) separately against the
+        ``restore`` command itself.
+        """
+        snap = journalled_db.parent / "fk-violation.jsonl"
+        edge_data = {
+            "edge_id": "edge-fk-1",
+            "from_thought_id": "missing-a",
+            "to_thought_id": "missing-b",
+            "edge_type": "ASSOCIATED",
+            "weight": 0.5,
+            "created_cycle": 1,
+        }
+        snap.write_text(json.dumps({"_type": "edge", "data": edge_data}) + "\n", encoding="utf-8")
+
+        async def _direct_import() -> BaseException:
+            import aiosqlite
+
+            conn = await aiosqlite.connect(str(journalled_db))
+            try:
+                # SQLite ships with foreign-key enforcement off per connection;
+                # ``restore`` itself turns this on when it opens its own
+                # connection (see ``_open_db`` in ``engrava.cli.main``), so a
+                # direct connection needs the same pragma to reproduce the
+                # violation this test pins.
+                await conn.execute("PRAGMA foreign_keys = ON")
+                await _import_records_to_db(conn, snap, orphan_journal_entries=False)
+            except BaseException as exc:  # noqa: BLE001 -- pinning exactly what escapes here
+                return exc
+            finally:
+                await conn.close()
+            pytest.fail("_import_records_to_db did not raise for an FK violation")
+
+        direct_exc = asyncio.run(_direct_import())
+        assert type(direct_exc) is sqlite3.IntegrityError, direct_exc
+        assert direct_exc.sqlite_errorcode == 787
+        assert direct_exc.sqlite_errorcode not in (1555, 2067)
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(journalled_db), "restore", "-i", str(snap)],
+            standalone_mode=False,
+        )
+
+        assert isinstance(result.exception, SystemExit), result.exception
+        assert result.exception.code == 1
+        assert str(journalled_db) in result.output
+        assert "IntegrityError" in result.output
+        assert "orphan-journal-entries" not in result.output
+
+    async def test_a_refused_collision_leaves_the_connection_out_of_a_transaction(
+        self,
+        colliding_snapshot: Path,
+        tmp_path: Path,
+    ) -> None:
+        """A refused collision leaves ``in_transaction`` false on the caller's own open connection.
+
+        A restore run through the CLI closes its connection afterward, and
+        closing an ``aiosqlite`` connection implicitly rolls back an open
+        transaction, so such a run does not show whether an explicit
+        rollback in ``_import_records_to_db``'s error path was silently
+        removed. This calls ``_import_records_to_db`` directly on a
+        connection it keeps open across the call, so only the explicit
+        rollback -- not connection teardown -- can account for the result.
+        """
+        import aiosqlite
+
+        from engrava import (
+            LifecycleStatus,
+            Priority,
+            SqliteEngravaCore,
+            ThoughtRecord,
+            ThoughtType,
+        )
+
+        db_path = tmp_path / "direct-target.db"
+        conn = await aiosqlite.connect(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        try:
+            # Built directly against the domain API, in-line, rather than via
+            # ``_write_journalled_thoughts`` -- that helper's own ``asyncio.run()``
+            # cannot be called from inside this test's already-running event loop.
+            store = SqliteEngravaCore(conn, journal_enabled=True)
+            await store.ensure_schema()
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id="t-old-0",
+                    essence="Essence for t-old-0",
+                    content="Content for t-old-0",
+                    thought_type=ThoughtType.OBSERVATION,
+                    source="test",
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    priority=Priority.P2,
+                    created_cycle=1,
+                    updated_cycle=1,
+                )
+            )
+            await conn.commit()
+
+            with pytest.raises(click.ClickException):
+                await _import_records_to_db(conn, colliding_snapshot, orphan_journal_entries=False)
+
+            assert not conn.in_transaction
+        finally:
+            await conn.close()
+
+    async def test_a_rollback_failure_during_cleanup_does_not_replace_the_original_error(
+        self,
+        colliding_snapshot: Path,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A rollback failure while a collision error is propagating must not
+        replace it.
+
+        The collision ``click.ClickException`` is the message a user restoring
+        into a journalled store can act on; a rollback failure in
+        ``_import_records_to_db``'s cleanup (a disk error, say) must not be
+        raised in front of it. The collision error reaches the caller
+        unchanged and the rollback failure is only in the log.
+        """
+        import aiosqlite
+
+        from engrava import (
+            LifecycleStatus,
+            Priority,
+            SqliteEngravaCore,
+            ThoughtRecord,
+            ThoughtType,
+        )
+
+        db_path = tmp_path / "rollback-failure-target.db"
+        conn = await aiosqlite.connect(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        try:
+            store = SqliteEngravaCore(conn, journal_enabled=True)
+            await store.ensure_schema()
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id="t-old-0",
+                    essence="Essence for t-old-0",
+                    content="Content for t-old-0",
+                    thought_type=ThoughtType.OBSERVATION,
+                    source="test",
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    priority=Priority.P2,
+                    created_cycle=1,
+                    updated_cycle=1,
+                )
+            )
+            await conn.commit()
+
+            real_rollback = conn.rollback
+
+            async def _failing_rollback() -> None:
+                await real_rollback()
+                msg = "injected rollback failure"
+                raise sqlite3.OperationalError(msg)
+
+            conn.rollback = _failing_rollback  # type: ignore[method-assign]
+
+            with (
+                caplog.at_level(logging.WARNING),
+                pytest.raises(click.ClickException) as exc_info,
+            ):
+                await _import_records_to_db(conn, colliding_snapshot, orphan_journal_entries=False)
+
+            # The caller sees the ORIGINAL collision error, not the rollback's.
+            assert "injected rollback failure" not in str(exc_info.value)
+            # ...and the rollback failure is logged underneath it.
+            assert "Error rolling back transaction during cleanup" in caplog.text
+            assert "injected rollback failure" in caplog.text
+        finally:
+            conn.rollback = real_rollback  # type: ignore[method-assign]
+            await conn.close()
+
+    def test_a_clean_restore_is_unaffected_by_the_rollback_cleanup_path(
+        self,
+        colliding_snapshot_with_a_leading_new_record: Path,
+        journalled_db: Path,
+    ) -> None:
+        """Control: an ordinary, non-colliding restore never touches the
+        rollback-failure path at all -- it commits and returns normally.
+        """
+        runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(journalled_db),
+                "restore",
+                "-i",
+                str(colliding_snapshot_with_a_leading_new_record),
+                "--orphan-journal-entries",
+            ],
+            standalone_mode=False,
+        )
+        assert result.exit_code == 0, result.output
+
+
+class TestRestoreRebuildsFtsIndex:
+    """A restore never leaves ``thought_fts`` carrying a stale entry.
+
+    Without ``PRAGMA recursive_triggers`` (unset anywhere under ``src/``, so it
+    stays at SQLite's default of off), an ``INSERT OR REPLACE`` that resolves a
+    primary-key or ``UNIQUE`` collision by deleting the existing row and
+    re-inserting it fires ``thought_fts_insert`` for the new rowid but never
+    fires ``thought_fts_delete`` for the one it removed -- that trigger only
+    runs for a ``DELETE`` a caller actually issues, never for one SQLite
+    performs internally to resolve a conflicting ``REPLACE``. The stale entry
+    then survives, keyed to a rowid ``thought`` may hand to a completely
+    unrelated row later, at which point a keyword search for the old content
+    resolves to that unrelated row instead.
+
+    The helper :func:`_assert_fts_index_matches_live_thoughts` compares
+    ``thought_fts``'s real ``MATCH`` rowids with a fresh re-index of
+    ``thought``'s current rows. A bare ``SELECT COUNT(*) FROM thought_fts``
+    reads straight through to ``thought`` on this external-content table and
+    cannot observe any of this (see :func:`_thought_fts_match_count`'s own
+    docstring).
+    """
+
+    def test_merge_restore_into_its_own_source_leaves_no_stale_row(
+        self,
+        runner: CliRunner,
+        tmp_path: Path,
+    ) -> None:
+        """Case 1: an ordinary merge restore (no journal) of a DB's own snapshot into itself.
+
+        Both thoughts collide on their own unchanged primary key; the index
+        must end with exactly one entry per live "alpha" thought (two in all).
+        """
+        db = tmp_path / "alpha.db"
+        r1 = runner.invoke(cli, ["--db", str(db), "remember", "alpha apples orchard"])
+        assert r1.exit_code == 0, r1.output
+        r2 = runner.invoke(cli, ["--db", str(db), "remember", "alpha avocado grove"])
+        assert r2.exit_code == 0, r2.output
+        assert _journal_entry_count(db) == 0
+
+        snap = tmp_path / "alpha.jsonl"
+        result = runner.invoke(cli, ["--db", str(db), "snapshot", "-o", str(snap)])
+        assert result.exit_code == 0, result.output
+
+        result = runner.invoke(cli, ["--db", str(db), "restore", "-i", str(snap)])
+        assert result.exit_code == 0, result.output
+
+        assert _thought_fts_match_count(db, "alpha") == 2
+        _assert_fts_index_matches_live_thoughts(db, "alpha")
+        _assert_recall_never_returns_a_mismatch(runner, db, "alpha")
+
+    def test_journalled_merge_restore_under_the_override_leaves_no_stale_row(
+        self,
+        runner: CliRunner,
+        journalled_db: Path,
+        identical_snapshot_of_journalled_db: Path,
+    ) -> None:
+        """Case 2: the same, on a journalled database, forced via ``--orphan-journal-entries``.
+
+        Without the override this restore is refused outright by the
+        journalled-merge collision gate (see
+        ``test_identical_restore_is_refused_and_rowids_never_move``), which is
+        exactly why the gate closes this class of damage for the common case
+        -- this test covers the caller who explicitly passes
+        ``--orphan-journal-entries`` and still must not get a stale index out of it.
+        """
+        assert _journal_entry_count(journalled_db) == 3
+        assert _thought_fts_match_count(journalled_db, "content") == 3
+
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(journalled_db),
+                "restore",
+                "-i",
+                str(identical_snapshot_of_journalled_db),
+                "--orphan-journal-entries",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+        assert _thought_fts_match_count(journalled_db, "content") == 3
+        _assert_fts_index_matches_live_thoughts(journalled_db, "content")
+        _assert_recall_never_returns_a_mismatch(runner, journalled_db, "content")
+        # The rebuild only ever rewrites thought_fts -- the journal itself is
+        # untouched, and still verifies clean.
+        assert _journal_entry_count(journalled_db) == 3
+        verify_result = runner.invoke(
+            cli, ["--db", str(journalled_db), "--format", "json", "verify"]
+        )
+        assert verify_result.exit_code == 0, verify_result.output
+        verify_data = json.loads(verify_result.output)
+        assert verify_data["valid"] is True
+        assert verify_data["entries_checked"] == 3
+
+    def test_clear_restore_after_a_merge_never_lets_recall_return_the_wrong_thought(
+        self,
+        runner: CliRunner,
+        tmp_path: Path,
+    ) -> None:
+        """Case 3: case 1's merge, followed by a ``--clear`` restore of unrelated data.
+
+        A stale "alpha" entry left by the merge would point at a rowid that
+        the first "zulu" insert reuses after ``--clear`` empties the table, so
+        ``recall "alpha"`` would resolve it to a "zulu" thought that does not
+        contain the word at all.
+        """
+        db = tmp_path / "alpha.db"
+        r1 = runner.invoke(cli, ["--db", str(db), "remember", "alpha apples orchard"])
+        assert r1.exit_code == 0, r1.output
+        r2 = runner.invoke(cli, ["--db", str(db), "remember", "alpha avocado grove"])
+        assert r2.exit_code == 0, r2.output
+        snap = tmp_path / "alpha.jsonl"
+        assert runner.invoke(cli, ["--db", str(db), "snapshot", "-o", str(snap)]).exit_code == 0
+        result = runner.invoke(cli, ["--db", str(db), "restore", "-i", str(snap)])
+        assert result.exit_code == 0, result.output
+
+        zulu_db = tmp_path / "zulu.db"
+        assert (
+            runner.invoke(cli, ["--db", str(zulu_db), "remember", "zulu zebra stripes"]).exit_code
+            == 0
+        )
+        assert (
+            runner.invoke(cli, ["--db", str(zulu_db), "remember", "zulu zinc metal"]).exit_code == 0
+        )
+        zulu_snap = tmp_path / "zulu.jsonl"
+        assert (
+            runner.invoke(cli, ["--db", str(zulu_db), "snapshot", "-o", str(zulu_snap)]).exit_code
+            == 0
+        )
+
+        result = runner.invoke(cli, ["--db", str(db), "restore", "-i", str(zulu_snap), "--clear"])
+        assert result.exit_code == 0, result.output
+
+        assert _thought_fts_match_count(db, "alpha") == 0
+        _assert_fts_index_matches_live_thoughts(db, "alpha")
+        _assert_fts_index_matches_live_thoughts(db, "zulu")
+        _assert_recall_never_returns_a_mismatch(runner, db, "alpha")
+
+    def test_merge_restore_heals_stale_rows_an_older_build_already_left_behind(
+        self,
+        runner: CliRunner,
+        plain_thoughts_db: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Case 4a: a merge restore into an already-damaged database comes out consistent.
+
+        The damage is built directly at the SQL level
+        (:func:`_corrupt_fts_with_raw_replace`), without going through
+        ``restore``. A per-row-delete-before-REPLACE alternative would not
+        heal this: the damage sits on a row this restore's own snapshot never
+        even mentions, so it has nothing to key a delete on. An
+        unconditional, full rebuild reaches it.
+        """
+        _corrupt_fts_with_raw_replace(plain_thoughts_db, "p-0")
+        # Sanity: the corruption landed -- a stale entry plus a fresh one.
+        assert len(_fts_match_rowids(plain_thoughts_db, "p-0")) == 2
+
+        source_db = tmp_path / "disjoint-source.db"
+        assert runner.invoke(cli, ["--db", str(source_db), "migrate"]).exit_code == 0
+
+        import asyncio
+
+        import aiosqlite
+
+        from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+
+        async def _seed() -> None:
+            conn = await aiosqlite.connect(str(source_db))
+            conn.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(conn)
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id="p-disjoint",
+                    essence="Essence for p-disjoint",
+                    content="Content for p-disjoint",
+                    thought_type=ThoughtType.OBSERVATION,
+                    source="test",
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    priority=Priority.P2,
+                    created_cycle=1,
+                    updated_cycle=1,
+                )
+            )
+            await conn.commit()
+            await conn.close()
+
+        asyncio.run(_seed())
+        disjoint_snap = tmp_path / "disjoint.jsonl"
+        disjoint_snap_result = runner.invoke(
+            cli, ["--db", str(source_db), "snapshot", "-o", str(disjoint_snap)]
+        )
+        assert disjoint_snap_result.exit_code == 0, disjoint_snap_result.output
+
+        result = runner.invoke(
+            cli, ["--db", str(plain_thoughts_db), "restore", "-i", str(disjoint_snap)]
+        )
+        assert result.exit_code == 0, result.output
+
+        assert len(_fts_match_rowids(plain_thoughts_db, "p-0")) == 1
+        _assert_fts_index_matches_live_thoughts(plain_thoughts_db, "p-0")
+        _assert_fts_index_matches_live_thoughts(plain_thoughts_db, "p-disjoint")
+        _assert_recall_never_returns_a_mismatch(runner, plain_thoughts_db, "p-0")
+        _assert_recall_never_returns_a_mismatch(runner, plain_thoughts_db, "p-disjoint")
+
+    def test_clear_restore_heals_stale_rows_an_older_build_already_left_behind(
+        self,
+        runner: CliRunner,
+        plain_thoughts_db: Path,
+        unrelated_snapshot: Path,
+    ) -> None:
+        """Case 4b: same as above, through the ``--clear`` path instead of a plain merge."""
+        _corrupt_fts_with_raw_replace(plain_thoughts_db, "p-0")
+        assert len(_fts_match_rowids(plain_thoughts_db, "p-0")) == 2
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(plain_thoughts_db), "restore", "-i", str(unrelated_snapshot), "--clear"],
+        )
+        assert result.exit_code == 0, result.output
+
+        # --clear discards p-0 itself along with everything else, so "p-0" now
+        # matches nothing at all -- not even the stale leftover.
+        assert len(_fts_match_rowids(plain_thoughts_db, "p-0")) == 0
+        _assert_fts_index_matches_live_thoughts(plain_thoughts_db, "p-0")
+        _assert_fts_index_matches_live_thoughts(plain_thoughts_db, "t-src")
+        _assert_recall_never_returns_a_mismatch(runner, plain_thoughts_db, "p-0")
+        _assert_recall_never_returns_a_mismatch(runner, plain_thoughts_db, "t-src")
+
+    def test_documented_repair_command_heals_a_damaged_journalled_database(
+        self,
+        journalled_db: Path,
+    ) -> None:
+        """Case 5: the documented repair command, run directly against an already-damaged,
+        journalled database.
+
+        Builds the same standalone damage as the merge-restore cases above,
+        then executes the exact SQL documented in ``docs/troubleshooting.md``
+        directly against the file -- never through ``engrava`` -- and checks
+        it leaves the index consistent while touching neither ``thought`` nor
+        the journal: SQLite's own FTS5 ``'rebuild'`` command reconstructs the
+        index purely from ``thought``'s current rows and the table's own
+        already-configured tokenizer, so it has no reason to write to either.
+
+        ``journalled_db`` holds exactly three thoughts (``t-old-0..2``), each
+        with its own id embedded in its essence/content -- checking all three
+        terms below, not just the one that was corrupted, is a complete sweep
+        of every row this database holds, matching what the documentation
+        claims ("every `MATCH` result... names only rows that actually
+        contain the term"). Comparing full rows
+        (:func:`_full_thought_table_snapshot`), not just the surviving id set,
+        is what backs the documentation's separate claim that `thought`'s rows
+        are left unchanged: an id-only comparison cannot see a column that
+        changed on a row whose id happens to survive.
+        """
+        _corrupt_fts_with_raw_replace(journalled_db, "t-old-0")
+        assert len(_fts_match_rowids(journalled_db, "t-old-0")) == 2
+
+        before_journal_count = _journal_entry_count(journalled_db)
+        assert before_journal_count == 3
+        before_thought_rows = _full_thought_table_snapshot(journalled_db)
+        assert len(before_thought_rows) == 3
+
+        conn = sqlite3.connect(journalled_db)
+        try:
+            conn.execute("INSERT INTO thought_fts(thought_fts) VALUES('rebuild');")
+            conn.commit()
+        finally:
+            conn.close()
+
+        assert len(_fts_match_rowids(journalled_db, "t-old-0")) == 1
+        runner = CliRunner()
+        for term in ("t-old-0", "t-old-1", "t-old-2"):
+            _assert_fts_index_matches_live_thoughts(journalled_db, term)
+            _assert_recall_never_returns_a_mismatch(runner, journalled_db, term)
+        assert _full_thought_table_snapshot(journalled_db) == before_thought_rows
+        assert _journal_entry_count(journalled_db) == before_journal_count
+
+        verify_result = runner.invoke(
+            cli, ["--db", str(journalled_db), "--format", "json", "verify"]
+        )
+        assert verify_result.exit_code == 0, verify_result.output
+        verify_data = json.loads(verify_result.output)
+        assert verify_data["valid"] is True
+        assert verify_data["entries_checked"] == before_journal_count
+
+    def test_merge_restore_with_no_thought_records_still_heals_stale_rows(
+        self,
+        runner: CliRunner,
+        plain_thoughts_db: Path,
+        tmp_path: Path,
+    ) -> None:
+        """A restore whose snapshot carries no thought record still heals prior damage.
+
+        Every other case in this class restores a snapshot that happens to
+        carry at least one thought record, which a narrower, wrong fix --
+        rebuilding only when the import actually touched a thought (gated on,
+        say, ``stream_result.total_records`` or "did this stream include a
+        THOUGHT record") -- would satisfy by accident and pass every one of
+        them anyway. This restores a metadata-only snapshot (exported from a
+        freshly migrated, otherwise empty database: ``engrava snapshot``
+        writes exactly one metadata header line and nothing else for it) into
+        an already-damaged target, so a conditional rebuild has nothing to
+        trigger on and the damage would survive under it.
+        """
+        _corrupt_fts_with_raw_replace(plain_thoughts_db, "p-0")
+        assert len(_fts_match_rowids(plain_thoughts_db, "p-0")) == 2
+
+        empty_source = tmp_path / "empty-source.db"
+        assert runner.invoke(cli, ["--db", str(empty_source), "migrate"]).exit_code == 0
+        empty_snap = tmp_path / "empty.jsonl"
+        snap_result = runner.invoke(
+            cli, ["--db", str(empty_source), "snapshot", "-o", str(empty_snap)]
+        )
+        assert snap_result.exit_code == 0, snap_result.output
+        # Sanity: genuinely no thought (or any other core-table) record here.
+        assert _snapshot_line_types(empty_snap) == {"metadata"}
+
+        result = runner.invoke(
+            cli, ["--db", str(plain_thoughts_db), "restore", "-i", str(empty_snap)]
+        )
+        assert result.exit_code == 0, result.output
+
+        assert len(_fts_match_rowids(plain_thoughts_db, "p-0")) == 1
+        _assert_fts_index_matches_live_thoughts(plain_thoughts_db, "p-0")
+        _assert_recall_never_returns_a_mismatch(runner, plain_thoughts_db, "p-0")
+
+    def test_clear_restore_with_no_thought_records_still_heals_stale_rows(
+        self,
+        runner: CliRunner,
+        plain_thoughts_db: Path,
+        tmp_path: Path,
+    ) -> None:
+        """Same guard as above, through ``--clear`` -- which also discards ``p-0`` itself."""
+        _corrupt_fts_with_raw_replace(plain_thoughts_db, "p-0")
+        assert len(_fts_match_rowids(plain_thoughts_db, "p-0")) == 2
+
+        empty_source = tmp_path / "empty-source-2.db"
+        assert runner.invoke(cli, ["--db", str(empty_source), "migrate"]).exit_code == 0
+        empty_snap = tmp_path / "empty-2.jsonl"
+        snap_result = runner.invoke(
+            cli, ["--db", str(empty_source), "snapshot", "-o", str(empty_snap)]
+        )
+        assert snap_result.exit_code == 0, snap_result.output
+        assert _snapshot_line_types(empty_snap) == {"metadata"}
+
+        result = runner.invoke(
+            cli,
+            ["--db", str(plain_thoughts_db), "restore", "-i", str(empty_snap), "--clear"],
+        )
+        assert result.exit_code == 0, result.output
+
+        # --clear discards p-0 itself along with everything else, so "p-0" now
+        # matches nothing at all -- not even the stale leftover.
+        assert len(_fts_match_rowids(plain_thoughts_db, "p-0")) == 0
+        _assert_fts_index_matches_live_thoughts(plain_thoughts_db, "p-0")
+        _assert_recall_never_returns_a_mismatch(runner, plain_thoughts_db, "p-0")
+
+
+class _FakeRollbackConnection:
+    """Stand-in connection for testing the CLI's ``_rollback_quietly`` in isolation.
+
+    Mirrors ``_FakeConnection`` (used for ``_close_quietly``): ``started`` fires
+    the instant ``rollback()`` begins running so a test can wait for it to
+    genuinely be in flight before delivering a cancellation, and ``may_finish``
+    holds it from completing until the test says so.
+    """
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.may_finish = asyncio.Event()
+        self.finished = False
+
+    async def rollback(self) -> None:
+        self.started.set()
+        await self.may_finish.wait()
+        self.finished = True
+
+
+class _FailingRollbackConnection:
+    """A connection whose ``rollback()`` raises an ordinary exception."""
+
+    async def rollback(self) -> None:
+        msg = "rollback blew up"
+        raise RuntimeError(msg)
+
+
+class TestCliRollbackQuietlyCancellation:
+    """``_rollback_quietly`` needs the same cancellation handling as ``_close_quietly``.
+
+    A rollback and a close are different statements with the same shape of
+    problem: both are aiosqlite suspension points, so an unshielded
+    cancellation could abandon either mid-flight. The cancellation test holds
+    the rollback open while the cancellation lands and checks that the cleanup
+    is still waiting for it.
+    """
+
+    async def test_the_rollback_still_completes_when_cancelled_mid_rollback(self) -> None:
+        """A cancelled cleanup keeps waiting for the shielded rollback to finish.
+
+        The rollback is held open (``may_finish`` stays unset) while the
+        cancellation lands, and the cleanup task must not be done yet. A
+        cleanup that hands the cancellation back without waiting for the
+        rollback, or that awaits the rollback without shielding it, fails
+        here. Releasing the rollback straight after ``cancel()`` would not
+        fail the first kind, because the rollback can finish before
+        anything looks.
+        """
+        conn = _FakeRollbackConnection()
+        task = asyncio.create_task(_rollback_quietly(conn))
+        await conn.started.wait()
+        task.cancel()
+        # Let the cancellation land while the rollback is still held open.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert not conn.finished
+        assert not task.done(), (
+            "the cancelled cleanup returned while the rollback was still in "
+            "flight -- it must keep waiting for the shielded rollback to finish"
+        )
+
+        conn.may_finish.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert conn.finished, (
+            "conn.rollback() never ran to completion under cancellation -- the "
+            "exact leak _rollback_quietly exists to prevent"
+        )
+
+    async def test_an_ordinary_exception_from_rollback_is_still_swallowed_and_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Control: the documented, uncancelled behaviour must be unchanged."""
+        conn = _FailingRollbackConnection()
+        with caplog.at_level(logging.WARNING):
+            await _rollback_quietly(conn)
+
+        assert "Error rolling back transaction during cleanup" in caplog.text
+
+
 class TestGc:
     """Tests for ``engrava gc``."""
 
@@ -673,7 +3941,12 @@ class TestGc:
     def test_gc_dry_run(self, runner: CliRunner, populated_db: Path) -> None:
         result = runner.invoke(cli, ["--db", str(populated_db), "gc", "--dry-run"])
         assert result.exit_code == 0
-        assert "Would delete 1" in result.output
+        # The dry run is read immediately before the destructive run, so it must
+        # name every row category the real run deletes, not just the thoughts
+        # its count covers.
+        assert "Would delete 1 archived thoughts" in result.output
+        assert "edges, embeddings, and actions" in result.output
+        assert "orphaned edges" not in result.output
 
         # Verify nothing actually deleted
         check = runner.invoke(
@@ -682,6 +3955,12 @@ class TestGc:
         )
         data = json.loads(check.output)
         assert data["thoughts"]["total"] == 3
+
+    def test_gc_help_names_full_blast_radius(self, runner: CliRunner) -> None:
+        result = runner.invoke(cli, ["gc", "--help"])
+        assert result.exit_code == 0
+        assert "edges, embeddings, and actions" in result.output
+        assert "orphaned edges" not in result.output
 
     def test_gc_nothing_to_collect(self, runner: CliRunner, populated_db: Path) -> None:
         # First gc removes the archived one
@@ -701,6 +3980,380 @@ class TestMigrate:
         assert result.exit_code == 0
         assert "Schema up to date" in result.output
         assert new_db.exists()
+
+
+@pytest.fixture
+def two_thought_one_edge_db(db_path: Path) -> Path:
+    """A DB with exactly thoughts T1, T2 and edge E0 (T1 -> T2).
+
+    Deliberately just these three rows -- unlike ``populated_db``'s three
+    thoughts and one edge -- so the consistency test below has nothing else
+    to account for when it asserts the export equals this pre-commit state
+    exactly.
+    """
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import (
+        EdgeRecord,
+        EdgeType,
+        LifecycleStatus,
+        Priority,
+        SqliteEngravaCore,
+        ThoughtRecord,
+        ThoughtType,
+    )
+
+    async def _setup() -> None:
+        conn = await aiosqlite.connect(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        await store.ensure_schema()
+        for thought_id in ("T1", "T2"):
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id=thought_id,
+                    essence=f"Essence for {thought_id}",
+                    content=f"Content for {thought_id}",
+                    thought_type=ThoughtType.OBSERVATION,
+                    source="test",
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    priority=Priority.P2,
+                    created_cycle=1,
+                    updated_cycle=1,
+                )
+            )
+        await store.create_edge(
+            EdgeRecord(
+                edge_id="E0",
+                from_thought_id="T1",
+                to_thought_id="T2",
+                edge_type=EdgeType.ASSOCIATED,
+                weight=0.9,
+                created_cycle=1,
+            )
+        )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_setup())
+    return db_path
+
+
+async def _insert_t3_and_delete_e0_after(
+    db_path: Path, paused: asyncio.Event, resume: asyncio.Event
+) -> None:
+    """Insert T3 with edge E3 (T1 -> T3), and delete E0, as one committed transaction.
+
+    Stands in for "the one supported concurrent writer" the same way
+    ``_concurrent_writer_commit_after`` does above for the snapshot test: a
+    second ``SqliteEngravaCore`` on the same file, not a mock. Waits for
+    ``paused`` (set by the caller once the read side has scanned ``thought``
+    and is about to scan ``edge``), commits, then sets ``resume`` so the
+    paused read continues.
+
+    The insert and the delete land as **one** transaction via
+    ``suspend_auto_commit`` -- a plain ``create_thought`` / ``create_edge`` /
+    ``delete_edge`` sequence would each commit on its own, which would not
+    exercise "a second connection commits one transaction" the way the spec
+    for this test calls for.
+
+    Args:
+        db_path: Path to the database both connections share.
+        paused: Set by the caller once the read has reached the point
+            between its thought-table and edge-table scans.
+        resume: Set here once the commit lands, to let the read continue.
+
+    """
+    import aiosqlite
+
+    from engrava import (
+        EdgeRecord,
+        EdgeType,
+        LifecycleStatus,
+        Priority,
+        SqliteEngravaCore,
+        ThoughtRecord,
+        ThoughtType,
+    )
+
+    await paused.wait()
+    writer_conn = await aiosqlite.connect(str(db_path))
+    writer_conn.row_factory = aiosqlite.Row
+    await writer_conn.execute("PRAGMA foreign_keys = ON")
+    writer_store = SqliteEngravaCore(writer_conn)
+    async with writer_store.suspend_auto_commit():
+        await writer_store.create_thought(
+            ThoughtRecord(
+                thought_id="T3",
+                essence="written mid-export",
+                content="written mid-export",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=99,
+                updated_cycle=99,
+            )
+        )
+        await writer_store.create_edge(
+            EdgeRecord(
+                edge_id="E3",
+                from_thought_id="T1",
+                to_thought_id="T3",
+                edge_type=EdgeType.ASSOCIATED,
+                weight=0.5,
+                created_cycle=99,
+            )
+        )
+        deleted = await writer_store.delete_edge("E0")
+        assert deleted, "E0 must exist to be deleted -- fixture drifted"
+    await writer_conn.close()
+    resume.set()
+
+
+async def _read_with_commit_interleaved_before_edge_scan(
+    db_path: Path,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Call ``_read_thoughts_and_edges_in_one_transaction`` while a writer commits mid-scan.
+
+    Pauses the reading connection right before its ``SELECT * FROM edge`` --
+    after the thought-table scan, before the edge-table one -- starts the
+    concurrent writer (:func:`_insert_t3_and_delete_e0_after`), and resumes
+    once it has committed. Same technique as
+    ``_export_with_commit_interleaved_before_edge_scan`` above (itself
+    borrowed from ``TestInProcessCriticalSection`` in
+    ``test_concurrency_contract.py``): a genuine ``asyncio.Task``, paused and
+    resumed via an ``asyncio.Event`` handshake, never a sleep or a mock.
+
+    Args:
+        db_path: Path to the source database.
+
+    Returns:
+        The ``(thoughts, edges)`` pair ``_read_thoughts_and_edges_in_one_
+        transaction`` returned.
+
+    """
+    import aiosqlite
+
+    conn = await aiosqlite.connect(str(db_path))
+    conn.row_factory = aiosqlite.Row
+    # Matches how the real CLI opens a connection for `export` (`_open_db`
+    # in `engrava.cli.main`) -- WAL mode is what makes a concurrent writer's
+    # commit non-blocking against an open reader, which is what lets this
+    # test observe the race rather than have the writer simply wait out the
+    # reader's lock.
+    await conn.execute("PRAGMA journal_mode = WAL")
+    await conn.execute("PRAGMA foreign_keys = ON")
+
+    paused = asyncio.Event()
+    resume = asyncio.Event()
+    original_execute = conn.execute
+    edge_scan_seen = False
+
+    async def _tracking_execute(sql: str, *args: object, **kwargs: object) -> object:
+        nonlocal edge_scan_seen
+        if sql == "SELECT * FROM edge" and not edge_scan_seen:
+            edge_scan_seen = True
+            paused.set()
+            await resume.wait()
+        return await original_execute(sql, *args, **kwargs)
+
+    setattr(conn, "execute", _tracking_execute)  # noqa: B010 -- see snapshot's own patch above for why setattr, not a subclass
+
+    try:
+        _, (thoughts, edges) = await asyncio.gather(
+            _insert_t3_and_delete_e0_after(db_path, paused, resume),
+            _read_thoughts_and_edges_in_one_transaction(conn, status_filter=None),
+        )
+    finally:
+        await conn.close()
+    return thoughts, edges
+
+
+class TestExportObservesOneConsistentState:
+    """``export`` must not read the thought and edge tables as two independent scans.
+
+    ``export_cmd`` runs ``SELECT * FROM thought`` and ``SELECT * FROM edge``
+    inside one explicit read transaction. Without one, each scan would be its
+    own implicit read: a writer that commits a new thought and its edge, and
+    deletes an existing edge, between the two scans could leave the export
+    holding an edge referencing a thought it never scanned, while also
+    missing an edge that existed at the moment export started. This does not
+    need a mocked writer to show: it uses the one supported concurrent
+    writer (a second ``SqliteEngravaCore`` on the same file), paused and
+    resumed with a genuine ``asyncio.Task`` at the exact point between the
+    two scans -- the same technique ``TestSnapshotObservesOneConsistentState``
+    above uses for ``snapshot``.
+    """
+
+    def test_export_survives_a_commit_between_the_thought_and_edge_scans(
+        self,
+        two_thought_one_edge_db: Path,
+    ) -> None:
+        """Export must equal the pre-commit state exactly: thoughts {T1, T2}, edge {E0}.
+
+        The pre-commit state is thoughts {T1, T2} and edge {E0} (T1 -> T2).
+        Mid-export, a concurrent writer inserts T3 with edge E3 (T1 -> T3)
+        and deletes E0, as one transaction. Export's read transaction,
+        opened before the thought scan and closed after the edge scan, takes
+        its snapshot no later than the thought scan -- strictly before the
+        writer's commit lands -- so it must see neither the new T3/E3 pair
+        nor the deletion of E0.
+
+        This assertion is chosen so that a wrong fix which filters exported
+        edges down to those whose endpoints are both exported still fails
+        it: that fix would drop E3 (correctly, but for the wrong reason —
+        the transaction never lets it become visible in the first place),
+        and would also miss E0, which was deleted before the edge scan but
+        must still appear because the deletion was never part of the
+        transaction's own consistent snapshot.
+        """
+        thoughts, edges = asyncio.run(
+            _read_with_commit_interleaved_before_edge_scan(two_thought_one_edge_db)
+        )
+
+        thought_ids = {t["thought_id"] for t in thoughts}
+        edge_ids = {e["edge_id"] for e in edges}
+
+        assert thought_ids == {"T1", "T2"}, (
+            f"export's thought scan must equal the pre-commit state exactly, got {thought_ids!r}"
+        )
+        assert edge_ids == {"E0"}, (
+            f"export's edge scan must equal the pre-commit state exactly, got "
+            f"{edge_ids!r} -- it must still carry E0 (deleted only after export's "
+            "transaction had already fixed its view of the database) and must not "
+            "carry E3 (committed only after that same point)"
+        )
+
+
+def _sync_writer_insert_t3_and_delete_e0(db_path: str) -> None:
+    """Insert T3 with edge E3 (T1 -> T3), and delete E0, via a plain stdlib connection.
+
+    Deliberately synchronous, plain :mod:`sqlite3`, not ``aiosqlite`` -- this
+    runs from inside the CLI export's own patched ``execute``, on the
+    export's own event loop. ``export_cmd`` drives its own ``asyncio.run()``
+    (via ``_run_command``), which cannot host a second concurrent
+    ``asyncio.Task`` the way the lower-level helper test above does with
+    ``asyncio.gather`` -- there is only one loop here, and it belongs to the
+    command under test. Blocking it synchronously for the duration of this
+    call is fine: the export side is, by construction, paused waiting for
+    this call to return before it can proceed.
+
+    Requires WAL mode already active on ``db_path`` -- asserted here rather
+    than assumed. In the default rollback-journal mode this connection's own
+    ``COMMIT`` would block on export's still-open read transaction (or fail
+    outright with "database is locked"), turning a silent precondition
+    violation into a hang or a confusing unrelated failure instead of a
+    clear one. The real CLI already runs every command in WAL mode
+    (``_open_db``), so this holds for the connection under test by the time
+    this function runs -- it only confirms that, not forces it.
+
+    Args:
+        db_path: Path to the database the CLI's own connection is reading.
+
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        (mode,) = conn.execute("PRAGMA journal_mode").fetchone()
+        assert mode.lower() == "wal", (
+            f"expected the database to already be in WAL mode by the time export "
+            f"reaches its edge scan, so this commit can land without blocking on "
+            f"export's still-open read transaction; got journal_mode={mode!r}"
+        )
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("BEGIN")
+        conn.execute(
+            "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("T3", "OBSERVATION", "written mid-export", "written mid-export", "P2"),
+        )
+        conn.execute(
+            "INSERT INTO edge (edge_id, from_thought_id, to_thought_id, edge_type) "
+            "VALUES (?, ?, ?, ?)",
+            ("E3", "T1", "T3", "ASSOCIATED"),
+        )
+        deleted = conn.execute("DELETE FROM edge WHERE edge_id = ?", ("E0",)).rowcount
+        assert deleted == 1, "E0 must exist to be deleted -- fixture drifted"
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestExportCLIObservesOneConsistentState:
+    """``export_cmd`` must actually route through the one-transaction helper.
+
+    ``TestExportObservesOneConsistentState`` above proves
+    ``_read_thoughts_and_edges_in_one_transaction`` itself is correct, but it
+    calls that helper directly -- it cannot tell whether ``export_cmd``
+    actually uses it. A wrong fix that defines the helper but never wires it
+    into ``export_cmd``, or a later refactor that quietly inlines the reads
+    again, passes that test (and every other test in this file) unchanged.
+
+    This test drives the real CLI command instead
+    (``CliRunner().invoke(cli, [..., "export", ...])``) and forces the same
+    interleaving from *inside* ``export_cmd``'s own event loop, rather than a
+    second one: patching ``aiosqlite.Connection.execute`` so that the moment
+    it is asked to run ``SELECT * FROM edge``, a plain synchronous stdlib
+    ``sqlite3`` connection commits the concurrent change first
+    (:func:`_sync_writer_insert_t3_and_delete_e0`), then delegates to the
+    real read. No second ``asyncio`` loop or task is needed.
+    """
+
+    def test_export_cli_survives_a_commit_between_the_thought_and_edge_scans(
+        self,
+        runner: CliRunner,
+        two_thought_one_edge_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Export via the real CLI must equal the pre-commit state exactly.
+
+        Same pre-commit state and same concurrent change as the
+        helper-level test above (thoughts {T1, T2}, edge {E0}; a writer
+        inserts T3 with edge E3 and deletes E0), but exercised through
+        ``engrava export`` itself so a bypass -- the helper defined but
+        never called by ``export_cmd`` -- cannot pass silently.
+        """
+        import aiosqlite
+
+        edge_scan_seen = False
+        real_execute = aiosqlite.Connection.execute
+
+        async def _tracking_execute(
+            self: aiosqlite.Connection, sql: str, *args: object, **kwargs: object
+        ) -> object:
+            nonlocal edge_scan_seen
+            if sql == "SELECT * FROM edge" and not edge_scan_seen:
+                edge_scan_seen = True
+                _sync_writer_insert_t3_and_delete_e0(str(two_thought_one_edge_db))
+            return await real_execute(self, sql, *args, **kwargs)
+
+        monkeypatch.setattr(aiosqlite.Connection, "execute", _tracking_execute)
+
+        out = tmp_path / "export.json"
+        result = runner.invoke(
+            cli,
+            ["--db", str(two_thought_one_edge_db), "export", "-o", str(out)],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert edge_scan_seen, "the patched `SELECT * FROM edge` never ran -- test setup is wrong"
+
+        data = json.loads(out.read_text(encoding="utf-8"))
+        thought_ids = {t["thought_id"] for t in data["thoughts"]}
+        edge_ids = {e["edge_id"] for e in data["edges"]}
+
+        assert thought_ids == {"T1", "T2"}, (
+            f"export must equal the pre-commit state exactly, got thoughts {thought_ids!r}"
+        )
+        assert edge_ids == {"E0"}, (
+            f"export must equal the pre-commit state exactly, got edges {edge_ids!r} -- it "
+            "must still carry E0 (deleted only after export's transaction had already "
+            "fixed its view of the database) and must not carry E3 (committed only after "
+            "that same point)"
+        )
 
 
 class TestExport:
@@ -739,6 +4392,835 @@ class TestExport:
         assert result.exit_code == 0
         default_out = populated_db.with_suffix(".export.json")
         assert default_out.exists()
+
+
+class TestExportAtomicReplace:
+    """``export`` must never destroy a good file at `-o` on a failed write.
+
+    `export_cmd` writes the new export to a same-directory temporary file and
+    publishes it onto `-o` only at the end, so `-o` is never truncated before
+    the new export exists. Same shape of tests as `TestSnapshotAtomicReplace`,
+    but `export`'s "closes or completes its reads" boundary is its database
+    connection's own close (via `_opened_db`), not a `commit()` -- its read
+    transaction is already committed before the file is written.
+    """
+
+    def test_write_failure_leaves_existing_target_untouched(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        out = tmp_path / "existing.json"
+        good_content = '{"format": "a byte-identical earlier good export"}'
+        out.write_text(good_content, encoding="utf-8")
+
+        # `export` writes its whole document in one `f.write()` call, so a
+        # genuine part-way failure has to let some of that call's characters
+        # land before raising -- failing the call outright (0 chars) would
+        # only prove a failure *before* any write, not one *during* it.
+        _fail_atomic_write_partway_through(monkeypatch, 10, OSError(27, "File too large"))
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(out)])
+
+        assert result.exit_code != 0
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_fdopen_failure_leaves_existing_target_untouched_and_no_leak(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failing `os.fdopen` must not leak the raw fd or the temp file it names.
+
+        Same shared-helper boundary as `TestSnapshotAtomicReplace`'s
+        equivalent test -- `_open_same_directory_tempfile` is common to both
+        writers.
+        """
+        out = tmp_path / "existing.json"
+        good_content = '{"format": "a byte-identical earlier good export"}'
+        out.write_text(good_content, encoding="utf-8")
+
+        captured_fd: list[int] = []
+        captured_identity: list[os.stat_result] = []
+
+        def _raise_fdopen(fd: int, *_args: object, **_kwargs: object) -> TextIO:
+            captured_fd.append(fd)
+            captured_identity.append(os.fstat(fd))
+            msg = "simulated fdopen failure"
+            raise OSError(msg)
+
+        monkeypatch.setattr(cli_main.os, "fdopen", _raise_fdopen)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(out)])
+
+        assert result.exit_code != 0
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+        _assert_fd_was_closed(captured_fd[0], captured_identity[0])
+
+    def test_connection_close_failure_leaves_existing_target_untouched(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`export` has no `commit()`; its real boundary is the connection's own close.
+
+        The patched close runs the real close first and then raises -- the
+        same technique this suite's ``test_cli_memory_verbs_error_boundary.py``
+        uses for a store's own close -- so the underlying aiosqlite worker
+        thread is never leaked past this test.
+        """
+        import aiosqlite
+
+        out = tmp_path / "existing.json"
+        good_content = '{"format": "a byte-identical earlier good export"}'
+        out.write_text(good_content, encoding="utf-8")
+
+        real_close = aiosqlite.Connection.close
+
+        async def _raise_after_real_close(self: aiosqlite.Connection) -> None:
+            await real_close(self)
+            msg = "simulated close failure once every read had completed"
+            raise OSError(5, msg)
+
+        monkeypatch.setattr(aiosqlite.Connection, "close", _raise_after_real_close)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(out)])
+
+        assert result.exit_code != 0
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_publication_failure_leaves_existing_target_untouched(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        out = tmp_path / "existing.json"
+        good_content = '{"format": "a byte-identical earlier good export"}'
+        out.write_text(good_content, encoding="utf-8")
+
+        _fail_publication(monkeypatch, OSError(30, "simulated replace failure"))
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(out)])
+
+        assert result.exit_code != 0
+        assert out.read_text(encoding="utf-8") == good_content
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_publishes_with_os_replace(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A copy-over-the-target publication (never calling `os.replace`) must fail this test."""
+        out = tmp_path / "export.json"
+        spy = _spy_on_publication(monkeypatch)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(out)])
+
+        assert result.exit_code == 0
+        assert spy.call_count == 1
+        tmp_arg, out_arg = spy.call_args.args
+        assert Path(out_arg) == out
+        assert Path(tmp_arg).parent == out.parent
+        assert not Path(tmp_arg).exists()
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_success_holds_full_valid_output(
+        self, runner: CliRunner, populated_db: Path, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "export.json"
+        result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(out)])
+
+        assert result.exit_code == 0
+        data = json.loads(out.read_text(encoding="utf-8"))
+        assert data["format"] == "engrava-export"
+        assert len(data["thoughts"]) == 3
+        assert len(data["edges"]) == 1
+        assert _atomic_temp_debris_in(out.parent) == []
+
+    def test_new_output_gets_the_umask_adjusted_default_mode(
+        self, runner: CliRunner, populated_db: Path, tmp_path: Path
+    ) -> None:
+        """A fresh `-o` comes out `open(path, "w")`-shaped, not `mkstemp`'s always-``0o600``.
+
+        ``0o027`` is deliberately unusual: neither a default mode nor a
+        stray ``0o600`` from an unpatched ``mkstemp`` could pass this by
+        coincidence the way a common umask like ``0o022`` might.
+        """
+        out = tmp_path / "fresh.json"
+
+        with _temporary_umask(0o027):
+            result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(out)])
+
+        assert result.exit_code == 0
+        assert out.stat().st_mode & 0o777 == 0o640
+
+    def test_existing_output_mode_survives_a_successful_replace(
+        self, runner: CliRunner, populated_db: Path, tmp_path: Path
+    ) -> None:
+        """An existing `-o`'s permission bits are copied onto the replacement, not narrowed
+        to ``0o600``.
+
+        ``0o604`` is deliberately unusual for the same reason as the sibling
+        test above.
+        """
+        out = tmp_path / "existing.json"
+        out.write_text('{"old": "content"}', encoding="utf-8")
+        out.chmod(0o604)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(out)])
+
+        assert result.exit_code == 0
+        assert out.stat().st_mode & 0o777 == 0o604
+
+    @pytest.mark.parametrize(
+        "output_for",
+        [
+            str,
+            lambda db_path: f"{db_path.parent}/../{db_path.parent.name}/{db_path.name}",
+        ],
+        ids=["same-path", "relative-spelling"],
+    )
+    def test_refuses_output_naming_the_live_database(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        output_for: Callable[[Path], str],
+    ) -> None:
+        before = populated_db.read_bytes()
+
+        result = runner.invoke(
+            cli, ["--db", str(populated_db), "export", "-o", output_for(populated_db)]
+        )
+
+        assert result.exit_code != 0
+        assert "Refusing to write output" in result.stderr
+        assert populated_db.read_bytes() == before
+        assert _atomic_temp_debris_in(populated_db.parent) == []
+
+    def test_refuses_output_naming_a_symlink_to_the_live_database(
+        self, runner: CliRunner, populated_db: Path, tmp_path: Path
+    ) -> None:
+        link = tmp_path / "link-to-live.db"
+        link.symlink_to(populated_db)
+        before = populated_db.read_bytes()
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(link)])
+
+        assert result.exit_code != 0
+        assert "Refusing to write output" in result.stderr
+        assert populated_db.read_bytes() == before
+        assert _atomic_temp_debris_in(populated_db.parent) == []
+
+    @pytest.mark.parametrize("companion_suffix", ["-wal", "-shm"])
+    def test_refuses_output_naming_a_wal_or_shm_companion(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        companion_suffix: str,
+    ) -> None:
+        """A guard that checks only the database path (not -wal/-shm) must fail this test."""
+        companion = Path(f"{populated_db}{companion_suffix}")
+        before = populated_db.read_bytes()
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(companion)])
+
+        assert result.exit_code != 0
+        assert "Refusing to write output" in result.stderr
+        assert populated_db.read_bytes() == before
+        assert _atomic_temp_debris_in(populated_db.parent) == []
+
+    def test_output_symlink_is_followed_and_kept_pointing_at_new_content(
+        self, runner: CliRunner, populated_db: Path, tmp_path: Path
+    ) -> None:
+        """`-o` naming a symlink writes through it, and the symlink itself survives.
+
+        Same rationale as `TestSnapshotAtomicReplace`'s equivalent test:
+        `os.replace` on a symlinked destination replaces the link itself, so
+        the real target is written and replaced instead of the link.
+        """
+        real_target = tmp_path / "actual.json"
+        real_target.write_text('{"old": "content"}', encoding="utf-8")
+        link = tmp_path / "link.json"
+        link.symlink_to(real_target)
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "export", "-o", str(link)])
+
+        assert result.exit_code == 0
+        assert link.is_symlink()
+        assert os.path.realpath(link) == os.path.realpath(real_target)
+        data = json.loads(real_target.read_text(encoding="utf-8"))
+        assert data["format"] == "engrava-export"
+        assert len(data["thoughts"]) == 3
+        assert _atomic_temp_debris_in(real_target.parent) == []
+
+
+# ------------------------------------------------------------------
+# Corrupt-database hang guard
+# ------------------------------------------------------------------
+#
+# ``sqlite3.DatabaseError: file is not a database`` raised from the first
+# ``PRAGMA`` against a corrupt/truncated file must not leave the aiosqlite
+# connection open. aiosqlite's connection worker thread is not a daemon and
+# stops only when ``Connection.close()`` sends it the shutdown sentinel, so a
+# leaked connection blocks ``threading._shutdown`` and the process never
+# exits — it prints a traceback (or nothing, depending on buffering) and then
+# hangs forever rather than returning any exit code.
+#
+# The hang happens at interpreter shutdown, which an in-process
+# ``CliRunner`` invocation never reaches, so these run the real CLI as a
+# subprocess with a hard wall-clock timeout: a regression here fails these
+# tests promptly instead of wedging the whole suite.
+
+# Long enough that a fixed, promptly-erroring command never gets close on a
+# loaded CI host; far short of "wedge the test worker" if a command hangs.
+_CLI_SUBPROCESS_TIMEOUT_S = 20.0
+
+# A command that returns fast enough for a live process to still be a
+# meaningful "promptly" — as opposed to merely "before the hard cap fired".
+_PROMPT_CEILING_S = 10.0
+
+
+def _run_python_subprocess(argv: list[str]) -> tuple[subprocess.CompletedProcess[str], float]:
+    """Run ``python *argv*`` as a real, separate process with a hard timeout.
+
+    Uses this test file's own ``src`` on ``PYTHONPATH`` rather than whatever
+    ``sys.path`` the test runner happened to start with, so the subprocess
+    always exercises the same worktree's code the test itself was collected
+    from — a shared, editable-installed ``engrava`` elsewhere on the host
+    must not shadow it.
+
+    Args:
+        argv: Full argv after the interpreter, e.g.
+            ``["-m", "engrava.cli.main", "--db", str(db_path), "info"]`` or
+            ``["-c", some_source, "--db", str(db_path), "info"]``.
+
+    Returns:
+        The completed process and the wall-clock seconds it took.
+
+    Raises:
+        Failed test: via ``pytest.fail``, if the process does not exit
+            within :data:`_CLI_SUBPROCESS_TIMEOUT_S` — the hang this guards
+            against — instead of letting ``subprocess.TimeoutExpired``
+            propagate as an error or, worse, blocking forever.
+
+    """
+    repo_src = str(Path(__file__).resolve().parent.parent / "src")
+    env = {**os.environ, "PYTHONPATH": repo_src}
+    start = time.monotonic()
+    try:
+        completed = subprocess.run(  # noqa: S603 -- fixed argv, no shell, our own source
+            [sys.executable, *argv],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            timeout=_CLI_SUBPROCESS_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            f"`python {' '.join(argv)}` did not exit within "
+            f"{_CLI_SUBPROCESS_TIMEOUT_S:.0f}s — this is the hang this test "
+            "guards against, not a slow environment."
+        )
+    return completed, time.monotonic() - start
+
+
+def _run_engrava_subprocess(args: list[str]) -> tuple[subprocess.CompletedProcess[str], float]:
+    """Run ``python -m engrava.cli.main *args*`` as a real, separate process.
+
+    Args:
+        args: Full CLI argv after the interpreter and ``-m`` module name,
+            e.g. ``["--db", str(db_path), "info"]``.
+
+    Returns:
+        The completed process and the wall-clock seconds it took.
+
+    """
+    return _run_python_subprocess(["-m", "engrava.cli.main", *args])
+
+
+def _assert_completed_fails_fast(
+    completed: subprocess.CompletedProcess[str], elapsed: float
+) -> None:
+    """Assert a completed subprocess exited non-zero, promptly, not via the hang."""
+    assert completed.returncode != 0, (
+        f"expected a non-zero exit, got {completed.returncode}\n"
+        f"stdout={completed.stdout!r}\nstderr={completed.stderr!r}"
+    )
+    assert completed.returncode != 124, "124 is the timeout(1) sentinel — this hung"
+    assert elapsed < _PROMPT_CEILING_S, (
+        f"took {elapsed:.1f}s — expected a prompt failure, not one that only "
+        "beat the hard subprocess timeout"
+    )
+
+
+def _assert_fails_fast_and_names_the_problem(args: list[str], *, db_path: Path) -> None:
+    """Assert *args* exits non-zero, promptly, naming the configured database's own path.
+
+    Stronger than checking the word "database" appears: that word alone
+    survives a regression to a message like "a database error occurred",
+    which leaves an operator running against several stores -- or with the
+    path coming from ``ENGRAVA_DB``/``--config`` rather than a literal
+    ``--db`` on the command they typed -- unable to tell which store failed.
+    Checking for *this invocation's* ``db_path`` fails on exactly that
+    regression.
+    """
+    completed, elapsed = _run_engrava_subprocess(args)
+    _assert_completed_fails_fast(completed, elapsed)
+    combined = completed.stdout + completed.stderr
+    assert str(db_path) in combined, (
+        f"expected the failure to name the configured database path {str(db_path)!r}\n"
+        f"stdout={completed.stdout!r}\nstderr={completed.stderr!r}"
+    )
+
+
+def _assert_succeeds(args: list[str]) -> None:
+    """Known-good control: the same command against a valid database still works."""
+    completed, _elapsed = _run_engrava_subprocess(args)
+    assert completed.returncode == 0, (
+        f"expected exit 0, got {completed.returncode}\n"
+        f"stdout={completed.stdout!r}\nstderr={completed.stderr!r}"
+    )
+
+
+@pytest.fixture
+def corrupt_db(tmp_path: Path) -> Path:
+    """A file named like a database that is not one — text, truncated, whatever.
+
+    A plain text file where a SQLite database is expected, which opens fine
+    (the file exists) but fails the first real read against it.
+    """
+    path = tmp_path / "corrupt.sqlite"
+    path.write_text("this is not a sqlite database, just some text\n", encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def valid_snapshot(runner: CliRunner, populated_db: Path, tmp_path: Path) -> Path:
+    """A real JSONL snapshot of ``populated_db`` — a valid ``restore`` input."""
+    snap = tmp_path / "valid-snapshot.jsonl"
+    result = runner.invoke(cli, ["--db", str(populated_db), "snapshot", "-o", str(snap)])
+    assert result.exit_code == 0
+    return snap
+
+
+class TestCorruptDatabaseExitsInsteadOfHanging:
+    """Every built-in command that opens the database file must fail fast.
+
+    One test per affected command, each with a known-good control: the same
+    command against ``populated_db`` (or an equivalent valid target) still
+    works. Covers eight built-in commands that route through a
+    connection-opening call in ``cli/main.py``: ``info``, ``gc``,
+    ``migrate``, ``snapshot``, ``verify``, ``query``, ``export``, and the
+    single-database branch of ``restore``. The ``--service`` branch of
+    ``snapshot``/``restore``, which only ever goes through
+    :class:`~engrava.infrastructure.service_manager.EngravaManager`, is not
+    covered here — that path closes on its own error.
+    """
+
+    def test_info(self, corrupt_db: Path, populated_db: Path) -> None:
+        _assert_fails_fast_and_names_the_problem(
+            ["--db", str(corrupt_db), "info"], db_path=corrupt_db
+        )
+        _assert_succeeds(["--db", str(populated_db), "info"])
+
+    def test_verify(self, corrupt_db: Path, populated_db: Path) -> None:
+        _assert_fails_fast_and_names_the_problem(
+            ["--db", str(corrupt_db), "verify"], db_path=corrupt_db
+        )
+        _assert_succeeds(["--db", str(populated_db), "verify"])
+
+    def test_query(self, corrupt_db: Path, populated_db: Path) -> None:
+        _assert_fails_fast_and_names_the_problem(
+            ["--db", str(corrupt_db), "query", "COUNT thoughts"], db_path=corrupt_db
+        )
+        _assert_succeeds(["--db", str(populated_db), "query", "COUNT thoughts"])
+
+    def test_gc(self, corrupt_db: Path, populated_db: Path) -> None:
+        _assert_fails_fast_and_names_the_problem(
+            ["--db", str(corrupt_db), "gc", "--dry-run"], db_path=corrupt_db
+        )
+        _assert_succeeds(["--db", str(populated_db), "gc", "--dry-run"])
+
+    def test_migrate(self, corrupt_db: Path, tmp_path: Path) -> None:
+        _assert_fails_fast_and_names_the_problem(
+            ["--db", str(corrupt_db), "migrate"], db_path=corrupt_db
+        )
+        # migrate is the one built-in whose target need not exist yet — a
+        # fresh path is its own "known good" control (see
+        # TestMigrate.test_migrate_creates_schema above).
+        _assert_succeeds(["--db", str(tmp_path / "fresh-for-migrate.db"), "migrate"])
+
+    def test_snapshot(self, corrupt_db: Path, populated_db: Path, tmp_path: Path) -> None:
+        bad_out = tmp_path / "bad.snapshot.jsonl"
+        good_out = tmp_path / "good.snapshot.jsonl"
+        _assert_fails_fast_and_names_the_problem(
+            ["--db", str(corrupt_db), "snapshot", "-o", str(bad_out)], db_path=corrupt_db
+        )
+        _assert_succeeds(["--db", str(populated_db), "snapshot", "-o", str(good_out)])
+
+    def test_export(self, corrupt_db: Path, populated_db: Path, tmp_path: Path) -> None:
+        bad_out = tmp_path / "bad.export.json"
+        good_out = tmp_path / "good.export.json"
+        _assert_fails_fast_and_names_the_problem(
+            ["--db", str(corrupt_db), "export", "-o", str(bad_out)], db_path=corrupt_db
+        )
+        _assert_succeeds(["--db", str(populated_db), "export", "-o", str(good_out)])
+
+    def test_restore(self, corrupt_db: Path, valid_snapshot: Path, tmp_path: Path) -> None:
+        _assert_fails_fast_and_names_the_problem(
+            ["--db", str(corrupt_db), "restore", "-i", str(valid_snapshot)], db_path=corrupt_db
+        )
+        good_target = tmp_path / "restored-for-control.db"
+        _assert_succeeds(["--db", str(good_target), "restore", "-i", str(valid_snapshot)])
+
+
+# A failure injected into ``SqliteEngravaCore.ensure_schema`` before ``cli()``
+# ever runs. Unlike ``corrupt_db``, this never touches ``_open_db`` at all —
+# ``aiosqlite.connect()`` against a target that does not exist yet always
+# succeeds, and the file it creates is a valid, empty SQLite database, so
+# every ``PRAGMA`` in ``_open_db`` passes. The only way to fail *after* the
+# connection is open and *before* the block that is supposed to protect it
+# is to fail inside whatever runs in between — here, ``ensure_schema()``.
+_ENSURE_SCHEMA_FAULT_INJECTION = """
+from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore
+
+
+async def _boom(self, *args, **kwargs):
+    raise RuntimeError("injected ensure_schema failure for a bootstrap-window test")
+
+
+SqliteEngravaCore.ensure_schema = _boom
+
+from engrava.cli.main import cli
+
+cli()
+"""
+
+
+class TestRestoreBootstrapWindowClosesOnFailure:
+    """A failure inside ``ensure_schema()`` -- not inside ``_open_db`` -- must
+    also close the connection promptly.
+
+    ``restore`` against a target that does not pre-exist calls
+    ``store = SqliteEngravaCore(conn)`` and then ``await
+    store.ensure_schema()`` to bootstrap it. ``_opened_db`` wraps the whole
+    body in one step, so neither of those can run ahead of the ``try`` that
+    guarantees the close: a failure there would otherwise leak the
+    connection exactly like the corrupt-file case -- just through a
+    different call, with a target file that is itself perfectly valid. The
+    ``corrupt_db`` tests above are blind to this: they all fail inside
+    ``_open_db``, which closes the connection on its own error.
+    """
+
+    def test_restore_bootstrap_failure_is_not_a_hang(self, tmp_path: Path) -> None:
+        target = tmp_path / "fresh-target-that-fails-to-bootstrap.db"
+        assert not target.exists()  # pre_existing must be False to reach ensure_schema()
+        missing_input = tmp_path / "never-read.jsonl"  # ensure_schema() fails first
+
+        completed, elapsed = _run_python_subprocess(
+            [
+                "-c",
+                _ENSURE_SCHEMA_FAULT_INJECTION,
+                "--db",
+                str(target),
+                "restore",
+                "-i",
+                str(missing_input),
+            ]
+        )
+        _assert_completed_fails_fast(completed, elapsed)
+        combined = completed.stdout + completed.stderr
+        assert "injected ensure_schema failure" in combined, (
+            f"expected the injected failure to surface, not something else\n"
+            f"stdout={completed.stdout!r}\nstderr={completed.stderr!r}"
+        )
+
+
+# A failure injected into ``aiosqlite.Connection.close()`` itself, on a
+# command that otherwise succeeds against a perfectly valid database. Proves
+# ``_opened_db``'s success path does not route a close failure through
+# ``_close_quietly`` -- which logs and swallows by design, correct only when
+# an exception is already in flight.
+_CLOSE_FAILS_ON_SUCCESS_INJECTION = """
+import aiosqlite
+
+_real_close = aiosqlite.Connection.close
+
+
+async def _close_blows_up(self):
+    await _real_close(self)
+    raise RuntimeError("injected close failure on the success path")
+
+
+aiosqlite.Connection.close = _close_blows_up
+
+from engrava.cli.main import cli
+
+cli()
+"""
+
+
+class TestSuccessPathCloseFailureIsNotSwallowed:
+    """A close() failure on an otherwise-successful command must surface.
+
+    ``_opened_db`` routes the close through ``_close_quietly`` only when the
+    command body raised. On the success path a close failure is not
+    secondary to anything, it is the only error there is, so it propagates.
+    ``_close_quietly`` logs and swallows by design (correct for the
+    exception-in-flight case), so an unconditional
+    ``finally: await _close_quietly(conn)`` would turn a genuine close
+    failure into a command that prints its normal success output and exits 0.
+    """
+
+    def test_close_failure_after_a_successful_command_is_not_silent(
+        self, populated_db: Path
+    ) -> None:
+        completed, elapsed = _run_python_subprocess(
+            [
+                "-c",
+                _CLOSE_FAILS_ON_SUCCESS_INJECTION,
+                "--db",
+                str(populated_db),
+                "info",
+            ]
+        )
+        _assert_completed_fails_fast(completed, elapsed)
+        combined = completed.stdout + completed.stderr
+        assert "injected close failure" in combined, (
+            f"expected the close failure to surface, not be swallowed\n"
+            f"stdout={completed.stdout!r}\nstderr={completed.stderr!r}"
+        )
+
+    def test_close_success_control_still_exits_zero(self, populated_db: Path) -> None:
+        """Known-good control: an ordinary close on the success path still exits 0."""
+        _assert_succeeds(["--db", str(populated_db), "info"])
+
+
+class _FakeConnection:
+    """Stand-in connection for testing the CLI's ``_close_quietly`` in isolation.
+
+    ``started`` fires the instant ``close()`` begins running, so a test can
+    wait for the close to genuinely be in flight before delivering a
+    cancellation -- no wall-clock sleep needed to land the race. ``may_finish``
+    then holds the close from completing until the test says so, which is
+    what makes the outcome deterministic rather than sleep-tuned: the
+    cancellation is guaranteed to land strictly before the close resolves,
+    and the close is guaranteed not to resolve on its own before the test
+    permits it.
+    """
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.may_finish = asyncio.Event()
+        self.finished = False
+
+    async def close(self) -> None:
+        self.started.set()
+        await self.may_finish.wait()
+        self.finished = True
+
+
+class _FailingConnection:
+    """A connection whose ``close()`` raises an ordinary exception."""
+
+    async def close(self) -> None:
+        msg = "close blew up"
+        raise RuntimeError(msg)
+
+
+class _SynchronouslyFailingConnection:
+    """A connection whose ``close()`` raises before returning an awaitable.
+
+    Not an ``async def`` -- calling ``conn.close()`` raises immediately,
+    before ``asyncio.ensure_future`` ever gets a coroutine to schedule.
+    Distinct from ``_FailingConnection``, whose exception only surfaces
+    once the resulting coroutine is awaited.
+    """
+
+    def close(self) -> None:
+        msg = "close blew up synchronously"
+        raise RuntimeError(msg)
+
+
+class TestCliCloseQuietlyCancellation:
+    """The CLI's own ``_close_quietly`` copy needs the same cancellation handling.
+
+    This module defines its own ``_close_quietly`` rather than importing the
+    infrastructure layer's (see that function's docstring), so the
+    escaped-``BaseException`` gap in ``await conn.close()`` is closed here
+    independently too. These mirror
+    ``TestCloseQuietlyCancellation`` in ``tests/test_service_isolation.py``,
+    which covers the infrastructure copy.
+    """
+
+    async def test_the_close_still_completes_when_cancelled_mid_close(self) -> None:
+        """A cancelled cleanup keeps waiting for the shielded close to finish.
+
+        The close is held open (``may_finish`` stays unset) while the
+        cancellation lands, and the cleanup task must not be done yet: a
+        helper that shields the close without the second ``await`` in its
+        ``CancelledError`` handler hands the cancellation back at once and
+        is caught here. Releasing the close straight after ``cancel()``
+        would not catch it, because the close can finish before anything
+        looks.
+        """
+        conn = _FakeConnection()
+        task = asyncio.create_task(_close_quietly(conn))
+        await conn.started.wait()
+        task.cancel()
+        # Let the cancellation land while the close is still held open.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert not conn.finished
+        assert not task.done(), (
+            "the cancelled cleanup returned while the close was still in "
+            "flight -- it must keep waiting for the shielded close to finish"
+        )
+
+        conn.may_finish.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert conn.finished, (
+            "conn.close() never ran to completion under cancellation -- the "
+            "exact leak _close_quietly exists to prevent"
+        )
+
+    async def test_an_ordinary_exception_from_close_is_still_swallowed_and_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Control: the documented, uncancelled behaviour must be unchanged."""
+        conn = _FailingConnection()
+        with caplog.at_level(logging.WARNING):
+            await _close_quietly(conn)
+
+        assert "Error closing connection during cleanup" in caplog.text
+
+    async def test_a_synchronous_close_failure_is_still_swallowed_and_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A close() that raises before returning an awaitable must not escape.
+
+        ``close_task = asyncio.ensure_future(conn.close())`` evaluates
+        ``conn.close()`` before scheduling anything -- if that line ever
+        sits outside the ``try``, a synchronous failure there escapes
+        instead of being logged and swallowed, changing the ordinary,
+        uncancelled contract this helper exists to keep.
+        """
+        conn = _SynchronouslyFailingConnection()
+        with caplog.at_level(logging.WARNING):
+            await _close_quietly(conn)
+
+        assert "Error closing connection during cleanup" in caplog.text
+
+
+class _PermissionDeniedConnection:
+    """A connection whose ``close()`` raises a real, ordinary ``PermissionError``."""
+
+    async def close(self) -> None:
+        raise PermissionError(13, "Permission denied")
+
+
+class _KeyboardInterruptOnCloseStrError(Exception):
+    """Its own ``__str__`` raises ``KeyboardInterrupt``, like a real Ctrl-C mid-read."""
+
+    def __str__(self) -> str:
+        raise KeyboardInterrupt
+
+
+class _SystemExitOnCloseStrError(Exception):
+    """Its own ``__str__`` raises ``SystemExit(37)`` instead of returning text."""
+
+    def __str__(self) -> str:
+        raise SystemExit(37)
+
+
+class _KeyboardInterruptOnCloseStrConnection:
+    """A connection whose ``close()`` raises an exception hostile in its own ``__str__``."""
+
+    async def close(self) -> None:
+        message = "close"
+        raise _KeyboardInterruptOnCloseStrError(message)
+
+
+class _SystemExitOnCloseStrConnection:
+    """A connection whose ``close()`` raises an exception hostile in its own ``__str__``."""
+
+    async def close(self) -> None:
+        message = "close"
+        raise _SystemExitOnCloseStrError(message)
+
+
+class TestCliCloseQuietlyDisclosesWhyNotJustWhere:
+    """The bare/default store tier's ``_close_quietly`` never passes ``exc_info=True``.
+
+    ``exc_info=True`` asks the standard library's traceback formatter to
+    render the close exception a second, unguarded way -- and frame metadata
+    alone says *where* closing failed, never *why*, so an ordinary
+    ``PermissionError``, a full disk, or a locked file would all look
+    identical. ``_close_quietly`` calls
+    :func:`~engrava.cli.exception_reporting._describe_exception` once on the
+    close exception -- the same single, guarded, non-absorbing attempt the
+    boundary makes for the original exception -- and logs its result
+    alongside the frame-only stack.
+    """
+
+    async def test_an_ordinary_close_failure_now_logs_why_not_just_where(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        conn = _PermissionDeniedConnection()
+        with caplog.at_level(logging.WARNING):
+            await _close_quietly(conn)
+
+        assert "Error closing connection during cleanup" in caplog.text
+        assert "PermissionError: [Errno 13] Permission denied" in caplog.text
+        assert "in _close_quietly" in caplog.text, (
+            "the frame-only stack must still be present alongside the new "
+            "description, not replaced by it"
+        )
+        for record in caplog.records:
+            assert record.exc_info is None, (
+                "must not pass exc_info=True any more -- that is the second, "
+                "unguarded render this fix removes"
+            )
+
+    async def test_a_keyboard_interrupt_from_the_close_exceptions_str_is_not_absorbed(
+        self,
+    ) -> None:
+        """The close exception's own formatting is read once -- a real
+        interrupt raised during that read must still escape, not be
+        swallowed the way the standard library's own traceback formatter
+        swallows it under ``exc_info=True``.
+        """
+        conn = _KeyboardInterruptOnCloseStrConnection()
+
+        with pytest.raises(KeyboardInterrupt):
+            await _close_quietly(conn)
+
+    async def test_a_system_exit_from_the_close_exceptions_str_is_not_absorbed(self) -> None:
+        conn = _SystemExitOnCloseStrConnection()
+
+        with pytest.raises(SystemExit) as exc_info:
+            await _close_quietly(conn)
+
+        assert exc_info.value.code == 37
 
 
 class _FormatThatComparesAsAnother(str):
@@ -859,3 +5341,35 @@ class TestCliConfigChoosesTheSourceItWasGiven:
         """Genuine emptiness keeps its old meaning; only the lie is closed."""
         monkeypatch.setenv("ENGRAVA_DB", str(tmp_path / "from-env.db"))
         assert str(EngravaCLIConfig.resolve(db_path="").db_path) == str(tmp_path / "from-env.db")
+
+
+class TestModuleEntryPointExposesTheMemoryVerbs:
+    """``python -m engrava.cli.main`` must expose ``remember`` / ``recall`` / ``link``.
+
+    Running this file directly makes it ``__main__`` -- a module object
+    distinct from ``engrava.cli.main`` even though it is the same file.
+    ``engrava.cli.memory_commands`` decorates the ``cli`` Group belonging to
+    the dotted-path import, not the ``__main__`` one, so without the
+    ``__main__`` guard re-entering through that dotted import, the three new
+    commands would silently resolve as "No such command" under ``-m`` even
+    though the installed ``engrava`` console-script entry point (which never
+    runs this file as ``__main__``) works.
+    """
+
+    def test_remember_appears_in_module_entry_point_help(self) -> None:
+        completed, _elapsed = _run_engrava_subprocess(["--help"])
+        assert completed.returncode == 0, completed.stderr
+        assert "remember" in completed.stdout
+        assert "recall" in completed.stdout
+        assert "link" in completed.stdout
+
+    def test_remember_actually_runs_under_the_module_entry_point(self, tmp_path: Path) -> None:
+        db = tmp_path / "module-entry.db"
+        completed, _elapsed = _run_engrava_subprocess(
+            ["--db", str(db), "remember", "stored via python -m"]
+        )
+        assert completed.returncode == 0, (
+            f"stdout={completed.stdout!r}\nstderr={completed.stderr!r}"
+        )
+        assert "No such command" not in completed.stderr
+        assert db.exists()

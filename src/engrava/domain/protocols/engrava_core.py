@@ -141,14 +141,18 @@ class EngravaCoreProtocol(EngravaReadProtocol, Protocol):
         *,
         deduplicate: bool = False,
     ) -> list[ThoughtRecord]:
-        """Persist many thoughts in one all-or-nothing transaction.
+        """Persist many thoughts in one transaction, all-or-nothing when this call owns it.
 
         Batch analogue of :meth:`create_thought`: the whole loop commits once
         (not per row) and is transactional — if any row raises, the entire batch
-        is rolled back and nothing is persisted. The returned list is in input
-        order. When auto-embed is active, all inserted thoughts are embedded in
-        a single batch provider call, producing vectors byte-identical to
-        per-thought embedding.
+        is rolled back and nothing is persisted, provided this call's own
+        transaction is the outermost one. Nested inside a caller's own
+        ``suspend_auto_commit()`` window, a caught failure can still commit the
+        batch's already-inserted rows along with the caller's own work — see
+        the concrete store's ``bulk_store`` docstring for the full mechanics.
+        The returned list is in input order. When auto-embed is active, all
+        inserted thoughts are embedded in a single batch provider call,
+        producing vectors byte-identical to per-thought embedding.
 
         Args:
             thoughts: The thoughts to persist, in order (empty list ⇒ ``[]``).

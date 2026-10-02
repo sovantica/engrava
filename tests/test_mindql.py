@@ -964,8 +964,8 @@ class TestQuotedValueStaysString:
             )
         )
         result = await store.execute_mindql(parse("FIND thoughts WHERE source = '007'"))
-        # Pre-fix: '007' was coerced to int 7 and never matched the stored
-        # string '007', so this returned no rows.
+        # The quoted '007' stays the string '007' rather than becoming int 7,
+        # so it matches the stored string.
         assert {row["thought_id"] for row in result.rows} == {"t-zero-pad"}
 
 
@@ -977,17 +977,15 @@ class TestQuotedValueStaysString:
 class TestConditionFullMatch:
     """A WHERE fragment must match an operand grammar in full.
 
-    A prefix match used to silently discard any trailing content after the
-    first ``field op value`` token. On the flat (pure-``AND``) path each
-    fragment is still matched in full. ``OR`` is now a first-class operator, so
-    ``priority = 'P1' OR 1=1`` parses as a boolean tree — but the injected
-    ``1=1`` operand names the non-column ``1``, which the per-table allowlist
-    rejects when the query runs, so the surplus can never quietly change the
-    result set.
+    On the flat (pure-``AND``) path each fragment is matched in full. ``OR`` is a
+    first-class operator, so ``priority = 'P1' OR 1=1`` parses as a boolean tree
+    — but the injected ``1=1`` operand names the non-column ``1``, which the
+    per-table allowlist rejects when the query runs, so the surplus can never
+    quietly change the result set.
     """
 
     def test_trailing_injection_operand_rejected_at_execution(self) -> None:
-        # ``OR 1=1`` is valid grammar now, but ``1`` is not an allowlisted
+        # ``OR 1=1`` is valid grammar, but ``1`` is not an allowlisted
         # column, so execution rejects it rather than widening the result set.
         q = parse("FIND thoughts WHERE priority = 'P1' OR 1=1")
         assert isinstance(q.where, BoolExpr)
@@ -1046,7 +1044,7 @@ class TestDefaultFindLimit:
                 )
             )
         result = await store.execute_mindql(parse("FIND thoughts"))
-        # Pre-fix: the query was unbounded and returned every stored row.
+        # ``default + 10`` rows are stored; only ``default`` of them come back.
         assert len(result.rows) == default
 
     async def test_explicit_limit_still_wins(
@@ -1862,6 +1860,232 @@ class TestLexicalScanQuoteAwareness:
 
 
 # ---------------------------------------------------------------------------
+# Whitespace inside a quoted value: never collapsed
+# ---------------------------------------------------------------------------
+
+# (case_id, value with an irregular whitespace run, whitespace-collapsed decoy
+# with the same words but ordinary single spaces). The decoy exists so a
+# match against the target's exact literal can be shown to exclude it: a fix
+# that collapsed the literal's whitespace before compiling the query would
+# match the decoy instead of (or in addition to) the target.
+_WHITESPACE_CASES: list[tuple[str, str, str]] = [
+    ("double_space", "hello  world", "hello world"),
+    ("tab", "hello\tworld", "hello world"),
+    ("newline", "hello\nworld", "hello world"),
+    ("leading_and_trailing_spaces", "  hello world  ", "hello world"),
+]
+
+# Just (case_id, value) for parser-level tests that never touch the database.
+_WHITESPACE_TARGETS: list[tuple[str, str]] = [
+    (case_id, value) for case_id, value, _decoy in _WHITESPACE_CASES
+]
+
+
+class TestParserQuotedValueWhitespacePreserved:
+    """A quoted value's internal whitespace survives parsing byte-for-byte.
+
+    Every run of whitespace inside a quoted literal — a double space, a tab,
+    a newline — reaches the parsed condition unchanged, rather than being
+    collapsed to one space.
+    """
+
+    @pytest.mark.parametrize(("case_id", "value"), _WHITESPACE_TARGETS)
+    def test_value_preserved_on_flat_path(self, case_id: str, value: str) -> None:
+        q = parse(f"FIND thoughts WHERE content = '{value}'")
+        assert q.where is None, case_id  # pure comparison stays on the flat path
+        assert q.conditions[0].value == value, case_id
+
+    @pytest.mark.parametrize(("case_id", "value"), _WHITESPACE_TARGETS)
+    def test_value_preserved_on_count_flat_path(self, case_id: str, value: str) -> None:
+        q = parse(f"COUNT thoughts WHERE content = '{value}'")
+        assert q.where is None, case_id
+        assert q.conditions[0].value == value, case_id
+
+    @pytest.mark.parametrize(("case_id", "value"), _WHITESPACE_TARGETS)
+    def test_value_preserved_on_tree_path(self, case_id: str, value: str) -> None:
+        # The trailing OR forces the boolean-expression tree path.
+        q = parse(f"FIND thoughts WHERE content = '{value}' OR priority = 'P1'")
+        assert isinstance(q.where, BoolExpr), case_id
+        left = q.where.operands[0]
+        assert isinstance(left, Comparison), case_id
+        assert left.value == value, case_id
+
+    def test_irregular_whitespace_between_keywords_parses_as_before(self) -> None:
+        # Tabs, newlines, and repeated spaces *outside* any literal separate
+        # the verb, table name, and clause keywords exactly as a single space
+        # would — only whitespace *inside* a quoted value is special.
+        spaced = parse(
+            "FIND thoughts WHERE priority = 'P1' ORDER BY created_cycle DESC LIMIT 5 OFFSET 1"
+        )
+        irregular = parse(
+            "FIND\tthoughts\n WHERE  priority = 'P1'   ORDER\tBY created_cycle"
+            "\nDESC    LIMIT\t5  OFFSET 1"
+        )
+        assert irregular.table == spaced.table
+        assert irregular.conditions == spaced.conditions
+        assert irregular.order_by == spaced.order_by
+        assert irregular.limit == spaced.limit
+        assert irregular.offset == spaced.offset
+
+    def test_extension_args_still_split_on_whitespace(self) -> None:
+        # Extension-command args are split on whitespace.
+        q = parse("CUSTOM  foo\tbar", known_extensions={"CUSTOM"})
+        assert q.extension_args == ["foo", "bar"]
+
+
+class TestExecutorQuotedValueWhitespaceMatchesExactly:
+    """FIND/COUNT match only the row whose value has the exact whitespace.
+
+    Each case seeds a target row carrying the exact (irregularly spaced)
+    value and a decoy row carrying the same words with whitespace collapsed
+    to single spaces, so a match against the target's literal that actually
+    (or additionally) selected the decoy would fail these assertions.
+    """
+
+    @pytest.fixture
+    async def whitespace_db(self, db: aiosqlite.Connection) -> aiosqlite.Connection:
+        """Seed one target + decoy thought pair per whitespace case."""
+        store = SqliteEngravaCore(db)
+        for i, (case_id, target_value, decoy_value) in enumerate(_WHITESPACE_CASES):
+            cycle = i * 2 + 1
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id=f"target-{case_id}",
+                    thought_type=ThoughtType.OBSERVATION,
+                    essence=f"essence {case_id}",
+                    content=target_value,
+                    priority=Priority.P1,
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    created_cycle=cycle,
+                    updated_cycle=cycle,
+                    source="test",
+                )
+            )
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id=f"decoy-{case_id}",
+                    thought_type=ThoughtType.OBSERVATION,
+                    essence=f"essence {case_id} decoy",
+                    content=decoy_value,
+                    priority=Priority.P1,
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    created_cycle=cycle + 1,
+                    updated_cycle=cycle + 1,
+                    source="test",
+                )
+            )
+        return db
+
+    @pytest.fixture
+    async def whitespace_count_db(self, db: aiosqlite.Connection) -> aiosqlite.Connection:
+        """Seed two exact-value rows and one collapsed-whitespace decoy per case.
+
+        A bare ``count == 1`` cannot tell "matched the target" from "matched
+        the decoy" when the fixture holds exactly one of each — both give the
+        same number, so a match that normalises the literal's whitespace before
+        binding would hit the single decoy and still report 1. Seeding two
+        exact-value rows against one decoy makes the two outcomes numerically
+        distinct: an exact match counts both targets (2); a normalising match
+        counts only the decoy (1) and fails the assertion below.
+        """
+        store = SqliteEngravaCore(db)
+        for i, (case_id, target_value, decoy_value) in enumerate(_WHITESPACE_CASES):
+            cycle = i * 3 + 1
+            for suffix in ("a", "b"):
+                await store.create_thought(
+                    ThoughtRecord(
+                        thought_id=f"target-{case_id}-{suffix}",
+                        thought_type=ThoughtType.OBSERVATION,
+                        essence=f"essence {case_id} {suffix}",
+                        content=target_value,
+                        priority=Priority.P1,
+                        lifecycle_status=LifecycleStatus.ACTIVE,
+                        created_cycle=cycle,
+                        updated_cycle=cycle,
+                        source="test",
+                    )
+                )
+                cycle += 1
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id=f"decoy-{case_id}",
+                    thought_type=ThoughtType.OBSERVATION,
+                    essence=f"essence {case_id} decoy",
+                    content=decoy_value,
+                    priority=Priority.P1,
+                    lifecycle_status=LifecycleStatus.ACTIVE,
+                    created_cycle=cycle,
+                    updated_cycle=cycle,
+                    source="test",
+                )
+            )
+        return db
+
+    @pytest.mark.parametrize(("case_id", "target_value"), _WHITESPACE_TARGETS)
+    async def test_find_flat_path_matches_only_the_target(
+        self,
+        whitespace_db: aiosqlite.Connection,
+        case_id: str,
+        target_value: str,
+    ) -> None:
+        store = SqliteEngravaCore(whitespace_db)
+        q = parse(f"FIND thoughts WHERE content = '{target_value}'")
+        assert q.where is None, case_id
+        result = await store.execute_mindql(q)
+        assert {row["thought_id"] for row in result.rows} == {f"target-{case_id}"}
+
+    @pytest.mark.parametrize(("case_id", "target_value"), _WHITESPACE_TARGETS)
+    async def test_count_flat_path_matches_only_the_target(
+        self,
+        whitespace_count_db: aiosqlite.Connection,
+        case_id: str,
+        target_value: str,
+    ) -> None:
+        # 2 exact-value rows vs. 1 decoy: a normalising fix would count the
+        # decoy (1) instead, so this discriminates where a bare ``== 1``
+        # (matching either shape) would not.
+        store = SqliteEngravaCore(whitespace_count_db)
+        q = parse(f"COUNT thoughts WHERE content = '{target_value}'")
+        assert q.where is None, case_id
+        result = await store.execute_mindql(q)
+        assert result.count == 2, case_id
+
+    @pytest.mark.parametrize(("case_id", "target_value"), _WHITESPACE_TARGETS)
+    async def test_find_tree_path_matches_only_the_target(
+        self,
+        whitespace_db: aiosqlite.Connection,
+        case_id: str,
+        target_value: str,
+    ) -> None:
+        store = SqliteEngravaCore(whitespace_db)
+        # The trailing OR (never true here) forces the boolean-tree path.
+        q = parse(
+            f"FIND thoughts WHERE content = '{target_value}' OR thought_id = 'does-not-exist'"
+        )
+        assert isinstance(q.where, BoolExpr), case_id
+        result = await store.execute_mindql(q)
+        assert {row["thought_id"] for row in result.rows} == {f"target-{case_id}"}
+
+    @pytest.mark.parametrize(("case_id", "target_value"), _WHITESPACE_TARGETS)
+    async def test_count_tree_path_matches_only_the_target(
+        self,
+        whitespace_count_db: aiosqlite.Connection,
+        case_id: str,
+        target_value: str,
+    ) -> None:
+        # 2 exact-value rows vs. 1 decoy: a normalising fix would count the
+        # decoy (1) instead, so this discriminates where a bare ``== 1``
+        # (matching either shape) would not.
+        store = SqliteEngravaCore(whitespace_count_db)
+        q = parse(
+            f"COUNT thoughts WHERE content = '{target_value}' OR thought_id = 'does-not-exist'"
+        )
+        assert isinstance(q.where, BoolExpr), case_id
+        result = await store.execute_mindql(q)
+        assert result.count == 2, case_id
+
+
+# ---------------------------------------------------------------------------
 # Executor-side query validation (constructed queries — parser bypassed)
 # ---------------------------------------------------------------------------
 
@@ -2389,6 +2613,121 @@ class TestExecutorRowBoundValidation:
             parse("FIND thoughts ORDER BY thought_id ASC LIMIT 2 OFFSET 2"),
         )
         assert [row["thought_id"] for row in result.rows] == ["t-002", "t-003"]
+
+
+# SQLite cannot store an integer past this; interpolating one raises a raw
+# ``sqlite3.IntegrityError`` instead of the ``MindQLParseError`` the guard
+# owes its caller. Values strictly above it must be rejected.
+_ROW_BOUND_OVER_SQLITE_MAX = (2**63, 2**64)
+
+
+def _ceiling_match(clause: str) -> str:
+    """Return the start of the error an out-of-range *clause* must raise, naming the range."""
+    return f"{clause} must be a non-negative integer no greater than {2**63 - 1} "
+
+
+class TestExecutorRowBoundSqliteCeiling:
+    """LIMIT/OFFSET are also bounded above, at SQLite's largest integer.
+
+    SQLite cannot hold an integer past ``2**63 - 1``: a bound above it is
+    interpolated into the SQL text same as any other, and reaches the
+    database as a raw ``sqlite3.IntegrityError`` instead of this module's
+    own ``MindQLParseError``. Covered both through ``parse()`` and through a
+    directly constructed ``MindQLQuery``, which is not type-checked at
+    runtime.
+    """
+
+    async def test_limit_at_sqlite_max_is_accepted_via_parse(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        query = parse(f"FIND thoughts LIMIT {2**63 - 1}")
+
+        result = await store.execute_mindql(query)
+
+        assert len(result.rows) == 5
+
+    async def test_offset_at_sqlite_max_is_accepted_via_parse(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        query = parse(f"FIND thoughts OFFSET {2**63 - 1}")
+
+        result = await store.execute_mindql(query)
+
+        assert result.rows == []
+
+    async def test_limit_at_sqlite_max_is_accepted_via_direct_query(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        query = MindQLQuery(command=MindQLCommand.FIND, table="thought", limit=2**63 - 1)
+
+        result = await store.execute_mindql(query)
+
+        assert len(result.rows) == 5
+
+    async def test_offset_at_sqlite_max_is_accepted_via_direct_query(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        query = MindQLQuery(command=MindQLCommand.FIND, table="thought", offset=2**63 - 1)
+
+        result = await store.execute_mindql(query)
+
+        assert result.rows == []
+
+    @pytest.mark.parametrize("value", _ROW_BOUND_OVER_SQLITE_MAX, ids=["2**63", "2**64"])
+    async def test_limit_past_sqlite_max_is_rejected_via_parse(
+        self,
+        populated_db: aiosqlite.Connection,
+        value: int,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        query = parse(f"FIND thoughts LIMIT {value}")
+
+        with pytest.raises(MindQLParseError, match=_ceiling_match("LIMIT")):
+            await store.execute_mindql(query)
+
+    @pytest.mark.parametrize("value", _ROW_BOUND_OVER_SQLITE_MAX, ids=["2**63", "2**64"])
+    async def test_offset_past_sqlite_max_is_rejected_via_parse(
+        self,
+        populated_db: aiosqlite.Connection,
+        value: int,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        query = parse(f"FIND thoughts OFFSET {value}")
+
+        with pytest.raises(MindQLParseError, match=_ceiling_match("OFFSET")):
+            await store.execute_mindql(query)
+
+    @pytest.mark.parametrize("value", _ROW_BOUND_OVER_SQLITE_MAX, ids=["2**63", "2**64"])
+    async def test_limit_past_sqlite_max_is_rejected_via_direct_query(
+        self,
+        populated_db: aiosqlite.Connection,
+        value: int,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        query = MindQLQuery(command=MindQLCommand.FIND, table="thought", limit=value)
+
+        with pytest.raises(MindQLParseError, match=_ceiling_match("LIMIT")):
+            await store.execute_mindql(query)
+
+    @pytest.mark.parametrize("value", _ROW_BOUND_OVER_SQLITE_MAX, ids=["2**63", "2**64"])
+    async def test_offset_past_sqlite_max_is_rejected_via_direct_query(
+        self,
+        populated_db: aiosqlite.Connection,
+        value: int,
+    ) -> None:
+        store = SqliteEngravaCore(populated_db)
+        query = MindQLQuery(command=MindQLCommand.FIND, table="thought", offset=value)
+
+        with pytest.raises(MindQLParseError, match=_ceiling_match("OFFSET")):
+            await store.execute_mindql(query)
 
 
 class TestExecutorBooleanJoinerValidation:

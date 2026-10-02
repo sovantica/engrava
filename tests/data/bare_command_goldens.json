@@ -1,0 +1,121 @@
+[
+  {
+    "args": [
+      "--db",
+      "WORKDIR/populated.db",
+      "info"
+    ],
+    "exit_code": 0,
+    "output": "Database: WORKDIR/populated.db\nMetrics schema version: 2 (database schema version: 21)\nThoughts: 2 ({'OBSERVATION': 2})\nEdges: 1 ({'ASSOCIATED': 1})\nStorage: 180224 bytes\nSearch latency: n=0 p50=0.0ms p95=0.0ms p99=0.0ms\n"
+  },
+  {
+    "args": [
+      "--db",
+      "WORKDIR/populated.db",
+      "--format",
+      "json",
+      "info"
+    ],
+    "exit_code": 0,
+    "output": "{\n  \"db_path\": \"WORKDIR/populated.db\",\n  \"metrics_schema_version\": 2,\n  \"database_schema_version\": 21,\n  \"snapshot_timestamp\": 0.0,\n  \"thoughts\": {\n    \"by_type\": {\n      \"OBSERVATION\": 2\n    },\n    \"by_status\": {\n      \"ACTIVE\": 2\n    },\n    \"total\": 2\n  },\n  \"edges\": {\n    \"by_type\": {\n      \"ASSOCIATED\": 1\n    },\n    \"total\": 1\n  },\n  \"storage\": {\n    \"db_bytes\": 180224,\n    \"wal_bytes\": 0,\n    \"vec_index_bytes\": 0,\n    \"total_bytes\": 180224\n  },\n  \"search_latency\": {\n    \"sample_count\": 0,\n    \"p50_ms\": 0.0,\n    \"p95_ms\": 0.0,\n    \"p99_ms\": 0.0,\n    \"min_ms\": 0.0,\n    \"max_ms\": 0.0,\n    \"mean_ms\": 0.0\n  },\n  \"measured\": true\n}\n"
+  },
+  {
+    "args": [
+      "--db",
+      "WORKDIR/does-not-exist.db",
+      "info"
+    ],
+    "exit_code": 1,
+    "output": "Database not found: WORKDIR/does-not-exist.db\n"
+  },
+  {
+    "args": [
+      "--db",
+      "WORKDIR/populated.db",
+      "verify"
+    ],
+    "exit_code": 0,
+    "output": "Journal integrity OK \u2014 3 entries verified.\n"
+  },
+  {
+    "args": [
+      "--db",
+      "WORKDIR/populated.db",
+      "--format",
+      "json",
+      "verify"
+    ],
+    "exit_code": 0,
+    "output": "{\n  \"valid\": true,\n  \"entries_checked\": 3,\n  \"first_invalid_sequence\": null,\n  \"error_message\": null\n}\n"
+  },
+  {
+    "args": [
+      "--db",
+      "WORKDIR/does-not-exist.db",
+      "verify"
+    ],
+    "exit_code": 1,
+    "output": "Database not found: WORKDIR/does-not-exist.db\n"
+  },
+  {
+    "args": [
+      "--db",
+      "WORKDIR/populated.db",
+      "query",
+      "SELECT thought_id, essence FROM thought ORDER BY thought_id"
+    ],
+    "exit_code": 0,
+    "output": "thought_id  essence            \n----------  -------------------\nt-old-0     Essence for t-old-0\nt-old-1     Essence for t-old-1\n"
+  },
+  {
+    "args": [
+      "--db",
+      "WORKDIR/populated.db",
+      "--format",
+      "json",
+      "query",
+      "COUNT thoughts WHERE priority = 'P2'"
+    ],
+    "exit_code": 0,
+    "output": "[\n  {\n    \"count\": 2\n  }\n]\n"
+  },
+  {
+    "args": [
+      "--db",
+      "WORKDIR/populated.db",
+      "query",
+      "FIND thoughts WHERE lifecycle_status = 'ACTIVE'"
+    ],
+    "exit_code": 0,
+    "output": "thought_id  thought_type  essence              content              content_hash                                                      priority  lifecycle_status  created_cycle  updated_cycle  source  confidence  embedding_ref  source_type  confirmation_count  consolidated_from  visibility  access_count  last_accessed_at  created_at                        updated_at                        expires_at  metadata_json  valid_from  valid_until  action_outcome_score  provenance  pinned  archived_at_cycle  archived_at  revision\n----------  ------------  -------------------  -------------------  ----------------------------------------------------------------  --------  ----------------  -------------  -------------  ------  ----------  -------------  -----------  ------------------  -----------------  ----------  ------------  ----------------  --------------------------------  --------------------------------  ----------  -------------  ----------  -----------  --------------------  ----------  ------  -----------------  -----------  --------\nt-old-0     OBSERVATION   Essence for t-old-0  Content for t-old-0  3e921ad9cf49d8d128eb9fc752a62a5787bff379f86160ffcc954a1a788f292b  P2        ACTIVE            1              1              test    None        None           EXPERIENCE   0                   None               selective   0             None              1970-01-01T00:00:00.000000+00:00  1970-01-01T00:00:00.000000+00:00  None        {}             None        None         None                  None        0       None               None         0       \nt-old-1     OBSERVATION   Essence for t-old-1  Content for t-old-1  55a64e462d2cfb45843111a3045beb5daa400405e843e1d62e34455cb949870e  P2        ACTIVE            2              2              test    None        None           EXPERIENCE   0                   None               selective   0             None              1970-01-01T00:00:00.000000+00:00  1970-01-01T00:00:00.000000+00:00  None        {}             None        None         None                  None        0       None               None         0       \n"
+  },
+  {
+    "args": [
+      "--db",
+      "WORKDIR/does-not-exist.db",
+      "query",
+      "SELECT 1"
+    ],
+    "exit_code": 1,
+    "output": "Database not found: WORKDIR/does-not-exist.db\n"
+  },
+  {
+    "args": [
+      "--db",
+      "WORKDIR/populated.db",
+      "gc",
+      "--dry-run"
+    ],
+    "exit_code": 0,
+    "output": "No archived thoughts to collect.\n"
+  },
+  {
+    "args": [
+      "--db",
+      "WORKDIR/does-not-exist.db",
+      "gc"
+    ],
+    "exit_code": 1,
+    "output": "Database not found: WORKDIR/does-not-exist.db\n"
+  }
+]

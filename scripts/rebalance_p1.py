@@ -31,6 +31,8 @@ from pathlib import Path
 
 import aiosqlite
 
+from engrava.infrastructure.sqlite.engrava_core import _close_quietly
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,7 +67,8 @@ async def rebalance(
         msg = f"max_p1_fraction must be in [0.0, 1.0], got {max_p1_fraction}"
         raise ValueError(msg)
 
-    async with aiosqlite.connect(str(db_path)) as db:
+    db = await aiosqlite.connect(str(db_path))
+    try:
         cursor = await db.execute("SELECT COUNT(*) FROM thought")
         row = await cursor.fetchone()
         total = int(row[0]) if row else 0
@@ -85,39 +88,64 @@ async def rebalance(
                 current_p1 * 100.0 / total if total else 0.0,
                 max_p1_fraction * 100.0,
             )
-            return 0
-
-        excess = current_p1 - max_p1
-        logger.info(
-            "rebalance_p1: demoting %d excess P1 thoughts to P2 "
-            "(current %d, allowed %d, total %d)%s",
-            excess,
-            current_p1,
-            max_p1,
-            total,
-            " [DRY RUN]" if dry_run else "",
-        )
-
-        if dry_run:
-            return excess
-
-        # Demote oldest P1 thoughts first (newest are most likely relevant).
-        await db.execute(
-            """
-            UPDATE thought
-            SET priority = 'P2'
-            WHERE thought_id IN (
-                SELECT thought_id
-                FROM thought
-                WHERE priority = 'P1'
-                ORDER BY created_at ASC
-                LIMIT ?
+            # A ``return`` here would exit the function from inside this
+            # ``try`` and skip the ``else`` clause below entirely (an
+            # early-return in a ``try`` body bypasses ``else``, unlike a
+            # ``finally``) -- leaving ``db`` unclosed on this path. Fall
+            # through to the single ``return`` after the try/except/else
+            # instead, so this branch closes the connection the same way
+            # the other two below do. That still is not an absolute: a
+            # failure inside the earlier ``aiosqlite.connect(...)`` call
+            # never reaches this ``try`` at all, and a close interrupted by
+            # a cancellation may not run to completion either.
+            demoted = 0
+        else:
+            excess = current_p1 - max_p1
+            logger.info(
+                "rebalance_p1: demoting %d excess P1 thoughts to P2 "
+                "(current %d, allowed %d, total %d)%s",
+                excess,
+                current_p1,
+                max_p1,
+                total,
+                " [DRY RUN]" if dry_run else "",
             )
-            """,
-            (excess,),
-        )
-        await db.commit()
-        return excess
+
+            if dry_run:
+                demoted = excess
+            else:
+                # Demote oldest P1 thoughts first (newest are most likely relevant).
+                await db.execute(
+                    """
+                    UPDATE thought
+                    SET priority = 'P2'
+                    WHERE thought_id IN (
+                        SELECT thought_id
+                        FROM thought
+                        WHERE priority = 'P1'
+                        ORDER BY created_at ASC
+                        LIMIT ?
+                    )
+                    """,
+                    (excess,),
+                )
+                await db.commit()
+                demoted = excess
+    except BaseException:
+        # The body already raised (or was cancelled) -- that is what the
+        # caller needs to see, so a failure in this cleanup close is
+        # secondary and goes through ``_close_quietly`` rather than
+        # replacing it. Mirrors ``_opened_db`` in ``engrava.cli.main``:
+        # ``aiosqlite.Connection.__aexit__`` is a bare, unconditional
+        # ``await close()`` and cannot draw this distinction itself.
+        await _close_quietly(db)
+        raise
+    else:
+        # The body succeeded. A close failure here is not secondary to
+        # anything -- it is the only error there is, so it must propagate
+        # normally rather than being logged and swallowed.
+        await db.close()
+    return demoted
 
 
 def main(argv: list[str] | None = None) -> int:

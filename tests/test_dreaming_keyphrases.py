@@ -3,16 +3,8 @@
 Two function surfaces are exercised:
 
 * :func:`extract_simple_keywords` — frequency-ranked single tokens.
-  These tests carry over the previous unit and cognitive-
-  boundary tests for the now-deleted ``_extract_keywords`` helper in
-  :mod:`engrava.extensions.dreaming` (the body migrated; the contract
-  is preserved byte-for-byte).
 * :func:`top_keyphrases_tfidf` — TF-IDF-scored 2-3 word n-grams over
   a cluster, with the corpus baseline supplied by the caller.
-
-The migrated tests deliberately keep the same input fixtures as the
-original location so behavioural parity is provable from the diff
-alone.
 """
 
 from __future__ import annotations
@@ -52,12 +44,12 @@ def _thought(content: str, thought_id: str = "t-x") -> ThoughtRecord:
 
 
 # ---------------------------------------------------------------------------
-# Migrated tests (4) from former tests/test_dreaming_clusters.py:155-185
+# ``extract_simple_keywords``: frequency-ranked single tokens
 # ---------------------------------------------------------------------------
 
 
 class TestExtractSimpleKeywords:
-    """Behavioural parity with the legacy ``_extract_keywords`` helper."""
+    """Top-N selection, short-token filtering and frequency ordering."""
 
     def test_returns_at_most_top_n(self) -> None:
         """Returns at most top_n keywords."""
@@ -85,8 +77,7 @@ class TestExtractSimpleKeywords:
 
 
 # ---------------------------------------------------------------------------
-# Migrated tests (3) from the former tier-boundary guard test.
-# (cognitive-boundary properties of the legacy helper)
+# Cognitive-boundary properties of ``extract_simple_keywords``
 # ---------------------------------------------------------------------------
 
 

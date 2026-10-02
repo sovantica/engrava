@@ -395,9 +395,12 @@ class ActionOutcomeSignal:
     whose linked actions succeeded (and verified) scores high, one whose
     actions failed scores low. A thought with no terminal actions has a
     ``None`` score and contributes ``0.0`` — but only when this signal is
-    active for the run (i.e. at least one candidate has an outcome). In an
-    action-free pool the signal is inactive and its weight is redistributed
-    onto the active signals, so it never nudges any score.
+    active for the run (i.e. at least one candidate has an outcome).
+    Activeness is presence-based, not variance-based: candidates that share
+    the same non-null outcome still count as data-bearing and keep the
+    signal active. In an action-free pool — every candidate's outcome is
+    ``None`` — the signal is inactive and its weight is redistributed onto
+    the active signals, so it never nudges any score.
 
     Examples:
         >>> sig = ActionOutcomeSignal()

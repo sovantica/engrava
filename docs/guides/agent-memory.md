@@ -95,7 +95,12 @@ async def store_percept(store, text, cycle, user_id, session_id, turn_index):
 ## Step 2 — retrieve relevant memory
 
 Before calling the LLM, pull the most relevant prior memories with
-`search_hybrid`. Pass `current_cycle` so the recency signal works, and turn the
+`search_hybrid`. Pass `current_cycle` so the recency signal works — but note
+that with this guide's own plain `SqliteEngravaCore(conn, ...)` constructor
+(no `search_config`), the recency weight resolves to `0.0`, not the `0.10`
+`SearchConfig.default_recency_weight` documented in [Search](../search.md);
+pass a `SearchConfig` explicitly (or an explicit `recency_weight` per call) if
+you want recency to actually contribute. Turn the
 returned `(thought_id, score)` tuples back into text via `get_thought`:
 
 ```python
@@ -116,12 +121,14 @@ async def retrieve_context(store, query, cycle):
 
 `result.results` is a list of `(thought_id, score)` — Engrava returns IDs, not
 records, so you fetch the ones you want. `result.backends_used` tells you which
-signals contributed (e.g. `{"fts5", "vector", "recency"}`).
+backends were *available* for the query (e.g. `{"fts5", "vector", "recency"}`) —
+a backend appears even if it returned zero results; it does not tell you which
+ones actually contributed to the ranking.
 
 ## Step 3 — build the prompt and call your LLM
 
-This is the only step that touches your model. Engrava is LLM-free; you own the
-call:
+This is the only step that touches your model. Engrava's built-in path doesn't
+call an LLM for you here; you own the call:
 
 ```python
 prompt = "Context:\n" + "\n".join(f"- {c}" for c in context)

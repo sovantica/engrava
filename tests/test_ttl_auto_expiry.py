@@ -44,6 +44,7 @@ from engrava.domain.exceptions import ReadOnlyViolationError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+    from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +272,7 @@ class TestSchemaMigration:
         cursor = await db.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 20
+        assert row[0] == 21
 
     async def test_expires_at_column_exists(self, db: aiosqlite.Connection) -> None:
         cursor = await db.execute("PRAGMA table_info(thought)")
@@ -303,7 +304,7 @@ class TestSchemaMigration:
         cursor = await conn.execute("PRAGMA user_version")
         row = await cursor.fetchone()
         assert row is not None
-        assert row[0] == 20
+        assert row[0] == 21
         await conn.close()
 
 
@@ -455,6 +456,154 @@ class TestCleanupArchive:
         far_future = _future_ts(seconds=200)
         result = await store.cleanup_expired(now=far_future)
         assert result.expired_count == 1
+
+
+class TestCleanupArchiveWroteAnythingDiscrimination:
+    """The ARCHIVE branch's ``wrote_anything`` must reflect what the UPDATE actually did.
+
+    The ARCHIVE branch derives ``wrote_anything`` from ``total_changes``, not
+    from the archive ``UPDATE`` having been issued. A ``BEFORE UPDATE``
+    trigger that vetoes the archive with ``RAISE(IGNORE)`` exposes the
+    difference: a plain veto that writes nothing of its own must not commit a
+    caller's own pending transaction, while a trigger that writes something
+    of its own before vetoing must still have that write survive.
+
+    Self-contained (a file-backed database, not this module's ``:memory:``
+    fixtures) because the durability test needs a second connection.
+    """
+
+    async def _open(self, tmp_path: Path, name: str) -> tuple[aiosqlite.Connection, Path]:
+        db_path = tmp_path / name
+        db = await aiosqlite.connect(str(db_path))
+        db.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(db)
+        await store.ensure_schema()
+        return db, db_path
+
+    async def test_trigger_write_before_the_archive_veto_is_durable(self, tmp_path: Path) -> None:
+        """The trigger's own write survives even though the archive itself is vetoed."""
+        db, db_path = await self._open(tmp_path, "archive-veto-durable.sqlite")
+        try:
+            store = SqliteEngravaCore(db)
+            past = _past_ts()
+            await store.create_thought(_make_thought(expires_at=past))
+            await db.execute("CREATE TABLE audit(note TEXT)")
+            await db.execute(
+                "CREATE TRIGGER thought_archive_audit BEFORE UPDATE ON thought "
+                "BEGIN INSERT INTO audit VALUES ('attempted'); SELECT RAISE(IGNORE); END"
+            )
+            await db.commit()
+
+            result = await store.cleanup_expired()
+
+            assert result.expired_count == 1
+            fetched = await store.get_thought("t-001")
+            assert fetched is not None
+            assert fetched.lifecycle_status == LifecycleStatus.CREATED, (
+                "the veto must leave the thought unarchived"
+            )
+
+            other = await aiosqlite.connect(str(db_path))
+            try:
+                cursor = await other.execute("SELECT COUNT(*) FROM audit")
+                row = await cursor.fetchone()
+                assert row is not None
+                assert row[0] == 1, (
+                    "the trigger's own write happened before the veto and "
+                    "must be committed, even though the archive UPDATE "
+                    "itself matched zero rows"
+                )
+            finally:
+                await other.close()
+        finally:
+            await db.close()
+
+    async def test_a_plain_archive_veto_commits_nothing(self, tmp_path: Path) -> None:
+        """A vetoed archive that wrote nothing at all must not commit a caller's own edit."""
+        db, _ = await self._open(tmp_path, "archive-veto-write-free.sqlite")
+        try:
+            store = SqliteEngravaCore(db)
+            past = _past_ts()
+            await store.create_thought(_make_thought(thought_id="vetoed", expires_at=past))
+            await store.create_thought(_make_thought(thought_id="unrelated"))
+            await db.execute(
+                "CREATE TRIGGER thought_archive_ignore BEFORE UPDATE ON thought "
+                "BEGIN SELECT RAISE(IGNORE); END"
+            )
+            await db.commit()
+
+            await db.execute("BEGIN")
+            await db.execute(
+                "UPDATE thought SET confidence = ? WHERE thought_id = ?",
+                (0.42, "unrelated"),
+            )
+
+            result = await store.cleanup_expired()
+
+            assert result.expired_count == 1
+            assert db.in_transaction is True, (
+                "the caller's own transaction, with their pending edit still "
+                "inside it, must still be open after a fully-vetoed archive "
+                "batch that wrote nothing of its own"
+            )
+            await db.rollback()
+
+            row = await store.get_thought("unrelated")
+            assert row is not None
+            assert row.confidence == 0.8, (
+                "the caller's rollback must undo their own edit -- a "
+                "write-free archive veto must not have committed it"
+            )
+        finally:
+            await db.close()
+
+    async def test_journal_entry_for_a_vetoed_archive_is_durable(self, tmp_path: Path) -> None:
+        """A vetoed archive's own journal insert must not be discarded either.
+
+        ``wrote_anything`` is sampled after the journal append, not right
+        after the archive ``UPDATE``. A ``BEFORE UPDATE`` veto leaves the
+        per-UPDATE delta at zero, but ``JournalWriter.append`` still inserts a
+        real ``UPDATE_THOUGHT`` row regardless of whether the archive itself
+        took effect, and that row must be committed rather than discarded by
+        the batch's closing rollback.
+        """
+        db, db_path = await self._open(tmp_path, "archive-veto-journal-durable.sqlite")
+        try:
+            store = SqliteEngravaCore(db, journal_enabled=True)
+            past = _past_ts()
+            await store.create_thought(_make_thought(expires_at=past))
+            await db.execute(
+                "CREATE TRIGGER thought_archive_ignore BEFORE UPDATE ON thought "
+                "BEGIN SELECT RAISE(IGNORE); END"
+            )
+            await db.commit()
+            journal_rows_before = (
+                await (await db.execute("SELECT COUNT(*) FROM journal_entry")).fetchone()
+            )[0]
+
+            result = await store.cleanup_expired()
+
+            assert result.expired_count == 1
+            fetched = await store.get_thought("t-001")
+            assert fetched is not None
+            assert fetched.lifecycle_status == LifecycleStatus.CREATED, (
+                "the veto must leave the thought unarchived"
+            )
+
+            other = await aiosqlite.connect(str(db_path))
+            try:
+                cursor = await other.execute("SELECT COUNT(*) FROM journal_entry")
+                row = await cursor.fetchone()
+                assert row is not None
+                assert row[0] == journal_rows_before + 1, (
+                    "the UPDATE_THOUGHT journal entry for this candidate must "
+                    "be committed even though the archive UPDATE itself "
+                    "matched zero rows"
+                )
+            finally:
+                await other.close()
+        finally:
+            await db.close()
 
 
 # =====================================================================
@@ -822,10 +971,10 @@ class TestTimezoneNormalization:
         t = _make_thought(expires_at="2026-04-12T13:00:00+00:00")
         assert t.expires_at == "2026-04-12T13:00:00+00:00"
 
-    def test_naive_timestamp_preserved(self) -> None:
-        """Naive timestamps (no timezone info) are left as-is."""
+    def test_naive_timestamp_read_as_utc(self) -> None:
+        """Naive timestamps (no timezone info) are read as UTC and stored canonical."""
         t = _make_thought(expires_at="2026-04-12T13:00:00")
-        assert t.expires_at == "2026-04-12T13:00:00"
+        assert t.expires_at == "2026-04-12T13:00:00+00:00"
 
     def test_created_at_normalized(self) -> None:
         """created_at also benefits from normalization."""
@@ -949,6 +1098,44 @@ class TestSqliteVecExpiredFilter:
         results = [("t-future", 0.9), ("t-ok", 0.8)]
         filtered = await store._filter_expired_results(results)
         assert len(filtered) == 2
+
+    async def test_filter_drops_an_id_with_no_thought_row_at_all(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """Absence from ``thought`` is a positive exclusion, not an incidental miss.
+
+        A hit that does not resolve to *any* ``thought`` row — the shape a
+        stale ``embedding_vec`` entry for an already-deleted thought takes —
+        must be dropped exactly like an ordinarily-ineligible (expired /
+        archived / retired-REFLECTION) one, not passed through because this
+        filter only ever learned to recognise the other cases. The id here
+        was never created, so there is nothing in ``thought`` to resolve it
+        against.
+        """
+        await store.create_thought(_make_thought(thought_id="t-ok"))
+
+        results = [("t-never-existed", 0.95), ("t-ok", 0.8)]
+        filtered = await store._filter_expired_results(results)
+
+        ids = [r[0] for r in filtered]
+        assert "t-never-existed" not in ids
+        assert "t-ok" in ids
+
+    async def test_filter_drops_everything_when_nothing_resolves(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """The all-unresolvable case: dropping every id must not fall back to keeping them.
+
+        A degenerate empty-eligible-set result must not be read as "nothing
+        to exclude, return the input unchanged" — the earlier exclusion-form
+        query had exactly that shortcut, and inverting the polarity without
+        also dropping it would silently keep every phantom hit whenever none
+        of them happened to resolve.
+        """
+        filtered = await store._filter_expired_results([("t-a", 0.9), ("t-b", 0.5)])
+        assert filtered == []
 
 
 # ---------------------------------------------------------------------------

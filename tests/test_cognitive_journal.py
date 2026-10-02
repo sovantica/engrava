@@ -88,6 +88,7 @@ async def writer(db: aiosqlite.Connection) -> JournalWriter:
 
 def _make_thought(
     thought_id: str = "t-001",
+    *,
     thought_type: ThoughtType = ThoughtType.TASK,
     essence: str = "Test thought",
     content: str = "Full content",
@@ -814,7 +815,7 @@ class TestSchemaMigration:
 
             cursor = await conn.execute("PRAGMA user_version")
             row = await cursor.fetchone()
-            assert row[0] == 20
+            assert row[0] == 21
         finally:
             await conn.close()
 
@@ -856,7 +857,7 @@ class TestSchemaMigration:
 
             cursor = await conn.execute("PRAGMA user_version")
             row = await cursor.fetchone()
-            assert row[0] == 20
+            assert row[0] == 21
         finally:
             await conn.close()
 
@@ -871,7 +872,7 @@ class TestSchemaMigration:
 
             cursor = await conn.execute("PRAGMA user_version")
             row = await cursor.fetchone()
-            assert row[0] == 20
+            assert row[0] == 21
         finally:
             await conn.close()
 

@@ -1,6 +1,6 @@
 # Error Handling and Recovery
 
-This guide describes the error and persistence contracts of Engrava v0.6. It is
+This guide describes the error and persistence contracts of Engrava v0.7. It is
 for application code that must decide whether to fix an input, retry a remote
 call, reconcile a partial write, or replace a store.
 
@@ -16,13 +16,17 @@ Engrava does not make every write idempotent.
 | `ThoughtNotFoundError`, `ActionNotFoundError`, `SourceThoughtNotFoundError`, `ReferentialIntegrityError` | Required data is absent | Refresh identifiers or create the missing parent deliberately | No |
 | `DuplicateEdgeError` | The requested directed, typed relationship already exists | Treat the write as idempotent success or choose a different direction/type | No |
 | `InvalidTransitionError`, `ReadOnlyViolationError` | Requested operation is not allowed in the current state/view | Change the requested transition or use a writable capability | No |
-| `StaleDataError` | The guarded update matched no row — a competing writer stamped a new `updated_cycle` **or deleted the row**; **nothing** of the rejected update was written | Re-read, recompute the intended change, then issue a new update — and handle the row being gone | No, not without re-reading |
+| `StaleDataError` | The guarded update matched no row — another guarded write bumped the row's `revision` in between, **or deleted the row**; **nothing** of the rejected update was written | Re-read, recompute the intended change, then issue a new update — and handle the row being gone | No, not without re-reading |
 | Remote embedding timeout, network error, `408`, `409`, `425`, `429`, or selected `5xx` | Depends on the operation; a single thought/update may already be committed | Let the provider exhaust its bounded retry policy, then reconcile by thought ID | Not the whole write blindly |
 | SQLite `OperationalError` containing `locked` or `busy` | The operation did not complete successfully; reconcile durable state when the write boundary is ambiguous | Reduce writer contention or increase `busy_timeout`; retry only an operation known to converge | Only with operation-specific proof |
+| `WriteContentionError` | The call could not get the cross-connection write lock, after `busy_timeout` and, for the dedup calls, the store's own bounded retries; the failed attempt wrote nothing | Retry the call; if it keeps recurring, remove the contention (see SQLite lock contention below) | Yes, the call itself |
+| `WriteLockTimeoutError` | A task could not get the store's in-process write lock within `write_lock_acquire_timeout_seconds`; the guarded write did not start | Find the cause first: a task spawned and awaited from inside another task's open `suspend_auto_commit()` window (drive writes from the one task that opened it), or a bound too small for a slow embedding provider (raise it) | Not until the cause is fixed |
+| `DedupLockReentryError` | A task re-entered the dedup window it already holds and was refused instead of blocking on itself | Fix the caller: an `update_thought()` override reached from `upsert_by_hash()`'s hit branch must not call back into a dedup entry point | No |
 | Rising `fts_match_failure_count` | Search retried with sanitized FTS syntax; the vector and other hybrid arms can still contribute | Inspect warning logs and offending queries | Engrava already retries the FTS arm once |
 | Rising `vector_arm_degradation_count` | The vector arm returned no results for an empty, zero, or non-finite query vector | Fix query embedding generation | No; the same vector degrades again |
-| `EmbeddingGenerationError` from single-item create/update | The thought/update is committed; its embedding is missing or, after an update, may be stale | Look up the thought and repair its embedding; do not recreate it | Retry embedding, not creation |
-| `JournalIntegrityError`, `ExtensionMigrationError` | Store opening or migration was rejected | Stop writes, preserve the files, diagnose or restore | No |
+| `EmbeddingGenerationError` from single-item create/update | If this call owns its outermost transaction, the thought/update is committed; embedding is missing (create), or, only if the row already had one, left in place and now stale (update) — otherwise still none. Nested inside the caller's own `suspend_auto_commit()`, nothing is durable yet: the *outermost* window's exit decides, and rollback reverts to whatever existed when that outermost window opened, not just to before this call — an earlier write to the same thought inside the same window is undone too, and a thought created inside that window no longer exists at all after rollback | If this call owned its transaction: look up the thought and repair its embedding, do not recreate it. If it was nested and the outer window rolled back, do not assume based on which call you issued — look the thought up by id first: absent means nothing this window wrote for it survived, including an earlier create in the same window — create it; present means it reverted to whatever state existed before the window opened — reissue the write against that state (a blind create instead raises `ValueError` on the still-existing id) | Only when durable: retry embedding, not creation/update. Otherwise, look the thought up first and branch on what you find: create it if absent, or reissue the update if it is present — do not retry blindly based on which call you originally issued |
+| `JournalIntegrityError`, `ExtensionMigrationError`, `SchemaVersionError`, `CoreMigrationError` | Store opening or migration was rejected; `CoreMigrationError` leaves the schema version at the last fully applied step | Stop writes, preserve the files, diagnose or restore. For `SchemaVersionError`, read `reason`: `newer_than_head` needs a newer Engrava; for the two sub-floor reasons, do not delete or re-initialise the file (see below) | No |
+| `EngravaError` caught as the base class | Depends on the subclass; the base type says nothing about what committed | Handle the specific subclasses above first and put a base-class handler after them; treat anything that reaches it as unclassified | Not on the base type alone |
 | `ConnectionQuarantinedError` | The store instance is terminally unusable | Close it, create a new store over a fresh connection, then reconcile durable state | Never on the same store |
 
 ## Caller, data, and configuration errors
@@ -56,14 +60,36 @@ These failures require a changed request, not backoff:
   SQLite error text.
 - `InvalidTransitionError` rejects an illegal lifecycle/action transition, and
   `ReadOnlyViolationError` rejects a write through `ReadOnlyEngrava`.
-- `StaleDataError` is recoverable only through a new read-modify-write cycle. Do
-  not replay stale `changes` without checking the newer record — and do not
-  assume the record still exists, because a row deleted mid-call raises this too.
-  Note what it does **not** tell you: the guard compares `updated_cycle`, which
-  only a caller advances, so an ordinary competing edit passes through it and
-  overwrites — see
-  [Concurrency](concurrency.md#optimistic-concurrency-and-staledataerror). Its
-  absence is not evidence that no one else wrote.
+- `StaleDataError` means a guarded update matched no row: another guarded write
+  bumped the row's `revision` between your read and your write, or the row was
+  deleted in that window. The error does not say which, and nothing of the
+  rejected update was written. It is recoverable only through a new
+  read-modify-write cycle: re-read the record, recompute the change, and do not
+  replay stale `changes` without checking the newer record. Do not assume the
+  record still exists, because a row deleted mid-call raises this too. The
+  engine bumps `revision` on every guarded write, so a guarded update whose
+  read-to-write window another writer's guarded write lands in raises this
+  error, whatever field that other write touched, instead of silently
+  overwriting that write. Between ordinary tasks sharing one store the write
+  lock serialises guarded writes, so it almost never fires there; the shapes it
+  does catch are a write from a second store on the same file and a same-task
+  nested write from a caller-owned hook — see
+  [Concurrency](concurrency.md#optimistic-concurrency-and-staledataerror).
+- `WriteLockTimeoutError` and `DedupLockReentryError` are raised instead of a
+  hang. The first means a task waited longer than
+  `write_lock_acquire_timeout_seconds` for the store's write lock; the exception
+  alone does not say whether a task was spawned and awaited from inside another
+  task's open `suspend_auto_commit()` window (a caller bug: issue the window's
+  writes from the one task that opened it) or the bound is too small for a
+  slow embedding provider or large batch (raise it). The second means the same
+  task tried to enter the dedup window it already holds, typically an
+  `update_thought()` override reached from `upsert_by_hash()`'s hit branch that
+  calls back into `create_thought(deduplicate=True)`, `get_or_create()`,
+  `upsert_by_hash()` or `bulk_store(deduplicate=True)`. Repeating that call unchanged
+  cannot help; see
+  [Concurrency](concurrency.md#a-deadlock-this-store-cannot-resolve-raises-it-does-not-hang)
+  and
+  [Extension hooks](extension-hooks.md#1b3-a-pre-existing-restriction-update_thought-on-upsert_by_hashs-hit-branch).
 - `DerivedRecordError` means a producer violated a derivation gate or collided
   with an unrelated identity. The source thought is already durable on the
   automatic post-store path; some earlier derived children may also be durable.
@@ -72,6 +98,34 @@ These failures require a changed request, not backoff:
 not caller mistakes. Do not keep opening the same files in a write-capable
 process. Preserve the database and WAL files, inspect the reported sequence or
 migration, and follow [Backup & Recovery](backup-and-recovery.md).
+
+`SchemaVersionError` and `CoreMigrationError` are the same kind of failure,
+raised by `ensure_schema()` and so by `from_config()`,
+`EngravaManager.get_store()`, and `engrava migrate`. `SchemaVersionError`
+carries `current_version` and a `reason`:
+
+- `newer_than_head`: the file was written by a newer Engrava. `engrava migrate`
+  cannot help; upgrade Engrava before opening it.
+- `populated_sub_floor` and `stale_shape_sub_floor`: the file is stamped below
+  the bootstrap floor and this build cannot tell which older version produced
+  it, so it refuses instead of stamping it current. Do not delete or
+  re-initialise it — even when no core table holds a row, it may carry data
+  outside the core tables — preserve it and follow Backup & Recovery.
+
+`CoreMigrationError` means a migration step returned without leaving the
+structure it targets (a column, table, index, foreign key, or trigger) in place.
+The version is not stamped past the last fully applied step, so the next
+`ensure_schema()` retries the remaining steps rather than treating a
+half-migrated file as current; repeating the open without changing anything is
+not a fix. Replace the database from a backup, or use a build that matches its
+schema history.
+
+`EngravaError` is the base of every typed error above except `ConfigError`,
+which derives from `ValueError`. It is not raised directly and carries no
+guarantee about what committed, so a handler for it belongs after the specific
+ones: Python runs the first `except` clause that matches, and a base-class
+clause written first hides the specific recovery below it. A raw
+`sqlite3.OperationalError` is not an `EngravaError` either.
 
 The complete exception surface is listed in the
 [API Reference](api-reference.md#exceptions).
@@ -90,11 +144,15 @@ Provider behavior is deliberately provider-specific:
   Their dependency/provider exceptions propagate.
 - Local, callback, and third-party providers define their own failure behavior.
 
-Once provider attempts are exhausted, auto-embedding never swallows the error.
-With `require_embedding=true`, Engrava wraps it in
-`EmbeddingGenerationError`; otherwise the provider's original exception is
-re-raised. Strict mode changes the exception type, **not** the single-item
-commit boundary.
+Once provider attempts are exhausted, auto-embedding on the thought a caller
+explicitly created or updated never swallows the error. With
+`require_embedding=true`, Engrava wraps it in `EmbeddingGenerationError`;
+otherwise the provider's original exception is re-raised. Strict mode changes
+the exception type, **not** the single-item commit boundary. A derived
+child's own embedding failure is a separate path: under the default
+`on_error="log"` derivation gate, it is logged and derivation continues, so
+the call that created or updated the source does not see it — see
+[Derived records](#derived-records).
 
 For a search that only failed while generating its query vector, retrying the
 search after a transient provider recovery does not replay a graph write. For a
@@ -118,8 +176,11 @@ Consequences:
   vector search.
 - An `on_store` or derivation failure does not roll back the source. Depending on
   where derivation failed, earlier derived children may already be committed.
-- Retrying `create_thought()` with the same ID raises `ValueError`; retrying
-  `remember()` creates another random ID. Neither is a recovery strategy.
+- Retrying `create_thought()` with the same ID raises `ValueError`. Retrying
+  `remember()` with the default `deduplicate=False` creates another random
+  ID; with `deduplicate=True`, a byte-identical existing row is reused and
+  its `confirmation_count` is incremented instead. Neither the default call
+  nor the deduplicated one is a repair for a failed embedding.
 
 Use strict embedding mode when callers need the typed thought ID for repair:
 
@@ -174,11 +235,17 @@ model lock rejects an incompatible model or dimension.
 ### Thought updates
 
 `update_thought()` commits the updated row and journal entry before re-embedding
-when `essence` or `content` changed. If query generation fails, the row contains
-the new text but:
+when `essence` or `content` changed, provided this call owns its outermost
+transaction. Nested inside the caller's own `suspend_auto_commit()` window,
+nothing is durable yet on any path — the outermost window's exit decides,
+rolling back an uncaught failure and everything it inserted. If the update
+does commit and query generation then fails, the row contains the new text
+but:
 
-- a thought that had no embedding remains unembedded;
-- a thought that had an embedding can retain the old, now stale vector;
+- a thought that had no embedding remains unembedded, and stays unfindable by
+  vector search;
+- a thought that had an embedding retains the old, now stale vector, and
+  stays findable by vector search against that outdated content;
 - dependent REFLECTION centroids may not yet have been rebound.
 
 Re-read the thought and repair/recompute enrichment. Do not replay the update
@@ -188,11 +255,22 @@ unchanged and assume that doing so re-embeds: an update that no longer changes
 ### Bulk ingest
 
 `bulk_store()` is different. Source rows, journal entries, and batch-generated
-embeddings run inside one `suspend_auto_commit()` transaction. Any `Exception`
-during that phase, including a provider exception, rolls the batch back. The
-`require_embedding` option controls whether that provider failure is wrapped as
-`EmbeddingGenerationError`; it does not change the rollback. Task cancellation
-is the `BaseException` caveat described under transaction contexts below.
+embeddings run inside one `suspend_auto_commit()` transaction. Called on its
+own, any exception during that phase, including a provider exception or a task
+cancellation, rolls the batch back and nothing from it is persisted. The
+`require_embedding` option controls whether a failure of the provider's embed
+call is wrapped as `EmbeddingGenerationError`; it does not change the rollback
+(see [Embeddings](guides/embeddings.md#when-auto-embed-fails-the-honest-boundary)
+for what that covers). The one window the rollback does not cover is a
+cancellation that lands during the final commit,
+described under transaction contexts below.
+
+Nested inside a caller's own `suspend_auto_commit()` window, the batch shares
+that outer transaction: a row error still aborts the batch's own inserts, but
+only the outermost window's exit decides commit or rollback. If the caller
+catches the propagated exception and the outer window then exits cleanly, the
+batch's successful prefix commits along with the rest of the outer block's
+work instead of being rolled back.
 
 Automatic derivation runs only after the batch commits. A derivation failure can
 therefore leave the complete source batch durable and zero or more derived
@@ -205,14 +283,20 @@ The source is durable before automatic derivation. Each derived child's row is
 then committed as its own unit before its embedding and `DERIVED_FROM` edge are
 completed. Re-running `derive_existing(source_id)` reuses deterministic children
 and edges and fills missing enrichment, provided the producer obeys the
-deterministic content contract. A failed compensating rollback is the one case
-that terminally quarantines the connection.
+deterministic content contract. A failed child undoes only its own failing
+step — the row and its journal entry, the edge and its journal entry, or an
+embedding attempt — never an earlier child's work, and never a caller's other
+pending writes when `derive_existing` runs inside the caller's own
+`suspend_auto_commit()` window or a raw `BEGIN`. When a step's own unwind
+cannot itself be trusted to have completed, it terminally quarantines the
+connection; that is one of several causes, listed under
+[Terminal connection quarantine](#terminal-connection-quarantine).
 
 ## Transaction context behavior
 
 `suspend_auto_commit()` groups writes on one store connection. A normal exit
-commits once; an `Exception` escaping the block causes a rollback and is
-re-raised.
+commits once; any exception escaping the block, including task cancellation,
+causes a rollback of the outermost transaction and is re-raised.
 
 ```python
 async def store_atomically(store, first, second, link):
@@ -226,19 +310,29 @@ Operational rules:
 
 - Let an error escape the `async with` block. Catching it inside and then leaving
   normally tells the context manager to commit.
-- Do not nest `suspend_auto_commit()` and do not run another writer concurrently
-  on the same store instance. The deferred-commit flag belongs to the instance,
-  not to an individual task: a write issued by any other task while the window is
-  open joins the window's transaction, and a rollback discards it too — with no
-  error reaching the task that issued it. Drive the window from one task at a
-  time.
+- `suspend_auto_commit()` holds a task-reentrant lock for its whole duration: a
+  *different* task's write on the same store instance now waits for the window
+  to close instead of joining its transaction (a wait that is bounded: past
+  `write_lock_acquire_timeout_seconds` it raises `WriteLockTimeoutError`), and
+  nesting on the *same* task is supported (only the outermost call commits or
+  rolls back). Drive the
+  window from one task at a time regardless — a second task's write is safe
+  from corruption, but it still simply waits, so interleaving unrelated writes
+  through a long-running window serialises them for no benefit. See
+  [Concurrency](concurrency.md#suspend_auto_commit-is-now-a-real-exclusive-window)
+  for the full contract.
 - Automatic on-store derivation is skipped inside a caller-held transaction.
   After commit, invoke `derive_existing()` explicitly for sources that need it.
-- In v0.6, the rollback branch catches `Exception`; `asyncio.CancelledError` is a
-  `BaseException` and does not pass through that branch. If cancellation reaches
-  a suspended-commit window, close/discard that store connection before
-  continuing and reconcile the affected IDs from a new store. Do not let a later
-  commit decide the fate of an indeterminate transaction.
+- The rollback branch catches `BaseException`, so `asyncio.CancelledError`
+  (and `SystemExit` or `KeyboardInterrupt`) escaping the block body rolls the
+  outermost transaction back like any other error. The exception to that rule is
+  a cancellation that lands during the outermost window's own `commit()`: the
+  commit runs after the body has returned, outside the rollback branch, so it
+  may or may not have completed by the time the cancellation propagates. Treat
+  the outcome as indeterminate: reconcile the affected IDs from a new store
+  before repeating anything, and do not let a later commit decide it. See the
+  `suspend_auto_commit()` entry in the
+  [0.6 to 0.7 upgrade notes](upgrade.md#06---07) for the change.
 
 For the supported writer topology and task boundaries, see
 [Concurrency](concurrency.md).
@@ -250,6 +344,15 @@ SQLite permits many readers but only one writer. Stores opened through
 `PRAGMA busy_timeout=5000`, so a competing connection waits for up to five
 seconds before surfacing `database is locked`. A manually supplied connection
 keeps its own pragma settings.
+
+`create_thought(deduplicate=True)`, `get_or_create()`, `upsert_by_hash()`,
+`bulk_store(deduplicate=True)` and the `revision`-guarded updates
+(`update_thought`, `restore_thought`, `update_edge`, `update_action`) convert
+contention that outlasts `busy_timeout` into `WriteContentionError`, carrying
+`operation` and `attempts`; from `bulk_store` the `operation` reads
+`"create_thought"`, the shared dedup path's label. The failed attempt wrote
+nothing, so retrying that call outright is safe. Other write
+paths can still surface the raw `OperationalError` from the table above.
 
 Prefer removing contention over adding a generic retry loop:
 
@@ -332,13 +435,27 @@ metrics-level signals.
 
 ## Terminal connection quarantine
 
-`ConnectionQuarantinedError` means Engrava could not guarantee that a
-compensating rollback for a derived child completed. The old connection may
-have an indeterminate open transaction, so the store revokes all new operations
-and replaces its internal connection with a failing proxy. This state never
-clears. The operation that caused the rollback can surface its original or
-derivation error; once quarantine is installed, the next newly-admitted public
-operation raises `ConnectionQuarantinedError`.
+`ConnectionQuarantinedError` means Engrava could not prove that a rollback or
+unwind it depends on completed, or that the connection's last operation ever
+reported. The old connection may have an indeterminate open transaction, so the
+store revokes all new operations and replaces its internal connection with a
+failing proxy. This state never clears. Any of these triggers it:
+
+- the savepoint unwind of a guarded write (`update_thought`,
+  `restore_thought`, `update_edge`, `update_action`, a derived child's row
+  insert or edge insert) failed;
+- the savepoint unwind of a `delete_thought` failed, including a delete made
+  through the TTL delete strategy or hygiene garbage collection — an ordinary
+  error such as a trigger veto can cause this, not only a cancellation, and the
+  derived-records seam need not be involved;
+- `close()` gave up waiting on the physical close after
+  `close_timeout_seconds` — see
+  [Deployment](deployment.md#if-the-worker-never-answers).
+
+The call that triggered the quarantine can surface its original error (or a
+cancellation that outranks it); a `close()` whose bound expired raises
+`ConnectionQuarantinedError` itself. Once quarantine is installed, the next
+newly-admitted public operation raises `ConnectionQuarantinedError`.
 
 Close the old store, open a new one, and inspect durable state before deciding
 what to repeat:
@@ -382,7 +499,7 @@ Use these contracts narrowly:
 | `create_thought()` | Not idempotent; the same ID raises and a new ID creates another row |
 | `remember()` | Not idempotent; each call creates a fresh ID unless content deduplication is requested |
 | `create_thought(deduplicate=True)` / `get_or_create()` | Prevent duplicate content rows, but each hit increments `confirmation_count`; not observationally idempotent |
-| `bulk_store()` | Atomic through source+embedding commit, but not safe to replay blindly after a post-commit derivation failure |
+| `bulk_store()` | Atomic through source+embedding commit when it owns that transaction outright — nested inside a caller's own `suspend_auto_commit()`, a caught row error can still commit the batch's successful prefix, while a caught embedding failure (see [API reference](api-reference.md#exceptions)) commits every row the batch inserted instead, since that failure only fires after every row is already in — and, either way, not safe to replay blindly after a post-commit derivation failure |
 | Retrieval calls | Do not mutate graph content, but can buffer access-frequency events when access tracking is enabled |
 
 When an API is not listed as idempotent, assume that retry requires an

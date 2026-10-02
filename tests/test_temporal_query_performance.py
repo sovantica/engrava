@@ -263,9 +263,9 @@ class TestPlanHelpers:
     def test_other_table_count_distinguishes_thought_from_thought_fts(self) -> None:
         """``THOUGHT_FTS`` is a different table, not the allowed ``THOUGHT``.
 
-        Regression guard: a substring test for ``THOUGHT`` would wrongly treat
-        an access of the ``thought_fts`` full-text table as the allowed
-        ``thought`` table. The helpers match the exact table token instead.
+        A substring test for ``THOUGHT`` would wrongly treat an access of the
+        ``thought_fts`` full-text table as the allowed ``thought`` table. The
+        helpers match the exact table token instead.
         """
         assert _other_table_count(["SEARCH THOUGHT_FTS USING INDEX X"]) == 1
         assert _other_table_count(["SCAN THOUGHT"]) == 0

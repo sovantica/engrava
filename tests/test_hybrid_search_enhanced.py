@@ -523,7 +523,7 @@ class TestFromConfigSearch:
             result = await store.search_hybrid("runtime", [0.1], current_cycle=100)
 
         # The single mocked FTS hit is the degenerate min-max case (hi == lo):
-        # it normalizes to the neutral 0.5 (not the old 1.0). Fused score =
+        # it normalizes to the neutral 0.5. Fused score =
         # fts 0.5*0.2 + vector 0.4*0.3 + recency 1.0*0.5 = 0.10 + 0.12 + 0.50.
         assert result.results[0] == ("t-runtime", pytest.approx(0.72))
 

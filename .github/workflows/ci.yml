@@ -21,9 +21,9 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev]"
       - name: Ruff check
-        run: ruff check src/ tests/
+        run: ruff check src/ tests/ examples/ scripts/
       - name: Ruff format
-        run: ruff format --check src/ tests/
+        run: ruff format --check src/ tests/ examples/ scripts/
 
   typecheck:
     runs-on: ubuntu-latest
@@ -88,12 +88,16 @@ jobs:
 
   # Warm the HuggingFace model cache exactly once before the test matrix.
   # The benchmark tests load a real sentence-transformers model
-  # (all-MiniLM-L6-v2) on purpose. If the matrix legs each populated the cache
-  # themselves, a cold cache means all three legs miss and download the model
+  # (all-MiniLM-L6-v2) on purpose, and the configured-embedding CLI tests
+  # (tests/test_cli_memory_verbs_embedding.py) load the package's actual
+  # default model (all-MiniLM-L12-v2) for the same reason — a mock would only
+  # prove the CLI can call a mock. If the matrix legs each populated the cache
+  # themselves, a cold cache means all three legs miss and download models
   # concurrently — tripping HF rate limiting (HTTP 429), and if every leg fails
-  # the cache is never saved. This single upstream job does at most one download
-  # per cold workflow run, saves the shared cache, and the matrix (which `needs`
-  # it) then restores a warm cache and runs fully offline.
+  # the cache is never saved. This single upstream job does at most one
+  # download per model per cold workflow run, saves the shared cache, and the
+  # matrix (which `needs` it) then restores a warm cache and runs fully
+  # offline.
   warm-hf-cache:
     runs-on: ubuntu-latest
     steps:
@@ -107,26 +111,34 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
-          key: hf-${{ runner.os }}-sentence-transformers-all-MiniLM-L6-v2-v1
-      - name: Download model on cache miss
+          key: hf-${{ runner.os }}-sentence-transformers-minilm-l6-l12-v1
+      - name: Download models on cache miss
         if: steps.hf-cache.outputs.cache-hit != 'true'
-        # Only the minimal stack needed to fetch + load the model. This is the
-        # single, serialized download for the whole workflow on a cold cache.
+        # Only the minimal stack needed to fetch + load the models. This is
+        # the single, serialized download for the whole workflow on a cold
+        # cache.
         run: |
           pip install "sentence-transformers>=3.0.0"
-          python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+          python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2'); SentenceTransformer('all-MiniLM-L12-v2')"
 
   # End-to-end pip-install upgrade validation: install the last released
-  # engrava from PyPI, populate a database with it, then upgrade in place to the
-  # current working tree and assert data + core CLI commands still work. Unlike
-  # the offline `test` matrix this job MUST reach the network (it pip-installs a
-  # released wheel from PyPI into a throwaway venv), so it is scoped to only the
-  # upgrade suite and sets the opt-in gate the test keeps for local runs.
+  # engrava from PyPI, populate a database with it, then upgrade in place to
+  # a wheel built from HEAD and assert data + core CLI commands still work.
+  # That wheel still carries HEAD's own pyproject.toml version — the release
+  # pipeline bumps the version later, in its own separate build — so it is
+  # not the exact wheel that gets published, only the same source tree.
+  # Unlike the offline `test` matrix this job MUST reach the network (it
+  # pip-installs a released wheel from PyPI into a throwaway venv), so it is
+  # scoped to only the upgrade suite and sets the opt-in gate the test keeps
+  # for local runs.
   #
   # ENGRAVA_UPGRADE_FROM_SPEC pins the previous release; bump it on every
   # release so the job always exercises the real previous-release -> HEAD path
-  # (e.g. 0.5.0 ships schema 18, HEAD ships schema 20, so this run drives the
-  # v18 -> v20 migration through a genuine reinstall).
+  # (e.g. 0.6.0 ships schema 20, HEAD ships schema 21, so this run drives the
+  # v20 -> v21 migration through a genuine reinstall). The upgrade target is
+  # the wheel built below, not an editable checkout -- an editable install
+  # imports straight from the source tree, so a packaging-only defect (a
+  # missing data file, a broken entry point) would be invisible to it.
   upgrade-matrix:
     name: Upgrade matrix (last released -> current)
     runs-on: ubuntu-latest
@@ -151,13 +163,17 @@ jobs:
           python-version: "3.12"
           cache: "pip"
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev]" build
+      - name: Build the candidate wheel
+        run: python -m build --wheel
       - name: Run upgrade matrix
         env:
           ENGRAVA_RUN_UPGRADE_MATRIX: "1"
-          ENGRAVA_UPGRADE_FROM_SPEC: "engrava==0.5.0"
-          ENGRAVA_UPGRADE_TO_SPEC: "."
-        run: pytest tests/upgrade/test_upgrade_matrix.py -q
+          ENGRAVA_UPGRADE_FROM_SPEC: "engrava==0.6.0"
+          ENGRAVA_UPGRADE_TO_EDITABLE: "0"
+        run: |
+          wheel_path="$(ls "$PWD"/dist/engrava-*.whl | head -n1)"
+          ENGRAVA_UPGRADE_TO_SPEC="$wheel_path" pytest tests/upgrade/test_upgrade_matrix.py -q
 
   test:
     needs: warm-hf-cache
@@ -166,7 +182,18 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
+      # Full history and tags, unlike every other job here. The release-gate
+      # tests prove they can go red by pointing at this repository's own
+      # history -- a released tag, origin/main, and a commit from before a
+      # forward merge. A depth-1, tagless checkout does not carry those, and
+      # the tests are written to skip rather than fail when they are absent,
+      # so on the default checkout they vanish silently while this job still
+      # reports green: the evidence that the gates can fail is exactly the
+      # evidence that would never run. The repository is small enough that
+      # fetching all of it costs seconds.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
@@ -178,7 +205,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
-          key: hf-${{ runner.os }}-sentence-transformers-all-MiniLM-L6-v2-v1
+          key: hf-${{ runner.os }}-sentence-transformers-minilm-l6-l12-v1
       - name: Install dependencies
         run: pip install -e ".[dev]"
       - name: Run tests

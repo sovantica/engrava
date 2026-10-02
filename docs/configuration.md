@@ -3,6 +3,140 @@
 engrava supports YAML-based configuration for production deployments.
 This document covers all configuration options.
 
+## Quick-start profiles
+
+The base install (`pip install engrava`) is light: five direct dependencies,
+no `torch`. Whether a machine-learning model ever loads into *your* process —
+and how much it costs to get there — is decided entirely by which
+**embeddings extra** you install and which provider you point `engrava.yaml`
+at. Nothing below changes an engine default; each profile is an ordinary
+`engrava.yaml`, shipped as a real file under [`examples/`](../examples/) so
+you can copy it as-is.
+
+Pick one **before** your first `pip install`, not after:
+
+| Profile | Install | Semantic search | Model runs where | One-time cost |
+|---|---|---|---|---|
+| [`lexical`](../examples/profile-lexical.yaml) | `pip install engrava` (base only) | **Inert** — no vector arm runs at all | nowhere — no provider configured | none |
+| [`network`](../examples/profile-network-ollama.yaml) | `pip install 'engrava[embeddings-ollama]'` | Works | out of process, in a separately-running Ollama server | none locally; needs Ollama running and the model pulled into it |
+| [`local`](../examples/profile-local.yaml) | `pip install 'engrava[embeddings-local]'` | Works, offline after warm-up | in this process | a large one-time dependency + model download (see below) |
+
+### `lexical` — no embedding provider
+
+```yaml
+database:
+  path: "./engrava.db"
+  wal_mode: true
+```
+
+No `embeddings:` section at all — that is the whole profile. FTS5/BM25
+keyword search, the edge graph, and MindQL all work exactly as usual, and the
+journal is available (off by default, same as every profile). **Semantic
+search is inert, not degraded**: with no provider configured,
+`search_hybrid()` / `recall()` never run a vector arm — verified against a
+live store: `HybridSearchResult.backends_used` comes back as
+`{'fts5', 'priority'}`, never containing `"vector"`, and a query that only a
+vector arm could answer returns nothing, silently, rather than raising. No
+embeddings dependency is installed and no model is ever downloaded — the
+store-open cost is exactly the base install's, not claimed to be zero or
+"instant".
+
+### `network` — Ollama, model out of process
+
+```yaml
+database:
+  path: "./engrava.db"
+  wal_mode: true
+
+embeddings:
+  provider: ollama
+  model: nomic-embed-text
+  base_url: "http://localhost:11434"
+  auto_embed: true
+
+extensions:
+  vector:
+    backend: numpy
+    dimension: 768   # nomic-embed-text's embedding dimension
+```
+
+Needs three things, none of which is a Python dependency of engrava beyond
+one small package:
+
+1. [Ollama](https://ollama.com) installed and running, reachable at
+   `base_url`.
+2. The model pulled into Ollama once: `ollama pull nomic-embed-text`.
+3. The `engrava[embeddings-ollama]` extra — it declares one direct
+   dependency, `httpx` (a ~70 KB wheel on PyPI), which brings in its own
+   dependencies in turn (for example `httpcore`, `h11`); that is the sole
+   cost this profile adds to the Python environment. No model file ever
+   touches this process.
+
+Verified against a live Ollama server: `store.recall()` against this exact
+profile returns `backends_used = {'fts5', 'priority', 'vector'}` — the vector
+arm ran, driven by a real HTTP call to Ollama, not a local model load.
+
+An OpenAI-compatible endpoint (`provider: openai-compatible`, its own
+`base_url`, and a real `api_key`) is a **variant of this same profile**, not
+a separate one — the model still runs outside this process, on the same
+"one HTTP dependency" cost — it is documented here as a variant rather than
+as its own profile because a profile with two backends is not one
+reproducible thing.
+
+**What you give up:** this profile needs Ollama reachable at query time.
+There is no offline fallback — if Ollama is down, embedding calls fail; the
+`local` profile trades that for a large upfront download instead.
+
+### `local` — sentence-transformers, offline after warm-up
+
+```yaml
+database:
+  path: "./engrava.db"
+  wal_mode: true
+
+embeddings:
+  provider: sentence-transformer
+  model: all-MiniLM-L6-v2
+  auto_embed: true
+
+extensions:
+  vector:
+    backend: numpy
+    dimension: 384
+```
+
+Needs the `engrava[embeddings-local]` extra, which pulls
+`sentence-transformers` and `torch`. Real, measured numbers, not general
+knowledge about these libraries:
+
+- `torch`'s current PyPI Linux/x86_64 wheel for Python 3.11
+  (`torch-2.14.0-cp311-cp311-manylinux_2_28_x86_64.whl`) is **554.6 MB**,
+  read from the PyPI package index on 2026-09-16. `sentence-transformers`
+  itself is a sub-1 MB wheel, but it brings in `transformers`, `tokenizers`,
+  and `huggingface_hub` on top, so the extra's total download exceeds
+  `torch` alone.
+- The model this profile names, `all-MiniLM-L6-v2`, is a **further, separate
+  download** — measured **88 MB** on disk under
+  `~/.cache/huggingface/hub` after the first call that uses it.
+
+**What you give up, and what "offline" actually requires.** After the
+dependency install and one warm model load, later `embed()` calls run
+in-process with no network call — but only once two environment variables
+are set: `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`. This was verified
+directly, not assumed: against this exact profile, with the model already
+cached and the network made unreachable, loading the model **still raised**
+with those two variables unset — the underlying `transformers` library
+issues a HEAD request checking for a PEFT adapter config on every load,
+cache or not, and does not fall back to the cache silently when that request
+fails. With both variables set, the identical load and query succeeded with
+no network reachable at all. Set them before your process starts if you rely
+on this profile being offline.
+
+**What you give up versus `network`:** a large one-time download (and the
+two offline environment variables above) in exchange for never needing a
+reachable service again — the inverse trade from `network`, which needs no
+local download but needs Ollama reachable at every query.
+
 ## Configuration File
 
 Create a `engrava.yaml` file:
@@ -104,7 +238,7 @@ whole section is optional.
 | `default_vector_weight` | `float` | `0.55` | Weight for vector similarity score |
 | `default_recency_weight` | `float` | `0.10` | Weight for recency-based score |
 | `default_priority_weight` | `float` | `0.05` | Weight for priority signal |
-| `default_graph_weight` | `float` | `0.0` | Weight for 1-hop graph signal. **`0.0` ⇒ the graph signal is OFF by default** — no graph queries run and there is zero overhead. Raise it (or pass `graph_weight=` per call) to opt in. |
+| `default_graph_weight` | `float` | `0.0` | Weight for 1-hop graph signal. **`0.0` ⇒ the graph ranking signal is OFF by default** and costs nothing; candidate-pool expansion over `CONSOLIDATED_FROM` edges is controlled separately by `graph_expansion_enabled`, is on by default, and reads those edges only when a reflection ranks among the top candidates. Raise it (or pass `graph_weight=` per call) to opt in. |
 | `recency_half_life` | `int` | `50` | Cycles for recency score to halve |
 | `recency_now_half_life_seconds` | `int` | `604800` | Wall-clock seconds for transaction-time recency to halve (7 days). Used when a query supplies `recency_now`; per-call override: `recency_now_half_life`. |
 | `priority_boost_p1` | `float` | `1.0` | Score multiplier for P1 thoughts |
@@ -142,8 +276,8 @@ Weights are redistributed proportionally when a signal is unavailable
 (e.g. no `current_cycle` → recency skipped). Set any weight to `0.0`
 to disable that signal entirely.
 
-> **The graph signal is off by default.** `default_graph_weight` is `0.0`, so a
-> default store runs no graph queries at all. This is separate from
+> **The graph ranking signal is off by default.** `default_graph_weight` is
+> `0.0`, so a default store runs no graph ranking queries. This is separate from
 > `graph_expansion_enabled` (default `true`), which controls candidate-pool
 > widening over `CONSOLIDATED_FROM` edges — the *ranking* graph signal stays
 > off until you give `default_graph_weight` (or a per-call `graph_weight`) a
@@ -217,7 +351,7 @@ vector dimension lives under `extensions.vector.dimension`, not here.
 | `provider` | `str` | `null` | Provider type: `"sentence-transformer"`, `"openai-compatible"`, `"ollama"`, `"huggingface"` |
 | `model` | `str` | `null` | Model name or identifier |
 | `auto_embed` | `bool` | `false` | Auto-embed on `create_thought` / `update_thought` |
-| `require_embedding` | `bool` | `false` | Turn an auto-embed provider failure into a hard error. With the default `false`, a failure logs a `WARNING` naming the thought and re-raises the provider's own error; the thought is *already committed*, so it stays persisted without an embedding (invisible to vector search). Set `true` to instead raise a typed `EmbeddingGenerationError`, the explicit fail-fast an operator opts into. No effect unless `auto_embed` is on |
+| `require_embedding` | `bool` | `false` | Turn a failure of the provider's embed call into a hard error. With the default `false`, a failure logs a `WARNING` naming the thought and re-raises the provider's own error (see [Embeddings](guides/embeddings.md#when-auto-embed-fails-the-honest-boundary) for what that covers). If the call does not own the outermost transaction — nested inside the caller's own `suspend_auto_commit()` window — nothing is durable yet, on any path: that window's exit decides. If the call does own it, the path decides: `create_thought` and `update_thought` have already committed by the time embedding runs, so the failure cannot undo them; a standalone `bulk_store` has not — its inserts and the single trailing embed call share one transaction, so the failure rolls the whole batch back. What is left behind is path-specific: `create_thought` leaves no embedding row at all, so the row stays unfindable by vector search; `update_thought` leaves any embedding the row already had in place — if the update committed, that embedding is now stale and the row stays findable by vector search against it, but if the row had no embedding before, it still has none and remains unfindable; a rolled-back standalone `bulk_store` leaves nothing behind. Set `true` to instead raise a typed `EmbeddingGenerationError`, the explicit fail-fast an operator opts into. No effect unless `auto_embed` is on. A derived child's own embedding failure is a separate path: under the default derivation `on_error="log"` gate it is logged and derivation continues instead of raising here |
 | `device` | `str` | `"cpu"` | Compute device for local providers (`"cpu"`, `"cuda"`) |
 | `batch_size` | `int` | `32` | Batch encoding size for local providers |
 | `base_url` | `str` | `null` | Base URL for remote providers |
@@ -248,7 +382,7 @@ operations.
 | `enabled` | `bool` | `false` | Enable dreaming consolidation |
 | `schedule_every_n_cycles` | `int` | `100` | Positive cadence consumed by `DreamingExtension.is_due()` / `run_if_due()`; Engrava does not start a background scheduler. |
 | `promote_threshold` | `float` | `0.7` | Promotion requires a redistributed weighted score strictly greater than this value. |
-| `signals` | `map[str, float]` | see below | Relative promotion-signal weights. A partial YAML map merges onto the defaults. Flat signals are removed and active weights are renormalised per run. |
+| `signals` | `map[str, float]` | see below | Relative promotion-signal weights. A partial YAML map merges onto the defaults. Which signals are active in a run, and how their weights are combined, is described in [Signals](dreaming.md#signals). |
 | `candidates_limit` | `int` | `200` | Limit for the ACTIVE promotion pool and each agglomerative type query. The LPA path reads the existing dream-edge graph rather than applying this as a graph-edge cap. |
 | `clustering_backend` | `"numpy" \| "python"` | `"numpy"` | Similarity backend for agglomerative clustering. `numpy` uses vectorised/chunked float32 matrix operations; `python` is the much slower O(n²) debugging fallback. |
 | `top_keyphrases_count` | `int` | `3` | Number of TF-IDF keyphrases written to each v2 REFLECTION payload. |
@@ -340,10 +474,14 @@ is no per-service `db_path` — the file is derived as `<data_dir>/<name>.db`):
 |-----|------|---------|-------------|
 | `embeddings` | `dict` | — | Per-service embedding-provider override (same shape as the top-level `embeddings` section) |
 
-The restore CLI constructs `EngravaManager` from the `services` object without
-passing the top-level `embeddings` section as `default_embeddings`. Therefore a
-service used with `restore --re-embed` must declare its provider explicitly at
-`services.configs.<name>.embeddings`; a top-level provider alone is not enough.
+The restore CLI passes the top-level `embeddings` section as `default_embeddings`
+only when `--re-embed` is set; a plain `restore` (no re-embed) constructs
+`EngravaManager` with no `default_embeddings` fallback. A per-service override
+at `services.configs.<name>.embeddings` always takes precedence when present,
+and `EngravaManager` falls back to `default_embeddings` for a service that
+does not declare its own provider. See
+[Asymmetric prefixes for instruction-tuned models](guides/embeddings.md#asymmetric-prefixes-for-instruction-tuned-models)
+for the `--re-embed` path itself.
 
 ### `journal`
 
@@ -368,7 +506,7 @@ Time-to-live / auto-expiry of thoughts. See the
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `strategy` | `str` | `"archive"` | What `cleanup_expired` does to expired thoughts: `"archive"` (soft, marks `ARCHIVED`) or `"delete"` (hard) |
-| `check_every_n_operations` | `int` | `0` | Run auto-cleanup every *N* store operations (`0` = manual only, via `cleanup_expired()` / `engrava gc --expired`) |
+| `check_every_n_operations` | `int` | `0` | Run auto-cleanup after every *N* thought create/update calls (`0` = manual only, via `cleanup_expired()` / `engrava gc --expired`); other store operations do not advance this counter |
 | `default_ttl_seconds` | `int \| null` | `null` | Default TTL applied to new thoughts with no explicit `expires_at` (`null` = no default) |
 
 ```yaml
@@ -380,9 +518,11 @@ ttl:
 
 ### `hygiene_policy`
 
-The rule-based [Memory Hygiene](memory-hygiene.md) forgetting loop — a no-LLM
-pass that archives cold, low-value thoughts and, separately opt-in,
-garbage-collects them after a restore window. **Absent or `enabled: false` (the
+The rule-based [Memory Hygiene](memory-hygiene.md) forgetting loop — built-in
+scoring makes no LLM calls; a configured custom `on_retrieve` or
+`decay_function` hook can — archives cold, low-value thoughts and, separately
+opt-in, garbage-collects them after a restore window. **Absent or
+`enabled: false` (the
 default) ⇒ the loop never runs and no read/write path changes.** Distinct from
 [`ttl`](#ttl): TTL expires by wall-clock `expires_at`; hygiene forgets by a
 signal-derived keep-score.
@@ -394,12 +534,12 @@ signal-derived keep-score.
 | `protected_priorities` | `list[str]` | `["P1"]` | Priorities never auto-archived or auto-GC'd. Set to `[]` for more aggressive hygiene. (Pinning is the hard never-forget marker.) |
 | `signal_weights` | `map[str, float]` | see below | Keep-score weights over the reusable signals. A partial map merges onto the defaults. |
 | `check_every_n_cycles` | `int` | `1` | Cadence for the convenience pass from `consolidate()` only — an explicit `run_hygiene` bypasses it. |
-| `max_evictions_per_run` | `int` | `100` | Caps **each** stage per run (≤ N archived and ≤ N GC'd). |
+| `max_evictions_per_run` | `int` | `100` | Caps **each** stage per run (≤ N archived and ≤ N GC'd). Does not cap the orphan-reflection sweep that runs before GC, which is uncapped and counted separately. |
 | `auto_gc_enabled` | `bool` | `false` | Whether Stage 2 (physical delete) runs. Enabling hygiene never implicitly enables deletion. |
 | `gc_min_archive_age_cycles` | `int` | `10` | Cycle restore window: a hygiene-archived thought is GC-eligible only after this many cycles. `0` makes this window always pass (disabled), symmetric with `gc_restore_window_seconds: 0`. |
 | `gc_restore_window_seconds` | `int` | `2592000` | Wall-clock restore window (seconds), required **in addition to** the cycle window, before GC may delete a hygiene-archived thought. Default `2592000` (30 days). `0` disables the wall-clock window (cycle-only). |
 | `min_inactivity_age_seconds` | `int` | `604800` | Minimum wall-clock inactivity (seconds) before a thought is archivable — a cold-start guard measured from last contact. Default `604800` (7 days). `0` disables the gate. |
-| `dry_run` | `bool` | `false` | Preview mode — compute the would-archive set (returned with reasons) without mutating or journaling. |
+| `dry_run` | `bool` | `false` | Preview mode — compute the would-archive set (returned with reasons) without mutating the database or journaling. Candidate collection and scoring still run, so a configured `on_retrieve` or `decay_function` hook still executes. |
 
 Default `signal_weights`: `recency 0.30`, `frequency 0.25`, `confirmation 0.20`,
 `confidence 0.15`, `staleness 0.10`. (`confidence` contributes to the keep-score
@@ -440,12 +580,17 @@ frequency (with access tracking enabled), confirmation, or action outcome.
 These two gates prevent cycle/ingest order alone from classifying fresh imports
 as disposable.
 
-Memory Hygiene is rule-based and does not call an LLM, but a run is reproducible
-only for a fixed store, full configuration, `current_cycle`, **and `now`** (and
-only when custom hooks are themselves deterministic). Calling `run_hygiene()`
-without `now=` reads the current UTC wall time once for the run; that instant
-controls both the inactivity gate and the wall-clock GC window. Pass a fixed
-timezone-aware `datetime` as `now=` when replaying or benchmarking a selection.
+Memory Hygiene's built-in scoring does not call an LLM (a configured
+`on_retrieve` or `decay_function` hook can). The fixed store, full
+configuration, `current_cycle`, and `now` (and deterministic custom hooks)
+fix the inactivity gate and the wall-clock GC window for the run, and the
+selection is reproducible on those boundaries alone. Calling `run_hygiene()`
+without `now=` reads the current UTC wall time once for those boundaries.
+Candidate collection is separate: it pages through `list_thoughts()`, whose
+own default expiry filter reads real wall-clock time on every call regardless
+of `now`, so a thought's expiry crossing during a long pass can still change
+which candidates are collected. Pass a fixed timezone-aware `datetime` as
+`now=` when replaying or benchmarking a selection.
 
 ### `ingest`
 
@@ -540,7 +685,7 @@ from engrava import EngravaManager, load_config
 
 config = load_config("engrava.yaml")
 
-async with EngravaManager.from_config(config.services) as mgr:
+async with await EngravaManager.from_config(config.services) as mgr:
     store = await mgr.get_store("main")
     # Use store normally...
 ```

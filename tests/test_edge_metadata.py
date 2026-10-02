@@ -122,7 +122,7 @@ class TestEdgeMetadataDomain:
         assert edge.metadata == {}
 
     def test_dumped_edge_always_includes_metadata_key(self) -> None:
-        """A dumped ``EdgeRecord`` now always carries ``"metadata": {}``."""
+        """A default-constructed ``EdgeRecord`` dumps ``"metadata": {}``."""
         dumped = _make_edge().model_dump()
         assert "metadata" in dumped
         assert dumped["metadata"] == {}
@@ -234,12 +234,11 @@ class TestEdgeMetadataPersistence:
     async def test_update_metadata_is_last_writer_wins_wholesale(
         self, store: SqliteEngravaCore
     ) -> None:
-        """Regression: ``update_edge`` replaces metadata wholesale (no key merge).
+        """``update_edge`` replaces metadata wholesale (no key merge).
 
-        Pins the current last-writer-wins semantics — the second update's
-        ``metadata`` fully replaces the first's; keys are not deep-merged and
-        there is no optimistic-concurrency guard. (Documented as a tracked
-        follow-up, not changed by this feature.)
+        Pins last-writer-wins semantics for sequential updates — the second
+        update's ``metadata`` fully replaces the first's; keys are not
+        deep-merged.
         """
         await store.create_edge(_make_edge("e-lww", metadata={"a": 1}))
         await store.update_edge("e-lww", metadata={"b": 2})
@@ -267,9 +266,7 @@ class TestEdgeMetadataPersistence:
         unvalidated metadata through this validation-free provenance path.
         Forcing the internally constructed record to carry a non-finite value —
         which ``_validate_metadata`` rejects on the caller paths — proves the
-        derived INSERT ignores it and stores ``'{}'`` verbatim (the old
-        ``json.dumps(edge.metadata, ...)`` binding would have stored
-        ``{"smuggled": NaN}`` instead).
+        derived INSERT ignores it and stores ``'{}'`` verbatim.
         """
 
         def _smuggle_metadata(**kwargs: object) -> EdgeRecord:

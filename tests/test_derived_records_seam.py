@@ -2,19 +2,19 @@
 
 Exercises the core-controlled, per-child, source-first, deferred, non-atomic
 persistence of an extension's derived records against a live
-``SqliteEngravaCore``. Each acceptance criterion of the seam is covered here or
+``SqliteEngravaCore``. Each required behaviour of the seam is covered here or
 in ``tests/domain/test_derived_records_types.py``:
 
-* AC-2  — no demo-consumer / extension import in the core seam.
-* AC-3  — the seam's public types add zero third-party dependencies.
-* AC-4  — ``on_error="log"`` is ordinary logging, no telemetry surface.
-* AC-5  — disabled path is byte-identical (thoughts + edges + journal).
-* AC-6  — hooks without ``derive_records`` run byte-identical (protocol compat).
-* AC-8  — the deterministic structural-split demo consumer.
-* AC-9  — the recursion guard across single / bulk / get-or-create, incl. an
-          adversarial producer that performs a nested public write.
-* AC-10 — fail-open, cancellation propagation, per-family continuation.
-* AC-11 — first-classness (embed/retrieve), conflict-as-reuse, and bounds.
+* no demo-consumer / extension import in the core seam.
+* the seam's public types add zero third-party dependencies.
+* ``on_error="log"`` is ordinary logging, no telemetry surface.
+* disabled path is byte-identical (thoughts + edges + journal).
+* hooks without ``derive_records`` run byte-identical (protocol compat).
+* the deterministic structural-split demo consumer.
+* the recursion guard across single / bulk / get-or-create, incl. an
+  adversarial producer that performs a nested public write.
+* fail-open, cancellation propagation, per-family continuation.
+* first-classness (embed/retrieve), conflict-as-reuse, and bounds.
 
 The explicit ``derive_existing()`` backfill trigger — the on-store seam's
 retroactive counterpart — is covered in its own section at the end of this file
@@ -27,10 +27,13 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import hashlib
 import logging
 import sqlite3
 import struct
+import threading
+import time
 import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -60,7 +63,6 @@ from engrava.embeddings.callback import CallbackProvider
 from engrava.infrastructure.sqlite.engrava_core import (
     _DERIVED_ESSENCE_MAX_CHARS,
     _build_embed_input,
-    _DerivationRollbackError,
     _derived_edge_id,
     _derived_thought_id,
     _essence_from_content,
@@ -250,7 +252,7 @@ def _make_store(
 
 
 # ---------------------------------------------------------------------------
-# AC-8 — deterministic structural-split demo consumer
+# Deterministic structural-split demo consumer
 # ---------------------------------------------------------------------------
 
 
@@ -315,7 +317,7 @@ async def test_structural_split_is_idempotent_across_reruns(
 
 
 # ---------------------------------------------------------------------------
-# AC-5 / AC-6 — disabled + protocol-compat byte-identical paths
+# Disabled + protocol-compat byte-identical paths
 # ---------------------------------------------------------------------------
 
 
@@ -375,7 +377,7 @@ async def test_existing_hooks_still_receive_on_store(db: aiosqlite.Connection) -
 
 
 # ---------------------------------------------------------------------------
-# AC-9 — recursion guard (single / bulk / get-or-create + adversarial nested)
+# Recursion guard (single / bulk / get-or-create + adversarial nested)
 # ---------------------------------------------------------------------------
 
 
@@ -437,7 +439,7 @@ async def test_get_or_create_dispatches_on_create_not_on_hit(
 
 
 # ---------------------------------------------------------------------------
-# AC-10 — fail-open, cancellation, continuation
+# Fail-open, cancellation, continuation
 # ---------------------------------------------------------------------------
 
 
@@ -519,7 +521,7 @@ async def test_child_failure_raise_aborts_remaining(
 
 
 # ---------------------------------------------------------------------------
-# AC-11 — first-classness, conflict-as-reuse, bounds
+# First-classness, conflict-as-reuse, bounds
 # ---------------------------------------------------------------------------
 
 
@@ -641,7 +643,7 @@ async def test_lazy_sequence_is_bounded_to_cap_plus_one(
 
 
 # ---------------------------------------------------------------------------
-# AC-2 / AC-3 — surface hygiene (no extension import in core; zero new deps)
+# Surface hygiene (no extension import in core; zero new deps)
 # ---------------------------------------------------------------------------
 
 _ALLOWED_TOP_MODULES = frozenset(
@@ -650,7 +652,7 @@ _ALLOWED_TOP_MODULES = frozenset(
 
 
 def test_seam_types_import_no_third_party_packages() -> None:
-    """The seam's public types module depends only on stdlib + engrava (AC-3)."""
+    """The seam's public types module depends only on stdlib + engrava."""
     source = Path(core_module.__file__).parent.parent.parent
     module_path = source / "domain" / "protocols" / "derived_records.py"
     tree = ast.parse(module_path.read_text(encoding="utf-8"))
@@ -664,14 +666,14 @@ def test_seam_types_import_no_third_party_packages() -> None:
 
 
 def test_core_seam_does_not_import_demo_consumer() -> None:
-    """The core does not import the demo (or any) derived-record producer (AC-2)."""
+    """The core does not import the demo (or any) derived-record producer."""
     core_source = Path(core_module.__file__).read_text(encoding="utf-8")
     assert "structural_split" not in core_source
     assert "StructuralSplitProducer" not in core_source
 
 
 # ---------------------------------------------------------------------------
-# F4 — core-derived essence (combining-mark-safe truncation)
+# Core-derived essence (combining-mark-safe truncation)
 # ---------------------------------------------------------------------------
 
 
@@ -701,7 +703,7 @@ def test_essence_truncation_does_not_sever_combining_mark() -> None:
 
 
 # ---------------------------------------------------------------------------
-# F2 — producer-sequence iteration failures are fail-open
+# Producer-sequence iteration failures are fail-open
 # ---------------------------------------------------------------------------
 
 
@@ -759,7 +761,7 @@ async def test_sequence_iteration_error_raise_reraises_source_durable(
 
 
 # ---------------------------------------------------------------------------
-# F1 / F3 — bulk_store derivation never rolls a committed source/child back
+# bulk_store derivation never rolls a committed source/child back
 # ---------------------------------------------------------------------------
 
 
@@ -804,7 +806,7 @@ async def test_bulk_derivation_failure_never_rolls_back_committed_state(
 
 
 # ---------------------------------------------------------------------------
-# F6 — durability + recoverability of a committed-yet-unenriched child
+# Durability + recoverability of a committed-yet-unenriched child
 # ---------------------------------------------------------------------------
 
 
@@ -905,7 +907,7 @@ async def test_cancellation_after_child_commit_propagates_and_recovers(
 
 
 # ---------------------------------------------------------------------------
-# F7 — recursion guard across all write entry points; re-materialization paths
+# Recursion guard across all write entry points; re-materialization paths
 # ---------------------------------------------------------------------------
 
 
@@ -981,7 +983,7 @@ def test_dispatch_derivation_has_exactly_two_call_sites() -> None:
 
 
 # ---------------------------------------------------------------------------
-# R2-1 — a dedup / hash hit never dispatches derivation (D5), embeddings OFF
+# A dedup / hash hit never dispatches derivation, embeddings OFF
 # ---------------------------------------------------------------------------
 
 
@@ -1011,7 +1013,7 @@ async def test_bulk_dedup_hit_never_derives_with_embeddings_off(
 
 
 # ---------------------------------------------------------------------------
-# R2-2 — documented contract: a create inside a caller-held transaction does not
+# Documented contract: a create inside a caller-held transaction does not
 # auto-derive; derivation is triggered by an explicit re-run / backfill.
 # ---------------------------------------------------------------------------
 
@@ -1021,7 +1023,7 @@ async def test_create_inside_caller_suspend_does_not_auto_derive(
 ) -> None:
     """A create in a caller-held transaction does not auto-derive; backfill does.
 
-    Documented contract (ADR D8): derivation fires only on a durably
+    Documented contract: derivation fires only on a durably
     auto-committed create. A caller that writes inside its own
     ``suspend_auto_commit`` window owns that transaction, so the source is not
     yet durable and derivation is not dispatched — the caller triggers it with an
@@ -1068,7 +1070,310 @@ async def test_caller_suspend_rollback_does_not_derive(
 
 
 # ---------------------------------------------------------------------------
-# R2-3 — conflict-as-reuse enrichment targets the STORED row, never producer content
+# The derivation gate is asked of the current task's own window only,
+# never of another task's, or a window this task's marker no longer names.
+# ---------------------------------------------------------------------------
+
+
+class _PausingOnStoreProducer(DefaultEngravaHooks):
+    """Pauses ``on_store`` for one thought id; signals when ``derive_records`` runs."""
+
+    def __init__(self) -> None:
+        self.pause_for: str | None = None
+        self.paused = asyncio.Event()
+        self.release = asyncio.Event()
+        self.derive_called = asyncio.Event()
+        self.calls = 0
+        self.source_ids: list[str] = []
+
+    async def on_store(self, thought: ThoughtRecord) -> ThoughtRecord:
+        if thought.thought_id == self.pause_for:
+            self.paused.set()
+            await self.release.wait()
+        return thought
+
+    async def derive_records(
+        self,
+        thought: ThoughtRecord,
+        ctx: DeriveContext,
+    ) -> Sequence[DerivedRecord]:
+        self.calls += 1
+        self.source_ids.append(ctx.source_thought_id)
+        self.derive_called.set()
+        return [_child(f"derived from {thought.thought_id}")]
+
+
+async def test_foreign_window_does_not_skip_derivation(db: aiosqlite.Connection) -> None:
+    """Another task's open ``suspend_auto_commit`` window must not blind derivation.
+
+    Task A's create commits and then pauses inside ``on_store``. While paused,
+    task B opens its own ``suspend_auto_commit`` window on the SAME store and
+    holds it open. A resumes and finishes ``on_store`` while B's window is
+    still open. The derivation gate must consult only A's own task-local
+    window marker (``None`` — A never opened a window of its own), not the
+    store-wide fact that *some* window happens to be open, so A's producer is
+    called even while B's window is still open.
+
+    Persisting the derived child then legitimately blocks on the write lock
+    B's window holds for its whole duration (a genuinely different task's
+    guarded write), so this test observes the producer call BEFORE releasing
+    B, then releases B, then awaits both tasks — the order the
+    behaviour requires: awaiting A first (or releasing B before observing the
+    call) would either race the assertion or deadlock A's derivation against
+    B's own window.
+    """
+    producer = _PausingOnStoreProducer()
+    producer.pause_for = "src-a"
+    store = _make_store(db, producer, DeriveGates(enabled=True))
+
+    task_a = asyncio.create_task(store.create_thought(_source("src-a", content="Body for A.")))
+    try:
+        await asyncio.wait_for(producer.paused.wait(), timeout=5.0)
+
+        entered = asyncio.Event()
+        leave = asyncio.Event()
+
+        async def _hold_foreign_window() -> None:
+            async with store.suspend_auto_commit():
+                entered.set()
+                await leave.wait()
+
+        task_b = asyncio.create_task(_hold_foreign_window())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5.0)
+
+            producer.release.set()
+            # RED (today's code): the producer is never called while a
+            # foreign window is open, so this times out -- that timeout IS
+            # the failure, not a hang.
+            await asyncio.wait_for(producer.derive_called.wait(), timeout=5.0)
+
+            # Proves the call happened while B's window was still open, not
+            # because B had already exited by the time we checked.
+            assert not task_b.done()
+
+            leave.set()
+            await asyncio.wait_for(task_b, timeout=5.0)
+        except BaseException:
+            if not task_b.done():
+                task_b.cancel()
+            raise
+        await asyncio.wait_for(task_a, timeout=5.0)
+    except BaseException:
+        if not task_a.done():
+            task_a.cancel()
+        raise
+
+    assert producer.calls == 1
+    assert producer.source_ids == ["src-a"]
+    assert await store.get_thought(_derived_thought_id("derived from src-a")) is not None
+
+
+async def test_nested_window_skips_until_outermost_closes(db: aiosqlite.Connection) -> None:
+    """A create between the inner window's exit and the outer's still skips.
+
+    Each nesting level's own identity is registered on entry and unregistered
+    in its own ``finally``, and the task-local marker is restored to the
+    enclosing level's identity on the inner exit (a plain ``ContextVar.reset``)
+    -- so a create made after the inner window has exited, but before the
+    outer one has, still sees an open window of its own task's and skips.
+    Once both have closed, the marker is back to ``None`` and a create derives
+    normally again.
+    """
+    producer = ListProducer([_child("nested-child")])
+    store = _make_store(db, producer, DeriveGates(enabled=True))
+
+    async with store.suspend_auto_commit():
+        await store.create_thought(_source("inner-src", content="Inside the inner window."))
+        async with store.suspend_auto_commit():
+            await store.create_thought(_source("innermost-src", content="Inside both windows."))
+        # The inner window has exited; the outer one is still open.
+        await store.create_thought(_source("after-inner-src", content="After inner, in outer."))
+
+    assert producer.calls == 0
+    # Both identities were discarded on their own `finally`, not merely
+    # shadowed by the marker reset.
+    assert store._open_auto_commit_windows == set()
+
+    # Both windows are closed now -- an ordinary create derives again.
+    await store.create_thought(_source("after-both-src", content="After both windows."))
+    assert producer.calls == 1
+    assert producer.source_ids == ["after-both-src"]
+
+
+async def test_two_stores_one_task_window_isolation() -> None:
+    """A window on store B must not overwrite store A's own marker for this task.
+
+    The task-local marker is a ``ContextVar`` created per store instance, not
+    at module level, precisely so one task holding windows on two different
+    stores keeps each store's identity independent. A create on A still skips
+    while A's own window is open, regardless of B's window nested inside it; a
+    create on B skips while B's own window is open; and a create on either
+    store, once both windows have exited, derives normally.
+    """
+    conn_a = await aiosqlite.connect(":memory:")
+    conn_a.row_factory = aiosqlite.Row
+    conn_b = await aiosqlite.connect(":memory:")
+    conn_b.row_factory = aiosqlite.Row
+    try:
+        producer_a = ListProducer([_child("child-of-a")])
+        producer_b = ListProducer([_child("child-of-b")])
+        store_a = _make_store(conn_a, producer_a, DeriveGates(enabled=True))
+        store_b = _make_store(conn_b, producer_b, DeriveGates(enabled=True))
+        await store_a.ensure_schema()
+        await store_b.ensure_schema()
+
+        async with store_a.suspend_auto_commit():
+            await store_a.create_thought(_source("a-1", content="On A, in A's window."))
+            async with store_b.suspend_auto_commit():
+                await store_a.create_thought(_source("a-2", content="On A, B's window nested."))
+                await store_b.create_thought(_source("b-1", content="On B, in B's window."))
+            # B's window has exited; A's own window is still open.
+            await store_a.create_thought(_source("a-3", content="On A, after B's window closed."))
+
+        assert producer_a.calls == 0
+        assert producer_b.calls == 0
+        assert store_a._open_auto_commit_windows == set()
+        assert store_b._open_auto_commit_windows == set()
+
+        # Both stores' windows are closed now -- ordinary creates derive.
+        await store_a.create_thought(_source("a-4", content="On A, after both windows closed."))
+        await store_b.create_thought(_source("b-2", content="On B, after both windows closed."))
+        assert producer_a.source_ids == ["a-4"]
+        assert producer_b.source_ids == ["b-2"]
+    finally:
+        await conn_a.close()
+        await conn_b.close()
+
+
+async def test_spawned_task_create_after_window_closes_derives_normally(
+    db: aiosqlite.Connection,
+) -> None:
+    """A task spawned inside a window derives once the window it copied has closed.
+
+    ``asyncio.create_task`` copies the current ``contextvars.Context``, so a
+    task spawned from inside a ``suspend_auto_commit`` window starts with that
+    window's identity as its own marker too. But the window's ``_write_lock``
+    hold is task-scoped, not context-scoped: the spawned task is a genuinely
+    different task, so its own create blocks on that lock until the window
+    closes. By the time it resumes, the window's identity is no longer in the
+    open set, so the spawned task's create derives normally -- exactly like
+    any ordinary create made after the window.
+    """
+    producer = ListProducer([_child("spawned-child")])
+    store = _make_store(db, producer, DeriveGates(enabled=True))
+
+    entered = asyncio.Event()
+    leave = asyncio.Event()
+    spawned: asyncio.Task[ThoughtRecord] | None = None
+
+    async def _hold_window_and_spawn() -> None:
+        nonlocal spawned
+        async with store.suspend_auto_commit():
+            spawned = asyncio.create_task(
+                store.create_thought(_source("spawned-src", content="Spawned body.")),
+            )
+            entered.set()
+            await leave.wait()
+
+    holder = asyncio.create_task(_hold_window_and_spawn())
+    await asyncio.wait_for(entered.wait(), timeout=5.0)
+    assert spawned is not None
+    # Let the spawned task actually start and block on the write lock.
+    await asyncio.sleep(0)
+    assert not spawned.done()
+
+    leave.set()
+    await asyncio.wait_for(holder, timeout=5.0)
+    await asyncio.wait_for(spawned, timeout=5.0)
+
+    assert producer.calls == 1
+    assert producer.source_ids == ["spawned-src"]
+
+
+async def test_cancellation_inside_window_unregisters_and_resets_marker(
+    db: aiosqlite.Connection,
+) -> None:
+    """A real ``task.cancel()`` delivered inside a window still resets the marker.
+
+    ``suspend_auto_commit`` already catches ``BaseException`` — which is why a
+    cancellation lands in the same ``finally`` as any other exception — so the
+    window's identity must be unregistered AND this task's marker reset there
+    too, exactly like a clean exit. A faulty cleanup that unregisters the
+    identity but leaves the marker stale would still make a later create look
+    correct from a *different* task (the marker check requires the marker to
+    equal a specific window id, and a different task's marker was never set in
+    the first place) -- so this test checks the marker directly, and checks it
+    from **inside** the cancelled task itself, where the reset actually
+    happens.
+
+    The window runs in its own spawned task, genuinely cancelled via
+    ``task.cancel()`` while parked on an event that never fires -- not a
+    ``CancelledError`` raised inline -- so the delivery is the real thing.
+    ``asyncio.create_task`` copies the current ``contextvars.Context``, so the
+    cancelled task's own marker is a value the *parent* task's context never
+    shares: the parent's marker reads ``None`` throughout regardless of
+    whether cleanup ran correctly. The cancelled task therefore records its
+    own observations, in a ``finally`` around the window, and re-raises so the
+    parent still sees the propagated ``CancelledError``.
+    """
+    producer = ListProducer([_child("post-cancel-child")])
+    store = _make_store(db, producer, DeriveGates(enabled=True))
+
+    entered = asyncio.Event()
+    unobserved: object = object()
+    observed_marker: object | None = unobserved
+    observed_open_windows: frozenset[object] | None = None
+
+    async def _window_cancelled_from_outside() -> None:
+        nonlocal observed_marker, observed_open_windows
+        try:
+            async with store.suspend_auto_commit():
+                await store.create_thought(_source("in-window", content="Body inside window."))
+                entered.set()
+                await asyncio.Event().wait()  # never set; only cancellation ends this
+        finally:
+            # Observed from INSIDE the cancelled task, after
+            # suspend_auto_commit's own `finally` has already run (its
+            # `async with` block has exited by the time control reaches
+            # here) -- this task's own contextvars.Context, not the parent's
+            # copy of it.
+            observed_marker = store._current_auto_commit_window.get()
+            observed_open_windows = frozenset(store._open_auto_commit_windows)
+
+    task = asyncio.create_task(_window_cancelled_from_outside())
+    await asyncio.wait_for(entered.wait(), timeout=5.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5.0)
+
+    # What the cancelled task itself observed, right after its own window's
+    # cleanup ran.
+    assert observed_marker is None, "the cancelled task's own marker was left stale"
+    assert observed_open_windows == frozenset(), (
+        "the cancelled window's identity was not unregistered"
+    )
+
+    assert not db.in_transaction
+    assert producer.calls == 0  # the in-window create rolled back with the cancellation
+    assert store._open_auto_commit_windows == set()
+
+    # The parent task's own marker -- trivially `None` even under a faulty
+    # cleanup, since a child task's context is a copy, never the parent's own.
+    # Kept because it documents that fact rather than because it discriminates
+    # anything on its own.
+    assert store._current_auto_commit_window.get() is None
+
+    # Still the parent task: a later create must derive, proving the
+    # (now-finished) cancelled task's window identity was actually
+    # unregistered store-wide, not merely invisible to the parent's marker.
+    await store.create_thought(_source("post-cancel", content="After cancellation."))
+    assert producer.calls == 1
+    assert producer.source_ids == ["post-cancel"]
+
+
+# ---------------------------------------------------------------------------
+# Conflict-as-reuse enrichment targets the STORED row, never producer content
 # ---------------------------------------------------------------------------
 
 
@@ -1120,7 +1425,7 @@ async def test_reuse_never_attaches_producer_content_vector_to_foreign_row(
 
 
 # ---------------------------------------------------------------------------
-# R2-4 — combining-mark truncation degenerate cases
+# Combining-mark truncation degenerate cases
 # ---------------------------------------------------------------------------
 
 
@@ -1231,6 +1536,54 @@ def _patch_journal_to_fail(
         return await original(mutation_type=mutation_type, target_id=target_id, delta=delta)
 
     monkeypatch.setattr(store._journal, "append", _flaky_append)
+
+
+def _patch_unwind_to_fail(
+    store: SqliteEngravaCore,
+    monkeypatch: pytest.MonkeyPatch,
+    savepoint_name: str,
+    unwind_exc: BaseException,
+) -> None:
+    """Make a ``_write_readback_savepoint`` unit's own ``ROLLBACK TO`` fail.
+
+    Patches the store's connection so the literal ``ROLLBACK TO
+    <savepoint_name>`` statement raises ``unwind_exc`` instead of running --
+    simulating an unwind whose own recovery cannot be trusted -- while every
+    other statement (including the failing write that triggers the unwind in
+    the first place) executes normally.
+    """
+    real_execute = store._db.execute
+    target_sql = f"ROLLBACK TO {savepoint_name}"
+
+    async def _wrapper(sql: str, *args: object, **kwargs: object) -> object:
+        if sql == target_sql:
+            raise unwind_exc
+        return await real_execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(store._db, "execute", _wrapper)
+
+
+def _spy_on_insert_derived_row(
+    store: SqliteEngravaCore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[str]:
+    """Record every child id actually passed to ``_insert_derived_row``.
+
+    A row's own absence after a failure proves the write was undone, but not
+    that a *later* child was never attempted at all (an attempt can fail
+    before writing anything). Wrapping the store's own bound method observes
+    every call this instance makes, in order, regardless of whether that call
+    goes on to write, fail, or never even reach the database.
+    """
+    seen: list[str] = []
+    original = store._insert_derived_row
+
+    async def _spy(child: ThoughtRecord) -> bool:
+        seen.append(child.thought_id)
+        return await original(child)
+
+    monkeypatch.setattr(store, "_insert_derived_row", _spy)
+    return seen
 
 
 async def test_child_insert_journal_failure_log_leaves_no_orphan(
@@ -1364,35 +1717,29 @@ async def test_cancellation_during_pending_child_insert_rolls_back(
     assert (await store.verify_journal()).valid
 
 
-async def test_failed_rollback_aborts_derivation_raise_propagates(
+async def test_failed_unwind_aborts_derivation_raise_propagates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Under ``on_error="raise"`` a failed per-child rollback propagates + quarantines.
+    """Under ``on_error="raise"`` a failed per-child unwind propagates + quarantines.
 
-    A rollback failure leaves the transaction indeterminate, so the dispatch
-    aborts (``_DerivationRollbackError`` under the raise policy) AND — (#1) any
-    non-clean compensating rollback quarantines the store, whether or not a
-    cancellation was involved — the connection is hard-invalidated so a later
-    op can never flush the orphan. The source + earlier child committed before
-    the failure stay durable on disk (verified via a fresh connection).
+    ``_insert_derived_row``'s own ``_write_readback_savepoint`` unit unwinds a
+    failed insert with ``ROLLBACK TO`` + ``RELEASE``; when that unwind itself
+    fails, recovery cannot be proven, so the connection is quarantined and the
+    child's *original* error (not a wrapper) propagates. The source + earlier
+    child committed before the failure stay durable on disk (verified via a
+    fresh connection).
     """
     db_path = tmp_path / "seam.db"
     store, conn = await _file_journaled_seam_store(db_path, "raise")
     poison = _derived_thought_id(_SEGMENTS[1])  # the 2nd of three children
     _patch_journal_to_fail(store, monkeypatch, mutation_type="INSERT_THOUGHT", target_id=poison)
+    _patch_unwind_to_fail(store, monkeypatch, "insert_derived_row", RuntimeError("rollback down"))
 
-    async def _bad_rollback() -> None:
-        msg = "rollback down"
-        raise RuntimeError(msg)
-
-    monkeypatch.setattr(store._db, "rollback", _bad_rollback)
-
-    with pytest.raises(_DerivationRollbackError):
+    with pytest.raises(RuntimeError, match="journal down"):
         await store.create_thought(_source(content=_THREE_PARAS))
 
-    # (#1) The store is quarantined and any subsequent op fails fast — reverting
-    # the quarantine-on-non-cancel fix leaves the store usable and this fails.
+    # The store is quarantined; ``get_thought`` raises ``ConnectionQuarantinedError``.
     assert store._connection_quarantined is True
     with pytest.raises(ConnectionQuarantinedError):
         await store.get_thought("src-1")
@@ -1408,33 +1755,33 @@ async def test_failed_rollback_aborts_derivation_raise_propagates(
     await conn.close()  # already closed by quarantine; double close is a no-op
 
 
-async def test_failed_rollback_aborts_derivation_log_does_not_raise(
+async def test_failed_unwind_aborts_derivation_log_propagates_after_logging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Under ``on_error="log"`` a failed per-child rollback aborts WITHOUT raising.
+    """Under ``on_error="log"`` a failed per-child unwind still propagates.
 
-    The source is already durably committed, so a ``_DerivationRollbackError``
-    must never escape a ``"log"`` policy as a caller-visible raise (fail-open,
-    ADR D10). But a rollback failure is indeterminate, so (#1) the store is still
-    quarantined even under ``"log"`` — precisely to stop the log-and-continue
-    caller from later flushing the orphan on the same store.
+    A quarantined connection cannot be trusted for the remaining children under
+    either policy, so this is the one case where the fail-open ``"log"`` policy
+    does not swallow the failure: it logs at ``ERROR`` first — naming the
+    source, so an operator can find which one was orphaned — then still raises.
     """
     db_path = tmp_path / "seam.db"
     store, conn = await _file_journaled_seam_store(db_path, "log")
     poison = _derived_thought_id(_SEGMENTS[1])  # the 2nd of three children
     _patch_journal_to_fail(store, monkeypatch, mutation_type="INSERT_THOUGHT", target_id=poison)
+    _patch_unwind_to_fail(store, monkeypatch, "insert_derived_row", RuntimeError("rollback down"))
 
-    async def _bad_rollback() -> None:
-        msg = "rollback down"
-        raise RuntimeError(msg)
+    with (
+        caplog.at_level(logging.ERROR, logger=core_module.__name__),
+        pytest.raises(RuntimeError, match="journal down"),
+    ):
+        await store.create_thought(_source(content=_THREE_PARAS))
+    assert any(record.levelno == logging.ERROR for record in caplog.records)
+    assert any("src-1" in record.getMessage() for record in caplog.records)
 
-    monkeypatch.setattr(store._db, "rollback", _bad_rollback)
-
-    # No exception escapes to the caller under the log policy (F2 preserved).
-    await store.create_thought(_source(content=_THREE_PARAS))
-
-    # (#1) But the store is quarantined and a subsequent op fails fast.
+    # The store is quarantined; ``get_thought`` raises ``ConnectionQuarantinedError``.
     assert store._connection_quarantined is True
     with pytest.raises(ConnectionQuarantinedError):
         await store.get_thought("src-1")
@@ -1447,15 +1794,15 @@ async def test_failed_rollback_aborts_derivation_log_does_not_raise(
     await conn.close()
 
 
-async def test_cancellation_with_failed_rollback_still_propagates_cancelled(
+async def test_cancelled_child_with_failed_unwind_still_propagates_cancelled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A cancelled child whose rollback also fails propagates CancelledError + quarantines.
+    """A cancelled child whose unwind also fails propagates CancelledError + quarantines.
 
-    D10 requires ``CancelledError`` to always propagate. Even when the
-    compensating rollback itself raises an ordinary exception, the cancellation —
-    not the rollback error — is what escapes; and (#1) the failed rollback still
+    ``CancelledError`` always propagates. Even when the unit's own unwind
+    raises an ordinary exception trying to recover from it, the cancellation —
+    not the unwind's own error — is what escapes; and the failed unwind still
     quarantines the store.
     """
     db_path = tmp_path / "seam.db"
@@ -1474,12 +1821,9 @@ async def test_cancellation_with_failed_rollback_still_propagates_cancelled(
             raise asyncio.CancelledError
         return await original_append(mutation_type=mutation_type, target_id=target_id, delta=delta)
 
-    async def _bad_rollback() -> None:
-        msg = "rollback down"
-        raise RuntimeError(msg)
-
     monkeypatch.setattr(store._journal, "append", _cancel_append)
-    monkeypatch.setattr(store._db, "rollback", _bad_rollback)
+    _patch_unwind_to_fail(store, monkeypatch, "insert_derived_row", RuntimeError("rollback down"))
+    attempted = _spy_on_insert_derived_row(store, monkeypatch)
 
     with pytest.raises(asyncio.CancelledError):
         await store.create_thought(_source(content=_THREE_PARAS))
@@ -1488,120 +1832,63 @@ async def test_cancellation_with_failed_rollback_still_propagates_cancelled(
     with pytest.raises(ConnectionQuarantinedError):
         await store.get_thought("src-1")
 
+    # The never-processed third child was never even attempted -- a row's own
+    # absence would not by itself rule out a failed attempt at it.
+    assert _derived_thought_id(_SEGMENTS[2]) not in attempted
+    assert attempted == [_derived_thought_id(_SEGMENTS[0]), poison]
+
+    # It is absent on disk too: a quarantined connection is non-continuable,
+    # so the dispatch must never reach it.
     await _reopen_and_verify_durable(
         db_path,
         present=["src-1", _derived_thought_id(_SEGMENTS[0])],
-        absent=[poison],
+        absent=[poison, _derived_thought_id(_SEGMENTS[2])],
     )
     await conn.close()
 
 
-async def test_repeated_cancellation_during_rollback_still_completes_it(
-    db: aiosqlite.Connection,
+async def test_cancelled_unwind_itself_still_propagates_cancelled_and_quarantines(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The shielded compensating rollback completes despite repeated cancellation.
+    """A cancellation landing during the unwind itself still quarantines + propagates.
 
-    A child fails (ordinary error) and enters the compensating rollback, which
-    runs as a shielded task. The caller is then cancelled *twice* while awaiting
-    it. Because the rollback task is shielded, neither cancellation aborts it: it
-    runs to completion, so ``in_transaction`` is ``False`` and the poison child's
-    pending insert is discarded — while ``CancelledError`` still propagates.
-
-    Reverting the hardening (the old ``suppress`` + unshielded retry) lets the
-    repeated cancellation abort the rollback, leaving the connection
-    mid-transaction (``in_transaction`` stays ``True``), which this test catches.
+    Distinct from the previous test: there the *child's own write* was
+    cancelled and the unwind's *recovery attempt* failed with an ordinary
+    error; here the child's own write fails with an ordinary error and it is
+    the unwind's ``ROLLBACK TO`` itself that is cancelled. Either shape must
+    quarantine the connection (recovery cannot be proven either way), let the
+    ``CancelledError`` win, and never reach the never-processed third child —
+    checked on disk via a fresh connection, since quarantine hard-closes this
+    one (an in-memory database would simply lose its data at that point).
     """
-    store = _journaled_seam_store(db, "log")
-    poison = _derived_thought_id(_SEGMENTS[1])  # the 2nd of three children
-    # Make the poison child's INSERT_THOUGHT journal append fail (ordinary error)
-    # so the child enters the compensating-rollback path.
-    _patch_journal_to_fail(store, monkeypatch, mutation_type="INSERT_THOUGHT", target_id=poison)
-
-    real_rollback = store._db.rollback
-    started = asyncio.Event()
-    release = asyncio.Event()
-    completed = {"done": False}
-
-    async def _slow_rollback() -> None:
-        # Signal it has started, block until released (so the caller can be
-        # cancelled mid-rollback), then run the real rollback to completion.
-        started.set()
-        await release.wait()
-        await real_rollback()
-        completed["done"] = True
-
-    monkeypatch.setattr(store._db, "rollback", _slow_rollback)
-
-    task = asyncio.create_task(store.create_thought(_source(content=_THREE_PARAS)))
-    await started.wait()  # the shielded rollback task is running
-    task.cancel()  # cancel the caller while it awaits the rollback
-    await asyncio.sleep(0)
-    task.cancel()  # a repeated cancellation must not abort the shielded rollback
-    await asyncio.sleep(0)
-    release.set()  # let the shielded rollback finish
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    # The shielded rollback ran to completion despite the repeated cancellation:
-    # no open transaction leaks and the poison child's pending insert is gone.
-    assert completed["done"] is True
-    assert store._db.in_transaction is False
-    assert store._connection_quarantined is False  # a clean rollback never quarantines
-    assert await store.get_thought(poison) is None
-    assert await store.get_thought("src-1") is not None
-    assert await store.get_thought(_derived_thought_id(_SEGMENTS[0])) is not None
-    assert (await store.verify_journal()).valid
-
-
-async def test_rollback_failure_during_cancellation_quarantines_store(
-    db: aiosqlite.Connection,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A rollback that ultimately fails under cancellation quarantines the store.
-
-    When a cancellation is in flight and the compensating rollback ultimately
-    *fails*, the long-lived connection may still hold an open transaction. The
-    store must be quarantined so a subsequent public operation fails fast with a
-    typed ``ConnectionQuarantinedError`` rather than silently running on /able
-    to flush the indeterminate transaction. The cancellation still propagates.
-
-    Reverting the quarantine leaves the store usable, so the follow-up operation
-    would run on the open transaction instead of failing — which this test
-    catches.
-    """
-    store = _journaled_seam_store(db, "log")
+    db_path = tmp_path / "seam.db"
+    store, conn = await _file_journaled_seam_store(db_path, "log")
     poison = _derived_thought_id(_SEGMENTS[1])
     _patch_journal_to_fail(store, monkeypatch, mutation_type="INSERT_THOUGHT", target_id=poison)
+    _patch_unwind_to_fail(store, monkeypatch, "insert_derived_row", asyncio.CancelledError())
+    attempted = _spy_on_insert_derived_row(store, monkeypatch)
 
-    started = asyncio.Event()
-    release = asyncio.Event()
-
-    async def _slow_failing_rollback() -> None:
-        started.set()
-        await release.wait()
-        msg = "rollback truly failed"
-        raise RuntimeError(msg)
-
-    monkeypatch.setattr(store._db, "rollback", _slow_failing_rollback)
-
-    task = asyncio.create_task(store.create_thought(_source(content=_THREE_PARAS)))
-    await started.wait()
-    task.cancel()  # cancel the caller while it awaits the rollback
-    await asyncio.sleep(0)
-    release.set()  # the shielded rollback now runs to completion — and fails
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await store.create_thought(_source(content=_THREE_PARAS))
 
-    # The rollback ultimately failed while a cancellation was in flight, so the
-    # connection may still hold an open transaction: the store is quarantined and
-    # every subsequent public operation fails fast rather than running on it.
     assert store._connection_quarantined is True
     with pytest.raises(ConnectionQuarantinedError):
         await store.get_thought("src-1")
     with pytest.raises(ConnectionQuarantinedError):
         await store.create_thought(_source("src-2", content="unrelated body"))
-    await _drain_quarantine_close(store)
+
+    # The never-processed third child was never even attempted -- a row's own
+    # absence would not by itself rule out a failed attempt at it.
+    assert _derived_thought_id(_SEGMENTS[2]) not in attempted
+    assert attempted == [_derived_thought_id(_SEGMENTS[0]), poison]
+
+    await _reopen_and_verify_durable(
+        db_path,
+        present=["src-1", _derived_thought_id(_SEGMENTS[0])],
+        absent=[poison, _derived_thought_id(_SEGMENTS[2])],
+    )
+    await conn.close()  # already closed by quarantine; double close is a no-op
 
 
 async def test_quarantined_store_commit_backstop_refuses(
@@ -1791,26 +2078,606 @@ async def test_quarantine_survives_self_cancelled_close(
     await _drain_quarantine_close(store)
 
 
-async def test_cancelled_rollback_task_quarantines_and_propagates_cancelled(
+async def test_close_cancellation_does_not_corpse_the_physical_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation of close()'s own caller must not corpse the physical close.
+
+    The branch that *creates* the close task (no prior quarantine -- this is
+    an ordinary close with nothing else in the picture) does not await it with
+    a bare ``await``, which would forward this call's own cancellation into
+    the task. A single cancellation could then cancel the physical close
+    before ``_db.close()`` had meaningfully run at all, yet leave a ``done()``
+    (cancelled) task sitting in the shared slot -- every later ``close()`` or
+    quarantine drain would see a completed task and report success without
+    the real connection ever having closed.
+
+    Draining under ``_drain_shielded`` closes this off structurally rather
+    than papering over it: it re-shields on every repeated cancellation and
+    never returns until the task is genuinely done, so the physical close
+    always runs to real completion. This is the same ``_drain_shielded``
+    helper used elsewhere for the identical reason (see its own docstring):
+    a single cancellation is easy for a coroutine to absorb by accident; a
+    *repeated* one is what actually exercises whether the shield holds.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(conn)
+    store._owns_connection = True
+    await store.ensure_schema()
+
+    close_calls = {"n": 0}
+    real_close = conn.close
+    started = asyncio.Event()
+    release = asyncio.Event()
+    completed = {"done": False}
+
+    async def _slow_close() -> None:
+        close_calls["n"] += 1
+        started.set()
+        await release.wait()
+        await real_close()
+        completed["done"] = True
+
+    monkeypatch.setattr(conn, "close", _slow_close)
+
+    task = asyncio.ensure_future(store.close())
+    await started.wait()  # the physical close has started (and is now gated)
+    task.cancel()  # cancel the caller while it awaits the physical close
+    await asyncio.sleep(0)
+    task.cancel()  # a repeated cancellation must not abort the shielded close either
+    await asyncio.sleep(0)
+    release.set()  # let the physical close finish
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert completed["done"] is True, (
+        "the physical close must run to real completion despite the caller's cancellation"
+    )
+    assert close_calls["n"] == 1
+    assert store._quarantine_close_task is not None
+    assert not store._quarantine_close_task.cancelled(), (
+        "the close task itself must not be cancelled -- only this caller's await was"
+    )
+
+
+async def test_close_cancellation_during_flush_still_closes_the_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation during the access-buffer flush must not skip the close.
+
+    ``close()``'s cancellation-safety -- the quarantine / ``_drain_shielded``
+    machinery exercised above -- only protects the physical close itself.
+    The access-buffer flush that runs *before* any of that was guarded only
+    by ``except Exception``, which does not catch ``asyncio.CancelledError``.
+    A cancellation landing there must not escape immediately: that would skip
+    the close entirely and leak the connection's non-daemon worker thread,
+    contradicting the docstring's promise that "a flush failure never blocks
+    the close." ``close()`` defers the cancellation and re-raises it once the
+    close has run.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(conn, access_tracking_enabled=True)
+    store._owns_connection = True
+    await store.ensure_schema()
+
+    started = asyncio.Event()
+
+    async def _flush_stalls_forever() -> int:
+        started.set()
+        await asyncio.sleep(10)  # cancelled long before this would return
+        return 0
+
+    monkeypatch.setattr(store, "flush_access_buffer", _flush_stalls_forever)
+
+    task = asyncio.ensure_future(store.close())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    try:
+        # close() awaits the worker's own stop future, so by the time the
+        # physical close completes the thread should already be done; poll
+        # briefly for the rare case where the OS thread's actual exit lags
+        # a hair behind.
+        deadline = time.monotonic() + 2.0
+        while conn._thread.is_alive() and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+
+        assert not conn._thread.is_alive(), (
+            "the connection's non-daemon worker thread survived a "
+            "cancellation during the access-buffer flush -- the close "
+            "below it never ran"
+        )
+    finally:
+        # However the assertion above turns out, never leave a leaked
+        # worker thread running past this test -- it is not a daemon, so
+        # it would otherwise block interpreter shutdown for the entire
+        # suite.
+        if conn._thread.is_alive():
+            stopped = conn.stop()
+            if stopped is not None:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stopped, timeout=5)
+            conn._thread.join(timeout=5)
+
+
+async def test_close_cancellation_during_flush_outranks_a_failing_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deferred cancellation must win over the physical close's own failure.
+
+    The sibling test above shows a cancelled flush still lets the physical
+    close run. But if ``self._quarantine_close_task.result()`` raised the
+    close's own exception *before* the line that re-raises the deferred
+    cancellation, a cancelled flush followed by a close that itself fails
+    would surface the close's ``RuntimeError``, not the caller's
+    ``CancelledError``, contradicting this method's own documented promise
+    that a cancellation of the caller's await always propagates ahead of
+    whatever the close task resolved to. The rule
+    ``_log_close_failure_over_pending_cancellation`` documents applies
+    here: the caller's own cancellation outranks anything the cleanup
+    discovers about itself.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(conn, access_tracking_enabled=True)
+    store._owns_connection = True
+    await store.ensure_schema()
+
+    started = asyncio.Event()
+
+    async def _flush_stalls_forever() -> int:
+        started.set()
+        await asyncio.sleep(10)  # cancelled long before this would return
+        return 0
+
+    monkeypatch.setattr(store, "flush_access_buffer", _flush_stalls_forever)
+
+    real_close = conn.close
+
+    async def _close_blows_up() -> None:
+        # Still performs the real close -- the point of this test is that
+        # its own failure report afterward must not outrank the
+        # already-pending cancellation.
+        await real_close()
+        msg = "close blew up after a cancellation was already pending"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(conn, "close", _close_blows_up)
+
+    task = asyncio.ensure_future(store.close())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    try:
+        deadline = time.monotonic() + 2.0
+        while conn._thread.is_alive() and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+
+        assert not conn._thread.is_alive(), (
+            "the connection's worker thread survived -- the close must "
+            "still run to completion even when a cancellation is already "
+            "pending"
+        )
+    finally:
+        if conn._thread.is_alive():
+            stopped = conn.stop()
+            if stopped is not None:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stopped, timeout=5)
+            conn._thread.join(timeout=5)
+
+
+async def test_close_after_quarantine_shares_the_close_task_and_returns_promptly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """close() after quarantine joins the same physical close, exactly once.
+
+    Builds its own connection rather than using the shared ``db`` fixture:
+    that fixture's own teardown does a bare ``await conn.close()`` on the
+    real connection, which is a *third*, uncoordinated close attempt this
+    test does not want in the picture.
+
+    Quarantine schedules its own detached close of the real connection
+    first. ``close()`` explicitly awaits quarantine's own close task, so it
+    must not return before the physical close is actually finished.
+
+    Asserted by **gating the physical close and checking that ``close()``
+    is still pending**, not by counting how many times it ran: a counter
+    can be satisfied by quarantine's own detached task completing on its
+    own schedule, regardless of whether ``close()`` ever joined it, which
+    would be a scheduling-dependent false pass. Checking that ``close()``
+    remains pending until the gate is explicitly released tests the
+    property directly.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(conn)
+    store._owns_connection = True
+    await store.ensure_schema()
+
+    close_calls = {"n": 0}
+    real_close = conn.close
+    close_started = asyncio.Event()
+    close_may_finish = asyncio.Event()
+
+    async def _gated_close() -> None:
+        close_calls["n"] += 1
+        close_started.set()
+        await close_may_finish.wait()
+        await real_close()
+
+    monkeypatch.setattr(conn, "close", _gated_close)
+
+    await store._quarantine_connection("indeterminate")
+    assert store._connection_quarantined is True
+
+    close_task = asyncio.ensure_future(store.close())
+    await asyncio.wait_for(close_started.wait(), timeout=5.0)
+    assert not close_task.done(), (
+        "close() must wait for the physical close to finish, not return once it has merely started"
+    )
+
+    close_may_finish.set()
+    await asyncio.wait_for(close_task, timeout=5.0)
+
+    assert close_calls["n"] == 1, "the real connection must be physically closed exactly once"
+
+
+async def test_quarantine_during_an_in_flight_close_does_not_double_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A quarantine racing an in-flight close() must not enter the real close twice.
+
+    The shape: ``close()`` has already entered the real connection's close
+    (published as the shared ``_quarantine_close_task`` before awaiting it),
+    and quarantine runs while that is still in flight. Two concurrent physical
+    closes on the same connection can each enqueue their own stop sentinel to
+    the worker thread, which exits on the first and can leave the other
+    caller's future unresolved forever -- a hang. The final await is
+    timeout-guarded so a regression here fails this test instead of stalling
+    the suite.
+
+    Builds its own connection rather than using the shared ``db`` fixture —
+    see the previous test's docstring for why.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(conn)
+    store._owns_connection = True
+    await store.ensure_schema()
+
+    close_calls = {"n": 0}
+    real_close = conn.close
+    close_started = asyncio.Event()
+    close_may_finish = asyncio.Event()
+
+    async def _gated_close() -> None:
+        close_calls["n"] += 1
+        close_started.set()
+        await close_may_finish.wait()
+        await real_close()
+
+    monkeypatch.setattr(conn, "close", _gated_close)
+
+    close_task = asyncio.ensure_future(store.close())
+    await asyncio.wait_for(close_started.wait(), timeout=5.0)
+    assert store._quarantine_close_task is not None, (
+        "close() must publish the shared close task before awaiting the physical close"
+    )
+
+    # Quarantine runs while close() is still mid-flight, gated on the same
+    # real close -- it must not start a second one.
+    await asyncio.wait_for(store._quarantine_connection("indeterminate"), timeout=5.0)
+    assert store._connection_quarantined is True
+
+    close_may_finish.set()
+    await asyncio.wait_for(close_task, timeout=5.0)
+
+    assert close_calls["n"] == 1, "the real connection must be physically closed exactly once"
+
+
+async def _wedge_the_worker_thread(
+    conn: aiosqlite.Connection,
+) -> tuple[asyncio.Future, threading.Event]:
+    """Genuinely block the aiosqlite worker thread, not merely slow it down.
+
+    A monkeypatched ``async def`` "slow close" (used by the tests above)
+    only ever blocks at the ``asyncio`` layer -- the underlying worker
+    thread is idle the whole time and would pick up a queued stop sentinel
+    instantly. That is enough to test bounded *observation*, but the bound
+    this exercises is specifically meant to survive a worker that will
+    never answer at all, and the two are not the same failure to construct.
+
+    This registers a real SQLite user-defined function that, once invoked,
+    blocks the calling thread on a ``threading.Event`` -- a synchronous,
+    OS-level block with no ``await`` anywhere nothing in ``asyncio`` can
+    reach or cancel. Firing it via ``conn.execute(...)`` without awaiting
+    the result queues that call onto aiosqlite's single worker thread
+    exactly like any other statement; once the thread picks it up, it is
+    genuinely stuck there -- every later item on the same queue, including
+    ``close()``'s own stop request, waits behind it with no supported way
+    to interrupt it, matching the shape a truly wedged worker takes in
+    production far more closely than an ``asyncio``-level mock does.
+
+    Returns:
+        The in-flight ``execute()`` future (still pending) and the
+        ``threading.Event`` the caller must ``.set()`` to unwedge the
+        worker and let this test clean up after itself.
+
+    """
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _wedge() -> int:
+        entered.set()
+        release.wait()  # blocks the real OS thread until the test releases it
+        return 0
+
+    await conn.create_function("wedge_worker_thread", 0, _wedge)
+    wedge_future = asyncio.ensure_future(conn.execute("SELECT wedge_worker_thread()"))
+    # threading.Event.wait() is a blocking call -- polling .is_set() keeps
+    # this coroutine, and the event loop it runs on, from blocking too. Not
+    # an asyncio.Event: the signal crosses from the worker's real OS thread,
+    # which cannot set an asyncio primitive directly.
+    while not entered.is_set():  # noqa: ASYNC110
+        await asyncio.sleep(0.001)
+    return wedge_future, release
+
+
+async def test_close_bound_expires_on_a_genuinely_unresponsive_worker() -> None:
+    """The first close() on a genuinely wedged worker returns bounded, not never.
+
+    Without a bound, ``close()`` would await the physical close with no
+    limit at all: queued behind a worker that will never answer, it would
+    never return -- the exact case this test constructs for real via
+    :func:`_wedge_the_worker_thread`, rather than a finite, merely-slow mock.
+    A bound that only proved itself against a mock that always eventually
+    returns would not actually prove anything about the unbounded case.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(conn, close_timeout_seconds=0.2)
+    store._owns_connection = True
+    await store.ensure_schema()
+
+    wedge_future, release = await _wedge_the_worker_thread(conn)
+    try:
+        started = time.monotonic()
+        with pytest.raises(ConnectionQuarantinedError):
+            await asyncio.wait_for(store.close(), timeout=5.0)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 2.0, (
+            "close() must return within its own bound, not wait out the "
+            "unresponsive worker -- the outer wait_for(timeout=5.0) is only "
+            "a suite-safety net, not the property under test"
+        )
+        assert store._connection_quarantined is True
+        with pytest.raises(ConnectionQuarantinedError):
+            await store._db.commit()
+    finally:
+        # Release the wedged thread and drain everything queued behind it
+        # (the wedge call itself, and close()'s own stop request) so
+        # nothing outlives this test -- a genuinely stuck worker that is
+        # never released leaks a live, non-daemon thread for as long as the
+        # process runs.
+        release.set()
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(wedge_future, timeout=5.0)
+        close_task = store._quarantine_close_task
+        assert close_task is not None
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(close_task, timeout=5.0)
+        deadline = time.monotonic() + 5.0
+        while conn._thread.is_alive() and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+        assert not conn._thread.is_alive(), (
+            "the aiosqlite worker thread survived past the test -- it is "
+            "not a daemon and would otherwise block interpreter shutdown "
+            "for the rest of the suite"
+        )
+
+
+async def test_close_bound_expires_again_on_a_second_call_without_a_second_physical_close() -> None:
+    """A second close() on the same wedge is bounded too, and starts nothing new.
+
+    The first close() expiring is the easy half. This covers the amendment's
+    harder requirement: a caller that calls close() again after the first
+    one gave up must not trigger a second physical close on the pinned
+    connection (two concurrent closes can each enqueue their own stop
+    sentinel, and the worker only ever answers the first -- see close()'s
+    own docstring), and must still get its own call bounded rather than
+    inheriting an unbounded wait on whatever the first call started.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(conn, close_timeout_seconds=0.2)
+    store._owns_connection = True
+    await store.ensure_schema()
+
+    wedge_future, release = await _wedge_the_worker_thread(conn)
+    try:
+        with pytest.raises(ConnectionQuarantinedError):
+            await asyncio.wait_for(store.close(), timeout=5.0)
+        first_close_task = store._quarantine_close_task
+        assert first_close_task is not None
+
+        started = time.monotonic()
+        with pytest.raises(ConnectionQuarantinedError):
+            await asyncio.wait_for(store.close(), timeout=5.0)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 2.0, "the second close() must also be bounded, not inherit an open wait"
+        assert store._quarantine_close_task is first_close_task, (
+            "a second close() must piggyback on the same physical-close task "
+            "-- a different task here would mean a second, independent "
+            "close() was issued against the same underlying connection"
+        )
+    finally:
+        release.set()
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(wedge_future, timeout=5.0)
+        close_task = store._quarantine_close_task
+        assert close_task is not None
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(close_task, timeout=5.0)
+        deadline = time.monotonic() + 5.0
+        while conn._thread.is_alive() and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+        assert not conn._thread.is_alive(), (
+            "the aiosqlite worker thread survived past the test -- it is "
+            "not a daemon and would otherwise block interpreter shutdown "
+            "for the rest of the suite"
+        )
+
+
+async def test_close_cancelled_while_draining_a_wedged_worker_still_quarantines() -> None:
+    """A caller cancelled while draining the task must still see the store quarantined.
+
+    ``_drain_shielded`` does not return early when *our* await of it is
+    cancelled: it re-shields and keeps waiting until its own bounded
+    ``asyncio.wait(...)`` completes. Against a genuinely wedged worker, that
+    bound then expires with the task still not ``done()`` -- so this call to
+    ``close()`` can end up with a non-``None`` cancellation *and* a genuine,
+    unrelated expiry at the same time. The expiry must still reach
+    ``_abandon_expired_close`` (quarantine + log) regardless: cancellation
+    precedence decides which exception propagates out of ``close()``, never
+    whether the store gets quarantined.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(conn, close_timeout_seconds=0.2)
+    store._owns_connection = True
+    await store.ensure_schema()
+
+    wedge_future, release = await _wedge_the_worker_thread(conn)
+    try:
+        close_task = asyncio.ensure_future(store.close())
+        await asyncio.sleep(0.01)  # let close() start draining the physical-close task
+        close_task.cancel()
+
+        started = time.monotonic()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(close_task, timeout=5.0)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 2.0, (
+            "the cancelled close() must still return once its own bound "
+            "expires, not wait out the unresponsive worker indefinitely"
+        )
+        assert store._connection_quarantined is True, (
+            "an expired bound must quarantine the store even when this "
+            "call's own await was cancelled while draining the task"
+        )
+        with pytest.raises(ConnectionQuarantinedError):
+            await store._db.commit()
+    finally:
+        release.set()
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(wedge_future, timeout=5.0)
+        close_task = store._quarantine_close_task
+        assert close_task is not None
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(close_task, timeout=5.0)
+        deadline = time.monotonic() + 5.0
+        while conn._thread.is_alive() and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+        assert not conn._thread.is_alive(), (
+            "the aiosqlite worker thread survived past the test -- it is "
+            "not a daemon and would otherwise block interpreter shutdown "
+            "for the rest of the suite"
+        )
+
+
+async def test_close_bound_covers_the_access_buffer_flush_too() -> None:
+    """A wedged worker cannot be reached only through the flush step either.
+
+    ``close()`` flushes the access buffer *before* it ever reaches the
+    bounded physical-close drain -- and that flush awaits the same worker
+    directly (``_write_lock`` + a raw ``executemany``), so it has a bound of
+    its own. Access tracking defaults to ``False`` on the manual
+    constructor, but ``from_config`` turns it on when dreaming is enabled and
+    ``DreamingConfig.access_tracking_enabled`` is set, and that flag defaults
+    to ``True`` -- so a store built with dreaming on and nothing said about
+    access tracking would hang here without the flush bound even with the
+    physical-close bound in place, exactly the case docs/deployment.md
+    promises is covered. Executed with a genuinely wedged
+    worker, not reasoned about: a buffer entry is seeded directly so the
+    flush actually reaches ``executemany`` instead of returning early on an
+    empty buffer.
+    """
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    store = SqliteEngravaCore(conn, access_tracking_enabled=True, close_timeout_seconds=0.2)
+    store._owns_connection = True
+    await store.ensure_schema()
+    store._access_buffer.record("some-thought-id", now="2026-01-01T00:00:00+00:00")
+    assert len(store._access_buffer) == 1
+
+    wedge_future, release = await _wedge_the_worker_thread(conn)
+    try:
+        started = time.monotonic()
+        with pytest.raises(ConnectionQuarantinedError):
+            # The outer wait_for is only a suite-safety net (per the sibling
+            # tests above) -- without the flush bound, this would need it to
+            # actually fire.
+            await asyncio.wait_for(store.close(), timeout=5.0)
+        elapsed = time.monotonic() - started
+
+        # Worst case here is the flush's own bound plus the physical-close
+        # bound run back to back (~0.4s at this test's 0.2s setting) --
+        # comfortably under any margin that would indicate an unbounded
+        # wait slipped through.
+        assert elapsed < 2.0, (
+            "close() must not hang in the access-buffer flush before it "
+            "ever reaches the bounded physical close"
+        )
+        assert store._connection_quarantined is True
+    finally:
+        release.set()
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(wedge_future, timeout=5.0)
+        close_task = store._quarantine_close_task
+        if close_task is not None:
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(close_task, timeout=5.0)
+        deadline = time.monotonic() + 5.0
+        while conn._thread.is_alive() and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+        assert not conn._thread.is_alive(), (
+            "the aiosqlite worker thread survived past the test -- it is "
+            "not a daemon and would otherwise block interpreter shutdown "
+            "for the rest of the suite"
+        )
+
+
+async def test_cancelled_unwinds_own_closing_rollback_quarantines_and_propagates(
     db: aiosqlite.Connection,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """(#2) A cancelled compensating-rollback task quarantines + propagates cancel.
+    """A cancellation on the unwind's own closing ``rollback()`` quarantines + propagates.
 
-    If the rollback task is cancelled, ``rollback_task.exception()`` would raise
-    ``CancelledError`` — which, unguarded, escapes *before* the quarantine runs.
-    Checking ``cancelled()`` first treats it as non-clean completion: the store
-    is quarantined and a ``CancelledError`` still propagates. Reverting the
-    ``cancelled()`` guard skips the quarantine, so the flag assertion fails.
+    Distinct from ``test_cancelled_unwind_itself_still_propagates_cancelled_and_quarantines``:
+    that one cancels the unwind's ``ROLLBACK TO`` (the savepoint step); this one
+    cancels the plain ``rollback()`` the unit calls afterward to close the
+    transaction it opened for the failing insert. Both are statements inside
+    the same unwind ``try`` block in ``_write_readback_savepoint``, and either
+    one raising -- cancellation or not -- must quarantine the connection and
+    let the ``CancelledError`` win.
     """
     store = _journaled_seam_store(db, "log")
     poison = _derived_thought_id(_SEGMENTS[1])
-    # The child fails with an ordinary error so it enters the rollback path...
+    # The child fails with an ordinary error so it enters the unwind path...
     _patch_journal_to_fail(store, monkeypatch, mutation_type="INSERT_THOUGHT", target_id=poison)
 
     async def _cancelled_rollback() -> None:
-        # ...and the compensating rollback itself is cancelled (its task raises
-        # CancelledError → the task ends in the cancelled state).
+        # ...and the unwind's own closing rollback() is what gets cancelled.
         raise asyncio.CancelledError
 
     monkeypatch.setattr(store._db, "rollback", _cancelled_rollback)
@@ -1867,7 +2734,6 @@ async def test_foreign_id_reuse_does_not_attach_false_provenance_log(
     ``Y``; attaching a ``DERIVED_FROM`` edge would falsely assert "Y was derived
     from source". Under ``on_error="log"`` the collision is logged and skipped:
     no edge is attached (and the foreign row's own content is untouched).
-    Reverting the fix attaches the edge and this fails.
     """
     child_content = "Derived body X."
     foreign_id = await _seed_foreign_row(
@@ -2017,9 +2883,9 @@ def test_is_unique_violation_false_for_check_named_unique() -> None:
     """A CHECK failure whose name contains ``"unique"`` is NOT a unique violation.
 
     This is the fragile case: its message ("CHECK constraint failed:
-    chk_unique_flag") contains "UNIQUE", so the old text-based classifier
-    misclassifies it as a unique violation. The structural (extended error code)
-    check correctly returns ``False``. Reverting the fix fails this test.
+    chk_unique_flag") contains "UNIQUE", so a text-based classifier would
+    misclassify it as a unique violation. The structural (extended error code)
+    check returns ``False``.
     """
     check_exc = _integrity_error("INSERT INTO parent (id, v) VALUES (2, 99)")
     assert check_exc.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_CHECK
@@ -2117,13 +2983,13 @@ class BackfillReentrantProducer(DefaultEngravaHooks):
         return [_child("the only child")]
 
 
-# --- AC-4: convergence with the on-store path + idempotency -----------------
+# --- Convergence with the on-store path + idempotency -----------------
 
 
 async def test_backfill_of_on_store_source_is_byte_identical_noop(
     db: aiosqlite.Connection,
 ) -> None:
-    """AC-4 (primary): backfilling an already-derived source is a byte-identical
+    """Backfilling an already-derived source is a byte-identical
     no-op — every child + edge is reused, nothing is created, and a second
     backfill is identical (idempotent)."""
     store = _make_store(db, StructuralSplitProducer(), DeriveGates(enabled=True))
@@ -2145,7 +3011,7 @@ async def test_backfill_of_on_store_source_is_byte_identical_noop(
 
 
 async def test_backfill_children_and_edges_match_on_store_from_scratch() -> None:
-    """AC-4: children + edges created by a from-scratch backfill are byte-
+    """Children + edges created by a from-scratch backfill are byte-
     identical (deterministic fields) to those an on-store write would produce for
     the same content — proving convergence, not merely reuse."""
     content = "Alpha para.\n\nBeta para."
@@ -2181,7 +3047,7 @@ async def test_backfill_children_and_edges_match_on_store_from_scratch() -> None
 
 
 async def test_backfill_is_idempotent_across_reruns(db: aiosqlite.Connection) -> None:
-    """AC-4: the first backfill creates every child; a re-run reuses them all and
+    """The first backfill creates every child; a re-run reuses them all and
     leaves the store unchanged."""
     store = _make_store(db, StructuralSplitProducer(), DeriveGates(enabled=False))
     await store.create_thought(_source(content="One.\n\nTwo.\n\nThree."))
@@ -2200,7 +3066,7 @@ async def test_backfill_is_idempotent_across_reruns(db: aiosqlite.Connection) ->
 async def test_backfill_reuses_preexisting_child_in_counts(
     db: aiosqlite.Connection,
 ) -> None:
-    """AC-4: a child colliding with a pre-existing row is reused (not re-created)
+    """A child colliding with a pre-existing row is reused (not re-created)
     and reported as ``reused`` in the result counts."""
     child_content = "Second para."
     preexisting_id = _derived_thought_id(child_content)
@@ -2226,11 +3092,11 @@ async def test_backfill_reuses_preexisting_child_in_counts(
     assert result == DeriveResult(thought_id="src-1", created=1, reused=1, skipped=0)
 
 
-# --- AC-7: capability-present gating, independent of enabled -----------------
+# --- Capability-present gating, independent of enabled -----------------
 
 
 async def test_backfill_runs_with_seam_disabled(db: aiosqlite.Connection) -> None:
-    """AC-7: backfill runs on capability-present alone — the on-store trigger is
+    """Backfill runs on capability-present alone — the on-store trigger is
     off (``enabled=False``) so only the explicit call derives."""
     store = _make_store(db, StructuralSplitProducer(), DeriveGates(enabled=False))
     await store.create_thought(_source(content="A.\n\nB."))
@@ -2244,7 +3110,7 @@ async def test_backfill_runs_with_seam_disabled(db: aiosqlite.Connection) -> Non
 async def test_backfill_without_producer_is_clean_noop(
     db: aiosqlite.Connection,
 ) -> None:
-    """AC-7: with no producer capability registered, backfill is a clean no-op."""
+    """With no producer capability registered, backfill is a clean no-op."""
     store = _make_store(db, DefaultEngravaHooks(), DeriveGates(enabled=True))
     await store.create_thought(_source(content="A.\n\nB."))
     result = await store.derive_existing("src-1")
@@ -2253,7 +3119,7 @@ async def test_backfill_without_producer_is_clean_noop(
 
 
 async def test_backfill_honors_cap_under_raise(db: aiosqlite.Connection) -> None:
-    """AC-7: backfill honours ``max_derived_per_source`` — an over-cap return is
+    """Backfill honours ``max_derived_per_source`` — an over-cap return is
     rejected before any child write."""
     producer = ListProducer([_child(f"c{i}") for i in range(5)])
     store = _make_store(
@@ -2282,13 +3148,13 @@ async def test_backfill_within_suspended_commit_joins_caller_transaction(
     assert await _count(db, "SELECT COUNT(*) FROM thought") == 3
 
 
-# --- AC-8: not-found (typed error) vs ineligible (clean skip) ----------------
+# --- Not-found (typed error) vs ineligible (clean skip) ----------------
 
 
 async def test_backfill_missing_source_raises_typed_error(
     db: aiosqlite.Connection,
 ) -> None:
-    """AC-8: a missing source id raises the typed error, never a silent no-op."""
+    """A missing source id raises the typed error, never a silent no-op."""
     store = _make_store(db, StructuralSplitProducer(), DeriveGates(enabled=False))
     with pytest.raises(SourceThoughtNotFoundError):
         await store.derive_existing("nonexistent-id")
@@ -2297,7 +3163,7 @@ async def test_backfill_missing_source_raises_typed_error(
 async def test_backfill_does_not_re_derive_a_derived_record(
     db: aiosqlite.Connection,
 ) -> None:
-    """AC-8/AC-5: a source that is itself a derived record is a clean skip — the
+    """A source that is itself a derived record is a clean skip — the
     producer is never invoked on it and no grandchild is created."""
     producer = EchoDeriveProducer()
     store = _make_store(db, producer, DeriveGates(enabled=True))
@@ -2314,13 +3180,13 @@ async def test_backfill_does_not_re_derive_a_derived_record(
     assert await store.get_thought(_derived_thought_id("X [d] [d]")) is None
 
 
-# --- AC-5: recursion guard (depth <= 1, nested writes, nested backfill) ------
+# --- Recursion guard (depth <= 1, nested writes, nested backfill) ------
 
 
 async def test_backfill_recursion_guard_blocks_nested_write(
     db: aiosqlite.Connection,
 ) -> None:
-    """AC-5: a nested public write a producer issues *during backfill* does not
+    """A nested public write a producer issues *during backfill* does not
     re-dispatch — depth stays at most one (no runaway recursion)."""
     producer = NestedWriteProducer()
     store = _make_store(db, producer, DeriveGates(enabled=True))
@@ -2340,8 +3206,9 @@ async def test_backfill_recursion_guard_blocks_nested_write(
 async def test_backfill_nested_derive_existing_is_a_noop(
     db: aiosqlite.Connection,
 ) -> None:
-    """AC-5 (strongest): a ``derive_existing`` invoked from within a derivation is
-    a no-op — it ignores ``enabled``, so *only* the recursion guard stops it."""
+    """The strongest test of the recursion guard: a ``derive_existing`` invoked
+    from within a derivation is a no-op — it ignores ``enabled``, so *only*
+    the recursion guard stops it."""
     producer = BackfillReentrantProducer()
     store = _make_store(db, producer, DeriveGates(enabled=False))
     producer.store = store
@@ -2355,13 +3222,13 @@ async def test_backfill_nested_derive_existing_is_a_noop(
     assert result == DeriveResult(thought_id="src-1", created=1, reused=0, skipped=0)
 
 
-# --- AC-6: fail-open, per-child isolation, cancellation ---------------------
+# --- Fail-open, per-child isolation, cancellation ---------------------
 
 
 async def test_backfill_producer_error_raise_keeps_source_durable(
     db: aiosqlite.Connection,
 ) -> None:
-    """AC-6: ``on_error='raise'`` re-raises, but the source stays durable."""
+    """``on_error='raise'`` re-raises, but the source stays durable."""
     producer = RaisingProducer()
     store = _make_store(db, producer, DeriveGates(enabled=False, on_error="raise"))
     await store.create_thought(_source())
@@ -2374,7 +3241,7 @@ async def test_backfill_producer_error_log_swallows(
     db: aiosqlite.Connection,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """AC-6: ``on_error='log'`` swallows the producer failure with ordinary logging."""
+    """``on_error='log'`` swallows the producer failure with ordinary logging."""
     producer = RaisingProducer()
     store = _make_store(db, producer, DeriveGates(enabled=False, on_error="log"))
     await store.create_thought(_source())
@@ -2390,7 +3257,7 @@ async def test_backfill_cancellation_propagates(
     db: aiosqlite.Connection,
     on_error: str,
 ) -> None:
-    """AC-6: a cancelled ``derive_records`` propagates ``CancelledError`` either way,
+    """A cancelled ``derive_records`` propagates ``CancelledError`` either way,
     leaving the source durable."""
     store = _make_store(
         db,
@@ -2404,7 +3271,7 @@ async def test_backfill_cancellation_propagates(
 
 
 async def test_backfill_child_failure_is_isolated_and_journal_valid() -> None:
-    """AC-6: a per-child failure under ``on_error='log'`` is isolated — it is
+    """A per-child failure under ``on_error='log'`` is isolated — it is
     counted as skipped, the other children commit, the source stays durable, and
     the journal hash-chain remains valid (no orphan / torn transaction)."""
     collide = "poison content"
@@ -2441,7 +3308,7 @@ async def test_backfill_child_failure_is_isolated_and_journal_valid() -> None:
 
 
 async def test_backfill_raise_in_suspend_window_rolls_back_caller_writes_source_survives() -> None:
-    """AC-6: a raising backfill inside a caller transaction rolls the whole window
+    """A raising backfill inside a caller transaction rolls the whole window
     back — the caller's unrelated write included — while the source stays durable.
 
     Under a caller-held ``suspend_auto_commit`` window with ``on_error="raise"`` a
@@ -2451,12 +3318,11 @@ async def test_backfill_raise_in_suspend_window_rolls_back_caller_writes_source_
     runs derivation *inside* such a window (the on-store trigger defers instead).
     The source thought, committed **before** the window, is unaffected.
 
-    Regression-sensitive by construction: the first produced child is persisted
-    (uncommitted) into the window before the second child collides and aborts, so
-    if the window did NOT roll back on the raise the unrelated write and that
-    first child's row + ``DERIVED_FROM`` edge would survive — assertions (a)/(c)
-    would fail. If the already-committed source were swept into the rollback,
-    assertion (b) would fail.
+    The first produced child is persisted (uncommitted) into the window before
+    the second child collides and aborts, so if the window did NOT roll back on
+    the raise the unrelated write and that first child's row + ``DERIVED_FROM``
+    edge would survive — assertions (a)/(c) would fail. If the already-committed
+    source were swept into the rollback, assertion (b) would fail.
     """
     collide = "poison content"
     # Make the source id equal a produced child's content-addressed derived id, so
@@ -2504,13 +3370,13 @@ async def test_backfill_raise_in_suspend_window_rolls_back_caller_writes_source_
     await conn.close()
 
 
-# --- AC-10/AC-11: non-LLM demo + first-classness ----------------------------
+# --- Non-LLM demo + first-classness ----------------------------
 
 
 async def test_structural_split_backfill_is_non_llm_demo(
     db: aiosqlite.Connection,
 ) -> None:
-    """AC-10: a deterministic structural-split producer backfilled via
+    """A deterministic structural-split producer backfilled via
     ``derive_existing`` — one linked child per paragraph, no LLM."""
     store = _make_store(db, StructuralSplitProducer(), DeriveGates(enabled=False))
     await store.create_thought(_source(content="One.\n\nTwo.\n\nThree."))
@@ -2526,7 +3392,7 @@ async def test_structural_split_backfill_is_non_llm_demo(
 async def test_backfilled_children_are_embedded_and_retrievable(
     db: aiosqlite.Connection,
 ) -> None:
-    """AC-11: backfilled children run the ordinary lifecycle — embedded + linked."""
+    """Backfilled children run the ordinary lifecycle — embedded + linked."""
     provider = CallbackProvider(_hash_embed, dimension=8, model_name="hash-8")
     store = _make_store(
         db,

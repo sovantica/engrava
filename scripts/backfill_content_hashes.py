@@ -27,6 +27,8 @@ from pathlib import Path
 
 import aiosqlite
 
+from engrava.infrastructure.sqlite.engrava_core import _close_quietly
+
 
 def _compute_hash(content: str) -> str:
     """Return the SHA-256 hex digest of *content* (UTF-8, no normalization).
@@ -73,7 +75,8 @@ async def backfill(db_path: Path, batch_size: int = 1000) -> int:
         raise ValueError(msg)
 
     total_updated = 0
-    async with aiosqlite.connect(str(db_path)) as db:
+    db = await aiosqlite.connect(str(db_path))
+    try:
         while True:
             cursor = await db.execute(
                 "SELECT thought_id, content FROM thought WHERE content_hash IS NULL LIMIT ?",
@@ -94,6 +97,20 @@ async def backfill(db_path: Path, batch_size: int = 1000) -> int:
             # When the final batch is short, no further rows remain.
             if len(rows) < batch_size:
                 break
+    except BaseException:
+        # The body already raised (or was cancelled) -- that is what the
+        # caller needs to see, so a failure in this cleanup close is
+        # secondary and goes through ``_close_quietly`` rather than
+        # replacing it. Mirrors ``_opened_db`` in ``engrava.cli.main``:
+        # ``aiosqlite.Connection.__aexit__`` is a bare, unconditional
+        # ``await close()`` and cannot draw this distinction itself.
+        await _close_quietly(db)
+        raise
+    else:
+        # The body succeeded. A close failure here is not secondary to
+        # anything -- it is the only error there is, so it must propagate
+        # normally rather than being logged and swallowed.
+        await db.close()
 
     return total_updated
 
