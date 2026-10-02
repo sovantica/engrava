@@ -41,6 +41,7 @@ from engrava.config import DreamingConfig, DreamingGates, SearchConfig
 from engrava.domain.enums import LifecycleStatus, Priority, ThoughtType
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.extensions.dreaming import DreamingExtension
+from engrava.infrastructure.sqlite.aiosqlite_connect import connect
 from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore, _close_quietly
 
 if TYPE_CHECKING:
@@ -234,7 +235,7 @@ async def evaluate_run(
     binding_dreaming, binding_search = _build_dreaming_config()
     effective_search = search_config if search_config is not None else binding_search
 
-    db = await aiosqlite.connect(db_uri)
+    db = await connect(db_uri)
     try:
         db.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(
@@ -642,7 +643,7 @@ async def measure_synthesis_coverage(
     binding_dreaming, binding_search = _build_dreaming_config()
 
     db_uri = str(db_path) if db_path is not None else ":memory:"
-    db = await aiosqlite.connect(db_uri)
+    db = await connect(db_uri)
     try:
         db.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(

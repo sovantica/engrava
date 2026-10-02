@@ -67,6 +67,7 @@ from engrava.config import (
 from engrava.domain.enums import LifecycleStatus, Priority, ThoughtType
 from engrava.domain.models.thought import ThoughtRecord
 from engrava.extensions.dreaming import DreamingExtension
+from engrava.infrastructure.sqlite.aiosqlite_connect import connect
 from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore, _close_quietly
 
 if TYPE_CHECKING:
@@ -490,7 +491,7 @@ async def _process_question(
     pass are captured (a before/after diff of the ARCHIVED set) and returned.
     """
     db_uri = _db_uri_for_question(question.question_id, db_dir)
-    db = await aiosqlite.connect(db_uri)
+    db = await connect(db_uri)
     try:
         db.row_factory = aiosqlite.Row
         store = SqliteEngravaCore(

@@ -32,6 +32,7 @@ from engrava.config import (
     ServicesConfig,
     resolve_embedding_provider,
 )
+from engrava.infrastructure.sqlite.aiosqlite_connect import connect
 from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore, _close_quietly
 
 if TYPE_CHECKING:
@@ -267,7 +268,7 @@ class EngravaManager:
         db_path = self._service_db_path(name)
         if not db_path.exists():
             return None
-        conn = await aiosqlite.connect(str(db_path))
+        conn = await connect(str(db_path))
         try:
             cursor = await conn.execute("PRAGMA user_version")
             row = await cursor.fetchone()
@@ -600,7 +601,7 @@ class EngravaManager:
         self._data_dir.mkdir(parents=True, exist_ok=True)
 
         db_path = self._service_db_path(service_name)
-        db = await aiosqlite.connect(str(db_path))
+        db = await connect(str(db_path))
         try:
             if self._wal_mode:
                 await db.execute("PRAGMA journal_mode=WAL")

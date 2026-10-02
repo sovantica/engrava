@@ -293,7 +293,9 @@ async def _open_db(cfg: EngravaCLIConfig) -> Any:  # noqa: ANN401
     """
     import aiosqlite  # noqa: PLC0415
 
-    conn = await aiosqlite.connect(str(cfg.db_path))
+    from engrava.infrastructure.sqlite.aiosqlite_connect import connect  # noqa: PLC0415
+
+    conn = await connect(str(cfg.db_path))
     try:
         conn.row_factory = aiosqlite.Row
         await conn.execute("PRAGMA journal_mode = WAL")

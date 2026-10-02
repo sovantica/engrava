@@ -37,7 +37,6 @@ import uuid
 from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING, NoReturn
 
-import aiosqlite
 import click
 
 from engrava import (
@@ -67,10 +66,13 @@ from engrava.cli.main import (
 )
 from engrava.cli.store_resolution import ResolvedStore, resolve_store_target
 from engrava.config_validation import ConfigError
+from engrava.infrastructure.sqlite.aiosqlite_connect import connect
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
     from pathlib import Path
+
+    import aiosqlite
 
     from engrava.cli.config import EngravaCLIConfig
 
@@ -518,7 +520,7 @@ async def _read_only_connection(db_path: Path) -> AsyncIterator[aiosqlite.Connec
     Closes on every exit. A close failure is only reported when the block
     succeeded; if the block already raised, that error is the one to see.
     """
-    conn = await aiosqlite.connect(_read_only_uri(db_path), uri=True)
+    conn = await connect(_read_only_uri(db_path), uri=True)
     try:
         yield conn
     except BaseException:

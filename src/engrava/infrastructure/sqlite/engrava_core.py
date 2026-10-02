@@ -109,6 +109,7 @@ from engrava.domain.protocols.derived_records import (
 from engrava.domain.protocols.dreaming import DreamingConsolidatorProtocol
 from engrava.domain.protocols.embedding_provider import RoleAwareEmbeddingProvider
 from engrava.domain.protocols.hooks import DefaultEngravaHooks, EngravaHooksProtocol
+from engrava.infrastructure.sqlite.aiosqlite_connect import connect
 from engrava.infrastructure.sqlite.connection_revocation import ConnectionRevocationToken
 from engrava.infrastructure.sqlite.hygiene import (
     EvictionReason,
@@ -2325,7 +2326,7 @@ class SqliteEngravaCore:
         from engrava.config import load_config, resolve_hooks  # noqa: PLC0415
 
         config = load_config(config_path)
-        db = await aiosqlite.connect(str(config.database_path))
+        db = await connect(str(config.database_path))
         try:
             if config.wal_mode:
                 await db.execute("PRAGMA journal_mode=WAL")
@@ -3250,13 +3251,19 @@ class SqliteEngravaCore:
         existing_tables = [table for table in _CORE_TABLE_NAMES if await self._table_exists(table)]
         if not existing_tables:
             return True
-        async with aiosqlite.connect(":memory:") as reference:
+        # Not `async with`: the connection returned here is already awaited
+        # (connected), and `Connection.__aenter__` awaits it again, which tries
+        # to start its worker thread a second time and raises.
+        reference = await connect(":memory:")
+        try:
             await reference.executescript(schema_sql)
             for table in existing_tables:
                 actual = await self._table_column_names(self._db, table)
                 expected = await self._table_column_names(reference, table)
                 if actual != expected:
                     return False
+        finally:
+            await reference.close()
         return True
 
     @staticmethod
