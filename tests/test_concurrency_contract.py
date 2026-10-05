@@ -1108,7 +1108,7 @@ class TestInProcessCriticalSection:
             _thought("t-expired", content="already expired"),
             expires_after_seconds=-100,
         )
-        select_prefix = "SELECT thought_id FROM thought WHERE expires_at"
+        select_prefix = "SELECT thought_id, pinned FROM thought WHERE expires_at"
         original_execute = store._db.execute
         observed_lock_state: list[bool | None] = []
 
