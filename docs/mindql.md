@@ -163,10 +163,12 @@ SELECT thought_id, priority, essence FROM thought WHERE thought_type = 'BELIEF' 
 ```
 
 Only statements that begin with `SELECT` are permitted; anything else is
-rejected. The passthrough is also restricted to a **single** statement: a
-single trailing `;` is tolerated, but any `;` remaining mid-string is rejected
+rejected. The passthrough is also restricted to a **single** statement: once
+a statement-ending `;` appears, only whitespace and comments may follow it —
+anything else is a second statement and is rejected
 (`MindQLParseError: Only a single SELECT statement is allowed`) so a second
-statement can never be smuggled in.
+statement can never be smuggled in. A `;` inside a comment, a string literal,
+a quoted identifier, or a parameter token is not a separator.
 
 **Bound parameters.** The passthrough can carry bound parameters, set
 programmatically on the query object (never parsed from the MQL text). When

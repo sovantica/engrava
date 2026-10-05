@@ -20,7 +20,6 @@ from engrava.mindql.parser import (
     MindQLParseError,
     TemporalPredicate,
     TemporalPredicateKind,
-    strip_string_literals,
 )
 
 if TYPE_CHECKING:
@@ -293,13 +292,257 @@ def _guard_row_bound(value: object, clause: str) -> int:
     return bound
 
 
+# SQLite's own tokenizer whitespace: space, tab, newline, form feed, carriage
+# return. Not Python's ``str.isspace``/``str.strip``, which also treat other
+# characters — for example ``\x0b`` (vertical tab) and U+00A0 (no-break
+# space) — as whitespace when SQLite's tokenizer does not.
+_SQLITE_WHITESPACE = " \t\n\r\f"
+
+# The three characters that open a doubled-to-escape quoted region: a
+# single-quoted string literal, or a double-quoted or backtick-quoted
+# identifier. ``[...]`` identifiers are handled separately below — SQLite
+# gives them no escape mechanism.
+_DOUBLING_QUOTES = ("'", '"', "`")
+
+# The four characters that open a SQLite parameter ("variable") token when
+# they start a fresh token — never when one of them is encountered mid-run
+# of IdChars, since ``$`` (uniquely among these four) is itself an IdChar.
+_VARIABLE_PREFIXES = ("$", "@", ":", "#")
+
+
+def _is_idchar(ch: str) -> bool:
+    """Return whether ``ch`` is an IdChar, in SQLite's tokenizer sense.
+
+    An IdChar is an ASCII letter, digit, ``_``, ``$``, or any character
+    outside ASCII (SQLite treats any byte ``>= 0x80`` as an IdChar; this scan
+    works on ``str`` text, so any non-ASCII character here stands for that).
+    IdChars make up the body of a plain identifier/keyword/number run and of
+    a variable token alike — and because ``$`` is one, a ``$`` immediately
+    following another IdChar is never a fresh variable token, only more of
+    the run it is already part of.
+
+    Args:
+        ch: A single character.
+
+    Returns:
+        Whether ``ch`` is an IdChar.
+
+    """
+    if not ch.isascii():
+        return True
+    return ch.isalnum() or ch in ("_", "$")
+
+
+def _skip_idchars(text: str, i: int) -> int:
+    """Return the index just past the run of IdChars starting at ``text[i]``.
+
+    Args:
+        text: The text being scanned.
+        i: The index to start scanning IdChars from.
+
+    Returns:
+        The index just past the run — ``i`` itself when ``text[i]`` is not
+        an IdChar, so the run is empty.
+
+    """
+    n = len(text)
+    while i < n and _is_idchar(text[i]):
+        i += 1
+    return i
+
+
+def _skip_variable_token(text: str, i: int) -> int:
+    """Return the index just past the variable token opening at ``text[i]``.
+
+    ``text[i]`` is one of ``$``, ``@``, ``:``, or ``#``, at a position where
+    it opens a fresh token (decided by the caller — see
+    :func:`_lex_single_statement`). Matches SQLite's own tokenizer: the token
+    consumes a run of IdChars; with none consumed, the token is illegal in
+    SQLite, and this scan advances past only the opening character, leaving
+    the rest of ``text`` to surface SQLite's own syntax error. A ``::``
+    immediately following the run extends the same token with another IdChar
+    run (``$a::b``). Once that is settled, an immediately following ``(``
+    extends the token further, to the first whitespace or ``)`` — the ``)``
+    included, and *everything in between taken literally*: a ``--`` or
+    ``/* ... */`` comment opener, a quote, or a ``;`` inside those
+    parentheses is not a comment, a literal, or a separator, because it is
+    all one token to SQLite. Whitespace or the end of ``text`` before a
+    ``)`` makes the token illegal in SQLite too; this scan stops there rather
+    than guessing how far a real parser would recover.
+
+    Args:
+        text: The text being scanned.
+        i: The index of the opening ``$``, ``@``, ``:``, or ``#``.
+
+    Returns:
+        The index just past the variable token.
+
+    """
+    n = len(text)
+    j = _skip_idchars(text, i + 1)
+    if j == i + 1:
+        return i + 1
+    while text[j : j + 2] == "::":
+        j = _skip_idchars(text, j + 2)
+    if text[j : j + 1] == "(":
+        j += 1
+        while j < n and text[j] not in _SQLITE_WHITESPACE and text[j] != ")":
+            j += 1
+        if j < n and text[j] == ")":
+            j += 1
+    return j
+
+
+def _skip_comment(text: str, i: int) -> int | None:
+    """Return the index just past the comment starting at ``text[i]``.
+
+    Args:
+        text: The text being scanned.
+        i: The index of a candidate comment opener.
+
+    Returns:
+        The index just past the comment (``len(text)`` when a ``/* ... */``
+        comment is unterminated, as SQLite's own tokenizer treats it — the
+        comment runs to the end of ``text``), or ``None`` when ``text[i]``
+        does not open a comment.
+
+    """
+    if text[i] == "-" and text[i + 1 : i + 2] == "-":
+        end = text.find("\n", i + 2)
+        return len(text) if end == -1 else end
+    if text[i] == "/" and text[i + 1 : i + 2] == "*":
+        end = text.find("*/", i + 2)
+        return len(text) if end == -1 else end + 2
+    return None
+
+
+def _skip_quoted(text: str, i: int, quote: str) -> int:
+    """Return the index just past the quoted region opened by ``quote`` at ``text[i]``.
+
+    Args:
+        text: The text being scanned.
+        i: The index of the opening ``quote``.
+        quote: The quote character that opened the region — one of ``'``,
+            ``"``, or `` ` ``. A doubled ``quote`` inside the region is an
+            escaped one and does not close it.
+
+    Returns:
+        The index just past the closing quote, or ``len(text)`` when the
+        region is left unterminated — it then runs to the end, same as
+        SQLite's own tokenizer.
+
+    """
+    i += 1
+    n = len(text)
+    while i < n:
+        if text[i] == quote:
+            if text[i + 1 : i + 2] == quote:
+                i += 2
+                continue
+            return i + 1
+        i += 1
+    return n
+
+
+def _is_trailing_noise(text: str) -> bool:
+    """Return whether ``text`` holds only SQLite whitespace and comments.
+
+    Args:
+        text: The text following a candidate statement separator.
+
+    Returns:
+        ``True`` if every character in ``text`` is SQLite whitespace or part
+        of a ``--`` or ``/* ... */`` comment; ``False`` as soon as anything
+        else is found — a second statement.
+
+    """
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in _SQLITE_WHITESPACE:
+            i += 1
+            continue
+        if ch in ("-", "/"):
+            skip_to = _skip_comment(text, i)
+            if skip_to is not None:
+                i = skip_to
+                continue
+        return False
+    return True
+
+
+def _lex_single_statement(text: str) -> str:
+    """Return the first SQL statement in ``text``, right-stripped.
+
+    A single lexical scan that matches SQLite's own tokenizer closely enough
+    to find the same statement-separating ``;`` SQLite would: it skips
+    single-quoted string literals, double-quoted and backtick-quoted
+    identifiers (where a doubled closing quote is an escaped one, inside the
+    literal or identifier rather than closing it), ``[...]`` identifiers
+    (which have no escape), ``--`` line comments, ``/* ... */`` block
+    comments (an unterminated one runs to the end of ``text``), and a
+    ``$``/``@``/``:``/``#`` parameter token that opens a fresh token (see
+    :func:`_skip_variable_token`) — including its optional ``(...)``
+    extension, inside which a comment opener, a quote, or a ``;`` is part of
+    the token, not live syntax. None of those can hide or fake a separator.
+    A quoted region, ``[...]`` identifier, or variable token left
+    unterminated by ``text`` is treated the same way: it runs to the end, so
+    nothing inside it is mistaken for a separator.
+
+    Args:
+        text: The normalised statement text to scan.
+
+    Returns:
+        ``text`` up to (and excluding) the first statement-separating ``;``,
+        right-stripped, or the whole of ``text`` when it holds no such
+        separator — never including a comment that trails that separator.
+
+    Raises:
+        MindQLParseError: If anything other than whitespace or a comment
+            follows that ``;`` — a second statement.
+
+    """
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in _DOUBLING_QUOTES:
+            i = _skip_quoted(text, i, ch)
+            continue
+        if ch == "[":
+            end = text.find("]", i + 1)
+            i = n if end == -1 else end + 1
+            continue
+        if ch in _VARIABLE_PREFIXES and not (ch == "$" and i > 0 and _is_idchar(text[i - 1])):
+            i = _skip_variable_token(text, i)
+            continue
+        if ch in ("-", "/"):
+            skip_to = _skip_comment(text, i)
+            if skip_to is not None:
+                i = skip_to
+                continue
+            i += 1
+            continue
+        if ch == ";":
+            if not _is_trailing_noise(text[i + 1 :]):
+                msg = "Only a single SELECT statement is allowed"
+                raise MindQLParseError(msg)
+            return text[:i].rstrip()
+        i += 1
+    return text
+
+
 def _guard_select_sql(sql: object) -> str:
     """Validate a SELECT-passthrough statement and return it trimmed.
 
     Belt-and-suspenders read-only guard: the statement must begin with
-    ``SELECT``, and it must be a *single* statement. A single trailing ``;`` is
-    tolerated (and stripped); any ``;`` remaining mid-string is rejected so a
-    second statement can never be smuggled in.
+    ``SELECT``, and it must be a *single* statement. The single-statement
+    check is the lexical scan in :func:`_lex_single_statement`, so a ``;``
+    inside a comment, a string literal, or a quoted identifier is never
+    mistaken for a second statement, and a real separator may be followed
+    only by whitespace and comments — matching what SQLite itself accepts as
+    one statement, not more and not fewer.
 
     Read-only-ness is decided on a value this module owns. ``str`` is
     subclassable and every method an inspection would reach for — ``strip``,
@@ -317,8 +560,8 @@ def _guard_select_sql(sql: object) -> str:
         sql: The raw SQL from a SELECT passthrough query.
 
     Returns:
-        The validated, trimmed SQL statement (without a trailing ``;``), as a
-        plain ``str``.
+        The validated statement, right-stripped and without a trailing
+        separator or trailing comment, as a plain ``str``.
 
     Raises:
         MindQLParseError: If the value is not a string, or is not a single
@@ -340,16 +583,7 @@ def _guard_select_sql(sql: object) -> str:
     if not statement.upper().startswith("SELECT"):
         msg = "Only SELECT statements are allowed"
         raise MindQLParseError(msg)
-    # Strip a single real trailing separator, then reject any that remain
-    # mid-statement. A trailing ``;`` is a real separator (a literal-closing
-    # quote would be the final char instead). The mid-statement check ignores
-    # ``;`` inside quoted string literals, so a valid ``SELECT ';' AS s`` is
-    # not falsely rejected.
-    without_trailing = statement[:-1].rstrip() if statement.endswith(";") else statement
-    if ";" in strip_string_literals(without_trailing):
-        msg = "Only a single SELECT statement is allowed"
-        raise MindQLParseError(msg)
-    return without_trailing
+    return _lex_single_statement(statement)
 
 
 # A single MindQL result row: an ordered ``{column: value}`` mapping.

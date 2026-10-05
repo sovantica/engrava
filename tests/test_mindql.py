@@ -7,6 +7,8 @@ as well as executor integration with aiosqlite.
 from __future__ import annotations
 
 import itertools
+import random
+import sqlite3
 from typing import TYPE_CHECKING, Literal, SupportsIndex, cast
 
 import aiosqlite
@@ -3822,6 +3824,314 @@ class TestSelectPassthroughLegitimateShapes:
             MindQLQuery(command=MindQLCommand.SELECT, raw_sql="SELECT ';' AS s"),
         )
         assert result.rows == [{"s": ";"}]
+
+
+class TestSelectGuardReadsCommentsAndQuotedIdentifiers:
+    """The single-statement scan matches SQLite's own tokens, not a naive ``;`` count.
+
+    Each case reproduces a row of the defect this scan replaces: a comment
+    that used to hide a real second statement from the old guard (which
+    blanked only single-quoted literals, so a quote mark *inside* a comment
+    opened a false "literal" of its own), or a valid single statement the old
+    guard refused because it had no notion of comments or quoted
+    identifiers.
+    """
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            pytest.param(
+                "SELECT 1 /* ' */; DELETE FROM thought /* ' */",
+                id="block-comment-no-longer-hides-the-separator-after-it",
+            ),
+            pytest.param(
+                "SELECT 1 -- '\n; DELETE FROM thought",
+                id="line-comment-no-longer-hides-the-separator-after-it",
+            ),
+        ],
+    )
+    def test_a_real_second_statement_is_still_refused(self, sql: str) -> None:
+        with pytest.raises(MindQLParseError) as excinfo:
+            executor_module._guard_select_sql(sql)
+        assert str(excinfo.value) == "Only a single SELECT statement is allowed"
+
+    @pytest.mark.parametrize(
+        ("sql", "expected"),
+        [
+            pytest.param(
+                "SELECT 1 /* ; */",
+                "SELECT 1 /* ; */",
+                id="semicolon-inside-a-block-comment-is-not-a-separator",
+            ),
+            pytest.param(
+                'SELECT "a;b" FROM (SELECT 1 AS "a;b")',
+                'SELECT "a;b" FROM (SELECT 1 AS "a;b")',
+                id="semicolon-inside-a-double-quoted-identifier-is-not-a-separator",
+            ),
+            pytest.param(
+                "SELECT [a;b] FROM (SELECT 1 AS [a;b])",
+                "SELECT [a;b] FROM (SELECT 1 AS [a;b])",
+                id="semicolon-inside-a-bracket-identifier-is-not-a-separator",
+            ),
+            pytest.param(
+                "SELECT 1; -- c",
+                "SELECT 1",
+                id="a-comment-trailing-the-real-separator-is-dropped-not-refused",
+            ),
+        ],
+    )
+    def test_a_statement_sqlite_runs_is_no_longer_refused(self, sql: str, expected: str) -> None:
+        assert executor_module._guard_select_sql(sql) == expected
+
+
+class TestSelectGuardReadsParameterTokens:
+    """A ``$``/``@``/``:``/``#`` parameter token is one token, not a comment opener.
+
+    Regression: the scan above started a comment at the first ``--`` or
+    ``/*`` it saw, with no notion that SQLite's tokenizer never reaches that
+    point inside a parameter token's ``(...)`` extension — there, every
+    character up to the first whitespace or ``)`` is part of the token,
+    comment openers, quotes, and ``;`` alike. ``$a(--); SELECT 2`` and
+    ``$a(/*); SELECT 2`` therefore *passed* the old scan (the fake "comment"
+    swallowed the real separator and the second statement with it), and a
+    real ``;`` inside ``$a(;)`` was *refused* (the scan saw a bare ``;`` with
+    no idea it sat inside a token).
+
+    Token start matters too: ``$`` is itself one of SQLite's IdChars, so a
+    ``$`` immediately after another IdChar (``a$a``) is never a fresh
+    parameter token — only more of the identifier it is already part of.
+    ``a$a(--)`` is therefore the identifier ``a$a``, then ``(``, then a real
+    ``--`` comment, exactly as before this change; the rows below confirm
+    the fix does not swallow that case too.
+    """
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            pytest.param(
+                "SELECT $a(--); SELECT 2",
+                id="dashdash-inside-a-parameter-token-is-not-a-comment-opener",
+            ),
+            pytest.param(
+                "SELECT $a(/*); SELECT 2",
+                id="slashstar-inside-a-parameter-token-is-not-a-comment-opener",
+            ),
+        ],
+    )
+    def test_a_real_second_statement_is_still_refused(self, sql: str) -> None:
+        # SQLite itself: ``conn.execute(sql)`` raises ``sqlite3.ProgrammingError:
+        # You can only execute one statement at a time.`` for both — confirmed
+        # by hand against an in-memory connection; both are exercised by the
+        # oracle sweep below too.
+        with pytest.raises(MindQLParseError) as excinfo:
+            executor_module._guard_select_sql(sql)
+        assert str(excinfo.value) == "Only a single SELECT statement is allowed"
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            pytest.param(
+                "SELECT $a(;)",
+                id="semicolon-inside-a-parameter-tokens-parens-is-not-a-separator",
+            ),
+            pytest.param(
+                "SELECT a$a(--)",
+                id="dollar-mid-identifier-leaves-a-real-comment-opener-alone",
+            ),
+            pytest.param(
+                "SELECT a$a(--); SELECT 2",
+                id="the-real-comment-after-a-mid-identifier-dollar-still-runs-to-the-end",
+            ),
+        ],
+    )
+    def test_a_statement_sqlite_runs_is_no_longer_refused(self, sql: str) -> None:
+        # SQLite on ``SELECT $a(;)``: ``sqlite3.ProgrammingError: Incorrect
+        # number of bindings supplied. The current statement uses 1, and
+        # there are 0 supplied.`` — reached only *after* SQLite's own check
+        # for a second statement already passed, so it proves one statement
+        # (see ``_oracle_sqlite_accepts``'s docstring below for why that
+        # error is read as an accept, not a skip).
+        #
+        # SQLite on the two ``a$a(--)`` rows: ``OperationalError: incomplete
+        # input`` for both, identically, because the unterminated ``--``
+        # comment (no closing newline in either literal) swallows the rest
+        # of the input including the ``)`` that would have closed the call —
+        # so SQLite cannot tell these two rows apart by statement count
+        # either. What SQLite *does* show is that ``a$a(`` is parsed as an
+        # ordinary identifier followed by a call, not specially — confirmed
+        # separately with a closed call, ``"SELECT a$a(1 --c\n)"``, which
+        # raises ``OperationalError: no such function: a$a`` for both the
+        # one- and two-statement variant alike: a name-resolution error,
+        # never "Incorrect number of bindings" or "one statement", which is
+        # what SQLite would raise instead if it ever treated ``a$a(`` as a
+        # parameter token. The guard's own verdict for the two rows at this
+        # test's actual SQL (accept, both) is checked against a hostile
+        # alternative instead: a planted mutation that treats every
+        # ``$``/``@``/``:``/``#`` as a fresh parameter token start, with no
+        # exception for one that is mid-identifier, turns the second row
+        # (but not the first) red — see the WS's failability report.
+        assert executor_module._guard_select_sql(sql) == sql
+
+
+# ---------------------------------------------------------------------------
+# Oracle property test: the scan's accept/reject verdict against SQLite's own
+# tokenizer, swept over generated statements.
+# ---------------------------------------------------------------------------
+
+#: SELECT heads every generated statement starts with, so the guard's leading
+#: ``SELECT`` check never decides the verdict — only the single-statement
+#: scan this sweep is about. The parameter-token heads double as their own
+#: fragment: each carries a comment opener or a ``;`` inside (or right
+#: after) a ``$``/``@``/``:``/``#`` token, so a scan that let that token's
+#: ``(...)`` extension be interrupted would see a false separator, and a
+#: scan that treated the plain ``$a::b`` form as more than one token would
+#: miscount its bound parameters.
+_ORACLE_SELECT_HEADS = (
+    "SELECT 1",
+    "SELECT 1 AS col",
+    "SELECT * FROM sqlite_master",
+    "SELECT 1 WHERE 1",
+    "SELECT $a(--)",
+    "SELECT $a(/*)",
+    "SELECT $a(;)",
+    "SELECT @b",
+    "SELECT :c",
+    "SELECT $d::e",
+    "SELECT #f",
+)
+
+#: Fragments exercising every lexical form the scan must skip whole — both
+#: doubling-escape quote kinds, the bracket form (no escape), both comment
+#: forms, including an unterminated block comment, and a ``$`` that is not
+#: a fresh parameter token because it sits mid-identifier (``a$a(--)``,
+#: where the ``(`` and the real ``--`` comment after it must still be read
+#: normally) — each carrying a ``;`` so a scan that stopped treating the
+#: fragment specially would see a false separator.
+_ORACLE_SKIPPED_FRAGMENTS = (
+    "'literal;text'",
+    "'it''s;a quote'",
+    '"a;b"',
+    '"a""b;c"',
+    "[a;b]",
+    "`a;b`",
+    "`a``b;c`",
+    "-- a line comment; with a semicolon",
+    "/* a block comment; with a semicolon */",
+    "/* an unterminated block comment; with no close",
+    "a$a(--)",
+)
+
+#: Fragments that open a real second statement, or just trail the real one.
+_ORACLE_SEPARATOR_TAILS = (
+    "",
+    ";",
+    "; SELECT 2",
+    ";SELECT 2",
+    "; -- trailing comment",
+    "; /* trailing comment */",
+    "; garbage not sql",
+)
+
+#: Generated statements compared per run. "A few thousand", per the spec.
+_ORACLE_SWEEP_SIZE = 4000
+
+
+def _oracle_sqlite_accepts(sql: str, conn: sqlite3.Connection) -> bool | None:
+    """Ask a real SQLite connection whether ``sql`` is a single statement.
+
+    Binding classification, made explicit: the parameter-token heads above
+    carry an unbound ``$a``/``@b``/``:c``/``$d::e``/``#f``, and this sweep
+    passes no parameters, so a head that is otherwise a single valid
+    statement fails with ``sqlite3.ProgrammingError: Incorrect number of
+    bindings supplied. ...`` — not the "only one statement" error. CPython's
+    ``sqlite3`` checks for leftover SQL (a second statement) when it
+    *prepares* the statement, strictly before binding any parameter values;
+    a multi-statement input is rejected there and never reaches the binding
+    check at all. Reaching "Incorrect number of bindings supplied" is
+    therefore itself proof that SQLite parsed ``sql`` as exactly one
+    statement — it failed only because this sweep binds nothing. Counting it
+    as a skip, as every other unrelated error is counted, would silently
+    drop every one of these generated statements from the comparison;
+    counting it as a reject would misreport a single statement as two. It is
+    counted as an accept.
+
+    Args:
+        sql: The already-normalised (``str.strip``ped) statement text.
+        conn: An open in-memory ``sqlite3`` connection.
+
+    Returns:
+        ``True`` if SQLite ran ``sql`` as one statement, or failed only on
+        the missing-bindings check described above; ``False`` if SQLite
+        raised its "only one statement" error; or ``None`` when SQLite
+        rejected ``sql`` for any other, unrelated reason (a syntax or
+        name-resolution error in the first statement) — the case the spec
+        says to skip, since that is not a verdict about how many statements
+        ``sql`` holds.
+
+    """
+    try:
+        conn.execute(sql)
+    except sqlite3.ProgrammingError as exc:
+        message = str(exc).lower()
+        if "you can only execute one statement" in message:
+            return False
+        if "incorrect number of bindings supplied" in message:
+            return True
+        return None
+    except sqlite3.Error:
+        return None
+    else:
+        return True
+
+
+class TestSelectGuardAgreesWithSqliteOracle:
+    """The scan's accept/reject verdict matches what ``sqlite3`` actually does.
+
+    Generates statements from the fragments above and asks two questions of
+    each: what does the guard decide, and does Python's ``sqlite3`` raise
+    "you can only execute one statement at a time" running the same
+    (normalised) text on an in-memory connection? The two must agree on every
+    statement SQLite's own verdict actually decides.
+    """
+
+    def test_oracle_sweep(self) -> None:
+        rng = random.Random(20261005)  # noqa: S311 - a reproducible sweep, not a secret
+        conn = sqlite3.connect(":memory:")
+        compared = 0
+        skipped = 0
+        try:
+            for _ in range(_ORACLE_SWEEP_SIZE):
+                head = rng.choice(_ORACLE_SELECT_HEADS)
+                middle = " ".join(
+                    rng.choice(_ORACLE_SKIPPED_FRAGMENTS) for _ in range(rng.randint(0, 3))
+                )
+                tail = rng.choice(_ORACLE_SEPARATOR_TAILS)
+                sql = " ".join(part for part in (head, middle, tail) if part)
+
+                # The guard normalises through ``str.strip`` first and executes
+                # what it returns, so that is the text whose statement count
+                # matters — not the raw (possibly differently-whitespaced) sql.
+                normalised = str.strip(sql)
+                sqlite_accepts = _oracle_sqlite_accepts(normalised, conn)
+                if sqlite_accepts is None:
+                    skipped += 1
+                    continue
+
+                try:
+                    executor_module._guard_select_sql(normalised)
+                except MindQLParseError:
+                    guard_accepts = False
+                else:
+                    guard_accepts = True
+
+                assert guard_accepts == sqlite_accepts, normalised
+                compared += 1
+        finally:
+            conn.close()
+
+        # A sweep that skipped (almost) everything would pass vacuously.
+        assert compared > _ORACLE_SWEEP_SIZE // 2
+        assert skipped < _ORACLE_SWEEP_SIZE
 
 
 # ---------------------------------------------------------------------------
