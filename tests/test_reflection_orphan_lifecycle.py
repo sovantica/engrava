@@ -80,7 +80,16 @@ def _reflection_cfg() -> DreamingConfig:
         enabled=True,
         promote_threshold=0.0,
         max_p1_fraction=1.0,
-        promote_targets="ALL",
+        # OBS_ONLY, not ALL: a second run_consolidation() call (most of this
+        # file's tests call it twice, once to create the REFLECTION and once
+        # to sweep it) runs promotion *before* the sweep, in the same pass. A
+        # REFLECTION is itself a promotion candidate under ALL, and with
+        # promote_threshold=0.0 it clears the bar -- which would raise it to
+        # the now-protected P1 priority moments before the sweep inspects it,
+        # making every orphan in this file unretireable. These tests are about
+        # the orphan sweep, not about promoting REFLECTIONs, so promotion is
+        # scoped to OBSERVATIONs only.
+        promote_targets="OBS_ONLY",
         gates=DreamingGates(
             min_age_cycles=0,
             allow_zero_confirmation=True,
@@ -212,6 +221,60 @@ class TestOrphanRetire:
         only = await store.search_reflections_only("", [0.9, 0.1, 0.0], top_k=10)
         assert rid not in {tid for tid, _ in only.results}
 
+    async def test_dreaming_sourced_zero_edges_is_retired(self, store: SqliteEngravaCore) -> None:
+        """A dreaming-created REFLECTION whose edges are all gone is retired.
+
+        Dreaming always sets ``source_type=KnowledgeSource.DREAMING`` on a
+        REFLECTION it creates. With zero resolvable ``CONSOLIDATED_FROM``
+        edges, that is enough on its own to call it fully orphaned -- the
+        store cannot tell "never had an edge" apart from "had one and the
+        source was hard-deleted" (see
+        ``test_hard_deleted_sources_retires_dreaming_reflection`` below for
+        that exact scenario); both are treated the same way for a
+        dreaming-created REFLECTION.
+        """
+        reflection = ThoughtRecord(
+            thought_id="orphan-noedge-dreaming",
+            thought_type=ThoughtType.REFLECTION,
+            essence="REFLECTION [x]",
+            content="{}",
+            priority=Priority.P2,
+            lifecycle_status=LifecycleStatus.ACTIVE,
+            created_cycle=0,
+            updated_cycle=0,
+            source="dreaming:deadbeef",
+            source_type=KnowledgeSource.DREAMING,
+        )
+        await store.create_thought(reflection)
+
+        retired = await store.retire_orphan_reflections()
+
+        assert retired == 1
+        assert await _raw_lifecycle(store, "orphan-noedge-dreaming") == "ARCHIVED"
+
+    async def test_hard_deleted_sources_retires_dreaming_reflection(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        """Hard-deleting every source cascades its edges away; the sweep retires it.
+
+        Reproduces the defect directly: deleting a source thought removes its
+        ``CONSOLIDATED_FROM`` edge with it (cascade), so the sweep's old
+        ``if not source_statuses: continue`` guard left a REFLECTION like this
+        ``ACTIVE`` forever. The fix treats a dreaming-sourced REFLECTION with
+        no remaining edges as fully orphaned, the same as one whose sources
+        are all non-ACTIVE.
+        """
+        rid, sources = await _seed_reflection(store)
+        for sid in sources:
+            await store.delete_thought(sid)
+        # The cascade really did remove both edges -- not a vacuous orphan.
+        assert await store.consolidated_source_statuses(rid) == []
+
+        retired = await store.retire_orphan_reflections()
+
+        assert retired == 1
+        assert await _raw_lifecycle(store, rid) == "ARCHIVED"
+
     async def test_gc_cascades_retired_orphan(self, store: SqliteEngravaCore) -> None:
         """After retire + gc, the orphan row, its centroid, and edges are all gone."""
         rid, sources = await _seed_reflection(store)
@@ -260,9 +323,18 @@ class TestPartialArchivedKept:
         assert result.orphans_retired == 0
         assert await _raw_lifecycle(store, rid) == "ACTIVE"
 
-    async def test_zero_source_reflection_not_retired(self, store: SqliteEngravaCore) -> None:
-        """A REFLECTION with no CONSOLIDATED_FROM edges is never retired (>=1 guard)."""
-        # Defensive/legacy shape: a REFLECTION with zero source edges.
+    async def test_non_dreaming_zero_source_reflection_not_retired(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        """A non-dreaming REFLECTION with no CONSOLIDATED_FROM edges is never retired.
+
+        Defensive/legacy shape: a REFLECTION built directly (not by dreaming,
+        so ``source_type`` is not ``DREAMING``) with zero source edges. The
+        deleted-sources rule only fires for a dreaming-created REFLECTION --
+        see ``test_dreaming_sourced_zero_edges_is_retired`` above for that
+        case -- so this one is left alone, exactly as a zero-edge
+        all-non-ACTIVE rule firing over an empty set always has been.
+        """
         reflection = ThoughtRecord(
             thought_id="orphan-noedge",
             thought_type=ThoughtType.REFLECTION,
@@ -272,8 +344,8 @@ class TestPartialArchivedKept:
             lifecycle_status=LifecycleStatus.ACTIVE,
             created_cycle=0,
             updated_cycle=0,
-            source="dreaming:deadbeef",
-            source_type=KnowledgeSource.DREAMING,
+            source="manual",
+            source_type=KnowledgeSource.EXPERIENCE,
         )
         await store.create_thought(reflection)
 
@@ -303,6 +375,57 @@ class TestPartialArchivedKept:
         ext = DreamingExtension(config=_reflection_cfg())
         result = await ext.run_consolidation(store, current_cycle=3)
         assert result.orphans_retired == 0
+        assert await _raw_lifecycle(store, rid) == "ACTIVE"
+
+
+# ---------------------------------------------------------------------------
+# Protection — pinned / protected-priority REFLECTIONs are never retired
+# ---------------------------------------------------------------------------
+
+
+class TestProtectedReflectionKept:
+    """A pinned or protected-priority REFLECTION survives the sweep regardless."""
+
+    async def test_pinned_reflection_survives_all_sources_archived(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        """Pinning the REFLECTION keeps it ACTIVE even once every source is archived."""
+        rid, sources = await _seed_reflection(store)
+        await store.update_thought(rid, pinned=True)
+        for sid in sources:
+            await store.update_thought(sid, lifecycle_status=LifecycleStatus.ARCHIVED)
+
+        retired = await store.retire_orphan_reflections()
+
+        assert retired == 0
+        assert await _raw_lifecycle(store, rid) == "ACTIVE"
+
+    async def test_p1_reflection_survives_all_sources_archived(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        """Raising the REFLECTION to the default protected priority (P1) keeps it ACTIVE."""
+        rid, sources = await _seed_reflection(store)
+        await store.update_thought(rid, priority=Priority.P1)
+        for sid in sources:
+            await store.update_thought(sid, lifecycle_status=LifecycleStatus.ARCHIVED)
+
+        retired = await store.retire_orphan_reflections()
+
+        assert retired == 0
+        assert await _raw_lifecycle(store, rid) == "ACTIVE"
+
+    async def test_pinned_dreaming_reflection_survives_hard_deleted_sources(
+        self, store: SqliteEngravaCore
+    ) -> None:
+        """Pinning also protects the deleted-sources path, not just the all-archived one."""
+        rid, sources = await _seed_reflection(store)
+        await store.update_thought(rid, pinned=True)
+        for sid in sources:
+            await store.delete_thought(sid)
+
+        retired = await store.retire_orphan_reflections()
+
+        assert retired == 0
         assert await _raw_lifecycle(store, rid) == "ACTIVE"
 
 

@@ -235,6 +235,39 @@ migration is involved. See [Extensions](extensions.md) and
 handler contract, and [MindQL](mindql.md#extension-commands) for the
 accessor's read-only guarantee.
 
+**Behaviour change: `engrava gc` keeps pinned and protected-priority archived
+rows by default, instead of deleting every `ARCHIVED` row unconditionally.**
+No schema migration is involved.
+
+**Who is affected.** Anyone who runs `engrava gc` (with or without
+`--expired`) against a store that pins thoughts, or configures
+`hygiene_policy.protected_priorities`, and expects every `ARCHIVED` row to be
+removed. `gc` now deletes only `ARCHIVED` rows that are neither `pinned` nor at
+a protected priority (`P1` unless `--config` names an `engrava.yaml` with a
+different `hygiene_policy.protected_priorities`), and reports how many it kept
+for that reason. Pass `--include-pinned` to restore the previous unconditional
+behaviour. `--dry-run` reports both the would-delete and would-keep counts.
+See [Data lifecycle → Running cleanup](data-lifecycle.md#running-cleanup).
+
+**Also in this release:** `gc --expired`'s TTL pass (`cleanup_expired()`,
+reached directly, through the TTL cadence, or through `gc --expired`) now
+skips a `pinned` row regardless of an expired TTL, so a store-wide default TTL
+no longer overrides pinning. A skipped row is counted in the new
+`CleanupResult.pinned_kept_count` field instead of `expired_count`; it is `0`
+whenever nothing pinned is past its TTL, and existing keyword construction of
+`CleanupResult` is unaffected. A protected-priority row is **not** exempt from
+TTL and still expires. When
+`--config` names an `engrava.yaml` with `journal.enabled: true`, `gc` (both the
+archived-collection pass and the `--expired` TTL pass) now also journals what
+it deletes or archives, where it previously journaled nothing regardless of
+that setting — see [Audit Trail](audit-trail.md#what-gets-recorded). The
+orphan-REFLECTION sweep that runs during dreaming consolidation and before
+Memory Hygiene's own GC stage now also respects pinning and protected
+priorities, and retires a REFLECTION whose entire source cluster was
+hard-deleted (previously it stayed `ACTIVE` indefinitely in that case) — see
+[Dreaming → Orphan sweep](dreaming.md#orphan-sweep). No public method
+signature changed.
+
 ### 0.6 -> 0.7
 
 **Behaviour change: the dreaming clustering cohesion gate now computes a

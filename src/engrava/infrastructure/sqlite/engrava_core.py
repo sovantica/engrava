@@ -8916,6 +8916,18 @@ class SqliteEngravaCore:
         * **delete**: Physically deletes the expired thought rows (cascading
           to edges, embeddings, and actions via ON DELETE CASCADE).
 
+        **A pinned row is never expired.** A past-TTL thought with
+        ``pinned = True`` is skipped by both strategies — neither archived nor
+        deleted — and counted in the returned ``pinned_kept_count`` instead of
+        ``expired_count``. ``pinned`` is the row's own durable keep-intent
+        marker; a store-wide default TTL (``ttl.default_ttl_seconds``) must not
+        override it. This holds whether this method is reached directly,
+        through the auto-cleanup cadence (:meth:`_maybe_auto_cleanup`), or
+        through the CLI's ``gc --expired``. **A protected priority (Memory
+        Hygiene's ``protected_priorities``, default ``P1``) is *not* exempt
+        here** — that protection is a Memory Hygiene concept, and a TTL is the
+        row's own explicit lifetime; only ``pinned`` is a TTL exemption.
+
         Mutations are recorded in the journal when journaling is enabled.
 
         Args:
@@ -8930,8 +8942,8 @@ class SqliteEngravaCore:
 
         Returns:
             A ``CleanupResult`` with the count of processed thoughts, the
-            strategy that was applied, and the canonical UTC form of the
-            instant it cleaned up to.
+            strategy that was applied, the canonical UTC form of the instant
+            it cleaned up to, and the number of pinned rows left untouched.
 
         Raises:
             ValueError: If ``now`` is not a valid ISO-8601 timestamp, or has no
@@ -8972,13 +8984,14 @@ class SqliteEngravaCore:
             # is no longer actually expired -- caller data loss, not merely a
             # stale read.
             cursor = await self._db.execute(
-                "SELECT thought_id FROM thought WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                "SELECT thought_id, pinned FROM thought "
+                "WHERE expires_at IS NOT NULL AND expires_at <= ?",
                 (now,),
             )
             expired_rows = await cursor.fetchall()
-            expired_ids = [
-                row["thought_id"] for row in expired_rows if row["thought_id"] != exclude_id
-            ]
+            expired_ids, pinned_kept_count = _split_expired_by_pinned(
+                expired_rows, exclude_id=exclude_id
+            )
 
             # The whole batch is one failure-atomic unit, via
             # _write_readback_savepoint (see update_thought for what that
@@ -9086,6 +9099,7 @@ class SqliteEngravaCore:
             expired_count=len(expired_ids),
             strategy_applied=strategy.value,
             timestamp=now,
+            pinned_kept_count=pinned_kept_count,
         )
 
     async def _maybe_auto_cleanup(self, *, exclude_id: str | None = None) -> None:
@@ -14452,12 +14466,37 @@ class SqliteEngravaCore:
         A REFLECTION is a derived synthesis of a live cluster. Once **every**
         thought it was consolidated from is no longer ``ACTIVE`` (all
         ``ARCHIVED`` / ``DONE`` — i.e. the synthesis now summarises nothing
-        live), the REFLECTION is retired ``ACTIVE -> ARCHIVED`` so ordinary GC
-        can reclaim it (cascading its centroid embedding and
-        ``CONSOLIDATED_FROM`` edges). This is the shared store-owned
-        implementation used both by dreaming consolidation and by the Memory
-        Hygiene GC stage (run there **before** any delete so no REFLECTION is
-        left summarising a cluster the delete would empty).
+        live), or every ``CONSOLIDATED_FROM`` edge it had is gone because its
+        sources were hard-deleted (see the dreaming-sourced case below), the
+        REFLECTION is retired ``ACTIVE -> ARCHIVED``. This is the shared
+        store-owned implementation used both by dreaming consolidation and by
+        the Memory Hygiene GC stage (run there **before** any delete so no
+        REFLECTION is left summarising a cluster the delete would empty).
+
+        **This retirement is not a Memory Hygiene archival.** The write below
+        is a direct lifecycle flip — unlike hygiene's own archive stage, it
+        does *not* stamp ``archived_at_cycle`` / ``archived_at``. Hygiene GC
+        only ever reaps a row that hygiene itself archived (selected on
+        ``archived_at_cycle IS NOT NULL``), so a REFLECTION this sweep retires
+        is structurally never hygiene-GC-eligible — stamping it would make it
+        so, which this method is not permitted to decide on the sweep's
+        caller's behalf. A retired REFLECTION can still be removed by any
+        of: ``engrava gc``, which keeps it if it is protected (see below)
+        unless ``--include-pinned`` is given; an explicit
+        :meth:`delete_thought`, whatever its protection; or TTL cleanup under
+        the ``delete`` strategy, if it carries an expired TTL and is not
+        pinned — protection is a hygiene policy, not a TTL exemption, and
+        :meth:`delete_thought` removes a row by id regardless of either.
+
+        **Protection.** A REFLECTION that is itself protected — ``pinned``, or
+        at a priority in ``protected_priorities`` — is never retired by this
+        sweep, exactly like Memory Hygiene's own archive/GC stages. The active
+        policy is the store's configured ``hygiene_policy`` when one is set,
+        else the library defaults (pinned, or priority ``P1``). A REFLECTION's
+        priority defaults to ``DreamingConfig.reflection_default_priority``
+        (``P2``), so default dreaming is unaffected; an operator who wants a
+        synthesis kept forever pins it or raises its priority into the
+        protected set.
 
         **Full coverage.** The sweep inspects *every* ACTIVE REFLECTION, not just
         the first page. ``list_thoughts`` orders by ``updated_cycle DESC`` and is
@@ -14480,9 +14519,20 @@ class SqliteEngravaCore:
 
         * **100% threshold** — a REFLECTION with at least one still-ACTIVE source
           is kept; the synthesis still summarises live members.
-        * **At least one source** — a REFLECTION with zero ``CONSOLIDATED_FROM``
-          edges (defensive: malformed / legacy) is never retired by an
-          all-non-ACTIVE rule firing over an empty set.
+        * **Deleted-sources retirement** — a REFLECTION has no remaining
+          ``CONSOLIDATED_FROM`` edges either because it never had any
+          (defensive: malformed / legacy), or because every source it was
+          consolidated from was hard-deleted, which cascades the edge away with
+          it. The two cases are indistinguishable from this row's own state, so
+          they are told apart by *how* the REFLECTION was created: dreaming
+          always sets ``source_type=KnowledgeSource.DREAMING`` on a REFLECTION
+          it creates, so a dreaming-sourced REFLECTION with zero edges is
+          treated as fully orphaned (retired, like one whose sources are all
+          non-ACTIVE); one that is not dreaming-sourced (for example created
+          directly by a caller) is left alone, as a zero-edge all-non-ACTIVE
+          rule firing over an empty set would otherwise wrongly retire it too.
+        * **Protection** — see above; checked last so a protected REFLECTION is
+          never retired regardless of which rule above would otherwise fire.
 
         The check is a deterministic set query over each candidate's source
         lifecycle statuses — no model call.
@@ -14491,6 +14541,17 @@ class SqliteEngravaCore:
             The number of REFLECTIONs retired during this sweep.
 
         """
+        policy = self._hygiene_policy
+        if policy is None:
+            # Deferred import: the config module imports this one, so a
+            # module-scope import would be circular (mirrors the same pattern
+            # in __init__ for the same reason).
+            from engrava.config import (  # noqa: PLC0415
+                HygienePolicyConfig as _HygienePolicyConfig,
+            )
+
+            policy = _HygienePolicyConfig()
+
         # Phase 1 — collect EVERY ACTIVE REFLECTION id by paginating the full
         # set. Done before any mutation so the ACTIVE filter stays stable and
         # offsets do not drift (see the collect-then-retire note above).
@@ -14517,19 +14578,65 @@ class SqliteEngravaCore:
         # set is materialised.
         retired = 0
         for reflection_id in candidate_ids:
-            source_statuses = await self.consolidated_source_statuses(reflection_id)
-            # Require >= 1 source AND 100% of them non-ACTIVE.
-            if not source_statuses:
-                continue
-            if any(status == LifecycleStatus.ACTIVE.value for status in source_statuses):
-                continue
-            await self.update_thought(
-                reflection_id,
-                lifecycle_status=LifecycleStatus.ARCHIVED,
-            )
-            retired += 1
+            if await self._is_retirable_orphan(reflection_id, policy):
+                await self.update_thought(
+                    reflection_id,
+                    lifecycle_status=LifecycleStatus.ARCHIVED,
+                )
+                retired += 1
 
         return retired
+
+    async def _is_retirable_orphan(self, reflection_id: str, policy: HygienePolicyConfig) -> bool:
+        """Decide whether one candidate REFLECTION should be retired right now.
+
+        Split out of :meth:`retire_orphan_reflections` to keep that method's
+        own branch count within the linter's complexity budget while
+        preserving every check it documents: the 100%-non-ACTIVE rule, the
+        dreaming-sourced deleted-edges rule, and the protection check -- see
+        that method's docstring for the full rationale of each.
+
+        Args:
+            reflection_id: The candidate REFLECTION id.
+            policy: The active hygiene policy (for the protection check).
+
+        Returns:
+            ``True`` if this candidate should be retired now.
+
+        """
+        source_statuses = await self.consolidated_source_statuses(reflection_id)
+
+        if source_statuses:
+            # Require 100% of the resolvable sources to be non-ACTIVE. The
+            # common case (still has an ACTIVE source) exits here on a single
+            # read, with no extra row fetch.
+            if any(status == LifecycleStatus.ACTIVE.value for status in source_statuses):
+                return False
+            row = await self._get_thought_row(reflection_id)
+            if row is None:
+                # Retired or deleted by a concurrent task since Phase 1.
+                return False
+            thought = self._row_to_thought(row)
+        else:
+            # No resolvable CONSOLIDATED_FROM edge. The row is fetched here
+            # (rather than deferred) because ``source_type`` itself decides
+            # orphaned-ness in this branch -- see the deleted-sources guard
+            # in the caller's docstring.
+            row = await self._get_thought_row(reflection_id)
+            if row is None:
+                return False
+            thought = self._row_to_thought(row)
+            if thought.source_type != KnowledgeSource.DREAMING:
+                # Not dreaming-sourced -- left alone, as a zero-edge
+                # all-non-ACTIVE rule would otherwise wrongly retire a
+                # caller-created REFLECTION too.
+                return False
+
+        # Re-fetched row (not the Phase 1 listing) so a pin or priority raise
+        # that landed after Phase 1 is still honoured at the moment this
+        # candidate is actually acted on -- the same re-check discipline the
+        # hygiene archive/GC stages apply at their own write time.
+        return not _hygiene_protected(thought, policy)
 
     def attach_dreaming_extension(self, extension: DreamingConsolidatorProtocol) -> None:
         """Wire a Dreaming consolidator onto this store.
@@ -15512,6 +15619,41 @@ def _decode_consolidated(raw: str | None) -> list[str] | None:
         return None
     result: list[str] = json.loads(raw)
     return result
+
+
+def _split_expired_by_pinned(
+    expired_rows: Iterable[aiosqlite.Row], *, exclude_id: str | None
+) -> tuple[list[str], int]:
+    """Split a TTL-expired row set into the ids to act on and a pinned-kept count.
+
+    A pinned row is the durable never-forget marker: it is excluded from the
+    batch entirely (neither archived nor deleted) and tallied separately so
+    the caller can see it was kept, not silently dropped. The excluded id
+    (just-written protection) is not counted either way.
+
+    Args:
+        expired_rows: Rows with ``thought_id`` and ``pinned`` columns, as
+            returned by :meth:`SqliteEngravaCore.cleanup_expired`'s own
+            expired-row query.
+        exclude_id: A thought id to skip entirely (neither acted on nor
+            counted as pinned-kept).
+
+    Returns:
+        ``(expired_ids, pinned_kept_count)``: the ids to archive/delete, and
+        how many excluded rows were pinned.
+
+    """
+    expired_ids: list[str] = []
+    pinned_kept_count = 0
+    for row in expired_rows:
+        thought_id = row["thought_id"]
+        if thought_id == exclude_id:
+            continue
+        if row["pinned"]:
+            pinned_kept_count += 1
+            continue
+        expired_ids.append(thought_id)
+    return expired_ids, pinned_kept_count
 
 
 def _clamp_decay(raw: float) -> float:

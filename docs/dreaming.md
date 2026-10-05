@@ -69,8 +69,9 @@ Walking the journey:
    embedding plus `CONSOLIDATED_FROM` edges back to the members — when reflections
    are enabled and eligible clusters pass the clustering/quality gates. This turns
    a pile of observations into fewer, higher-level memories. (A REFLECTION whose
-   source cluster later leaves the active set is automatically retired so a stale
-   summary can't resurface.)
+   source cluster later leaves the active set — or is hard-deleted — is
+   automatically retired, unless it is pinned or protected, so a stale summary
+   can't resurface; see the [orphan sweep](#orphan-sweep).)
 6. **How it shows up in retrieval.** All of this changes future
    [hybrid search](search.md) *mechanically*: the P1 memory ranks higher via the
    priority signal, any new edges feed the opt-in graph signal, and reflections
@@ -620,6 +621,44 @@ no thought carrying the cluster's hash remains, so the next pass processes
 the cluster as new; with journaling enabled, the journal still holds both
 the insert and the deletion.
 
+### Orphan sweep
+
+The fourth consolidation phase retires a REFLECTION whose source cluster has
+left the active set, so a stale synthesis can't keep resurfacing in search.
+Two cases retire a REFLECTION, both checked against the same protection rule
+first:
+
+- **All sources left ACTIVE.** Every thought the REFLECTION was consolidated
+  from is now `ARCHIVED` / `DONE` (or otherwise non-`ACTIVE`) — the synthesis
+  now summarises nothing live.
+- **Every source was hard-deleted.** Deleting a thought cascades its
+  `CONSOLIDATED_FROM` edge away with it, so a REFLECTION whose sources were all
+  hard-deleted (rather than archived) is left with zero resolvable edges. This
+  is retired exactly like the all-non-`ACTIVE` case, but **only** for a
+  REFLECTION dreaming itself created (`source_type` is `DREAMING`) — one with
+  no edges that was not created by dreaming (for example built directly
+  through the API) is left alone, the same defensive guard that has always
+  kept a malformed or legacy zero-edge REFLECTION from being wrongly swept.
+
+**Protection applies here too.** A pinned REFLECTION, or one at a priority in
+`protected_priorities` (default `P1`), is never retired by this sweep — see
+[Protection](memory-hygiene.md#protection--what-never-gets-forgotten). A
+REFLECTION's priority defaults to `reflection_default_priority` (`P2`), so
+default dreaming is unaffected; pin a synthesis, or raise its priority into the
+protected set, to keep it past this sweep regardless of its source cluster.
+
+**A swept REFLECTION is not Memory Hygiene GC-eligible.** Retiring a
+REFLECTION here is a direct `ACTIVE -> ARCHIVED` flip, not a Memory Hygiene
+archival — it does not stamp `archived_at_cycle` / `archived_at`, and Memory
+Hygiene's GC stage only ever reaps a row *it* archived (selected on
+`archived_at_cycle IS NOT NULL`). A swept REFLECTION therefore stops surfacing
+in search immediately, and is physically removed by any of: an explicit
+`engrava gc`, which keeps it if it is protected unless `--include-pinned` is
+given; an explicit delete, whatever its protection; or TTL cleanup under the
+`delete` strategy, if it carries an expired TTL and is not pinned (protection
+is a hygiene policy, not a TTL exemption) — see
+[Data lifecycle → Running cleanup](data-lifecycle.md#running-cleanup).
+
 ### Configuration
 
 ```yaml
@@ -678,7 +717,7 @@ The cross-cluster boilerplate filter is controlled separately by
 | `reflections_created` | New REFLECTION thoughts |
 | `promotion_capped` | Whether the corpus-wide P1 fraction prevented a promotion |
 | `p1_fraction_after` | P1 share after the run |
-| `orphans_retired` | ACTIVE REFLECTIONs archived because all sources left the active set |
+| `orphans_retired` | ACTIVE REFLECTIONs archived by the [orphan sweep](#orphan-sweep) (all sources left the active set, or all were hard-deleted), excluding protected ones |
 | `active_signal_weights` | Effective weights after flat-signal redistribution |
 | `flat_signals` | Configured signals dropped as inactive for this run (see [Signals](#signals)) |
 

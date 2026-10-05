@@ -158,10 +158,12 @@ def _write_journalled_thoughts(db_path: Path, thought_ids: list[str]) -> None:
 
     Unlike ``populated_db``, this builds the store with ``journal_enabled=True``
     so ``create_thought`` writes one hash-linked ``journal_entry`` row per
-    thought -- the CLI itself never enables journaling (there is no CLI flag
-    for it), so a store that already carries journal history has to be built
-    directly against the domain API, exactly as it would be by an application
-    embedding engrava as a library.
+    thought -- no CLI command creates a thought through the journal (``engrava
+    gc`` can journal the archives/deletes it performs itself, via
+    ``--config``'s ``journal:`` section, but that is its own writes, not a
+    thought's creation), so a store that already carries journal history for a
+    *create* has to be built directly against the domain API, exactly as it
+    would be by an application embedding engrava as a library.
 
     Args:
         db_path: Path to create the database at. Must not already exist.
@@ -376,6 +378,157 @@ def populated_db(db_path: Path) -> Path:
             created_cycle=1,
         )
         await store.create_edge(edge)
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_setup())
+    return db_path
+
+
+@pytest.fixture
+def protected_archived_db(db_path: Path) -> Path:
+    """A DB with one live thought and three ARCHIVED ones: pinned, P1, plain.
+
+    Backs ``gc``'s protection tests: the pinned and P1 rows must survive a
+    default ``gc`` and a default ``gc --dry-run``'s count, while the plain
+    (P2, unpinned) row is the one row either actually collects.
+    """
+    import asyncio
+
+    import aiosqlite
+
+    from engrava import (
+        LifecycleStatus,
+        Priority,
+        SqliteEngravaCore,
+        ThoughtRecord,
+        ThoughtType,
+    )
+
+    async def _setup() -> None:
+        conn = await aiosqlite.connect(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        await store.ensure_schema()
+
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-live",
+                essence="still active",
+                content="still active",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=1,
+                updated_cycle=1,
+            )
+        )
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-pinned",
+                essence="archived but pinned",
+                content="archived but pinned",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ARCHIVED,
+                priority=Priority.P2,
+                created_cycle=1,
+                updated_cycle=1,
+                pinned=True,
+            )
+        )
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-p1",
+                essence="archived at P1",
+                content="archived at P1",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ARCHIVED,
+                priority=Priority.P1,
+                created_cycle=1,
+                updated_cycle=1,
+            )
+        )
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-plain",
+                essence="archived, unprotected",
+                content="archived, unprotected",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ARCHIVED,
+                priority=Priority.P2,
+                created_cycle=1,
+                updated_cycle=1,
+            )
+        )
+        await conn.commit()
+        await conn.close()
+
+    asyncio.run(_setup())
+    return db_path
+
+
+@pytest.fixture
+def pinned_expired_db(db_path: Path) -> Path:
+    """A DB with one pinned, past-TTL thought and one plain, past-TTL thought.
+
+    Backs ``gc --expired``'s pinned-exemption and journaling tests: under the
+    default ``archive`` strategy the pinned row must survive, the plain one
+    must be archived.
+    """
+    import asyncio
+    import datetime as _datetime
+
+    import aiosqlite
+
+    from engrava import (
+        LifecycleStatus,
+        Priority,
+        SqliteEngravaCore,
+        ThoughtRecord,
+        ThoughtType,
+    )
+
+    past = (_datetime.datetime.now(_datetime.UTC) - _datetime.timedelta(hours=1)).isoformat()
+
+    async def _setup() -> None:
+        conn = await aiosqlite.connect(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        store = SqliteEngravaCore(conn)
+        await store.ensure_schema()
+
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-pinned-expired",
+                essence="pinned, past TTL",
+                content="pinned, past TTL",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=1,
+                updated_cycle=1,
+                pinned=True,
+                expires_at=past,
+            )
+        )
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-plain-expired",
+                essence="plain, past TTL",
+                content="plain, past TTL",
+                thought_type=ThoughtType.OBSERVATION,
+                source="test",
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                priority=Priority.P2,
+                created_cycle=1,
+                updated_cycle=1,
+                expires_at=past,
+            )
+        )
         await conn.commit()
         await conn.close()
 
@@ -4013,6 +4166,10 @@ class TestGc:
         assert "Would delete 1 archived thoughts" in result.output
         assert "edges, embeddings, and actions" in result.output
         assert "orphaned edges" not in result.output
+        # The would-keep line prints unconditionally, "0" included -- nothing
+        # here is protected, so it must still appear rather than being
+        # suppressed.
+        assert "Would keep 0 archived thoughts because they are protected." in result.output
 
         # Verify nothing actually deleted
         check = runner.invoke(
@@ -4035,6 +4192,501 @@ class TestGc:
         result = runner.invoke(cli, ["--db", str(populated_db), "gc"])
         assert result.exit_code == 0
         assert "No archived" in result.output
+
+    def test_gc_keeps_pinned_and_p1_by_default(
+        self, runner: CliRunner, protected_archived_db: Path
+    ) -> None:
+        """A plain gc deletes only the unprotected archived row."""
+        result = runner.invoke(cli, ["--db", str(protected_archived_db), "gc"])
+        assert result.exit_code == 0
+        assert "Collected 1" in result.output
+        assert "Kept 2 archived thoughts because they are protected." in result.output
+
+        check = runner.invoke(cli, ["--db", str(protected_archived_db), "--format", "json", "info"])
+        data = json.loads(check.output)
+        assert data["thoughts"]["total"] == 3  # t-live, t-pinned, t-p1 survive
+
+    def test_gc_include_pinned_deletes_everything(
+        self, runner: CliRunner, protected_archived_db: Path
+    ) -> None:
+        """--include-pinned restores the unconditional delete-everything behaviour."""
+        result = runner.invoke(cli, ["--db", str(protected_archived_db), "gc", "--include-pinned"])
+        assert result.exit_code == 0
+        assert "Collected 3" in result.output
+        assert "Kept" not in result.output
+
+        check = runner.invoke(cli, ["--db", str(protected_archived_db), "--format", "json", "info"])
+        data = json.loads(check.output)
+        assert data["thoughts"]["total"] == 1  # only t-live survives
+
+    def test_gc_dry_run_reports_protected_counts(
+        self, runner: CliRunner, protected_archived_db: Path
+    ) -> None:
+        """--dry-run reports both the would-delete and would-keep counts."""
+        result = runner.invoke(cli, ["--db", str(protected_archived_db), "gc", "--dry-run"])
+        assert result.exit_code == 0
+        assert "Would delete 1 archived thoughts" in result.output
+        assert "Would keep 2 archived thoughts because they are protected." in result.output
+
+        check = runner.invoke(cli, ["--db", str(protected_archived_db), "--format", "json", "info"])
+        data = json.loads(check.output)
+        assert data["thoughts"]["total"] == 4  # nothing was actually deleted
+
+    def test_gc_help_names_include_pinned(self, runner: CliRunner) -> None:
+        result = runner.invoke(cli, ["gc", "--help"])
+        assert result.exit_code == 0
+        assert "--include-pinned" in result.output
+
+    def test_gc_journals_its_deletes_when_configured(
+        self, runner: CliRunner, protected_archived_db: Path, tmp_path: Path
+    ) -> None:
+        """With journaling enabled via --config, gc appends a DELETE_THOUGHT entry."""
+        config_path = tmp_path / "engrava.yaml"
+        config_path.write_text(
+            f"database:\n  path: {protected_archived_db}\njournal:\n  enabled: true\n",
+            encoding="utf-8",
+        )
+
+        assert _journal_entry_count(protected_archived_db) == 0
+        result = runner.invoke(
+            cli, ["--db", str(protected_archived_db), "--config", str(config_path), "gc"]
+        )
+        assert result.exit_code == 0
+        assert "Collected 1" in result.output
+
+        deltas = _journal_entry_deltas(protected_archived_db, "t-plain")
+        assert len(deltas) == 1
+        assert deltas[0]["after"] is None  # a DELETE_THOUGHT entry
+        assert deltas[0]["before"] is not None
+
+        # No entry for a row gc kept protected.
+        assert _journal_entry_deltas(protected_archived_db, "t-pinned") == []
+
+        verify_result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(protected_archived_db),
+                "--format",
+                "json",
+                "verify",
+            ],
+        )
+        assert verify_result.exit_code == 0
+        verify_data = json.loads(verify_result.output)
+        assert verify_data["valid"] is True
+        assert verify_data["entries_checked"] == 1
+
+    def test_gc_without_config_journals_nothing(
+        self, runner: CliRunner, protected_archived_db: Path
+    ) -> None:
+        """Without --config, gc's deletes are not journaled, exactly as before."""
+        result = runner.invoke(cli, ["--db", str(protected_archived_db), "gc"])
+        assert result.exit_code == 0
+        assert _journal_entry_count(protected_archived_db) == 0
+
+    def test_gc_archived_journal_matches_deleted_rows_under_concurrent_write(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """A concurrent write landing in the old read/delete window used to
+        produce a journal entry for a row that survived gc's pass.
+
+        The write lock gc now takes before reading which rows are eligible
+        closes that window: the race either lands before the lock is taken
+        (and so is seen by the eligible-row read, fully deleted and
+        journaled), or is refused while gc's pass holds the lock. Either way,
+        the journal and what was actually deleted must agree.
+        """
+        import aiosqlite
+
+        from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+
+        db_path = tmp_path / "race.db"
+
+        async def _setup() -> None:
+            conn = await aiosqlite.connect(str(db_path))
+            conn.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(conn)
+            await store.ensure_schema()
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id="t-victim",
+                    essence="eligible when read, raced afterwards",
+                    content="eligible when read, raced afterwards",
+                    thought_type=ThoughtType.OBSERVATION,
+                    source="test",
+                    lifecycle_status=LifecycleStatus.ARCHIVED,
+                    priority=Priority.P2,
+                    created_cycle=1,
+                    updated_cycle=1,
+                )
+            )
+            await conn.commit()
+            await conn.close()
+
+        asyncio.run(_setup())
+
+        config_path = tmp_path / "engrava.yaml"
+        config_path.write_text(
+            f"database:\n  path: {db_path}\njournal:\n  enabled: true\n", encoding="utf-8"
+        )
+
+        race_outcomes: list[str] = []
+        original_before_snapshots = cli_main._gc_archived_before_snapshots
+
+        async def _racing_before_snapshots(
+            conn: object, archived_filter: str, protect_params: list[object]
+        ) -> dict[str, dict[str, object]]:
+            # The snapshot read runs first, unaffected -- then the race is
+            # injected in the window right after it, the same window the
+            # defect exploited: a second connection trying to change the row
+            # before the deletes below act on it.
+            snapshots = await original_before_snapshots(conn, archived_filter, protect_params)
+            race_conn = sqlite3.connect(str(db_path), timeout=0.2)
+            try:
+                race_conn.execute("UPDATE thought SET pinned = 1 WHERE thought_id = 't-victim'")
+                race_conn.commit()
+                race_outcomes.append("pinned")
+            except sqlite3.OperationalError as exc:
+                race_outcomes.append(f"refused: {exc}")
+            finally:
+                race_conn.close()
+            return snapshots
+
+        with mock.patch.object(cli_main, "_gc_archived_before_snapshots", _racing_before_snapshots):
+            result = runner.invoke(cli, ["--db", str(db_path), "--config", str(config_path), "gc"])
+        assert result.exit_code == 0
+        assert race_outcomes, "the race injection never ran"
+
+        conn = sqlite3.connect(db_path)
+        try:
+            row = conn.execute(
+                "SELECT thought_id FROM thought WHERE thought_id = 't-victim'"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        deltas = _journal_entry_deltas(db_path, "t-victim")
+
+        if row is None:
+            # Deleted: the journal must carry exactly the entry that
+            # documents it -- not zero, and not more than one.
+            assert len(deltas) == 1
+        else:
+            # Survived the race: there must be no entry claiming a row that
+            # is still there was deleted.
+            assert deltas == []
+
+        verify_result = runner.invoke(cli, ["--db", str(db_path), "--format", "json", "verify"])
+        assert verify_result.exit_code == 0
+        assert json.loads(verify_result.output)["valid"] is True
+
+    def test_gc_archived_rolls_back_on_mid_pass_failure(self, tmp_path: Path) -> None:
+        """A failure after the write lock is taken -- here, in the journal
+        append -- leaves no open transaction and deletes nothing.
+
+        Exercised by calling ``_gc_archived`` directly (rather than through
+        the CLI dispatch, which closes the connection on any exception) so
+        the connection's own post-failure state can be inspected.
+        """
+        import aiosqlite
+
+        from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+
+        db_path = tmp_path / "midpass.db"
+        config_path = tmp_path / "engrava.yaml"
+        config_path.write_text(
+            f"database:\n  path: {db_path}\njournal:\n  enabled: true\n", encoding="utf-8"
+        )
+
+        async def _run() -> None:
+            conn = await aiosqlite.connect(str(db_path))
+            conn.row_factory = aiosqlite.Row
+            store = SqliteEngravaCore(conn)
+            await store.ensure_schema()
+            await store.create_thought(
+                ThoughtRecord(
+                    thought_id="t-doomed",
+                    essence="about to fail mid-pass",
+                    content="about to fail mid-pass",
+                    thought_type=ThoughtType.OBSERVATION,
+                    source="test",
+                    lifecycle_status=LifecycleStatus.ARCHIVED,
+                    priority=Priority.P2,
+                    created_cycle=1,
+                    updated_cycle=1,
+                )
+            )
+            await conn.commit()
+
+            cfg = EngravaCLIConfig(db_path=db_path, config_path=config_path)
+
+            # Asserted inside a `finally` -- not after it, like the other
+            # tests in this module -- so a failing assertion here cannot
+            # itself leak this connection's non-daemon aiosqlite worker
+            # thread and hang the interpreter at process exit.
+            try:
+                with (
+                    mock.patch.object(
+                        cli_main, "_journal_gc_deletes", side_effect=RuntimeError("boom")
+                    ),
+                    pytest.raises(RuntimeError, match="boom"),
+                ):
+                    await cli_main._gc_archived(
+                        conn, cfg, dry_run=False, quiet=False, include_pinned=False
+                    )
+
+                assert conn.in_transaction is False
+
+                cursor = await conn.execute(
+                    "SELECT COUNT(*) FROM thought WHERE thought_id = 't-doomed'"
+                )
+                count_row = await cursor.fetchone()
+                assert count_row[0] == 1  # still there -- the delete was rolled back
+            finally:
+                await conn.close()
+
+        asyncio.run(_run())
+
+    def test_gc_archived_rolls_back_when_cancelled_at_begin(self, tmp_path: Path) -> None:
+        """A cancellation that arrives as ``BEGIN IMMEDIATE`` completes leaves no transaction.
+
+        The await on ``BEGIN IMMEDIATE`` can be cancelled after the worker
+        thread has already run it, so the transaction must be closed by the
+        same rollback that covers the rest of the pass.
+        """
+        import aiosqlite
+
+        from engrava import LifecycleStatus, Priority, SqliteEngravaCore, ThoughtRecord, ThoughtType
+
+        db_path = tmp_path / "cancelled.db"
+
+        async def _run() -> None:
+            conn = await aiosqlite.connect(str(db_path))
+            conn.row_factory = aiosqlite.Row
+            try:
+                store = SqliteEngravaCore(conn)
+                await store.ensure_schema()
+                await store.create_thought(
+                    ThoughtRecord(
+                        thought_id="t-kept",
+                        essence="survives a cancelled gc",
+                        content="survives a cancelled gc",
+                        thought_type=ThoughtType.OBSERVATION,
+                        source="test",
+                        lifecycle_status=LifecycleStatus.ARCHIVED,
+                        priority=Priority.P2,
+                        created_cycle=1,
+                        updated_cycle=1,
+                    )
+                )
+                await conn.commit()
+
+                real_execute = conn.execute
+
+                async def _cancel_after_begin(sql: str, *args: object) -> object:
+                    result = await real_execute(sql, *args)
+                    if sql == "BEGIN IMMEDIATE":
+                        raise asyncio.CancelledError
+                    return result
+
+                cfg = EngravaCLIConfig(db_path=db_path)
+                with (
+                    mock.patch.object(conn, "execute", _cancel_after_begin),
+                    pytest.raises(asyncio.CancelledError),
+                ):
+                    await cli_main._gc_archived(
+                        conn, cfg, dry_run=False, quiet=False, include_pinned=False
+                    )
+
+                assert conn.in_transaction is False
+                cursor = await conn.execute(
+                    "SELECT COUNT(*) FROM thought WHERE thought_id = 't-kept'"
+                )
+                count_row = await cursor.fetchone()
+                assert count_row[0] == 1
+            finally:
+                await conn.close()
+
+        asyncio.run(_run())
+
+    def test_gc_dry_run_with_nothing_archived_reports_both_zero_counts(
+        self, runner: CliRunner, populated_db: Path
+    ) -> None:
+        """--dry-run prints both counts even when nothing is archived."""
+        first = runner.invoke(cli, ["--db", str(populated_db), "gc"])
+        assert first.exit_code == 0
+        result = runner.invoke(cli, ["--db", str(populated_db), "gc", "--dry-run"])
+        assert result.exit_code == 0
+        assert "Would delete 0 archived thoughts" in result.output
+        assert "Would keep 0 archived thoughts because they are protected." in result.output
+
+    def test_gc_expired_keeps_a_pinned_row(
+        self, runner: CliRunner, pinned_expired_db: Path
+    ) -> None:
+        """gc --expired never expires a pinned row, under the default archive strategy."""
+        result = runner.invoke(cli, ["--db", str(pinned_expired_db), "gc", "--expired"])
+        assert result.exit_code == 0
+        assert "Cleaned up 1 expired thoughts (strategy: archive)." in result.output
+        assert "Kept 1 pinned thoughts with an expired TTL." in result.output
+
+        # Read the two rows back directly -- the report above is the
+        # command's own account; this is what it actually left on disk.
+        conn = sqlite3.connect(pinned_expired_db)
+        try:
+            pinned_status = conn.execute(
+                "SELECT lifecycle_status FROM thought WHERE thought_id = 't-pinned-expired'"
+            ).fetchone()[0]
+            plain_status = conn.execute(
+                "SELECT lifecycle_status FROM thought WHERE thought_id = 't-plain-expired'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert pinned_status == "ACTIVE"
+        assert plain_status == "ARCHIVED"
+
+    def test_gc_expired_journals_when_configured(
+        self, runner: CliRunner, pinned_expired_db: Path, tmp_path: Path
+    ) -> None:
+        """With journaling enabled via --config, gc --expired journals its archive."""
+        config_path = tmp_path / "engrava.yaml"
+        config_path.write_text(
+            f"database:\n  path: {pinned_expired_db}\njournal:\n  enabled: true\n",
+            encoding="utf-8",
+        )
+
+        assert _journal_entry_count(pinned_expired_db) == 0
+        result = runner.invoke(
+            cli,
+            ["--db", str(pinned_expired_db), "--config", str(config_path), "gc", "--expired"],
+        )
+        assert result.exit_code == 0
+
+        deltas = _journal_entry_deltas(pinned_expired_db, "t-plain-expired")
+        assert len(deltas) == 1
+        assert deltas[0]["after"] is not None  # UPDATE_THOUGHT (archive strategy)
+        # The kept pinned row is untouched, so it is not journaled either.
+        assert _journal_entry_deltas(pinned_expired_db, "t-pinned-expired") == []
+
+        verify_result = runner.invoke(
+            cli, ["--db", str(pinned_expired_db), "--format", "json", "verify"]
+        )
+        assert verify_result.exit_code == 0
+        verify_data = json.loads(verify_result.output)
+        assert verify_data["valid"] is True
+        assert verify_data["entries_checked"] == 1
+
+    def test_pinned_reflection_survives_sweep_and_gc_end_to_end(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        """Pin a REFLECTION, archive its sources, sweep, then run engrava gc.
+
+        The full chain the WS exists to close off: a pinned synthesis must
+        still be there at the end, through both the deterministic sweep (run
+        here via the store directly -- it is store-owned, not CLI-exposed) and
+        the CLI's own ``engrava gc``.
+        """
+        import asyncio
+
+        import aiosqlite
+
+        from engrava import (
+            EdgeRecord,
+            EdgeType,
+            KnowledgeSource,
+            LifecycleStatus,
+            Priority,
+            SqliteEngravaCore,
+            ThoughtRecord,
+            ThoughtType,
+        )
+
+        db_path = tmp_path / "chain.db"
+
+        async def _setup_and_sweep() -> None:
+            conn = await aiosqlite.connect(str(db_path))
+            conn.row_factory = aiosqlite.Row
+            try:
+                store = SqliteEngravaCore(conn)
+                await store.ensure_schema()
+
+                for sid in ("src-a", "src-b"):
+                    await store.create_thought(
+                        ThoughtRecord(
+                            thought_id=sid,
+                            essence=f"source {sid}",
+                            content=f"source {sid}",
+                            thought_type=ThoughtType.OBSERVATION,
+                            source="test",
+                            lifecycle_status=LifecycleStatus.ARCHIVED,
+                            priority=Priority.P2,
+                            created_cycle=1,
+                            updated_cycle=1,
+                        )
+                    )
+                await store.create_thought(
+                    ThoughtRecord(
+                        thought_id="refl-chain",
+                        essence="REFLECTION [chain]",
+                        content="{}",
+                        thought_type=ThoughtType.REFLECTION,
+                        source="dreaming:chain",
+                        source_type=KnowledgeSource.DREAMING,
+                        lifecycle_status=LifecycleStatus.ACTIVE,
+                        priority=Priority.P2,
+                        created_cycle=1,
+                        updated_cycle=1,
+                        pinned=True,
+                    )
+                )
+                for sid in ("src-a", "src-b"):
+                    await store.create_edge(
+                        EdgeRecord(
+                            edge_id=f"e-{sid}",
+                            from_thought_id="refl-chain",
+                            to_thought_id=sid,
+                            edge_type=EdgeType.CONSOLIDATED_FROM,
+                            weight=1.0,
+                            created_cycle=1,
+                            source=KnowledgeSource.DREAMING,
+                        )
+                    )
+                await conn.commit()
+
+                # The sweep: every source is ARCHIVED (non-ACTIVE), but the
+                # REFLECTION is pinned, so it must stay ACTIVE.
+                retired = await store.retire_orphan_reflections()
+                assert retired == 0
+            finally:
+                await conn.close()
+
+        asyncio.run(_setup_and_sweep())
+
+        conn = sqlite3.connect(db_path)
+        try:
+            status = conn.execute(
+                "SELECT lifecycle_status FROM thought WHERE thought_id = 'refl-chain'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert status == "ACTIVE", "the sweep must not have touched the pinned REFLECTION"
+
+        # engrava gc: the sources are ARCHIVED and unprotected, so they are
+        # collected; the REFLECTION is still ACTIVE (never archived by the
+        # sweep), so gc has nothing to decide about it either way -- it must
+        # simply still be there.
+        result = runner.invoke(cli, ["--db", str(db_path), "gc"])
+        assert result.exit_code == 0
+
+        conn = sqlite3.connect(db_path)
+        try:
+            row = conn.execute(
+                "SELECT lifecycle_status FROM thought WHERE thought_id = 'refl-chain'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None, "the pinned REFLECTION must exist at the end of the chain"
+        assert row[0] == "ACTIVE"
 
 
 class TestMigrate:

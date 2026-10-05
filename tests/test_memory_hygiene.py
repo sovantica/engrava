@@ -1118,16 +1118,24 @@ class TestArchiveReversible:
         ``cleanup_expired`` has no lifecycle filter, so a hygiene-archived row
         that kept its ``expires_at`` would be **physically deleted** under
         ``ttl_strategy="delete"`` — bypassing both GC restore windows and the
-        ``auto_gc_enabled`` switch. The pinned control row proves the sweep is
-        live and really does delete what is still under TTL.
+        ``auto_gc_enabled`` switch. The protected-priority control row proves
+        the sweep is live and really does delete what is still under TTL --
+        ``pinned`` would also have kept hygiene off it, but ``pinned`` is
+        itself a TTL exemption (unlike a protected priority), which would
+        have kept this row out of the sweep below for the wrong reason and
+        proven nothing about the sweep being live.
         """
         policy = _forgetful_policy(eviction_threshold=1.0)
         s = await _make_store(policy, ttl_strategy="delete")
         try:
             await s.create_thought(_evictable_thought("cold", expires_at=_FAR_FUTURE))
-            # Pinned, so hygiene never archives it: it keeps its TTL and is the
-            # non-target the sweep is expected to reap.
-            await s.create_thought(_thought("under_ttl", pinned=True, expires_at=_FAR_FUTURE))
+            # Protected priority (not pinned): hygiene never archives it
+            # either, but -- unlike pinning -- a protected priority is not a
+            # TTL exemption, so it still keeps its TTL and is the non-target
+            # the sweep is expected to reap.
+            await s.create_thought(
+                _thought("under_ttl", priority=Priority.P1, expires_at=_FAR_FUTURE)
+            )
 
             await s.run_hygiene(current_cycle=42, now=_NOW)
             assert await _raw_lifecycle(s, "cold") == "ARCHIVED"
@@ -1618,6 +1626,160 @@ class TestGarbageCollection:
             assert await _raw_lifecycle(s, "refl") == "ARCHIVED"
             cursor = await s._db.execute("SELECT COUNT(*) AS n FROM edge")
             assert (await cursor.fetchone())["n"] == 0
+        finally:
+            await s._db.close()
+
+    async def test_gc_orphan_sweep_skips_pinned_reflection(self) -> None:
+        """A pinned REFLECTION is never retired by the sweep, even when fully orphaned."""
+        policy = HygienePolicyConfig(
+            enabled=True,
+            eviction_threshold=0.0,
+            auto_gc_enabled=True,
+            gc_min_archive_age_cycles=0,
+            gc_restore_window_seconds=0,
+        )
+        s = await _make_store(policy)
+        try:
+            await s.create_thought(_thought("src", updated_cycle=0))
+            await s.update_thought(
+                "src",
+                lifecycle_status=LifecycleStatus.ARCHIVED,
+                archived_at_cycle=0,
+            )
+            await s.create_thought(
+                _thought(
+                    "refl",
+                    thought_type=ThoughtType.REFLECTION,
+                    updated_cycle=0,
+                    pinned=True,
+                )
+            )
+            await s.create_edge(
+                EdgeRecord(
+                    edge_id="e1",
+                    from_thought_id="refl",
+                    to_thought_id="src",
+                    edge_type=EdgeType.CONSOLIDATED_FROM,
+                    weight=0.5,
+                    created_cycle=0,
+                    source=KnowledgeSource.EXPERIENCE,
+                )
+            )
+            result = await s.run_hygiene(current_cycle=1000)
+            # The source is still GC'd (it is not itself protected); the
+            # pinned REFLECTION is left exactly as it was. ``retired_count``
+            # is internal (not on the public ``HygieneResult``), so the
+            # retirement outcome is read back from the row itself.
+            assert result.gc_count == 1
+            assert await s.get_thought("src") is None
+            assert await _raw_lifecycle(s, "refl") == "ACTIVE"
+        finally:
+            await s._db.close()
+
+    async def test_gc_orphan_sweep_skips_protected_priority_reflection(self) -> None:
+        """A P1 (default-protected-priority) REFLECTION is never retired by the sweep."""
+        policy = HygienePolicyConfig(
+            enabled=True,
+            eviction_threshold=0.0,
+            auto_gc_enabled=True,
+            gc_min_archive_age_cycles=0,
+            gc_restore_window_seconds=0,
+        )
+        s = await _make_store(policy)
+        try:
+            await s.create_thought(_thought("src", updated_cycle=0))
+            await s.update_thought(
+                "src",
+                lifecycle_status=LifecycleStatus.ARCHIVED,
+                archived_at_cycle=0,
+            )
+            await s.create_thought(
+                _thought(
+                    "refl",
+                    thought_type=ThoughtType.REFLECTION,
+                    updated_cycle=0,
+                    priority=Priority.P1,
+                )
+            )
+            await s.create_edge(
+                EdgeRecord(
+                    edge_id="e1",
+                    from_thought_id="refl",
+                    to_thought_id="src",
+                    edge_type=EdgeType.CONSOLIDATED_FROM,
+                    weight=0.5,
+                    created_cycle=0,
+                    source=KnowledgeSource.EXPERIENCE,
+                )
+            )
+            result = await s.run_hygiene(current_cycle=1000)
+            assert result.gc_count == 1
+            assert await s.get_thought("src") is None
+            assert await _raw_lifecycle(s, "refl") == "ACTIVE"
+        finally:
+            await s._db.close()
+
+    async def test_orphan_sweep_retirement_is_not_hygiene_gc_eligible(self) -> None:
+        """A swept, unprotected REFLECTION is never reaped by Memory Hygiene GC.
+
+        The sweep's own retirement is a direct lifecycle flip, not a hygiene
+        archival -- it never stamps ``archived_at_cycle``, and hygiene GC only
+        ever reaps a row selected on ``archived_at_cycle IS NOT NULL``. A
+        mutation that stamped it on retirement would make the *second*
+        ``run_hygiene`` call below (run far enough forward to clear both
+        restore windows many times over) delete ``refl`` -- the assertion
+        that it is still there is what such a mutation would flip.
+        """
+        policy = HygienePolicyConfig(
+            enabled=True,
+            eviction_threshold=0.0,
+            auto_gc_enabled=True,
+            gc_min_archive_age_cycles=0,
+            gc_restore_window_seconds=0,
+        )
+        s = await _make_store(policy)
+        try:
+            await s.create_thought(_thought("src", updated_cycle=0))
+            await s.update_thought(
+                "src",
+                lifecycle_status=LifecycleStatus.ARCHIVED,
+                archived_at_cycle=0,
+            )
+            await s.create_thought(
+                _thought("refl", thought_type=ThoughtType.REFLECTION, updated_cycle=0)
+            )
+            await s.create_edge(
+                EdgeRecord(
+                    edge_id="e1",
+                    from_thought_id="refl",
+                    to_thought_id="src",
+                    edge_type=EdgeType.CONSOLIDATED_FROM,
+                    weight=0.5,
+                    created_cycle=0,
+                    source=KnowledgeSource.EXPERIENCE,
+                )
+            )
+            first = await s.run_hygiene(current_cycle=1000)
+            assert first.gc_count == 1
+            assert await _raw_lifecycle(s, "refl") == "ARCHIVED"
+            assert await _raw_archived_at_cycle(s, "refl") is None
+
+            # Run hygiene again, far enough forward to clear both restore
+            # windows many times over if ``refl`` were ever hygiene-GC
+            # eligible. It is not: ``archived_at_cycle`` is still NULL.
+            second = await s.run_hygiene(current_cycle=10_000)
+            assert second.gc_count == 0
+            assert await s.get_thought("refl") is not None
+
+            # Explicitly removable (unprotected): the same unconditional
+            # delete ``engrava gc`` issues by default on an unprotected
+            # ARCHIVED row.
+            await s._db.execute(
+                "DELETE FROM thought WHERE thought_id = 'refl' "
+                "AND lifecycle_status = 'ARCHIVED' AND pinned = 0 AND priority NOT IN ('P1')"
+            )
+            await s._db.commit()
+            assert await s.get_thought("refl") is None
         finally:
             await s._db.close()
 

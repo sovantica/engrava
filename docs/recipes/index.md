@@ -102,8 +102,10 @@ print(f"{result.expired_count} thoughts expired via '{result.strategy_applied}'"
 ```
 
 A store-wide default TTL and the archive-vs-delete strategy are set in config —
-see the [`ttl` configuration](../configuration.md). Archived thoughts leave disk
-only on a later `engrava gc`.
+see the [`ttl` configuration](../configuration.md). A thought the `archive`
+strategy archives stays on disk until it is deleted: by `engrava gc`, which keeps
+pinned and protected-priority rows unless `--include-pinned` is given, or by an
+explicit `delete_thought`.
 
 ## Deduplicate repeated facts
 

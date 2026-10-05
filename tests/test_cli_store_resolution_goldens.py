@@ -152,27 +152,48 @@ def test_bare_commands_unchanged_by_the_store_resolution_refactor(tmp_path: Path
     assert actual == golden
 
 
-class TestConfigNeverReachesTheBareBuiltins:
-    """A ``--config`` -- even a broken one -- must be a no-op for these four commands.
+#: ``_invocation_matrix()`` entries this class's invariant does not cover.
+#: ``gc`` is a deliberate, narrower exception: it now reads ``--config`` for
+#: its hygiene-protection set (``hygiene_policy.protected_priorities``) and
+#: its journal setting (``journal.enabled``) -- see the next paragraph -- so
+#: a ``--config`` is no longer a no-op for it in general. It stays out of this
+#: class's matrix rather than being asserted byte-identical to "no --config".
+_NOT_CONFIG_INVARIANT = "gc"
 
-    ``info`` / ``verify`` / ``query`` / ``gc`` never call
+
+class TestConfigNeverReachesTheBareBuiltins:
+    """A ``--config`` -- even a broken one -- must be a no-op for ``info``/``verify``/``query``.
+
+    ``info`` / ``verify`` / ``query`` never call
     :func:`engrava.cli.memory_commands._resolve_for_command`; only
     ``remember`` / ``recall`` / ``link`` go through the ``--config``-loading
     gate that validates a caller-named file unconditionally (see
     ``resolve_store_target``'s docstring). The golden-replay matrix above
-    proves these four commands are unchanged by the *store-resolution
-    refactor*, but its own invocation matrix never supplies ``--config`` at
-    all -- so it says nothing about the config-loading gate specifically.
-    A future change that mistakenly wired these four into that same gate
-    (routing their target through ``resolve_store_target`` instead of
-    ``cfg.db_path`` directly) would leave every one of the existing focused
-    CLI tests green, because none of them ever pass ``--config`` to one of
-    these four commands. This closes that gap directly: a ``--config`` that
-    cannot even parse must still leave each command's behaviour on its
-    ``--db`` target byte-identical to not having named ``--config`` at all.
+    proves these commands are unchanged by the *store-resolution refactor*,
+    but its own invocation matrix never supplies ``--config`` at all -- so it
+    says nothing about the config-loading gate specifically. A future change
+    that mistakenly wired one of these three into that same gate (routing its
+    target through ``resolve_store_target`` instead of ``cfg.db_path``
+    directly) would leave every one of the existing focused CLI tests green,
+    because none of them ever pass ``--config`` to one of these three
+    commands. This closes that gap directly: a ``--config`` that cannot even
+    parse must still leave each command's behaviour on its ``--db`` target
+    byte-identical to not having named ``--config`` at all.
+
+    ``gc`` is **not** included here. It used to share this invariant, but it
+    now deliberately reads ``--config`` for two things a plain ``--db`` run
+    cannot express: the hygiene policy's protected-priority set (default
+    ``gc`` protection) and whether the journal is enabled (``gc``'s own
+    journaling of what it deletes). A broken or missing ``--config`` is still
+    handled the same way the config-loading gate always has -- it surfaces as
+    an error once ``gc`` actually has something to act on -- but asserting
+    "byte-identical to no ``--config``" would now be asserting the opposite of
+    the behaviour this adds. The golden-replay matrix above still exercises
+    ``gc --dry-run`` and a missing-database ``gc`` with no ``--config`` at
+    all, which is unaffected by this and stays covered there.
     """
 
-    def test_a_broken_config_does_not_change_info_verify_query_gc(self, tmp_path: Path) -> None:
+    def test_a_broken_config_does_not_change_info_verify_query(self, tmp_path: Path) -> None:
         db = tmp_path / "populated.db"
         missing = tmp_path / "does-not-exist.db"
         _build_populated_db(db)
@@ -182,6 +203,8 @@ class TestConfigNeverReachesTheBareBuiltins:
 
         runner = CliRunner()
         for args in _invocation_matrix(db, missing):
+            if _NOT_CONFIG_INVARIANT in args:
+                continue
             db_flag, db_value, *rest = args
             with_config_args = [db_flag, db_value, "--config", str(bad_config), *rest]
 
@@ -196,7 +219,7 @@ class TestConfigNeverReachesTheBareBuiltins:
             assert with_config_result.exit_code == bare_result.exit_code, args
             assert with_config_output == bare_output, args
 
-    def test_a_missing_config_does_not_change_info_verify_query_gc(self, tmp_path: Path) -> None:
+    def test_a_missing_config_does_not_change_info_verify_query(self, tmp_path: Path) -> None:
         db = tmp_path / "populated.db"
         missing = tmp_path / "does-not-exist.db"
         _build_populated_db(db)
@@ -205,6 +228,8 @@ class TestConfigNeverReachesTheBareBuiltins:
 
         runner = CliRunner()
         for args in _invocation_matrix(db, missing):
+            if _NOT_CONFIG_INVARIANT in args:
+                continue
             db_flag, db_value, *rest = args
             with_config_args = [db_flag, db_value, "--config", str(missing_config), *rest]
 

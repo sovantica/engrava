@@ -109,13 +109,16 @@ def _make_thought(
     thought_id: str = "t-001",
     expires_at: str | None = None,
     lifecycle_status: LifecycleStatus = LifecycleStatus.CREATED,
+    *,
+    pinned: bool = False,
+    priority: Priority = Priority.P2,
 ) -> ThoughtRecord:
     return ThoughtRecord(
         thought_id=thought_id,
         thought_type=ThoughtType.TASK,
         essence="Test thought",
         content="Full content",
-        priority=Priority.P2,
+        priority=priority,
         lifecycle_status=lifecycle_status,
         created_cycle=0,
         updated_cycle=0,
@@ -124,6 +127,7 @@ def _make_thought(
         source_type=KnowledgeSource.EXPERIENCE,
         visibility=ThoughtVisibility.SELECTIVE,
         expires_at=expires_at,
+        pinned=pinned,
     )
 
 
@@ -166,6 +170,16 @@ class TestCleanupResult:
         assert result.expired_count == 5
         assert result.strategy_applied == "archive"
         assert result.timestamp == "2026-04-12T10:00:00+00:00"
+        assert result.pinned_kept_count == 0
+
+    def test_pinned_kept_count_is_keyword_constructible(self) -> None:
+        result = CleanupResult(
+            expired_count=0,
+            strategy_applied="archive",
+            timestamp="t",
+            pinned_kept_count=2,
+        )
+        assert result.pinned_kept_count == 2
 
     def test_frozen(self) -> None:
         result = CleanupResult(expired_count=0, strategy_applied="delete", timestamp="t")
@@ -692,6 +706,113 @@ class TestCleanupJournal:
         delete_entries = [e for e in entries if e.mutation_type == "DELETE_THOUGHT"]
         assert len(delete_entries) >= 1
         assert delete_entries[-1].target_id == "t-001"
+
+
+# =====================================================================
+# 8b. cleanup_expired() — pinned rows are exempt from TTL, protected
+#     priorities are not
+# =====================================================================
+
+
+class TestCleanupPinnedExemption:
+    """A pinned row's TTL is never enforced; a protected-priority row's still is."""
+
+    async def test_archive_strategy_keeps_a_pinned_expired_row(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        past = _past_ts()
+        await store.create_thought(_make_thought(expires_at=past, pinned=True))
+
+        result = await store.cleanup_expired()
+
+        assert result.expired_count == 0
+        assert result.pinned_kept_count == 1
+        fetched = await store.get_thought("t-001")
+        assert fetched is not None
+        assert fetched.lifecycle_status == LifecycleStatus.CREATED
+        assert fetched.expires_at == past
+
+    async def test_delete_strategy_keeps_a_pinned_expired_row(
+        self,
+        store_delete: SqliteEngravaCore,
+    ) -> None:
+        past = _past_ts()
+        await store_delete.create_thought(_make_thought(expires_at=past, pinned=True))
+
+        result = await store_delete.cleanup_expired()
+
+        assert result.expired_count == 0
+        assert result.pinned_kept_count == 1
+        fetched = await store_delete.get_thought("t-001")
+        assert fetched is not None
+
+    async def test_archive_strategy_still_expires_a_protected_priority_row(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """Protected priority (P1) is a hygiene concept, not a TTL exemption."""
+        past = _past_ts()
+        await store.create_thought(_make_thought(expires_at=past, priority=Priority.P1))
+
+        result = await store.cleanup_expired()
+
+        assert result.expired_count == 1
+        assert result.pinned_kept_count == 0
+        fetched = await store.get_thought("t-001")
+        assert fetched is not None
+        assert fetched.lifecycle_status == LifecycleStatus.ARCHIVED
+
+    async def test_delete_strategy_still_expires_a_protected_priority_row(
+        self,
+        store_delete: SqliteEngravaCore,
+    ) -> None:
+        past = _past_ts()
+        await store_delete.create_thought(_make_thought(expires_at=past, priority=Priority.P1))
+
+        result = await store_delete.cleanup_expired()
+
+        assert result.expired_count == 1
+        assert result.pinned_kept_count == 0
+        assert await store_delete.get_thought("t-001") is None
+
+    async def test_pinned_and_unpinned_expired_rows_in_the_same_pass(
+        self,
+        store: SqliteEngravaCore,
+    ) -> None:
+        """Both counts are reported correctly when the batch mixes the two."""
+        past = _past_ts()
+        await store.create_thought(_make_thought("t-pinned", expires_at=past, pinned=True))
+        await store.create_thought(_make_thought("t-plain", expires_at=past))
+
+        result = await store.cleanup_expired()
+
+        assert result.expired_count == 1
+        assert result.pinned_kept_count == 1
+        pinned_after = await store.get_thought("t-pinned")
+        assert pinned_after is not None
+        assert pinned_after.lifecycle_status == LifecycleStatus.CREATED
+        plain_after = await store.get_thought("t-plain")
+        assert plain_after is not None
+        assert plain_after.lifecycle_status == LifecycleStatus.ARCHIVED
+
+    async def test_pinned_expired_row_not_journaled(
+        self,
+        store_journal: SqliteEngravaCore,
+    ) -> None:
+        """A kept pinned row is not touched, so it is not journaled either."""
+        past = _past_ts()
+        await store_journal.create_thought(_make_thought(expires_at=past, pinned=True))
+
+        result = await store_journal.cleanup_expired()
+        assert result.expired_count == 0
+        assert result.pinned_kept_count == 1
+
+        writer = store_journal.journal
+        assert writer is not None
+        entries = await writer.get_entries()
+        update_entries = [e for e in entries if e.mutation_type == "UPDATE_THOUGHT"]
+        assert update_entries == []
 
 
 # =====================================================================

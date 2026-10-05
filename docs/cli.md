@@ -736,6 +736,23 @@ the actions sourced from them, then reconciles the vector index by removing ever
 `vec0` row no `embedding` row owns. With `--expired` it also runs the TTL expiry
 cleanup first.
 
+> **`gc` keeps pinned and protected-priority rows by default.** An `ARCHIVED`
+> thought that is `pinned`, or at a priority in the hygiene policy's
+> protected-priority set, survives `gc` and is reported as kept rather than
+> deleted — see [Forgetting → Protection](memory-hygiene.md#protection--what-never-gets-forgotten)
+> for the default and how `--config`'s `hygiene_policy:` section overrides it.
+> Pass `--include-pinned` to delete them
+> too — the unconditional behaviour `gc` used to always have. `gc --expired`'s
+> TTL pass has its own, narrower rule: it skips a `pinned` row regardless of
+> `--include-pinned` (a TTL is the row's own explicit lifetime, not hygiene
+> protection), but a protected-priority row with an expired TTL still expires —
+> see [Data lifecycle → Time-to-live](data-lifecycle.md#time-to-live-ttl-and-expiry).
+> When `--config` names an `engrava.yaml` with `journal.enabled: true`, both
+> passes append their journal entries (`DELETE_THOUGHT` for what `gc` itself
+> deletes; the TTL pass's own entries the way `cleanup_expired()` already
+> records them) in the same transaction as the write; without `--config`, or
+> with journaling disabled, nothing is journaled, as before.
+
 > **`gc` now refuses on a database that is not on the current schema.** If
 > `--db` (or the resolved service database) is below or above this build's
 > head schema version, `gc` deletes nothing and exits `1` naming
@@ -747,9 +764,11 @@ cleanup first.
 |---|---|---|---|
 | `--dry-run` | flag | off | Show what would be deleted without changing anything. |
 | `--expired` | flag | off | Also run expiry cleanup (archive or delete per `ttl.strategy`) before collecting. |
+| `--include-pinned` | flag | off | Also delete pinned and protected-priority archived thoughts (otherwise they are kept). |
 
 ```bash
 engrava --db engrava.db gc                 # delete ARCHIVED thoughts + their edges/embeddings/actions
+engrava --db engrava.db gc --include-pinned  # also delete pinned / protected-priority rows
 engrava --db engrava.db gc --expired       # run expiry cleanup first (per strategy)
 engrava --db engrava.db gc --expired --dry-run
 ```
