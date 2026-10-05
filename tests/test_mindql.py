@@ -24,7 +24,7 @@ from engrava import (
 from engrava.domain.protocols.hooks import MindQLExtension
 from engrava.mindql import executor as executor_module
 from engrava.mindql import parser as parser_module
-from engrava.mindql.executor import MindQLExecutor
+from engrava.mindql.executor import MindQLExecutor, ReadOnlyAccessor, ReadOnlyCursor
 from engrava.mindql.parser import (
     BoolExpr,
     Comparison,
@@ -386,7 +386,7 @@ class TestStoreExecuteMindql:
         received: dict[str, object] = {}
 
         async def _handler(
-            conn: aiosqlite.Connection,
+            accessor: ReadOnlyAccessor,
             args: object,
         ) -> list[dict[str, object]]:
             received["args"] = args
@@ -474,6 +474,278 @@ class TestExecutorExtension:
         )
         with pytest.raises(MindQLParseError, match="Unknown extension"):
             await executor.execute(q)
+
+
+async def _thought_priority_snapshot(conn: aiosqlite.Connection) -> dict[str, str]:
+    """Return ``{thought_id: priority}`` for every stored thought.
+
+    Catches an ``UPDATE`` that changes a value without changing row count or
+    schema -- the one DML shape a plain id list or ``sqlite_master`` dump
+    would both miss.
+    """
+    cursor = await conn.execute("SELECT thought_id, priority FROM thought")
+    return {str(row[0]): str(row[1]) for row in await cursor.fetchall()}
+
+
+async def _thought_id_list(conn: aiosqlite.Connection) -> list[str]:
+    """Read every stored thought id directly, bypassing any executor path."""
+    cursor = await conn.execute("SELECT thought_id FROM thought ORDER BY thought_id")
+    return [str(row[0]) for row in await cursor.fetchall()]
+
+
+async def _sqlite_master_snapshot(conn: aiosqlite.Connection) -> list[tuple[object, ...]]:
+    """Return the full ``sqlite_master`` contents as a comparable snapshot."""
+    cursor = await conn.execute(
+        "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name",
+    )
+    return [tuple(row) for row in await cursor.fetchall()]
+
+
+# Every single-statement write/DDL/transaction-control shape an extension
+# handler might try through the accessor. Each must be refused by the guard
+# before it reaches SQLite -- at the base (the handler holding the live
+# connection, as before this boundary existed), every one of these lands.
+_EXTENSION_WRITE_ATTEMPTS: tuple[tuple[str, str], ...] = (
+    (
+        "insert",
+        (
+            "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+            "VALUES ('mutant-insert', 'OBSERVATION', 'e', 'c', 'P1')"
+        ),
+    ),
+    ("update", "UPDATE thought SET priority = 'P4'"),
+    ("delete", "DELETE FROM thought"),
+    ("create_table", "CREATE TABLE mutant_table (x)"),
+    ("drop_table", "DROP TABLE thought"),
+    ("pragma", "PRAGMA journal_mode = DELETE"),
+    ("attach", "ATTACH DATABASE ':memory:' AS mutant_other"),
+    ("begin", "BEGIN"),
+    ("commit", "COMMIT"),
+)
+
+
+class TestReadOnlyAccessorWriteRefusal:
+    """Every single-statement write attempt through the accessor is refused.
+
+    Mirrors the spec's failability table: at the base (an extension handler
+    holding the live connection), each of these writes lands; through the
+    accessor it must raise ``MindQLParseError`` before it ever reaches SQLite,
+    leaving the database unchanged.
+    """
+
+    @pytest.mark.parametrize(
+        ("name", "statement"),
+        _EXTENSION_WRITE_ATTEMPTS,
+        ids=[name for name, _ in _EXTENSION_WRITE_ATTEMPTS],
+    )
+    async def test_single_statement_write_refused(
+        self,
+        populated_db: aiosqlite.Connection,
+        name: str,
+        statement: str,
+    ) -> None:
+        accessor = ReadOnlyAccessor(populated_db)
+        schema_before = await _sqlite_master_snapshot(populated_db)
+        ids_before = await _thought_id_list(populated_db)
+        priorities_before = await _thought_priority_snapshot(populated_db)
+
+        with pytest.raises(MindQLParseError, match="SELECT"):
+            await accessor.execute(statement)
+
+        assert await _sqlite_master_snapshot(populated_db) == schema_before
+        assert await _thought_id_list(populated_db) == ids_before
+        assert await _thought_priority_snapshot(populated_db) == priorities_before
+
+    async def test_multi_statement_refused_with_typed_error(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        """A second statement smuggled after a real ``SELECT`` is also refused.
+
+        At the base (the raw connection, no guard at all) this very string
+        raises ``sqlite3.ProgrammingError`` from the driver itself, not a
+        MindQL error -- that is the base failure this test must *not* accept.
+        """
+        accessor = ReadOnlyAccessor(populated_db)
+        ids_before = await _thought_id_list(populated_db)
+
+        with pytest.raises(MindQLParseError, match="single SELECT"):
+            await accessor.execute("SELECT 1; DELETE FROM thought")
+
+        assert await _thought_id_list(populated_db) == ids_before
+
+
+class TestReadOnlyCursorBoundary:
+    """``ReadOnlyCursor`` exposes no write surface and no reference back out."""
+
+    async def test_cursor_has_no_write_or_escape_surface(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        accessor = ReadOnlyAccessor(populated_db)
+        cursor = await accessor.execute("SELECT thought_id FROM thought")
+        assert isinstance(cursor, ReadOnlyCursor)
+
+        for attr in (
+            "execute",
+            "executemany",
+            "executescript",
+            "execute_insert",
+            "connection",
+            "_conn",
+            "_cursor",
+            "close",
+            "commit",
+            "rollback",
+        ):
+            assert attr not in dir(cursor)
+            with pytest.raises(AttributeError):
+                getattr(cursor, attr)
+
+    async def test_cursor_write_attempt_is_refused_and_db_unchanged(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        ids_before = await _thought_id_list(populated_db)
+        accessor = ReadOnlyAccessor(populated_db)
+        cursor = await accessor.execute("SELECT thought_id FROM thought")
+
+        with pytest.raises(AttributeError):
+            await cursor.execute("UPDATE thought SET priority = 'P4'")  # type: ignore[attr-defined]
+        with pytest.raises(AttributeError):
+            await cursor.executescript("DELETE FROM thought;")  # type: ignore[attr-defined]
+        with pytest.raises(AttributeError):
+            _ = cursor.connection  # type: ignore[attr-defined]
+        with pytest.raises(AttributeError):
+            _ = cursor._conn  # type: ignore[attr-defined]
+
+        assert await _thought_id_list(populated_db) == ids_before
+
+    async def test_cursor_still_supports_the_read_surface(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        """fetchone / fetchmany / async iteration / description all still work."""
+        accessor = ReadOnlyAccessor(populated_db)
+
+        cursor = await accessor.execute(
+            "SELECT thought_id FROM thought ORDER BY thought_id",
+        )
+        first = await cursor.fetchone()
+        assert first is not None
+        assert first["thought_id"] == "t-000"
+
+        cursor = await accessor.execute(
+            "SELECT thought_id FROM thought ORDER BY thought_id",
+        )
+        batch = await cursor.fetchmany(2)
+        assert [row["thought_id"] for row in batch] == ["t-000", "t-001"]
+
+        cursor = await accessor.execute(
+            "SELECT thought_id FROM thought ORDER BY thought_id",
+        )
+        seen = [row["thought_id"] async for row in cursor]
+        assert seen == await _thought_id_list(populated_db)
+
+        cursor = await accessor.execute(
+            "SELECT thought_id, priority FROM thought ORDER BY thought_id",
+        )
+        assert [d[0] for d in cursor.description] == ["thought_id", "priority"]
+
+
+class TestReadOnlyAccessorBoundary:
+    """``ReadOnlyAccessor`` exposes no attribute that reaches the connection."""
+
+    async def test_accessor_exposes_no_connection_attribute(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        accessor = ReadOnlyAccessor(populated_db)
+        for forbidden in (
+            "_conn",
+            "_db",
+            "connection",
+            "commit",
+            "rollback",
+            "executescript",
+            "executemany",
+            "execute_insert",
+        ):
+            assert forbidden not in dir(accessor)
+            with pytest.raises(AttributeError):
+                getattr(accessor, forbidden)
+
+
+class TestExtensionGuardRunsOnEveryPath:
+    """The accessor boundary is enforced identically through every entry point."""
+
+    @staticmethod
+    async def _wipe_handler(db: ReadOnlyAccessor, _args: list[str]) -> list[dict[str, object]]:
+        await db.execute("DELETE FROM thought")
+        return []
+
+    async def test_guard_runs_through_executor_directly(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        ext = MindQLExtension(command_name="WIPE", handler=self._wipe_handler, description="wipe")
+        executor = MindQLExecutor(populated_db, extensions={"WIPE": ext})
+        ids_before = await _thought_id_list(populated_db)
+
+        with pytest.raises(MindQLParseError, match="SELECT"):
+            await executor.execute(parse("WIPE", known_extensions={"WIPE"}))
+
+        assert await _thought_id_list(populated_db) == ids_before
+
+    async def test_guard_runs_through_store_execute_mindql(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        ext = MindQLExtension(command_name="WIPE", handler=self._wipe_handler, description="wipe")
+        store = SqliteEngravaCore(populated_db)
+        ids_before = await _thought_id_list(populated_db)
+
+        with pytest.raises(MindQLParseError, match="SELECT"):
+            await store.execute_mindql(
+                parse("WIPE", known_extensions={"WIPE"}),
+                extensions={"WIPE": ext},
+            )
+
+        assert await _thought_id_list(populated_db) == ids_before
+
+    async def test_sova_shaped_layer_handler_is_unaffected(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        """A handler shaped like Sova's ``LAYER`` is unaffected by the boundary.
+
+        Parameterised ``SELECT``, ``fetchall``, ``cursor.description`` --
+        returns the same rows and column names it did before this boundary
+        existed.
+        """
+
+        async def _layer_handler(
+            db: ReadOnlyAccessor,
+            args: list[str],
+        ) -> list[dict[str, object]]:
+            priority = f"P{args[0]}"
+            cursor = await db.execute(
+                "SELECT thought_id, priority FROM thought WHERE priority = ?",
+                (priority,),
+            )
+            rows = await cursor.fetchall()
+            columns = [d[0] for d in cursor.description]
+            return [dict(zip(columns, row, strict=True)) for row in rows]
+
+        ext = MindQLExtension(command_name="LAYER", handler=_layer_handler, description="layer")
+        store = SqliteEngravaCore(populated_db)
+        result = await store.execute_mindql(
+            parse("LAYER 1", known_extensions={"LAYER"}),
+            extensions={"LAYER": ext},
+        )
+
+        assert sorted(row["thought_id"] for row in result.rows) == ["t-000", "t-001"]
+        assert result.columns == ["thought_id", "priority"]
 
 
 class TestExecutorColumnValidation:

@@ -58,6 +58,7 @@ from engrava import (
     MindQLQuery,
     Priority,
     ProvenanceContext,
+    ReadOnlyAccessor,
     ScoringContext,
     SentenceTransformerProvider,
     SqliteEngravaCore,
@@ -263,12 +264,14 @@ async def test_api_reference_metrics_snapshot() -> None:
 async def test_extensions_custom_mindql_command_end_to_end() -> None:
     """extensions.md + extension-hooks.md custom MindQL command.
 
-    A MindQLExtension handler is invoked as handler(conn, args) and the verb is
-    recognised by parse() only when listed in known_extensions.
+    A MindQLExtension handler is invoked as handler(accessor, args), where
+    accessor is a ReadOnlyAccessor wrapping the connection (not the raw
+    connection itself), and the verb is recognised by parse() only when
+    listed in known_extensions.
     """
 
     async def _handle_stats(
-        db: aiosqlite.Connection,
+        db: ReadOnlyAccessor,
         _args: list[str],
     ) -> list[dict[str, object]]:
         cursor = await db.execute(

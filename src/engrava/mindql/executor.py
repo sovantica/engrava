@@ -24,6 +24,9 @@ from engrava.mindql.parser import (
 )
 
 if TYPE_CHECKING:
+    import sqlite3
+    from collections.abc import AsyncIterator, Mapping, Sequence
+
     import aiosqlite
 
     from engrava.domain.protocols.hooks import MindQLExtension
@@ -383,6 +386,127 @@ class MindQLResult:
     command: str = ""
 
 
+#: Row batch size for :meth:`ReadOnlyCursor.__aiter__`'s chunked fetch —
+#: mirrors ``aiosqlite.Cursor``'s own default iteration chunk size.
+_READONLY_ITER_CHUNK_SIZE = 64
+
+
+class ReadOnlyCursor:
+    """Restricted cursor returned by :class:`ReadOnlyAccessor`.
+
+    Wraps the ``aiosqlite`` cursor produced by a guarded ``SELECT``, exposing
+    only ``fetchone``, ``fetchall``, ``fetchmany``, async iteration, and
+    ``description`` — the read surface a MindQL extension handler needs (a
+    handler shaped like Sova's ``LAYER`` reads exactly these). There is no
+    ``execute``, ``executemany``, ``executescript``, ``connection``, or
+    ``close``-and-reuse, and no attribute passthrough to the wrapped cursor
+    (no ``__getattr__`` forwarding).
+
+    The wrapped cursor lives only in the closures of the methods below, never
+    as a named attribute: ``getattr(cursor, "_conn")`` or
+    ``getattr(cursor, "connection")`` raises ``AttributeError`` rather than
+    returning it. This closes the ordinary and attribute-level paths to the
+    live connection. Deliberate introspection (closure cells, ``gc``) can
+    still reach it — a handler is trusted in-process Python code, and this
+    boundary is not meant to hold against that.
+    """
+
+    def __init__(self, cursor: aiosqlite.Cursor) -> None:
+        """Wrap an already-executed cursor.
+
+        Args:
+            cursor: The cursor returned by the guarded ``SELECT`` this wraps.
+
+        """
+
+        async def fetchone() -> sqlite3.Row | None:
+            """Fetch the next row, or ``None`` when exhausted."""
+            return await cursor.fetchone()
+
+        async def fetchmany(size: int | None = None) -> list[sqlite3.Row]:
+            """Fetch up to ``size`` rows (the cursor's ``arraysize`` when omitted)."""
+            return list(await cursor.fetchmany(size))
+
+        async def fetchall() -> list[sqlite3.Row]:
+            """Fetch all remaining rows."""
+            return list(await cursor.fetchall())
+
+        self.fetchone = fetchone
+        self.fetchmany = fetchmany
+        self.fetchall = fetchall
+        self.description = cursor.description
+
+    def __aiter__(self) -> AsyncIterator[sqlite3.Row]:
+        """Iterate remaining rows.
+
+        Fetched in chunks of :data:`_READONLY_ITER_CHUNK_SIZE`.
+        """
+        return self._iter_rows()
+
+    async def _iter_rows(self) -> AsyncIterator[sqlite3.Row]:
+        while True:
+            rows = await self.fetchmany(_READONLY_ITER_CHUNK_SIZE)
+            if not rows:
+                return
+            for row in rows:
+                yield row
+
+
+class ReadOnlyAccessor:
+    """The only argument a MindQL extension handler receives.
+
+    Wraps the store's live ``aiosqlite.Connection`` so a handler can run a
+    single guarded ``SELECT`` and nothing else: :meth:`execute` runs
+    :func:`_guard_select_sql` before the statement reaches SQLite — exactly
+    as the ``SELECT`` passthrough command does — and returns a
+    :class:`ReadOnlyCursor`, never the raw cursor. There is no ``commit``,
+    ``rollback``, ``executescript``, ``executemany``, ``execute_insert``, and
+    no attribute passthrough to the connection (no ``__getattr__``
+    forwarding).
+
+    The wrapped connection lives only in :meth:`execute`'s closure, never as
+    a named attribute: ``getattr(accessor, "_db")``,
+    ``getattr(accessor, "_conn")`` and ``getattr(accessor, "connection")`` all
+    raise ``AttributeError``. As with :class:`ReadOnlyCursor`, this closes the
+    ordinary and attribute-level paths to the live connection, not deliberate
+    introspection (closure cells, ``gc``).
+    """
+
+    def __init__(self, db: aiosqlite.Connection) -> None:
+        """Wrap a live connection.
+
+        Args:
+            db: The connection a MindQL extension handler would otherwise
+                receive directly.
+
+        """
+
+        async def execute(
+            sql: str,
+            parameters: Sequence[object] | Mapping[str, object] = (),
+        ) -> ReadOnlyCursor:
+            """Run a single guarded ``SELECT`` and return a restricted cursor.
+
+            Args:
+                sql: The statement to run. Must be a single ``SELECT``.
+                parameters: Bound ``?`` (or named) parameters, as with any
+                    ``aiosqlite`` execute call.
+
+            Returns:
+                A :class:`ReadOnlyCursor` over the statement's results.
+
+            Raises:
+                MindQLParseError: If ``sql`` is not a string, or is not a
+                    single ``SELECT`` statement.
+
+            """
+            statement = _guard_select_sql(sql)
+            cursor = await db.execute(statement, parameters)
+            return ReadOnlyCursor(cursor)
+
+        self.execute = execute
+
+
 class MindQLExecutor:
     """Execute MindQL queries against an aiosqlite connection.
 
@@ -523,6 +647,11 @@ class MindQLExecutor:
     async def _execute_extension(self, query: MindQLQuery) -> MindQLResult:
         """Execute an extension command.
 
+        The handler is invoked with a :class:`ReadOnlyAccessor` wrapping this
+        executor's connection, never the live connection itself — this is the
+        one place that boundary is enforced, so a handler can only run a
+        single guarded ``SELECT`` through it (see :class:`ReadOnlyAccessor`).
+
         Args:
             query: Parsed extension query.
 
@@ -539,7 +668,7 @@ class MindQLExecutor:
             msg = f"Unknown extension command: {name!r}"
             raise MindQLParseError(msg)
 
-        result = await ext.handler(self._db, query.extension_args)
+        result = await ext.handler(ReadOnlyAccessor(self._db), query.extension_args)
         rows = result if isinstance(result, list) else []
         keys = list(rows[0].keys()) if rows else []
         return MindQLResult(columns=keys, rows=rows, command=name)

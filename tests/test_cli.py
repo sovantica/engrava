@@ -36,7 +36,11 @@ from engrava.cli.main import (
     _rollback_quietly,
     cli,
 )
-from engrava.infrastructure.sqlite.engrava_core import CORE_SCHEMA_HEAD_VERSION
+from engrava.domain.protocols.hooks import MindQLExtension
+from engrava.infrastructure.sqlite.engrava_core import (
+    CORE_SCHEMA_HEAD_VERSION,
+    SqliteEngravaCore,
+)
 
 # Literal SQL, never interpolated: a read-back that assembles its own query
 # cannot be trusted to disagree with the schema the command wrote to.
@@ -1336,6 +1340,68 @@ class TestQuery:
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data[0]["count"] == 3
+
+    def test_query_extension_routes_through_store_execute_mindql(
+        self,
+        runner: CliRunner,
+        populated_db: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The ``query`` command must route extension commands through ``execute_mindql``.
+
+        ``SqliteEngravaCore.execute_mindql``'s own call site is the only place
+        the read-only accessor is enforced for an extension handler, not a
+        ``MindQLExecutor`` the CLI builds itself. A spy on ``execute_mindql``
+        proves the route; a write attempt through the handler proves the
+        guard is live on it, and the database is read back unchanged
+        afterwards.
+        """
+        calls: list[str] = []
+        original_execute_mindql = SqliteEngravaCore.execute_mindql
+
+        async def _spy_execute_mindql(
+            self: SqliteEngravaCore,
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            calls.append("execute_mindql")
+            return await original_execute_mindql(self, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(SqliteEngravaCore, "execute_mindql", _spy_execute_mindql)
+
+        async def _wipe_handler(db: object, _args: list[str]) -> list[dict[str, object]]:
+            await db.execute("DELETE FROM thought")  # type: ignore[attr-defined]
+            return []
+
+        monkeypatch.setattr(
+            "engrava.cli.main._load_mindql_extensions",
+            lambda: {
+                "WIPE": MindQLExtension(
+                    command_name="WIPE",
+                    handler=_wipe_handler,
+                    description="wipe everything",
+                ),
+            },
+        )
+
+        conn = sqlite3.connect(str(populated_db))
+        try:
+            ids_before = sorted(row[0] for row in conn.execute("SELECT thought_id FROM thought"))
+        finally:
+            conn.close()
+
+        result = runner.invoke(cli, ["--db", str(populated_db), "query", "WIPE"])
+
+        assert result.exit_code != 0
+        assert "Query error" in result.output
+        assert calls == ["execute_mindql"]
+
+        conn = sqlite3.connect(str(populated_db))
+        try:
+            ids_after = sorted(row[0] for row in conn.execute("SELECT thought_id FROM thought"))
+        finally:
+            conn.close()
+        assert ids_after == ids_before
 
 
 # ------------------------------------------------------------------

@@ -213,6 +213,28 @@ For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 
 ## Version Notes
 
+### 0.7 -> 0.8
+
+**Breaking change for MindQL extension authors: a custom command's handler no
+longer receives the live connection.** `MindQLExtension.handler`'s first
+argument used to be the raw `aiosqlite.Connection` the store runs on, which
+let a handler run any SQL through it — including writes, DDL, and `PRAGMA` —
+through what was documented as a read-only query language. The handler now
+receives a `ReadOnlyAccessor` wrapping that connection: its only capability is
+`execute()`, which accepts a single `SELECT` statement (the same guard the
+`SELECT` passthrough already enforced) and returns a restricted cursor
+(`fetchone`, `fetchall`, `fetchmany`, async iteration, and `description` — no
+`execute()`-family method, no `connection`). A handler that only reads
+through a single parameterised `SELECT` — the shape every documented example
+already used — works unchanged; a handler that wrote through the connection
+it used to receive now raises `MindQLParseError` (for anything that is not a
+`SELECT`) or `AttributeError` (for a write attempted through the returned
+cursor, which carries no `execute()`-family method either). No schema
+migration is involved. See [Extensions](extensions.md) and
+[Extension hooks](extension-hooks.md#3-custom-mindql-verb) for the updated
+handler contract, and [MindQL](mindql.md#extension-commands) for the
+accessor's read-only guarantee.
+
 ### 0.6 -> 0.7
 
 **Behaviour change: the dreaming clustering cohesion gate now computes a

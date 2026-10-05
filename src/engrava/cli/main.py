@@ -1052,7 +1052,6 @@ def query(ctx: click.Context, mql: str) -> None:
             click.echo(f"Database not found: {cfg.db_path}")
             sys.exit(1)
 
-        from engrava.mindql.executor import MindQLExecutor  # noqa: PLC0415
         from engrava.mindql.parser import (  # noqa: PLC0415
             MindQLCommand,
             MindQLParseError,
@@ -1073,10 +1072,12 @@ def query(ctx: click.Context, mql: str) -> None:
 
                 # The schema-version gate classifies the *parsed* command, not
                 # the CLI command name — FIND/COUNT/SELECT are reads (warn and
-                # attempt on a behind schema); EXTENSION can write (there is
-                # today no read-only accessor for an extension handler to run
-                # under, so it is refused on a behind schema like any other
-                # destructive operation). Every classification also refuses a
+                # attempt on a behind schema); EXTENSION is still gated as
+                # destructive even though a handler now runs under a
+                # read-only accessor rather than the live connection (see
+                # ReadOnlyAccessor in engrava.mindql.executor): a stale schema
+                # can still be one a handler's assumptions about column shape
+                # do not hold against. Every classification also refuses a
                 # newer-than-head schema outright.
                 schema_version = await _read_schema_version(conn)
                 if parsed.command is MindQLCommand.EXTENSION:
@@ -1084,8 +1085,8 @@ def query(ctx: click.Context, mql: str) -> None:
                 else:
                     _apply_read_schema_gate_for_version(schema_version, command="query")
 
-                executor = MindQLExecutor(conn, extensions=extensions)
-                result = await executor.execute(parsed)
+                store = SqliteEngravaCore(conn)
+                result = await store.execute_mindql(parsed, extensions=extensions)
                 click.echo(_format_rows(result.rows, cfg.output_format, columns=result.columns))
             except MindQLParseError as exc:
                 click.echo(f"Query error: {exc}", err=True)

@@ -272,6 +272,21 @@ Custom MindQL verbs are provided through an extension's
 `extensions=` argument (entry-point discovery wires this up automatically).
 See [Extensions](extensions.md) for the registration flow.
 
+**Extension handlers are read-only too.** A handler is invoked with a
+`ReadOnlyAccessor`, not the store's live connection. Its only capability is
+`execute()`, which runs a single `SELECT` statement through the same guard
+described above and returns a restricted cursor: `fetchone`, `fetchall`,
+`fetchmany`, async iteration, and `description` — no `execute()`-family
+method on the cursor, and no `connection` to reach back through. A handler
+that only reads through a single parameterised `SELECT` (the shape every
+documented example uses) is unaffected; one that tried to write through the
+connection it used to receive directly now raises `MindQLParseError` (for
+anything that is not a `SELECT`) or `AttributeError` (for a write attempted
+through the cursor). This closes the ordinary and attribute-level paths to a
+write — a handler is in-process Python code, so deliberate introspection
+(closure cells, `gc`) can still reach the underlying connection; the accessor
+is not a sandbox against that.
+
 ## Python API
 
 ### Parsing
