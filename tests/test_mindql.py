@@ -6,6 +6,7 @@ as well as executor integration with aiosqlite.
 
 from __future__ import annotations
 
+import itertools
 from typing import TYPE_CHECKING, Literal, SupportsIndex, cast
 
 import aiosqlite
@@ -35,6 +36,7 @@ from engrava.mindql.parser import (
     MindQLQuery,
     TemporalPredicate,
     TemporalPredicateKind,
+    WhereNode,
     parse,
 )
 
@@ -1694,11 +1696,10 @@ class TestParserEdgeCases:
         with pytest.raises(MindQLParseError, match="Expected WHERE, ORDER BY"):
             parse("FIND thoughts BOGUS")
 
-    def test_trailing_and_ignored_on_flat_path(self) -> None:
-        # A trailing AND produces an empty fragment that is skipped.
-        q = parse("FIND thoughts WHERE priority = 'P1' AND ")
-        assert q.where is None
-        assert len(q.conditions) == 1
+    def test_trailing_and_rejected_on_flat_path(self) -> None:
+        # A trailing AND is a dangling boolean keyword, not silently dropped.
+        with pytest.raises(MindQLParseError, match="Dangling 'AND'"):
+            parse("FIND thoughts WHERE priority = 'P1' AND ")
 
     def test_invalid_order_by_field_rejected(self) -> None:
         with pytest.raises(MindQLParseError, match="Invalid ORDER BY field"):
@@ -1852,11 +1853,12 @@ class TestLexicalScanQuoteAwareness:
     def test_doubled_quote_escape_not_mis_scanned(self) -> None:
         # A doubled ``''`` inside a literal is skipped by the lexical scan, so
         # the ``OR`` inside the literal is not mistaken for grammar and the
-        # literal is seen as balanced (not unterminated). MindQL values do not
-        # support the ``''`` escape, so the fragment rejects cleanly rather
-        # than being mis-routed or silently accepted.
-        with pytest.raises(MindQLParseError):
-            parse("FIND thoughts WHERE content = 'it''s OR mine'")
+        # literal is seen as balanced (not unterminated). The ``''`` sequence
+        # is the SQL-style escape for one literal quote, so the value comes
+        # out as ``it's OR mine`` on the (still) flat path.
+        q = parse("FIND thoughts WHERE content = 'it''s OR mine'")
+        assert q.where is None
+        assert q.conditions[0].value == "it's OR mine"
 
 
 # ---------------------------------------------------------------------------
@@ -3548,3 +3550,508 @@ class TestSelectPassthroughLegitimateShapes:
             MindQLQuery(command=MindQLCommand.SELECT, raw_sql="SELECT ';' AS s"),
         )
         assert result.rows == [{"s": ";"}]
+
+
+# ---------------------------------------------------------------------------
+# Keyword boundary: a boolean keyword is a whole word, outside a literal
+# ---------------------------------------------------------------------------
+
+
+class TestKeywordWordBoundary:
+    """``AND`` / ``OR`` are recognised only as a whole word, never mid-word.
+
+    Reproduces the defect where ``_WhereTokenizer``'s keyword regex checked a
+    word boundary only after the keyword, so ``OR`` inside ``vendor`` (or any
+    value ending in ``or``/``and``) was mistaken for the operator.
+    """
+
+    def test_value_ending_in_or_combined_with_real_or(self) -> None:
+        # 'vendor' ends in 'or', which must stay operand text.
+        q = parse("FIND thoughts WHERE source = vendor OR priority = 1")
+        assert isinstance(q.where, BoolExpr)
+        assert q.where.op == "OR"
+        left, right = q.where.operands
+        assert isinstance(left, Comparison)
+        assert left.field == "source"
+        assert left.value == "vendor"
+        assert isinstance(right, Comparison)
+        assert right.field == "priority"
+        assert right.value == 1
+
+    @pytest.mark.parametrize(
+        "value",
+        ["vendor", "editor", "brand", "ORACLE", "ANDROID", "command", "doctor"],
+    )
+    def test_keyword_shaped_values_stay_operand_text(self, value: str) -> None:
+        q = parse(f"FIND thoughts WHERE source = {value} OR priority = 1")
+        assert isinstance(q.where, BoolExpr)
+        left = q.where.operands[0]
+        assert isinstance(left, Comparison)
+        assert left.value == value
+
+    def test_unicode_word_stays_operand_text(self) -> None:
+        # 'é' is a Unicode word character: 'ORé' must not be split as 'OR'.
+        q = parse("FIND thoughts WHERE source = ORé OR priority = 1")
+        assert isinstance(q.where, BoolExpr)
+        left = q.where.operands[0]
+        assert isinstance(left, Comparison)
+        assert left.value == "ORé"
+
+    def test_unicode_word_stays_operand_text_leading_boundary(self) -> None:
+        # 'é' is a Unicode word character on the *leading* side of the
+        # keyword too: 'éOR' must not be split as 'OR'.
+        q = parse("FIND thoughts WHERE source = éOR OR priority = 1")
+        assert isinstance(q.where, BoolExpr)
+        left = q.where.operands[0]
+        assert isinstance(left, Comparison)
+        assert left.value == "éOR"
+
+    @pytest.mark.parametrize("keyword", ["OR", "or"])
+    def test_tight_parens_around_or_still_parse(self, keyword: str) -> None:
+        # No space before/after OR: the preceding ')' already makes a real
+        # boundary, and must keep doing so. Both cases matter: with the
+        # upper-case keyword, a mutation that stops recognising it as a
+        # keyword can still accidentally reconstruct the same tree from a
+        # mis-scanned operand fragment that happens to read "OR" — only the
+        # lower-case spelling, which a correct scan still upper-cases to the
+        # structural token but a broken one leaves as literal text, exposes
+        # that kind of mutation.
+        q = parse(f"FIND thoughts WHERE (source = 'x'){keyword}(source = 'y')")
+        assert isinstance(q.where, BoolExpr)
+        assert q.where.op == "OR"
+        left, right = q.where.operands
+        assert isinstance(left, Comparison)
+        assert left.value == "x"
+        assert isinstance(right, Comparison)
+        assert right.value == "y"
+
+    @pytest.mark.parametrize("keyword", ["OR", "or"])
+    def test_tight_quote_before_or_still_parses(self, keyword: str) -> None:
+        q = parse(f"FIND thoughts WHERE source='x'{keyword} source='y'")
+        assert isinstance(q.where, BoolExpr)
+        assert q.where.op == "OR"
+        left, right = q.where.operands
+        assert isinstance(left, Comparison)
+        assert left.value == "x"
+        assert isinstance(right, Comparison)
+        assert right.value == "y"
+
+    async def test_unquoted_value_matches_same_rows_as_quoted(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        # Acceptance: unquoted 'vendor' must behave exactly like 'vendor'.
+        store = SqliteEngravaCore(db)
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-vendor",
+                thought_type=ThoughtType.OBSERVATION,
+                essence="e",
+                content="c",
+                priority=Priority.P2,
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                created_cycle=1,
+                updated_cycle=1,
+                source="vendor",
+                confidence=0.5,
+            )
+        )
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-priority",
+                thought_type=ThoughtType.OBSERVATION,
+                essence="e",
+                content="c",
+                priority=Priority.P1,
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                created_cycle=1,
+                updated_cycle=1,
+                source="other",
+                confidence=0.5,
+            )
+        )
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-neither",
+                thought_type=ThoughtType.OBSERVATION,
+                essence="e",
+                content="c",
+                priority=Priority.P2,
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                created_cycle=1,
+                updated_cycle=1,
+                source="other",
+                confidence=0.5,
+            )
+        )
+        unquoted = await store.execute_mindql(
+            parse("FIND thoughts WHERE source = vendor OR priority = 1")
+        )
+        quoted = await store.execute_mindql(
+            parse("FIND thoughts WHERE source = 'vendor' OR priority = 1")
+        )
+        # ``priority`` is stored as its string enum value, so the inert
+        # ``priority = 1`` side of the OR never matches anything here; only
+        # the left side (quoted vs. unquoted 'vendor') can tell the two
+        # queries apart, and it must not.
+        assert {row["thought_id"] for row in unquoted.rows} == {"t-vendor"}
+        assert {row["thought_id"] for row in unquoted.rows} == {
+            row["thought_id"] for row in quoted.rows
+        }
+
+
+# ---------------------------------------------------------------------------
+# AND split, and ORDER BY / LIMIT / OFFSET detection, stay outside literals
+# ---------------------------------------------------------------------------
+
+
+class TestQuoteAwareAndSplit:
+    """Splitting the WHERE tail on ``AND`` never looks inside a literal."""
+
+    def test_and_inside_literal_stays_one_value(self) -> None:
+        # 'a AND b' must not be cut inside the literal.
+        q = parse("FIND thoughts WHERE essence = 'a AND b'")
+        assert q.where is None
+        assert len(q.conditions) == 1
+        assert q.conditions[0].value == "a AND b"
+
+    def test_and_inside_literal_combined_with_a_real_and(self) -> None:
+        q = parse("FIND thoughts WHERE essence = 'a AND b' AND priority = 'P1'")
+        assert q.where is None
+        assert len(q.conditions) == 2
+        assert q.conditions[0].value == "a AND b"
+        assert q.conditions[1].field == "priority"
+
+
+class TestQuoteAwareTrailingClauses:
+    """ORDER BY / LIMIT / OFFSET text inside a literal is not a real clause."""
+
+    def test_order_by_text_inside_literal_is_not_a_clause(self) -> None:
+        # The value IS the literal text "ORDER BY priority".
+        q = parse("FIND thoughts WHERE essence = 'ORDER BY priority'")
+        assert q.where is None
+        assert q.order_by == ()
+        assert q.conditions[0].value == "ORDER BY priority"
+
+    def test_limit_text_inside_literal_is_not_a_clause(self) -> None:
+        q = parse("FIND thoughts WHERE essence = 'LIMIT 5'")
+        assert q.where is None
+        assert q.limit is None
+        assert q.conditions[0].value == "LIMIT 5"
+
+    def test_offset_text_inside_literal_is_not_a_clause(self) -> None:
+        q = parse("FIND thoughts WHERE essence = 'OFFSET 5'")
+        assert q.where is None
+        assert q.offset is None
+        assert q.conditions[0].value == "OFFSET 5"
+
+    def test_real_order_by_after_a_literal_still_works(self) -> None:
+        q = parse("FIND thoughts WHERE essence = 'x' ORDER BY created_cycle DESC LIMIT 5 OFFSET 1")
+        assert q.where is None
+        assert q.conditions[0].value == "x"
+        assert q.order_by == (("created_cycle", "DESC"),)
+        assert q.limit == 5
+        assert q.offset == 1
+
+
+# ---------------------------------------------------------------------------
+# Quote escape: '' inside a literal means one literal quote
+# ---------------------------------------------------------------------------
+
+
+class TestQuoteEscape:
+    """``''`` inside a single-quoted literal is one literal ``'`` (SQL style)."""
+
+    def test_escaped_quote_in_condition(self) -> None:
+        q = parse("FIND thoughts WHERE source = 'O''Brien'")
+        assert q.where is None
+        assert q.conditions[0].value == "O'Brien"
+
+    def test_escaped_quote_in_condition_on_tree_path(self) -> None:
+        # A trailing OR forces the tree path; the escape must work there too.
+        q = parse("FIND thoughts WHERE source = 'O''Brien' OR priority = 'P1'")
+        assert isinstance(q.where, BoolExpr)
+        left = q.where.operands[0]
+        assert isinstance(left, Comparison)
+        assert left.value == "O'Brien"
+
+    def test_escaped_quote_in_in_list(self) -> None:
+        q = parse("FIND thoughts WHERE source IN ('O''Brien', 'x')")
+        assert isinstance(q.where, InCondition)
+        assert q.where.values == ("O'Brien", "x")
+
+    async def test_escaped_quote_round_trips_through_executor(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(db)
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-obrien",
+                thought_type=ThoughtType.OBSERVATION,
+                essence="e",
+                content="c",
+                priority=Priority.P1,
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                created_cycle=1,
+                updated_cycle=1,
+                source="O'Brien",
+                confidence=0.5,
+            )
+        )
+        executor = MindQLExecutor(db)
+        result = await executor.execute(parse("FIND thoughts WHERE source = 'O''Brien'"))
+        assert [row["thought_id"] for row in result.rows] == ["t-obrien"]
+        in_result = await executor.execute(parse("FIND thoughts WHERE source IN ('O''Brien')"))
+        assert [row["thought_id"] for row in in_result.rows] == ["t-obrien"]
+
+    def test_unterminated_literal_still_raises_the_same_message(self) -> None:
+        # Unchanged by the escape addition: this message must not move.
+        with pytest.raises(MindQLParseError, match="Unterminated string literal in WHERE clause"):
+            parse("FIND thoughts WHERE source = 'unterminated")
+
+
+# ---------------------------------------------------------------------------
+# Dangling / doubled boolean keyword
+# ---------------------------------------------------------------------------
+
+
+class TestDanglingBooleanKeyword:
+    """A dangling or doubled ``AND``/``OR`` is rejected, never silently fixed up."""
+
+    def test_trailing_and_rejected(self) -> None:
+        # A trailing AND used to be silently dropped.
+        with pytest.raises(MindQLParseError, match="Dangling 'AND'"):
+            parse("FIND thoughts WHERE priority = 'P1' AND")
+
+    def test_leading_and_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="Dangling 'AND'"):
+            parse("FIND thoughts WHERE AND priority = 'P1'")
+
+    def test_doubled_and_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="Dangling 'AND'"):
+            parse("FIND thoughts WHERE priority = 'P1' AND AND source = 'x'")
+
+    def test_trailing_or_rejected(self) -> None:
+        # Already correct at the base (tree path); kept here as the fourth
+        # shape the requirement names, alongside the three AND shapes above.
+        with pytest.raises(MindQLParseError):
+            parse("FIND thoughts WHERE priority = 'P1' OR")
+
+
+# ---------------------------------------------------------------------------
+# WHERE nesting depth limit
+# ---------------------------------------------------------------------------
+
+
+def _nested_where(depth: int) -> str:
+    """Build a FIND query with ``depth`` levels of parenthesised nesting."""
+    return "FIND thoughts WHERE " + "(" * depth + "priority = 'P1'" + ")" * depth
+
+
+class TestWhereNestingDepthLimit:
+    """Deep parenthesised nesting raises ``MindQLParseError``, never ``RecursionError``."""
+
+    def test_default_recursion_limit_depth_raises_parse_error_not_recursion_error(
+        self,
+    ) -> None:
+        # At the base, 1,000 levels (the default sys recursion limit) raises
+        # RecursionError. It must now raise MindQLParseError instead.
+        with pytest.raises(MindQLParseError, match="nested too deeply"):
+            parse(_nested_where(1000))
+
+    def test_256_levels_accepted(self) -> None:
+        q = parse(_nested_where(256))
+        node: object = q.where
+        depth = 0
+        while isinstance(node, BoolExpr):
+            depth += 1
+            node = node.operands[0]
+        assert isinstance(node, Comparison)
+        assert node.field == "priority"
+
+    def test_257_levels_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match=r"nested too deeply \(limit 256\)"):
+            parse(_nested_where(257))
+
+
+# ---------------------------------------------------------------------------
+# Property-style sweep: previously-valid queries parse the same way
+# ---------------------------------------------------------------------------
+#
+# A corpus of queries spanning the pre-existing grammar (simple comparisons,
+# AND / OR / parentheses, IN, temporal predicates, ORDER BY, LIMIT, OFFSET,
+# EXPLAIN) is checked against a handful of structural invariants that a
+# change to the shared tokenizer/splitter could silently break — this is
+# what shows the fix for the six defects above did not change anything else.
+
+# Each leaf carries both the form it parses to on the flat path (``None``
+# when the leaf itself forces the tree, e.g. ``IN``) and the form it parses
+# to as a tree operand, so the sweep below can assert on the exact values a
+# body should produce, not just its shape.
+_SweepLeaf = tuple[str, bool, Condition | TemporalPredicate | None, WhereNode]
+
+_SWEEP_LEAVES: list[_SweepLeaf] = [
+    # (condition text, forces the boolean-expression tree on its own,
+    #  flat-path node, tree-path node)
+    (
+        "priority = 'P1'",
+        False,
+        Condition(field="priority", operator=MindQLOperator.EQ, value="P1"),
+        Comparison(field="priority", operator=MindQLOperator.EQ, value="P1"),
+    ),
+    (
+        "source = x",
+        False,
+        Condition(field="source", operator=MindQLOperator.EQ, value="x"),
+        Comparison(field="source", operator=MindQLOperator.EQ, value="x"),
+    ),
+    (
+        "confidence > 0.5",
+        False,
+        Condition(field="confidence", operator=MindQLOperator.GT, value=0.5),
+        Comparison(field="confidence", operator=MindQLOperator.GT, value=0.5),
+    ),
+    (
+        "created_cycle = 7",
+        False,
+        Condition(field="created_cycle", operator=MindQLOperator.EQ, value=7),
+        Comparison(field="created_cycle", operator=MindQLOperator.EQ, value=7),
+    ),
+    (
+        f"valid_at '{_T_JAN}'",
+        False,
+        TemporalPredicate(kind=TemporalPredicateKind.VALID_AT, start=_T_JAN),
+        TemporalPredicate(kind=TemporalPredicateKind.VALID_AT, start=_T_JAN),
+    ),
+    (
+        "thought_type IN ('BELIEF', 'OBSERVATION')",
+        True,
+        None,
+        InCondition(field="thought_type", values=("BELIEF", "OBSERVATION")),
+    ),
+]
+
+# What the flat path (``_parse_flat_where``) returns for a set of flat-path
+# leaves: conditions and temporal predicates each in the relative order their
+# own type appeared in, matching how that function builds its two lists.
+_SweepExpected = tuple[list[Condition], list[TemporalPredicate]] | WhereNode
+
+
+def _flat_result(
+    *nodes: Condition | TemporalPredicate,
+) -> tuple[list[Condition], list[TemporalPredicate]]:
+    conditions = [node for node in nodes if isinstance(node, Condition)]
+    temporal_predicates = [node for node in nodes if isinstance(node, TemporalPredicate)]
+    return conditions, temporal_predicates
+
+
+def _single_leaf_expected(leaf: _SweepLeaf) -> _SweepExpected:
+    """What a lone leaf, used as the whole WHERE body, should parse to."""
+    _, forces_tree, flat, tree = leaf
+    if forces_tree:
+        return tree
+    assert flat is not None  # construction invariant: non-tree leaves carry a flat node
+    return _flat_result(flat)
+
+
+def _and_pair_expected(left: _SweepLeaf, right: _SweepLeaf) -> tuple[bool, _SweepExpected]:
+    """The ``forces_tree`` flag and expected parse result for ``left AND right``."""
+    _, left_tree, left_flat, left_node = left
+    _, right_tree, right_flat, right_node = right
+    forces_tree = left_tree or right_tree
+    if forces_tree:
+        return True, BoolExpr(op="AND", operands=(left_node, right_node))
+    assert left_flat is not None  # construction invariant, see _single_leaf_expected
+    assert right_flat is not None
+    return False, _flat_result(left_flat, right_flat)
+
+
+def _sweep_bodies() -> list[tuple[str, bool, _SweepExpected]]:
+    """Return ``(WHERE body, forces_tree, expected parse result)`` triples.
+
+    ``expected`` is what the generator put into the body — the flat
+    ``(conditions, temporal_predicates)`` pair, or the ``where`` tree —
+    compared below against the real parse result value for value, not merely
+    checked for shape.
+    """
+    bodies: list[tuple[str, bool, _SweepExpected]] = [
+        (leaf[0], leaf[1], _single_leaf_expected(leaf)) for leaf in _SWEEP_LEAVES
+    ]
+    for left, right in itertools.combinations(_SWEEP_LEAVES, 2):
+        and_forces_tree, and_expected = _and_pair_expected(left, right)
+        bodies.append((f"{left[0]} AND {right[0]}", and_forces_tree, and_expected))
+        bodies.append(
+            (
+                f"{left[0]} OR {right[0]}",
+                True,
+                BoolExpr(op="OR", operands=(left[3], right[3])),
+            )
+        )
+    nested = BoolExpr(
+        op="AND",
+        operands=(
+            BoolExpr(op="OR", operands=(_SWEEP_LEAVES[0][3], _SWEEP_LEAVES[1][3])),
+            _SWEEP_LEAVES[2][3],
+        ),
+    )
+    bodies.append(("(priority = 'P1' OR source = x) AND confidence > 0.5", True, nested))
+    return bodies
+
+
+_SWEEP_BODIES = _sweep_bodies()
+_SWEEP_SUFFIXES: dict[str, str] = {
+    "none": "",
+    "order-by": " ORDER BY created_cycle DESC",
+    "full": " ORDER BY created_cycle DESC LIMIT 5 OFFSET 2",
+}
+_SWEEP_PREFIXES: dict[str, str] = {
+    "find": "FIND thoughts WHERE ",
+    "explain-find": "EXPLAIN FIND thoughts WHERE ",
+}
+
+
+class TestParseResultUnchangedSweep:
+    """A generated corpus of previously-valid queries keeps parsing the same way."""
+
+    @pytest.mark.parametrize(
+        ("body", "forces_tree", "expected"),
+        _SWEEP_BODIES,
+        ids=[f"body{i:03d}" for i in range(len(_SWEEP_BODIES))],
+    )
+    @pytest.mark.parametrize("suffix_id", sorted(_SWEEP_SUFFIXES))
+    @pytest.mark.parametrize("prefix_id", sorted(_SWEEP_PREFIXES))
+    def test_sweep_entry_parses_consistently(
+        self,
+        prefix_id: str,
+        suffix_id: str,
+        body: str,
+        forces_tree: bool,
+        expected: _SweepExpected,
+    ) -> None:
+        query = f"{_SWEEP_PREFIXES[prefix_id]}{body}{_SWEEP_SUFFIXES[suffix_id]}"
+        parsed = parse(query)
+        assert parsed.command == MindQLCommand.FIND
+        assert parsed.table == "thought"
+        assert parsed.explain == (prefix_id == "explain-find")
+        if forces_tree:
+            assert parsed.where == expected
+            assert parsed.conditions == []
+            assert parsed.temporal_predicates == []
+        else:
+            assert parsed.where is None
+            expected_conditions, expected_temporal_predicates = expected
+            assert parsed.conditions == expected_conditions
+            assert parsed.temporal_predicates == expected_temporal_predicates
+        if suffix_id == "none":
+            assert parsed.order_by == ()
+            assert parsed.limit is None
+            assert parsed.offset is None
+        elif suffix_id == "order-by":
+            assert parsed.order_by == (("created_cycle", "DESC"),)
+            assert parsed.limit is None
+            assert parsed.offset is None
+        else:
+            assert parsed.order_by == (("created_cycle", "DESC"),)
+            assert parsed.limit == 5
+            assert parsed.offset == 2

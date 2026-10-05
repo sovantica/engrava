@@ -19,7 +19,12 @@ read-only SQL passthrough.
   identifier like `source = '007'` matches the stored string `'007'`, whereas an
   unquoted `created_cycle = 7` is coerced to the integer `7` (or to a float, for
   `7.5`). An unquoted word that is not a number stays a string (`source = abc`),
-  but a value containing spaces must be quoted.
+  but a value containing spaces must be quoted. A single-quoted value may contain
+  a literal quote by doubling it, SQL-style: `source = 'O''Brien'` matches the
+  stored string `O'Brien`, in a condition or inside an `IN (...)` list.
+- A boolean keyword (`AND`, `OR`) is recognised only as a whole word outside a
+  quoted value, so an unquoted value that happens to end or start with one —
+  `source = vendor`, `source = ORACLE` — is never mistaken for the operator.
 - Operators: `=`, `!=`, `>`, `<`, `>=`, `<=`, and `IN (...)`.
 - Conditions combine with `AND`, `OR`, and parentheses (see
   [Boolean expressions](#boolean-expressions-and-or-parentheses)).
@@ -127,7 +132,11 @@ Because `AND` binds tighter, the second example groups as
 `priority = 'P1' OR (priority = 'P2' AND source = 'x')`. Use parentheses (as in
 the third example) to group an `OR` before an `AND`. A `WHERE` that uses only
 simple comparisons and/or valid-time predicates joined by `AND` (no `OR`, no
-parentheses, no `IN`) behaves exactly as it always has.
+parentheses, no `IN`) is read as a flat list of conditions joined by `AND`; a
+leading, trailing, or doubled `AND` raises `MindQLParseError`.
+
+Parenthesised grouping may nest up to **256** levels deep; nesting deeper than
+that raises `MindQLParseError`.
 
 ### COUNT
 

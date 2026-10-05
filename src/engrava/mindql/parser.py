@@ -297,9 +297,13 @@ class MindQLParseError(Exception):
     """
 
 
-# Regex for tokenizing conditions: field op value
+# Regex for tokenizing conditions: field op value. The quoted alternative's
+# body, ``(?:[^']|'')*``, accepts the SQL ``''`` escape (two quotes together
+# mean one literal quote) as well as ordinary non-quote characters, so the
+# match only ends at a *lone* closing quote. The raw capture still contains
+# any ``''`` pairs verbatim; callers unescape with ``.replace("''", "'")``.
 _CONDITION_RE = re.compile(
-    r"(\w+)\s*(!=|>=|<=|=|>|<)\s*(?:'([^']*)'|(\S+))",
+    r"(\w+)\s*(!=|>=|<=|=|>|<)\s*(?:'((?:[^']|'')*)'|(\S+))",
 )
 
 # Matches the verb and table-name tokens at the start of a FIND/COUNT query,
@@ -557,6 +561,19 @@ def _strip_trailing_clauses(
     LIMIT, then ORDER BY) so what remains is exactly the WHERE clause. ORDER BY
     and OFFSET are FIND-only.
 
+    The three keywords are searched for on a single quote-masked copy of
+    ``text`` (see :func:`_mask_quoted`), built once up front, so a clause
+    keyword that merely appears *inside* a quoted WHERE value —
+    ``essence = 'ORDER BY priority'`` names no real ``ORDER BY`` — is never
+    mistaken for a real trailing clause. Match indices from the masked copy
+    line up with ``text`` exactly (masking preserves length), so every
+    substring actually extracted still comes from ``text``. As each clause is
+    cut off the end of ``text``, the same prefix is cut from the masked copy,
+    so the next search still scans a mask of exactly what remains: masking
+    only ever replaces interior literal characters, never the quote marks or
+    anything outside a literal, so a prefix of the full mask is always the
+    mask of that same prefix.
+
     Args:
         text: Everything after the table name.
         command: The owning command, used to gate the FIND-only clauses.
@@ -568,31 +585,35 @@ def _strip_trailing_clauses(
         MindQLParseError: If ORDER BY / OFFSET is used with COUNT.
 
     """
+    masked = _mask_quoted(text)
+
     offset: int | None = None
-    offset_match = re.search(r"\bOFFSET\s+(\d+)\s*$", text, re.IGNORECASE)
+    offset_match = re.search(r"\bOFFSET\s+(\d+)\s*$", masked, re.IGNORECASE)
     if offset_match:
         if command is not MindQLCommand.FIND:
             msg = "OFFSET is only supported for FIND queries"
             raise MindQLParseError(msg)
-        offset = int(offset_match.group(1))
+        offset = int(text[offset_match.start(1) : offset_match.end(1)])
         text = text[: offset_match.start()].strip()
+        masked = masked[: offset_match.start()].strip()
 
     limit: int | None = None
-    limit_match = re.search(r"\bLIMIT\s+(\d+)\s*$", text, re.IGNORECASE)
+    limit_match = re.search(r"\bLIMIT\s+(\d+)\s*$", masked, re.IGNORECASE)
     if limit_match:
-        limit = int(limit_match.group(1))
+        limit = int(text[limit_match.start(1) : limit_match.end(1)])
         text = text[: limit_match.start()].strip()
+        masked = masked[: limit_match.start()].strip()
 
     order_by: tuple[tuple[str, str], ...] = ()
     # DOTALL: the sort-item list is now the verbatim source text, so a
     # newline used as a separator (outside any literal) must stay part of
     # ``.`` instead of stopping the match, exactly as a space or tab would.
-    order_match = re.search(r"\bORDER\s+BY\s+(.+?)\s*$", text, re.IGNORECASE | re.DOTALL)
+    order_match = re.search(r"\bORDER\s+BY\s+(.+?)\s*$", masked, re.IGNORECASE | re.DOTALL)
     if order_match:
         if command is not MindQLCommand.FIND:
             msg = "ORDER BY is only supported for FIND queries"
             raise MindQLParseError(msg)
-        order_by = _parse_order_by(order_match.group(1))
+        order_by = _parse_order_by(text[order_match.start(1) : order_match.end(1)])
         text = text[: order_match.start()].strip()
 
     return text, order_by, limit, offset
@@ -603,9 +624,12 @@ def _parse_flat_where(
 ) -> tuple[list[Condition], list[TemporalPredicate]]:
     """Parse a pure-``AND`` WHERE into flat condition + temporal-predicate lists.
 
-    This is the historical path, byte-for-byte unchanged: each ``AND``-separated
-    part is tried as a temporal predicate first, then as an ordinary condition.
-    Reached only when the WHERE contains no ``OR``, parentheses, or ``IN``.
+    This is the historical path: each ``AND``-separated fragment is tried as a
+    temporal predicate first, then as an ordinary condition, and execution of
+    the result is unchanged. Splitting on ``AND`` itself is quote-aware (see
+    :func:`_split_unquoted_and`) and rejects a dangling or doubled ``AND``
+    rather than silently dropping it. Reached only when the WHERE contains no
+    ``OR``, parentheses, or ``IN`` outside a literal.
 
     Args:
         where_text: The WHERE clause body (``WHERE`` keyword already stripped).
@@ -615,25 +639,67 @@ def _parse_flat_where(
 
     Raises:
         MindQLParseError: If a fragment is neither a temporal predicate nor a
-            valid condition.
+            valid condition, or ``AND`` is dangling or doubled.
 
     """
     conditions: list[Condition] = []
     temporal_predicates: list[TemporalPredicate] = []
-    parts = re.split(r"\bAND\b", where_text, flags=re.IGNORECASE)
-    for part in parts:
-        stripped_part = part.strip()
-        if not stripped_part:
-            continue
+    for fragment in _split_unquoted_and(where_text):
         # Recognise temporal predicates before the ordinary condition
         # grammar — they carry keyword + bare timestamp args (no operator)
         # and so never match ``_CONDITION_RE``.
-        temporal = _try_parse_temporal_predicate(stripped_part)
+        temporal = _try_parse_temporal_predicate(fragment)
         if temporal is not None:
             temporal_predicates.append(temporal)
             continue
-        conditions.append(_parse_condition(stripped_part))
+        conditions.append(_parse_condition(fragment))
     return conditions, temporal_predicates
+
+
+# A boolean keyword at a fixed scan position (used to split the flat-path
+# WHERE on ``AND``), bounded on both sides so it matches only a whole word.
+_AND_KEYWORD_RE = re.compile(r"\bAND\b", re.IGNORECASE)
+
+
+def _split_unquoted_and(where_text: str) -> list[str]:
+    r"""Split a pure-``AND`` WHERE body on ``AND`` outside any quoted literal.
+
+    Unlike the historical ``re.split(r"\bAND\b", ...)``, this never splits
+    inside a single-quoted value — ``essence = 'a AND b'`` stays one fragment
+    — and a leading, trailing, or doubled ``AND``, which used to produce (and
+    silently drop) an empty fragment, is rejected instead.
+
+    Args:
+        where_text: The WHERE clause body. Reached only once the caller has
+            confirmed it needs the flat, pure-``AND`` path (no ``OR``,
+            parentheses, or ``IN`` outside a literal), so any ``'`` here is
+            already known to be balanced.
+
+    Returns:
+        The ``AND``-separated fragments, in source order, each stripped of
+        surrounding whitespace; never an empty string.
+
+    Raises:
+        MindQLParseError: If ``AND`` is leading, trailing, or has no operand
+            between two occurrences.
+
+    """
+    masked = _mask_quoted(where_text)
+    fragments: list[str] = []
+    pos = 0
+    for match in _AND_KEYWORD_RE.finditer(masked):
+        fragment = where_text[pos : match.start()].strip()
+        if not fragment:
+            msg = "Dangling 'AND' in WHERE clause"
+            raise MindQLParseError(msg)
+        fragments.append(fragment)
+        pos = match.end()
+    trailing = where_text[pos:].strip()
+    if not trailing:
+        msg = "Dangling 'AND' in WHERE clause"
+        raise MindQLParseError(msg)
+    fragments.append(trailing)
+    return fragments
 
 
 def strip_string_literals(text: str) -> str:
@@ -709,6 +775,63 @@ def _has_unterminated_string(text: str) -> bool:
             in_str = True
         i += 1
     return in_str
+
+
+# Placeholder for a masked character inside a literal. Never alphanumeric or
+# ``_``, so it can never itself complete a ``\b``-bounded keyword match, and
+# it is not whitespace, so it cannot be mistaken for a separator either.
+_MASK_CHAR = "\x00"
+
+
+def _mask_quoted(text: str) -> str:
+    r"""Return a copy of ``text`` safe to scan with a word-boundary regex.
+
+    Replaces the interior of every single-quoted literal with
+    :data:`_MASK_CHAR`, preserving length and the position of every other
+    character. A plain ``\b``-bounded regex search (for ``AND``, ``ORDER BY``,
+    ``LIMIT``, or ``OFFSET``) must never match text that is actually inside a
+    quoted value — for example ``essence = 'ORDER BY priority'`` names no real
+    ``ORDER BY`` clause. Searching the masked text instead finds only matches
+    outside literals, while every match index still lines up with ``text``:
+    the quote marks themselves are never masked, so an adjacency like
+    ``'x'AND`` still reads as a real keyword boundary. Honours the SQL ``''``
+    escape the same way :func:`strip_string_literals` and
+    :func:`_has_unterminated_string` do: a doubled quote stays inside the
+    literal rather than ending it. An unterminated literal masks through to
+    the end of ``text`` — callers on the tree path reject that case
+    precisely via :func:`_has_unterminated_string` before relying on a scan
+    like this one; masking it harmlessly here is enough for the flat path.
+
+    Args:
+        text: The raw MindQL fragment.
+
+    Returns:
+        A same-length string safe to scan with word-boundary regexes.
+
+    """
+    out = list(text)
+    i = 0
+    n = len(text)
+    in_str = False
+    while i < n:
+        ch = text[i]
+        if in_str:
+            if ch == "'":
+                if i + 1 < n and text[i + 1] == "'":
+                    out[i] = _MASK_CHAR
+                    out[i + 1] = _MASK_CHAR
+                    i += 2
+                    continue
+                in_str = False
+                i += 1
+                continue
+            out[i] = _MASK_CHAR
+            i += 1
+            continue
+        if ch == "'":
+            in_str = True
+        i += 1
+    return "".join(out)
 
 
 def _needs_tree(where_text: str) -> bool:
@@ -799,9 +922,12 @@ def _parse_condition(part: str) -> Condition:
     # group 3 = quoted value, group 4 = unquoted value. A single-quoted literal
     # is taken verbatim as a string; only the unquoted bare value is coerced to
     # int/float, so e.g. ``'007'`` stays the string ``"007"`` instead of int 7.
+    # A quoted value may carry the SQL ``''`` escape (one literal quote).
     quoted_value = match.group(3)
     value: str | int | float = (
-        quoted_value if quoted_value is not None else _coerce_value(match.group(4))
+        quoted_value.replace("''", "'")
+        if quoted_value is not None
+        else _coerce_value(match.group(4))
     )
     return Condition(
         field=field_name,
@@ -821,12 +947,23 @@ def _parse_condition(part: str) -> Condition:
 # list is consumed as part of the operand rather than mistaken for grouping.
 _IN_HEAD_RE = re.compile(r"\w+\s+IN\s*\(", re.IGNORECASE)
 
-# A single value inside an ``IN (...)`` list: single-quoted string or bare token.
-_IN_VALUE_RE = re.compile(r"\s*(?:'([^']*)'|([^,()'\s]+))\s*")
+# A single value inside an ``IN (...)`` list: single-quoted string (honouring
+# the SQL ``''`` escape, same as ``_CONDITION_RE``) or a bare token.
+_IN_VALUE_RE = re.compile(r"\s*(?:'((?:[^']|'')*)'|([^,()'\s]+))\s*")
 
 
-# A structural boolean keyword (``AND`` / ``OR``) at the current scan position.
-_BOOL_KEYWORD_RE = re.compile(r"(AND|OR)\b", re.IGNORECASE)
+# A structural boolean keyword (``AND`` / ``OR``) at the current scan
+# position. Bounded on *both* sides so it matches only a whole word: without
+# the leading ``\b`` a value ending in "or"/"and" (e.g. ``vendor``) would be
+# mistaken for the operator when it is scanned mid-word.
+_BOOL_KEYWORD_RE = re.compile(r"\b(AND|OR)\b", re.IGNORECASE)
+
+# Maximum parenthesis nesting depth a WHERE boolean expression may use. Below
+# Python's default recursion limit (1000) with comfortable headroom — at that
+# default limit this recursive-descent parser hits RecursionError at 330
+# levels deep (measured), so 256 both matches no plausible real query and
+# leaves the explicit check below well clear of the interpreter's own ceiling.
+_MAX_WHERE_NESTING_DEPTH = 256
 
 
 class _WhereTokenizer:
@@ -1016,6 +1153,11 @@ def _parse_bool_expr(where_text: str) -> WhereNode:
 class _BoolExprParser:
     """Recursive-descent parser for the WHERE boolean-expression grammar.
 
+    Tracks the current parenthesis nesting depth so it can reject a WHERE
+    nested deeper than :data:`_MAX_WHERE_NESTING_DEPTH` with a precise
+    :class:`MindQLParseError` well before the input could ever exhaust
+    Python's own call-stack depth (``RecursionError``).
+
     Args:
         tokens: The token stream from :func:`_tokenize_where`.
 
@@ -1024,6 +1166,7 @@ class _BoolExprParser:
     def __init__(self, tokens: list[str]) -> None:
         self._tokens = tokens
         self._pos = 0
+        self._depth = 0
 
     def at_end(self) -> bool:
         """Return whether all tokens have been consumed."""
@@ -1067,12 +1210,17 @@ class _BoolExprParser:
             msg = "Expected a condition in WHERE clause"
             raise MindQLParseError(msg)
         if current == "(":
+            self._depth += 1
+            if self._depth > _MAX_WHERE_NESTING_DEPTH:
+                msg = f"WHERE clause nested too deeply (limit {_MAX_WHERE_NESTING_DEPTH})"
+                raise MindQLParseError(msg)
             self._advance()
             node = self.parse_or()
             if self.peek() != ")":
                 msg = "Unbalanced parentheses in WHERE clause"
                 raise MindQLParseError(msg)
             self._advance()
+            self._depth -= 1
             return node
         if current in ("AND", "OR", ")"):
             msg = f"Unexpected token in WHERE clause: {current!r}"
@@ -1142,8 +1290,9 @@ def _parse_in_values(body: str) -> tuple[str | int | float, ...]:
     """Parse the comma-separated value list inside an ``IN (...)`` clause.
 
     Each value follows the same quoting rules as a comparison value: a
-    single-quoted literal is kept verbatim as a string, a bare token is coerced
-    to ``int`` / ``float`` / ``str``.
+    single-quoted literal is kept verbatim as a string (honouring the SQL
+    ``''`` escape for a literal quote), a bare token is coerced to
+    ``int`` / ``float`` / ``str``.
 
     Args:
         body: The text between the ``IN`` parentheses.
@@ -1180,7 +1329,7 @@ def _parse_in_values(body: str) -> tuple[str | int | float, ...]:
         quoted = value_match.group(1)
         bare = value_match.group(2)
         if quoted is not None:
-            values.append(quoted)
+            values.append(quoted.replace("''", "'"))
         else:
             values.append(_coerce_value(bare))
         pos = value_match.end()
