@@ -1,11 +1,10 @@
 {
-  "mcp": {
-    "servers": {
-      "engrava": {
-        "command": "engrava-mcp",
-        "env": {
-          "ENGRAVA_MCP_CONFIG": "/absolute/path/to/engrava.yaml"
-        }
+  "servers": {
+    "engrava": {
+      "type": "stdio",
+      "command": "engrava-mcp",
+      "env": {
+        "ENGRAVA_MCP_CONFIG": "/absolute/path/to/engrava.yaml"
       }
     }
   }
