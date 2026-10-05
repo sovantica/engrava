@@ -43,6 +43,7 @@ from engrava.cli.snapshot_records import (
 )
 from engrava.config import (
     EmbeddingConfig,
+    EngravaConfig,
     ServicesConfig,
     resolve_embedding_provider,
 )
@@ -779,8 +780,8 @@ def _configure_verbose_logging(ctx: click.Context) -> None:
 # ------------------------------------------------------------------
 
 #: Subcommands that read ``ctx.obj["services_config"]`` / ``["default_embeddings"]``
-#: — see the ``cli()`` group callback below, which loads a ``--config`` file
-#: only when the invoked subcommand is one of these two.
+#: / ``["full_config"]`` — see the ``cli()`` group callback below, which loads
+#: a ``--config`` file only when the invoked subcommand is one of these two.
 _SERVICES_CONFIG_COMMANDS = frozenset({"snapshot", "restore"})
 
 
@@ -893,15 +894,17 @@ def cli(
 
     # Pre-load services config for --service default resolution. Gated on the
     # two commands that actually read ``services_config`` / ``default_embeddings``
-    # off ``ctx.obj`` (``snapshot`` and ``restore`` — see their own bodies
-    # below): every other command, including the memory verbs (they resolve
-    # their own database through engrava.cli.store_resolution and never touch
-    # either value), skips this load — and its failure. A group callback runs
-    # before Click even knows which subcommand's options to parse, so an
-    # unconditional load would raise on a broken --config before a
-    # subcommand's own precedence logic ever ran, whatever --db said.
+    # / ``full_config`` off ``ctx.obj`` (``snapshot`` and ``restore`` — see
+    # their own bodies below): every other command, including the memory
+    # verbs (they resolve their own database through
+    # engrava.cli.store_resolution and never touch any of these values),
+    # skips this load — and its failure. A group callback runs before Click
+    # even knows which subcommand's options to parse, so an unconditional
+    # load would raise on a broken --config before a subcommand's own
+    # precedence logic ever ran, whatever --db said.
     services_cfg = None
     default_embeddings = None
+    full_config = None
     if ctx.invoked_subcommand in _SERVICES_CONFIG_COMMANDS and cfg.config_path is not None:
         from engrava.config import load_config  # noqa: PLC0415
 
@@ -912,8 +915,14 @@ def cli(
             sys.exit(1)
         services_cfg = ms_config.services
         default_embeddings = ms_config.embeddings
+        full_config = ms_config
     ctx.obj["services_config"] = services_cfg
     ctx.obj["default_embeddings"] = default_embeddings
+    # The full parsed config, passed to EngravaManager as ``base_config`` so
+    # a multi-service CLI command gets the same journal / hygiene / TTL /
+    # hooks / dreaming wiring a single-database ``from_config`` open gets,
+    # instead of only the PRAGMAs and the embedding provider.
+    ctx.obj["full_config"] = full_config
 
     # Whether --db (or ENGRAVA_DB) was actually supplied, as opposed to
     # cfg.db_path holding the CLI's own hardcoded default. EngravaCLIConfig
@@ -1572,6 +1581,7 @@ def snapshot(ctx: click.Context, output_path: str | None, service_name: str | No
     """
     cfg: EngravaCLIConfig = ctx.obj["config"]
     services_cfg: ServicesConfig | None = ctx.obj.get("services_config")
+    full_config: EngravaConfig | None = ctx.obj.get("full_config")
 
     # Resolve default service from config if --service not given.
     effective_service = service_name
@@ -1592,9 +1602,15 @@ def snapshot(ctx: click.Context, output_path: str | None, service_name: str | No
             )
 
             data_dir = services_cfg.data_dir if services_cfg else cfg.db_path.parent
+            # ``base_config`` is the loaded ``engrava.yaml`` (when ``--config``
+            # was given): it gets the manager's store the same journal /
+            # hygiene / TTL / hooks / dreaming wiring a single-database
+            # ``from_config`` open gets, instead of only the PRAGMAs and the
+            # embedding provider.
             manager = EngravaManager(
                 data_dir=data_dir,
                 services_config=services_cfg,
+                base_config=full_config,
             )
             if not manager.service_exists(effective_service):
                 click.echo(
@@ -3199,6 +3215,7 @@ async def _restore_service_snapshot(
     cfg: EngravaCLIConfig,
     services_cfg: ServicesConfig | None,
     default_embeddings: EmbeddingConfig | None,
+    base_config: EngravaConfig | None,
 ) -> None:
     """Restore a JSONL snapshot into a named service database.
 
@@ -3212,10 +3229,17 @@ async def _restore_service_snapshot(
     # The service name was validated up front by the command (see restore()), so
     # ``effective_service`` is a well-formed, non-empty name here.
     data_dir = services_cfg.data_dir if services_cfg else cfg.db_path.parent
+    # ``default_embeddings`` keeps its existing, ``--re-embed``-gated meaning
+    # regardless of ``base_config``: passing it explicitly here (rather than
+    # relying on ``base_config.embeddings``) is what keeps an ordinary
+    # restore from instantiating an embedding provider it was never asked
+    # for. ``base_config`` still applies everything else — the journal,
+    # hygiene policy, TTL, hooks and dreaming — to the restored store.
     manager = EngravaManager(
         data_dir=data_dir,
         default_embeddings=default_embeddings if re_embed else None,
         services_config=services_cfg,
+        base_config=base_config,
     )
     try:
         # restore is destructive (an existing target can be cleared, and is
@@ -3402,6 +3426,7 @@ def restore(
     cfg: EngravaCLIConfig = ctx.obj["config"]
     services_cfg: ServicesConfig | None = ctx.obj.get("services_config")
     default_embeddings: EmbeddingConfig | None = ctx.obj.get("default_embeddings")
+    full_config: EngravaConfig | None = ctx.obj.get("full_config")
 
     if re_embed and skip_embeddings:
         click.echo("Error: --re-embed and --skip-embeddings are mutually exclusive.", err=True)
@@ -3436,6 +3461,7 @@ def restore(
                 cfg=cfg,
                 services_cfg=services_cfg,
                 default_embeddings=default_embeddings,
+                base_config=full_config,
             )
         else:
             await _restore_single_db(

@@ -123,7 +123,13 @@ from engrava.infrastructure.sqlite.journal_writer import JournalWriter
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Sequence
 
-    from engrava.config import HygienePolicyConfig, MetricsConfig, SearchConfig
+    from engrava.config import (
+        EmbeddingConfig,
+        EngravaConfig,
+        HygienePolicyConfig,
+        MetricsConfig,
+        SearchConfig,
+    )
     from engrava.domain.manifest import ExtensionManifest
     from engrava.domain.models.filters import MetadataFilter, VisibilityQueryFilter
     from engrava.domain.models.metrics import EngravaMetrics, LatencyHistogram
@@ -2278,6 +2284,220 @@ class SqliteEngravaCore:
     # ------------------------------------------------------------------
 
     @classmethod
+    async def _build_configured_store(
+        cls,
+        config: EngravaConfig,
+        db_path: Path,
+        *,
+        migrate: bool = True,
+        embeddings: EmbeddingConfig | None,
+        embedding_provider: EmbeddingProviderProtocol | None,
+        cycle_provider: CycleProvider | None,
+        write_lock_acquire_timeout_seconds: float,
+        close_timeout_seconds: float,
+    ) -> Self:
+        """Open *db_path* and wire every setting *config* carries.
+
+        The shared builder behind :meth:`from_config`.
+
+        :meth:`from_config` and ``EngravaManager`` (see
+        ``engrava.infrastructure.service_manager``) both need to open a store
+        from an :class:`~engrava.config.EngravaConfig` with the full set of
+        settings wired — hooks, the embedding provider, the journal, TTL,
+        metrics, extension manifests, access tracking, the hygiene policy,
+        derive gates, dreaming, and the vector backend. This is the one place
+        that does it, in one fixed order, so a setting added here reaches
+        every caller instead of only the one someone remembered to update.
+
+        The two callers differ only in what they pass in: ``from_config``
+        always resolves its own embedding provider from ``config.embeddings``
+        and never skips the schema migration; the manager resolves a
+        possibly per-service ``embeddings`` override, may substitute a
+        caller-supplied ``embedding_provider`` instead of resolving one from
+        config, and may pass ``migrate=False`` for a read against an
+        existing, previously initialized database.
+
+        Args:
+            config: The full configuration to wire. ``config.database_path``
+                is never read here — *db_path* is the file this call opens,
+                which lets a caller (the manager) target a path of its own
+                choosing while applying the rest of *config* unchanged.
+            db_path: The SQLite database file to open.
+            migrate: When ``True`` (the default), calls ``ensure_schema()`` —
+                a fresh database is bootstrapped and an existing behind one is
+                brought to head, and any manifest's extension migrations run
+                with it. When ``False``, the database is opened exactly as
+                stored and neither runs. ``config.journal.verify_on_open``
+                still applies in that case, but only when the core schema the
+                ``journal_entry`` table depends on is already at head
+                (:data:`CORE_SCHEMA_HEAD_VERSION`); otherwise it is skipped
+                with a debug log line rather than walking a chain whose
+                prerequisite schema may not even be there yet.
+            embeddings: The embedding configuration backing ``auto_embed`` /
+                ``require_embedding`` and, absent an explicit
+                *embedding_provider*, the config a provider is resolved from.
+                Kept independent of ``config.embeddings`` so a caller can
+                supply a per-service override without constructing a second
+                ``EngravaConfig`` just to vary it.
+            embedding_provider: A pre-built provider to use verbatim instead
+                of resolving one from *embeddings* — the seam a caller-supplied
+                provider object goes through. ``None`` resolves one from
+                *embeddings* exactly as ``from_config`` always has.
+            cycle_provider: Forwarded verbatim to the constructor — see its
+                own docstring.
+            write_lock_acquire_timeout_seconds: Forwarded verbatim to the
+                constructor.
+            close_timeout_seconds: Forwarded verbatim to the constructor and
+                to :meth:`close`.
+
+        Returns:
+            A configured ``SqliteEngravaCore``, with its schema applied
+            unless *migrate* is ``False``.
+
+        Raises:
+            ConfigError: If a dotted ``hooks_class`` / manifest path cannot be
+                resolved, or an embedding provider cannot be instantiated.
+            JournalIntegrityError: If ``config.journal.verify_on_open`` is
+                enabled, the schema is at head, and the persisted hash chain
+                fails verification.
+
+        """
+        from engrava.config import resolve_hooks  # noqa: PLC0415
+
+        db = await connect(str(db_path))
+        try:
+            if config.wal_mode:
+                await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA foreign_keys=ON")
+            # synchronous=NORMAL is the documented-safe companion to WAL: the
+            # database stays durable across an application crash and is only at
+            # risk of losing the most recent transactions on an OS crash or
+            # power loss, which is the standard recommendation for WAL.
+            await db.execute("PRAGMA synchronous=NORMAL")
+            # busy_timeout makes a second connection wait (up to 5s) for a lock
+            # instead of failing immediately with SQLITE_BUSY.
+            await db.execute("PRAGMA busy_timeout=5000")
+            db.row_factory = aiosqlite.Row
+
+            hooks = resolve_hooks(config.hooks_class)
+
+            from engrava.config import (  # noqa: PLC0415
+                resolve_embedding_provider,
+                resolve_manifests,
+            )
+
+            emb_provider = (
+                embedding_provider
+                if embedding_provider is not None
+                else resolve_embedding_provider(embeddings)
+            )
+            auto_embed = embeddings.auto_embed if embeddings else False
+            require_embedding = embeddings.require_embedding if embeddings else False
+
+            manifests = resolve_manifests(
+                config.extension_manifest_paths,
+                discover=config.extension_discover,
+            )
+
+            # Access tracking feeds the dreaming ``frequency`` signal. It is on
+            # only when dreaming is enabled AND its ``access_tracking_enabled``
+            # flag is set (the default). With dreaming off, tracking stays off,
+            # so the retrieval and scoring paths are byte-identical to today.
+            access_tracking_enabled = (
+                config.dreaming is not None
+                and config.dreaming.enabled
+                and config.dreaming.access_tracking_enabled
+            )
+
+            store = cls(
+                db,
+                hooks=hooks,
+                embedding_provider=emb_provider,
+                auto_embed=auto_embed,
+                require_embedding=require_embedding,
+                search_config=config.search,
+                journal_enabled=config.journal.enabled,
+                ttl_strategy=config.ttl.strategy,
+                ttl_check_every_n=config.ttl.check_every_n_operations,
+                ttl_default_seconds=config.ttl.default_ttl_seconds,
+                metrics_config=config.metrics,
+                manifests=manifests,
+                access_tracking_enabled=access_tracking_enabled,
+                hygiene_policy=config.hygiene_policy,
+                derive_gates=config.derive,
+                cycle_provider=cycle_provider,
+                write_lock_acquire_timeout_seconds=write_lock_acquire_timeout_seconds,
+                close_timeout_seconds=close_timeout_seconds,
+            )
+            store._owns_connection = True
+
+            # The composition root owns concrete optional implementations; the
+            # SQLite facade retains only the inward consolidator contract. Keep
+            # construction after the store, matching the established error and
+            # cleanup ordering, and avoid importing Dreaming when it is disabled.
+            # Attached through the public seam (rather than the private
+            # attribute from_config used to write directly) — the two are the
+            # same underlying slot, so this is not a behaviour change.
+            if config.dreaming is not None and config.dreaming.enabled:
+                from engrava._composition import (  # noqa: PLC0415
+                    compose_dreaming_consolidator,
+                )
+
+                store.attach_dreaming_extension(compose_dreaming_consolidator(config.dreaming))
+
+            if migrate:
+                await store.ensure_schema()
+                schema_at_head = True
+            else:
+                cursor = await db.execute("PRAGMA user_version")
+                row = await cursor.fetchone()
+                schema_at_head = (int(row[0]) if row else 0) == CORE_SCHEMA_HEAD_VERSION
+
+            # Opt-in on-open integrity check. With migrate=True the schema has
+            # just been ensured, so this runs unconditionally when enabled —
+            # byte-identical to from_config's original behaviour. With
+            # migrate=False (a caller that deliberately opened the database
+            # exactly as stored) the chain is walked only when the core schema
+            # journal_entry depends on is already at head, and skipped with a
+            # debug line otherwise rather than failing a read this call was
+            # explicitly told not to migrate.
+            if config.journal.verify_on_open:
+                if schema_at_head:
+                    integrity = await store.verify_journal()
+                    if not integrity.valid:
+                        # Raised inside the try so the enclosing handler closes the
+                        # connection before propagating — a leaked handle on a
+                        # rejected open would otherwise pin the WAL.
+                        raise JournalIntegrityError(  # noqa: TRY301
+                            integrity.first_invalid_sequence,
+                            integrity.error_message,
+                        )
+                else:
+                    logger.debug(
+                        "Skipping journal.verify_on_open for %s: core schema is "
+                        "not at head (migrate=False)",
+                        db_path,
+                    )
+
+            await store._configure_vector_backend(
+                backend_name=config.vector_backend,
+                embedding_dimension=config.embedding_dimension,
+            )
+        except BaseException:
+            # Not ``except Exception``: ``asyncio.CancelledError`` derives
+            # from ``BaseException``, and a cancellation during any await
+            # above must close ``db`` exactly like an ordinary failure does
+            # — otherwise it leaks aiosqlite's non-daemon connection worker
+            # thread just as an uncaught error during open would. Routed
+            # through ``_close_quietly`` rather than a direct
+            # ``await db.close()`` so a failure in the close itself cannot
+            # replace this exception -- see that function's docstring.
+            await _close_quietly(db)
+            raise
+
+        return store
+
+    @classmethod
     async def from_config(
         cls,
         config_path: str | Path,
@@ -2323,118 +2543,18 @@ class SqliteEngravaCore:
                 and the persisted hash chain fails verification.
 
         """
-        from engrava.config import load_config, resolve_hooks  # noqa: PLC0415
+        from engrava.config import load_config  # noqa: PLC0415
 
         config = load_config(config_path)
-        db = await connect(str(config.database_path))
-        try:
-            if config.wal_mode:
-                await db.execute("PRAGMA journal_mode=WAL")
-            await db.execute("PRAGMA foreign_keys=ON")
-            # synchronous=NORMAL is the documented-safe companion to WAL: the
-            # database stays durable across an application crash and is only at
-            # risk of losing the most recent transactions on an OS crash or
-            # power loss, which is the standard recommendation for WAL.
-            await db.execute("PRAGMA synchronous=NORMAL")
-            # busy_timeout makes a second connection wait (up to 5s) for a lock
-            # instead of failing immediately with SQLITE_BUSY.
-            await db.execute("PRAGMA busy_timeout=5000")
-            db.row_factory = aiosqlite.Row
-
-            hooks = resolve_hooks(config.hooks_class)
-
-            # Resolve embedding provider from config.
-            from engrava.config import (  # noqa: PLC0415
-                resolve_embedding_provider,
-                resolve_manifests,
-            )
-
-            emb_provider = resolve_embedding_provider(config.embeddings)
-            auto_embed = config.embeddings.auto_embed if config.embeddings else False
-            require_embedding = config.embeddings.require_embedding if config.embeddings else False
-
-            manifests = resolve_manifests(
-                config.extension_manifest_paths,
-                discover=config.extension_discover,
-            )
-
-            # Access tracking feeds the dreaming ``frequency`` signal. It is on
-            # only when dreaming is enabled AND its ``access_tracking_enabled``
-            # flag is set (the default). With dreaming off, tracking stays off,
-            # so the retrieval and scoring paths are byte-identical to today.
-            access_tracking_enabled = (
-                config.dreaming is not None
-                and config.dreaming.enabled
-                and config.dreaming.access_tracking_enabled
-            )
-
-            store = cls(
-                db,
-                hooks=hooks,
-                embedding_provider=emb_provider,
-                auto_embed=auto_embed,
-                require_embedding=require_embedding,
-                search_config=config.search,
-                journal_enabled=config.journal.enabled,
-                ttl_strategy=config.ttl.strategy,
-                ttl_check_every_n=config.ttl.check_every_n_operations,
-                ttl_default_seconds=config.ttl.default_ttl_seconds,
-                metrics_config=config.metrics,
-                manifests=manifests,
-                access_tracking_enabled=access_tracking_enabled,
-                hygiene_policy=config.hygiene_policy,
-                derive_gates=config.derive,
-                cycle_provider=cycle_provider,
-                write_lock_acquire_timeout_seconds=write_lock_acquire_timeout_seconds,
-                close_timeout_seconds=close_timeout_seconds,
-            )
-            store._owns_connection = True
-
-            # The composition root owns concrete optional implementations; the
-            # SQLite facade retains only the inward consolidator contract. Keep
-            # construction after the store, matching the established error and
-            # cleanup ordering, and avoid importing Dreaming when it is disabled.
-            if config.dreaming is not None and config.dreaming.enabled:
-                from engrava._composition import (  # noqa: PLC0415
-                    compose_dreaming_consolidator,
-                )
-
-                store._dreaming_extension = compose_dreaming_consolidator(config.dreaming)
-
-            await store.ensure_schema()
-
-            # Opt-in on-open integrity check. Runs only when explicitly
-            # enabled and only after the schema is ensured, so the
-            # ``journal_entry`` table is guaranteed to exist. Default-off ⇒
-            # the open path is byte-identical to before when disabled.
-            if config.journal.verify_on_open:
-                integrity = await store.verify_journal()
-                if not integrity.valid:
-                    # Raised inside the try so the enclosing handler closes the
-                    # connection before propagating — a leaked handle on a
-                    # rejected open would otherwise pin the WAL.
-                    raise JournalIntegrityError(  # noqa: TRY301
-                        integrity.first_invalid_sequence,
-                        integrity.error_message,
-                    )
-
-            await store._configure_vector_backend(
-                backend_name=config.vector_backend,
-                embedding_dimension=config.embedding_dimension,
-            )
-        except BaseException:
-            # Not ``except Exception``: ``asyncio.CancelledError`` derives
-            # from ``BaseException``, and a cancellation during any await
-            # above must close ``db`` exactly like an ordinary failure does
-            # — otherwise it leaks aiosqlite's non-daemon connection worker
-            # thread just as an uncaught error during open would. Routed
-            # through ``_close_quietly`` rather than a direct
-            # ``await db.close()`` so a failure in the close itself cannot
-            # replace this exception -- see that function's docstring.
-            await _close_quietly(db)
-            raise
-
-        return store
+        return await cls._build_configured_store(
+            config,
+            config.database_path,
+            embeddings=config.embeddings,
+            embedding_provider=None,
+            cycle_provider=cycle_provider,
+            write_lock_acquire_timeout_seconds=write_lock_acquire_timeout_seconds,
+            close_timeout_seconds=close_timeout_seconds,
+        )
 
     async def close(self) -> None:
         """Close the database connection if owned by this instance.

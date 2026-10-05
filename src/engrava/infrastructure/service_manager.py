@@ -28,18 +28,47 @@ import aiosqlite
 
 from engrava.config import (
     EmbeddingConfig,
+    EngravaConfig,
     SearchConfig,
     ServicesConfig,
     resolve_embedding_provider,
 )
+from engrava.config_validation import ConfigError
 from engrava.infrastructure.sqlite.aiosqlite_connect import connect
-from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore, _close_quietly
+from engrava.infrastructure.sqlite.engrava_core import (
+    _CLOSE_TIMEOUT_SECONDS,
+    _WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS,
+    SqliteEngravaCore,
+    _close_quietly,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
+
+    from engrava.domain.protocols.embedding_provider import EmbeddingProviderProtocol
 
 
 logger = logging.getLogger(__name__)
+
+
+class _Unset:
+    """Sentinel type for ``EngravaManager.__init__``'s ``default_embeddings`` default.
+
+    Distinguishes "the caller did not pass ``default_embeddings`` at all" from
+    an explicit ``None``, which means "no embedding provider for any service
+    without its own override" and must *not* fall back to
+    ``base_config.embeddings`` — see ``_resolve_embedding_config``. Module-private:
+    no caller outside this module ever constructs or names an instance of it.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<unset>"
+
+
+_UNSET = _Unset()
 
 
 class _CreationAbandonedError(Exception):
@@ -63,13 +92,47 @@ class EngravaManager:
 
     Args:
         data_dir: Directory for per-service database files.
-        default_embeddings: Fallback embedding config for services
-            without explicit overrides.
-        default_search: Default hybrid-search weights.
-        wal_mode: Enable WAL journal mode.
+        default_embeddings: Fallback embedding config for a service without
+            its own override (see ``services_config``). Left unset (the
+            default), it falls back to ``base_config.embeddings`` when
+            ``base_config`` is set, and to ``None`` otherwise — the same
+            fallback whether the manager is constructed directly or through
+            :meth:`from_config`. Pass an explicit value, including ``None``,
+            to override that fallback: an explicit ``None`` means no provider
+            for any service without its own override even when
+            ``base_config`` carries its own ``embeddings`` — how the CLI's
+            ``restore`` suppresses embedding regeneration without
+            ``--re-embed``.
+        default_search: Default hybrid-search weights. Ignored when
+            ``base_config`` is set, which carries its own ``search`` weights.
+        wal_mode: Enable WAL journal mode. Ignored when ``base_config`` is
+            set, which carries its own ``wal_mode``.
         vector_backend: Vector backend name (``"numpy"`` or ``"sqlite-vec"``).
-        embedding_dimension: Default embedding vector dimension.
+            Ignored when ``base_config`` is set, which carries its own
+            ``vector_backend``.
+        embedding_dimension: Default embedding vector dimension. Ignored when
+            ``base_config`` is set, which carries its own
+            ``embedding_dimension``.
         services_config: Optional ``ServicesConfig`` for per-service overrides.
+        base_config: Optional full ``EngravaConfig`` to apply to every store
+            this manager builds — the journal, hygiene policy, TTL, metrics,
+            extension manifests, access tracking, derive gates, dreaming,
+            hooks and ``require_embedding``, none of which reach a store
+            built without it. When set, each per-service store is built the
+            same way :meth:`SqliteEngravaCore.from_config` builds one, except
+            that the database path is this service's own file (never
+            ``base_config.database_path``) and the embedding config is
+            resolved per service (see ``_resolve_embedding_config``) rather
+            than taken from ``base_config.embeddings`` directly. ``None``
+            (the default) keeps a service's store exactly as before —
+            PRAGMAs, embeddings and the vector backend only.
+        embedding_provider_factory: Optional factory called with a service
+            name to supply that service's embedding provider object
+            directly, instead of one resolved from configuration. Takes
+            precedence over the resolved embedding configuration when it
+            returns a provider; returning ``None`` falls back to the
+            resolved embedding configuration, the same on both the
+            ``base_config`` path and the plain per-service path.
 
     """
 
@@ -77,12 +140,14 @@ class EngravaManager:
         self,
         data_dir: Path,
         *,
-        default_embeddings: EmbeddingConfig | None = None,
+        default_embeddings: EmbeddingConfig | _Unset | None = _UNSET,
         default_search: SearchConfig | None = None,
         wal_mode: bool = True,
         vector_backend: str = "numpy",
         embedding_dimension: int = 384,
         services_config: ServicesConfig | None = None,
+        base_config: EngravaConfig | None = None,
+        embedding_provider_factory: Callable[[str], EmbeddingProviderProtocol | None] | None = None,
     ) -> None:
         from engrava.config_validation import (  # noqa: PLC0415 -- deferred to avoid a config import cycle
             require_exact_type_or_none,
@@ -92,9 +157,17 @@ class EngravaManager:
         self._data_dir = data_dir
         # The manager retains these and reads them itself (``configs`` decides
         # which embedding config a service gets), so it requires the exact
-        # class at its own boundary rather than relying on the store's.
-        self._default_embeddings = require_exact_type_or_none(
-            default_embeddings, EmbeddingConfig, "EngravaManager.default_embeddings"
+        # class at its own boundary rather than relying on the store's. The
+        # sentinel default is never owned through that boundary: it is not a
+        # config object, and ``_resolve_embedding_config`` checks for it with
+        # ``isinstance`` before this value could ever reach ``base_config``'s
+        # own embeddings.
+        self._default_embeddings: EmbeddingConfig | _Unset | None = (
+            default_embeddings
+            if isinstance(default_embeddings, _Unset)
+            else require_exact_type_or_none(
+                default_embeddings, EmbeddingConfig, "EngravaManager.default_embeddings"
+            )
         )
         self._default_search = require_exact_type_or_none(
             default_search, SearchConfig, "EngravaManager.default_search"
@@ -109,6 +182,17 @@ class EngravaManager:
         self._services_config = require_exact_type_or_none(
             services_config, ServicesConfig, "EngravaManager.services_config"
         )
+        # The full configuration a per-service store is built from when set
+        # (see ``_create_configured_store``). ``None`` keeps every existing
+        # caller's behaviour byte-for-byte: ``_create_store`` only takes that
+        # branch when this is set.
+        self._base_config = require_exact_type_or_none(
+            base_config, EngravaConfig, "EngravaManager.base_config"
+        )
+        # A live callable, not a configuration value — stored verbatim, like
+        # ``SqliteEngravaCore``'s own ``cycle_provider``, rather than owned
+        # through a config-object boundary.
+        self._embedding_provider_factory = embedding_provider_factory
         self._stores: dict[str, SqliteEngravaCore] = {}
         # Tracks a creation in flight for a name that is not in ``_stores``
         # yet. ``self._lock`` guards the bookkeeping on both dicts
@@ -523,18 +607,51 @@ class EngravaManager:
     # ------------------------------------------------------------------
 
     @classmethod
-    async def from_config(cls, config: ServicesConfig, **kwargs: object) -> EngravaManager:
-        """Create a manager from a ``ServicesConfig``.
+    async def from_config(
+        cls, config: ServicesConfig | EngravaConfig, **kwargs: object
+    ) -> EngravaManager:
+        """Create a manager from a ``ServicesConfig`` or a full ``EngravaConfig``.
 
         Args:
-            config: Parsed services configuration.
+            config: Either a ``ServicesConfig`` (today's behaviour, unchanged:
+                only per-service embedding overrides reach a built store), or
+                a full ``EngravaConfig`` whose ``services`` is set. The latter
+                is passed through as this manager's ``base_config``, so every
+                store it builds gets the same wiring
+                :meth:`SqliteEngravaCore.from_config` gives one — see
+                ``base_config`` on the constructor.
             **kwargs: Additional keyword arguments forwarded to the
                 constructor (``default_embeddings``, ``wal_mode``, etc.).
 
         Returns:
             A new ``EngravaManager`` instance.
 
+        Raises:
+            ConfigError: If ``config`` is an ``EngravaConfig`` whose
+                ``services`` is ``None`` — there is no ``data_dir`` to build
+                per-service stores under.
+
         """
+        if isinstance(config, EngravaConfig):
+            if config.services is None:
+                msg = (
+                    "EngravaConfig.services must be set to build an EngravaManager "
+                    "from a full EngravaConfig"
+                )
+                raise ConfigError(msg)
+            # No ``default_embeddings`` seeding needed here: left out of
+            # ``**kwargs``, the constructor's sentinel default makes
+            # ``_resolve_embedding_config`` fall back to
+            # ``base_config.embeddings`` itself — the same ``config`` passed
+            # below. An explicit ``default_embeddings`` in ``**kwargs`` —
+            # including ``None`` — still wins, forwarded verbatim like any
+            # other constructor keyword this method passes through.
+            return cls(
+                data_dir=config.services.data_dir,
+                services_config=config.services,
+                base_config=config,
+                **kwargs,  # type: ignore[arg-type]  # forwarded verbatim to the constructor, which types them
+            )
         return cls(
             data_dir=config.data_dir,
             services_config=config,
@@ -567,8 +684,22 @@ class EngravaManager:
     def _resolve_embedding_config(self, service_name: str) -> EmbeddingConfig | None:
         """Resolve the embedding config for a service.
 
-        Per-service overrides take precedence over the manager-level
-        default.
+        Resolution order:
+
+        1. the service's own override in ``services_config``, when present;
+        2. an explicitly passed ``default_embeddings`` — including an
+           explicit ``None``, which means no provider for this service and
+           wins even when ``base_config`` carries its own ``embeddings``
+           (the CLI's ``restore`` relies on this to suppress embedding
+           regeneration when ``--re-embed`` is not requested);
+        3. when ``default_embeddings`` was left unset and ``base_config`` is
+           set, ``base_config.embeddings``;
+        4. otherwise ``None``.
+
+        This order is the same whether the manager was built directly or
+        through :meth:`from_config` — the sentinel default on
+        ``default_embeddings`` is what makes step 3 possible without
+        ``from_config`` having to seed anything itself.
 
         Args:
             service_name: Service identifier.
@@ -581,6 +712,8 @@ class EngravaManager:
             svc_cfg = self._services_config.configs[service_name]
             if svc_cfg.embeddings is not None:
                 return svc_cfg.embeddings
+        if isinstance(self._default_embeddings, _Unset):
+            return self._base_config.embeddings if self._base_config is not None else None
         return self._default_embeddings
 
     async def _create_store(self, service_name: str, *, migrate: bool = True) -> SqliteEngravaCore:
@@ -588,7 +721,11 @@ class EngravaManager:
 
         Creates the data directory and database file if needed, applies the
         schema (unless ``migrate`` is ``False``), and configures the
-        embedding provider.
+        embedding provider. When ``base_config`` is set on this manager, the
+        store is instead built with that configuration's full wiring — see
+        :meth:`_create_configured_store`; everything below this point is the
+        unchanged, PRAGMAs-and-embeddings-only path a manager without
+        ``base_config`` has always used.
 
         Args:
             service_name: Service identifier.
@@ -601,6 +738,12 @@ class EngravaManager:
         self._data_dir.mkdir(parents=True, exist_ok=True)
 
         db_path = self._service_db_path(service_name)
+
+        if self._base_config is not None:
+            store = await self._create_configured_store(service_name, db_path, migrate=migrate)
+            logger.info("Initialized service %r: %s", service_name, db_path)
+            return store
+
         db = await connect(str(db_path))
         try:
             if self._wal_mode:
@@ -617,7 +760,19 @@ class EngravaManager:
             db.row_factory = aiosqlite.Row
 
             emb_config = self._resolve_embedding_config(service_name)
-            emb_provider = resolve_embedding_provider(emb_config)
+            # A set factory takes precedence over the resolved configuration,
+            # but only when it actually returns a provider: a factory that
+            # returns None falls back to resolving one from emb_config, the
+            # same as an unset factory -- mirroring how
+            # SqliteEngravaCore._build_configured_store treats its own
+            # embedding_provider argument.
+            emb_provider = (
+                self._embedding_provider_factory(service_name)
+                if self._embedding_provider_factory is not None
+                else None
+            )
+            if emb_provider is None:
+                emb_provider = resolve_embedding_provider(emb_config)
             auto_embed = emb_config.auto_embed if emb_config else False
 
             store = SqliteEngravaCore(
@@ -649,6 +804,56 @@ class EngravaManager:
 
         logger.info("Initialized service %r: %s", service_name, db_path)
         return store
+
+    async def _create_configured_store(
+        self, service_name: str, db_path: Path, *, migrate: bool
+    ) -> SqliteEngravaCore:
+        """Build a per-service store with the manager's full ``base_config`` wiring.
+
+        Delegates to :meth:`SqliteEngravaCore._build_configured_store` — the
+        same internal builder :meth:`SqliteEngravaCore.from_config` uses — so
+        a manager-built service gets the journal, hygiene policy, TTL, hooks,
+        dreaming and ``require_embedding`` settings ``base_config`` carries,
+        not just the PRAGMAs and the vector backend :meth:`_create_store`'s
+        other branch configures. Only called when ``self._base_config`` is
+        set; the ``None`` guard below exists purely so the type checker can
+        narrow it, since that is already guaranteed by the only caller.
+
+        Args:
+            service_name: Service identifier, used to resolve a per-service
+                ``embeddings`` override and, when set, to call
+                ``embedding_provider_factory``.
+            db_path: This service's own database file. ``base_config``'s own
+                ``database_path`` is never read — the manager always
+                allocates one file per service.
+            migrate: Forwarded from :meth:`get_store` — see its docstring and
+                :meth:`SqliteEngravaCore._build_configured_store`'s.
+
+        Returns:
+            Fully initialized ``SqliteEngravaCore``.
+
+        """
+        base_config = self._base_config
+        if base_config is None:
+            msg = "_create_configured_store requires EngravaManager.base_config to be set"
+            raise ConfigError(msg)  # pragma: no cover -- guarded by the only caller
+
+        emb_config = self._resolve_embedding_config(service_name)
+        embedding_provider = (
+            self._embedding_provider_factory(service_name)
+            if self._embedding_provider_factory is not None
+            else None
+        )
+        return await SqliteEngravaCore._build_configured_store(  # noqa: SLF001
+            base_config,
+            db_path,
+            migrate=migrate,
+            embeddings=emb_config,
+            embedding_provider=embedding_provider,
+            cycle_provider=None,
+            write_lock_acquire_timeout_seconds=_WRITE_LOCK_ACQUIRE_TIMEOUT_SECONDS,
+            close_timeout_seconds=_CLOSE_TIMEOUT_SECONDS,
+        )
 
     async def _create_registered_store(
         self,
