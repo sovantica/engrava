@@ -237,16 +237,19 @@ _UNPARSEABLE_ALLOWLIST: dict[_ClauseKey, str] = {
             "When `collapse_key` is set (or the reflection cap is below `1.0`, which the "
             "default `0.3` is), the fallback also widens its own row window by "
             "`search.collapse_pool_factor` beyond `top_k`, the same bounded headroom "
-            "collapse and the cap already get from the FTS/vector arms' larger `fts_top_k` "
-            "/ `vector_top_k` budgets — so backfill has distinct candidates to draw from"
+            "collapse and the cap already get from the FTS/vector arms' `fts_top_k` / "
+            "`vector_top_k` pools — each is a **minimum** per-arm pool, raised to `top_k` "
+            "when smaller, before that widening — so backfill has distinct candidates to "
+            "draw from"
         ),
     ): (
         "value tokens: `collapse_key`, `1.0`, `0.3`, `top_k`, `fts_top_k`, "
-        "`vector_top_k` -- `search.collapse_pool_factor` is only named here, with no "
-        "default value of its own in this clause; `1.0` and `0.3` are the reflection "
-        "cap's own comparison threshold and default, and `collapse_key`, `top_k`, "
-        "`fts_top_k`, `vector_top_k` are unrelated parameter names, all picked up as "
-        "value-shaped tokens -- 6 values against 1 field"
+        "`vector_top_k`, `top_k` -- `search.collapse_pool_factor` is only named here, with "
+        "no default value of its own in this clause; `1.0` and `0.3` are the reflection "
+        "cap's own comparison threshold and default, `collapse_key`, `fts_top_k`, "
+        "`vector_top_k` are unrelated parameter names, and `top_k` is picked up twice "
+        "(the fallback's own widen-beyond-`top_k`, and the per-arm floor's "
+        "raise-to-`top_k`) -- 7 values against 1 field"
     ),
     (
         "docs/search.md",

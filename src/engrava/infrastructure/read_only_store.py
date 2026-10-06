@@ -333,8 +333,11 @@ class ReadOnlyEngrava(EngravaReadProtocol):
             current_cycle: Optional cognitive-cycle recency reference.
             recency_now: Optional transaction-time recency instant (ISO-8601).
             recency_now_half_life: Optional transaction-time half-life override.
-            fts_top_k: Max candidates from FTS5 before fusion.
-            vector_top_k: Max candidates from vector search before fusion.
+            fts_top_k: Minimum candidate pool from FTS5 before fusion; raised
+                to ``top_k`` when smaller, before any collapse-pool widening.
+            vector_top_k: Minimum candidate pool from vector search before
+                fusion; raised to ``top_k`` when smaller, before any
+                collapse-pool widening.
             filters: Optional metadata filter forwarded verbatim.
             visibility: Optional bounded visibility query filter.
             collapse_key: Optional de-fragmentation unit key.

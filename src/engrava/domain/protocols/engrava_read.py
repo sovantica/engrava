@@ -297,8 +297,11 @@ class EngravaReadProtocol(Protocol):
             recency_now_half_life: Optional transaction-time half-life override,
                 in seconds (default 604800 = 7 days); consulted only with
                 ``recency_now``.
-            fts_top_k: Max candidates from FTS5 before fusion.
-            vector_top_k: Max candidates from vector search before fusion.
+            fts_top_k: Minimum candidate pool from FTS5 before fusion; raised
+                to ``top_k`` when smaller, before any collapse-pool widening.
+            vector_top_k: Minimum candidate pool from vector search before
+                fusion; raised to ``top_k`` when smaller, before any
+                collapse-pool widening.
             filters: Optional metadata filter (an ``AND`` of typed field
                 predicates over ``metadata``), applied in-arm before each
                 arm's limit so it never starves ``top_k``. ``None`` (or an

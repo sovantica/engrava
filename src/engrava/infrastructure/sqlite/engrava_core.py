@@ -12836,8 +12836,11 @@ class SqliteEngravaCore:
                 when ``recency_now`` is supplied; ``None`` uses
                 ``SearchConfig.recency_now_half_life_seconds`` (default 604800 =
                 7 days). Must be ``> 0``.
-            fts_top_k: Max candidates from FTS5 before fusion.
-            vector_top_k: Max candidates from vector search before fusion.
+            fts_top_k: Minimum candidate pool from FTS5 before fusion; raised
+                to ``top_k`` when smaller, before any collapse-pool widening.
+            vector_top_k: Minimum candidate pool from vector search before
+                fusion; raised to ``top_k`` when smaller, before any
+                collapse-pool widening.
             priority_weight: Optional priority fusion-weight override.
             graph_weight: Optional graph signal fusion-weight override.
             graph_edge_decay: Optional graph edge decay override.
@@ -13009,6 +13012,17 @@ class SqliteEngravaCore:
 
             msg = f"collapse_max_per_unit must be >= 1, got {collapse_max_per_unit}"
             raise InvalidFilterError(msg)
+
+        # Per-arm floor: each arm's candidate pool is at least ``top_k``, so a
+        # ``top_k`` above the default (or caller-supplied) pool size no longer
+        # silently caps the merged result below what actually matches. Applied
+        # here, before any collapse-pool widening below — that widening then
+        # multiplies the already-floored value, same as it multiplies a
+        # caller-supplied pool larger than ``top_k``. A ``top_k`` at or below
+        # the pool leaves both ``max()`` calls a no-op, so this is byte-
+        # identical to before for the common (small ``top_k``) case.
+        fts_top_k = max(fts_top_k, top_k)
+        vector_top_k = max(vector_top_k, top_k)
 
         # Validate the de-fragmentation unit key (if any) at argument time —
         # never mid-query (reuses the shared metadata path grammar). ``None``
