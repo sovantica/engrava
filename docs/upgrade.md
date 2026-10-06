@@ -268,6 +268,46 @@ hard-deleted (previously it stayed `ACTIVE` indefinitely in that case) — see
 [Dreaming → Orphan sweep](dreaming.md#orphan-sweep). No public method
 signature changed.
 
+**Behaviour change: a directly constructed store (no `SearchConfig`) now
+resolves an omitted `recency_weight` to `0.1`, not `0.0`.** No schema
+migration is involved.
+
+**Who is affected.** Anyone who calls `search_hybrid()` — directly, or
+through `recall()`, which never passes an explicit `recency_weight` of its
+own — with a recency reference (a cognitive cycle, `current_cycle` explicit
+or via `cycle_provider`, or a transaction-time `recency_now`) on a store
+built `SqliteEngravaCore(conn, ...)` with no `search_config` argument, and
+(for a direct `search_hybrid()` call) does not pass an explicit
+`recency_weight`. That one construction path used to carry
+its own literal (`0.0`) for this default; every other path — a default
+`SearchConfig()`, an explicit `SearchConfig(...)`, or `from_config` with no
+override — already resolved it to `0.1`. An explicit per-call
+`recency_weight` to `search_hybrid()` still wins, exactly as before. So does
+an explicit `SearchConfig` you built with a different value for that same
+setting. `search_reflections_only()` is **not** affected: it takes no
+per-call `recency_weight` and consults no `cycle_provider`, and its own
+recency fallback already resolved to `0.1` before this release.
+
+**What changed.** The two defaults disagreed with each other and with the
+documented default (see [Hybrid Search](search.md#signal-model)). Now every
+construction path reads this weight from the same place — `SearchConfig`'s
+own field default — so an omitted `search:` YAML section and `search: {}`
+resolve identically too. Because recency is active whenever a
+recency reference is present **and** the resolved weight is above `0.0`, a
+direct-constructor store that calls `search_hybrid()` (or `recall()`) with
+`current_cycle`, a `cycle_provider` or `recency_now` now activates the recency signal where it previously
+stayed silent, which can reorder results and change the raw scores
+`HybridSearchResult` reports — the same two kinds of effect
+[the 0.6 -> 0.7 fallback-path change](#06---07) below describes, from the
+opposite direction (recency turning on instead of off).
+
+**What to do.** If you relied on a direct-constructor store ranking without
+recency by default, pass `recency_weight=0.0` per call to `search_hybrid()`
+— `recall()` has no such per-call override — or construct with
+`search_config=SearchConfig(default_recency_weight=0.0)` (or the equivalent
+`default_recency_weight: 0.0` in `from_config`'s `search:` section) to keep
+the previous ranking on either method.
+
 ### 0.6 -> 0.7
 
 **Behaviour change: the dreaming clustering cohesion gate now computes a

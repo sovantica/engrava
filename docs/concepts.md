@@ -199,6 +199,10 @@ dreaming's age/scheduling gates (`min_age_cycles`, `schedule_every_n_cycles`,
 > **The trap to avoid.** Because Engrava does not advance the cycle for you,
 > there are two distinct failure modes — and neither raises an error:
 >
+> Recency's weight, like every hybrid-search default, comes from
+> `SearchConfig`, whichever way the store was built (see
+> [Hybrid Search → Signal model](search.md#signal-model)).
+>
 > - **Providing no recency reference** makes the recency signal **inactive** —
 >   it is dropped from the ranking and its weight is redistributed to the other
 >   signals. This means no explicit `current_cycle`, no explicit `recency_now`,

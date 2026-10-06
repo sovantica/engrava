@@ -18,12 +18,13 @@ recency reference nor a cycle provider can resolve recency, or no embeddings
 can resolve the vector arm),
 its weight is **redistributed proportionally** across active signals.
 
-**The table's defaults apply only when a `SearchConfig` is passed to the
-store.** `SqliteEngravaCore(conn, ...)` with no `search_config` argument
-resolves `default_recency_weight` to `0.0`, not `0.10` — the two are separate
-defaults that disagree, and recency is silently inert on a store built the
-plain way until you pass a `SearchConfig` explicitly (or an explicit per-call
-`recency_weight`).
+**The table's defaults apply on every construction path.**
+`SqliteEngravaCore(conn, ...)` with no `search_config` argument resolves them
+exactly like a store built with a default `SearchConfig()` or `from_config`
+with no override — one source, `SearchConfig`'s own field defaults, so an
+omitted `search:` section and `search: {}` resolve identically too. An
+explicit per-call weight, or a `SearchConfig` you built with a different
+value, still wins over the table.
 
 ## Graceful Degradation
 

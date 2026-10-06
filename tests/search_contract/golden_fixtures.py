@@ -167,17 +167,20 @@ HYBRID_RANKING_QUERIES: tuple[str, ...] = (
 # Hybrid query-time overrides
 # ---------------------------------------------------------------------------
 # A directly-constructed store (no ``SearchConfig``) resolves an unspecified
-# ``recency_weight`` to ``0.0`` (see
-# ``SqliteEngravaCore._resolve_hybrid_defaults``) — NOT the ``0.10`` documented
-# default, which only applies once a ``SearchConfig`` exists. And every
-# construction path resolves an unspecified ``graph_weight`` to ``0.0`` (the
-# graph signal is opt-in). Without these two explicit overrides, the recency
-# and graph signals would be structurally silent in this golden regardless of
-# what the corpus contains — corpus variety alone does not activate them. The
-# recency weight (0.10), the half-life (left at its 50-cycle default) and the
-# edge decay (left at its 0.5 default) match the documented defaults. The 0.1
-# graph weight does not: the documented default is 0.0, and 0.1 is an explicit
-# choice that switches the graph signal on for this golden.
+# ``recency_weight`` to the same ``0.10`` documented default as every other
+# construction path (see ``SqliteEngravaCore._resolve_hybrid_defaults``, which
+# reads it from ``SearchConfig``'s own field default). This golden still passes
+# it explicitly rather than relying on that default: its frozen scores are
+# pinned to a literal this module owns, not to whatever ``SearchConfig``'s
+# default happens to be on a given release. Every construction path resolves
+# an unspecified ``graph_weight`` to ``0.0`` (the graph signal is opt-in) —
+# without that explicit override, the graph signal would be structurally
+# silent in this golden regardless of what the corpus contains, since corpus
+# variety alone does not activate it. The recency weight (0.10), the half-life
+# (left at its 50-cycle default) and the edge decay (left at its 0.5 default)
+# match the documented defaults. The 0.1 graph weight does not: the documented
+# default is 0.0, and 0.1 is an explicit choice that switches the graph signal
+# on for this golden.
 HYBRID_CURRENT_CYCLE = 100
 # Deliberately always positive: a resolved recency weight of ``0.0`` takes a
 # different code path on the query-less fallback (flat scores instead of

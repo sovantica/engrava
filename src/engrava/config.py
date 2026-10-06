@@ -2875,21 +2875,31 @@ def _parse_search(raw: Any) -> SearchConfig:  # noqa: ANN401
         "search",
     )
 
-    fts_w = _require_nonneg_float(raw.get("default_fts_weight", 0.3), "search.default_fts_weight")
+    # One source for every omitted key: the field default lives once, on
+    # SearchConfig itself, so an omitted `search:` section and `search: {}`
+    # resolve identically to it rather than to a second, separately
+    # maintained literal here.
+    fts_w = _require_nonneg_float(
+        raw.get("default_fts_weight", SearchConfig.default_fts_weight),
+        "search.default_fts_weight",
+    )
     vec_w = _require_nonneg_float(
-        raw.get("default_vector_weight", 0.55),
+        raw.get("default_vector_weight", SearchConfig.default_vector_weight),
         "search.default_vector_weight",
     )
     rec_w = _require_nonneg_float(
-        raw.get("default_recency_weight", 0.1),
+        raw.get("default_recency_weight", SearchConfig.default_recency_weight),
         "search.default_recency_weight",
     )
     pri_w = _require_nonneg_float(
-        raw.get("default_priority_weight", 0.05),
+        raw.get("default_priority_weight", SearchConfig.default_priority_weight),
         "search.default_priority_weight",
     )
 
-    half_life = _require_positive_int(raw.get("recency_half_life", 50), "search.recency_half_life")
+    half_life = _require_positive_int(
+        raw.get("recency_half_life", SearchConfig.recency_half_life),
+        "search.recency_half_life",
+    )
 
     recency_now_half_life_seconds = _require_positive_int(
         raw.get("recency_now_half_life_seconds", 604800),
@@ -2902,7 +2912,8 @@ def _parse_search(raw: Any) -> SearchConfig:  # noqa: ANN401
     boost_p4 = _require_nonneg_float(raw.get("priority_boost_p4", 0.0), "search.priority_boost_p4")
 
     graph_w = _require_nonneg_float(
-        raw.get("default_graph_weight", 0.0), "search.default_graph_weight"
+        raw.get("default_graph_weight", SearchConfig.default_graph_weight),
+        "search.default_graph_weight",
     )
     graph_decay = _require_nonneg_float(raw.get("graph_edge_decay", 0.5), "search.graph_edge_decay")
     max_neighbors = _require_positive_int(

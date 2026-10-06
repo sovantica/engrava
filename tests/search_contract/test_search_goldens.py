@@ -66,11 +66,14 @@ _HYBRID_FROM_CONFIG_CASES: dict[str, list[list[str | float]]] = load_hybrid_rank
 async def _search_direct_golden(store: SqliteEngravaCore, query: str) -> list[list[str | float]]:
     """Run one query the same way the directly-constructed golden was built.
 
-    A directly-constructed store needs explicit ``current_cycle`` /
-    ``recency_weight`` / ``graph_weight`` to give the recency and graph
-    signals a baseline at all — see the comment above ``HYBRID_CURRENT_CYCLE``
-    in golden_fixtures.py. Every live re-query against the
-    ``HYBRID_RANKED_GOLDEN_PATH`` golden must reproduce them exactly, or a
+    A directly-constructed store needs an explicit ``current_cycle`` to give
+    the recency and graph signals a reference to activate on at all, and an
+    explicit ``graph_weight`` to give the opt-in graph signal a non-zero
+    baseline — ``recency_weight`` is passed too, pinning the golden to a
+    literal this module owns rather than to whatever ``SearchConfig``'s own
+    default happens to be on a given release; see the comment above
+    ``HYBRID_CURRENT_CYCLE`` in golden_fixtures.py. Every live re-query against
+    the ``HYBRID_RANKED_GOLDEN_PATH`` golden must reproduce them exactly, or a
     live call that silently drifted from how the golden was generated would
     "pass" by comparing two different queries rather than catching a
     regression.

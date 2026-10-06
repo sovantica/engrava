@@ -1195,16 +1195,22 @@ def _ingest_from_page() -> object:
     return namespace["ingest"]
 
 
-async def test_tutorial_hash_vectors_are_what_separate_the_lower_notes(
+async def test_tutorial_hash_vectors_and_recency_together_separate_the_lower_notes(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """tutorial.md: "run the same query with vector_weight=0.0 and those three tie".
+    """tutorial.md: "zero both vector_weight and recency_weight and those three tie".
 
     The page explains its own ranking by saying the arbitrary hash-vector scores
-    are what separates everything below the top hit. That is a causal claim about
-    one arm of a fused ranking, and the published transcript cannot show it — the
-    transcript also carries a priority signal, which could just as well have
-    produced the order. So run the ablation the page names.
+    are what separates everything below the top hit. With recency active by
+    default too (see the single-source-of-defaults fix: a direct-constructor
+    store resolves it the same as every other construction path), that is only
+    half the story — the vector arm alone is not what ties the bottom three;
+    zeroing it alone still leaves them distinct, because the real, cycle-based
+    recency signal still separates them on its own. Only zeroing *both* ties
+    them, which is the page's actual claim. Run three ablations to show the
+    whole shape: vector alone zeroed (still distinct — recency still separates),
+    recency alone zeroed (still distinct — vector's arbitrary hash still
+    separates), and both zeroed together (tied).
 
     The scenario is the page's: its ``embed``, its ``NOTES``, its ``ingest``, its
     ``link`` between the pair its ``main()`` names, its ``search``, the dimension
@@ -1215,8 +1221,9 @@ async def test_tutorial_hash_vectors_are_what_separate_the_lower_notes(
     A page-only change to its corpus, its priorities, its linking or its search
     call then fails here rather than leaving this paragraph quietly false.
 
-    The lower scores are compared **exactly**, not rounded: "tie" is the claim,
-    and three distinct scores that round alike would satisfy a rounded one.
+    The both-zeroed scores are compared **exactly**, not rounded: "tie" is the
+    claim, and three distinct scores that round alike would satisfy a rounded
+    one.
     """
     pieces = _tutorial_pieces()
     embed = cast("Callable[[str], list[float]]", pieces["embed"])
@@ -1243,30 +1250,56 @@ async def test_tutorial_hash_vectors_are_what_separate_the_lower_notes(
         await search(store, _tutorial_query(), len(notes))
         printed = capsys.readouterr().out.strip()
 
-        ablated = await store.search_hybrid(
+        vector_off_only = await store.search_hybrid(
             _tutorial_query(),
             top_k=len(notes),
             current_cycle=len(notes),
             vector_weight=0.0,
         )
+        recency_off_only = await store.search_hybrid(
+            _tutorial_query(),
+            top_k=len(notes),
+            current_cycle=len(notes),
+            recency_weight=0.0,
+        )
+        both_off = await store.search_hybrid(
+            _tutorial_query(),
+            top_k=len(notes),
+            current_cycle=len(notes),
+            vector_weight=0.0,
+            recency_weight=0.0,
+        )
 
-    # Precondition: this store reproduces the page. Without it the ablation below
-    # would be a statement about some other corpus that resembles the tutorial's.
+    # Precondition: this store reproduces the page. Without it the ablations
+    # below would be a statement about some other corpus that resembles the
+    # tutorial's.
     assert printed == documented, (
         f"This scenario no longer reproduces {_TUTORIAL}'s published output, so "
-        f"the ablation below would say nothing about that page.\n"
+        f"the ablations below would say nothing about that page.\n"
         f"--- documented ---\n{documented}\n--- produced ---\n{printed}"
     )
 
-    scores = [score for _, score in ablated.results]
-    assert len(scores) == len(notes)
-    # Everything below the top hit collapses to a single identical score once the
-    # arbitrary vector contribution is removed, so nothing but that arm was
-    # ordering them in the output the page publishes.
-    assert len(set(scores[1:])) == 1
-    assert scores[0] > scores[1]
+    vector_off_scores = [score for _, score in vector_off_only.results]
+    recency_off_scores = [score for _, score in recency_off_only.results]
+    both_off_scores = [score for _, score in both_off.results]
+    assert len(vector_off_scores) == len(recency_off_scores) == len(both_off_scores) == len(notes)
+
+    # Zeroing the vector arm alone does NOT tie the lower notes: the real,
+    # cycle-based recency signal still separates them on its own.
+    assert len(set(vector_off_scores[1:])) == len(vector_off_scores) - 1, (
+        f"vector_weight=0.0 alone unexpectedly tied the lower notes: {vector_off_scores}"
+    )
+    # Zeroing recency alone does NOT tie them either: the vector arm's
+    # arbitrary hash scores still separate them on their own (this is the
+    # pre-single-source-of-defaults behaviour, still true with recency off).
+    assert len(set(recency_off_scores[1:])) == len(recency_off_scores) - 1, (
+        f"recency_weight=0.0 alone unexpectedly tied the lower notes: {recency_off_scores}"
+    )
+    # Only zeroing both ties them — this is the page's actual claim.
+    assert len(set(both_off_scores[1:])) == 1
+    assert both_off_scores[0] > both_off_scores[1]
     # The page prints that number; pin it, or the prose could name any value.
-    assert f"{scores[1]:.3f}" == _tutorial_ablated_score()
+    assert f"{both_off_scores[1]:.3f}" == _tutorial_ablated_score()
 
 
 def test_upgrade_page_publishes_the_error_the_code_actually_raises() -> None:
@@ -1391,9 +1424,11 @@ async def test_migration_guide_edges_do_not_feed_ranking_at_defaults() -> None:
     ``ASSOCIATED`` edge, rank identically at defaults — and the search reports
     no graph signal at all.
 
-    Both stores are exercised, because the two resolve the default from
-    different places: one from ``SearchConfig.default_graph_weight``, which the
-    page names, and one from the core's config-less fallback.
+    Both stores are exercised, because the two resolve ``default_graph_weight``
+    from different places: one from ``SearchConfig.default_graph_weight``, which
+    the page names, and one from the core's config-less fallback — now the same
+    single source, so both must also produce the identical frozen order below,
+    not merely agree on the graph signal's absence.
 
     The opted-in half is asserted in the same test rather than left to a
     mutation, because it is the page's own point. Without it, "the edge changed
@@ -1407,11 +1442,14 @@ async def test_migration_guide_edges_do_not_feed_ranking_at_defaults() -> None:
     assert DeriveGates().enabled is False
 
     # The frozen default order, written down rather than compared to itself: two
-    # rankings that agree prove nothing if a change moves both.
+    # rankings that agree prove nothing if a change moves both. Both the
+    # config-less store and the explicit SearchConfig() store resolve every
+    # hybrid-search default from the same place, so both produce this order —
+    # including the recency signal, active on both now that a cycle is passed.
     frozen_default = [
         "The espresso machine descaling is overdue.",
-        "Coffee tastes better with freshly ground beans.",
         "Buy oat milk and coffee beans on the way home.",
+        "Coffee tastes better with freshly ground beans.",
     ]
 
     for with_config in (False, True):
@@ -1424,12 +1462,7 @@ async def test_migration_guide_edges_do_not_feed_ranking_at_defaults() -> None:
         assert with_edge == without_edge
         assert "graph" not in signals_without
         assert "graph" not in signals_with
-        if not with_config:
-            # The store the page's own defaults produce. (With a SearchConfig the
-            # recency arm also activates — a separate, out-of-scope inconsistency
-            # between that default and the config-less one — so its order is only
-            # required to be edge-independent, not to equal this.)
-            assert without_edge == frozen_default
+        assert without_edge == frozen_default
 
         # Opting in turns the signal on, for the very same store and edge — so
         # the absences above are the default weight's doing.
@@ -1439,6 +1472,9 @@ async def test_migration_guide_edges_do_not_feed_ranking_at_defaults() -> None:
         assert "graph" in opted_in_signals
 
     # ...and on the config-less path the opted-in signal actually moves the order.
+    # (0.8, not the 0.4 used above merely to show the signal switches on: with
+    # the recency signal now also contributing on this path, 0.4 of graph
+    # is not yet enough to outweigh it and flip the order — 0.8 is.)
     baseline, _ = await _rank_with_optional_edge(edge=False, graph_weight=None, with_config=False)
-    opted_in, _ = await _rank_with_optional_edge(edge=True, graph_weight=0.4, with_config=False)
+    opted_in, _ = await _rank_with_optional_edge(edge=True, graph_weight=0.8, with_config=False)
     assert opted_in != baseline

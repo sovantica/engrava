@@ -101,7 +101,12 @@ asyncio.run(main())
 
 `remember()` stores the text as a thought (generating its ID for you) and
 returns the stored `ThoughtRecord`; `recall()` runs the same hybrid search as
-`search_hybrid()` and returns the ranked results. For full control — setting
+`search_hybrid()` and returns the ranked results. This `store` has no
+`SearchConfig` of its own, and it still ranks with the same default weights —
+FTS `0.30`, vector `0.55`, recency `0.10`, priority `0.05`, graph `0.00`
+(opt-in) — as a store built with one; see [Hybrid
+Search](https://github.com/sovantica/engrava/blob/main/docs/search.md#signal-model).
+For full control — setting
 priority, thought type, metadata, or the cognitive cycle on a write — build a
 `ThoughtRecord` yourself and call `create_thought()`.
 

@@ -11763,37 +11763,34 @@ class SqliteEngravaCore:
             ValueError: If any weight is negative or half-life is invalid.
 
         """
-        search_config = self._search_config
+        # One source for every fallback: a store with no SearchConfig resolves
+        # exactly SearchConfig()'s own field defaults, never a literal that could
+        # drift from them (see SearchConfig in engrava.config).
+        from engrava.config import (  # noqa: PLC0415 -- deferred: the config module imports this one
+            SearchConfig as _SearchConfig,
+        )
+
+        search_config = self._search_config or _SearchConfig()
 
         resolved_fts_weight = (
-            fts_weight
-            if fts_weight is not None
-            else (search_config.default_fts_weight if search_config is not None else 0.3)
+            fts_weight if fts_weight is not None else search_config.default_fts_weight
         )
         resolved_vector_weight = (
-            vector_weight
-            if vector_weight is not None
-            else (search_config.default_vector_weight if search_config is not None else 0.55)
+            vector_weight if vector_weight is not None else search_config.default_vector_weight
         )
         resolved_recency_weight = (
-            recency_weight
-            if recency_weight is not None
-            else (search_config.default_recency_weight if search_config is not None else 0.0)
+            recency_weight if recency_weight is not None else search_config.default_recency_weight
         )
         resolved_recency_half_life = (
-            recency_half_life
-            if recency_half_life is not None
-            else (search_config.recency_half_life if search_config is not None else 50)
+            recency_half_life if recency_half_life is not None else search_config.recency_half_life
         )
         resolved_priority_weight = (
             priority_weight
             if priority_weight is not None
-            else (search_config.default_priority_weight if search_config is not None else 0.05)
+            else search_config.default_priority_weight
         )
         resolved_graph_weight = (
-            graph_weight
-            if graph_weight is not None
-            else (search_config.default_graph_weight if search_config is not None else 0.0)
+            graph_weight if graph_weight is not None else search_config.default_graph_weight
         )
 
         if resolved_fts_weight < 0.0:
@@ -13506,12 +13503,19 @@ class SqliteEngravaCore:
             reflection_ids, effective_vector, q_norm, embeddings_by_id
         )
 
-        # Optional recency blend when current_cycle is provided
+        # Optional recency blend when current_cycle is provided. One source for
+        # the fallback: a store with no SearchConfig resolves exactly
+        # SearchConfig()'s own field defaults, the same as search_hybrid's
+        # _resolve_hybrid_defaults (see SearchConfig in engrava.config).
         if current_cycle is not None:
             backends_used_set.add("recency")
-            search_config = self._search_config
-            recency_weight = search_config.default_recency_weight if search_config else 0.1
-            recency_half_life = search_config.recency_half_life if search_config else 50
+            from engrava.config import (  # noqa: PLC0415 -- deferred: the config module imports this one
+                SearchConfig as _SearchConfig,
+            )
+
+            search_config = self._search_config or _SearchConfig()
+            recency_weight = search_config.default_recency_weight
+            recency_half_life = search_config.recency_half_life
             if recency_weight > 0.0:
                 recency_scores = await self._load_recency_scores(
                     thought_ids={rid for rid, _ in scores},

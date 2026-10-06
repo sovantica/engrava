@@ -168,10 +168,10 @@ Run it and you'll see the top three notes for the coffee query, plus the total
 count:
 
 ```text
-Query: 'anything about coffee?'  (signals: ['fts5', 'priority', 'vector'])
-  0.844  Coffee tastes better with freshly ground beans.
-  0.504  The espresso machine descaling is overdue.
-  0.494  Standup moved to 10am on Thursdays.
+Query: 'anything about coffee?'  (signals: ['fts5', 'priority', 'recency', 'vector'])
+  0.858  Coffee tastes better with freshly ground beans.
+  0.550  The espresso machine descaling is overdue.
+  0.542  Standup moved to 10am on Thursdays.
 
 Stored 4 notes.
 ```
@@ -186,10 +186,12 @@ combine to produce it:
   across its candidates, so the weaker of the two matches is pinned to `0.0` —
   the oat-milk note loses its entire keyword contribution.
 - The hash vectors still score every note, but a sha256 digest has no relation
-  to meaning, so those scores are effectively arbitrary. They are what separates
-  the bottom three: run the same query with `vector_weight=0.0` and those three
-  come back with one and the same score (`0.043`, to three decimals). Here the
-  arbitrary scores happen to put the standup note above the oat-milk note.
+  to meaning, so those scores are effectively arbitrary. The vector arm and
+  the real, cycle-based recency signal together are what separates the bottom
+  three: either one alone still separates them, but run the same query with
+  both `vector_weight=0.0` and `recency_weight=0.0` and those three come back
+  with one and the same score (`0.043`, to three decimals). Here the arbitrary
+  scores happen to put the standup note above the oat-milk note.
 
 Swap the toy `embed` for a provider backed by a semantic embedding model (see the
 [Embeddings guide](guides/embeddings.md)) and the vector scores start reflecting

@@ -218,22 +218,6 @@ _UNPARSEABLE_ALLOWLIST: dict[_ClauseKey, str] = {
     (
         "docs/search.md",
         (
-            "**The table's defaults apply only when a `SearchConfig` is passed to the "
-            "store.** `SqliteEngravaCore(conn, ...)` with no `search_config` argument "
-            "resolves `default_recency_weight` to `0.0`, not `0.10` — the two are "
-            "separate defaults that disagree, and recency is silently inert on a store "
-            "built the plain way until you pass a `SearchConfig` explicitly (or an explicit "
-            "per-call `recency_weight`)."
-        ),
-    ): (
-        "value tokens: `search_config`, `0.0`, `0.10`, `recency_weight` -- two "
-        "contrasting numbers (`0.0`, `0.10`) plus the parameter names `search_config` "
-        "and `recency_weight`, all picked up as value-shaped tokens -- "
-        "4 values against 1 field"
-    ),
-    (
-        "docs/search.md",
-        (
             "When `collapse_key` is set (or the reflection cap is below `1.0`, which the "
             "default `0.3` is), the fallback also widens its own row window by "
             "`search.collapse_pool_factor` beyond `top_k`, the same bounded headroom "
