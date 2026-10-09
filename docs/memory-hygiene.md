@@ -158,6 +158,15 @@ be archived — a model-confidence estimate is not a user keep-decision.
 more aggressive hygiene can set it to `()` so even top-priority thoughts are
 eligible. Pinning is the invariant.
 
+**This protection also covers the orphan-REFLECTION sweep and `engrava gc`.**
+A pinned or protected-priority REFLECTION is never retired by the sweep
+described in [Dreaming → Orphan sweep](dreaming.md#orphan-sweep), and the CLI's
+`engrava gc` keeps a pinned or protected-priority `ARCHIVED` row by default
+(`--include-pinned` overrides it) — see [Data lifecycle → Running cleanup](data-lifecycle.md#running-cleanup).
+**This protection is not a TTL exemption.** A protected-priority thought with
+an expired TTL still expires — only `pinned` exempts a row from TTL cleanup;
+see [Data lifecycle → Time-to-live](data-lifecycle.md#time-to-live-ttl-and-expiry).
+
 ## Two stages: archive, then (optionally) GC
 
 Stage 1 (archive) is the **default action** and is reversible for lifecycle

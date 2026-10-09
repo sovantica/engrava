@@ -391,6 +391,10 @@ class TestOffOnPair:
 # stop *benchmark* code leaking into `__all__`; a core exception is not that,
 # and the correct response to it firing here is a deliberate update to this
 # baseline, not a silenced test.
+#
+# Extended with ReadOnlyAccessor and ReadOnlyCursor: deliberate core exports,
+# the types a MindQL extension handler receives instead of the live
+# connection. Not benchmark code.
 _ALL_BASELINE = frozenset(
     {
         "ActionNotFoundError",
@@ -484,6 +488,8 @@ _ALL_BASELINE = frozenset(
         "OpenAICompatibleProvider",
         "Priority",
         "ProvenanceContext",
+        "ReadOnlyAccessor",
+        "ReadOnlyCursor",
         "ReadOnlyEngrava",
         "ReadOnlyMindStore",
         "ReadOnlyViolationError",

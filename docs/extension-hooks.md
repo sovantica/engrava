@@ -432,19 +432,22 @@ care about.
 
 A custom MindQL command is an `MindQLExtension` whose `handler` is an async
 callable. The executor invokes the handler with **two positional arguments** —
-the open `aiosqlite.Connection` and the parsed extension-argument list — and
-expects a `list[dict[str, object]]` back:
+a `ReadOnlyAccessor` wrapping the store's connection and the parsed
+extension-argument list — and expects a `list[dict[str, object]]` back. The
+accessor's only capability is `execute()`, which runs a single `SELECT`
+statement through the same guard as the `SELECT` passthrough command; see
+[MindQL: Extension Commands](mindql.md#extension-commands) for the full
+read-only contract:
 
 ```python
 from __future__ import annotations
 
-import aiosqlite
-
 from engrava.domain.protocols.hooks import MindQLExtension
+from engrava.mindql.executor import ReadOnlyAccessor
 
 
 async def _recent_handler(
-    db: aiosqlite.Connection,
+    db: ReadOnlyAccessor,
     args: list[str],  # noqa: ARG001 — this command takes no args
 ) -> list[dict[str, object]]:
     """Return the 100 most recently updated thoughts."""

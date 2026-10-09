@@ -39,8 +39,9 @@ canonical reverse path: it returns an archived thought to `ACTIVE` and clears
 the hygiene archive stamps. Two maintenance mechanisms have dedicated archival
 paths outside the ordinary `evolve()` sequence:
 
-- TTL cleanup with the `archive` strategy archives any expired row, clears its
-  `expires_at`, and clears the hygiene-specific archive stamps.
+- TTL cleanup with the `archive` strategy archives any expired row that is not
+  pinned, clears its `expires_at`, and clears the hygiene-specific archive
+  stamps. A pinned row is never expired (see below).
 - Memory Hygiene may archive an eligible `ACTIVE` or `CREATED` row, clears its
   `expires_at`, and stamps `archived_at_cycle` plus `archived_at` for its restore
   windows.
@@ -108,6 +109,17 @@ Ranked retrieval (`search_hybrid`, `recall`, `search_fts`, and
 before cleanup has archived or deleted them. `include_expired` belongs only to
 the list/count APIs; it is not a ranked-search parameter.
 
+**A pinned thought is never expired.** A cleanup pass skips every row with
+`pinned = True`, whether reached directly (`cleanup_expired()`), through the
+`ttl.check_every_n_operations` cadence, or through the CLI's `gc --expired` —
+neither archived nor deleted, and reported separately (`pinned_kept_count`,
+below) rather than silently dropped from the count. `pinned` is the row's own
+durable keep-intent marker, so a store-wide `ttl.default_ttl_seconds` must not
+override it. A [protected priority](memory-hygiene.md#protection--what-never-gets-forgotten)
+(`P1` by default) is **not** exempt here: that protection is a Memory Hygiene
+concept, and a TTL is the row's own explicit lifetime — only `pinned` is a TTL
+exemption.
+
 ## Archive vs. delete
 
 What a cleanup pass *does* to an expired thought is governed by the store's TTL
@@ -134,6 +146,7 @@ result = await store.cleanup_expired()
 print(result.expired_count)  # how many thoughts were expired
 print(result.strategy_applied)  # "archive" or "delete" (per config)
 print(result.timestamp)  # ISO-8601 time of the pass
+print(result.pinned_kept_count)  # past-TTL rows kept because they are pinned
 ```
 
 You can also have the store run cleanup automatically via
@@ -173,6 +186,17 @@ live — their embeddings and the actions sourced from them, then reconciles the
 vector index by removing every `vec0` row no `embedding` row owns. This is how
 archived data is finally deleted from the live table.
 
+**`gc` keeps pinned and protected-priority rows by default.** An `ARCHIVED`
+thought that is `pinned`, or at a priority in the hygiene policy's
+protected-priority set, survives a plain `gc` — it prints how many it kept.
+Pass `--include-pinned` to delete them too, the unconditional behaviour `gc`
+used to always have. See [Forgetting → Protection](memory-hygiene.md#protection--what-never-gets-forgotten)
+for the default protected-priority set and how `--config`'s `hygiene_policy:`
+section overrides it.
+When `--config` names an `engrava.yaml` with `journal.enabled: true`, `gc` also
+appends a `DELETE_THOUGHT` journal entry per row it deletes, in the same
+transaction as the delete.
+
 > **`gc` refuses to delete on a `vec0`-indexed store without the vector extra.**
 > If the database carries an `embedding_vec` table and `sqlite-vec` cannot be
 > loaded — most commonly because `engrava[vec]` is not installed, though an
@@ -207,7 +231,10 @@ procedure below addresses the following:
    command falls through and **does** collect pre-existing `ARCHIVED` rows, so do
    not read "it only archives" as a guarantee that nothing was deleted. To remove
    the row deliberately, run a **separate** `engrava gc`, or use
-   `ttl.strategy: delete` so the row is deleted outright.
+   `ttl.strategy: delete` so the row is deleted outright. **If the row is pinned,
+   or at a protected priority (`P1` by default), `engrava gc` keeps it instead of
+   deleting it** — pass `--include-pinned` when an erasure target may be one of
+   those.
 2. **The audit journal retains a content delta.** If the
    [audit journal](audit-trail.md) is enabled, the thought's content can live in
    that journal independently of how it is later deleted: the original
@@ -217,9 +244,11 @@ procedure below addresses the following:
    `DELETE_THOUGHT` entry carrying the same content — so the data survives in
    `journal_entry` after the thought row is gone, in the insert/update entry if
    nothing else. The CLI's `engrava gc` (and `gc --expired`) construct their own
-   connection without journaling, so a deletion made that way records no
-   `DELETE_THOUGHT` entry at all even when `journal.enabled` is set in config —
-   see [Audit Trail](audit-trail.md#what-gets-recorded) — but that does not
+   connection, so they journal a deletion made that way only when `--config`
+   names an `engrava.yaml` with `journal.enabled: true`; without `--config`, or
+   with journaling disabled, no `DELETE_THOUGHT` entry is recorded for it even
+   when a store opened elsewhere has `journal.enabled` set — see
+   [Audit Trail](audit-trail.md#what-gets-recorded) — but that does not
    remove the earlier insert or update entry either way. A true erasure must
    purge every journal entry that carries this content: the original insert
    (and any update), and the delete entry if one exists. Purging a non-tail

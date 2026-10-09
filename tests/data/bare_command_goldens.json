@@ -107,7 +107,7 @@
       "--dry-run"
     ],
     "exit_code": 0,
-    "output": "No archived thoughts to collect.\n"
+    "output": "Would delete 0 archived thoughts, plus their edges, embeddings, and actions.\nWould keep 0 archived thoughts because they are protected.\n"
   },
   {
     "args": [

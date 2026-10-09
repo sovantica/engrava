@@ -43,6 +43,7 @@ from engrava.cli.snapshot_records import (
 )
 from engrava.config import (
     EmbeddingConfig,
+    EngravaConfig,
     ServicesConfig,
     resolve_embedding_provider,
 )
@@ -779,8 +780,8 @@ def _configure_verbose_logging(ctx: click.Context) -> None:
 # ------------------------------------------------------------------
 
 #: Subcommands that read ``ctx.obj["services_config"]`` / ``["default_embeddings"]``
-#: — see the ``cli()`` group callback below, which loads a ``--config`` file
-#: only when the invoked subcommand is one of these two.
+#: / ``["full_config"]`` — see the ``cli()`` group callback below, which loads
+#: a ``--config`` file only when the invoked subcommand is one of these two.
 _SERVICES_CONFIG_COMMANDS = frozenset({"snapshot", "restore"})
 
 
@@ -893,15 +894,17 @@ def cli(
 
     # Pre-load services config for --service default resolution. Gated on the
     # two commands that actually read ``services_config`` / ``default_embeddings``
-    # off ``ctx.obj`` (``snapshot`` and ``restore`` — see their own bodies
-    # below): every other command, including the memory verbs (they resolve
-    # their own database through engrava.cli.store_resolution and never touch
-    # either value), skips this load — and its failure. A group callback runs
-    # before Click even knows which subcommand's options to parse, so an
-    # unconditional load would raise on a broken --config before a
-    # subcommand's own precedence logic ever ran, whatever --db said.
+    # / ``full_config`` off ``ctx.obj`` (``snapshot`` and ``restore`` — see
+    # their own bodies below): every other command, including the memory
+    # verbs (they resolve their own database through
+    # engrava.cli.store_resolution and never touch any of these values),
+    # skips this load — and its failure. A group callback runs before Click
+    # even knows which subcommand's options to parse, so an unconditional
+    # load would raise on a broken --config before a subcommand's own
+    # precedence logic ever ran, whatever --db said.
     services_cfg = None
     default_embeddings = None
+    full_config = None
     if ctx.invoked_subcommand in _SERVICES_CONFIG_COMMANDS and cfg.config_path is not None:
         from engrava.config import load_config  # noqa: PLC0415
 
@@ -912,8 +915,14 @@ def cli(
             sys.exit(1)
         services_cfg = ms_config.services
         default_embeddings = ms_config.embeddings
+        full_config = ms_config
     ctx.obj["services_config"] = services_cfg
     ctx.obj["default_embeddings"] = default_embeddings
+    # The full parsed config, passed to EngravaManager as ``base_config`` so
+    # a multi-service CLI command gets the same journal / hygiene / TTL /
+    # hooks / dreaming wiring a single-database ``from_config`` open gets,
+    # instead of only the PRAGMAs and the embedding provider.
+    ctx.obj["full_config"] = full_config
 
     # Whether --db (or ENGRAVA_DB) was actually supplied, as opposed to
     # cfg.db_path holding the CLI's own hardcoded default. EngravaCLIConfig
@@ -1052,7 +1061,6 @@ def query(ctx: click.Context, mql: str) -> None:
             click.echo(f"Database not found: {cfg.db_path}")
             sys.exit(1)
 
-        from engrava.mindql.executor import MindQLExecutor  # noqa: PLC0415
         from engrava.mindql.parser import (  # noqa: PLC0415
             MindQLCommand,
             MindQLParseError,
@@ -1073,10 +1081,12 @@ def query(ctx: click.Context, mql: str) -> None:
 
                 # The schema-version gate classifies the *parsed* command, not
                 # the CLI command name — FIND/COUNT/SELECT are reads (warn and
-                # attempt on a behind schema); EXTENSION can write (there is
-                # today no read-only accessor for an extension handler to run
-                # under, so it is refused on a behind schema like any other
-                # destructive operation). Every classification also refuses a
+                # attempt on a behind schema); EXTENSION is still gated as
+                # destructive even though a handler now runs under a
+                # read-only accessor rather than the live connection (see
+                # ReadOnlyAccessor in engrava.mindql.executor): a stale schema
+                # can still be one a handler's assumptions about column shape
+                # do not hold against. Every classification also refuses a
                 # newer-than-head schema outright.
                 schema_version = await _read_schema_version(conn)
                 if parsed.command is MindQLCommand.EXTENSION:
@@ -1084,8 +1094,8 @@ def query(ctx: click.Context, mql: str) -> None:
                 else:
                     _apply_read_schema_gate_for_version(schema_version, command="query")
 
-                executor = MindQLExecutor(conn, extensions=extensions)
-                result = await executor.execute(parsed)
+                store = SqliteEngravaCore(conn)
+                result = await store.execute_mindql(parsed, extensions=extensions)
                 click.echo(_format_rows(result.rows, cfg.output_format, columns=result.columns))
             except MindQLParseError as exc:
                 click.echo(f"Query error: {exc}", err=True)
@@ -1571,6 +1581,7 @@ def snapshot(ctx: click.Context, output_path: str | None, service_name: str | No
     """
     cfg: EngravaCLIConfig = ctx.obj["config"]
     services_cfg: ServicesConfig | None = ctx.obj.get("services_config")
+    full_config: EngravaConfig | None = ctx.obj.get("full_config")
 
     # Resolve default service from config if --service not given.
     effective_service = service_name
@@ -1591,9 +1602,15 @@ def snapshot(ctx: click.Context, output_path: str | None, service_name: str | No
             )
 
             data_dir = services_cfg.data_dir if services_cfg else cfg.db_path.parent
+            # ``base_config`` is the loaded ``engrava.yaml`` (when ``--config``
+            # was given): it gets the manager's store the same journal /
+            # hygiene / TTL / hooks / dreaming wiring a single-database
+            # ``from_config`` open gets, instead of only the PRAGMAs and the
+            # embedding provider.
             manager = EngravaManager(
                 data_dir=data_dir,
                 services_config=services_cfg,
+                base_config=full_config,
             )
             if not manager.service_exists(effective_service):
                 click.echo(
@@ -3198,6 +3215,7 @@ async def _restore_service_snapshot(
     cfg: EngravaCLIConfig,
     services_cfg: ServicesConfig | None,
     default_embeddings: EmbeddingConfig | None,
+    base_config: EngravaConfig | None,
 ) -> None:
     """Restore a JSONL snapshot into a named service database.
 
@@ -3211,10 +3229,17 @@ async def _restore_service_snapshot(
     # The service name was validated up front by the command (see restore()), so
     # ``effective_service`` is a well-formed, non-empty name here.
     data_dir = services_cfg.data_dir if services_cfg else cfg.db_path.parent
+    # ``default_embeddings`` keeps its existing, ``--re-embed``-gated meaning
+    # regardless of ``base_config``: passing it explicitly here (rather than
+    # relying on ``base_config.embeddings``) is what keeps an ordinary
+    # restore from instantiating an embedding provider it was never asked
+    # for. ``base_config`` still applies everything else — the journal,
+    # hygiene policy, TTL, hooks and dreaming — to the restored store.
     manager = EngravaManager(
         data_dir=data_dir,
         default_embeddings=default_embeddings if re_embed else None,
         services_config=services_cfg,
+        base_config=base_config,
     )
     try:
         # restore is destructive (an existing target can be cleared, and is
@@ -3401,6 +3426,7 @@ def restore(
     cfg: EngravaCLIConfig = ctx.obj["config"]
     services_cfg: ServicesConfig | None = ctx.obj.get("services_config")
     default_embeddings: EmbeddingConfig | None = ctx.obj.get("default_embeddings")
+    full_config: EngravaConfig | None = ctx.obj.get("full_config")
 
     if re_embed and skip_embeddings:
         click.echo("Error: --re-embed and --skip-embeddings are mutually exclusive.", err=True)
@@ -3435,6 +3461,7 @@ def restore(
                 cfg=cfg,
                 services_cfg=services_cfg,
                 default_embeddings=default_embeddings,
+                base_config=full_config,
             )
         else:
             await _restore_single_db(
@@ -3551,6 +3578,12 @@ async def _gc_expired(
 
     Returns True when the caller should skip the subsequent archived-GC
     (i.e. archive strategy was used and thoughts were moved).
+
+    A pinned row past its TTL is never archived or deleted here — it is kept
+    and reported separately, matching ``cleanup_expired()``'s own behaviour
+    (see its docstring). When the loaded config enables the journal, the
+    store built below journals this pass's archive/delete the way it already
+    journals every other mutation.
     """
     from engrava.config import TTLConfig, load_config  # noqa: PLC0415
     from engrava.domain.models.ttl import CleanupStrategy  # noqa: PLC0415
@@ -3559,25 +3592,36 @@ async def _gc_expired(
     )
 
     ttl_cfg = TTLConfig()
+    journal_enabled = False
     if cfg.config_path and cfg.config_path.exists():
         ms_cfg = load_config(cfg.config_path)
         ttl_cfg = ms_cfg.ttl
+        journal_enabled = ms_cfg.journal.enabled
 
-    store = SqliteEngravaCore(db=conn, ttl_strategy=ttl_cfg.strategy)
+    store = SqliteEngravaCore(
+        db=conn, ttl_strategy=ttl_cfg.strategy, journal_enabled=journal_enabled
+    )
 
+    now_iso = datetime.datetime.now(datetime.UTC).isoformat()
     cursor = await conn.execute(
-        "SELECT COUNT(*) FROM thought WHERE expires_at IS NOT NULL AND expires_at <= ?",
-        (datetime.datetime.now(datetime.UTC).isoformat(),),
+        "SELECT "
+        "SUM(CASE WHEN pinned = 0 THEN 1 ELSE 0 END) AS unpinned, "
+        "SUM(CASE WHEN pinned != 0 THEN 1 ELSE 0 END) AS pinned "
+        "FROM thought WHERE expires_at IS NOT NULL AND expires_at <= ?",
+        (now_iso,),
     )
     row = await cursor.fetchone()
-    exp_count = row[0] if row else 0
+    exp_count = (row["unpinned"] if row else 0) or 0
+    pinned_count = (row["pinned"] if row else 0) or 0
 
-    if exp_count == 0:
+    if exp_count == 0 and pinned_count == 0:
         click.echo("No expired thoughts to cleanup.")
         return False
 
     if dry_run:
         click.echo(f"Would {ttl_cfg.strategy} {exp_count} expired thoughts.")
+        if pinned_count:
+            click.echo(f"Would keep {pinned_count} pinned thoughts with an expired TTL.")
         return False
 
     purge_vectors = False
@@ -3591,60 +3635,280 @@ async def _gc_expired(
     click.echo(
         f"Cleaned up {result.expired_count} expired thoughts (strategy: {result.strategy_applied})."
     )
+    if result.pinned_kept_count:
+        click.echo(f"Kept {result.pinned_kept_count} pinned thoughts with an expired TTL.")
     return result.strategy_applied == CleanupStrategy.ARCHIVE and result.expired_count > 0
+
+
+async def _resolve_gc_protection(
+    cfg: EngravaCLIConfig, *, include_pinned: bool
+) -> tuple[str, list[object], bool]:
+    """Resolve the ``gc`` protection filter and journal setting from ``--config``.
+
+    Args:
+        cfg: The CLI's resolved configuration (for ``config_path``).
+        include_pinned: When ``True``, no protection is applied at all — the
+            returned filter and params select every ``ARCHIVED`` row, matching
+            ``gc``'s pre-protection, unconditional-delete behaviour.
+
+    Returns:
+        ``(archived_filter, protect_params, journal_enabled)``: ``archived_filter``
+        is a SQL predicate (``lifecycle_status = 'ARCHIVED'``, plus the
+        protection clause unless ``include_pinned``) built only from ``?``
+        placeholders; ``protect_params`` are its bind values; ``journal_enabled``
+        is ``ms_cfg.journal.enabled`` when ``--config`` names a file, else
+        ``False``.
+
+    """
+    protected_priorities: tuple[str, ...] = ("P1",)
+    journal_enabled = False
+    if cfg.config_path and cfg.config_path.exists():
+        from engrava.config import load_config  # noqa: PLC0415
+
+        ms_cfg = load_config(cfg.config_path)
+        if ms_cfg.hygiene_policy is not None:
+            protected_priorities = ms_cfg.hygiene_policy.protected_priorities
+        journal_enabled = ms_cfg.journal.enabled
+
+    protect_clause = ""
+    protect_params: list[object] = []
+    if not include_pinned:
+        protect_clause = " AND pinned = 0"
+        if protected_priorities:
+            placeholders = ", ".join("?" for _ in protected_priorities)
+            protect_clause += f" AND priority NOT IN ({placeholders})"
+            protect_params.extend(protected_priorities)
+    return f"lifecycle_status = 'ARCHIVED'{protect_clause}", protect_params, journal_enabled
+
+
+async def _gc_archived_before_snapshots(
+    conn: aiosqlite.Connection, archived_filter: str, protect_params: list[object]
+) -> dict[str, dict[str, object]]:
+    """Read back the pre-delete state of every row ``_gc_archived`` is about to delete.
+
+    Only called when journaling is enabled — the snapshots are the journal's
+    ``DELETE_THOUGHT`` ``before`` images, read through the public
+    :meth:`~engrava.infrastructure.sqlite.engrava_core.SqliteEngravaCore.get_thought`
+    on a throwaway store wrapping the same connection (a pure read: this store
+    is never configured with ``journal_enabled`` or ``access_tracking_enabled``,
+    so it writes nothing of its own).
+
+    Called only after ``_gc_archived`` has taken the write lock with ``BEGIN
+    IMMEDIATE``, so the id read below and the delete it is a before-image of
+    see the same rows: no other connection can insert, archive, pin or
+    re-prioritise a row in between.
+
+    Args:
+        conn: The CLI's own connection.
+        archived_filter: The filter built by :func:`_resolve_gc_protection`.
+        protect_params: Its bind values.
+
+    Returns:
+        Each eligible ``thought_id`` mapped to its row, JSON-serialised.
+
+    """
+    from engrava.infrastructure.sqlite.engrava_core import SqliteEngravaCore  # noqa: PLC0415
+
+    id_cursor = await conn.execute(
+        f"SELECT thought_id FROM thought WHERE {archived_filter}",  # noqa: S608 - only ``?`` placeholders
+        protect_params,
+    )
+    eligible_ids = [r["thought_id"] for r in await id_cursor.fetchall()]
+    snapshot_store = SqliteEngravaCore(db=conn)
+    before_snapshots: dict[str, dict[str, object]] = {}
+    for thought_id in eligible_ids:
+        thought = await snapshot_store.get_thought(thought_id)
+        if thought is not None:
+            before_snapshots[thought_id] = thought.model_dump(mode="json")
+    return before_snapshots
+
+
+async def _journal_gc_deletes(
+    conn: aiosqlite.Connection, before_snapshots: dict[str, dict[str, object]]
+) -> None:
+    """Append one ``DELETE_THOUGHT`` journal entry per row ``_gc_archived`` deleted.
+
+    Args:
+        conn: The CLI's own connection, already carrying the deletes this call
+            journals — the caller commits once, after this returns, so each
+            entry lands in the same transaction as the delete it documents.
+        before_snapshots: Each deleted ``thought_id`` mapped to its pre-delete
+            row, from :func:`_gc_archived_before_snapshots`.
+
+    """
+    from engrava.infrastructure.sqlite.journal_writer import JournalWriter  # noqa: PLC0415
+
+    journal = JournalWriter(conn)
+    for thought_id, before in before_snapshots.items():
+        await journal.append(
+            mutation_type="DELETE_THOUGHT",
+            target_id=thought_id,
+            delta={"before": before, "after": None},
+        )
+
+
+def _echo_gc_archived_preview(eligible_count: int, protected_count: int) -> None:
+    """Report ``--dry-run``'s would-delete and would-keep counts.
+
+    Both numbers print unconditionally, ``0`` included: a preview that drops
+    the would-keep line whenever nothing is protected cannot be told apart
+    from one that never checked.
+    """
+    click.echo(
+        f"Would delete {eligible_count} archived thoughts, "
+        "plus their edges, embeddings, and actions."
+    )
+    click.echo(f"Would keep {protected_count} archived thoughts because they are protected.")
+
+
+def _echo_gc_archived_nothing_eligible(protected_count: int, *, quiet: bool) -> None:
+    """Report that nothing unprotected was left to collect."""
+    if not quiet:
+        click.echo("No archived thoughts to collect.")
+    if protected_count:
+        click.echo(f"Kept {protected_count} archived thoughts because they are protected.")
+
+
+def _echo_gc_archived_collected(collected: int, protected_count: int) -> None:
+    """Report what a real (non-``--dry-run``) pass actually collected and kept."""
+    click.echo(f"Collected {collected} archived thoughts.")
+    if protected_count:
+        click.echo(f"Kept {protected_count} archived thoughts because they are protected.")
 
 
 async def _gc_archived(
     conn: aiosqlite.Connection,
+    cfg: EngravaCLIConfig,
     *,
     dry_run: bool,
     quiet: bool,
+    include_pinned: bool,
 ) -> None:
-    """Physically delete all ARCHIVED thoughts, their edges, embeddings, actions and vectors.
+    """Physically delete ARCHIVED thoughts, their edges, embeddings, actions and vectors.
 
-    Every statement below — the child deletes, the parent delete and the vector
-    purge — runs in the one transaction this function's ``commit`` closes, so a
-    failed purge takes the deletes with it rather than stranding the vectors of
-    rows that are already gone.
+    Pinned and protected-priority ARCHIVED rows are kept by default — the
+    protected-priority set is the configured ``hygiene_policy.protected_priorities``
+    when ``--config`` names an ``engrava.yaml``, else the library default
+    (``P1``). Pass ``include_pinned=True`` to restore the unconditional delete.
+
+    The counts read above — whether anything is archived at all, and the
+    dry-run preview's would-delete / would-keep split — are a lock-free
+    preview: they only decide which message to print or whether to return
+    early, and change nothing. Once a real pass is going to delete, this
+    connection's own ``isolation_level`` is the Python ``sqlite3`` default
+    (``""``), under which the driver opens its own implicit transaction only
+    before the first DML statement — a plain ``SELECT`` never starts one. Left
+    alone, that means the eligible-row read, the before-images and the deletes
+    below would not share one transaction, and a second connection could
+    insert, archive, pin or re-prioritise a row in the gap between the read
+    and the delete — producing a row deleted with no journal entry, or a
+    ``DELETE_THOUGHT`` entry for a row that survived.
+
+    So this takes the write lock with an explicit ``BEGIN IMMEDIATE`` first,
+    before any of: the eligible-id read, the before-images, the child and
+    parent deletes, the journal append and the vector purge. With the lock
+    already held, the driver's own implicit-transaction check sees
+    ``in_transaction`` already ``True`` and never issues a second, nested
+    ``BEGIN`` of its own for the ``DELETE``s that follow. ``_prepare_vector_index_purge``
+    only loads the ``sqlite-vec`` extension and reads a count — no statement of
+    its own that could start or interact with a transaction. Every statement
+    from the lock onward — the eligible-row read, the snapshots, the child
+    deletes, the parent delete, the journal append (when the loaded config
+    enables the journal) and the vector purge — therefore runs in the one
+    transaction this function's own ``commit`` closes, so a failed purge takes
+    the deletes with it rather than stranding the vectors of rows that are
+    already gone. A failure or cancellation anywhere in that block is rolled
+    back before it propagates (see :func:`_rollback_quietly`): no path leaves
+    the connection inside a transaction.
     """
     cursor = await conn.execute("SELECT COUNT(*) FROM thought WHERE lifecycle_status = 'ARCHIVED'")
     row = await cursor.fetchone()
     archived_count = row[0] if row else 0
 
     if archived_count == 0:
-        if not quiet:
+        if dry_run:
+            _echo_gc_archived_preview(0, 0)
+        elif not quiet:
             click.echo("No archived thoughts to collect.")
         return
 
+    archived_filter, protect_params, journal_enabled = await _resolve_gc_protection(
+        cfg, include_pinned=include_pinned
+    )
+
+    eligible_cursor = await conn.execute(
+        f"SELECT COUNT(*) FROM thought WHERE {archived_filter}",  # noqa: S608 - only ``?`` placeholders
+        protect_params,
+    )
+    eligible_row = await eligible_cursor.fetchone()
+    eligible_count = eligible_row[0] if eligible_row else 0
+    protected_count = archived_count - eligible_count
+
     if dry_run:
-        click.echo(
-            f"Would delete {archived_count} archived thoughts, "
-            "plus their edges, embeddings, and actions."
-        )
+        _echo_gc_archived_preview(eligible_count, protected_count)
         return
 
-    purge_vectors = await _prepare_vector_index_purge(conn)
+    if eligible_count == 0:
+        _echo_gc_archived_nothing_eligible(protected_count, quiet=quiet)
+        return
 
-    await conn.execute(
-        "DELETE FROM edge WHERE from_thought_id IN "
-        "(SELECT thought_id FROM thought WHERE lifecycle_status = 'ARCHIVED') "
-        "OR to_thought_id IN "
-        "(SELECT thought_id FROM thought WHERE lifecycle_status = 'ARCHIVED')"
-    )
-    await conn.execute(
-        "DELETE FROM embedding WHERE owner_id IN "
-        "(SELECT thought_id FROM thought WHERE lifecycle_status = 'ARCHIVED')"
-    )
-    await conn.execute(
-        "DELETE FROM action WHERE source_thought_id IN "
-        "(SELECT thought_id FROM thought WHERE lifecycle_status = 'ARCHIVED')"
-    )
-    cursor = await conn.execute("DELETE FROM thought WHERE lifecycle_status = 'ARCHIVED'")
-    collected = cursor.rowcount
-    if purge_vectors:
-        await _reconcile_vector_index(conn)
-    await conn.commit()
-    click.echo(f"Collected {collected} archived thoughts.")
+    try:
+        # Inside the ``try``: a cancellation that lands while this await is
+        # pending can still let the queued ``BEGIN IMMEDIATE`` run on the
+        # worker thread, and the rollback below then closes it. A
+        # ``BEGIN`` that fails outright leaves no transaction, and the
+        # rollback is a no-op.
+        await conn.execute("BEGIN IMMEDIATE")
+        purge_vectors = await _prepare_vector_index_purge(conn)
+
+        before_snapshots: dict[str, dict[str, object]] = {}
+        if journal_enabled:
+            before_snapshots = await _gc_archived_before_snapshots(
+                conn, archived_filter, protect_params
+            )
+
+        # Recomputed under the lock the report below must match what this
+        # pass actually did, not the preview above — a concurrent writer
+        # could still have changed the picture in the window before the
+        # lock was taken.
+        archived_total_cursor = await conn.execute(
+            "SELECT COUNT(*) FROM thought WHERE lifecycle_status = 'ARCHIVED'"
+        )
+        archived_total_row = await archived_total_cursor.fetchone()
+        archived_total = archived_total_row[0] if archived_total_row else 0
+
+        await conn.execute(
+            "DELETE FROM edge WHERE from_thought_id IN "  # noqa: S608 - only ``?`` placeholders
+            f"(SELECT thought_id FROM thought WHERE {archived_filter}) "
+            "OR to_thought_id IN "
+            f"(SELECT thought_id FROM thought WHERE {archived_filter})",
+            [*protect_params, *protect_params],
+        )
+        await conn.execute(
+            "DELETE FROM embedding WHERE owner_id IN "  # noqa: S608 - only ``?`` placeholders
+            f"(SELECT thought_id FROM thought WHERE {archived_filter})",
+            protect_params,
+        )
+        await conn.execute(
+            "DELETE FROM action WHERE source_thought_id IN "  # noqa: S608 - only ``?`` placeholders
+            f"(SELECT thought_id FROM thought WHERE {archived_filter})",
+            protect_params,
+        )
+        cursor = await conn.execute(
+            f"DELETE FROM thought WHERE {archived_filter}",  # noqa: S608
+            protect_params,
+        )
+        collected = cursor.rowcount
+        if journal_enabled and before_snapshots:
+            await _journal_gc_deletes(conn, before_snapshots)
+        if purge_vectors:
+            await _reconcile_vector_index(conn)
+        await conn.commit()
+    except BaseException:
+        await _rollback_quietly(conn)
+        raise
+    protected_count = archived_total - collected
+    _echo_gc_archived_collected(collected, protected_count)
 
 
 @cli.command()
@@ -3654,12 +3918,25 @@ async def _gc_archived(
     is_flag=True,
     help="Also cleanup expired TTL thoughts (archive or delete per config).",
 )
+@click.option(
+    "--include-pinned",
+    is_flag=True,
+    help=(
+        "Also delete pinned and protected-priority archived thoughts "
+        "(without this flag, they are kept)."
+    ),
+)
 @click.pass_context
-def gc(ctx: click.Context, *, dry_run: bool, expired: bool) -> None:
+def gc(ctx: click.Context, *, dry_run: bool, expired: bool, include_pinned: bool) -> None:
     """Garbage-collect archived thoughts, their edges, embeddings, and actions.
 
     With ``--expired``, also clean up expired TTL thoughts first (archived
     or deleted per the configured ``ttl.strategy``).
+
+    Pinned and protected-priority (``P1`` unless ``--config`` names an
+    ``engrava.yaml`` with a different ``hygiene_policy.protected_priorities``)
+    archived thoughts are kept by default. Pass ``--include-pinned`` to delete
+    them too.
     """
     cfg: EngravaCLIConfig = ctx.obj["config"]
 
@@ -3681,7 +3958,9 @@ def gc(ctx: click.Context, *, dry_run: bool, expired: bool) -> None:
                 skip_archived_gc = await _gc_expired(conn, cfg, dry_run=dry_run)
                 if skip_archived_gc:
                     return
-            await _gc_archived(conn, dry_run=dry_run, quiet=expired)
+            await _gc_archived(
+                conn, cfg, dry_run=dry_run, quiet=expired, include_pinned=include_pinned
+            )
 
     _run_command(_gc(), command="gc", db_path=cfg.db_path)
 

@@ -62,7 +62,9 @@ replace the store path with your own.
 | [`mcp-client-config.json`](mcp-client-config.json) | The default stdio block (Claude Desktop, Claude Code, Cursor, Windsurf, Cline, Codex, …). Points at an `engrava.yaml`. |
 | [`mcp-client-config.db-path.json`](mcp-client-config.db-path.json) | Same shape, but points at a bare SQLite file via `ENGRAVA_DB_PATH` (lexical search only). |
 | [`mcp-client-config.readonly.json`](mcp-client-config.readonly.json) | Read-only deployment — `ENGRAVA_MCP_READ_ONLY=true` hides the write tools. |
-| [`mcp-client-config.vscode.json`](mcp-client-config.vscode.json) | VS Code, which nests servers under an `mcp` key. |
+| [`mcp-client-config.vscode.json`](mcp-client-config.vscode.json) | VS Code: the content of `.vscode/mcp.json` (or the profile-level `mcp.json`). |
+
+The settings form — multi-root workspace settings, and the older user `settings.json` (VS Code migrates it to `mcp.json` automatically since 1.102) — nests the same `servers` object one level deeper, under an `mcp` key.
 
 These drive the standalone [`engrava-mcp`](https://github.com/sovantica/engrava-mcp) server — install it with `uvx engrava-mcp` (or `pip install engrava-mcp`).
 

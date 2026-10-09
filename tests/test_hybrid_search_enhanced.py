@@ -435,11 +435,17 @@ class TestBackwardCompat:
         r = await store.search_hybrid("test", [0.1, 0.2, 0.3])
         assert r.results == []
 
-    async def test_default_recency_weight_is_zero(
+    async def test_no_cycle_reference_means_no_recency_impact(
         self,
         store: SqliteEngravaCore,
     ) -> None:
-        """Default recency_weight=0.0 means no recency impact."""
+        """No current_cycle (or recency_now) means recency never activates.
+
+        Not a claim about the resolved recency weight's value — recency is
+        inactive here because no cognitive-cycle or transaction-time
+        reference was passed at all, regardless of what the weight resolves
+        to.
+        """
         await store.create_thought(
             _make("t-bc", essence="Compat test", content="Old style"),
         )

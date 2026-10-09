@@ -205,6 +205,7 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 | 0.4.x | 0.5.0 | Yes | **Schema-changing** minor upgrade (`user_version` 14 → 18), although the library API is drop-in. **Breaking for MCP-server users only:** the `engrava[mcp]` extra and the in-engrava `engrava-mcp` command are removed — the server moved to the standalone [`engrava-mcp`](https://github.com/sovantica/engrava-mcp) package (see the 0.4 → 0.5 note) |
 | 0.5.0 | 0.6.0 | Yes | **Schema-changing** minor upgrade (`user_version` 18 → 20), with two additive columns. Default retrieval now excludes archived thoughts, and wrong-dimension query vectors raise a typed error. An edge `decay_multiplier` of `0.0` no longer reads back as `1.0`, and a later update no longer rewrites it to `1.0` — values a 0.5.x update already overwrote stay overwritten. Back up, quiesce shared-store workers, migrate once, and review the [0.5 → 0.6 notes](#05---06) |
 | 0.6.x | 0.7.0 | Yes | **Schema-changing** minor upgrade (`user_version` 20 → 21): every `thought` / `edge` / `action` row gains a `revision INTEGER NOT NULL DEFAULT 0` column, and stored timestamps are rewritten into one canonical UTC form with no instant changed; `EngravaMetrics.schema_version` separately moves `1 → 2`; and `engrava --format json info` loses its `schema_version` key in favor of `metrics_schema_version` + `database_schema_version` (see below). `update_thought`, `restore_thought`, `update_edge` and `update_action` now check and increment `revision` atomically on every guarded write, so a write that lands after another guarded write touched the same row — including from a second connection or process — raises `StaleDataError` instead of silently overwriting; `update_edge` and `update_action` could never raise it before. No public method signature changed. **Behaviour change:** when the resolved recency weight is `0.0` **and** a cognitive-cycle reference (`current_cycle`, explicit or via `cycle_provider`) is present, the query-less fallback path now treats recency as fully off instead of still decaying by cycle — which can change result order for stores with heterogeneous thought priorities. `recency_now` (transaction-time) callers are unaffected; that axis was already correct. Also in this release: three new `EngravaError` subclasses (`WriteContentionError`, `WriteLockTimeoutError`, `DedupLockReentryError`) can now come out of the dedup and guarded-write paths; a new public override seam, `prepare_thought_for_insert()`, restores pre-insert customization that `get_or_create()` / `upsert_by_hash()` had silently stopped routing through an overridden `create_thought()`; `gc --dry-run` now names everything the real run deletes (edges, embeddings, and actions, not only orphaned edges); reconciliation, the vector-index purge and search now resolve a vector through its `thought` row, and `delete_thought` issues its own deletes for a thought's `edge`, `embedding` and `action` rows; a corrupt or truncated database file now makes the CLI exit with an error instead of hanging; and `restore` now refuses an `embedding` row with an empty `owner_type`/`owner_id`, a non-ISO-8601 `created_at`, or a non-positive `dimension` — every such row was already invalid on every prior release, so this only ever rejects a snapshot that already carried a broken record; and a merge restore (no `--clear`) into a target whose `journal_entry` table is non-empty now refuses any record that collides with an existing row and rolls the whole restore back instead of replacing it, unless `--orphan-journal-entries` is also given — journaling is opt-in and the CLI never enables it, so this only reaches a target that already has journaling on. Also in this release, the dreaming clustering cohesion gate (`cluster_quality_cohesion_threshold`) now divides by both vectors' norms instead of using a raw dot product, moving the score for most non-unit-vector providers. Review the [0.6 → 0.7 notes](#06---07) |
+| 0.7.0 | 0.7.1 | Yes | Patch-level upgrade; no schema change (`user_version` unchanged) — safe to roll across workers. Every change is a defect fix, and each one changes what some caller sees: a MindQL extension handler receives a `SELECT`-only accessor instead of the live connection; a MindQL `WHERE` with a dangling `AND`, or nested more than 256 levels deep, raises; `engrava gc` keeps pinned and protected-priority rows unless `--include-pinned` is given, and TTL never expires a pinned row; `top_k` above the per-arm pool returns a full page; a directly constructed store, or one `EngravaManager` builds with neither `base_config` nor `default_search`, applies recency weight `0.1` when given a recency reference; and `EngravaManager` gains `base_config` to build fully configured stores. Review the [0.7.0 → 0.7.1 notes](#070---071) |
 
 For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 `0.x.*` line do not change the schema and are low-risk; **minor** upgrades
@@ -212,6 +213,147 @@ For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 [rolling-upgrades](#rolling-upgrades-multiple-workers) note below.
 
 ## Version Notes
+
+### 0.7.0 -> 0.7.1
+
+A patch release: no schema change (`user_version` unchanged), safe to roll across workers. Every change below is a
+defect fix, but each one changes what some caller sees.
+
+**Breaking change for MindQL extension authors: a custom command's handler no
+longer receives the live connection.** `MindQLExtension.handler`'s first
+argument used to be the raw `aiosqlite.Connection` the store runs on, which
+let a handler run any SQL through it — including writes, DDL, and `PRAGMA` —
+through what was documented as a read-only query language. The handler now
+receives a `ReadOnlyAccessor` wrapping that connection: its only capability is
+`execute()`, which accepts a single `SELECT` statement (the same guard the
+`SELECT` passthrough already enforced) and returns a restricted cursor
+(`fetchone`, `fetchall`, `fetchmany`, async iteration, and `description` — no
+`execute()`-family method, no `connection`). A handler that only reads
+through a single parameterised `SELECT` — the shape every documented example
+already used — works unchanged; a handler that wrote through the connection
+it used to receive now raises `MindQLParseError` (for anything that is not a
+`SELECT`) or `AttributeError` (for a write attempted through the returned
+cursor, which carries no `execute()`-family method either). No schema
+migration is involved. See [Extensions](extensions.md) and
+[Extension hooks](extension-hooks.md#3-custom-mindql-verb) for the updated
+handler contract, and [MindQL](mindql.md#extension-commands) for the
+accessor's read-only guarantee.
+
+**Behaviour change: MindQL's `WHERE` parser rejects two shapes it used to run.**
+- A leading, trailing or doubled `AND` (`FIND ... WHERE source = x AND`) used to be dropped silently, so the query
+  ran without it. It now raises `MindQLParseError`.
+- A `WHERE` nested more than 256 parentheses deep now raises `MindQLParseError`. Before, such a query parsed up to
+  Python's recursion limit, and deeper input raised `RecursionError`.
+
+Also in this release:
+- `AND` and `OR` are recognised only as whole words outside a quoted value. A value ending in one, followed by a
+  boolean operator, used to fail to parse: `source = vendor OR priority = 1`. It now parses.
+- A quoted value that contains `AND` or `ORDER BY` is read as a value, not as grammar.
+- A doubled quote inside a single-quoted value is one literal quote, SQL-style. `source = 'O''Brien'` used to match
+  the raw text `'O''Brien'` and now matches `O'Brien`. The same value inside an `IN (...)` list used to raise, and
+  now parses.
+
+See [MindQL](mindql.md).
+
+**The `SELECT` passthrough's single-statement check reads SQL the way SQLite does.** It used to reject any `;`
+left after blanking single-quoted literals. A `SELECT` with a `;` inside a comment or a quoted identifier is now
+accepted, and the one statement may be followed by `;`, whitespace and comments. A second statement hidden behind a
+quote inside a comment, which the old check let through, is now refused. The same check guards an extension
+handler's `ReadOnlyAccessor.execute()`.
+
+**`EngravaManager` can build fully configured stores.** It used to give each service's store only the PRAGMAs,
+the embedding provider and the vector backend, so the journal, TTL, metrics, extension manifests, access tracking,
+hygiene policy, derive gates, dreaming, hooks and `require_embedding` never reached a manager-built store. Two new
+optional keywords fix this: `base_config` applies a full `EngravaConfig` to every store the manager builds, and
+`embedding_provider_factory` supplies a caller-built provider per service. `EngravaManager.from_config()` also
+accepts a full `EngravaConfig`. Without `base_config`, the manager wires a store as before. A store it builds
+with neither `base_config` nor `default_search` has no `SearchConfig`, so the recency default change below reaches
+it too; with `base_config`, a store takes `base_config.search`. The CLI's `snapshot` and
+`restore` commands now pass the loaded configuration to the manager as `base_config`. See
+[Configuration](configuration.md) and [Deployment](deployment.md).
+
+**`top_k` above the per-arm pool returns a full page.** `fts_top_k` and `vector_top_k` used to cap each arm's
+candidates below `top_k`, so `search_hybrid()`, and `recall()` through it, returned fewer results than matched once
+`top_k` passed the pool size (50 by default). Each arm's pool is now at least `top_k`. A `top_k` at or below the
+pool is unaffected.
+
+**The VS Code MCP example loads as shipped.** `examples/mcp-client-config.vscode.json` nested its servers under an
+`mcp` key, which `.vscode/mcp.json` does not read. It now holds the `servers` object at the top level, with
+`"type": "stdio"`. See [Examples](../examples/README.md).
+
+**Behaviour change: `engrava gc` keeps pinned and protected-priority archived
+rows by default, instead of deleting every `ARCHIVED` row unconditionally.**
+No schema migration is involved.
+
+**Who is affected.** Anyone who runs `engrava gc` (with or without
+`--expired`) against a store that pins thoughts, or configures
+`hygiene_policy.protected_priorities`, and expects every `ARCHIVED` row to be
+removed. `gc` now deletes only `ARCHIVED` rows that are neither `pinned` nor at
+a protected priority (`P1` unless `--config` names an `engrava.yaml` with a
+different `hygiene_policy.protected_priorities`), and reports how many it kept
+for that reason. Pass `--include-pinned` to restore the previous unconditional
+behaviour. `--dry-run` reports both the would-delete and would-keep counts.
+See [Data lifecycle → Running cleanup](data-lifecycle.md#running-cleanup).
+
+**Also in this release:** `gc --expired`'s TTL pass (`cleanup_expired()`,
+reached directly, through the TTL cadence, or through `gc --expired`) now
+skips a `pinned` row regardless of an expired TTL, so a store-wide default TTL
+no longer overrides pinning. A skipped row is counted in the new
+`CleanupResult.pinned_kept_count` field instead of `expired_count`; it is `0`
+whenever nothing pinned is past its TTL, and existing keyword construction of
+`CleanupResult` is unaffected. A protected-priority row is **not** exempt from
+TTL and still expires. When
+`--config` names an `engrava.yaml` with `journal.enabled: true`, `gc` (both the
+archived-collection pass and the `--expired` TTL pass) now also journals what
+it deletes or archives, where it previously journaled nothing regardless of
+that setting — see [Audit Trail](audit-trail.md#what-gets-recorded). The
+orphan-REFLECTION sweep that runs during dreaming consolidation and before
+Memory Hygiene's own GC stage now also respects pinning and protected
+priorities, and retires a REFLECTION whose entire source cluster was
+hard-deleted (previously it stayed `ACTIVE` indefinitely in that case) — see
+[Dreaming → Orphan sweep](dreaming.md#orphan-sweep). No public method
+signature changed.
+
+**Behaviour change: a directly constructed store (no `SearchConfig`) now
+resolves an omitted `recency_weight` to `0.1`, not `0.0`.** No schema
+migration is involved.
+
+**Who is affected.** Anyone who calls `search_hybrid()` — directly, or
+through `recall()`, which never passes an explicit `recency_weight` of its
+own — with a recency reference (a cognitive cycle, `current_cycle` explicit
+or via `cycle_provider`, or a transaction-time `recency_now`) on a store
+built `SqliteEngravaCore(conn, ...)` with no `search_config` argument — which includes a store
+`EngravaManager` builds with neither `base_config` nor `default_search` — and
+(for a direct `search_hybrid()` call) does not pass an explicit
+`recency_weight`. That one construction path used to carry
+its own literal (`0.0`) for this default; every other path — a default
+`SearchConfig()`, an explicit `SearchConfig(...)`, or `from_config` with no
+override — already resolved it to `0.1`. An explicit per-call
+`recency_weight` to `search_hybrid()` still wins, exactly as before. So does
+an explicit `SearchConfig` you built with a different value for that same
+setting. `search_reflections_only()` is **not** affected: it takes no
+per-call `recency_weight` and consults no `cycle_provider`, and its own
+recency fallback already resolved to `0.1` before this release.
+
+**What changed.** The two defaults disagreed with each other and with the
+documented default (see [Hybrid Search](search.md#signal-model)). Now every
+construction path reads this weight from the same place — `SearchConfig`'s
+own field default — so an omitted `search:` YAML section and `search: {}`
+resolve identically too. Because recency is active whenever a
+recency reference is present **and** the resolved weight is above `0.0`, a
+direct-constructor store that calls `search_hybrid()` (or `recall()`) with
+`current_cycle`, a `cycle_provider` or `recency_now` now activates the recency signal where it previously
+stayed silent, which can reorder results and change the raw scores
+`HybridSearchResult` reports — the same two kinds of effect
+[the 0.6 -> 0.7 fallback-path change](#06---07) below describes, from the
+opposite direction (recency turning on instead of off).
+
+**What to do.** If you relied on a direct-constructor store ranking without
+recency by default, pass `recency_weight=0.0` per call to `search_hybrid()`
+— `recall()` has no such per-call override — or construct with
+`search_config=SearchConfig(default_recency_weight=0.0)` (or the equivalent
+`default_recency_weight: 0.0` in `from_config`'s `search:` section) to keep
+the previous ranking on either method.
 
 ### 0.6 -> 0.7
 

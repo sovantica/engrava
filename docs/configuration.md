@@ -690,4 +690,14 @@ async with await EngravaManager.from_config(config.services) as mgr:
     # Use store normally...
 ```
 
+Passing `config.services` (a bare `ServicesConfig`) wires only the per-service
+`embeddings` override, the PRAGMAs, and the vector backend — every store this
+builds behaves exactly like one from an older `engrava` release. To apply the
+*rest* of `engrava.yaml` to every service as well — the journal, hygiene
+policy, TTL, hooks, dreaming, and `require_embedding` — pass the whole
+`config` instead: `EngravaManager.from_config(config)`. Either form requires
+`config.services` to be set; passing `config` additionally carries everything
+else `config` holds through to each service's store, the same way a
+single-database `SqliteEngravaCore.from_config(...)` open already does.
+
 See the CLI `--service` flag for command-line multi-service access.

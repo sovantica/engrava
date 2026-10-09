@@ -18,12 +18,13 @@ recency reference nor a cycle provider can resolve recency, or no embeddings
 can resolve the vector arm),
 its weight is **redistributed proportionally** across active signals.
 
-**The table's defaults apply only when a `SearchConfig` is passed to the
-store.** `SqliteEngravaCore(conn, ...)` with no `search_config` argument
-resolves `default_recency_weight` to `0.0`, not `0.10` — the two are separate
-defaults that disagree, and recency is silently inert on a store built the
-plain way until you pass a `SearchConfig` explicitly (or an explicit per-call
-`recency_weight`).
+**The table's defaults apply on every construction path.**
+`SqliteEngravaCore(conn, ...)` with no `search_config` argument resolves them
+exactly like a store built with a default `SearchConfig()` or `from_config`
+with no override — one source, `SearchConfig`'s own field defaults, so an
+omitted `search:` section and `search: {}` resolve identically too. An
+explicit per-call weight, or a `SearchConfig` you built with a different
+value, still wins over the table.
 
 ## Graceful Degradation
 
@@ -63,9 +64,10 @@ plain way until you pass a `SearchConfig` explicitly (or an explicit per-call
   reflection cap is below `1.0`, which the default `0.3` is), the fallback
   also widens its own row window by `search.collapse_pool_factor` beyond
   `top_k`, the same bounded headroom collapse and the cap already get from
-  the FTS/vector arms' larger `fts_top_k` / `vector_top_k` budgets — so
-  backfill has distinct candidates to draw from. See the "De-fragmentation /
-  collapse" and `reflection_topk_cap` sections below.
+  the FTS/vector arms' `fts_top_k` / `vector_top_k` pools — each is a
+  **minimum** per-arm pool, raised to `top_k` when smaller, before that
+  widening — so backfill has distinct candidates to draw from. See the
+  "De-fragmentation / collapse" and `reflection_topk_cap` sections below.
 
 The vector arm distinguishes two bad-query-vector cases:
 

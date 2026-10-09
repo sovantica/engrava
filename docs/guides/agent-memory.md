@@ -95,12 +95,13 @@ async def store_percept(store, text, cycle, user_id, session_id, turn_index):
 ## Step 2 — retrieve relevant memory
 
 Before calling the LLM, pull the most relevant prior memories with
-`search_hybrid`. Pass `current_cycle` so the recency signal works — but note
-that with this guide's own plain `SqliteEngravaCore(conn, ...)` constructor
-(no `search_config`), the recency weight resolves to `0.0`, not the `0.10`
-`SearchConfig.default_recency_weight` documented in [Search](../search.md);
-pass a `SearchConfig` explicitly (or an explicit `recency_weight` per call) if
-you want recency to actually contribute. Turn the
+`search_hybrid`. Pass `current_cycle` so the recency signal works — this
+guide's own plain `SqliteEngravaCore(conn, ...)` constructor (no
+`search_config`) resolves the recency weight to the same `0.10`
+`SearchConfig.default_recency_weight` documented in [Search](../search.md) as
+every other construction path; pass an explicit `recency_weight` per call (or
+a `SearchConfig` with a different `default_recency_weight`) if you want a
+different value. Turn the
 returned `(thought_id, score)` tuples back into text via `get_thought`:
 
 ```python

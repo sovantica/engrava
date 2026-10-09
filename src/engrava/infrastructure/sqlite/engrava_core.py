@@ -123,7 +123,13 @@ from engrava.infrastructure.sqlite.journal_writer import JournalWriter
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Sequence
 
-    from engrava.config import HygienePolicyConfig, MetricsConfig, SearchConfig
+    from engrava.config import (
+        EmbeddingConfig,
+        EngravaConfig,
+        HygienePolicyConfig,
+        MetricsConfig,
+        SearchConfig,
+    )
     from engrava.domain.manifest import ExtensionManifest
     from engrava.domain.models.filters import MetadataFilter, VisibilityQueryFilter
     from engrava.domain.models.metrics import EngravaMetrics, LatencyHistogram
@@ -2278,6 +2284,220 @@ class SqliteEngravaCore:
     # ------------------------------------------------------------------
 
     @classmethod
+    async def _build_configured_store(
+        cls,
+        config: EngravaConfig,
+        db_path: Path,
+        *,
+        migrate: bool = True,
+        embeddings: EmbeddingConfig | None,
+        embedding_provider: EmbeddingProviderProtocol | None,
+        cycle_provider: CycleProvider | None,
+        write_lock_acquire_timeout_seconds: float,
+        close_timeout_seconds: float,
+    ) -> Self:
+        """Open *db_path* and wire every setting *config* carries.
+
+        The shared builder behind :meth:`from_config`.
+
+        :meth:`from_config` and ``EngravaManager`` (see
+        ``engrava.infrastructure.service_manager``) both need to open a store
+        from an :class:`~engrava.config.EngravaConfig` with the full set of
+        settings wired — hooks, the embedding provider, the journal, TTL,
+        metrics, extension manifests, access tracking, the hygiene policy,
+        derive gates, dreaming, and the vector backend. This is the one place
+        that does it, in one fixed order, so a setting added here reaches
+        every caller instead of only the one someone remembered to update.
+
+        The two callers differ only in what they pass in: ``from_config``
+        always resolves its own embedding provider from ``config.embeddings``
+        and never skips the schema migration; the manager resolves a
+        possibly per-service ``embeddings`` override, may substitute a
+        caller-supplied ``embedding_provider`` instead of resolving one from
+        config, and may pass ``migrate=False`` for a read against an
+        existing, previously initialized database.
+
+        Args:
+            config: The full configuration to wire. ``config.database_path``
+                is never read here — *db_path* is the file this call opens,
+                which lets a caller (the manager) target a path of its own
+                choosing while applying the rest of *config* unchanged.
+            db_path: The SQLite database file to open.
+            migrate: When ``True`` (the default), calls ``ensure_schema()`` —
+                a fresh database is bootstrapped and an existing behind one is
+                brought to head, and any manifest's extension migrations run
+                with it. When ``False``, the database is opened exactly as
+                stored and neither runs. ``config.journal.verify_on_open``
+                still applies in that case, but only when the core schema the
+                ``journal_entry`` table depends on is already at head
+                (:data:`CORE_SCHEMA_HEAD_VERSION`); otherwise it is skipped
+                with a debug log line rather than walking a chain whose
+                prerequisite schema may not even be there yet.
+            embeddings: The embedding configuration backing ``auto_embed`` /
+                ``require_embedding`` and, absent an explicit
+                *embedding_provider*, the config a provider is resolved from.
+                Kept independent of ``config.embeddings`` so a caller can
+                supply a per-service override without constructing a second
+                ``EngravaConfig`` just to vary it.
+            embedding_provider: A pre-built provider to use verbatim instead
+                of resolving one from *embeddings* — the seam a caller-supplied
+                provider object goes through. ``None`` resolves one from
+                *embeddings* exactly as ``from_config`` always has.
+            cycle_provider: Forwarded verbatim to the constructor — see its
+                own docstring.
+            write_lock_acquire_timeout_seconds: Forwarded verbatim to the
+                constructor.
+            close_timeout_seconds: Forwarded verbatim to the constructor and
+                to :meth:`close`.
+
+        Returns:
+            A configured ``SqliteEngravaCore``, with its schema applied
+            unless *migrate* is ``False``.
+
+        Raises:
+            ConfigError: If a dotted ``hooks_class`` / manifest path cannot be
+                resolved, or an embedding provider cannot be instantiated.
+            JournalIntegrityError: If ``config.journal.verify_on_open`` is
+                enabled, the schema is at head, and the persisted hash chain
+                fails verification.
+
+        """
+        from engrava.config import resolve_hooks  # noqa: PLC0415
+
+        db = await connect(str(db_path))
+        try:
+            if config.wal_mode:
+                await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA foreign_keys=ON")
+            # synchronous=NORMAL is the documented-safe companion to WAL: the
+            # database stays durable across an application crash and is only at
+            # risk of losing the most recent transactions on an OS crash or
+            # power loss, which is the standard recommendation for WAL.
+            await db.execute("PRAGMA synchronous=NORMAL")
+            # busy_timeout makes a second connection wait (up to 5s) for a lock
+            # instead of failing immediately with SQLITE_BUSY.
+            await db.execute("PRAGMA busy_timeout=5000")
+            db.row_factory = aiosqlite.Row
+
+            hooks = resolve_hooks(config.hooks_class)
+
+            from engrava.config import (  # noqa: PLC0415
+                resolve_embedding_provider,
+                resolve_manifests,
+            )
+
+            emb_provider = (
+                embedding_provider
+                if embedding_provider is not None
+                else resolve_embedding_provider(embeddings)
+            )
+            auto_embed = embeddings.auto_embed if embeddings else False
+            require_embedding = embeddings.require_embedding if embeddings else False
+
+            manifests = resolve_manifests(
+                config.extension_manifest_paths,
+                discover=config.extension_discover,
+            )
+
+            # Access tracking feeds the dreaming ``frequency`` signal. It is on
+            # only when dreaming is enabled AND its ``access_tracking_enabled``
+            # flag is set (the default). With dreaming off, tracking stays off,
+            # so the retrieval and scoring paths are byte-identical to today.
+            access_tracking_enabled = (
+                config.dreaming is not None
+                and config.dreaming.enabled
+                and config.dreaming.access_tracking_enabled
+            )
+
+            store = cls(
+                db,
+                hooks=hooks,
+                embedding_provider=emb_provider,
+                auto_embed=auto_embed,
+                require_embedding=require_embedding,
+                search_config=config.search,
+                journal_enabled=config.journal.enabled,
+                ttl_strategy=config.ttl.strategy,
+                ttl_check_every_n=config.ttl.check_every_n_operations,
+                ttl_default_seconds=config.ttl.default_ttl_seconds,
+                metrics_config=config.metrics,
+                manifests=manifests,
+                access_tracking_enabled=access_tracking_enabled,
+                hygiene_policy=config.hygiene_policy,
+                derive_gates=config.derive,
+                cycle_provider=cycle_provider,
+                write_lock_acquire_timeout_seconds=write_lock_acquire_timeout_seconds,
+                close_timeout_seconds=close_timeout_seconds,
+            )
+            store._owns_connection = True
+
+            # The composition root owns concrete optional implementations; the
+            # SQLite facade retains only the inward consolidator contract. Keep
+            # construction after the store, matching the established error and
+            # cleanup ordering, and avoid importing Dreaming when it is disabled.
+            # Attached through the public seam (rather than the private
+            # attribute from_config used to write directly) — the two are the
+            # same underlying slot, so this is not a behaviour change.
+            if config.dreaming is not None and config.dreaming.enabled:
+                from engrava._composition import (  # noqa: PLC0415
+                    compose_dreaming_consolidator,
+                )
+
+                store.attach_dreaming_extension(compose_dreaming_consolidator(config.dreaming))
+
+            if migrate:
+                await store.ensure_schema()
+                schema_at_head = True
+            else:
+                cursor = await db.execute("PRAGMA user_version")
+                row = await cursor.fetchone()
+                schema_at_head = (int(row[0]) if row else 0) == CORE_SCHEMA_HEAD_VERSION
+
+            # Opt-in on-open integrity check. With migrate=True the schema has
+            # just been ensured, so this runs unconditionally when enabled —
+            # byte-identical to from_config's original behaviour. With
+            # migrate=False (a caller that deliberately opened the database
+            # exactly as stored) the chain is walked only when the core schema
+            # journal_entry depends on is already at head, and skipped with a
+            # debug line otherwise rather than failing a read this call was
+            # explicitly told not to migrate.
+            if config.journal.verify_on_open:
+                if schema_at_head:
+                    integrity = await store.verify_journal()
+                    if not integrity.valid:
+                        # Raised inside the try so the enclosing handler closes the
+                        # connection before propagating — a leaked handle on a
+                        # rejected open would otherwise pin the WAL.
+                        raise JournalIntegrityError(  # noqa: TRY301
+                            integrity.first_invalid_sequence,
+                            integrity.error_message,
+                        )
+                else:
+                    logger.debug(
+                        "Skipping journal.verify_on_open for %s: core schema is "
+                        "not at head (migrate=False)",
+                        db_path,
+                    )
+
+            await store._configure_vector_backend(
+                backend_name=config.vector_backend,
+                embedding_dimension=config.embedding_dimension,
+            )
+        except BaseException:
+            # Not ``except Exception``: ``asyncio.CancelledError`` derives
+            # from ``BaseException``, and a cancellation during any await
+            # above must close ``db`` exactly like an ordinary failure does
+            # — otherwise it leaks aiosqlite's non-daemon connection worker
+            # thread just as an uncaught error during open would. Routed
+            # through ``_close_quietly`` rather than a direct
+            # ``await db.close()`` so a failure in the close itself cannot
+            # replace this exception -- see that function's docstring.
+            await _close_quietly(db)
+            raise
+
+        return store
+
+    @classmethod
     async def from_config(
         cls,
         config_path: str | Path,
@@ -2323,118 +2543,18 @@ class SqliteEngravaCore:
                 and the persisted hash chain fails verification.
 
         """
-        from engrava.config import load_config, resolve_hooks  # noqa: PLC0415
+        from engrava.config import load_config  # noqa: PLC0415
 
         config = load_config(config_path)
-        db = await connect(str(config.database_path))
-        try:
-            if config.wal_mode:
-                await db.execute("PRAGMA journal_mode=WAL")
-            await db.execute("PRAGMA foreign_keys=ON")
-            # synchronous=NORMAL is the documented-safe companion to WAL: the
-            # database stays durable across an application crash and is only at
-            # risk of losing the most recent transactions on an OS crash or
-            # power loss, which is the standard recommendation for WAL.
-            await db.execute("PRAGMA synchronous=NORMAL")
-            # busy_timeout makes a second connection wait (up to 5s) for a lock
-            # instead of failing immediately with SQLITE_BUSY.
-            await db.execute("PRAGMA busy_timeout=5000")
-            db.row_factory = aiosqlite.Row
-
-            hooks = resolve_hooks(config.hooks_class)
-
-            # Resolve embedding provider from config.
-            from engrava.config import (  # noqa: PLC0415
-                resolve_embedding_provider,
-                resolve_manifests,
-            )
-
-            emb_provider = resolve_embedding_provider(config.embeddings)
-            auto_embed = config.embeddings.auto_embed if config.embeddings else False
-            require_embedding = config.embeddings.require_embedding if config.embeddings else False
-
-            manifests = resolve_manifests(
-                config.extension_manifest_paths,
-                discover=config.extension_discover,
-            )
-
-            # Access tracking feeds the dreaming ``frequency`` signal. It is on
-            # only when dreaming is enabled AND its ``access_tracking_enabled``
-            # flag is set (the default). With dreaming off, tracking stays off,
-            # so the retrieval and scoring paths are byte-identical to today.
-            access_tracking_enabled = (
-                config.dreaming is not None
-                and config.dreaming.enabled
-                and config.dreaming.access_tracking_enabled
-            )
-
-            store = cls(
-                db,
-                hooks=hooks,
-                embedding_provider=emb_provider,
-                auto_embed=auto_embed,
-                require_embedding=require_embedding,
-                search_config=config.search,
-                journal_enabled=config.journal.enabled,
-                ttl_strategy=config.ttl.strategy,
-                ttl_check_every_n=config.ttl.check_every_n_operations,
-                ttl_default_seconds=config.ttl.default_ttl_seconds,
-                metrics_config=config.metrics,
-                manifests=manifests,
-                access_tracking_enabled=access_tracking_enabled,
-                hygiene_policy=config.hygiene_policy,
-                derive_gates=config.derive,
-                cycle_provider=cycle_provider,
-                write_lock_acquire_timeout_seconds=write_lock_acquire_timeout_seconds,
-                close_timeout_seconds=close_timeout_seconds,
-            )
-            store._owns_connection = True
-
-            # The composition root owns concrete optional implementations; the
-            # SQLite facade retains only the inward consolidator contract. Keep
-            # construction after the store, matching the established error and
-            # cleanup ordering, and avoid importing Dreaming when it is disabled.
-            if config.dreaming is not None and config.dreaming.enabled:
-                from engrava._composition import (  # noqa: PLC0415
-                    compose_dreaming_consolidator,
-                )
-
-                store._dreaming_extension = compose_dreaming_consolidator(config.dreaming)
-
-            await store.ensure_schema()
-
-            # Opt-in on-open integrity check. Runs only when explicitly
-            # enabled and only after the schema is ensured, so the
-            # ``journal_entry`` table is guaranteed to exist. Default-off ⇒
-            # the open path is byte-identical to before when disabled.
-            if config.journal.verify_on_open:
-                integrity = await store.verify_journal()
-                if not integrity.valid:
-                    # Raised inside the try so the enclosing handler closes the
-                    # connection before propagating — a leaked handle on a
-                    # rejected open would otherwise pin the WAL.
-                    raise JournalIntegrityError(  # noqa: TRY301
-                        integrity.first_invalid_sequence,
-                        integrity.error_message,
-                    )
-
-            await store._configure_vector_backend(
-                backend_name=config.vector_backend,
-                embedding_dimension=config.embedding_dimension,
-            )
-        except BaseException:
-            # Not ``except Exception``: ``asyncio.CancelledError`` derives
-            # from ``BaseException``, and a cancellation during any await
-            # above must close ``db`` exactly like an ordinary failure does
-            # — otherwise it leaks aiosqlite's non-daemon connection worker
-            # thread just as an uncaught error during open would. Routed
-            # through ``_close_quietly`` rather than a direct
-            # ``await db.close()`` so a failure in the close itself cannot
-            # replace this exception -- see that function's docstring.
-            await _close_quietly(db)
-            raise
-
-        return store
+        return await cls._build_configured_store(
+            config,
+            config.database_path,
+            embeddings=config.embeddings,
+            embedding_provider=None,
+            cycle_provider=cycle_provider,
+            write_lock_acquire_timeout_seconds=write_lock_acquire_timeout_seconds,
+            close_timeout_seconds=close_timeout_seconds,
+        )
 
     async def close(self) -> None:
         """Close the database connection if owned by this instance.
@@ -8796,6 +8916,18 @@ class SqliteEngravaCore:
         * **delete**: Physically deletes the expired thought rows (cascading
           to edges, embeddings, and actions via ON DELETE CASCADE).
 
+        **A pinned row is never expired.** A past-TTL thought with
+        ``pinned = True`` is skipped by both strategies — neither archived nor
+        deleted — and counted in the returned ``pinned_kept_count`` instead of
+        ``expired_count``. ``pinned`` is the row's own durable keep-intent
+        marker; a store-wide default TTL (``ttl.default_ttl_seconds``) must not
+        override it. This holds whether this method is reached directly,
+        through the auto-cleanup cadence (:meth:`_maybe_auto_cleanup`), or
+        through the CLI's ``gc --expired``. **A protected priority (Memory
+        Hygiene's ``protected_priorities``, default ``P1``) is *not* exempt
+        here** — that protection is a Memory Hygiene concept, and a TTL is the
+        row's own explicit lifetime; only ``pinned`` is a TTL exemption.
+
         Mutations are recorded in the journal when journaling is enabled.
 
         Args:
@@ -8810,8 +8942,8 @@ class SqliteEngravaCore:
 
         Returns:
             A ``CleanupResult`` with the count of processed thoughts, the
-            strategy that was applied, and the canonical UTC form of the
-            instant it cleaned up to.
+            strategy that was applied, the canonical UTC form of the instant
+            it cleaned up to, and the number of pinned rows left untouched.
 
         Raises:
             ValueError: If ``now`` is not a valid ISO-8601 timestamp, or has no
@@ -8852,13 +8984,14 @@ class SqliteEngravaCore:
             # is no longer actually expired -- caller data loss, not merely a
             # stale read.
             cursor = await self._db.execute(
-                "SELECT thought_id FROM thought WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                "SELECT thought_id, pinned FROM thought "
+                "WHERE expires_at IS NOT NULL AND expires_at <= ?",
                 (now,),
             )
             expired_rows = await cursor.fetchall()
-            expired_ids = [
-                row["thought_id"] for row in expired_rows if row["thought_id"] != exclude_id
-            ]
+            expired_ids, pinned_kept_count = _split_expired_by_pinned(
+                expired_rows, exclude_id=exclude_id
+            )
 
             # The whole batch is one failure-atomic unit, via
             # _write_readback_savepoint (see update_thought for what that
@@ -8966,6 +9099,7 @@ class SqliteEngravaCore:
             expired_count=len(expired_ids),
             strategy_applied=strategy.value,
             timestamp=now,
+            pinned_kept_count=pinned_kept_count,
         )
 
     async def _maybe_auto_cleanup(self, *, exclude_id: str | None = None) -> None:
@@ -11629,37 +11763,34 @@ class SqliteEngravaCore:
             ValueError: If any weight is negative or half-life is invalid.
 
         """
-        search_config = self._search_config
+        # One source for every fallback: a store with no SearchConfig resolves
+        # exactly SearchConfig()'s own field defaults, never a literal that could
+        # drift from them (see SearchConfig in engrava.config).
+        from engrava.config import (  # noqa: PLC0415 -- deferred: the config module imports this one
+            SearchConfig as _SearchConfig,
+        )
+
+        search_config = self._search_config or _SearchConfig()
 
         resolved_fts_weight = (
-            fts_weight
-            if fts_weight is not None
-            else (search_config.default_fts_weight if search_config is not None else 0.3)
+            fts_weight if fts_weight is not None else search_config.default_fts_weight
         )
         resolved_vector_weight = (
-            vector_weight
-            if vector_weight is not None
-            else (search_config.default_vector_weight if search_config is not None else 0.55)
+            vector_weight if vector_weight is not None else search_config.default_vector_weight
         )
         resolved_recency_weight = (
-            recency_weight
-            if recency_weight is not None
-            else (search_config.default_recency_weight if search_config is not None else 0.0)
+            recency_weight if recency_weight is not None else search_config.default_recency_weight
         )
         resolved_recency_half_life = (
-            recency_half_life
-            if recency_half_life is not None
-            else (search_config.recency_half_life if search_config is not None else 50)
+            recency_half_life if recency_half_life is not None else search_config.recency_half_life
         )
         resolved_priority_weight = (
             priority_weight
             if priority_weight is not None
-            else (search_config.default_priority_weight if search_config is not None else 0.05)
+            else search_config.default_priority_weight
         )
         resolved_graph_weight = (
-            graph_weight
-            if graph_weight is not None
-            else (search_config.default_graph_weight if search_config is not None else 0.0)
+            graph_weight if graph_weight is not None else search_config.default_graph_weight
         )
 
         if resolved_fts_weight < 0.0:
@@ -12702,8 +12833,11 @@ class SqliteEngravaCore:
                 when ``recency_now`` is supplied; ``None`` uses
                 ``SearchConfig.recency_now_half_life_seconds`` (default 604800 =
                 7 days). Must be ``> 0``.
-            fts_top_k: Max candidates from FTS5 before fusion.
-            vector_top_k: Max candidates from vector search before fusion.
+            fts_top_k: Minimum candidate pool from FTS5 before fusion; raised
+                to ``top_k`` when smaller, before any collapse-pool widening.
+            vector_top_k: Minimum candidate pool from vector search before
+                fusion; raised to ``top_k`` when smaller, before any
+                collapse-pool widening.
             priority_weight: Optional priority fusion-weight override.
             graph_weight: Optional graph signal fusion-weight override.
             graph_edge_decay: Optional graph edge decay override.
@@ -12875,6 +13009,17 @@ class SqliteEngravaCore:
 
             msg = f"collapse_max_per_unit must be >= 1, got {collapse_max_per_unit}"
             raise InvalidFilterError(msg)
+
+        # Per-arm floor: each arm's candidate pool is at least ``top_k``, so a
+        # ``top_k`` above the default (or caller-supplied) pool size no longer
+        # silently caps the merged result below what actually matches. Applied
+        # here, before any collapse-pool widening below — that widening then
+        # multiplies the already-floored value, same as it multiplies a
+        # caller-supplied pool larger than ``top_k``. A ``top_k`` at or below
+        # the pool leaves both ``max()`` calls a no-op, so this is byte-
+        # identical to before for the common (small ``top_k``) case.
+        fts_top_k = max(fts_top_k, top_k)
+        vector_top_k = max(vector_top_k, top_k)
 
         # Validate the de-fragmentation unit key (if any) at argument time —
         # never mid-query (reuses the shared metadata path grammar). ``None``
@@ -13358,12 +13503,19 @@ class SqliteEngravaCore:
             reflection_ids, effective_vector, q_norm, embeddings_by_id
         )
 
-        # Optional recency blend when current_cycle is provided
+        # Optional recency blend when current_cycle is provided. One source for
+        # the fallback: a store with no SearchConfig resolves exactly
+        # SearchConfig()'s own field defaults, the same as search_hybrid's
+        # _resolve_hybrid_defaults (see SearchConfig in engrava.config).
         if current_cycle is not None:
             backends_used_set.add("recency")
-            search_config = self._search_config
-            recency_weight = search_config.default_recency_weight if search_config else 0.1
-            recency_half_life = search_config.recency_half_life if search_config else 50
+            from engrava.config import (  # noqa: PLC0415 -- deferred: the config module imports this one
+                SearchConfig as _SearchConfig,
+            )
+
+            search_config = self._search_config or _SearchConfig()
+            recency_weight = search_config.default_recency_weight
+            recency_half_life = search_config.recency_half_life
             if recency_weight > 0.0:
                 recency_scores = await self._load_recency_scores(
                     thought_ids={rid for rid, _ in scores},
@@ -14332,12 +14484,37 @@ class SqliteEngravaCore:
         A REFLECTION is a derived synthesis of a live cluster. Once **every**
         thought it was consolidated from is no longer ``ACTIVE`` (all
         ``ARCHIVED`` / ``DONE`` — i.e. the synthesis now summarises nothing
-        live), the REFLECTION is retired ``ACTIVE -> ARCHIVED`` so ordinary GC
-        can reclaim it (cascading its centroid embedding and
-        ``CONSOLIDATED_FROM`` edges). This is the shared store-owned
-        implementation used both by dreaming consolidation and by the Memory
-        Hygiene GC stage (run there **before** any delete so no REFLECTION is
-        left summarising a cluster the delete would empty).
+        live), or every ``CONSOLIDATED_FROM`` edge it had is gone because its
+        sources were hard-deleted (see the dreaming-sourced case below), the
+        REFLECTION is retired ``ACTIVE -> ARCHIVED``. This is the shared
+        store-owned implementation used both by dreaming consolidation and by
+        the Memory Hygiene GC stage (run there **before** any delete so no
+        REFLECTION is left summarising a cluster the delete would empty).
+
+        **This retirement is not a Memory Hygiene archival.** The write below
+        is a direct lifecycle flip — unlike hygiene's own archive stage, it
+        does *not* stamp ``archived_at_cycle`` / ``archived_at``. Hygiene GC
+        only ever reaps a row that hygiene itself archived (selected on
+        ``archived_at_cycle IS NOT NULL``), so a REFLECTION this sweep retires
+        is structurally never hygiene-GC-eligible — stamping it would make it
+        so, which this method is not permitted to decide on the sweep's
+        caller's behalf. A retired REFLECTION can still be removed by any
+        of: ``engrava gc``, which keeps it if it is protected (see below)
+        unless ``--include-pinned`` is given; an explicit
+        :meth:`delete_thought`, whatever its protection; or TTL cleanup under
+        the ``delete`` strategy, if it carries an expired TTL and is not
+        pinned — protection is a hygiene policy, not a TTL exemption, and
+        :meth:`delete_thought` removes a row by id regardless of either.
+
+        **Protection.** A REFLECTION that is itself protected — ``pinned``, or
+        at a priority in ``protected_priorities`` — is never retired by this
+        sweep, exactly like Memory Hygiene's own archive/GC stages. The active
+        policy is the store's configured ``hygiene_policy`` when one is set,
+        else the library defaults (pinned, or priority ``P1``). A REFLECTION's
+        priority defaults to ``DreamingConfig.reflection_default_priority``
+        (``P2``), so default dreaming is unaffected; an operator who wants a
+        synthesis kept forever pins it or raises its priority into the
+        protected set.
 
         **Full coverage.** The sweep inspects *every* ACTIVE REFLECTION, not just
         the first page. ``list_thoughts`` orders by ``updated_cycle DESC`` and is
@@ -14360,9 +14537,20 @@ class SqliteEngravaCore:
 
         * **100% threshold** — a REFLECTION with at least one still-ACTIVE source
           is kept; the synthesis still summarises live members.
-        * **At least one source** — a REFLECTION with zero ``CONSOLIDATED_FROM``
-          edges (defensive: malformed / legacy) is never retired by an
-          all-non-ACTIVE rule firing over an empty set.
+        * **Deleted-sources retirement** — a REFLECTION has no remaining
+          ``CONSOLIDATED_FROM`` edges either because it never had any
+          (defensive: malformed / legacy), or because every source it was
+          consolidated from was hard-deleted, which cascades the edge away with
+          it. The two cases are indistinguishable from this row's own state, so
+          they are told apart by *how* the REFLECTION was created: dreaming
+          always sets ``source_type=KnowledgeSource.DREAMING`` on a REFLECTION
+          it creates, so a dreaming-sourced REFLECTION with zero edges is
+          treated as fully orphaned (retired, like one whose sources are all
+          non-ACTIVE); one that is not dreaming-sourced (for example created
+          directly by a caller) is left alone, as a zero-edge all-non-ACTIVE
+          rule firing over an empty set would otherwise wrongly retire it too.
+        * **Protection** — see above; checked last so a protected REFLECTION is
+          never retired regardless of which rule above would otherwise fire.
 
         The check is a deterministic set query over each candidate's source
         lifecycle statuses — no model call.
@@ -14371,6 +14559,17 @@ class SqliteEngravaCore:
             The number of REFLECTIONs retired during this sweep.
 
         """
+        policy = self._hygiene_policy
+        if policy is None:
+            # Deferred import: the config module imports this one, so a
+            # module-scope import would be circular (mirrors the same pattern
+            # in __init__ for the same reason).
+            from engrava.config import (  # noqa: PLC0415
+                HygienePolicyConfig as _HygienePolicyConfig,
+            )
+
+            policy = _HygienePolicyConfig()
+
         # Phase 1 — collect EVERY ACTIVE REFLECTION id by paginating the full
         # set. Done before any mutation so the ACTIVE filter stays stable and
         # offsets do not drift (see the collect-then-retire note above).
@@ -14397,19 +14596,65 @@ class SqliteEngravaCore:
         # set is materialised.
         retired = 0
         for reflection_id in candidate_ids:
-            source_statuses = await self.consolidated_source_statuses(reflection_id)
-            # Require >= 1 source AND 100% of them non-ACTIVE.
-            if not source_statuses:
-                continue
-            if any(status == LifecycleStatus.ACTIVE.value for status in source_statuses):
-                continue
-            await self.update_thought(
-                reflection_id,
-                lifecycle_status=LifecycleStatus.ARCHIVED,
-            )
-            retired += 1
+            if await self._is_retirable_orphan(reflection_id, policy):
+                await self.update_thought(
+                    reflection_id,
+                    lifecycle_status=LifecycleStatus.ARCHIVED,
+                )
+                retired += 1
 
         return retired
+
+    async def _is_retirable_orphan(self, reflection_id: str, policy: HygienePolicyConfig) -> bool:
+        """Decide whether one candidate REFLECTION should be retired right now.
+
+        Split out of :meth:`retire_orphan_reflections` to keep that method's
+        own branch count within the linter's complexity budget while
+        preserving every check it documents: the 100%-non-ACTIVE rule, the
+        dreaming-sourced deleted-edges rule, and the protection check -- see
+        that method's docstring for the full rationale of each.
+
+        Args:
+            reflection_id: The candidate REFLECTION id.
+            policy: The active hygiene policy (for the protection check).
+
+        Returns:
+            ``True`` if this candidate should be retired now.
+
+        """
+        source_statuses = await self.consolidated_source_statuses(reflection_id)
+
+        if source_statuses:
+            # Require 100% of the resolvable sources to be non-ACTIVE. The
+            # common case (still has an ACTIVE source) exits here on a single
+            # read, with no extra row fetch.
+            if any(status == LifecycleStatus.ACTIVE.value for status in source_statuses):
+                return False
+            row = await self._get_thought_row(reflection_id)
+            if row is None:
+                # Retired or deleted by a concurrent task since Phase 1.
+                return False
+            thought = self._row_to_thought(row)
+        else:
+            # No resolvable CONSOLIDATED_FROM edge. The row is fetched here
+            # (rather than deferred) because ``source_type`` itself decides
+            # orphaned-ness in this branch -- see the deleted-sources guard
+            # in the caller's docstring.
+            row = await self._get_thought_row(reflection_id)
+            if row is None:
+                return False
+            thought = self._row_to_thought(row)
+            if thought.source_type != KnowledgeSource.DREAMING:
+                # Not dreaming-sourced -- left alone, as a zero-edge
+                # all-non-ACTIVE rule would otherwise wrongly retire a
+                # caller-created REFLECTION too.
+                return False
+
+        # Re-fetched row (not the Phase 1 listing) so a pin or priority raise
+        # that landed after Phase 1 is still honoured at the moment this
+        # candidate is actually acted on -- the same re-check discipline the
+        # hygiene archive/GC stages apply at their own write time.
+        return not _hygiene_protected(thought, policy)
 
     def attach_dreaming_extension(self, extension: DreamingConsolidatorProtocol) -> None:
         """Wire a Dreaming consolidator onto this store.
@@ -15392,6 +15637,41 @@ def _decode_consolidated(raw: str | None) -> list[str] | None:
         return None
     result: list[str] = json.loads(raw)
     return result
+
+
+def _split_expired_by_pinned(
+    expired_rows: Iterable[aiosqlite.Row], *, exclude_id: str | None
+) -> tuple[list[str], int]:
+    """Split a TTL-expired row set into the ids to act on and a pinned-kept count.
+
+    A pinned row is the durable never-forget marker: it is excluded from the
+    batch entirely (neither archived nor deleted) and tallied separately so
+    the caller can see it was kept, not silently dropped. The excluded id
+    (just-written protection) is not counted either way.
+
+    Args:
+        expired_rows: Rows with ``thought_id`` and ``pinned`` columns, as
+            returned by :meth:`SqliteEngravaCore.cleanup_expired`'s own
+            expired-row query.
+        exclude_id: A thought id to skip entirely (neither acted on nor
+            counted as pinned-kept).
+
+    Returns:
+        ``(expired_ids, pinned_kept_count)``: the ids to archive/delete, and
+        how many excluded rows were pinned.
+
+    """
+    expired_ids: list[str] = []
+    pinned_kept_count = 0
+    for row in expired_rows:
+        thought_id = row["thought_id"]
+        if thought_id == exclude_id:
+            continue
+        if row["pinned"]:
+            pinned_kept_count += 1
+            continue
+        expired_ids.append(thought_id)
+    return expired_ids, pinned_kept_count
 
 
 def _clamp_decay(raw: float) -> float:

@@ -19,7 +19,12 @@ read-only SQL passthrough.
   identifier like `source = '007'` matches the stored string `'007'`, whereas an
   unquoted `created_cycle = 7` is coerced to the integer `7` (or to a float, for
   `7.5`). An unquoted word that is not a number stays a string (`source = abc`),
-  but a value containing spaces must be quoted.
+  but a value containing spaces must be quoted. A single-quoted value may contain
+  a literal quote by doubling it, SQL-style: `source = 'O''Brien'` matches the
+  stored string `O'Brien`, in a condition or inside an `IN (...)` list.
+- A boolean keyword (`AND`, `OR`) is recognised only as a whole word outside a
+  quoted value, so an unquoted value that happens to end or start with one —
+  `source = vendor`, `source = ORACLE` — is never mistaken for the operator.
 - Operators: `=`, `!=`, `>`, `<`, `>=`, `<=`, and `IN (...)`.
 - Conditions combine with `AND`, `OR`, and parentheses (see
   [Boolean expressions](#boolean-expressions-and-or-parentheses)).
@@ -127,7 +132,11 @@ Because `AND` binds tighter, the second example groups as
 `priority = 'P1' OR (priority = 'P2' AND source = 'x')`. Use parentheses (as in
 the third example) to group an `OR` before an `AND`. A `WHERE` that uses only
 simple comparisons and/or valid-time predicates joined by `AND` (no `OR`, no
-parentheses, no `IN`) behaves exactly as it always has.
+parentheses, no `IN`) is read as a flat list of conditions joined by `AND`; a
+leading, trailing, or doubled `AND` raises `MindQLParseError`.
+
+Parenthesised grouping may nest up to **256** levels deep; nesting deeper than
+that raises `MindQLParseError`.
 
 ### COUNT
 
@@ -154,10 +163,12 @@ SELECT thought_id, priority, essence FROM thought WHERE thought_type = 'BELIEF' 
 ```
 
 Only statements that begin with `SELECT` are permitted; anything else is
-rejected. The passthrough is also restricted to a **single** statement: a
-single trailing `;` is tolerated, but any `;` remaining mid-string is rejected
+rejected. The passthrough is also restricted to a **single** statement: once
+a statement-ending `;` appears, only whitespace and comments may follow it —
+anything else is a second statement and is rejected
 (`MindQLParseError: Only a single SELECT statement is allowed`) so a second
-statement can never be smuggled in.
+statement can never be smuggled in. A `;` inside a comment, a string literal,
+a quoted identifier, or a parameter token is not a separator.
 
 **Bound parameters.** The passthrough can carry bound parameters, set
 programmatically on the query object (never parsed from the MQL text). When
@@ -262,6 +273,21 @@ Custom MindQL verbs are provided through an extension's
 `ExtensionManifest.mindql_extensions` and reach the executor via the
 `extensions=` argument (entry-point discovery wires this up automatically).
 See [Extensions](extensions.md) for the registration flow.
+
+**Extension handlers are read-only too.** A handler is invoked with a
+`ReadOnlyAccessor`, not the store's live connection. Its only capability is
+`execute()`, which runs a single `SELECT` statement through the same guard
+described above and returns a restricted cursor: `fetchone`, `fetchall`,
+`fetchmany`, async iteration, and `description` — no `execute()`-family
+method on the cursor, and no `connection` to reach back through. A handler
+that only reads through a single parameterised `SELECT` (the shape every
+documented example uses) is unaffected; one that tried to write through the
+connection it used to receive directly now raises `MindQLParseError` (for
+anything that is not a `SELECT`) or `AttributeError` (for a write attempted
+through the cursor). This closes the ordinary and attribute-level paths to a
+write — a handler is in-process Python code, so deliberate introspection
+(closure cells, `gc`) can still reach the underlying connection; the accessor
+is not a sandbox against that.
 
 ## Python API
 
