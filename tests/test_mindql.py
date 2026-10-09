@@ -6,6 +6,9 @@ as well as executor integration with aiosqlite.
 
 from __future__ import annotations
 
+import itertools
+import random
+import sqlite3
 from typing import TYPE_CHECKING, Literal, SupportsIndex, cast
 
 import aiosqlite
@@ -23,7 +26,7 @@ from engrava import (
 from engrava.domain.protocols.hooks import MindQLExtension
 from engrava.mindql import executor as executor_module
 from engrava.mindql import parser as parser_module
-from engrava.mindql.executor import MindQLExecutor
+from engrava.mindql.executor import MindQLExecutor, ReadOnlyAccessor, ReadOnlyCursor
 from engrava.mindql.parser import (
     BoolExpr,
     Comparison,
@@ -35,6 +38,7 @@ from engrava.mindql.parser import (
     MindQLQuery,
     TemporalPredicate,
     TemporalPredicateKind,
+    WhereNode,
     parse,
 )
 
@@ -384,7 +388,7 @@ class TestStoreExecuteMindql:
         received: dict[str, object] = {}
 
         async def _handler(
-            conn: aiosqlite.Connection,
+            accessor: ReadOnlyAccessor,
             args: object,
         ) -> list[dict[str, object]]:
             received["args"] = args
@@ -472,6 +476,278 @@ class TestExecutorExtension:
         )
         with pytest.raises(MindQLParseError, match="Unknown extension"):
             await executor.execute(q)
+
+
+async def _thought_priority_snapshot(conn: aiosqlite.Connection) -> dict[str, str]:
+    """Return ``{thought_id: priority}`` for every stored thought.
+
+    Catches an ``UPDATE`` that changes a value without changing row count or
+    schema -- the one DML shape a plain id list or ``sqlite_master`` dump
+    would both miss.
+    """
+    cursor = await conn.execute("SELECT thought_id, priority FROM thought")
+    return {str(row[0]): str(row[1]) for row in await cursor.fetchall()}
+
+
+async def _thought_id_list(conn: aiosqlite.Connection) -> list[str]:
+    """Read every stored thought id directly, bypassing any executor path."""
+    cursor = await conn.execute("SELECT thought_id FROM thought ORDER BY thought_id")
+    return [str(row[0]) for row in await cursor.fetchall()]
+
+
+async def _sqlite_master_snapshot(conn: aiosqlite.Connection) -> list[tuple[object, ...]]:
+    """Return the full ``sqlite_master`` contents as a comparable snapshot."""
+    cursor = await conn.execute(
+        "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master ORDER BY type, name",
+    )
+    return [tuple(row) for row in await cursor.fetchall()]
+
+
+# Every single-statement write/DDL/transaction-control shape an extension
+# handler might try through the accessor. Each must be refused by the guard
+# before it reaches SQLite -- at the base (the handler holding the live
+# connection, as before this boundary existed), every one of these lands.
+_EXTENSION_WRITE_ATTEMPTS: tuple[tuple[str, str], ...] = (
+    (
+        "insert",
+        (
+            "INSERT INTO thought (thought_id, thought_type, essence, content, priority) "
+            "VALUES ('mutant-insert', 'OBSERVATION', 'e', 'c', 'P1')"
+        ),
+    ),
+    ("update", "UPDATE thought SET priority = 'P4'"),
+    ("delete", "DELETE FROM thought"),
+    ("create_table", "CREATE TABLE mutant_table (x)"),
+    ("drop_table", "DROP TABLE thought"),
+    ("pragma", "PRAGMA journal_mode = DELETE"),
+    ("attach", "ATTACH DATABASE ':memory:' AS mutant_other"),
+    ("begin", "BEGIN"),
+    ("commit", "COMMIT"),
+)
+
+
+class TestReadOnlyAccessorWriteRefusal:
+    """Every single-statement write attempt through the accessor is refused.
+
+    Mirrors the spec's failability table: at the base (an extension handler
+    holding the live connection), each of these writes lands; through the
+    accessor it must raise ``MindQLParseError`` before it ever reaches SQLite,
+    leaving the database unchanged.
+    """
+
+    @pytest.mark.parametrize(
+        ("name", "statement"),
+        _EXTENSION_WRITE_ATTEMPTS,
+        ids=[name for name, _ in _EXTENSION_WRITE_ATTEMPTS],
+    )
+    async def test_single_statement_write_refused(
+        self,
+        populated_db: aiosqlite.Connection,
+        name: str,
+        statement: str,
+    ) -> None:
+        accessor = ReadOnlyAccessor(populated_db)
+        schema_before = await _sqlite_master_snapshot(populated_db)
+        ids_before = await _thought_id_list(populated_db)
+        priorities_before = await _thought_priority_snapshot(populated_db)
+
+        with pytest.raises(MindQLParseError, match="SELECT"):
+            await accessor.execute(statement)
+
+        assert await _sqlite_master_snapshot(populated_db) == schema_before
+        assert await _thought_id_list(populated_db) == ids_before
+        assert await _thought_priority_snapshot(populated_db) == priorities_before
+
+    async def test_multi_statement_refused_with_typed_error(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        """A second statement smuggled after a real ``SELECT`` is also refused.
+
+        At the base (the raw connection, no guard at all) this very string
+        raises ``sqlite3.ProgrammingError`` from the driver itself, not a
+        MindQL error -- that is the base failure this test must *not* accept.
+        """
+        accessor = ReadOnlyAccessor(populated_db)
+        ids_before = await _thought_id_list(populated_db)
+
+        with pytest.raises(MindQLParseError, match="single SELECT"):
+            await accessor.execute("SELECT 1; DELETE FROM thought")
+
+        assert await _thought_id_list(populated_db) == ids_before
+
+
+class TestReadOnlyCursorBoundary:
+    """``ReadOnlyCursor`` exposes no write surface and no reference back out."""
+
+    async def test_cursor_has_no_write_or_escape_surface(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        accessor = ReadOnlyAccessor(populated_db)
+        cursor = await accessor.execute("SELECT thought_id FROM thought")
+        assert isinstance(cursor, ReadOnlyCursor)
+
+        for attr in (
+            "execute",
+            "executemany",
+            "executescript",
+            "execute_insert",
+            "connection",
+            "_conn",
+            "_cursor",
+            "close",
+            "commit",
+            "rollback",
+        ):
+            assert attr not in dir(cursor)
+            with pytest.raises(AttributeError):
+                getattr(cursor, attr)
+
+    async def test_cursor_write_attempt_is_refused_and_db_unchanged(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        ids_before = await _thought_id_list(populated_db)
+        accessor = ReadOnlyAccessor(populated_db)
+        cursor = await accessor.execute("SELECT thought_id FROM thought")
+
+        with pytest.raises(AttributeError):
+            await cursor.execute("UPDATE thought SET priority = 'P4'")  # type: ignore[attr-defined]
+        with pytest.raises(AttributeError):
+            await cursor.executescript("DELETE FROM thought;")  # type: ignore[attr-defined]
+        with pytest.raises(AttributeError):
+            _ = cursor.connection  # type: ignore[attr-defined]
+        with pytest.raises(AttributeError):
+            _ = cursor._conn  # type: ignore[attr-defined]
+
+        assert await _thought_id_list(populated_db) == ids_before
+
+    async def test_cursor_still_supports_the_read_surface(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        """fetchone / fetchmany / async iteration / description all still work."""
+        accessor = ReadOnlyAccessor(populated_db)
+
+        cursor = await accessor.execute(
+            "SELECT thought_id FROM thought ORDER BY thought_id",
+        )
+        first = await cursor.fetchone()
+        assert first is not None
+        assert first["thought_id"] == "t-000"
+
+        cursor = await accessor.execute(
+            "SELECT thought_id FROM thought ORDER BY thought_id",
+        )
+        batch = await cursor.fetchmany(2)
+        assert [row["thought_id"] for row in batch] == ["t-000", "t-001"]
+
+        cursor = await accessor.execute(
+            "SELECT thought_id FROM thought ORDER BY thought_id",
+        )
+        seen = [row["thought_id"] async for row in cursor]
+        assert seen == await _thought_id_list(populated_db)
+
+        cursor = await accessor.execute(
+            "SELECT thought_id, priority FROM thought ORDER BY thought_id",
+        )
+        assert [d[0] for d in cursor.description] == ["thought_id", "priority"]
+
+
+class TestReadOnlyAccessorBoundary:
+    """``ReadOnlyAccessor`` exposes no attribute that reaches the connection."""
+
+    async def test_accessor_exposes_no_connection_attribute(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        accessor = ReadOnlyAccessor(populated_db)
+        for forbidden in (
+            "_conn",
+            "_db",
+            "connection",
+            "commit",
+            "rollback",
+            "executescript",
+            "executemany",
+            "execute_insert",
+        ):
+            assert forbidden not in dir(accessor)
+            with pytest.raises(AttributeError):
+                getattr(accessor, forbidden)
+
+
+class TestExtensionGuardRunsOnEveryPath:
+    """The accessor boundary is enforced identically through every entry point."""
+
+    @staticmethod
+    async def _wipe_handler(db: ReadOnlyAccessor, _args: list[str]) -> list[dict[str, object]]:
+        await db.execute("DELETE FROM thought")
+        return []
+
+    async def test_guard_runs_through_executor_directly(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        ext = MindQLExtension(command_name="WIPE", handler=self._wipe_handler, description="wipe")
+        executor = MindQLExecutor(populated_db, extensions={"WIPE": ext})
+        ids_before = await _thought_id_list(populated_db)
+
+        with pytest.raises(MindQLParseError, match="SELECT"):
+            await executor.execute(parse("WIPE", known_extensions={"WIPE"}))
+
+        assert await _thought_id_list(populated_db) == ids_before
+
+    async def test_guard_runs_through_store_execute_mindql(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        ext = MindQLExtension(command_name="WIPE", handler=self._wipe_handler, description="wipe")
+        store = SqliteEngravaCore(populated_db)
+        ids_before = await _thought_id_list(populated_db)
+
+        with pytest.raises(MindQLParseError, match="SELECT"):
+            await store.execute_mindql(
+                parse("WIPE", known_extensions={"WIPE"}),
+                extensions={"WIPE": ext},
+            )
+
+        assert await _thought_id_list(populated_db) == ids_before
+
+    async def test_sova_shaped_layer_handler_is_unaffected(
+        self,
+        populated_db: aiosqlite.Connection,
+    ) -> None:
+        """A handler shaped like Sova's ``LAYER`` is unaffected by the boundary.
+
+        Parameterised ``SELECT``, ``fetchall``, ``cursor.description`` --
+        returns the same rows and column names it did before this boundary
+        existed.
+        """
+
+        async def _layer_handler(
+            db: ReadOnlyAccessor,
+            args: list[str],
+        ) -> list[dict[str, object]]:
+            priority = f"P{args[0]}"
+            cursor = await db.execute(
+                "SELECT thought_id, priority FROM thought WHERE priority = ?",
+                (priority,),
+            )
+            rows = await cursor.fetchall()
+            columns = [d[0] for d in cursor.description]
+            return [dict(zip(columns, row, strict=True)) for row in rows]
+
+        ext = MindQLExtension(command_name="LAYER", handler=_layer_handler, description="layer")
+        store = SqliteEngravaCore(populated_db)
+        result = await store.execute_mindql(
+            parse("LAYER 1", known_extensions={"LAYER"}),
+            extensions={"LAYER": ext},
+        )
+
+        assert sorted(row["thought_id"] for row in result.rows) == ["t-000", "t-001"]
+        assert result.columns == ["thought_id", "priority"]
 
 
 class TestExecutorColumnValidation:
@@ -1694,11 +1970,10 @@ class TestParserEdgeCases:
         with pytest.raises(MindQLParseError, match="Expected WHERE, ORDER BY"):
             parse("FIND thoughts BOGUS")
 
-    def test_trailing_and_ignored_on_flat_path(self) -> None:
-        # A trailing AND produces an empty fragment that is skipped.
-        q = parse("FIND thoughts WHERE priority = 'P1' AND ")
-        assert q.where is None
-        assert len(q.conditions) == 1
+    def test_trailing_and_rejected_on_flat_path(self) -> None:
+        # A trailing AND is a dangling boolean keyword, not silently dropped.
+        with pytest.raises(MindQLParseError, match="Dangling 'AND'"):
+            parse("FIND thoughts WHERE priority = 'P1' AND ")
 
     def test_invalid_order_by_field_rejected(self) -> None:
         with pytest.raises(MindQLParseError, match="Invalid ORDER BY field"):
@@ -1852,11 +2127,12 @@ class TestLexicalScanQuoteAwareness:
     def test_doubled_quote_escape_not_mis_scanned(self) -> None:
         # A doubled ``''`` inside a literal is skipped by the lexical scan, so
         # the ``OR`` inside the literal is not mistaken for grammar and the
-        # literal is seen as balanced (not unterminated). MindQL values do not
-        # support the ``''`` escape, so the fragment rejects cleanly rather
-        # than being mis-routed or silently accepted.
-        with pytest.raises(MindQLParseError):
-            parse("FIND thoughts WHERE content = 'it''s OR mine'")
+        # literal is seen as balanced (not unterminated). The ``''`` sequence
+        # is the SQL-style escape for one literal quote, so the value comes
+        # out as ``it's OR mine`` on the (still) flat path.
+        q = parse("FIND thoughts WHERE content = 'it''s OR mine'")
+        assert q.where is None
+        assert q.conditions[0].value == "it's OR mine"
 
 
 # ---------------------------------------------------------------------------
@@ -3548,3 +3824,816 @@ class TestSelectPassthroughLegitimateShapes:
             MindQLQuery(command=MindQLCommand.SELECT, raw_sql="SELECT ';' AS s"),
         )
         assert result.rows == [{"s": ";"}]
+
+
+class TestSelectGuardReadsCommentsAndQuotedIdentifiers:
+    """The single-statement scan matches SQLite's own tokens, not a naive ``;`` count.
+
+    Each case reproduces a row of the defect this scan replaces: a comment
+    that used to hide a real second statement from the old guard (which
+    blanked only single-quoted literals, so a quote mark *inside* a comment
+    opened a false "literal" of its own), or a valid single statement the old
+    guard refused because it had no notion of comments or quoted
+    identifiers.
+    """
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            pytest.param(
+                "SELECT 1 /* ' */; DELETE FROM thought /* ' */",
+                id="block-comment-no-longer-hides-the-separator-after-it",
+            ),
+            pytest.param(
+                "SELECT 1 -- '\n; DELETE FROM thought",
+                id="line-comment-no-longer-hides-the-separator-after-it",
+            ),
+        ],
+    )
+    def test_a_real_second_statement_is_still_refused(self, sql: str) -> None:
+        with pytest.raises(MindQLParseError) as excinfo:
+            executor_module._guard_select_sql(sql)
+        assert str(excinfo.value) == "Only a single SELECT statement is allowed"
+
+    @pytest.mark.parametrize(
+        ("sql", "expected"),
+        [
+            pytest.param(
+                "SELECT 1 /* ; */",
+                "SELECT 1 /* ; */",
+                id="semicolon-inside-a-block-comment-is-not-a-separator",
+            ),
+            pytest.param(
+                'SELECT "a;b" FROM (SELECT 1 AS "a;b")',
+                'SELECT "a;b" FROM (SELECT 1 AS "a;b")',
+                id="semicolon-inside-a-double-quoted-identifier-is-not-a-separator",
+            ),
+            pytest.param(
+                "SELECT [a;b] FROM (SELECT 1 AS [a;b])",
+                "SELECT [a;b] FROM (SELECT 1 AS [a;b])",
+                id="semicolon-inside-a-bracket-identifier-is-not-a-separator",
+            ),
+            pytest.param(
+                "SELECT 1; -- c",
+                "SELECT 1",
+                id="a-comment-trailing-the-real-separator-is-dropped-not-refused",
+            ),
+        ],
+    )
+    def test_a_statement_sqlite_runs_is_no_longer_refused(self, sql: str, expected: str) -> None:
+        assert executor_module._guard_select_sql(sql) == expected
+
+
+class TestSelectGuardReadsParameterTokens:
+    """A ``$``/``@``/``:``/``#`` parameter token is one token, not a comment opener.
+
+    Regression: the scan above started a comment at the first ``--`` or
+    ``/*`` it saw, with no notion that SQLite's tokenizer never reaches that
+    point inside a parameter token's ``(...)`` extension — there, every
+    character up to the first whitespace or ``)`` is part of the token,
+    comment openers, quotes, and ``;`` alike. ``$a(--); SELECT 2`` and
+    ``$a(/*); SELECT 2`` therefore *passed* the old scan (the fake "comment"
+    swallowed the real separator and the second statement with it), and a
+    real ``;`` inside ``$a(;)`` was *refused* (the scan saw a bare ``;`` with
+    no idea it sat inside a token).
+
+    Token start matters too: ``$`` is itself one of SQLite's IdChars, so a
+    ``$`` immediately after another IdChar (``a$a``) is never a fresh
+    parameter token — only more of the identifier it is already part of.
+    ``a$a(--)`` is therefore the identifier ``a$a``, then ``(``, then a real
+    ``--`` comment, exactly as before this change; the rows below confirm
+    the fix does not swallow that case too.
+    """
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            pytest.param(
+                "SELECT $a(--); SELECT 2",
+                id="dashdash-inside-a-parameter-token-is-not-a-comment-opener",
+            ),
+            pytest.param(
+                "SELECT $a(/*); SELECT 2",
+                id="slashstar-inside-a-parameter-token-is-not-a-comment-opener",
+            ),
+        ],
+    )
+    def test_a_real_second_statement_is_still_refused(self, sql: str) -> None:
+        # SQLite itself: ``conn.execute(sql)`` raises ``sqlite3.ProgrammingError:
+        # You can only execute one statement at a time.`` for both — confirmed
+        # by hand against an in-memory connection; both are exercised by the
+        # oracle sweep below too.
+        with pytest.raises(MindQLParseError) as excinfo:
+            executor_module._guard_select_sql(sql)
+        assert str(excinfo.value) == "Only a single SELECT statement is allowed"
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            pytest.param(
+                "SELECT $a(;)",
+                id="semicolon-inside-a-parameter-tokens-parens-is-not-a-separator",
+            ),
+            pytest.param(
+                "SELECT a$a(--)",
+                id="dollar-mid-identifier-leaves-a-real-comment-opener-alone",
+            ),
+            pytest.param(
+                "SELECT a$a(--); SELECT 2",
+                id="the-real-comment-after-a-mid-identifier-dollar-still-runs-to-the-end",
+            ),
+        ],
+    )
+    def test_a_statement_sqlite_runs_is_no_longer_refused(self, sql: str) -> None:
+        # SQLite on ``SELECT $a(;)``: ``sqlite3.ProgrammingError: Incorrect
+        # number of bindings supplied. The current statement uses 1, and
+        # there are 0 supplied.`` — reached only *after* SQLite's own check
+        # for a second statement already passed, so it proves one statement
+        # (see ``_oracle_sqlite_accepts``'s docstring below for why that
+        # error is read as an accept, not a skip).
+        #
+        # SQLite on the two ``a$a(--)`` rows: ``OperationalError: incomplete
+        # input`` for both, identically, because the unterminated ``--``
+        # comment (no closing newline in either literal) swallows the rest
+        # of the input including the ``)`` that would have closed the call —
+        # so SQLite cannot tell these two rows apart by statement count
+        # either. What SQLite *does* show is that ``a$a(`` is parsed as an
+        # ordinary identifier followed by a call, not specially — confirmed
+        # separately with a closed call, ``"SELECT a$a(1 --c\n)"``, which
+        # raises ``OperationalError: no such function: a$a`` for both the
+        # one- and two-statement variant alike: a name-resolution error,
+        # never "Incorrect number of bindings" or "one statement", which is
+        # what SQLite would raise instead if it ever treated ``a$a(`` as a
+        # parameter token. The guard's own verdict for the two rows at this
+        # test's actual SQL (accept, both) is checked against a hostile
+        # alternative instead: a planted mutation that treats every
+        # ``$``/``@``/``:``/``#`` as a fresh parameter token start, with no
+        # exception for one that is mid-identifier, turns the second row
+        # (but not the first) red — see the WS's failability report.
+        assert executor_module._guard_select_sql(sql) == sql
+
+
+# ---------------------------------------------------------------------------
+# Oracle property test: the scan's accept/reject verdict against SQLite's own
+# tokenizer, swept over generated statements.
+# ---------------------------------------------------------------------------
+
+#: SELECT heads every generated statement starts with, so the guard's leading
+#: ``SELECT`` check never decides the verdict — only the single-statement
+#: scan this sweep is about. The parameter-token heads double as their own
+#: fragment: each carries a comment opener or a ``;`` inside (or right
+#: after) a ``$``/``@``/``:``/``#`` token, so a scan that let that token's
+#: ``(...)`` extension be interrupted would see a false separator, and a
+#: scan that treated the plain ``$a::b`` form as more than one token would
+#: miscount its bound parameters.
+_ORACLE_SELECT_HEADS = (
+    "SELECT 1",
+    "SELECT 1 AS col",
+    "SELECT * FROM sqlite_master",
+    "SELECT 1 WHERE 1",
+    "SELECT $a(--)",
+    "SELECT $a(/*)",
+    "SELECT $a(;)",
+    "SELECT @b",
+    "SELECT :c",
+    "SELECT $d::e",
+    "SELECT #f",
+)
+
+#: Fragments exercising every lexical form the scan must skip whole — both
+#: doubling-escape quote kinds, the bracket form (no escape), both comment
+#: forms, including an unterminated block comment, and a ``$`` that is not
+#: a fresh parameter token because it sits mid-identifier (``a$a(--)``,
+#: where the ``(`` and the real ``--`` comment after it must still be read
+#: normally) — each carrying a ``;`` so a scan that stopped treating the
+#: fragment specially would see a false separator.
+_ORACLE_SKIPPED_FRAGMENTS = (
+    "'literal;text'",
+    "'it''s;a quote'",
+    '"a;b"',
+    '"a""b;c"',
+    "[a;b]",
+    "`a;b`",
+    "`a``b;c`",
+    "-- a line comment; with a semicolon",
+    "/* a block comment; with a semicolon */",
+    "/* an unterminated block comment; with no close",
+    "a$a(--)",
+)
+
+#: Fragments that open a real second statement, or just trail the real one.
+_ORACLE_SEPARATOR_TAILS = (
+    "",
+    ";",
+    "; SELECT 2",
+    ";SELECT 2",
+    "; -- trailing comment",
+    "; /* trailing comment */",
+    "; garbage not sql",
+)
+
+#: Generated statements compared per run. "A few thousand", per the spec.
+_ORACLE_SWEEP_SIZE = 4000
+
+
+def _oracle_sqlite_accepts(sql: str, conn: sqlite3.Connection) -> bool | None:
+    """Ask a real SQLite connection whether ``sql`` is a single statement.
+
+    Binding classification, made explicit: the parameter-token heads above
+    carry an unbound ``$a``/``@b``/``:c``/``$d::e``/``#f``, and this sweep
+    passes no parameters, so a head that is otherwise a single valid
+    statement fails with ``sqlite3.ProgrammingError: Incorrect number of
+    bindings supplied. ...`` — not the "only one statement" error. CPython's
+    ``sqlite3`` checks for leftover SQL (a second statement) when it
+    *prepares* the statement, strictly before binding any parameter values;
+    a multi-statement input is rejected there and never reaches the binding
+    check at all. Reaching "Incorrect number of bindings supplied" is
+    therefore itself proof that SQLite parsed ``sql`` as exactly one
+    statement — it failed only because this sweep binds nothing. Counting it
+    as a skip, as every other unrelated error is counted, would silently
+    drop every one of these generated statements from the comparison;
+    counting it as a reject would misreport a single statement as two. It is
+    counted as an accept.
+
+    Args:
+        sql: The already-normalised (``str.strip``ped) statement text.
+        conn: An open in-memory ``sqlite3`` connection.
+
+    Returns:
+        ``True`` if SQLite ran ``sql`` as one statement, or failed only on
+        the missing-bindings check described above; ``False`` if SQLite
+        raised its "only one statement" error; or ``None`` when SQLite
+        rejected ``sql`` for any other, unrelated reason (a syntax or
+        name-resolution error in the first statement) — the case the spec
+        says to skip, since that is not a verdict about how many statements
+        ``sql`` holds.
+
+    """
+    try:
+        conn.execute(sql)
+    except sqlite3.ProgrammingError as exc:
+        message = str(exc).lower()
+        if "you can only execute one statement" in message:
+            return False
+        if "incorrect number of bindings supplied" in message:
+            return True
+        return None
+    except sqlite3.Error:
+        return None
+    else:
+        return True
+
+
+class TestSelectGuardAgreesWithSqliteOracle:
+    """The scan's accept/reject verdict matches what ``sqlite3`` actually does.
+
+    Generates statements from the fragments above and asks two questions of
+    each: what does the guard decide, and does Python's ``sqlite3`` raise
+    "you can only execute one statement at a time" running the same
+    (normalised) text on an in-memory connection? The two must agree on every
+    statement SQLite's own verdict actually decides.
+    """
+
+    def test_oracle_sweep(self) -> None:
+        rng = random.Random(20261005)  # noqa: S311 - a reproducible sweep, not a secret
+        conn = sqlite3.connect(":memory:")
+        compared = 0
+        skipped = 0
+        try:
+            for _ in range(_ORACLE_SWEEP_SIZE):
+                head = rng.choice(_ORACLE_SELECT_HEADS)
+                middle = " ".join(
+                    rng.choice(_ORACLE_SKIPPED_FRAGMENTS) for _ in range(rng.randint(0, 3))
+                )
+                tail = rng.choice(_ORACLE_SEPARATOR_TAILS)
+                sql = " ".join(part for part in (head, middle, tail) if part)
+
+                # The guard normalises through ``str.strip`` first and executes
+                # what it returns, so that is the text whose statement count
+                # matters — not the raw (possibly differently-whitespaced) sql.
+                normalised = str.strip(sql)
+                sqlite_accepts = _oracle_sqlite_accepts(normalised, conn)
+                if sqlite_accepts is None:
+                    skipped += 1
+                    continue
+
+                try:
+                    executor_module._guard_select_sql(normalised)
+                except MindQLParseError:
+                    guard_accepts = False
+                else:
+                    guard_accepts = True
+
+                assert guard_accepts == sqlite_accepts, normalised
+                compared += 1
+        finally:
+            conn.close()
+
+        # A sweep that skipped (almost) everything would pass vacuously.
+        assert compared > _ORACLE_SWEEP_SIZE // 2
+        assert skipped < _ORACLE_SWEEP_SIZE
+
+
+# ---------------------------------------------------------------------------
+# Keyword boundary: a boolean keyword is a whole word, outside a literal
+# ---------------------------------------------------------------------------
+
+
+class TestKeywordWordBoundary:
+    """``AND`` / ``OR`` are recognised only as a whole word, never mid-word.
+
+    Reproduces the defect where ``_WhereTokenizer``'s keyword regex checked a
+    word boundary only after the keyword, so ``OR`` inside ``vendor`` (or any
+    value ending in ``or``/``and``) was mistaken for the operator.
+    """
+
+    def test_value_ending_in_or_combined_with_real_or(self) -> None:
+        # 'vendor' ends in 'or', which must stay operand text.
+        q = parse("FIND thoughts WHERE source = vendor OR priority = 1")
+        assert isinstance(q.where, BoolExpr)
+        assert q.where.op == "OR"
+        left, right = q.where.operands
+        assert isinstance(left, Comparison)
+        assert left.field == "source"
+        assert left.value == "vendor"
+        assert isinstance(right, Comparison)
+        assert right.field == "priority"
+        assert right.value == 1
+
+    @pytest.mark.parametrize(
+        "value",
+        ["vendor", "editor", "brand", "ORACLE", "ANDROID", "command", "doctor"],
+    )
+    def test_keyword_shaped_values_stay_operand_text(self, value: str) -> None:
+        q = parse(f"FIND thoughts WHERE source = {value} OR priority = 1")
+        assert isinstance(q.where, BoolExpr)
+        left = q.where.operands[0]
+        assert isinstance(left, Comparison)
+        assert left.value == value
+
+    def test_unicode_word_stays_operand_text(self) -> None:
+        # 'é' is a Unicode word character: 'ORé' must not be split as 'OR'.
+        q = parse("FIND thoughts WHERE source = ORé OR priority = 1")
+        assert isinstance(q.where, BoolExpr)
+        left = q.where.operands[0]
+        assert isinstance(left, Comparison)
+        assert left.value == "ORé"
+
+    def test_unicode_word_stays_operand_text_leading_boundary(self) -> None:
+        # 'é' is a Unicode word character on the *leading* side of the
+        # keyword too: 'éOR' must not be split as 'OR'.
+        q = parse("FIND thoughts WHERE source = éOR OR priority = 1")
+        assert isinstance(q.where, BoolExpr)
+        left = q.where.operands[0]
+        assert isinstance(left, Comparison)
+        assert left.value == "éOR"
+
+    @pytest.mark.parametrize("keyword", ["OR", "or"])
+    def test_tight_parens_around_or_still_parse(self, keyword: str) -> None:
+        # No space before/after OR: the preceding ')' already makes a real
+        # boundary, and must keep doing so. Both cases matter: with the
+        # upper-case keyword, a mutation that stops recognising it as a
+        # keyword can still accidentally reconstruct the same tree from a
+        # mis-scanned operand fragment that happens to read "OR" — only the
+        # lower-case spelling, which a correct scan still upper-cases to the
+        # structural token but a broken one leaves as literal text, exposes
+        # that kind of mutation.
+        q = parse(f"FIND thoughts WHERE (source = 'x'){keyword}(source = 'y')")
+        assert isinstance(q.where, BoolExpr)
+        assert q.where.op == "OR"
+        left, right = q.where.operands
+        assert isinstance(left, Comparison)
+        assert left.value == "x"
+        assert isinstance(right, Comparison)
+        assert right.value == "y"
+
+    @pytest.mark.parametrize("keyword", ["OR", "or"])
+    def test_tight_quote_before_or_still_parses(self, keyword: str) -> None:
+        q = parse(f"FIND thoughts WHERE source='x'{keyword} source='y'")
+        assert isinstance(q.where, BoolExpr)
+        assert q.where.op == "OR"
+        left, right = q.where.operands
+        assert isinstance(left, Comparison)
+        assert left.value == "x"
+        assert isinstance(right, Comparison)
+        assert right.value == "y"
+
+    async def test_unquoted_value_matches_same_rows_as_quoted(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        # Acceptance: unquoted 'vendor' must behave exactly like 'vendor'.
+        store = SqliteEngravaCore(db)
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-vendor",
+                thought_type=ThoughtType.OBSERVATION,
+                essence="e",
+                content="c",
+                priority=Priority.P2,
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                created_cycle=1,
+                updated_cycle=1,
+                source="vendor",
+                confidence=0.5,
+            )
+        )
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-priority",
+                thought_type=ThoughtType.OBSERVATION,
+                essence="e",
+                content="c",
+                priority=Priority.P1,
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                created_cycle=1,
+                updated_cycle=1,
+                source="other",
+                confidence=0.5,
+            )
+        )
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-neither",
+                thought_type=ThoughtType.OBSERVATION,
+                essence="e",
+                content="c",
+                priority=Priority.P2,
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                created_cycle=1,
+                updated_cycle=1,
+                source="other",
+                confidence=0.5,
+            )
+        )
+        unquoted = await store.execute_mindql(
+            parse("FIND thoughts WHERE source = vendor OR priority = 1")
+        )
+        quoted = await store.execute_mindql(
+            parse("FIND thoughts WHERE source = 'vendor' OR priority = 1")
+        )
+        # ``priority`` is stored as its string enum value, so the inert
+        # ``priority = 1`` side of the OR never matches anything here; only
+        # the left side (quoted vs. unquoted 'vendor') can tell the two
+        # queries apart, and it must not.
+        assert {row["thought_id"] for row in unquoted.rows} == {"t-vendor"}
+        assert {row["thought_id"] for row in unquoted.rows} == {
+            row["thought_id"] for row in quoted.rows
+        }
+
+
+# ---------------------------------------------------------------------------
+# AND split, and ORDER BY / LIMIT / OFFSET detection, stay outside literals
+# ---------------------------------------------------------------------------
+
+
+class TestQuoteAwareAndSplit:
+    """Splitting the WHERE tail on ``AND`` never looks inside a literal."""
+
+    def test_and_inside_literal_stays_one_value(self) -> None:
+        # 'a AND b' must not be cut inside the literal.
+        q = parse("FIND thoughts WHERE essence = 'a AND b'")
+        assert q.where is None
+        assert len(q.conditions) == 1
+        assert q.conditions[0].value == "a AND b"
+
+    def test_and_inside_literal_combined_with_a_real_and(self) -> None:
+        q = parse("FIND thoughts WHERE essence = 'a AND b' AND priority = 'P1'")
+        assert q.where is None
+        assert len(q.conditions) == 2
+        assert q.conditions[0].value == "a AND b"
+        assert q.conditions[1].field == "priority"
+
+
+class TestQuoteAwareTrailingClauses:
+    """ORDER BY / LIMIT / OFFSET text inside a literal is not a real clause."""
+
+    def test_order_by_text_inside_literal_is_not_a_clause(self) -> None:
+        # The value IS the literal text "ORDER BY priority".
+        q = parse("FIND thoughts WHERE essence = 'ORDER BY priority'")
+        assert q.where is None
+        assert q.order_by == ()
+        assert q.conditions[0].value == "ORDER BY priority"
+
+    def test_limit_text_inside_literal_is_not_a_clause(self) -> None:
+        q = parse("FIND thoughts WHERE essence = 'LIMIT 5'")
+        assert q.where is None
+        assert q.limit is None
+        assert q.conditions[0].value == "LIMIT 5"
+
+    def test_offset_text_inside_literal_is_not_a_clause(self) -> None:
+        q = parse("FIND thoughts WHERE essence = 'OFFSET 5'")
+        assert q.where is None
+        assert q.offset is None
+        assert q.conditions[0].value == "OFFSET 5"
+
+    def test_real_order_by_after_a_literal_still_works(self) -> None:
+        q = parse("FIND thoughts WHERE essence = 'x' ORDER BY created_cycle DESC LIMIT 5 OFFSET 1")
+        assert q.where is None
+        assert q.conditions[0].value == "x"
+        assert q.order_by == (("created_cycle", "DESC"),)
+        assert q.limit == 5
+        assert q.offset == 1
+
+
+# ---------------------------------------------------------------------------
+# Quote escape: '' inside a literal means one literal quote
+# ---------------------------------------------------------------------------
+
+
+class TestQuoteEscape:
+    """``''`` inside a single-quoted literal is one literal ``'`` (SQL style)."""
+
+    def test_escaped_quote_in_condition(self) -> None:
+        q = parse("FIND thoughts WHERE source = 'O''Brien'")
+        assert q.where is None
+        assert q.conditions[0].value == "O'Brien"
+
+    def test_escaped_quote_in_condition_on_tree_path(self) -> None:
+        # A trailing OR forces the tree path; the escape must work there too.
+        q = parse("FIND thoughts WHERE source = 'O''Brien' OR priority = 'P1'")
+        assert isinstance(q.where, BoolExpr)
+        left = q.where.operands[0]
+        assert isinstance(left, Comparison)
+        assert left.value == "O'Brien"
+
+    def test_escaped_quote_in_in_list(self) -> None:
+        q = parse("FIND thoughts WHERE source IN ('O''Brien', 'x')")
+        assert isinstance(q.where, InCondition)
+        assert q.where.values == ("O'Brien", "x")
+
+    async def test_escaped_quote_round_trips_through_executor(
+        self,
+        db: aiosqlite.Connection,
+    ) -> None:
+        store = SqliteEngravaCore(db)
+        await store.create_thought(
+            ThoughtRecord(
+                thought_id="t-obrien",
+                thought_type=ThoughtType.OBSERVATION,
+                essence="e",
+                content="c",
+                priority=Priority.P1,
+                lifecycle_status=LifecycleStatus.ACTIVE,
+                created_cycle=1,
+                updated_cycle=1,
+                source="O'Brien",
+                confidence=0.5,
+            )
+        )
+        executor = MindQLExecutor(db)
+        result = await executor.execute(parse("FIND thoughts WHERE source = 'O''Brien'"))
+        assert [row["thought_id"] for row in result.rows] == ["t-obrien"]
+        in_result = await executor.execute(parse("FIND thoughts WHERE source IN ('O''Brien')"))
+        assert [row["thought_id"] for row in in_result.rows] == ["t-obrien"]
+
+    def test_unterminated_literal_still_raises_the_same_message(self) -> None:
+        # Unchanged by the escape addition: this message must not move.
+        with pytest.raises(MindQLParseError, match="Unterminated string literal in WHERE clause"):
+            parse("FIND thoughts WHERE source = 'unterminated")
+
+
+# ---------------------------------------------------------------------------
+# Dangling / doubled boolean keyword
+# ---------------------------------------------------------------------------
+
+
+class TestDanglingBooleanKeyword:
+    """A dangling or doubled ``AND``/``OR`` is rejected, never silently fixed up."""
+
+    def test_trailing_and_rejected(self) -> None:
+        # A trailing AND used to be silently dropped.
+        with pytest.raises(MindQLParseError, match="Dangling 'AND'"):
+            parse("FIND thoughts WHERE priority = 'P1' AND")
+
+    def test_leading_and_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="Dangling 'AND'"):
+            parse("FIND thoughts WHERE AND priority = 'P1'")
+
+    def test_doubled_and_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match="Dangling 'AND'"):
+            parse("FIND thoughts WHERE priority = 'P1' AND AND source = 'x'")
+
+    def test_trailing_or_rejected(self) -> None:
+        # Already correct at the base (tree path); kept here as the fourth
+        # shape the requirement names, alongside the three AND shapes above.
+        with pytest.raises(MindQLParseError):
+            parse("FIND thoughts WHERE priority = 'P1' OR")
+
+
+# ---------------------------------------------------------------------------
+# WHERE nesting depth limit
+# ---------------------------------------------------------------------------
+
+
+def _nested_where(depth: int) -> str:
+    """Build a FIND query with ``depth`` levels of parenthesised nesting."""
+    return "FIND thoughts WHERE " + "(" * depth + "priority = 'P1'" + ")" * depth
+
+
+class TestWhereNestingDepthLimit:
+    """Deep parenthesised nesting raises ``MindQLParseError``, never ``RecursionError``."""
+
+    def test_default_recursion_limit_depth_raises_parse_error_not_recursion_error(
+        self,
+    ) -> None:
+        # At the base, 1,000 levels (the default sys recursion limit) raises
+        # RecursionError. It must now raise MindQLParseError instead.
+        with pytest.raises(MindQLParseError, match="nested too deeply"):
+            parse(_nested_where(1000))
+
+    def test_256_levels_accepted(self) -> None:
+        q = parse(_nested_where(256))
+        node: object = q.where
+        depth = 0
+        while isinstance(node, BoolExpr):
+            depth += 1
+            node = node.operands[0]
+        assert isinstance(node, Comparison)
+        assert node.field == "priority"
+
+    def test_257_levels_rejected(self) -> None:
+        with pytest.raises(MindQLParseError, match=r"nested too deeply \(limit 256\)"):
+            parse(_nested_where(257))
+
+
+# ---------------------------------------------------------------------------
+# Property-style sweep: previously-valid queries parse the same way
+# ---------------------------------------------------------------------------
+#
+# A corpus of queries spanning the pre-existing grammar (simple comparisons,
+# AND / OR / parentheses, IN, temporal predicates, ORDER BY, LIMIT, OFFSET,
+# EXPLAIN) is checked against a handful of structural invariants that a
+# change to the shared tokenizer/splitter could silently break — this is
+# what shows the fix for the six defects above did not change anything else.
+
+# Each leaf carries both the form it parses to on the flat path (``None``
+# when the leaf itself forces the tree, e.g. ``IN``) and the form it parses
+# to as a tree operand, so the sweep below can assert on the exact values a
+# body should produce, not just its shape.
+_SweepLeaf = tuple[str, bool, Condition | TemporalPredicate | None, WhereNode]
+
+_SWEEP_LEAVES: list[_SweepLeaf] = [
+    # (condition text, forces the boolean-expression tree on its own,
+    #  flat-path node, tree-path node)
+    (
+        "priority = 'P1'",
+        False,
+        Condition(field="priority", operator=MindQLOperator.EQ, value="P1"),
+        Comparison(field="priority", operator=MindQLOperator.EQ, value="P1"),
+    ),
+    (
+        "source = x",
+        False,
+        Condition(field="source", operator=MindQLOperator.EQ, value="x"),
+        Comparison(field="source", operator=MindQLOperator.EQ, value="x"),
+    ),
+    (
+        "confidence > 0.5",
+        False,
+        Condition(field="confidence", operator=MindQLOperator.GT, value=0.5),
+        Comparison(field="confidence", operator=MindQLOperator.GT, value=0.5),
+    ),
+    (
+        "created_cycle = 7",
+        False,
+        Condition(field="created_cycle", operator=MindQLOperator.EQ, value=7),
+        Comparison(field="created_cycle", operator=MindQLOperator.EQ, value=7),
+    ),
+    (
+        f"valid_at '{_T_JAN}'",
+        False,
+        TemporalPredicate(kind=TemporalPredicateKind.VALID_AT, start=_T_JAN),
+        TemporalPredicate(kind=TemporalPredicateKind.VALID_AT, start=_T_JAN),
+    ),
+    (
+        "thought_type IN ('BELIEF', 'OBSERVATION')",
+        True,
+        None,
+        InCondition(field="thought_type", values=("BELIEF", "OBSERVATION")),
+    ),
+]
+
+# What the flat path (``_parse_flat_where``) returns for a set of flat-path
+# leaves: conditions and temporal predicates each in the relative order their
+# own type appeared in, matching how that function builds its two lists.
+_SweepExpected = tuple[list[Condition], list[TemporalPredicate]] | WhereNode
+
+
+def _flat_result(
+    *nodes: Condition | TemporalPredicate,
+) -> tuple[list[Condition], list[TemporalPredicate]]:
+    conditions = [node for node in nodes if isinstance(node, Condition)]
+    temporal_predicates = [node for node in nodes if isinstance(node, TemporalPredicate)]
+    return conditions, temporal_predicates
+
+
+def _single_leaf_expected(leaf: _SweepLeaf) -> _SweepExpected:
+    """What a lone leaf, used as the whole WHERE body, should parse to."""
+    _, forces_tree, flat, tree = leaf
+    if forces_tree:
+        return tree
+    assert flat is not None  # construction invariant: non-tree leaves carry a flat node
+    return _flat_result(flat)
+
+
+def _and_pair_expected(left: _SweepLeaf, right: _SweepLeaf) -> tuple[bool, _SweepExpected]:
+    """The ``forces_tree`` flag and expected parse result for ``left AND right``."""
+    _, left_tree, left_flat, left_node = left
+    _, right_tree, right_flat, right_node = right
+    forces_tree = left_tree or right_tree
+    if forces_tree:
+        return True, BoolExpr(op="AND", operands=(left_node, right_node))
+    assert left_flat is not None  # construction invariant, see _single_leaf_expected
+    assert right_flat is not None
+    return False, _flat_result(left_flat, right_flat)
+
+
+def _sweep_bodies() -> list[tuple[str, bool, _SweepExpected]]:
+    """Return ``(WHERE body, forces_tree, expected parse result)`` triples.
+
+    ``expected`` is what the generator put into the body — the flat
+    ``(conditions, temporal_predicates)`` pair, or the ``where`` tree —
+    compared below against the real parse result value for value, not merely
+    checked for shape.
+    """
+    bodies: list[tuple[str, bool, _SweepExpected]] = [
+        (leaf[0], leaf[1], _single_leaf_expected(leaf)) for leaf in _SWEEP_LEAVES
+    ]
+    for left, right in itertools.combinations(_SWEEP_LEAVES, 2):
+        and_forces_tree, and_expected = _and_pair_expected(left, right)
+        bodies.append((f"{left[0]} AND {right[0]}", and_forces_tree, and_expected))
+        bodies.append(
+            (
+                f"{left[0]} OR {right[0]}",
+                True,
+                BoolExpr(op="OR", operands=(left[3], right[3])),
+            )
+        )
+    nested = BoolExpr(
+        op="AND",
+        operands=(
+            BoolExpr(op="OR", operands=(_SWEEP_LEAVES[0][3], _SWEEP_LEAVES[1][3])),
+            _SWEEP_LEAVES[2][3],
+        ),
+    )
+    bodies.append(("(priority = 'P1' OR source = x) AND confidence > 0.5", True, nested))
+    return bodies
+
+
+_SWEEP_BODIES = _sweep_bodies()
+_SWEEP_SUFFIXES: dict[str, str] = {
+    "none": "",
+    "order-by": " ORDER BY created_cycle DESC",
+    "full": " ORDER BY created_cycle DESC LIMIT 5 OFFSET 2",
+}
+_SWEEP_PREFIXES: dict[str, str] = {
+    "find": "FIND thoughts WHERE ",
+    "explain-find": "EXPLAIN FIND thoughts WHERE ",
+}
+
+
+class TestParseResultUnchangedSweep:
+    """A generated corpus of previously-valid queries keeps parsing the same way."""
+
+    @pytest.mark.parametrize(
+        ("body", "forces_tree", "expected"),
+        _SWEEP_BODIES,
+        ids=[f"body{i:03d}" for i in range(len(_SWEEP_BODIES))],
+    )
+    @pytest.mark.parametrize("suffix_id", sorted(_SWEEP_SUFFIXES))
+    @pytest.mark.parametrize("prefix_id", sorted(_SWEEP_PREFIXES))
+    def test_sweep_entry_parses_consistently(
+        self,
+        prefix_id: str,
+        suffix_id: str,
+        body: str,
+        forces_tree: bool,
+        expected: _SweepExpected,
+    ) -> None:
+        query = f"{_SWEEP_PREFIXES[prefix_id]}{body}{_SWEEP_SUFFIXES[suffix_id]}"
+        parsed = parse(query)
+        assert parsed.command == MindQLCommand.FIND
+        assert parsed.table == "thought"
+        assert parsed.explain == (prefix_id == "explain-find")
+        if forces_tree:
+            assert parsed.where == expected
+            assert parsed.conditions == []
+            assert parsed.temporal_predicates == []
+        else:
+            assert parsed.where is None
+            expected_conditions, expected_temporal_predicates = expected
+            assert parsed.conditions == expected_conditions
+            assert parsed.temporal_predicates == expected_temporal_predicates
+        if suffix_id == "none":
+            assert parsed.order_by == ()
+            assert parsed.limit is None
+            assert parsed.offset is None
+        elif suffix_id == "order-by":
+            assert parsed.order_by == (("created_cycle", "DESC"),)
+            assert parsed.limit is None
+            assert parsed.offset is None
+        else:
+            assert parsed.order_by == (("created_cycle", "DESC"),)
+            assert parsed.limit == 5
+            assert parsed.offset == 2

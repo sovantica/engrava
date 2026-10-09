@@ -25,11 +25,15 @@ from click.testing import CliRunner
 
 from engrava import (
     ConfigError,
+    DreamingConfig,
     EdgeRecord,
     EdgeType,
     EmbeddingConfig,
+    EmbeddingGenerationError,
     EngravaConfig,
     HygienePolicyConfig,
+    JournalConfig,
+    JournalIntegrityError,
     LifecycleStatus,
     MetricsConfig,
     Priority,
@@ -39,6 +43,7 @@ from engrava import (
     SqliteEngravaCore,
     ThoughtRecord,
     ThoughtType,
+    TTLConfig,
 )
 from engrava.cli.main import cli
 from engrava.config import (
@@ -47,9 +52,11 @@ from engrava.config import (
     load_config,
 )
 from engrava.domain.protocols.derived_records import DeriveGates
+from engrava.domain.protocols.hooks import DefaultEngravaHooks
 from engrava.infrastructure import service_manager as service_manager_module
 from engrava.infrastructure.service_manager import EngravaManager
 from engrava.infrastructure.sqlite.engrava_core import (
+    CORE_SCHEMA_HEAD_VERSION,
     _close_quietly,
     _run_cleanup_step_quietly,
 )
@@ -853,6 +860,579 @@ class TestEngravaManager:
 
 
 # ------------------------------------------------------------------
+# EngravaManager(base_config=...) — full configuration wiring
+# ------------------------------------------------------------------
+
+
+class _MarkerHooks(DefaultEngravaHooks):
+    """A hooks class distinguishable from the "unconfigured" default.
+
+    ``resolve_hooks(None)`` -- what a store gets when ``hooks_class`` is
+    never set -- also returns a plain ``DefaultEngravaHooks``, so a test
+    resolving that same class by dotted path could not tell "configured"
+    apart from "never configured". Subclassing it keeps every method a
+    no-op (satisfying ``EngravaHooksProtocol`` for free) while giving
+    ``type(store._hooks) is _MarkerHooks`` a result only a real
+    ``hooks_class`` wiring can produce.
+    """
+
+
+class _FailingEmbeddingProvider:
+    """An embedding provider whose every call raises, to drive ``require_embedding``."""
+
+    dimension = 4
+    model_name = "failing-manager-provider"
+
+    async def embed(self, text: str) -> list[float]:
+        del text
+        msg = "embedding provider offline"
+        raise RuntimeError(msg)
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        del texts
+        msg = "embedding provider offline"
+        raise RuntimeError(msg)
+
+
+def _manager_thought(thought_id: str) -> ThoughtRecord:
+    return ThoughtRecord(
+        thought_id=thought_id,
+        essence=f"Essence {thought_id}",
+        content=f"Content for {thought_id}",
+        thought_type=ThoughtType.OBSERVATION,
+        source="test",
+        lifecycle_status=LifecycleStatus.ACTIVE,
+        priority=Priority.P2,
+        created_cycle=1,
+        updated_cycle=1,
+    )
+
+
+def _install_construction_spies(
+    mp: pytest.MonkeyPatch,
+) -> tuple[list[str], list[dict[str, object]]]:
+    """Patch ``SqliteEngravaCore``'s construction seam to record a call trace.
+
+    Returns the ordered step trace and the captured ``__init__`` keyword
+    arguments (positional ``db`` excluded -- the connection object
+    necessarily differs between two opens and is not what a caller is
+    proving equal here). Used to compare a direct ``from_config`` open
+    against an ``EngravaManager``-built one end to end.
+    """
+    trace: list[str] = []
+    init_kwargs: list[dict[str, object]] = []
+
+    real_init = SqliteEngravaCore.__init__
+    real_attach = SqliteEngravaCore.attach_dreaming_extension
+    real_ensure_schema = SqliteEngravaCore.ensure_schema
+    real_configure = SqliteEngravaCore._configure_vector_backend
+
+    def _init(self: SqliteEngravaCore, db: object, *args: object, **kwargs: object) -> None:
+        trace.append("init")
+        init_kwargs.append(dict(kwargs))
+        real_init(self, db, *args, **kwargs)  # type: ignore[arg-type]
+
+    def _attach(self: SqliteEngravaCore, extension: object) -> None:
+        trace.append("attach_dreaming_extension")
+        real_attach(self, extension)  # type: ignore[arg-type]
+
+    async def _ensure_schema(self: SqliteEngravaCore) -> None:
+        trace.append("ensure_schema")
+        await real_ensure_schema(self)
+
+    async def _configure(
+        self: SqliteEngravaCore, *, backend_name: str, embedding_dimension: int
+    ) -> None:
+        trace.append("configure_vector_backend")
+        await real_configure(
+            self, backend_name=backend_name, embedding_dimension=embedding_dimension
+        )
+
+    mp.setattr(SqliteEngravaCore, "__init__", _init)
+    mp.setattr(SqliteEngravaCore, "attach_dreaming_extension", _attach)
+    mp.setattr(SqliteEngravaCore, "ensure_schema", _ensure_schema)
+    mp.setattr(SqliteEngravaCore, "_configure_vector_backend", _configure)
+    return trace, init_kwargs
+
+
+class TestEngravaManagerBaseConfig:
+    """``EngravaManager(base_config=...)`` applies the full configuration.
+
+    Each store a manager builds this way is wired the same way
+    ``SqliteEngravaCore.from_config`` wires one — journal, hygiene policy,
+    TTL, hooks, dreaming and ``require_embedding``, none of which a manager
+    without ``base_config`` ever configures (see
+    ``TestEngravaManager`` above, whose stores keep behaving exactly as
+    before this feature existed).
+    """
+
+    async def test_base_config_enables_the_journal_through_the_manager(
+        self, tmp_path: Path
+    ) -> None:
+        data_dir = tmp_path / "services"
+        base_config = EngravaConfig(
+            database_path=data_dir / "unused.db",  # never read -- see base_config's docstring
+            services=ServicesConfig(data_dir=data_dir),
+            journal=JournalConfig(enabled=True),
+        )
+        manager = EngravaManager(data_dir=data_dir, base_config=base_config)
+        try:
+            store = await manager.get_store("alpha")
+            assert store._journal_enabled is True
+            await store.create_thought(_manager_thought("t-001"))
+            result = await store.verify_journal()
+            assert result.entries_checked >= 1
+        finally:
+            await manager.close_all()
+
+    async def test_base_config_enables_require_embedding_through_the_manager(
+        self, tmp_path: Path
+    ) -> None:
+        data_dir = tmp_path / "services"
+        base_config = EngravaConfig(
+            database_path=data_dir / "unused.db",
+            services=ServicesConfig(data_dir=data_dir),
+            embeddings=EmbeddingConfig(auto_embed=True, require_embedding=True),
+        )
+        # Built through EngravaManager.from_config, whose base_config feeds
+        # _resolve_embedding_config's own fallback when default_embeddings
+        # is left unset (see its docstring) -- auto_embed / require_embedding
+        # are read off the *resolved* embeddings config. A direct
+        # EngravaManager(...) construction gets the same fallback; see
+        # TestDefaultEmbeddingsFallback below.
+        manager = await EngravaManager.from_config(
+            base_config,
+            embedding_provider_factory=lambda _name: _FailingEmbeddingProvider(),
+        )
+        try:
+            store = await manager.get_store("alpha")
+            assert store._require_embedding is True
+            with pytest.raises(EmbeddingGenerationError):
+                await store.create_thought(_manager_thought("t-req"))
+        finally:
+            await manager.close_all()
+
+    async def test_base_config_attaches_dreaming_through_the_manager(self, tmp_path: Path) -> None:
+        data_dir = tmp_path / "services"
+        base_config = EngravaConfig(
+            database_path=data_dir / "unused.db",
+            services=ServicesConfig(data_dir=data_dir),
+            dreaming=DreamingConfig(enabled=True),
+        )
+        manager = EngravaManager(data_dir=data_dir, base_config=base_config)
+        try:
+            store = await manager.get_store("alpha")
+            assert store._dreaming_extension is not None
+        finally:
+            await manager.close_all()
+
+    async def test_base_config_wires_hygiene_ttl_hooks_and_vector_backend(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every setting the shared builder passes to the store is checked against its value.
+
+        Not just that a manager-built store and a ``from_config``-built store agree
+        with each other (that comparison stays green even if both stop reading a
+        setting at all) -- each assertion below compares the store's own attribute
+        to the literal value ``base_config`` carries, so dropping any one setting's
+        wiring in the builder turns the matching assertion red on its own.
+        """
+        import sys
+        import types
+
+        from engrava.domain.manifest import ExtensionManifest
+
+        manifest_module_name = "_manager_config_wiring_probe_manifest_mod"
+        manifest_module = types.ModuleType(manifest_module_name)
+        manifest_module.MANIFEST = ExtensionManifest(  # type: ignore[attr-defined]
+            name="manager-wiring-probe", version="0.0.1", hooks_class=DefaultEngravaHooks
+        )
+        sys.modules[manifest_module_name] = manifest_module
+        try:
+            data_dir = tmp_path / "services"
+            base_config = EngravaConfig(
+                database_path=data_dir / "unused.db",
+                services=ServicesConfig(data_dir=data_dir),
+                hygiene_policy=HygienePolicyConfig(enabled=True),
+                ttl=TTLConfig(
+                    strategy="delete", check_every_n_operations=5, default_ttl_seconds=3600
+                ),
+                hooks_class="tests.test_service_isolation._MarkerHooks",
+                vector_backend="numpy",
+                embedding_dimension=777,
+                metrics=MetricsConfig(window_size=321, enabled=False),
+                extension_manifest_paths=[f"{manifest_module_name}:MANIFEST"],
+                dreaming=DreamingConfig(enabled=True),
+                derive=DeriveGates(enabled=True, max_derived_per_source=8),
+            )
+            configure_calls: list[tuple[str, int]] = []
+            real_configure = SqliteEngravaCore._configure_vector_backend
+
+            async def _spy_configure(
+                self: SqliteEngravaCore, *, backend_name: str, embedding_dimension: int
+            ) -> None:
+                configure_calls.append((backend_name, embedding_dimension))
+                await real_configure(
+                    self, backend_name=backend_name, embedding_dimension=embedding_dimension
+                )
+
+            monkeypatch.setattr(SqliteEngravaCore, "_configure_vector_backend", _spy_configure)
+
+            # The manager's own, legacy constructor knob -- deliberately
+            # different from base_config.embedding_dimension, so a value
+            # reaching _configure_vector_backend proves it came from
+            # base_config, not from this (otherwise-ignored) kwarg.
+            manager = EngravaManager(
+                data_dir=data_dir, base_config=base_config, embedding_dimension=111
+            )
+            try:
+                store = await manager.get_store("alpha")
+
+                assert store._hygiene_policy is not None
+                assert store._hygiene_policy.enabled is True
+
+                assert store._ttl_strategy == "delete"
+                assert store._ttl_check_every_n == 5
+                assert store._ttl_default_seconds == 3600
+
+                assert type(store._hooks) is _MarkerHooks
+
+                assert configure_calls == [("numpy", 777)]
+
+                assert store._metrics_config.window_size == 321
+                assert store._metrics_config.enabled is False
+
+                assert [manifest.name for manifest in store._manifests] == ["manager-wiring-probe"]
+
+                # dreaming.enabled with access_tracking_enabled left at its
+                # own default (True) is what turns this on.
+                assert store._access_tracking_enabled is True
+
+                assert store._derive_gates.enabled is True
+                assert store._derive_gates.max_derived_per_source == 8
+            finally:
+                await manager.close_all()
+        finally:
+            del sys.modules[manifest_module_name]
+
+    async def test_per_service_embeddings_override_wins_with_base_config(
+        self, tmp_path: Path
+    ) -> None:
+        data_dir = tmp_path / "services"
+        base_config = EngravaConfig(
+            database_path=data_dir / "unused.db",
+            services=ServicesConfig(
+                data_dir=data_dir,
+                configs={
+                    "special": ServiceConfig(
+                        embeddings=EmbeddingConfig(provider=None, model="override-model")
+                    ),
+                },
+            ),
+            embeddings=EmbeddingConfig(provider=None, model="base-model"),
+        )
+        manager = await EngravaManager.from_config(base_config)
+        try:
+            overridden = manager._resolve_embedding_config("special")
+            assert overridden is not None
+            assert overridden.model == "override-model"
+
+            plain = manager._resolve_embedding_config("plain")
+            assert plain is not None
+            assert plain.model == "base-model"
+        finally:
+            await manager.close_all()
+
+    async def test_embedding_provider_factory_is_called_with_the_service_name(
+        self, tmp_path: Path
+    ) -> None:
+        data_dir = tmp_path / "services"
+        calls: list[str] = []
+        provider = _FailingEmbeddingProvider()
+
+        def _factory(service_name: str) -> _FailingEmbeddingProvider:
+            calls.append(service_name)
+            return provider
+
+        manager = EngravaManager(data_dir=data_dir, embedding_provider_factory=_factory)
+        try:
+            store = await manager.get_store("alpha")
+            assert calls == ["alpha"]
+            assert store._embedding_provider is provider
+        finally:
+            await manager.close_all()
+
+    async def test_factory_returning_none_falls_back_to_resolved_configuration(
+        self, tmp_path: Path
+    ) -> None:
+        """Without ``base_config``, a factory that returns ``None`` is not the final word.
+
+        It falls back to resolving a provider from the resolved embedding
+        configuration, exactly as an unset factory already does -- "ollama" is
+        resolved to a real ``OllamaProvider`` instance with no network call
+        (construction is lazy; see its own docstring), so this needs no mock.
+        """
+        from engrava.embeddings.ollama import OllamaProvider
+
+        data_dir = tmp_path / "services"
+        manager = EngravaManager(
+            data_dir=data_dir,
+            default_embeddings=EmbeddingConfig(provider="ollama", model="nomic-embed-text"),
+            embedding_provider_factory=lambda _name: None,
+        )
+        try:
+            store = await manager.get_store("alpha")
+            assert type(store._embedding_provider) is OllamaProvider
+            assert store._embedding_provider.model_name == "nomic-embed-text"
+        finally:
+            await manager.close_all()
+
+    async def test_verify_on_open_refuses_a_tampered_journal_through_the_manager(
+        self, tmp_path: Path
+    ) -> None:
+        data_dir = tmp_path / "services"
+        base_config = EngravaConfig(
+            database_path=data_dir / "unused.db",
+            services=ServicesConfig(data_dir=data_dir),
+            journal=JournalConfig(enabled=True, verify_on_open=True),
+        )
+
+        manager = EngravaManager(data_dir=data_dir, base_config=base_config)
+        try:
+            store = await manager.get_store("alpha")
+            await store.create_thought(_manager_thought("t-001"))
+            await store.update_thought("t-001", essence="changed")
+            db_path = manager._service_db_path("alpha")
+        finally:
+            await manager.close_all()
+
+        conn = await aiosqlite.connect(str(db_path))
+        try:
+            await conn.execute(
+                "UPDATE journal_entry SET delta = ? WHERE sequence_number = 1",
+                (json.dumps({"before": None, "after": {"tampered": True}}),),
+            )
+            await conn.commit()
+        finally:
+            await conn.close()
+
+        manager2 = EngravaManager(data_dir=data_dir, base_config=base_config)
+        try:
+            with pytest.raises(JournalIntegrityError):
+                await manager2.get_store("alpha")
+        finally:
+            await manager2.close_all()
+
+    def test_migrate_false_with_base_config_does_not_migrate_a_behind_schema_database(
+        self, tmp_path: Path
+    ) -> None:
+        # A plain (non-async) test, like TestServiceSnapshot above: the CLI
+        # invocation below runs its own asyncio.run() internally, which
+        # cannot nest inside a pytest-asyncio event loop -- so the async
+        # setup here is driven through explicit asyncio.run() calls instead
+        # of an async test body.
+        data_dir = tmp_path / "services"
+        base_config = EngravaConfig(
+            database_path=data_dir / "unused.db",
+            services=ServicesConfig(data_dir=data_dir),
+        )
+
+        async def _build_to_head() -> None:
+            # Build a service database to head, then roll its stamp back by
+            # one -- the migration ladder's own steps are irrelevant here;
+            # only the stamped user_version drives the migrate=False /
+            # verify_on_open skip-logic under test.
+            manager = EngravaManager(data_dir=data_dir, base_config=base_config)
+            try:
+                await manager.get_store("alpha")
+            finally:
+                await manager.close_all()
+            db_path = data_dir / "alpha.db"
+            conn = await aiosqlite.connect(str(db_path))
+            try:
+                await conn.execute(f"PRAGMA user_version = {CORE_SCHEMA_HEAD_VERSION - 1}")
+                await conn.commit()
+            finally:
+                await conn.close()
+
+        asyncio.run(_build_to_head())
+
+        async def _open_without_migrating() -> int:
+            manager2 = EngravaManager(data_dir=data_dir, base_config=base_config)
+            try:
+                store = await manager2.get_store("alpha", migrate=False)
+                cursor = await store._db.execute("PRAGMA user_version")
+                row = await cursor.fetchone()
+                return int(row[0])
+            finally:
+                await manager2.close_all()
+
+        assert asyncio.run(_open_without_migrating()) == CORE_SCHEMA_HEAD_VERSION - 1
+
+        # The CLI's service snapshot path depends on this same migrate=False
+        # behaviour (see service.py's `snapshot` command) and must still work
+        # against this same behind-schema database.
+        runner = CliRunner()
+        config_path = tmp_path / "snapshot.yaml"
+        config_path.write_text(
+            f"database:\n  path: {data_dir / 'unused.db'}\n"
+            f"services:\n  data_dir: {data_dir}\n  default_service: alpha\n",
+            encoding="utf-8",
+        )
+        out = tmp_path / "behind.jsonl"
+        result = runner.invoke(
+            cli,
+            [
+                "--db",
+                str(data_dir / "any.db"),
+                "--config",
+                str(config_path),
+                "snapshot",
+                "--service",
+                "alpha",
+                "-o",
+                str(out),
+            ],
+        )
+        assert result.exit_code == 0
+
+    async def test_manager_and_from_config_build_byte_identical_stores(
+        self, tmp_path: Path
+    ) -> None:
+        """A manager-built store's construction matches ``from_config``'s own, step for step.
+
+        The one documented difference -- dreaming attached through
+        ``attach_dreaming_extension`` rather than the private attribute
+        write -- is not a difference here any more: ``from_config`` itself
+        now goes through that same seam (see ``_build_configured_store``),
+        so both traces below are expected to be identical, not merely
+        compatible.
+        """
+        data_dir = tmp_path / "services"
+        direct_db = tmp_path / "direct.db"
+        yaml_path = tmp_path / "shared.yaml"
+        yaml_path.write_text(
+            f"database:\n  path: {direct_db}\n"
+            "journal:\n  enabled: true\n"
+            "hygiene_policy:\n  enabled: true\n"
+            "ttl:\n  strategy: delete\n  check_every_n_operations: 3\n"
+            "extensions:\n  dreaming:\n    enabled: true\n"
+            f"services:\n  data_dir: {data_dir}\n",
+            encoding="utf-8",
+        )
+
+        with pytest.MonkeyPatch.context() as mp:
+            trace_a, kwargs_a = _install_construction_spies(mp)
+            store_a = await SqliteEngravaCore.from_config(yaml_path)
+            await store_a.close()
+
+        parsed_config = load_config(yaml_path)
+        assert parsed_config.services is not None
+        with pytest.MonkeyPatch.context() as mp:
+            trace_b, kwargs_b = _install_construction_spies(mp)
+            manager = await EngravaManager.from_config(parsed_config)
+            try:
+                await manager.get_store(parsed_config.services.default_service)
+            finally:
+                await manager.close_all()
+
+        assert (
+            trace_a
+            == trace_b
+            == [
+                "init",
+                "attach_dreaming_extension",
+                "ensure_schema",
+                "configure_vector_backend",
+            ]
+        )
+
+        assert len(kwargs_a) == len(kwargs_b) == 1
+        hooks_a = kwargs_a[0].pop("hooks")
+        hooks_b = kwargs_b[0].pop("hooks")
+        assert type(hooks_a) is DefaultEngravaHooks
+        assert type(hooks_b) is DefaultEngravaHooks
+        assert kwargs_a == kwargs_b
+
+
+class TestDefaultEmbeddingsFallback:
+    """``default_embeddings`` left unset falls back to ``base_config.embeddings``.
+
+    An explicit value -- including ``None`` -- always overrides that fallback,
+    whether the manager is built directly or through ``from_config``. See
+    ``EngravaManager._resolve_embedding_config``'s docstring for the exact
+    resolution order.
+    """
+
+    async def test_direct_construction_with_base_config_resolves_embeddings_from_it(
+        self, tmp_path: Path
+    ) -> None:
+        data_dir = tmp_path / "services"
+        base_config = EngravaConfig(
+            database_path=data_dir / "unused.db",
+            services=ServicesConfig(data_dir=data_dir),
+            embeddings=EmbeddingConfig(auto_embed=True, require_embedding=True),
+        )
+        # EngravaManager(...) directly, not through from_config, with
+        # default_embeddings left unset -- the sentinel default is what
+        # makes this fall back to base_config.embeddings.
+        manager = EngravaManager(
+            data_dir=data_dir,
+            base_config=base_config,
+            embedding_provider_factory=lambda _name: _FailingEmbeddingProvider(),
+        )
+        try:
+            resolved = manager._resolve_embedding_config("alpha")
+            assert resolved is base_config.embeddings
+
+            store = await manager.get_store("alpha")
+            assert store._require_embedding is True
+            with pytest.raises(EmbeddingGenerationError):
+                await store.create_thought(_manager_thought("t-req"))
+        finally:
+            await manager.close_all()
+
+    async def test_explicit_default_embeddings_none_with_base_config_gets_no_provider(
+        self, tmp_path: Path
+    ) -> None:
+        data_dir = tmp_path / "services"
+        base_config = EngravaConfig(
+            database_path=data_dir / "unused.db",
+            services=ServicesConfig(data_dir=data_dir),
+            embeddings=EmbeddingConfig(auto_embed=True, require_embedding=True),
+        )
+        # An explicit None wins over base_config.embeddings, exactly like the
+        # CLI's restore without --re-embed.
+        manager = EngravaManager(
+            data_dir=data_dir,
+            base_config=base_config,
+            default_embeddings=None,
+        )
+        try:
+            assert manager._resolve_embedding_config("alpha") is None
+
+            store = await manager.get_store("alpha")
+            assert store._embedding_provider is None
+            assert store._require_embedding is False
+        finally:
+            await manager.close_all()
+
+    async def test_no_base_config_default_embeddings_unset_behaves_as_at_the_base(
+        self, tmp_path: Path
+    ) -> None:
+        data_dir = tmp_path / "services"
+        manager = EngravaManager(data_dir=data_dir)
+        try:
+            assert manager._resolve_embedding_config("alpha") is None
+
+            store = await manager.get_store("alpha")
+            assert store._embedding_provider is None
+            assert store._auto_embed is False
+        finally:
+            await manager.close_all()
+
+
+# ------------------------------------------------------------------
 # _close_quietly cancellation handling (infrastructure copy)
 # ------------------------------------------------------------------
 
@@ -1635,8 +2215,13 @@ class TestReEmbedRequiresProvider:
                 return None
             return _RestoreEmbeddingProvider(config.model or config.provider)
 
+        # A restore into a named service now applies the manager's full
+        # configuration wiring, so the provider is resolved inside
+        # SqliteEngravaCore._build_configured_store's own deferred import of
+        # engrava.config.resolve_embedding_provider — not through the
+        # manager module's own (now-unused for this path) import of it.
         monkeypatch.setattr(
-            "engrava.infrastructure.service_manager.resolve_embedding_provider",
+            "engrava.config.resolve_embedding_provider",
             _resolve,
         )
 

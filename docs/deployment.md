@@ -82,7 +82,10 @@ Operational consequences:
   contended (see
   [multiple stores, one file](concurrency.md#multiple-stores-one-database-file)).
   Either run a single writer replica, or give each replica its own database via
-  [`EngravaManager`](concurrency.md#per-service-isolation).
+  [`EngravaManager`](concurrency.md#per-service-isolation) — construct it with
+  the full `EngravaConfig` (not just `config.services`) so each replica's
+  store gets the same journal, hygiene policy, TTL, hooks and dreaming
+  settings a single-database `from_config` open would.
 
 ## Multiple workers
 
@@ -104,7 +107,9 @@ servers (Gunicorn/Uvicorn workers, etc.):
   [Concurrency → Multiple stores, one database file](concurrency.md#multiple-stores-one-database-file).
 - **Per-tenant or per-worker isolation:** give each its own database file via
   [`EngravaManager`](concurrency.md#per-service-isolation) when you need
-  independent writers.
+  independent writers. Construct it with the full `EngravaConfig` (not just
+  `config.services`) to apply the rest of `engrava.yaml` — the journal,
+  hygiene policy, TTL, hooks and dreaming — to every service it builds.
 
 ## Graceful shutdown
 

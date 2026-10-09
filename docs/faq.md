@@ -136,6 +136,9 @@ cognitive-cycle recency and the dreaming age gate. On restart, recover its
 high-water mark with `await store.max_cycle()`, which considers thought updates
 and edge creation cycles rather than only thought creation.
 
+The recency weight, like every hybrid-search default, comes from
+`SearchConfig`, whichever way the store was built; see
+[Hybrid Search → Signal model](search.md#signal-model).
 Recency is inactive only when a query has no explicit `current_cycle`, no
 explicit transaction-time `recency_now`, and no configured cycle provider. An
 explicit `recency_now` suppresses a passive provider; supplying both explicit

@@ -134,7 +134,12 @@ from engrava.infrastructure.sqlite.hygiene import EvictionReason, HygieneResult
 from engrava.infrastructure.sqlite.journal_writer import JournalWriter
 from engrava.infrastructure.sqlite.vector_sqlite_vec import SqliteVecSearchBackend
 from engrava.metadata import percept, thought, utterance
-from engrava.mindql.executor import MindQLExecutor, MindQLResult
+from engrava.mindql.executor import (
+    MindQLExecutor,
+    MindQLResult,
+    ReadOnlyAccessor,
+    ReadOnlyCursor,
+)
 from engrava.mindql.parser import MindQLCommand, MindQLParseError, MindQLQuery, parse
 
 __all__ = [
@@ -229,6 +234,8 @@ __all__ = [
     "OpenAICompatibleProvider",
     "Priority",
     "ProvenanceContext",
+    "ReadOnlyAccessor",
+    "ReadOnlyCursor",
     "ReadOnlyEngrava",
     "ReadOnlyMindStore",
     "ReadOnlyViolationError",

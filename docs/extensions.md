@@ -92,18 +92,20 @@ today because core never calls it, but not a no-op if you invoke it directly.
 ## Custom MindQL Commands
 
 A custom command is an `MindQLExtension`. Its `handler` is an async callable
-that the executor invokes with two positional arguments — the open
-`aiosqlite.Connection` and the parsed argument list — and returns a
-`list[dict[str, object]]`. The `MindQLExtension` fields are `command_name`,
-`handler`, `description`, and `category` (there is no `help_text` field):
+that the executor invokes with two positional arguments — a `ReadOnlyAccessor`
+wrapping the store's connection and the parsed argument list — and returns a
+`list[dict[str, object]]`. The accessor's only capability is `execute()`, which
+runs a single `SELECT` statement; see [Extension Commands](mindql.md#extension-commands)
+for the full read-only contract. The `MindQLExtension` fields are
+`command_name`, `handler`, `description`, and `category` (there is no
+`help_text` field):
 
 ```python
-import aiosqlite
-from engrava import MindQLExtension
+from engrava import MindQLExtension, ReadOnlyAccessor
 
 
 async def _handle_stats(
-    db: aiosqlite.Connection,
+    db: ReadOnlyAccessor,
     args: list[str],  # noqa: ARG001 — STATS takes no args
 ) -> list[dict[str, object]]:
     cursor = await db.execute(

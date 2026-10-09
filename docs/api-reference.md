@@ -913,6 +913,27 @@ result = await store.execute_mindql(
 print(result.rows)
 ```
 
+### `MindQLExtension`, `ReadOnlyAccessor`, and `ReadOnlyCursor`
+
+`MindQLExtension` registers a custom MindQL command: `command_name`,
+`handler`, `description`, and `category` (defaults to `"extension"`). The
+executor invokes `handler` with two positional arguments — a
+`ReadOnlyAccessor` and the parsed argument list — and awaits a
+`list[dict[str, object]]` back. See
+[Custom MindQL Commands](extensions.md#custom-mindql-commands) for a worked
+example.
+
+A handler receives a `ReadOnlyAccessor`, never the store's live connection —
+its only capability is `execute()`, restricted to a single `SELECT`:
+
+| Type | Member | Description |
+|---|---|---|
+| `ReadOnlyAccessor` | `await execute(sql, parameters=()) -> ReadOnlyCursor` | Runs one `SELECT` statement through the same guard as the `SELECT` passthrough; raises `MindQLParseError` for anything else. |
+| `ReadOnlyCursor` | `fetchone()`, `fetchall()`, `fetchmany(size=None)`, `async for row in cursor`, `.description` | The read surface of an `aiosqlite.Cursor` and nothing else — no `execute()`-family method, no `connection`. |
+
+See [Extension Commands](mindql.md#extension-commands) for the read-only
+guarantee this closes off.
+
 ### `MindQLExecutor`
 
 `MindQLExecutor` runs against an open `aiosqlite.Connection` (the same

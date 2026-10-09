@@ -101,7 +101,13 @@ captured according to the configured TTL strategy:
 - **delete** strategy → a `DELETE_THOUGHT` entry (`after: null`).
 
 (The separate `engrava gc` CLI command, which physically purges already-archived
-rows, operates at the storage layer and is not journaled.)
+rows, now also appends its own `DELETE_THOUGHT` entry per row it deletes — in
+the same transaction as the delete — when `--config` names an `engrava.yaml`
+with `journal.enabled: true`. Without `--config`, or with journaling disabled,
+nothing is journaled: `gc` builds its own connection and only wires a journal
+writer onto it when told to. `gc --expired`'s TTL pass is journaled the same
+way `cleanup_expired()` above already is, through the store it builds for
+that pass.)
 
 Deleting a thought also removes its incident edges, embeddings, and actions
 through database cascades (and purges its vector-index row). When deletion goes

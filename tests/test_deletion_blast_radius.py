@@ -1147,17 +1147,28 @@ class TestGcArchivedBlastRadius:
         calling it directly (bypassing the CLI's schema-version gate) is what
         keeps that coverage rather than losing it entirely alongside the
         CLI-level test above.
+
+        ``include_pinned=True``: the protection columns this helper otherwise
+        queries (``pinned``, ``priority``) are real schema-24+ ambitions that
+        did not exist yet at this fixture's pre-cascade (core-11) version --
+        ``pinned`` arrives only at core-18. The same gate that keeps
+        ``_gc_archived`` off a pre-cascade schema in practice keeps it off a
+        pre-``pinned`` one too, for the same reason; this direct call asks for
+        the unconditional behaviour precisely so it stays about the explicit
+        child-deletes, not about a protection feature this schema predates.
         """
         import aiosqlite as _aiosqlite
 
+        from engrava.cli.config import EngravaCLIConfig
         from engrava.cli.main import _gc_archived
 
         conn = await _aiosqlite.connect(str(pre_cascade_mixed_lifecycle_db))
         conn.row_factory = _aiosqlite.Row
+        cfg = EngravaCLIConfig(db_path=pre_cascade_mixed_lifecycle_db)
         try:
             version = (await (await conn.execute("PRAGMA user_version")).fetchone())[0]
             assert version == _PRE_CASCADE_VERSION
-            await _gc_archived(conn, dry_run=False, quiet=False)
+            await _gc_archived(conn, cfg, dry_run=False, quiet=False, include_pinned=True)
         finally:
             await conn.close()
 

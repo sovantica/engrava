@@ -101,6 +101,44 @@ def _ids(result: list[tuple[str, float]]) -> list[str]:
     return [tid for tid, _ in result]
 
 
+def _spy_on_search_similar(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Patch ``search_similar`` to record each call's ``top_k`` (the vector arm's
+    actual request size), and return the list it appends to.
+
+    Pool-widening (or its absence) is otherwise only observable through final
+    result membership, which collapses to the same answer for every pool size
+    at or above ``top_k`` once that pool feeds no collapse-backfill machinery
+    (``collapse_key=None``) or feeds a ``top_k`` too small for a freed slot to
+    reach the window -- the pool width is a real difference the final output
+    does not always show. Spying on the arm's own request directly observes
+    the pool size the budget math actually produced, independent of both.
+    """
+    calls: list[int] = []
+    real_search_similar = SqliteEngravaCore.search_similar
+
+    async def spy(
+        self: SqliteEngravaCore,
+        query_vector: list[float],
+        top_k: int = 10,
+        threshold: float = 0.0,
+        *,
+        include_archived: bool = False,
+        _filter_clause: tuple[str, list[object]] | None = None,
+    ) -> list[tuple[str, float]]:
+        calls.append(top_k)
+        return await real_search_similar(
+            self,
+            query_vector,
+            top_k,
+            threshold,
+            include_archived=include_archived,
+            _filter_clause=_filter_clause,
+        )
+
+    monkeypatch.setattr(SqliteEngravaCore, "search_similar", spy)
+    return calls
+
+
 @pytest.fixture
 async def store(tmp_path: Path) -> AsyncIterator[SqliteEngravaCore]:
     """Fresh in-file store with the default SearchConfig."""
@@ -626,9 +664,14 @@ class TestPoolWidening:
     async def test_widening_enables_deeper_distinct_unit_backfill(self, tmp_path: Path) -> None:
         """A distinct unit past the un-widened budget is backfilled once widened.
 
-        ``vector_top_k=2`` un-widened sees only the 2 strongest u1 fragments;
-        the ``x4`` widening (=> 8) pulls the rank-4 ``deep`` row into the pool,
-        and collapse then surfaces it as a distinct unit.
+        ``top_k=2`` keeps the per-arm floor (``max(vector_top_k, top_k)``) a
+        no-op, so ``deep`` can only be reached through the collapse-pool
+        widening, not through the floor: un-widened, ``vector_top_k=2`` sees
+        only the 2 strongest ``u1`` fragments; the ``x4`` widening (=> 8)
+        pulls the rank-4 ``deep`` row into the pool, collapse then evicts the
+        surplus same-unit fragment it crowded out, and ``deep`` backfills the
+        freed slot as a distinct unit -- all within the same ``top_k=2``
+        final window.
         """
         conn = await aiosqlite.connect(str(tmp_path / "widen.db"))
         conn.row_factory = aiosqlite.Row
@@ -639,7 +682,7 @@ class TestPoolWidening:
             result = await s.search_hybrid(
                 "no-fts-match",
                 query_vector=[1.0, 0.0, 0.0, 0.0],
-                top_k=5,
+                top_k=2,
                 fts_top_k=2,
                 vector_top_k=2,
                 collapse_key="$.unit",
@@ -648,12 +691,22 @@ class TestPoolWidening:
         finally:
             await conn.close()
 
-    async def test_none_path_pool_not_widened(self, tmp_path: Path) -> None:
-        """Without collapse_key the arm budget is NOT widened (deep row stays out).
+    async def test_none_path_pool_not_widened(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without collapse_key the arm budget is NOT widened by collapse_pool_factor.
 
-        Same store and budget; with ``collapse_key=None`` the budget stays at
-        ``vector_top_k=2``, so the rank-4 ``deep`` row never enters the pool.
+        ``top_k=2`` keeps the per-arm floor (``max(vector_top_k, top_k)``) a
+        no-op, isolating the thing actually under test: with
+        ``collapse_key=None`` the ``x4`` collapse-pool widening never fires,
+        so the vector arm's own request stays at ``vector_top_k=2`` -- pinned
+        directly via a spy on ``search_similar``, since at this ``top_k`` a
+        wider *fetched* pool would not, by itself, change which rows survive
+        the final truncation (there is no collapse/backfill machinery on the
+        ``None`` path to let a deeper row climb into the window). The
+        un-widened pool also means the rank-4 ``deep`` row never enters it.
         """
+        calls = _spy_on_search_similar(monkeypatch)
         conn = await aiosqlite.connect(str(tmp_path / "nowiden.db"))
         conn.row_factory = aiosqlite.Row
         s = SqliteEngravaCore(conn, search_config=SearchConfig(collapse_pool_factor=4))
@@ -663,11 +716,12 @@ class TestPoolWidening:
             result = await s.search_hybrid(
                 "no-fts-match",
                 query_vector=[1.0, 0.0, 0.0, 0.0],
-                top_k=5,
+                top_k=2,
                 fts_top_k=2,
                 vector_top_k=2,
                 collapse_key=None,
             )
+            assert calls == [2]
             assert "deep" not in set(_ids(result.results))
         finally:
             await conn.close()
@@ -861,6 +915,20 @@ class TestDeepBackfillCliffRegression:
     fragments, whose *answer* fact lives in the deeper ``u1-ans`` chunk, not the
     top one) and a *distinct* gold unit ``u2`` whose best chunk sits past the
     un-widened per-arm window (the rank-51 cliff, modelled by ``vector_top_k=2``).
+
+    The ``None`` path (no ``collapse_key``) documents what the per-arm floor
+    alone can and cannot reach here: at ``top_k`` above the pool the floor
+    (``max(vector_top_k, top_k)``) reaches ``u2-best`` on its own, with no
+    collapse widening involved; at ``top_k`` at or below the pool the floor is
+    a no-op and the cliff is exactly as before. The ``collapse_key`` paths
+    below use that same ``top_k=20``, so the floor alone already supplies
+    their pool too -- the collapse-pool widening on top of it is redundant
+    for *reaching* ``u2-best`` at this ``top_k``, not something those paths
+    additionally need. What ``collapse_key`` actually adds here is
+    *retention*: whether the deeper ``u1-ans`` answer chunk survives
+    alongside ``u2-best`` depends on ``collapse_max_per_unit``, not on
+    widening. ``TestPoolWidening`` above is where reachability genuinely
+    depends on the widening, not the floor.
     """
 
     @staticmethod
@@ -876,12 +944,22 @@ class TestDeepBackfillCliffRegression:
             await s.create_thought(_thought(tid, essence=f"row {tid}", metadata={"unit": unit}))
             await s.store_embedding(tid, vec)
 
-    async def test_today_none_path_misses_deeper_distinct_unit(self, tmp_path: Path) -> None:
-        """Default path (no ``collapse_key``): the distinct deeper unit is unreachable.
+    async def test_top_k_above_pool_on_none_path_now_reaches_the_deeper_unit(
+        self, tmp_path: Path
+    ) -> None:
+        """A ``top_k`` above the per-arm pool reaches the cliff on the ``None`` path too.
 
-        ``collapse_key=None`` never widens the pool, so with ``vector_top_k=2``
-        the candidate set is only the two strongest ``u1`` fragments and the
-        distinct ``u2-best`` past the window is absent — exactly the cliff.
+        ``collapse_key=None`` still never widens the pool by
+        ``collapse_pool_factor`` -- but the per-arm floor
+        (``max(vector_top_k, top_k)``) is unconditional and applies on *every*
+        path, collapse or none. With ``top_k=20 > vector_top_k=2`` the floor
+        alone raises the pool to 20, which already covers this 4-row store, so
+        the distinct ``u2-best`` past the un-widened ``vector_top_k=2`` window
+        is reached without any collapse mechanics at all. This superseded
+        ``test_today_none_path_misses_deeper_distinct_unit``, which pinned the
+        pre-floor cliff at this same ``top_k=20``; see
+        ``test_top_k_at_or_below_pool_on_none_path_still_misses_the_deeper_unit``
+        below for the cliff that still holds when the floor is a no-op.
         """
         conn = await aiosqlite.connect(str(tmp_path / "cliff_none.db"))
         conn.row_factory = aiosqlite.Row
@@ -893,6 +971,37 @@ class TestDeepBackfillCliffRegression:
                 "no-fts-match",
                 query_vector=[1.0, 0.0, 0.0, 0.0],
                 top_k=20,
+                fts_top_k=2,
+                vector_top_k=2,
+                collapse_key=None,
+            )
+            assert "u2-best" in set(_ids(result.results))
+        finally:
+            await conn.close()
+
+    async def test_top_k_at_or_below_pool_on_none_path_still_misses_the_deeper_unit(
+        self, tmp_path: Path
+    ) -> None:
+        """The cliff still holds on the ``None`` path when the floor is a no-op.
+
+        Same store; with ``top_k=2 <= vector_top_k=2`` the per-arm floor
+        (``max(vector_top_k, top_k)``) changes nothing, and ``collapse_key=None``
+        never applies ``collapse_pool_factor`` either, so the candidate set is
+        still only the two strongest ``u1`` fragments and the distinct
+        ``u2-best`` past the window is absent -- the cliff this regression
+        documents is about collapse widening, not about the floor, and it is
+        unchanged for any ``top_k`` the floor does not touch.
+        """
+        conn = await aiosqlite.connect(str(tmp_path / "cliff_none_small_topk.db"))
+        conn.row_factory = aiosqlite.Row
+        s = SqliteEngravaCore(conn, search_config=SearchConfig(collapse_pool_factor=4))
+        await s.ensure_schema()
+        try:
+            await self._seed(s)
+            result = await s.search_hybrid(
+                "no-fts-match",
+                query_vector=[1.0, 0.0, 0.0, 0.0],
+                top_k=2,
                 fts_top_k=2,
                 vector_top_k=2,
                 collapse_key=None,
@@ -1025,13 +1134,23 @@ class TestMaxPerUnitRecallNeutralityDeterminism:
 class TestMaxPerUnitBoundedWidening:
     """A6 — deeper retention still rides the bounded, config-backed widening."""
 
-    async def test_none_path_still_unwidened_with_param_set(self, tmp_path: Path) -> None:
+    async def test_none_path_still_unwidened_with_param_set(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """The param does not widen the pool on the ``collapse_key=None`` path.
 
-        Widening is gated on ``collapse_key`` alone; setting only
-        ``collapse_max_per_unit`` must leave the un-widened budget in force, so a
-        past-the-window row stays out.
+        ``top_k=2`` keeps the per-arm floor (``max(vector_top_k, top_k)``) a
+        no-op, isolating the thing actually under test: widening by
+        ``collapse_pool_factor`` is gated on ``collapse_key`` alone, so setting
+        only ``collapse_max_per_unit`` (with ``collapse_key=None``) must leave
+        the un-widened budget in force -- pinned directly via a spy on
+        ``search_similar``, since at this ``top_k`` final-result membership
+        would not, by itself, show a wider fetch (the ``None`` path has no
+        collapse/backfill machinery to let a deeper row climb into the
+        window). The un-widened budget also means the past-the-window row
+        stays out.
         """
+        calls = _spy_on_search_similar(monkeypatch)
         conn = await aiosqlite.connect(str(tmp_path / "param_nowiden.db"))
         conn.row_factory = aiosqlite.Row
         s = SqliteEngravaCore(conn, search_config=SearchConfig(collapse_pool_factor=4))
@@ -1041,23 +1160,35 @@ class TestMaxPerUnitBoundedWidening:
             result = await s.search_hybrid(
                 "no-fts-match",
                 query_vector=[1.0, 0.0, 0.0, 0.0],
-                top_k=20,
+                top_k=2,
                 fts_top_k=2,
                 vector_top_k=2,
                 collapse_key=None,
                 collapse_max_per_unit=2,
             )
+            assert calls == [2]
             assert "u2-best" not in set(_ids(result.results))
         finally:
             await conn.close()
 
-    async def test_widening_factor_one_bounds_the_pool(self, tmp_path: Path) -> None:
+    async def test_widening_factor_one_bounds_the_pool(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A ``collapse_pool_factor=1`` keeps the pool un-widened even under N=2.
 
-        Confirms the deep pool is the *bounded, configurable* widening — not an
-        unbounded over-fetch: with factor 1 the deeper distinct unit stays past
-        the window even with the retention lever on.
+        ``top_k=2`` keeps the per-arm floor (``max(vector_top_k, top_k)``) a
+        no-op, isolating the thing actually under test: the deep pool is the
+        *bounded, configurable* widening -- not an unbounded over-fetch --
+        so with factor 1 the widening multiply (``vector_top_k * 1``) leaves
+        the vector arm's own request at the un-widened ``vector_top_k=2``,
+        pinned directly via a spy on ``search_similar`` (at this ``top_k``,
+        with only 2 ``u1`` fragments ever reaching the retain-by-unit step,
+        final-result membership cannot tell a factor of 1 apart from a wider
+        one that still leaves the deeper unit past the truncated window). The
+        un-widened budget also means the deeper distinct unit stays past the
+        window even with the retention lever on.
         """
+        calls = _spy_on_search_similar(monkeypatch)
         conn = await aiosqlite.connect(str(tmp_path / "factor_one.db"))
         conn.row_factory = aiosqlite.Row
         s = SqliteEngravaCore(conn, search_config=SearchConfig(collapse_pool_factor=1))
@@ -1067,12 +1198,13 @@ class TestMaxPerUnitBoundedWidening:
             result = await s.search_hybrid(
                 "no-fts-match",
                 query_vector=[1.0, 0.0, 0.0, 0.0],
-                top_k=20,
+                top_k=2,
                 fts_top_k=2,
                 vector_top_k=2,
                 collapse_key="$.unit",
                 collapse_max_per_unit=2,
             )
+            assert calls == [2]
             assert "u2-best" not in set(_ids(result.results))
         finally:
             await conn.close()
