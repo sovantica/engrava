@@ -56,6 +56,7 @@ Example: `feat(dreaming): add priority signal to hybrid search`
 - `docs` — documentation (prose, not code)
 - `bench` — benchmarks, performance testing
 - `deps` — dependency updates
+- `deps-dev` — development-only dependency updates (the scope Dependabot gives them)
 - `release` — release tooling, semantic-release config
 - `ci` — CI workflows (also: commit type `ci:`)
 - `build` — build tooling (also: commit type `build:`)
