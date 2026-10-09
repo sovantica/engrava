@@ -39,8 +39,9 @@ canonical reverse path: it returns an archived thought to `ACTIVE` and clears
 the hygiene archive stamps. Two maintenance mechanisms have dedicated archival
 paths outside the ordinary `evolve()` sequence:
 
-- TTL cleanup with the `archive` strategy archives any expired row, clears its
-  `expires_at`, and clears the hygiene-specific archive stamps.
+- TTL cleanup with the `archive` strategy archives any expired row that is not
+  pinned, clears its `expires_at`, and clears the hygiene-specific archive
+  stamps. A pinned row is never expired (see below).
 - Memory Hygiene may archive an eligible `ACTIVE` or `CREATED` row, clears its
   `expires_at`, and stamps `archived_at_cycle` plus `archived_at` for its restore
   windows.
