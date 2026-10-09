@@ -238,7 +238,7 @@ jobs:
       # gated, and never rebuilds them, so there is no source ref for it to
       # resolve — mutable or otherwise.
       - name: Download gated release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: release-dist-${{ needs.release.outputs.version }}
           path: dist
