@@ -5,6 +5,19 @@ All notable changes to engrava will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1](https://github.com/sovantica/engrava/compare/v0.7.0...v0.7.1) (2026-10-09)
+
+### Fixed
+
+* **docs:** ship the VS Code MCP example VS Code actually reads ([0a2afbb](https://github.com/sovantica/engrava/commit/0a2afbbd73e8c92d32f337d116abd8934ec06953))
+* **infra:** build EngravaManager stores with the full configuration ([5ebdc46](https://github.com/sovantica/engrava/commit/5ebdc46d89e6478664f88361148cf6e9994b202f))
+* **lifecycle:** keep pinned reflections through the sweep, gc and TTL ([4928047](https://github.com/sovantica/engrava/commit/4928047095138216edabb137a7543e5f5ac17993))
+* **mindql:** extension handlers get a read-only accessor instead of the live connection ([847766a](https://github.com/sovantica/engrava/commit/847766a15bb3afebe28575144bc0e7b089982d6d))
+* **mindql:** read values ending in or/and, and quoted literals, correctly ([c5e7842](https://github.com/sovantica/engrava/commit/c5e7842b2bdfab4eb12c7fdaf2f78c311a9baaac))
+* **mindql:** the single-SELECT guard reads SQL comments and quoted identifiers ([b34fcdf](https://github.com/sovantica/engrava/commit/b34fcdf22914ab55db2082f45524096c47972039))
+* **search:** raise the per-arm candidate pool to at least top_k ([3a34d0e](https://github.com/sovantica/engrava/commit/3a34d0e33eb35b3bcdd0d12c292c342ecfbf322d))
+* **search:** single-source the hybrid-search defaults on SearchConfig ([424efe2](https://github.com/sovantica/engrava/commit/424efe22f5a5dc5f58fc5c182de0851a0b109180))
+
 ## [0.7.0](https://github.com/sovantica/engrava/compare/v0.6.0...v0.7.0) (2026-10-02)
 
 ### Added
