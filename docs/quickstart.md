@@ -12,7 +12,7 @@ one in.
 |---|---|---|
 | Keyword search only, nothing else to think about | `pip install engrava` | none — semantic search is inert, not degraded |
 | Semantic search, model stays out of your process | `pip install 'engrava[embeddings-ollama]'` + a running [Ollama](https://ollama.com) | one extra service to run; no local download |
-| Semantic search, offline after first use (only with 2 env vars set) | `pip install 'engrava[embeddings-local]'` | a large one-time download (`sentence-transformers` + `torch`, ~550+ MB) plus a first-use model download |
+| Semantic search, offline after first use (only with 2 env vars set) | `pip install 'engrava[embeddings-local]'` | a large one-time download (`sentence-transformers` + `torch`, ~3000+ MB on Linux x86_64, Python 3.11, most of it NVIDIA CUDA libraries; [no GPU?](configuration.md#no-nvidia-gpu-install-the-cpu-only-build)) plus a first-use model download |
 
 Each option ships as a ready-to-copy `engrava.yaml` — see
 [Configuration → Quick-start profiles](configuration.md#quick-start-profiles)
@@ -38,10 +38,13 @@ profile above):
 pip install 'engrava[embeddings-local]'
 ```
 
-The extra pulls `sentence-transformers` and `torch` — a large one-time
-download (~550+ MB on the PyPI Linux/x86_64 wheel for Python 3.11; see
+The extra pulls `sentence-transformers` and `torch`, a large one-time
+download (~3000+ MB on Linux x86_64 with Python 3.11, most of it NVIDIA
+CUDA libraries; see
 [Configuration → Quick-start profiles](configuration.md#quick-start-profiles)
-for the exact, platform-scoped numbers) — plus a further encoder model
+for the exact, platform-scoped numbers, and
+[Configuration: No NVIDIA GPU](configuration.md#no-nvidia-gpu-install-the-cpu-only-build)
+for the CPU-only install), plus a further encoder model
 download on first use. The encoder is **not** a language model: it
 turns text into a fixed-size vector. There are no API keys, and — once
 `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` are set — no network traffic

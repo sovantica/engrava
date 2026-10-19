@@ -481,3 +481,143 @@ class TestRunSmokeSequenceVectorLane:
         assert all("--db" in c for c in calls)
         recall_call = next(c for c in calls if "recall" in c)
         assert smoke_module._remembered_text("base") in recall_call
+
+
+class TestRunLaneCpuTorchOrchestration:
+    """``_run_lane``'s own wiring of the CPU-torch step -- no real venv, no network.
+
+    Every collaborator ``_run_lane`` calls (``_create_lane_venv``,
+    ``_install_cpu_only_torch``, ``_install_wheel``, ``_check_cpu_only_torch``,
+    ``_write_vector_config``, ``_run_smoke_sequence``) is monkeypatched to a
+    fake that only records its own name (and, where it matters, its
+    arguments) onto a shared list -- so these tests pin the *orchestration*
+    in ``_run_lane`` itself, not the collaborators' own behaviour (each is
+    tested directly elsewhere in this file).
+    """
+
+    @staticmethod
+    def _patch_collaborators(
+        smoke_module: object, monkeypatch: pytest.MonkeyPatch, calls: list[str]
+    ) -> None:
+        def fake_create_lane_venv(work_dir: Path, lane_name: str) -> Path:
+            del lane_name
+            return work_dir / "venv"
+
+        def fake_install_cpu_only_torch(venv_dir: Path) -> None:
+            del venv_dir
+            calls.append("install_cpu_only_torch")
+
+        def fake_install_wheel(venv_dir: Path, wheel: Path, extras: tuple[str, ...]) -> None:
+            del venv_dir, wheel, extras
+            calls.append("install_wheel")
+
+        def fake_check_cpu_only_torch(venv_dir: Path, work_dir: Path) -> None:
+            del venv_dir, work_dir
+            calls.append("check_cpu_only_torch")
+
+        def fake_write_vector_config(work_dir: Path, db_path: Path) -> Path:
+            del db_path
+            return work_dir / "engrava.yaml"
+
+        def fake_run_smoke_sequence(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            calls.append("run_smoke_sequence")
+
+        monkeypatch.setattr(smoke_module, "_create_lane_venv", fake_create_lane_venv)
+        monkeypatch.setattr(smoke_module, "_install_cpu_only_torch", fake_install_cpu_only_torch)
+        monkeypatch.setattr(smoke_module, "_install_wheel", fake_install_wheel)
+        monkeypatch.setattr(smoke_module, "_check_cpu_only_torch", fake_check_cpu_only_torch)
+        monkeypatch.setattr(smoke_module, "_write_vector_config", fake_write_vector_config)
+        monkeypatch.setattr(smoke_module, "_run_smoke_sequence", fake_run_smoke_sequence)
+
+    def test_vector_lane_runs_cpu_torch_install_wheel_check_then_smoke_in_order(
+        self, smoke_module: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[str] = []
+        self._patch_collaborators(smoke_module, monkeypatch, calls)
+        smoke_module._run_lane(
+            Path("dist/engrava-1.0-py3-none-any.whl"), "vector", ("embeddings-local", "vec")
+        )
+        assert calls == [
+            "install_cpu_only_torch",
+            "install_wheel",
+            "check_cpu_only_torch",
+            "run_smoke_sequence",
+        ]
+
+    def test_base_lane_calls_neither_cpu_torch_function(
+        self, smoke_module: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[str] = []
+        self._patch_collaborators(smoke_module, monkeypatch, calls)
+        smoke_module._run_lane(Path("dist/engrava-1.0-py3-none-any.whl"), "base", ())
+        assert calls == ["install_wheel", "run_smoke_sequence"]
+        assert "install_cpu_only_torch" not in calls
+        assert "check_cpu_only_torch" not in calls
+
+
+class TestCheckCpuOnlyTorch:
+    """``_check_cpu_only_torch`` runs the real check script with the lane venv's own python."""
+
+    def test_runs_with_the_lane_venvs_own_python_and_the_repo_check_script(
+        self, smoke_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[list[str]] = []
+
+        def fake_run(
+            command: list[str], *, cwd: Path, check: bool = True
+        ) -> subprocess.CompletedProcess[str]:
+            del cwd, check
+            seen.append(command)
+            return _completed()
+
+        monkeypatch.setattr(smoke_module, "_run", fake_run)
+        venv_dir = tmp_path / "venv"
+        work_dir = tmp_path
+        smoke_module._check_cpu_only_torch(venv_dir, work_dir)
+        assert len(seen) == 1
+        expected_python = str(smoke_module._venv_bin(venv_dir, "python"))
+        expected_script = str(smoke_module.REPO_ROOT / "scripts" / "check_cpu_only_torch.py")
+        assert seen[0] == [expected_python, expected_script]
+
+    def test_a_failing_check_raises_called_process_error(
+        self, smoke_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fake_run(
+            command: list[str], *, cwd: Path, check: bool = True
+        ) -> subprocess.CompletedProcess[str]:
+            del cwd, check
+            raise subprocess.CalledProcessError(1, command, output="", stderr="FAILED")
+
+        monkeypatch.setattr(smoke_module, "_run", fake_run)
+        with pytest.raises(subprocess.CalledProcessError):
+            smoke_module._check_cpu_only_torch(tmp_path / "venv", tmp_path)
+
+
+class TestCheckFailurePropagatesThroughMain:
+    """A failing CPU-only-torch check in one lane fails ``main`` like any other lane failure."""
+
+    def test_check_failure_in_the_vector_lane_makes_main_return_nonzero(
+        self, smoke_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[str] = []
+        TestRunLaneCpuTorchOrchestration._patch_collaborators(smoke_module, monkeypatch, calls)
+        monkeypatch.setattr(
+            smoke_module, "_select_wheel", lambda: tmp_path / "engrava-1.0-py3-none-any.whl"
+        )
+
+        def failing_check(venv_dir: Path, work_dir: Path) -> None:
+            del venv_dir, work_dir
+            raise subprocess.CalledProcessError(
+                1, ["check_cpu_only_torch.py"], output="", stderr="FAILED"
+            )
+
+        monkeypatch.setattr(smoke_module, "_check_cpu_only_torch", failing_check)
+
+        exit_code = smoke_module.main()
+
+        assert exit_code == 1
+        # The base lane (no extras) completed its own smoke sequence before
+        # the vector lane's check raised -- only the vector lane's call is
+        # missing, not every lane's.
+        assert calls.count("run_smoke_sequence") == 1

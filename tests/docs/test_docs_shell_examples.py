@@ -183,6 +183,12 @@ EXEMPT_BASH_BLOCKS: tuple[tuple[str, str, ExemptionReason, str], ...] = (
         "f062fe7d84352d8b",
     ),
     (
+        "docs/configuration.md",
+        "download.pytorch.org/whl/cpu",
+        ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,
+        "7597da9932fdb844",
+    ),
+    (
         "docs/guides/agent-memory.md",
         "python examples/agent_loop.py",
         ExemptionReason.NOT_AN_ENGRAVA_INVOCATION,

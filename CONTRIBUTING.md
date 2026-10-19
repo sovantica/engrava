@@ -35,6 +35,17 @@ python -m venv .venv
 source .venv/bin/activate  # Linux/macOS
 .venv\Scripts\Activate.ps1  # Windows
 
+# No NVIDIA GPU: install the CPU build of torch first. On Linux, the
+# default PyPI build pulls the NVIDIA CUDA libraries as dependencies:
+# several gigabytes that a machine without a GPU never uses. Keep
+# --no-deps: without it, --index-url would also resolve torch's own
+# dependencies from this index instead of PyPI.
+python -m pip install --no-deps torch --index-url https://download.pytorch.org/whl/cpu
+
+# With an NVIDIA GPU: skip the command above and pick the index that
+# matches your GPU and driver from pytorch.org's install selector
+# (https://pytorch.org/get-started/locally/) before the next step.
+
 # Install in editable mode with dev dependencies
 pip install -e ".[dev]"
 ```

@@ -109,12 +109,19 @@ Needs the `engrava[embeddings-local]` extra, which pulls
 `sentence-transformers` and `torch`. Real, measured numbers, not general
 knowledge about these libraries:
 
-- `torch`'s current PyPI Linux/x86_64 wheel for Python 3.11
-  (`torch-2.14.0-cp311-cp311-manylinux_2_28_x86_64.whl`) is **554.6 MB**,
-  read from the PyPI package index on 2026-09-16. `sentence-transformers`
-  itself is a sub-1 MB wheel, but it brings in `transformers`, `tokenizers`,
-  and `huggingface_hub` on top, so the extra's total download exceeds
-  `torch` alone.
+- `torch` 2.14.1's current PyPI Linux x86_64 wheel for Python 3.11 is
+  **554.6 MB**, measured from the PyPI package index on 2026-10-16. On
+  Linux, that wheel's own dependency metadata adds the NVIDIA CUDA
+  libraries too: 19 more distributions, **2,445.4 MB** together. Installing
+  the extra therefore pulls about **3,000 MB** in all before
+  `sentence-transformers`'s own dependencies, most of it usable only with
+  an NVIDIA GPU. The macOS arm64 wheel (127.3 MB) and the Windows amd64
+  wheel (124.1 MB) carry none of that. Without an NVIDIA GPU, the CPU-only
+  Linux build is **196.2 MB** and pulls no CUDA dependency at all; see
+  "No NVIDIA GPU: install the CPU-only build" below.
+- `sentence-transformers` itself is a sub-1 MB wheel, but it brings in
+  `transformers`, `tokenizers`, and `huggingface_hub` on top, so the
+  extra's total download exceeds `torch` alone.
 - The model this profile names, `all-MiniLM-L6-v2`, is a **further, separate
   download** — measured **88 MB** on disk under
   `~/.cache/huggingface/hub` after the first call that uses it.
@@ -136,6 +143,34 @@ on this profile being offline.
 two offline environment variables above) in exchange for never needing a
 reachable service again — the inverse trade from `network`, which needs no
 local download but needs Ollama reachable at every query.
+
+#### No NVIDIA GPU: install the CPU-only build
+
+Install the CPU-only build of `torch` first, in the same environment the
+next command installs into. This only works in a fresh virtual
+environment: pip treats an existing `torch`, even the default CUDA build,
+as already satisfying the extra's requirement and leaves it as is, and
+uninstalling `torch` alone leaves its CUDA libraries behind.
+
+```bash
+# Run in a fresh virtual environment, before either package is installed.
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install 'engrava[embeddings-local]'
+```
+
+The second command keeps the CPU-only `torch` the first one just
+installed: it already satisfies the extra's own requirement
+(`torch>=2.0.0`; `2.14.1+cpu` satisfies it), so nothing pulls the default
+PyPI build or its CUDA dependencies in behind it.
+
+With an NVIDIA GPU, skip the first command: keep the default PyPI build,
+or pick the index that matches your GPU and driver from
+[pytorch.org's install selector](https://pytorch.org/get-started/locally/).
+
+The same holds for `engrava-mcp[local]`, whose own metadata declares
+`local = ["engrava[embeddings-local]>=0.7,<0.8"]` (`engrava-mcp`'s
+`pyproject.toml`, read 2026-10-16): install the CPU-only `torch` first,
+then `pip install 'engrava-mcp[local]'` in the same environment.
 
 ## Configuration File
 
