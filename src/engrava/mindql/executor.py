@@ -631,7 +631,7 @@ class ReadOnlyCursor:
     Wraps the ``aiosqlite`` cursor produced by a guarded ``SELECT``, exposing
     only ``fetchone``, ``fetchall``, ``fetchmany``, async iteration, and
     ``description`` — the read surface a MindQL extension handler needs (a
-    handler shaped like Sova's ``LAYER`` reads exactly these). There is no
+    handler that runs one parameterised ``SELECT`` uses exactly these). There is no
     ``execute``, ``executemany``, ``executescript``, ``connection``, or
     ``close``-and-reuse, and no attribute passthrough to the wrapped cursor
     (no ``__getattr__`` forwarding).
