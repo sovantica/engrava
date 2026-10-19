@@ -260,8 +260,11 @@ cannot even begin until the window has closed. Concretely:
 
 - **A different task's write now waits, and survives independently.** It
   cannot join the window's transaction — by the time it runs, the window has
-  already committed or rolled back — so its own outcome no longer depends on
-  the window's.
+  already committed or rolled back — so it cannot share the window's writes.
+  If the window's rollback fails, the store instead revokes admission before
+  releasing the lock: the queued write raises `ConnectionQuarantinedError`
+  rather than committing abandoned work. Open a new store and reconcile
+  durable state; the quarantined instance cannot be reused.
 - **Nesting is supported and safe.** A nested `suspend_auto_commit()` call —
   reachable only from the *same* task, since the lock above blocks any other
   task before it could nest — shares the outer call's transaction. Only the

@@ -296,7 +296,11 @@ connection; that is one of several causes, listed under
 
 `suspend_auto_commit()` groups writes on one store connection. A normal exit
 commits once; any exception escaping the block, including task cancellation,
-causes a rollback of the outermost transaction and is re-raised.
+attempts a rollback of the outermost transaction. A successful rollback re-raises
+the identical body exception and leaves the connection usable. If rollback also
+fails, the store is quarantined before another guarded writer can enter: an
+ordinary rollback error is the explicit cause of the original body exception,
+while cancellation of the rollback takes precedence over the body failure.
 
 ```python
 async def store_atomically(store, first, second, link):
@@ -448,6 +452,8 @@ failing proxy. This state never clears. Any of these triggers it:
   through the TTL delete strategy or hygiene garbage collection — an ordinary
   error such as a trigger veto can cause this, not only a cancellation, and the
   derived-records seam need not be involved;
+- the outer transaction's body failed and its rollback also failed, or the
+  compensating rollback after a failed commit could not complete;
 - `close()` gave up waiting on the physical close after
   `close_timeout_seconds` — see
   [Deployment](deployment.md#if-the-worker-never-answers).
@@ -455,7 +461,12 @@ failing proxy. This state never clears. Any of these triggers it:
 The call that triggered the quarantine can surface its original error (or a
 cancellation that outranks it); a `close()` whose bound expired raises
 `ConnectionQuarantinedError` itself. Once quarantine is installed, the next
-newly-admitted public operation raises `ConnectionQuarantinedError`.
+newly-admitted public operation raises `ConnectionQuarantinedError`. This
+includes a writer already queued on the failed window's lock: it cannot commit
+that window's abandoned writes. Retirement does not wait for physical close,
+which may fail or remain pending; a concurrent owned `close()` shares that same
+physical-close task under its existing bound. A separately retained caller-owned
+raw connection is outside the core admission guarantee.
 
 Close the old store, open a new one, and inspect durable state before deciding
 what to repeat:

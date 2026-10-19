@@ -5245,8 +5245,9 @@ class SqliteEngravaCore:
     async def suspend_auto_commit(self) -> AsyncIterator[None]:
         """Context manager that disables per-method auto-commit.
 
-        Batches every write in the block into one transaction: the block
-        commits once on clean exit and rolls back entirely on any exception.
+        Batches every write in the block into one transaction. Clean exit
+        commits once; an escaping exception attempts an outermost rollback.
+        If rollback fails, quarantine revokes further core operations.
 
         **One writer for the duration of the window.** This method takes
         :attr:`_write_lock` for its entire duration, so a *different* task
@@ -5316,6 +5317,19 @@ class SqliteEngravaCore:
         this window's work despite the reported failure. See
         :meth:`_commit_or_recover` for the recovery this now performs.
 
+        **A failed rollback retires this store before another writer enters.**
+        If the body fails and its outer rollback also fails, the existing
+        quarantine mechanism revokes core and journal admission immediately,
+        without waiting for the detached physical close. The identical body
+        failure is raised from an ordinary rollback error; cancellation raised
+        by the rollback takes precedence instead. A queued writer cannot
+        publish the failed window through a later commit. Raw SQL through a
+        separately retained caller-owned connection is outside this guarantee.
+
+        This outer window owns the whole active transaction even if the caller
+        opened it before entry. Nested windows still leave recovery to the
+        outermost owner; no independent savepoint or BEGIN ownership is implied.
+
         Yields:
             None — the store operates in deferred-commit mode.
 
@@ -5331,7 +5345,7 @@ class SqliteEngravaCore:
             window_token = self._current_auto_commit_window.set(window_id)
             try:
                 yield
-            except BaseException:
+            except BaseException as exc:
                 if self._connection_quarantined:
                     # A guarded write inside this window already quarantined
                     # the connection while unwinding its own unit and left
@@ -5343,7 +5357,16 @@ class SqliteEngravaCore:
                     # guard.
                     raise
                 if is_outermost and self._db.in_transaction:
-                    await self._db.rollback()
+                    try:
+                        await self._db.rollback()
+                    except BaseException as rollback_exc:
+                        await self._quarantine_connection(
+                            "outer transaction rollback failed; "
+                            "replace this store and inspect durable state"
+                        )
+                        if isinstance(rollback_exc, asyncio.CancelledError):
+                            raise
+                        raise exc from rollback_exc
                 raise
             else:
                 if is_outermost and self._db.in_transaction:
