@@ -110,7 +110,7 @@ jobs:
   # (tests/test_cli_memory_verbs_embedding.py) load the package's actual
   # default model (all-MiniLM-L12-v2) for the same reason — a mock would only
   # prove the CLI can call a mock. If the matrix legs each populated the cache
-  # themselves, a cold cache means all three legs miss and download models
+  # themselves, a cold cache means all matrix legs miss and download models
   # concurrently — tripping HF rate limiting (HTTP 429), and if every leg fails
   # the cache is never saved. This single upstream job does at most one
   # download per model per cold workflow run, saves the shared cache, and the
@@ -208,7 +208,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       # Full history and tags, unlike every other job here. The release-gate
       # tests prove they can go red by pointing at this repository's own

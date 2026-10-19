@@ -10,7 +10,7 @@ database with a newer version.
 
 ## Requirements
 
-- Python `>=3.11`; the maintained CI matrix covers Python 3.11, 3.12, and 3.13.
+- Python `>=3.11`; the maintained CI matrix covers Python 3.11, 3.12, 3.13, and 3.14.
 - A Python SQLite build with FTS5 support.
 - No API key or network service for the base package.
 - An optional local or remote embedding provider for semantic vector search;

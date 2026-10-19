@@ -22,7 +22,7 @@ from.
 ## Installation
 
 Engrava requires Python `>=3.11`; the maintained CI matrix covers Python 3.11,
-3.12, and 3.13. Its SQLite build must include FTS5 (standard in normal Python
+3.12, 3.13, and 3.14. Its SQLite build must include FTS5 (standard in normal Python
 distributions). See [Known Limitations](known-limitations.md#fts5-availability)
 for a quick capability check and optional-backend platform notes.
 
