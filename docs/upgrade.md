@@ -206,6 +206,7 @@ engrava --db new-old-version.db restore -i backup.snapshot.jsonl
 | 0.5.0 | 0.6.0 | Yes | **Schema-changing** minor upgrade (`user_version` 18 → 20), with two additive columns. Default retrieval now excludes archived thoughts, and wrong-dimension query vectors raise a typed error. An edge `decay_multiplier` of `0.0` no longer reads back as `1.0`, and a later update no longer rewrites it to `1.0` — values a 0.5.x update already overwrote stay overwritten. Back up, quiesce shared-store workers, migrate once, and review the [0.5 → 0.6 notes](#05---06) |
 | 0.6.x | 0.7.0 | Yes | **Schema-changing** minor upgrade (`user_version` 20 → 21): every `thought` / `edge` / `action` row gains a `revision INTEGER NOT NULL DEFAULT 0` column, and stored timestamps are rewritten into one canonical UTC form with no instant changed; `EngravaMetrics.schema_version` separately moves `1 → 2`; and `engrava --format json info` loses its `schema_version` key in favor of `metrics_schema_version` + `database_schema_version` (see below). `update_thought`, `restore_thought`, `update_edge` and `update_action` now check and increment `revision` atomically on every guarded write, so a write that lands after another guarded write touched the same row — including from a second connection or process — raises `StaleDataError` instead of silently overwriting; `update_edge` and `update_action` could never raise it before. No public method signature changed. **Behaviour change:** when the resolved recency weight is `0.0` **and** a cognitive-cycle reference (`current_cycle`, explicit or via `cycle_provider`) is present, the query-less fallback path now treats recency as fully off instead of still decaying by cycle — which can change result order for stores with heterogeneous thought priorities. `recency_now` (transaction-time) callers are unaffected; that axis was already correct. Also in this release: three new `EngravaError` subclasses (`WriteContentionError`, `WriteLockTimeoutError`, `DedupLockReentryError`) can now come out of the dedup and guarded-write paths; a new public override seam, `prepare_thought_for_insert()`, restores pre-insert customization that `get_or_create()` / `upsert_by_hash()` had silently stopped routing through an overridden `create_thought()`; `gc --dry-run` now names everything the real run deletes (edges, embeddings, and actions, not only orphaned edges); reconciliation, the vector-index purge and search now resolve a vector through its `thought` row, and `delete_thought` issues its own deletes for a thought's `edge`, `embedding` and `action` rows; a corrupt or truncated database file now makes the CLI exit with an error instead of hanging; and `restore` now refuses an `embedding` row with an empty `owner_type`/`owner_id`, a non-ISO-8601 `created_at`, or a non-positive `dimension` — every such row was already invalid on every prior release, so this only ever rejects a snapshot that already carried a broken record; and a merge restore (no `--clear`) into a target whose `journal_entry` table is non-empty now refuses any record that collides with an existing row and rolls the whole restore back instead of replacing it, unless `--orphan-journal-entries` is also given — journaling is opt-in and the CLI never enables it, so this only reaches a target that already has journaling on. Also in this release, the dreaming clustering cohesion gate (`cluster_quality_cohesion_threshold`) now divides by both vectors' norms instead of using a raw dot product, moving the score for most non-unit-vector providers. Review the [0.6 → 0.7 notes](#06---07) |
 | 0.7.0 | 0.7.1 | Yes | Patch-level upgrade; no schema change (`user_version` unchanged) — safe to roll across workers. Every change is a defect fix, and each one changes what some caller sees: a MindQL extension handler receives a `SELECT`-only accessor instead of the live connection; a MindQL `WHERE` with a dangling `AND`, or nested more than 256 levels deep, raises; `engrava gc` keeps pinned and protected-priority rows unless `--include-pinned` is given, and TTL never expires a pinned row; `top_k` above the per-arm pool returns a full page; a directly constructed store, or one `EngravaManager` builds with neither `base_config` nor `default_search`, applies recency weight `0.1` when given a recency reference; and `EngravaManager` gains `base_config` to build fully configured stores. Review the [0.7.0 → 0.7.1 notes](#070---071) |
+| 0.7.1 | 0.7.2 | Yes | Patch-level upgrade; no schema change (`user_version` unchanged), safe to roll across workers. When a `suspend_auto_commit()` block fails and its rollback fails too, the store is now quarantined before its write lock is released, so a waiting or later operation that reaches the database through it raises `ConnectionQuarantinedError`. A derivation that finds its derived thought or provenance edge already stored no longer leaves the store holding the write lock. numpy is no longer capped below 2.3, and Python 3.14 is supported. Review the [0.7.1 to 0.7.2 notes](#071---072) |
 
 For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 `0.x.*` line do not change the schema and are low-risk; **minor** upgrades
@@ -213,6 +214,37 @@ For any upgrade not listed, the rule of thumb is: **patch** upgrades within a
 [rolling-upgrades](#rolling-upgrades-multiple-workers) note below.
 
 ## Version Notes
+
+### 0.7.1 -> 0.7.2
+
+A patch release: no schema change (`user_version` unchanged), safe to roll across workers.
+
+**A failed rollback now quarantines the store.** When the body of a `suspend_auto_commit()` block raises, the store
+rolls back the outermost transaction. If that rollback failed too, 0.7.1 released the write lock with the
+transaction state unknown, and a write already waiting on the lock, or any later write, could commit the abandoned
+writes together with its own. 0.7.2 quarantines the store before it releases the lock: the waiting write, and every
+later operation that reaches the database through that store, raises `ConnectionQuarantinedError`; a call that
+returns without touching the database, such as a search with an empty query, returns as before. The body's
+exception still reaches the caller, with the rollback error as its `__cause__`. If the rollback was cancelled, the
+cancellation propagates instead. A rollback that succeeds behaves as before.
+
+**What to do.** Handle it as the other quarantine causes: close the store, open a new one, and inspect durable
+state before you repeat any write. See [Error handling](error-handling.md#transaction-context-behavior).
+
+**Re-deriving a thought no longer leaves the database locked.** With a derived-record producer configured, a
+derivation that found its derived thought, or its provenance edge, already stored left the transaction it had
+opened still open in 0.7.1. That happened when `derive_existing()` ran again on a thought, and when a new thought's
+producer returned content already stored without a provenance edge. The store then held SQLite's write lock until
+its next commit, and writes from other connections failed with `database is locked`. 0.7.2 closes that transaction
+with a rollback; a transaction the caller already holds is left as it was. Stores without a producer are not
+affected.
+
+**numpy is no longer capped below 2.3.** No numpy below 2.3.2 ships a wheel for Python 3.14, so on 3.14 the cap
+made every install compile numpy from source. Without the cap, an upgrade on any Python version may also move
+numpy to 2.3 or later. The floor, 1.26.0, is unchanged, and a pin your own project sets still applies. For
+development, the `dev` extra now needs mypy 2.4.0 or later and declares httpx itself.
+
+**Python 3.14** is tested in CI and listed in the package classifiers. `requires-python` is unchanged.
 
 ### 0.7.0 -> 0.7.1
 
