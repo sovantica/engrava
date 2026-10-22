@@ -108,6 +108,13 @@ dev = [
     # not ANN at the pinned 0.1.x line — not just the numpy fallback.  Mirrors
     # the constraint declared in the ``vec`` extra above.
     "sqlite-vec>=0.1.0,<0.2.0",
+    # The OpenAI-compatible and Ollama provider tests import httpx, the client
+    # those providers use (the ``embeddings-openai`` and ``embeddings-ollama``
+    # extras above declare it for users). It used to reach this environment
+    # only transitively, through huggingface_hub 1.x; huggingface_hub 2.0
+    # moved to a different HTTP client, so a fresh dev install stopped carrying
+    # it and those tests failed to import it. Same floor as those two extras.
+    "httpx>=0.27.0",
 ]
 
 [tool.setuptools.packages.find]
