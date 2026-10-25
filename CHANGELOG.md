@@ -5,6 +5,14 @@ All notable changes to engrava will be documented in this file.
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2](https://github.com/sovantica/engrava/compare/v0.7.1...v0.7.2) (2026-10-25)
+
+### Fixed
+
+* **build:** install numpy from a wheel on Python 3.14 ([eb6c68c](https://github.com/sovantica/engrava/commit/eb6c68cd9178a870bbbcff04f643d4a569ab0ed9))
+* **core:** close the transaction a reused derived child or edge opened ([762f9e1](https://github.com/sovantica/engrava/commit/762f9e15db5ebba8b4df432f49cdc14391897d45))
+* **core:** quarantine the store when an outer transaction rollback fails ([00c31bd](https://github.com/sovantica/engrava/commit/00c31bd2e825b402c3fd6fcd03006397e8b596b5))
+
 ## [0.7.1](https://github.com/sovantica/engrava/compare/v0.7.0...v0.7.1) (2026-10-09)
 
 ### Fixed
