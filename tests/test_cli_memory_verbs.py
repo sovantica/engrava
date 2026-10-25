@@ -587,39 +587,39 @@ class TestConfigPrecedence:
         assert db.exists()
 
     def test_missing_explicit_config_without_db_is_an_error_not_a_silent_default(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         missing_config = tmp_path / "does-not-exist.yaml"
         default_db = tmp_path / "engrava.db"
         runner = CliRunner()
 
-        with runner.isolated_filesystem(temp_dir=tmp_path):
-            result = runner.invoke(cli, ["--config", str(missing_config), "remember", "hello"])
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(cli, ["--config", str(missing_config), "remember", "hello"])
         assert result.exit_code == 2
         assert str(missing_config) in result.output
         assert not default_db.exists()
 
     def test_malformed_config_without_db_is_a_clean_error_not_a_traceback(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         bad_config = tmp_path / "broken.yaml"
         bad_config.write_text("not: valid: yaml: [", encoding="utf-8")
         runner = CliRunner()
 
-        with runner.isolated_filesystem(temp_dir=tmp_path):
-            result = runner.invoke(cli, ["--config", str(bad_config), "remember", "hello"])
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(cli, ["--config", str(bad_config), "remember", "hello"])
         assert result.exit_code == 2
         assert "Traceback" not in result.output
 
-    def test_malformed_config_without_db_json_emits_error_object(self, tmp_path: Path) -> None:
+    def test_malformed_config_without_db_json_emits_error_object(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         bad_config = tmp_path / "broken.yaml"
         bad_config.write_text("not: valid: yaml: [", encoding="utf-8")
         runner = CliRunner()
 
-        with runner.isolated_filesystem(temp_dir=tmp_path):
-            result = runner.invoke(
-                cli, ["--config", str(bad_config), "remember", "hello", "--json"]
-            )
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(cli, ["--config", str(bad_config), "remember", "hello", "--json"])
         assert result.exit_code == 2
         payload = json.loads(_last_line(result.output))
         assert payload["schema"] == "engrava.cli.error.v1"
@@ -641,32 +641,34 @@ class TestOptionShapedValueIsRejected:
     """
 
     def test_db_flag_shaped_value_is_rejected_before_any_database_is_created(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         runner = CliRunner()
-        with runner.isolated_filesystem(temp_dir=tmp_path):
-            result = runner.invoke(cli, ["--db", "--json", "remember", "hello world"])
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(cli, ["--db", "--json", "remember", "hello world"])
         assert result.exit_code == 2
         assert "Traceback" not in result.output
         assert "--json" in result.output
         assert not (tmp_path / "--json").exists()
 
-    def test_config_flag_shaped_value_is_rejected(self, tmp_path: Path) -> None:
+    def test_config_flag_shaped_value_is_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         runner = CliRunner()
-        with runner.isolated_filesystem(temp_dir=tmp_path):
-            result = runner.invoke(cli, ["--config", "--verbose", "remember", "hello"])
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(cli, ["--config", "--verbose", "remember", "hello"])
         assert result.exit_code == 2
         assert "Traceback" not in result.output
 
-    def test_dot_slash_prefixed_dash_path_still_works(self, tmp_path: Path) -> None:
+    def test_dot_slash_prefixed_dash_path_still_works(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """The documented escape hatch (a leading ``./``) is not itself rejected."""
-        import pathlib
-
         runner = CliRunner()
-        with runner.isolated_filesystem(temp_dir=tmp_path) as cwd:
-            result = runner.invoke(cli, ["--db", "./--not-really-a-flag", "remember", "hello"])
-            assert result.exit_code == 0, result.output
-            assert (pathlib.Path(cwd) / "--not-really-a-flag").exists()
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(cli, ["--db", "./--not-really-a-flag", "remember", "hello"])
+        assert result.exit_code == 0, result.output
+        assert (tmp_path / "--not-really-a-flag").exists()
 
 
 class TestNumericValidation:

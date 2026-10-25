@@ -715,11 +715,11 @@ class TestExtensionGuardRunsOnEveryPath:
 
         assert await _thought_id_list(populated_db) == ids_before
 
-    async def test_sova_shaped_layer_handler_is_unaffected(
+    async def test_read_only_layer_handler_is_unaffected(
         self,
         populated_db: aiosqlite.Connection,
     ) -> None:
-        """A handler shaped like Sova's ``LAYER`` is unaffected by the boundary.
+        """A read-only ``LAYER`` handler is unaffected by the boundary.
 
         Parameterised ``SELECT``, ``fetchall``, ``cursor.description`` --
         returns the same rows and column names it did before this boundary

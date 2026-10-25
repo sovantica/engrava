@@ -54,10 +54,14 @@ Dreaming/consolidation and the knowledge graph need **no extra** — they are pa
 of the base install.
 
 > **`embeddings-local` carries a large first-run download.** It pulls
-> `sentence-transformers` and `torch` — `torch`'s current PyPI Linux/x86_64
-> wheel for Python 3.11 alone measures 554.6 MB — plus a further, separate
-> model download (~88 MB for `all-MiniLM-L6-v2`, cached under
-> `~/.cache/huggingface/hub`) on first use. `engrava-mcp[local]` is the exact
+> `sentence-transformers` and `torch`, plus a further, separate model
+> download (~88 MB for `all-MiniLM-L6-v2`, cached under
+> `~/.cache/huggingface/hub`) on first use. On Linux, the PyPI build of
+> `torch` also pulls the NVIDIA CUDA libraries as dependencies: several
+> gigabytes, most of it usable only with an NVIDIA GPU. Without one,
+> install the CPU-only build first (see
+> [Configuration: No NVIDIA GPU](https://github.com/sovantica/engrava/blob/main/docs/configuration.md#no-nvidia-gpu-install-the-cpu-only-build)
+> for the exact command and numbers). `engrava-mcp[local]` is the exact
 > same download, reached through the server package instead of this one. If
 > you do not need semantic search in-process, `pip install engrava` alone
 > (no extra, no download, no model) already gives you keyword search, the

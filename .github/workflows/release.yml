@@ -156,8 +156,12 @@ jobs:
         with:
           path: ~/.cache/huggingface
           key: hf-${{ runner.os }}-sentence-transformers-all-MiniLM-L6-v2-v1
+      - name: Install CPU-only torch
+        run: python -m pip install --no-deps torch --index-url https://download.pytorch.org/whl/cpu
       - name: Install release-gate dependencies
         run: pip install -e ".[embeddings-local]" build twine
+      - name: Check CPU-only torch
+        run: python scripts/check_cpu_only_torch.py
       - name: Generate release app token
         id: app-token
         uses: actions/create-github-app-token@v3
@@ -213,7 +217,7 @@ jobs:
       # failure unlikely is worth the retention budget.
       - name: Upload verified release artifacts
         if: steps.detect.outputs.published == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-dist-${{ steps.detect.outputs.version }}
           path: dist/
@@ -238,7 +242,7 @@ jobs:
       # gated, and never rebuilds them, so there is no source ref for it to
       # resolve — mutable or otherwise.
       - name: Download gated release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: release-dist-${{ needs.release.outputs.version }}
           path: dist

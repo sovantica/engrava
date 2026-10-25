@@ -5245,8 +5245,9 @@ class SqliteEngravaCore:
     async def suspend_auto_commit(self) -> AsyncIterator[None]:
         """Context manager that disables per-method auto-commit.
 
-        Batches every write in the block into one transaction: the block
-        commits once on clean exit and rolls back entirely on any exception.
+        Batches every write in the block into one transaction. Clean exit
+        commits once; an escaping exception attempts an outermost rollback.
+        If rollback fails, quarantine revokes further core operations.
 
         **One writer for the duration of the window.** This method takes
         :attr:`_write_lock` for its entire duration, so a *different* task
@@ -5316,6 +5317,19 @@ class SqliteEngravaCore:
         this window's work despite the reported failure. See
         :meth:`_commit_or_recover` for the recovery this now performs.
 
+        **A failed rollback retires this store before another writer enters.**
+        If the body fails and its outer rollback also fails, the existing
+        quarantine mechanism revokes core and journal admission immediately,
+        without waiting for the detached physical close. The identical body
+        failure is raised from an ordinary rollback error; cancellation raised
+        by the rollback takes precedence instead. A queued writer cannot
+        publish the failed window through a later commit. Raw SQL through a
+        separately retained caller-owned connection is outside this guarantee.
+
+        This outer window owns the whole active transaction even if the caller
+        opened it before entry. Nested windows still leave recovery to the
+        outermost owner; no independent savepoint or BEGIN ownership is implied.
+
         Yields:
             None — the store operates in deferred-commit mode.
 
@@ -5331,7 +5345,7 @@ class SqliteEngravaCore:
             window_token = self._current_auto_commit_window.set(window_id)
             try:
                 yield
-            except BaseException:
+            except BaseException as exc:
                 if self._connection_quarantined:
                     # A guarded write inside this window already quarantined
                     # the connection while unwinding its own unit and left
@@ -5343,7 +5357,16 @@ class SqliteEngravaCore:
                     # guard.
                     raise
                 if is_outermost and self._db.in_transaction:
-                    await self._db.rollback()
+                    try:
+                        await self._db.rollback()
+                    except BaseException as rollback_exc:
+                        await self._quarantine_connection(
+                            "outer transaction rollback failed; "
+                            "replace this store and inspect durable state"
+                        )
+                        if isinstance(rollback_exc, asyncio.CancelledError):
+                            raise
+                        raise exc from rollback_exc
                 raise
             else:
                 if is_outermost and self._db.in_transaction:
@@ -8519,10 +8542,14 @@ class SqliteEngravaCore:
         Enrichment of a reused row is handled by the caller against the stored
         row's own content. The conflicting ``INSERT`` statement is aborted by
         SQLite itself (its own changes rolled back, the transaction preserved),
-        so the reuse early-return leaves no pending uncommitted mutation behind:
-        it still runs inside the savepoint unit below (the ``INSERT`` is what
-        raises), but exits that unit normally — a clean ``RELEASE``, never an
-        unwind — because nothing of this attempt is left for the unit to undo.
+        so the reuse leaves no pending uncommitted mutation behind: the unit
+        below (the ``INSERT`` is what raises) still exits normally -- a clean
+        ``RELEASE``, never an unwind -- because nothing of this attempt is left
+        for the unit to undo. On that reuse exit, a transaction this call
+        opened for itself is then rolled back (never committed -- nothing was
+        written); a transaction a caller already held when this call started
+        is left exactly as it was, mirroring :meth:`delete_thought` and
+        :meth:`cleanup_expired`'s own write-free exits.
 
         **The insert and its journal entry are one failure-atomic unit**, via
         :meth:`_write_readback_savepoint` — see :meth:`update_thought` for what
@@ -8545,6 +8572,12 @@ class SqliteEngravaCore:
 
         """
         async with self._write_lock:
+            # Sampled before the unit below opens anything -- mirrors
+            # delete_thought / cleanup_expired: whether this call is the one
+            # that opened the transaction it may need to close on the reuse
+            # exit below.
+            opened_transaction = not self._db.in_transaction
+            inserted = True
             async with self._write_readback_savepoint("insert_derived_row", begin="IMMEDIATE"):
                 try:
                     await self._db.execute(
@@ -8554,15 +8587,22 @@ class SqliteEngravaCore:
                 except aiosqlite.IntegrityError as exc:
                     if not _is_unique_violation(exc):
                         raise
-                    return False
-                if self._journal is not None:
+                    inserted = False
+                if inserted and self._journal is not None:
                     await self._journal.append(
                         mutation_type="INSERT_THOUGHT",
                         target_id=child.thought_id,
                         delta={"before": None, "after": child.model_dump(mode="json")},
                     )
-            await self._maybe_commit()
-            return True
+            if inserted:
+                await self._maybe_commit()
+            elif opened_transaction and self._db.in_transaction:
+                # Conflict-as-reuse: nothing was written, so there is nothing
+                # of this call's own to commit. Close only a transaction this
+                # call itself opened, never one a caller already held -- see
+                # delete_thought / cleanup_expired for the same reasoning.
+                await self._db.rollback()
+            return inserted
 
     async def _insert_derived_edge(
         self,
@@ -8576,11 +8616,15 @@ class SqliteEngravaCore:
         conflict-safe on both its deterministic id and the ``(from, to, type)``
         unique constraint, so a re-run or a concurrent derivation reuses the
         existing edge rather than failing; SQLite itself aborts the conflicting
-        ``INSERT`` (rolling back only its own changes), so the reuse early-return
-        leaves no pending uncommitted mutation: it still runs inside the
-        savepoint unit below (the ``INSERT`` is what raises), but exits that
-        unit normally — a clean ``RELEASE``, never an unwind — because nothing
-        of this attempt is left for the unit to undo.
+        ``INSERT`` (rolling back only its own changes), so the reuse leaves no
+        pending uncommitted mutation: the unit below (the ``INSERT`` is what
+        raises) still exits normally -- a clean ``RELEASE``, never an unwind --
+        because nothing of this attempt is left for the unit to undo. On that
+        reuse exit, a transaction this call opened for itself is then rolled
+        back (never committed -- nothing was written); a transaction a caller
+        already held when this call started is left exactly as it was,
+        mirroring :meth:`delete_thought` and :meth:`cleanup_expired`'s own
+        write-free exits.
 
         **The insert and its journal entry are one failure-atomic unit**, via
         :meth:`_write_readback_savepoint` — see :meth:`update_thought` for what
@@ -8608,6 +8652,10 @@ class SqliteEngravaCore:
             source=KnowledgeSource.EXPERIENCE,
         )
         async with self._write_lock:
+            # Sampled before the unit below opens anything -- see
+            # _insert_derived_row for the same reasoning.
+            opened_transaction = not self._db.in_transaction
+            inserted = True
             async with self._write_readback_savepoint("insert_derived_edge", begin="IMMEDIATE"):
                 try:
                     await self._db.execute(
@@ -8641,14 +8689,21 @@ class SqliteEngravaCore:
                 except aiosqlite.IntegrityError as exc:
                     if not _is_unique_violation(exc):
                         raise
-                    return
-                if self._journal is not None:
+                    inserted = False
+                if inserted and self._journal is not None:
                     await self._journal.append(
                         mutation_type="INSERT_EDGE",
                         target_id=edge.edge_id,
                         delta={"before": None, "after": edge.model_dump(mode="json")},
                     )
-            await self._maybe_commit()
+            if inserted:
+                await self._maybe_commit()
+            elif opened_transaction and self._db.in_transaction:
+                # Conflict-as-reuse: nothing was written, so there is nothing
+                # of this call's own to commit. Close only a transaction this
+                # call itself opened, never one a caller already held -- see
+                # delete_thought / cleanup_expired for the same reasoning.
+                await self._db.rollback()
 
     async def _batch_embed_thoughts(self, inserted: list[ThoughtRecord]) -> None:
         """Embed the freshly-inserted thoughts of a batch in one provider call.

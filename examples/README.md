@@ -10,11 +10,14 @@ services, no API keys.
 pip install 'engrava[embeddings-local]'
 ```
 
-The `embeddings-local` extra pulls `sentence-transformers` and `torch`
-— a large one-time download (~550+ MB on the PyPI Linux/x86_64 wheel
-for Python 3.11) — plus a further encoder model download on first use.
+The `embeddings-local` extra pulls `sentence-transformers` and `torch`,
+a large one-time download (~3000+ MB on Linux x86_64 with Python 3.11,
+most of it NVIDIA CUDA libraries), plus a further encoder model download
+on first use.
 See [`docs/configuration.md` → Quick-start profiles](../docs/configuration.md#quick-start-profiles)
-for the exact, platform-scoped numbers. The encoder is a
+for the exact, platform-scoped numbers, and
+[`docs/configuration.md`: No NVIDIA GPU](../docs/configuration.md#no-nvidia-gpu-install-the-cpu-only-build)
+for the CPU-only install. The encoder is a
 vector-producing model, **not** a language model — no API keys are
 needed, and — once `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` are set —
 there is no network traffic after the first download (see

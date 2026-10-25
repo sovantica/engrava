@@ -551,6 +551,14 @@ def test_leaf_ast_node_types_includes_constant() -> None:
 # `Num`, `Str`) are not on this list: `_leaf_ast_node_types()` excludes them
 # before this list is ever consulted, since which of them even reach it
 # varies by Python version.
+#
+# `TemplateStr` and `Interpolation` -- Python 3.14's PEP 750 template
+# strings, the counterparts of `JoinedStr` and `FormattedValue` -- are
+# listed here by name for the same reason this set is reviewed once by
+# hand rather than computed from whatever the running interpreter happens
+# to expose: naming a type that does not exist on 3.11-3.13 costs nothing,
+# since `_leaf_ast_node_types()` never produces a node by that name there
+# and the census below only ever looks up names that are actually present.
 _CANNOT_HOLD_A_NESTED_STATEMENT: frozenset[str] = frozenset(
     {
         "Add",
@@ -592,6 +600,7 @@ _CANNOT_HOLD_A_NESTED_STATEMENT: frozenset[str] = frozenset(
         "IfExp",
         "In",
         "Index",
+        "Interpolation",
         "Invert",
         "Is",
         "IsNot",
@@ -637,6 +646,7 @@ _CANNOT_HOLD_A_NESTED_STATEMENT: frozenset[str] = frozenset(
         "Sub",
         "Subscript",
         "Suite",
+        "TemplateStr",
         "Tuple",
         "TypeAlias",
         "TypeIgnore",
