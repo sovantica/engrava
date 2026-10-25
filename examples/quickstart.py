@@ -4,16 +4,17 @@ Requirements:
     pip install 'engrava[embeddings-local]'
 
 The ``[embeddings-local]`` extra pulls ``sentence-transformers`` and
-``torch`` — a large one-time download (~550+ MB on the PyPI
-Linux/x86_64 wheel for Python 3.11; see docs/configuration.md's
-"Quick-start profiles" section for the exact, platform-scoped numbers)
-— so vector search has a real ENCODER, plus a further encoder model
-download on first run, then cached locally. The encoder is NOT a
-language model: it turns text into a fixed-size vector and is fully
-local — no API keys, and no network after the first download once
-``HF_HUB_OFFLINE=1`` and ``TRANSFORMERS_OFFLINE=1`` are set (see
-docs/configuration.md's "local" profile for why those two variables
-are needed).
+``torch``, a large one-time download (~3000+ MB on Linux x86_64 with
+Python 3.11, most of it NVIDIA CUDA libraries; see
+docs/configuration.md's "Quick-start profiles" section for the exact,
+platform-scoped numbers, and its "No NVIDIA GPU" subsection for the
+CPU-only install), so vector search has a real ENCODER, plus a
+further encoder model download on first run, then cached locally.
+The encoder is NOT a language model: it turns text into a fixed-size
+vector and is fully local: no API keys, and no network after the
+first download once ``HF_HUB_OFFLINE=1`` and ``TRANSFORMERS_OFFLINE=1``
+are set (see docs/configuration.md's "local" profile for why those
+two variables are needed).
 
 Run this directly:
     python examples/quickstart.py

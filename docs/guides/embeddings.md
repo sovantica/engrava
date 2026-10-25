@@ -205,6 +205,10 @@ Runs a sentence-transformers model on your machine. Requires the
 pip install "engrava[embeddings-local]"
 ```
 
+Without an NVIDIA GPU, install the CPU build of `torch` first; see
+[Configuration: No NVIDIA GPU](../configuration.md#no-nvidia-gpu-install-the-cpu-only-build)
+for the exact command.
+
 ```python
 from engrava import SentenceTransformerProvider
 

@@ -21,7 +21,16 @@ dependency set can still have a packaging defect specific to the other:
 * ``base`` -- no extras. Exercises the console script most users get from
   a plain ``pip install engrava``, resolving its database through ``--db``
   for every command.
-* ``vector`` -- ``engrava[embeddings-local,vec]``. ``remember`` and
+* ``vector`` -- ``engrava[embeddings-local,vec]``. Before the wheel goes in,
+  this lane installs the CPU build of torch into the lane venv
+  (``--no-deps``, the PyTorch CPU index), the same step the project's CI
+  jobs run before any torch-pulling install (see
+  ``.github/workflows/ci.yml``) -- so the wheel's own resolution of
+  ``sentence-transformers`` finds torch already satisfied and never reaches
+  for the default PyPI build, which on Linux pulls the NVIDIA CUDA
+  libraries. Right after the wheel install, ``check_cpu_only_torch.py`` runs
+  with the lane venv's own interpreter and fails the lane if that did not
+  hold. ``remember`` and
   ``recall`` resolve their database through their own config file's
   ``database.path`` instead (``--config``, never alongside ``--db`` -- an
   explicit ``--db`` outranks ``--config`` for those two commands, per
@@ -129,6 +138,64 @@ def _install_wheel(venv_dir: Path, wheel: Path, extras: tuple[str, ...]) -> None
     target = f"{wheel}[{','.join(extras)}]" if extras else str(wheel)
     pip = _venv_bin(venv_dir, "pip")
     _run([str(pip), "install", "--quiet", target], cwd=venv_dir)
+
+
+#: The PyTorch CPU-only build index, installed into the ``vector`` lane
+#: venv before the wheel -- mirrors the project's CI jobs (see
+#: ``.github/workflows/ci.yml``).
+_TORCH_CPU_INDEX_URL = "https://download.pytorch.org/whl/cpu"
+
+#: Runs with the lane venv's own interpreter (see ``_check_cpu_only_torch``),
+#: so it is self-contained (stdlib only) and carries no import that would
+#: resolve against this script's own environment instead.
+_CPU_ONLY_TORCH_CHECK_SCRIPT = REPO_ROOT / "scripts" / "check_cpu_only_torch.py"
+
+
+def _install_cpu_only_torch(venv_dir: Path) -> None:
+    """Install the CPU build of torch into a lane venv, before the wheel.
+
+    ``--no-deps`` is required: without it, ``--index-url`` would also
+    supply torch's own dependencies from the PyTorch index. With it, the
+    wheel install that follows resolves those dependencies from PyPI and
+    finds torch already satisfied, so it keeps this CPU build rather than
+    reaching for the default PyPI build's CUDA stack.
+
+    Args:
+        venv_dir: The lane's virtual environment.
+
+    """
+    pip = _venv_bin(venv_dir, "pip")
+    _run(
+        [
+            str(pip),
+            "install",
+            "--quiet",
+            "--no-deps",
+            "torch",
+            "--index-url",
+            _TORCH_CPU_INDEX_URL,
+        ],
+        cwd=venv_dir,
+    )
+
+
+def _check_cpu_only_torch(venv_dir: Path, work_dir: Path) -> None:
+    """Run ``check_cpu_only_torch.py`` with the lane venv's own interpreter.
+
+    Args:
+        venv_dir: The lane's virtual environment (its ``python`` runs the
+            check, so it reports on that venv's installed distributions,
+            not this script's).
+        work_dir: Working directory for the check subprocess.
+
+    Raises:
+        subprocess.CalledProcessError: The venv holds a CUDA torch build or
+            a CUDA-adjacent distribution. Caught in ``main`` the same way
+            as every other lane failure.
+
+    """
+    python = str(_venv_bin(venv_dir, "python"))
+    _run([python, str(_CPU_ONLY_TORCH_CHECK_SCRIPT)], cwd=work_dir)
 
 
 def _write_vector_config(work_dir: Path, db_path: Path) -> Path:
@@ -518,7 +585,14 @@ def _run_lane(wheel: Path, lane_name: str, extras: tuple[str, ...]) -> None:
     with tempfile.TemporaryDirectory(prefix=f"engrava-wheel-smoke-{lane_name}-") as raw_work_dir:
         work_dir = Path(raw_work_dir)
         venv_dir = _create_lane_venv(work_dir, lane_name)
+        # Only a lane with extras (today, only "vector") installs torch, via
+        # sentence-transformers in embeddings-local -- the base lane has
+        # nothing for check_cpu_only_torch.py to check.
+        if extras:
+            _install_cpu_only_torch(venv_dir)
         _install_wheel(venv_dir, wheel, extras)
+        if extras:
+            _check_cpu_only_torch(venv_dir, work_dir)
         db_path = work_dir / f"smoke-{lane_name}.db"
         config_path = _write_vector_config(work_dir, db_path) if extras else None
         _run_smoke_sequence(venv_dir, work_dir, lane_name, db_path=db_path, config_path=config_path)

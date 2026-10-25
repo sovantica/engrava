@@ -37,8 +37,14 @@ jobs:
           path: ~/.cache/huggingface
           key: hf-${{ runner.os }}-sentence-transformers-all-MiniLM-L6-v2-v1
 
+      - name: Install CPU-only torch
+        run: python -m pip install --no-deps torch --index-url https://download.pytorch.org/whl/cpu
+
       - name: Install package with embeddings extra
         run: pip install -e ".[embeddings-local]"
+
+      - name: Check CPU-only torch
+        run: python scripts/check_cpu_only_torch.py
 
       - name: Run pre-publish smoke gate
         # Same committed floors as the publish path

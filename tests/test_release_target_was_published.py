@@ -15,6 +15,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -229,6 +230,11 @@ def _read_text_rejecting_the_bytes(self: Path, *args: object, **kwargs: object) 
     return b"\xff".decode("utf-8")
 
 
+def _loads_raising_recursion_error(*args: object, **kwargs: object) -> object:
+    msg = "maximum recursion depth exceeded"
+    raise RecursionError(msg)
+
+
 class TestReadDeclaredTargetBoundary:
     """``read_declared_target()`` has one catch-all boundary, not an enumerated exception list.
 
@@ -257,12 +263,36 @@ class TestReadDeclaredTargetBoundary:
         expected = f"could not read {repo / 'release-target.json'}: UnicodeDecodeError: "
         assert expected in str(excinfo.value)
 
+    def test_a_recursion_error_from_json_decoding_raises_a_clean_gate_input_error(
+        self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Deterministic counterpart to the real nested-document case below:
+        # forces json.loads() itself to raise RecursionError, regardless of
+        # whether a real document of any practical depth still exercises
+        # CPython's own recursion limit on the interpreter running this test
+        # (on 3.14 the 10,000-level document below no longer does -- see that
+        # test). This proves the gate's exception boundary converts a
+        # RecursionError into a clean GateInputError independent of that.
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "release-target.json").write_text('{"version": "0.7.0"}')
+        monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
+        monkeypatch.setattr(gate_module.json, "loads", _loads_raising_recursion_error)  # type: ignore[attr-defined]
+        with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
+            gate_module.read_declared_target()  # type: ignore[attr-defined]
+        assert isinstance(excinfo.value.__cause__, RecursionError)
+        assert "RecursionError" in str(excinfo.value)
+
     def test_a_deeply_nested_json_document_raises_a_clean_gate_input_error(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # A 10,000-level nested JSON document. A RecursionError out of
-        # json.loads() is not a json.JSONDecodeError, so such a list would
-        # miss it too.
+        # A 10,000-level nested JSON document. Below 3.14, a RecursionError
+        # out of json.loads() is not a json.JSONDecodeError, so such a list
+        # would miss it too, and the gate's own boundary must still turn it
+        # into a clean GateInputError naming it. On 3.14, CPython parses this
+        # depth without raising at all, so the document instead resolves to
+        # a real (deeply nested) list, and the gate's own deliberate "must
+        # be a string" check is what fires.
         repo = tmp_path / "repo"
         repo.mkdir()
         nested = "[" * 10_000 + "]" * 10_000
@@ -270,7 +300,10 @@ class TestReadDeclaredTargetBoundary:
         monkeypatch.setattr(gate_module, "REPO_ROOT", repo)  # type: ignore[attr-defined]
         with pytest.raises(gate_module.GateInputError) as excinfo:  # type: ignore[attr-defined]
             gate_module.read_declared_target()  # type: ignore[attr-defined]
-        assert "RecursionError" in str(excinfo.value)
+        if sys.version_info >= (3, 14):
+            assert "'version' value must be a string, got list" in str(excinfo.value)
+        else:
+            assert "RecursionError" in str(excinfo.value)
 
     def test_an_unrelated_oversized_integer_field_raises_a_clean_gate_input_error(
         self, gate_module: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
